@@ -4,9 +4,7 @@ This document explains how to add support for new diffusion models in SGLang dif
 
 ## Architecture Overview
 
-SGLang diffusion is engineered for both performance and flexibility, built upon a modular pipeline architecture. This
-design allows developers to easily construct complex, customized pipelines for various diffusion models by combining and
-reusing different components.
+SGLang diffusion is engineered for both performance and flexibility, built upon a modular pipeline architecture. This design allows developers to easily construct complex, customized pipelines for various diffusion models by combining and reusing different components.
 
 At its core, the architecture revolves around two key concepts, as highlighted in our [blog post](https://lmsys.org/blog/2025-11-07-sglang-diffusion/#architecture):
 
@@ -17,13 +15,13 @@ At its core, the architecture revolves around two key concepts, as highlighted i
 
 To add support for a new diffusion model, you will primarily need to define or configure the following components:
 
-1.  **`PipelineConfig`**: This is a dataclass that holds all the static configurations for your model pipeline. It includes paths to model components (like UNet, VAE, text encoders), precision settings (e.g., `fp16`, `bf16`), and other model-specific architectural parameters. Each model typically has its own subclass of `PipelineConfig`.
+1.  **`PipelineConfig`**: This is a dataclass that holds all the static configurations for your model pipeline. It includes paths to model components (like UNet, VAE, text encoders), precision settings (e.g., `fp16`, `bf16`), and other model-specific architectural parameters. Each model typically has its own subclass of `PipelineConfig`. Base class: [`configs/pipeline_configs/base.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipeline_configs/base.py); model implementations: [`configs/pipeline_configs/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipeline_configs/) (e.g. `qwen_image.py`, `flux.py`).
 
-2.  **`SamplingParams`**: This dataclass defines the parameters that control the generation process at runtime. These are the user-provided inputs for a generation request, such as the `prompt`, `negative_prompt`, `guidance_scale`, `num_inference_steps`, `seed`, output dimensions (`height`, `width`), etc.
+2.  **`SamplingParams`**: This dataclass defines the parameters that control the generation process at runtime. These are the user-provided inputs for a generation request, such as the `prompt`, `negative_prompt`, `guidance_scale`, `num_inference_steps`, `seed`, output dimensions (`height`, `width`), etc. Base class: [`configs/sample/sampling_params.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/sampling_params.py); model implementations: [`configs/sample/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/) (e.g. `qwenimage.py`, `flux.py`).
 
 3.  **`ComposedPipeline` (not a config)**: This is the central class where you define the structure of your model's generation pipeline. You will create a new class that inherits from `ComposedPipelineBase` and, within it, instantiate and chain together the necessary `PipelineStage`s in the correct order. See `ComposedPipelineBase` and `PipelineStage` base definitions:
-    - [`ComposedPipelineBase`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/composed_pipeline_base.py)
-    - [`PipelineStage`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/stages/base.py)
+    - [`ComposedPipelineBase`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines_core/composed_pipeline_base.py)
+    - [`PipelineStage`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines_core/stages/base.py)
     - [Central registry (models/config mapping)](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)
 
 4.  **Modules (components referenced by the pipeline)**: Each pipeline references a set of modules that are loaded from the model repository (e.g., Diffusers `model_index.json`) and assembled via the registry/loader. Common modules include:
@@ -67,19 +65,20 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
       - `vae`: Variational autoencoder for latent encoding/decoding
 
 2.  **Create Configs**:
-    - **PipelineConfig**: [`QwenImageEditPipelineConfig`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipelines/qwen_image.py) defines model-specific parameters, precision settings, preprocessing functions, and latent shape calculations.
+    - **PipelineConfig**: [`QwenImageEditPipelineConfig`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py) defines model-specific parameters, component configs (e.g. VAE, DiT, text encoder), precision settings, preprocessing functions, and latent shape calculations.
     - **SamplingParams**: [`QwenImageSamplingParams`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/configs/sample/qwenimage.py) sets runtime defaults like `num_frames=1`, `guidance_scale=4.0`, `num_inference_steps=50`.
 
 3.  **Implement Model Components**:
-    - Adapt or implement specific model components in the appropriate directories:
-      - **DiT/Transformer**: Implement in [`runtime/models/dits/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/) - e.g., [`qwen_image.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py) for Qwen's DiT architecture
-      - **Encoders**: Implement in [`runtime/models/encoders/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/) - e.g., text encoders like [`qwen2_5vl.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py)
-      - **VAEs**: Implement in [`runtime/models/vaes/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/) - e.g., [`autoencoder_kl_qwenimage.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py)
-      - **Schedulers**: Implement in [`runtime/models/schedulers/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/schedulers/) if needed
+    - Under [`sglang/multimodal_gen/runtime/models/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/) you define all runtime model components. Adapt or implement the following in the appropriate subdirectories:
+      - **DiT/Transformer**: [`runtime/models/dits/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/) - e.g., [`qwen_image.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/dits/qwen_image.py) for Qwen's DiT architecture
+      - **Encoders**: [`runtime/models/encoders/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/) - e.g., text encoders like [`qwen2_5vl.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py)
+      - **VAEs**: [`runtime/models/vaes/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/) - e.g., [`autoencoder_kl_qwenimage.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py)
+      - **Schedulers**: [`runtime/models/schedulers/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/models/schedulers/) if needed
     - These components handle the core model logic, attention mechanisms, and data transformations specific to the target diffusion model.
 
 4.  **Define Pipeline Class**:
-    - The [`QwenImageEditPipeline`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/architectures/basic/qwen_image/qwen_image.py) class inherits from `ComposedPipelineBase` and orchestrates stages sequentially.
+    - Under [`sglang/multimodal_gen/runtime/pipelines/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/) you define pipeline classes that inherit from `ComposedPipelineBase` and orchestrate stages (encoding, denoising, decoding, etc.) for each diffusion model.
+    - For this Qwen-Image model, we use the QwenImageEditPipeline. The [`QwenImageEditPipeline`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/qwen_image.py) class inherits from `ComposedPipelineBase` and orchestrates stages sequentially.
     - Declare required modules via `_required_config_modules` and implement the pipeline stages:
 
     ```python
@@ -103,5 +102,5 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
 5.  **Register Configs**:
     - Register the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) via `_register_configs` to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
 
-By following this pattern of defining configurations and composing pipelines, you can integrate new diffusion models
-into SGLang with ease.
+By following this pattern of defining configurations and composing pipelines, you can integrate new diffusion models into SGLang with ease.
+
