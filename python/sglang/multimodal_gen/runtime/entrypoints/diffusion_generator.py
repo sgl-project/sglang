@@ -15,7 +15,10 @@ from typing import Any, List, Union
 
 import numpy as np
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -263,6 +266,25 @@ class DiffGenerator:
                             results.append(result_item)
                         continue
 
+                    if req.data_type == DataType.MESH:
+                        for output_idx, sample in enumerate(
+                            output_batch.output_file_paths
+                        ):
+                            result_item: dict[str, Any] = {
+                                "output_file_path": sample,
+                                "prompts": req.prompt,
+                                "generation_time": timer.duration,
+                                "peak_memory_mb": output_batch.peak_memory_mb,
+                                "timings": (
+                                    output_batch.timings.to_dict()
+                                    if output_batch.timings
+                                    else {}
+                                ),
+                                "prompt_index": output_idx,
+                            }
+                            results.append(result_item)
+                        continue
+
                     samples_out: list[Any] = []
                     audios_out: list[Any] = []
                     frames_out: list[Any] = []
@@ -326,7 +348,10 @@ class DiffGenerator:
             return None
         else:
             if requests[0].return_frames:
-                results = [r["frames"] for r in results]
+                if requests[0].data_type == DataType.MESH:
+                    results = [r["output_file_path"] for r in results]
+                else:
+                    results = [r["frames"] for r in results]
             if len(results) == 1:
                 return results[0]
             return results

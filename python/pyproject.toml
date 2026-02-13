@@ -113,7 +113,14 @@ diffusion = [
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.2.0",
-  "addict"
+  "addict",
+  "trimesh>=4.0.0",
+  "pymeshlab",
+  "pygltflib>=1.16.0",
+  "xatlas",
+  "diso",
+  "rembg",
+  "onnxruntime"
 ]
 
 tracing = [
@@ -148,6 +155,7 @@ all = [
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
+diso = ["torch", "setuptools"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
