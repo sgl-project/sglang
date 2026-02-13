@@ -2157,14 +2157,21 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if _use_static_weights:
-            topk = topk_ids.shape[1]
+            # Static path: pass local routed counts directly to waterfill.
+            # The waterfill kernel uses probabilistic sampling based on relative
+            # gaps (target_total - routed_counts[r]), so local counts already
+            # preserve the correct relative ordering.  Scaling by static weights
+            # adds noise since each rank computes a different "estimated global"
+            # — the local counts are a more honest signal.
+            # No all_reduce, no GPU→CPU sync.
             if profile_waterfill_timing:
                 evt_allreduce_s.record()
-            global_routed_counts, local_tokens_per_rank = (
-                self.deepep_waterfill_balancer.estimate_global_counts(
-                    local_routed_counts, topk
-                )
-            )
+            global_routed_counts = local_routed_counts
+            topk = topk_ids.shape[1]
+            local_num_tokens = local_routed_counts.sum() // max(topk, 1)
+            local_tokens_per_rank = local_num_tokens.expand(
+                self.deepep_waterfill_balancer.world_size
+            ).to(torch.int64)
             if profile_waterfill_timing:
                 evt_allreduce_e.record()
         else:

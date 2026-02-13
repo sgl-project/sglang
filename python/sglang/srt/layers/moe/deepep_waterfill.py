@@ -46,7 +46,7 @@ LOCAL_SHARED_MARKER = -1
 
 # Local preference factor used by waterfill assignment.
 # Set to 1.0 to disable the bias and use pure argmin over routed_counts.
-LOCAL_PREFERENCE_FACTOR = 1.0
+LOCAL_PREFERENCE_FACTOR = 1.1
 
 # Try to import Triton for GPU-optimized kernels
 try:
@@ -552,10 +552,21 @@ if HAS_TRITON:
         token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = token_idx < num_tokens
 
-        # Use pre-computed target_total instead of deriving from routed_counts_ptr.
-        # This allows routed_counts_ptr to carry effective load (routed + DP-attention)
-        # while target_total is computed correctly from pure routed counts + shared token count.
-        target_total = precomputed_target_total
+        # Use pre-computed target_total when given; otherwise derive from
+        # routed_counts_ptr (avoids GPU→CPU sync when called from static path).
+        if precomputed_target_total > 0:
+            target_total = precomputed_target_total
+        else:
+            # Derive target_total from routed_counts (same formula as Python side).
+            r_idx = tl.arange(0, world_size)
+            routed_vec = tl.load(
+                routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
+            ).to(tl.int64)
+            total_effective = tl.sum(routed_vec)
+            total_tokens_global = total_effective // topk
+            target_total = (
+                total_effective + total_tokens_global + world_size - 1
+            ) // world_size
 
         # ===== Step 1: Select destination rank for shared expert =====
         # Prefer balanced total load (routed + shared) by sampling destination among
@@ -1557,16 +1568,36 @@ class DeepEPWaterfillBalancer:
             else:
                 effective_load = routed_counts_i64
 
-            # When routed imbalance is mild (max_load <= mean_total_load), allow shared tokens
-            # to be dispatched to any rank to better approach perfect balance.
-            total_routed = int(routed_counts_i64.sum().item())
-            total_tokens_global = total_routed // topk
-            total_effective = int(effective_load.sum().item())
-            max_effective = int(effective_load.max().item())
-            target_total = (
-                total_effective + total_tokens_global + self.world_size - 1
-            ) // self.world_size
-            allow_all_ranks = max_effective <= target_total
+            # Compute target_total and allow_all_ranks WITHOUT GPU→CPU sync.
+            # When using static weights, always allow dispatch to any rank (EPLB
+            # already balances routed load, so the mild-imbalance condition is
+            # almost always satisfied).  For the dynamic path, keep the original
+            # logic but compute target_total entirely on GPU (single .item() at
+            # the very end, reducing 3 syncs to 1).
+            if self.has_static_weights():
+                # Static path: zero GPU→CPU syncs.
+                # Pass target_total=0 so the kernel derives it from routed_counts.
+                # allow_all_ranks=True since EPLB keeps routed load balanced.
+                allow_all_ranks = True
+                target_total = 0
+            else:
+                # Dynamic path: keep original logic (3 → 1 sync).
+                total_routed_t = routed_counts_i64.sum()
+                total_tokens_global_t = total_routed_t // topk
+                total_effective_t = effective_load.sum()
+                max_effective_t = effective_load.max()
+                target_total = int(
+                    (
+                        (
+                            total_effective_t
+                            + total_tokens_global_t
+                            + self.world_size
+                            - 1
+                        )
+                        // self.world_size
+                    ).item()
+                )
+                allow_all_ranks = bool((max_effective_t <= target_total).item())
 
             expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts = (
                 waterfill_prepare_dispatch_fused(
