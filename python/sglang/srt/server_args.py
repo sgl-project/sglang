@@ -1275,7 +1275,7 @@ class ServerArgs:
                 if self.enable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
-                if is_sm100_supported() or is_sm120_supported():
+                if is_sm100_supported():
                     if (
                         self.attention_backend is None
                         and self.prefill_attention_backend is None
@@ -1283,11 +1283,11 @@ class ServerArgs:
                     ):
                         self.attention_backend = "trtllm_mla"
                         logger.info(
-                            "Use trtllm_mla as attention backend on Blackwell for DeepseekV3ForCausalLM"
+                            "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                         )
 
             # Set moe backend for DeepSeek
-            if is_sm100_supported() or is_sm120_supported():
+            if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
@@ -1296,7 +1296,7 @@ class ServerArgs:
                     if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
                         self.quantization = "fp8"
                         logger.info(
-                            "Quantization not specified, default to fp8 for DeepSeek on Blackwell"
+                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
                         )
                     else:
                         self.quantization = quant_method
@@ -1307,7 +1307,7 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on Blackwell for DeepseekV3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
                 if (
@@ -1334,7 +1334,7 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
-                if is_sm100_supported() or is_sm120_supported():
+                if is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
@@ -1443,7 +1443,7 @@ class ServerArgs:
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
-                if is_sm100_supported() or is_sm120_supported():
+                if is_sm100_supported():
                     self.attention_backend, platform = "trtllm_mha", "sm100"
                 elif is_sm90_supported():
                     self.attention_backend, platform = "fa3", "sm90"
@@ -1463,9 +1463,7 @@ class ServerArgs:
                 "trtllm_mha",
                 "intel_xpu",
             }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-            if (
-                is_sm100_supported() or is_sm120_supported()
-            ) and self.moe_runner_backend == "auto":
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -1503,7 +1501,7 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
             if self.attention_backend is None:
-                if is_cuda() and (is_sm100_supported() or is_sm120_supported()):
+                if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_cuda() and get_device_sm() >= 80:
                     self.attention_backend = "fa3"
@@ -1558,7 +1556,7 @@ class ServerArgs:
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
         ]:
-            if is_sm100_supported() or is_sm120_supported():
+            if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
@@ -1572,7 +1570,7 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on Blackwell for "
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                         f"{model_arch}"
                     )
         elif model_arch in [
@@ -1580,7 +1578,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
-            if is_sm100_supported() or is_sm120_supported():
+            if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
@@ -1594,7 +1592,7 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        f"Use flashinfer_trtllm as MoE runner backend on Blackwell for {model_arch}"
+                        f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
                     )
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
@@ -1604,7 +1602,7 @@ class ServerArgs:
             )
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
-            if is_sm100_supported() or is_sm120_supported():
+            if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1622,7 +1620,7 @@ class ServerArgs:
                     if check_pkg_version_at_least("flashinfer-python", "0.6.2"):
                         self.moe_runner_backend = "flashinfer_trtllm"
                         logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on Blackwell for Glm4MoeForCausalLM"
+                            "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                         )
 
         elif model_arch in [
@@ -1788,7 +1786,7 @@ class ServerArgs:
                     # ref: https://github.com/sgl-project/sglang/issues/17411
                     self.attention_backend = "fa3"
                 elif (
-                    (is_sm100_supported() or is_sm120_supported())
+                    is_sm100_supported()
                     and is_no_spec_infer_or_topk_one(self)
                     and (
                         self.speculative_algorithm is None
@@ -1861,7 +1859,7 @@ class ServerArgs:
             self.attention_backend == "trtllm_mla"
             or self.decode_attention_backend == "trtllm_mla"
         ):
-            if not is_blackwell_supported():
+            if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
@@ -1882,9 +1880,9 @@ class ServerArgs:
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
         ):
-            if not is_blackwell_supported():
+            if not is_sm100_supported():
                 raise ValueError(
-                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
+                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
                 )
 
             if self.page_size not in [16, 32, 64]:
