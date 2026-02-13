@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
@@ -86,6 +87,8 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    _default_sampling_params_logged = False
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
@@ -100,10 +103,14 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
-        if self.default_sampling_params:
+        if (
+            self.default_sampling_params
+            and not OpenAIServingChat._default_sampling_params_logged
+        ):
             logger.info(
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
+            OpenAIServingChat._default_sampling_params_logged = True
 
         # Check if the model is a GPT-OSS model
         self.is_gpt_oss = (
@@ -813,25 +820,19 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             if request.return_routed_experts and routed_experts:
-                for index, choice_routed_experts in routed_experts.items():
-                    if choice_routed_experts is not None:
-                        routed_experts_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[
-                                ChatCompletionResponseStreamChoice(
-                                    index=index,
-                                    delta=DeltaMessage(
-                                        sgl_ext=SglExt(
-                                            routed_experts=choice_routed_experts
-                                        )
-                                    ),
-                                    finish_reason=None,
-                                )
-                            ],
-                            model=request.model,
-                        )
-                        yield (f"data: {routed_experts_chunk.model_dump_json()}\n\n")
+                # Get first non-None routed_experts value
+                first_routed_experts = next(
+                    (v for v in routed_experts.values() if v is not None), None
+                )
+                if first_routed_experts is not None:
+                    routed_experts_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[],  # sglext is at response level
+                        model=request.model,
+                        sglext=SglExt(routed_experts=first_routed_experts),
+                    )
+                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -891,6 +892,19 @@ class OpenAIServingChat(OpenAIServingBase):
         """Build chat completion response from generation results"""
         choices = []
 
+        # Build sglext at response level (from first ret_item, as these are per-request)
+        first_ret = ret[0]
+        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        cached_tokens_details = process_cached_tokens_details_from_ret(
+            first_ret, request
+        )
+        response_sglext = None
+        if routed_experts or cached_tokens_details:
+            response_sglext = SglExt(
+                routed_experts=routed_experts,
+                cached_tokens_details=cached_tokens_details,
+            )
+
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None
@@ -899,7 +913,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
-            routed_experts = process_routed_experts_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
@@ -960,9 +973,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                sgl_ext=(
-                    SglExt(routed_experts=routed_experts) if routed_experts else None
-                ),
             )
             choices.append(choice_data)
 
@@ -980,6 +990,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            sglext=response_sglext,
         )
 
     def _process_logprobs_tokens(

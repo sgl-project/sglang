@@ -1,6 +1,3 @@
-from sglang.multimodal_gen.runtime.models.model_stages.glm_image import (
-    GlmImageBeforeDenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -8,6 +5,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+    GlmImageBeforeDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

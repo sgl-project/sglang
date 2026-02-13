@@ -958,6 +958,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
@@ -1536,6 +1537,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                # Add detailed cache breakdown if available
+                if (
+                    hasattr(recv_obj, "cached_tokens_details")
+                    and recv_obj.cached_tokens_details
+                ):
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
+                        i
+                    ]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
@@ -1854,6 +1863,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
+            if (
+                recv_obj.spec_acceptance_histogram
+                and len(recv_obj.spec_acceptance_histogram) > i
+                and recv_obj.spec_acceptance_histogram[i]
+            ):
+                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
+                    i
+                ]
+
     def _calculate_timing_metrics(
         self,
         meta_info: Dict[str, Any],
@@ -1974,6 +1993,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Get detailed cache breakdown if available
+            cached_tokens_details = None
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                cached_tokens_details = recv_obj.cached_tokens_details[i]
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1982,6 +2009,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                cached_tokens_details,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

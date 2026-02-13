@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=51, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestAbort(CustomTestCase):
@@ -236,12 +236,12 @@ class TestAbortAllWithRetraction(CustomTestCase):
             print("Finished test_abort_all_with_retraction")
 
 
-class TestAbortWithQueueTimeout(CustomTestCase):
+class TestAbortWithWaitingTimeout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_QUEUED_TIMEOUT_MS.override(1):
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -269,7 +269,7 @@ class TestAbortWithQueueTimeout(CustomTestCase):
         )
         return response.json()
 
-    def test_queue_timeout(self):
+    def test_waiting_timeout(self):
         num_requests = 2
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
@@ -283,13 +283,13 @@ class TestAbortWithQueueTimeout(CustomTestCase):
             self.assertEqual(error_count, 1)
 
 
-class TestAbortWithForwardTimeout(CustomTestCase):
+class TestAbortWithRunningTimeout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_FORWARD_TIMEOUT_MS.override(
-            1
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(
+            0.001
         ), envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False):
             cls.process = popen_launch_server(
                 cls.model,
@@ -302,7 +302,7 @@ class TestAbortWithForwardTimeout(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_forward_timeout(self):
+    def test_running_timeout(self):
         response = requests.post(
             self.base_url + "/generate",
             json={

@@ -233,6 +233,7 @@ class PiecewiseCudaGraphRunner:
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
+        self.moe_fusions = self.model_runner.moe_fusions
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -358,7 +359,11 @@ class PiecewiseCudaGraphRunner:
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
         with set_forward_context(
-            forward_batch, self.attention_layers, self.quant_config, self.moe_layers
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -520,7 +525,11 @@ class PiecewiseCudaGraphRunner:
 
             kwargs = {}
             with set_forward_context(
-                forward_batch, self.attention_layers, self.quant_config, self.moe_layers
+                forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -684,6 +693,7 @@ class PiecewiseCudaGraphRunner:
                 self.attention_layers,
                 self.quant_config,
                 self.moe_layers,
+                self.moe_fusions,
             ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(

@@ -154,6 +154,10 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+        if lora_config.lora_added_tokens_size > 0:
+            raise ValueError(
+                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
 
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
