@@ -552,21 +552,21 @@ if HAS_TRITON:
         token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = token_idx < num_tokens
 
-        # Use pre-computed target_total when given; otherwise derive from
-        # routed_counts_ptr (avoids GPU→CPU sync when called from static path).
-        if precomputed_target_total > 0:
-            target_total = precomputed_target_total
-        else:
-            # Derive target_total from routed_counts (same formula as Python side).
-            r_idx = tl.arange(0, world_size)
-            routed_vec = tl.load(
-                routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
-            ).to(tl.int64)
-            total_effective = tl.sum(routed_vec)
-            total_tokens_global = total_effective // topk
-            target_total = (
-                total_effective + total_tokens_global + world_size - 1
-            ) // world_size
+        r_idx = tl.arange(0, world_size)
+        routed_vec = tl.load(
+            routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
+        ).to(tl.int64)
+        total_effective_k = tl.sum(routed_vec)
+        total_tokens_global_k = total_effective_k // topk
+        derived_target = (
+            total_effective_k + total_tokens_global_k + world_size - 1
+        ) // world_size
+        # Use precomputed value when provided; otherwise use derived value.
+        target_total = (
+            derived_target
+            if precomputed_target_total <= 0
+            else precomputed_target_total
+        )
 
         # ===== Step 1: Select destination rank for shared expert =====
         # Prefer balanced total load (routed + shared) by sampling destination among
