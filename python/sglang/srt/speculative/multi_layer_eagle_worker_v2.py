@@ -127,6 +127,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
 
+        # Chain-style MTP: each step propagates its own output hidden states to the
+        # next step.  Non-chain: each step uses the target model's hidden states.
+        draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
+        self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
+
         self.init_lm_head()
 
         # Used for KV Cache reversion
@@ -384,7 +389,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
             if (
-                step < self.speculative_num_steps - 1
+                self.chain_mtp_hidden_states
+                and step < self.speculative_num_steps - 1
                 and output.logits_output.hidden_states is not None
             ):
                 forward_batch.spec_info.hidden_states = (
@@ -599,8 +605,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
-            # Draft prefill: use FULL so we get all-token hidden states for chain-style MTP
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            # Chain-style MTP needs FULL to get all-token hidden states;
+            # non-chain only needs LAST (the target model's hidden states).
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.draft_worker.chain_mtp_hidden_states
+                else CaptureHiddenMode.LAST
+            )
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,

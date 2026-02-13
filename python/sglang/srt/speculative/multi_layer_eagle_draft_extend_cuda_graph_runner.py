@@ -391,7 +391,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             # output (hidden_states_before_norm) so that assign_new_state_triton
             # propagates each MTP layer's own output to the next MTP layer,
             # rather than always feeding the target model's hidden states.
-            if ret.hidden_states is not None:
+            if (
+                self.eagle_worker.chain_mtp_hidden_states
+                and ret.hidden_states is not None
+            ):
                 self.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
 
             select_index = (
