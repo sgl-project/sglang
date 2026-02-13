@@ -17,7 +17,7 @@ register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
 class TestOpenAIServerIgnoreEOS(CustomTestCase):
-    """Testcase: Test 'ignore_eos' is True, the EOS is ignore and continue reasoning
+    """Testcase: Test 'ignore_eos' is True, the EOS is ignored and continue reasoning
 
     [Test Category] Interface
     [Test Target] ignore_eos

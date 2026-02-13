@@ -117,7 +117,7 @@ class TestMaxLoadedLorasError(CustomTestCase):
                 return_stdout_stderr=(out_log_file, err_log_file),
             )
         except Exception as e:
-            print(f"Server launch failed as expects:{e}")
+            print(f"Server launch failed as expectes:{e}")
         finally:
             err_log_file.seek(0)
             content = err_log_file.read()
