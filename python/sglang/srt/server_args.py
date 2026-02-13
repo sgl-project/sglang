@@ -5597,9 +5597,14 @@ class PortArgs:
                 if nccl_port < 60000:
                     nccl_port += 42
                 else:
-                    nccl_port -= 43
+                    nccl_port = server_args.port + random.randint(100, 1000)
         else:
             nccl_port = server_args.nccl_port
+            # Check if the port is available
+            while True:
+                if is_port_available(nccl_port):
+                    break
+                nccl_port += 1
 
         if server_args.tokenizer_worker_num == 1:
             tokenizer_worker_ipc_name = None
