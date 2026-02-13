@@ -4,7 +4,7 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
-    DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH
+    DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (

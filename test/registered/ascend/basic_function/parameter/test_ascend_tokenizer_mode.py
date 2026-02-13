@@ -1,5 +1,6 @@
 import os
 import unittest
+from shutil import copy2
 
 import requests
 
@@ -13,14 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-from shutil import copy2
-
-register_npu_ci(
-    est_time=400,
-    suite="nightly-1-npu-a3",
-    nightly=True,
-    disabled="run failed",
-)
+register_npu_ci(est_time=100, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestEnableTokenizerModeSlow(CustomTestCase):
@@ -37,7 +31,11 @@ class TestEnableTokenizerModeSlow(CustomTestCase):
     def setUpClass(cls):
         cls.model_path = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.tokenizer_path = "/tmp"
-        cls.file_names = ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
+        cls.file_names = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ]
         for file_name in cls.file_names:
             if not os.path.exists(cls.tokenizer_path + "/" + file_name):
                 copy2(cls.model_path + "/" + file_name, cls.tokenizer_path)
