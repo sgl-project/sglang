@@ -244,9 +244,15 @@ class DeepseekV2MLP(nn.Module):
             tp_size=tp_size,
         )
         if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+            if hasattr(self.gate_up_proj, "weight_packed"):
+                self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+            elif hasattr(self.gate_up_proj, "qweight"):
+                self.gate_up_proj.weight = getattr(self.gate_up_proj, "qweight")
         if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+            if hasattr(self.down_proj, "weight_packed"):
+                self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+            elif hasattr(self.down_proj, "qweight"):
+                self.down_proj.weight = getattr(self.down_proj, "qweight")
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
