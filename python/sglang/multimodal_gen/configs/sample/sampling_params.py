@@ -97,6 +97,8 @@ class SamplingParams:
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
+    output_quality: str | None = "default"
+    output_compression: int | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -153,6 +155,9 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
 
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool = False
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -204,12 +209,25 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
+        # Handle output_quality to output_compression conversion
+        if self.output_compression is None and self.output_quality is not None:
+            self.output_compression = self._adjust_output_quality(
+                self.output_quality, self.data_type
+            )
+
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
+        """Convert output_quality string to compression level."""
+        output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+        if output_quality == "default":
+            return 50 if data_type == DataType.VIDEO else 75
+        return output_quality_mapper.get(output_quality)
 
     def _validate(self):
         """
@@ -364,6 +382,12 @@ class SamplingParams:
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.warning(error_msg)
+
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -559,6 +583,18 @@ class SamplingParams:
             help="Name of the output file",
         )
         parser.add_argument(
+            "--output-quality",
+            type=str,
+            default=SamplingParams.output_quality,
+            help="Output quality setting (default, low, medium, high, maximum)",
+        )
+        parser.add_argument(
+            "--output-compression",
+            type=int,
+            default=SamplingParams.output_compression,
+            help="Output compression level (0-100, higher means better quality but larger file size)",
+        )
+        parser.add_argument(
             "--num-outputs-per-prompt",
             type=int,
             default=SamplingParams.num_outputs_per_prompt,
@@ -738,6 +774,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -806,9 +854,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass

@@ -1,13 +1,11 @@
+# Copied and adapted from: https://github.com/OpenMOSS/MOVA/tree/main/mova/diffusion/schedulers/flow_match.py and flow_match_pair.py
 # SPDX-License-Identifier: Apache-2.0
-# Copied and adapted from: mossVG/mova/diffusion/schedulers/flow_match.py and flow_match_pair.py
 
 from __future__ import annotations
 
 import math
 
 import torch
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
@@ -88,7 +86,7 @@ class FlowMatchScheduler(BaseScheduler):
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
-        # 第一次设置 train_timesteps
+        # Initialize train_timesteps on first set.
         if self.train_timesteps is None:
             self.train_timesteps = self.timesteps
             self.train_sigmas = self.sigmas
@@ -160,14 +158,16 @@ class FlowMatchScheduler(BaseScheduler):
         return mu
 
 
-class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
-    """
-    在 FlowMatchScheduler 的基础上，提供便捷的配对接口：
-    - 默认返回形状为 [num_timesteps, 2] 的张量，每一行为 (t, t)
-    - 允许通过 set_pair_postprocess(fn) 设置一个后处理函数以修改配对行为
+class FlowMatchPairScheduler(FlowMatchScheduler):
+    """Pairing scheduler built on FlowMatchScheduler.
+
+    Provides a convenient pairing interface for timesteps or sigmas.
+
+    Attributes:
+        pair_timesteps: Cached timestep pairs of shape [num_timesteps, 2].
+        pair_sigmas: Cached sigma pairs of shape [num_timesteps, 2].
     """
 
-    @register_to_config
     def __init__(
         self,
         num_inference_steps=100,
@@ -203,35 +203,47 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
         )
 
     def set_pair_postprocess(self, fn):
-        """
-        设置一个后处理函数，用于在默认配对生成后进行自定义修改。
-        要求：
-        - fn(pairs: torch.Tensor) -> torch.Tensor
-        - 返回的张量必须与输入 pairs 形状一致，否则直接 raise。
+        """Set a postprocess function to customize pairs after construction.
+
+        Args:
+            fn: Callable with signature fn(pairs: torch.Tensor) -> torch.Tensor.
+                The returned tensor must have the same shape as input pairs.
+
+        Raises:
+            TypeError: If fn is not callable or None.
+            RuntimeError: If scheduler is not initialized.
         """
         if fn is not None and not callable(fn):
-            raise TypeError("pair_postprocess 必须是可调用对象或 None")
+            raise TypeError("pair_postprocess must be callable or None")
         self._pair_postprocess_fn = fn
         self._pair_postprocess_requires_source = (
             False if fn is None else bool(getattr(fn, "_requires_source", False))
         )
         if self.timesteps is None or self.sigmas is None:
-            raise RuntimeError("调度器未初始化，请先调用 set_timesteps()")
+            raise RuntimeError("Scheduler not initialized; call set_timesteps() first")
         self._refresh_pair_cache()
 
     def set_pair_postprocess_by_name(self, name: str | None, **kwargs):
-        """
-        通过名称快速配置后处理函数。
-        支持：
-        - None/"none"/"off"/"false"/"no": 关闭
-        - "quadratic_perp_bulge_swap": x2=x+d, y2=x-d，其中 d=4*amp*s*(1-s), s=t/T
-        - "v2a_sequential": 假设原 pairs 为 (t,t)，用列0步长2采样一半序列，先让列0按该序列变化，再让列1按该序列变化
-        - "a2v_sequential": 同上，先列1后列0
-        - "dual_sigma_shift": 仅使用 timestep 数量，重新按照 FlowMatchScheduler 的 sigma 变换逻辑为两列独立构建调度，可配置 visual_shift/audio_shift
+        """Configure a postprocess function by name.
 
-        额外参数：
-        - amp: 浮点幅度，默认 150.0
+        Supported names:
+            - None/"none"/"off"/"false"/"no": disable
+            - "quadratic_perp_bulge_swap": x2=x+d, y2=x-d, where d=4*amp*s*(1-s), s=t/T
+            - "v2a_sequential": assume pairs are (t,t); sample half sequence from column 0
+              with stride 2, then let column 0 follow this sequence first, followed by column 1
+            - "a2v_sequential": same as above, but column 1 first then column 0
+            - "dual_sigma_shift": use only timestep count; rebuild two columns independently using
+              FlowMatchScheduler sigma transform logic; configurable visual_shift/audio_shift
+
+        Args:
+            name: Postprocess name or None to disable.
+            **kwargs: Extra parameters for the named postprocess. For example:
+                - amp: Float amplitude, default 150.0.
+
+        Raises:
+            ValueError: If name is unknown.
         """
+
         if name is None or str(name).lower() in ("none", "off", "false", "no"):
             self.set_pair_postprocess(None)
             return
@@ -244,7 +256,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 x = pairs[:, 0]
                 T = float(self.num_train_timesteps)
                 s = x / T
@@ -263,7 +275,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 N = pairs.shape[0]
                 base = pairs[:, 0]
                 seq_half = base[::2]
@@ -288,7 +300,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 N = pairs.shape[0]
                 base = pairs[:, 0]
                 seq_half = base[::2]
@@ -313,7 +325,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 zeros = torch.zeros_like(pairs[:, 0])
                 return torch.stack([zeros, pairs[:, 1]], dim=1)
 
@@ -327,7 +339,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     or pairs.ndim != 2
                     or pairs.shape[1] != 2
                 ):
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 zeros = torch.zeros_like(pairs[:, 1])
                 return torch.stack([pairs[:, 0], zeros], dim=1)
 
@@ -351,13 +363,13 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
 
             def _dual_sigma_shift(pairs: torch.Tensor, *, source: str):
                 if not isinstance(pairs, torch.Tensor):
-                    raise TypeError("pairs 必须是 torch.Tensor")
+                    raise TypeError("pairs must be a torch.Tensor")
                 if pairs.ndim != 2 or pairs.shape[1] != 2:
-                    raise ValueError("pairs 必须是形状 [N, 2] 的 torch.Tensor")
+                    raise ValueError("pairs must be a torch.Tensor of shape [N, 2]")
                 if pairs.shape[0] == 0:
-                    raise ValueError("pairs 的长度必须大于 0")
+                    raise ValueError("pairs length must be greater than 0")
                 if source not in ("timesteps", "sigmas"):
-                    raise ValueError("source 仅支持 'timesteps' 或 'sigmas'")
+                    raise ValueError("source must be 'timesteps' or 'sigmas'")
 
                 num_steps = pairs.shape[0]
                 device = pairs.device
@@ -367,9 +379,9 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                     shift_value: float, denoising_strength: float, mu_override
                 ):
                     if shift_value <= 0:
-                        raise ValueError("shift 必须为正数")
+                        raise ValueError("shift must be positive")
                     if denoising_strength <= 0:
-                        raise ValueError("denoising_strength 必须为正数")
+                        raise ValueError("denoising_strength must be positive")
 
                     sigma_start = (
                         self.sigma_min
@@ -399,7 +411,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
                         mu_value = mu_override
                         if mu_value is None:
                             raise RuntimeError(
-                                "启用了 exponential_shift 但未提供 exponential_shift_mu"
+                                "exponential_shift enabled but exponential_shift_mu is missing"
                             )
                         exp_mu = math.exp(float(mu_value))
                         base = exp_mu / (exp_mu + (1 / base - 1))
@@ -444,7 +456,14 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
         raise ValueError("source must be 'timesteps' or 'sigmas'")
 
     def timestep_to_sigma(self, timestep: torch.Tensor | float) -> torch.Tensor:
-        """根据给定的 timestep（标量）返回对应的 sigma（按最近邻在 self.timesteps 中查找）。"""
+        """Return sigma for a scalar timestep via nearest neighbor lookup.
+
+        Args:
+            timestep: Scalar timestep value.
+
+        Returns:
+            Sigma corresponding to the nearest timestep.
+        """
         t_value = float(timestep)
         t_cpu = torch.tensor(t_value)
         idx = torch.argmin((self.train_timesteps - t_cpu).abs())
@@ -457,10 +476,19 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
         timestep_to: torch.Tensor | None,
         sample: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        使用显式给定的 (from, to) timestep 对，按照对应的 sigma 差进行一步更新：
+        """Advance one step using an explicit (from, to) timestep pair.
+
+        The update rule is:
             x_{to} = x_{from} + model_output * (sigma(to) - sigma(from))
-        该方法可用于两个模态分别沿着它们各自列序列推进。
+
+        Args:
+            model_output: Predicted model output.
+            timestep_from: Source timestep.
+            timestep_to: Target timestep or None for terminal.
+            sample: Current sample at timestep_from.
+
+        Returns:
+            Updated sample at timestep_to.
         """
         sigma_from = self.timestep_to_sigma(timestep_from)
         if timestep_to is None:
@@ -476,7 +504,7 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
 
     def _refresh_pair_cache(self) -> None:
         if self.timesteps is None or self.sigmas is None:
-            raise RuntimeError("调度器未初始化，请先调用 set_timesteps()")
+            raise RuntimeError("Scheduler not initialized; call set_timesteps() first")
 
         def _apply_postprocess(pairs: torch.Tensor, source: str) -> torch.Tensor:
             if self._pair_postprocess_fn is None:
@@ -486,9 +514,9 @@ class FlowMatchPairScheduler(FlowMatchScheduler, SchedulerMixin, ConfigMixin):
             else:
                 modified = self._pair_postprocess_fn(pairs)
             if not isinstance(modified, torch.Tensor):
-                raise TypeError("pair_postprocess 返回值必须是 torch.Tensor")
+                raise TypeError("pair_postprocess must return a torch.Tensor")
             if modified.shape != pairs.shape:
-                raise ValueError("pair_postprocess 返回的张量形状必须与输入一致")
+                raise ValueError("pair_postprocess must return the same shape as input")
             return modified
 
         base_pairs_timesteps = self._make_pairs_from_vector(self.timesteps)

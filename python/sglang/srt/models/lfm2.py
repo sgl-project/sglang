@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -39,28 +40,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
+from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
-
-
-# We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm
-# kernel the difference in logprobs slightly increases, but to an acceptable degree
-# class Lfm2RMSNorm(nn.Module):
-#     """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
-
-#     def __init__(self, hidden_size: int, eps: float = 1e-6):
-#         super().__init__()
-#         self.weight = nn.Parameter(torch.ones(hidden_size))
-#         self.variance_epsilon = eps
-
-#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-#         input_dtype = hidden_states.dtype
-#         hidden_states = hidden_states.to(torch.float32)
-#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-#         return (self.weight * hidden_states).to(input_dtype)
 
 
 class Lfm2MLP(nn.Module):
@@ -122,7 +108,6 @@ class Lfm2Attention(nn.Module):
         self,
         config: Lfm2Config,
         layer_id: int,
-        attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -221,6 +206,7 @@ class Lfm2ShortConv(nn.Module):
     - Uses double gating: B (before conv) and C (after conv)
     - Fixed-size cache: stores last (kernel_size - 1) tokens
     - Uses causal_conv1d_fn for prefill and causal_conv1d_update for decode
+    - Supports tensor parallelism: hidden dimension is sharded across TP ranks
     """
 
     def __init__(
@@ -233,24 +219,39 @@ class Lfm2ShortConv(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.conv_kernel = int(config.conv_L_cache)
-        self.L_cache = self.conv_kernel - 1
         self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
 
-        self.in_proj = nn.Linear(
-            config.hidden_size, 3 * config.hidden_size, bias=self.use_bias
+        tp_size = get_tensor_model_parallel_world_size()
+        self.hidden_size_per_partition = self.hidden_size // tp_size
+
+        # Use MergedColumnParallelLinear so each output (B, C, x) is sharded separately
+        self.in_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.hidden_size] * 3,  # B, C, x each get hidden_size
+            bias=self.use_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.in_proj",
         )
-        self.out_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=self.use_bias
+        self.out_proj = RowParallelLinear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=self.use_bias,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
         )
 
-        # Conv weights stored in format matching causal_conv1d: (hidden_size, kernel_size)
-        # Weight loading will handle conversion from HF's (hidden_size, 1, kernel_size)
+        # Conv weights sharded along hidden dimension: (hidden_size/tp, kernel_size)
         self.conv_weight = nn.Parameter(
-            torch.empty(config.hidden_size, self.conv_kernel)
+            torch.empty(self.hidden_size_per_partition, self.conv_kernel)
         )
+        set_weight_attrs(self.conv_weight, {"weight_loader": sharded_weight_loader(0)})
         if self.use_bias:
-            self.conv_bias = nn.Parameter(torch.empty(config.hidden_size))
+            self.conv_bias = nn.Parameter(torch.empty(self.hidden_size_per_partition))
+            set_weight_attrs(
+                self.conv_bias, {"weight_loader": sharded_weight_loader(0)}
+            )
         else:
             self.register_parameter("conv_bias", None)
 
@@ -267,7 +268,7 @@ class Lfm2ShortConv(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
-        proj = self.in_proj(hidden_states)
+        proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
         Bx = B_gate * x
 
@@ -315,7 +316,8 @@ class Lfm2ShortConv(nn.Module):
                 activation=None,
             ).transpose(0, 1)
 
-        return self.out_proj(C_gate * conv_out)
+        output, _ = self.out_proj(C_gate * conv_out)
+        return output
 
 
 class Lfm2DecoderLayer(nn.Module):
@@ -325,7 +327,6 @@ class Lfm2DecoderLayer(nn.Module):
         self,
         config: Lfm2Config,
         layer_id: int,
-        attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -340,7 +341,6 @@ class Lfm2DecoderLayer(nn.Module):
             self.self_attn = Lfm2Attention(
                 config=config,
                 layer_id=layer_id,
-                attn_layer_id=attn_layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
             )
@@ -401,23 +401,15 @@ class Lfm2Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        # Compute attention layer IDs for KV cache
-        attn_layer_ids = []
-        attn_count = 0
-        for layer_type in config.layer_types:
-            if layer_type == "full_attention":
-                attn_layer_ids.append(attn_count)
-                attn_count += 1
-            else:
-                attn_layer_ids.append(-1)
-
-        self.num_attention_layers = attn_count
+        # Count attention layers for KV cache sizing
+        self.num_attention_layers = sum(
+            1 for lt in config.layer_types if lt == "full_attention"
+        )
 
         def get_layer(idx: int, prefix: str, **kwargs):
             return Lfm2DecoderLayer(
                 config=config,
                 layer_id=idx,
-                attn_layer_id=attn_layer_ids[idx],
                 quant_config=quant_config,
                 prefix=prefix,
             )
@@ -516,16 +508,12 @@ class Lfm2ForCausalLM(nn.Module):
             if "embed_tokens.weight" in name:
                 embed_tokens_weight = loaded_weight
 
-            # Handle conv.weight -> conv_weight conversion for ShortConv layers
-            # HF shape: (hidden_size, 1, kernel_size) -> squeeze to (hidden_size, kernel_size)
-            if ".conv.weight" in name:
-                name = name.replace(".conv.weight", ".conv_weight")
-                # Squeeze out the middle dimension: (D, 1, K) -> (D, K)
-                loaded_weight = loaded_weight.squeeze(1)
-
-            # Handle conv.bias -> conv_bias conversion
-            if ".conv.bias" in name:
-                name = name.replace(".conv.bias", ".conv_bias")
+            # Handle conv weight/bias naming: HF uses conv.conv, we use conv_weight/conv_bias
+            if ".conv.conv.weight" in name:
+                name = name.replace(".conv.conv.weight", ".conv.conv_weight")
+                loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
+            if ".conv.conv.bias" in name:
+                name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:

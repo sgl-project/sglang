@@ -690,19 +690,12 @@ class Grok1ForCausalLM(nn.Module):
             config, "load_presharded_embedding", False
         )
 
-        self.is_weights_presharded = (
-            self.load_presharded_mlp
-            or self.load_presharded_moe
-            or self.load_presharded_attn
-            or self.load_presharded_embedding
-        )
-
         default_replicate_lm_head = False
         self.replicate_lm_head = getattr(
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if self.is_weights_presharded:
+        if get_tensor_model_parallel_world_size() > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
