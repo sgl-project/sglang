@@ -26,12 +26,11 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
-from huggingface_hub import snapshot_download
 from huggingface_hub.errors import (
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
@@ -45,6 +44,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -412,20 +412,6 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
             "Only HuggingFace diffusers format is supported."
         )
 
-    # Check for transformer and vae directories
-    transformer_dir = os.path.join(model_path, "transformer")
-    vae_dir = os.path.join(model_path, "vae")
-
-    if not os.path.exists(transformer_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a transformer/ directory."
-        )
-
-    if not os.path.exists(vae_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a vae/ directory."
-        )
-
     # Load the config
     with open(config_path) as f:
         config = json.load(f)
@@ -435,6 +421,37 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
         raise ValueError("model_index.json does not contain _diffusers_version")
 
     logger.info("Diffusers version: %s", config["_diffusers_version"])
+
+    component_keys = [
+        key
+        for key, value in config.items()
+        if isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
+    ]
+    if component_keys:
+        missing_components = [
+            component_key
+            for component_key in component_keys
+            if not os.path.exists(os.path.join(model_path, component_key))
+        ]
+        if missing_components:
+            missing_str = ", ".join(missing_components)
+            raise ValueError(
+                f"Model directory {model_path} is missing required component "
+                f"directories: {missing_str}."
+            )
+    else:
+        transformer_dir = os.path.join(model_path, "transformer")
+        vae_dir = os.path.join(model_path, "vae")
+        if not os.path.exists(transformer_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a transformer/ directory."
+            )
+        if not os.path.exists(vae_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a vae/ directory."
+            )
     return cast(dict[str, Any], config)
 
 
@@ -450,7 +467,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     import tempfile
 
-    from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
     # If it's a local path, verify it directly
@@ -543,14 +559,35 @@ def maybe_download_model(
 
     def _verify_model_complete(path: str) -> bool:
         """Check if model directory has required subdirectories."""
+        config_path = os.path.join(path, "model_index.json")
+        if not os.path.exists(config_path):
+            return False
+
+        try:
+            with open(config_path) as config_file:
+                model_index = json.load(config_file)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read model_index.json at %s: %s", config_path, exc
+            )
+            return False
+
+        component_keys = [
+            key
+            for key, value in model_index.items()
+            if isinstance(value, (list, tuple))
+            and len(value) == 2
+            and all(isinstance(item, str) for item in value)
+        ]
+        if component_keys:
+            return all(
+                os.path.exists(os.path.join(path, component_key))
+                for component_key in component_keys
+            )
+
         transformer_dir = os.path.join(path, "transformer")
         vae_dir = os.path.join(path, "vae")
-        config_path = os.path.join(path, "model_index.json")
-        return (
-            os.path.exists(config_path)
-            and os.path.exists(transformer_dir)
-            and os.path.exists(vae_dir)
-        )
+        return os.path.exists(transformer_dir) and os.path.exists(vae_dir)
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
@@ -584,7 +621,7 @@ def maybe_download_model(
                 return model_name_or_path
         else:
             logger.warning(
-                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "Local model at %s appears incomplete (missing required components), "
                 "will attempt re-download",
                 model_name_or_path,
             )
@@ -600,9 +637,7 @@ def maybe_download_model(
             ignore_patterns=["*.onnx", "*.msgpack"],
             local_dir=local_dir,
             local_files_only=True,
-            resume_download=True,
             max_workers=8,
-            etag_timeout=60,
         )
         if is_lora or _verify_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
@@ -671,9 +706,7 @@ def maybe_download_model(
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
-                    resume_download=True,
                     max_workers=8,
-                    etag_timeout=120,
                 )
 
             # Verify downloaded model is complete (skip for LoRA)
@@ -687,9 +720,7 @@ def maybe_download_model(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
                         local_dir=local_dir,
-                        resume_download=True,
                         max_workers=8,
-                        etag_timeout=60,
                         force_download=True,
                     )
                 if not _verify_model_complete(local_path):
@@ -737,3 +768,71 @@ def maybe_download_model(
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
+
+
+# Unified download functions with Hugging Face-compatible names
+def hf_hub_download(
+    repo_id: str,
+    filename: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    **kwargs,
+) -> str:
+    """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import model_file_download
+
+        return model_file_download(
+            model_id=repo_id,
+            file_path=filename,
+            cache_dir=local_dir,
+            **kwargs,
+        )
+    else:
+        from huggingface_hub import hf_hub_download as _hf_hub_download
+
+        return _hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=local_dir,
+            **kwargs,
+        )
+
+
+def snapshot_download(
+    repo_id: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    ignore_patterns: Optional[Union[list[str], str]] = None,
+    allow_patterns: Optional[Union[list[str], str]] = None,
+    local_files_only: bool = False,
+    max_workers: int = 8,
+    **kwargs,
+) -> str:
+    """Unified snapshot_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import snapshot_download as _ms_snapshot_download
+
+        ms_kwargs = {
+            "model_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+        }
+        ms_kwargs.update(kwargs)
+        return _ms_snapshot_download(**ms_kwargs)
+    else:
+        from huggingface_hub import snapshot_download as _hf_snapshot_download
+
+        hf_kwargs = {
+            "repo_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+            "resume_download": True,
+            "etag_timeout": 60,
+        }
+        hf_kwargs.update(kwargs)
+        return _hf_snapshot_download(**hf_kwargs)

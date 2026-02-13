@@ -638,7 +638,7 @@ kubectl apply -f p.yaml
 kubectl apply -f d.yaml
 ```
 
-At this point, we have completed the deployment of the 1P1D SGlang engine part.
+At this point, we have completed the deployment of the 1P1D SGLang engine part.
 
 To allow our users to directly experience the model API, we still need a load balancer to handle sequential calls between prefill and decode. Different companies implement LBs differently, and the community will also officially release a new LB component written in Rust in the near future.
 

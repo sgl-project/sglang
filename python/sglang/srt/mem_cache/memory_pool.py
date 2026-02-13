@@ -52,7 +52,14 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -68,6 +75,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 
 
@@ -124,7 +133,6 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -136,7 +144,6 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
@@ -145,20 +152,32 @@ class ReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        if not any(r.is_dllm() for r in reqs):
+            assert (
+                len(chunked) <= 1
+            ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
-
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_index[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
 
-        return select_index
-
-    def free(self, free_index: Union[int, List[int]]):
-        if isinstance(free_index, (int,)):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req: Req):
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(self.size))
@@ -230,6 +249,13 @@ class MambaPool:
                 )
                 for conv_shape in conv_state_shape
             ]
+
+            if _is_cpu and _cpu_has_amx_support:
+                from sglang.srt.layers.amx_utils import _init_amx_conv_state
+
+                # CPU uses a different layout of conv_state for kernel optimization
+                conv_state = _init_amx_conv_state(conv_state)
+
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
@@ -472,10 +498,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, need_size: int, reqs: Optional[List["Req"]]) -> Optional[List[int]]:
-        assert reqs is not None
-        select_index = super().alloc(need_size)
-        if select_index == None:
+    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+        select_index = super().alloc(reqs)
+        if select_index is None:
             return None
 
         mamba_index = []
@@ -540,37 +565,29 @@ class HybridReqToTokenPool(ReqToTokenPool):
         else:
             return mamba_next_track_idx
 
-    # For chunk prefill, we can not free mamba cache, we need use it in the future
-    def free(
-        self,
-        free_index: Union[int, List[int]],
-        free_mamba_cache: bool = True,
-        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+    def free_mamba_cache(
+        self, req: "Req", mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
-        if isinstance(free_index, (int,)):
-            free_index = [free_index]
-        super().free(free_index)
-        if free_mamba_cache:
-            mamba_index = self.req_index_to_mamba_index_mapping[free_index]
-            self.mamba_pool.free(mamba_index)
+        mamba_index = req.mamba_pool_idx
+        assert mamba_index is not None, "double free? mamba_index is None"
+        self.mamba_pool.free(mamba_index.unsqueeze(0))
+        req.mamba_pool_idx = None
 
-            if self.enable_mamba_extra_buffer:
+        if self.enable_mamba_extra_buffer:
+            mamba_ping_pong_track_buffer_to_free = (
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
+            )
+            if mamba_ping_pong_track_buffer_to_keep is not None:
+                assert mamba_ping_pong_track_buffer_to_keep in [
+                    0,
+                    1,
+                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                idx_to_free = list(range(self.mamba_ping_pong_track_buffer_size))
+                idx_to_free.remove(mamba_ping_pong_track_buffer_to_keep)
                 mamba_ping_pong_track_buffer_to_free = (
-                    self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                        free_index
-                    ].squeeze(0)
+                    mamba_ping_pong_track_buffer_to_free[idx_to_free]
                 )
-                if mamba_ping_pong_track_buffer_to_keep is not None:
-                    assert mamba_ping_pong_track_buffer_to_keep in [
-                        0,
-                        1,
-                    ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
-                    idx_to_free = list(range(self.mamba_ping_pong_track_buffer_size))
-                    idx_to_free.remove(mamba_ping_pong_track_buffer_to_keep)
-                    mamba_ping_pong_track_buffer_to_free = (
-                        mamba_ping_pong_track_buffer_to_free[idx_to_free]
-                    )
-                self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+            self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

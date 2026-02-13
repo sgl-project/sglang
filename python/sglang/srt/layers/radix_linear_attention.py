@@ -31,36 +31,30 @@ class RadixLinearAttention(nn.Module):
     def __init__(
         self,
         layer_id: int,
-        num_qk_heads: int,
+        num_q_heads: int,
+        num_k_heads: int,
         num_v_heads: int,
-        head_qk_dim: int,
+        head_q_dim: int,
+        head_k_dim: int,
         head_v_dim: int,
-        attention_tp_size: int = 1,
         # GDN KDA Shared Weights
         conv_weights: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
-        bias: Optional[torch.Tensor] = None,
+        bias: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
-        # Q and K share the same head count and dimension (per-TP values)
-        self.num_qk_heads = num_qk_heads
+        self.num_q_heads = num_q_heads
+        self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
-        self.head_qk_dim = head_qk_dim
+        self.head_q_dim = head_q_dim
+        self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.attention_tp_size = attention_tp_size
-
-        self.qk_dim_per_tp = num_qk_heads * head_qk_dim
-        self.value_dim_per_tp = num_v_heads * head_v_dim
-
-        self.key_dim = self.qk_dim_per_tp * attention_tp_size
-        self.value_dim = self.value_dim_per_tp * attention_tp_size
-
-        self.num_k_heads = num_qk_heads
-        self.num_q_heads = num_qk_heads
-        self.head_k_dim = head_qk_dim
+        self.q_dim = num_q_heads * head_q_dim
+        self.k_dim = num_k_heads * head_k_dim
+        self.v_dim = num_v_heads * head_v_dim
 
         self.conv_weights = conv_weights
         self.bias = bias
