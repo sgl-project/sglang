@@ -770,6 +770,6 @@ PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "Possible solutions:\n"
     "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
     "2. set --piecewise-cuda-graph-max-tokens to a smaller value (e.g., 512)\n"
-    "3. disable Piecewise CUDA graph by unset --enable-piecewise-cuda-graph\n"
+    "3. disable Piecewise CUDA graph by set --disable-piecewise-cuda-graph to True\n"
     "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )

@@ -140,7 +140,8 @@ class TestVLMViTCudaGraph(CustomTestCase):
                 other_args=[
                     "--mm-attention-backend",
                     "fa3",
-                    "--enable-piecewise-cuda-graph",
+                    "--disable-piecewise-cuda-graph",
+                    "False",
                     "--piecewise-cuda-graph-max-tokens",
                     "8192",
                     "--chunked-prefill-size",
