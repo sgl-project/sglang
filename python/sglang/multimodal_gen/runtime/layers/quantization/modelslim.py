@@ -16,8 +16,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-
-from types import MappingProxyType
+    from types import MappingProxyType
 
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
