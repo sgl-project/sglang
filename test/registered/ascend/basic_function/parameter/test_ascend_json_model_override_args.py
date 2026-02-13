@@ -22,6 +22,7 @@ class TestJsonModelOverrideArgs(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --json-model-override-args
     """
+
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
     base_url = DEFAULT_URL_FOR_TEST
 
@@ -67,7 +68,7 @@ class TestJsonModelOverrideArgs(CustomTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn(
-    "longer than the model's context length (50 tokens)", response.text
+            "longer than the model's context length (50 tokens)", response.text
         )
 
 

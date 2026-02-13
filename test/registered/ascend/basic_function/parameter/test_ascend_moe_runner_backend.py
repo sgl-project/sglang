@@ -21,6 +21,7 @@ class TestMoreRunnerBackendTriton(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --moe-runner-backend
     """
+
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
     moe_runner_backend = "triton"
 
@@ -36,8 +37,7 @@ class TestMoreRunnerBackendTriton(CustomTestCase):
                 "--disable-cuda-graph",
                 "--moe-runner-backend",
                 cls.moe_runner_backend,
-
-            ]
+            ],
         )
 
     @classmethod

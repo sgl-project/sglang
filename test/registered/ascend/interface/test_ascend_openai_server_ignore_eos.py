@@ -28,7 +28,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.other_args =[
+        cls.other_args = [
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",

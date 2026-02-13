@@ -22,6 +22,7 @@ class TestRequestLengthValidation(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --max-total-tokens, --context-length
     """
+
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
     @classmethod

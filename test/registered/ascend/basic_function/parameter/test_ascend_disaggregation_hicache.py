@@ -29,7 +29,7 @@ register_npu_ci(
 
 
 class DisaggregationHiCacheBase(PDDisaggregationServerBase):
-    """Testcase: Vaildate Prefill/Decode disaggregated services with hicache write policy configuration, Repeated long hints hit the prefix cache.
+    """Testcase: Validate Prefill/Decode disaggregated services with hicache write policy configuration, Repeated long hints hit the prefix cache.
                  and on the GSM8K dataset is no less than 0.86
 
     [Test Category] Parameter

@@ -1,7 +1,10 @@
 import unittest
 
+from sglang.test.ascend.test_ascend_utils import (
+    QWEN3_32B_WEIGHTS_PATH,
+    run_bench_serving,
+)
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH, run_bench_serving
 from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(
@@ -52,12 +55,13 @@ class TestAscendL2CacheTTFT(CustomTestCase):
                 5,
                 "--hicache-write-policy",
                 "write_back",
-            ]
+            ],
         ]
         for common_arg in common_args:
             other_args = common_arg + (
-                ["--attention-backend",
-                 "ascend",
+                [
+                    "--attention-backend",
+                    "ascend",
                  ]
             )
             res = run_bench_serving(

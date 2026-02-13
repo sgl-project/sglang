@@ -1,5 +1,5 @@
-import os
 import glob
+import os
 import unittest
 
 import requests
@@ -59,8 +59,7 @@ class TestDownloadDir(CustomTestCase):
                     "max_new_tokens": 32,
                 },
             },
-
-            timeout=30
+            timeout=30,
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("Paris", response.text)
@@ -75,8 +74,7 @@ class TestDownloadDir(CustomTestCase):
         self.assertGreater(
             len(weight_files),
             0,
-
-            msg=f"--download-dir {self.download_dir} No model weight"
+            msg=f"--download-dir {self.download_dir} No model weight",
         )
 
 

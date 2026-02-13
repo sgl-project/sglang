@@ -23,6 +23,7 @@ class TestRadixCacheFCFS(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --schedule-policy
     """
+
     extra_args = ["--schedule-policy", "fcfs", ]
 
     @classmethod

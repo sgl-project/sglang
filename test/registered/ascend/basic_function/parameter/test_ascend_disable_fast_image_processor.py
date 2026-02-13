@@ -21,6 +21,7 @@ class TestDisableFastImageProcessor(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --disable-fast-image-processor
     """
+
     model = PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
     IMAGE_SGL_LOGO_URL = "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20241022/emyrja/dog_and_girl.jpeg"
 
