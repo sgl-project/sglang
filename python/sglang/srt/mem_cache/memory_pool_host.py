@@ -13,7 +13,13 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_lf_pf as jit_transfer_hicache_all_layer_lf_pf,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_one_layer_pf_lf as jit_transfer_hicache_one_layer_pf_lf,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -398,17 +404,30 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_pf_lf(
-                    src_k=self.k_buffer,
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer,
-                    dst_v=device_pool.v_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_pf_lf(
+                        k_cache_dst=device_pool.k_buffer[layer_id],
+                        v_cache_dst=device_pool.v_buffer[layer_id],
+                        k_cache_src=self.k_buffer,
+                        v_cache_src=self.v_buffer,
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        layer_id=layer_id,
+                        src_layout_dim=self.layout_dim,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_pf_lf(
+                        src_k=self.k_buffer,
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer,
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -499,17 +518,30 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_lf_pf(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k=self.k_buffer,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v=self.v_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_lf_pf(
+                        k_cache_dst=self.k_buffer,
+                        v_cache_dst=self.v_buffer,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_lf_pf(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k=self.k_buffer,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v=self.v_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_pool.k_data_ptrs,

@@ -223,6 +223,92 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_a
   }
 }
 
+// Page-First source to Layer-First destination (one layer at a time)
+template <
+    std::integral T,
+    std::size_t kElementSize,
+    std::size_t kUnroll,
+    std::size_t kBlockQuota,
+    std::size_t kNumThreads,
+    std::size_t kMaxOccupancy>
+__global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_per_layer_pf_lf(
+    const __grid_constant__ HicacheKernelParams params) {
+  using namespace device;
+  static_assert(kNumThreads % kWarpThreads == 0);
+  static_assert(kWarpThreads % kUnroll == 0);
+
+  constexpr auto kWarpThreads = device::kWarpThreads / kUnroll;
+  constexpr auto kWarpsPerBlock = kNumThreads / kWarpThreads;
+  constexpr auto kWorkers = kWarpsPerBlock * kBlockQuota;
+
+  const auto& [
+    k_cache_dst, v_cache_dst, indices_dst, // dst (layer_first single layer)
+    k_cache_src, v_cache_src, indices_src, // src (page_first buffer)
+    length, src_layout_dim, kv_cache_dst_stride, layer_id // metadata
+  ] = params;
+  const auto warp_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+
+  constexpr auto kGranularity = 128 / kWarpThreads;
+
+  for (auto i = warp_id; i < length; i += kWorkers) {
+    const auto pos_src = static_cast<const T*>(indices_src)[i];
+    const auto pos_dst = static_cast<const T*>(indices_dst)[i];
+    const auto src_k = pointer::offset(k_cache_src, pos_src * src_layout_dim + layer_id * kElementSize);
+    const auto src_v = pointer::offset(v_cache_src, pos_src * src_layout_dim + layer_id * kElementSize);
+    const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
+    const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
+    const auto vec_k = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_k);
+    const auto vec_v = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_v);
+    warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_k, vec_k);
+    warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_v, vec_v);
+  }
+}
+
+// Layer-First source to Page-First destination (all layers at once)
+template <
+    std::integral T,
+    std::size_t kElementSize,
+    std::size_t kUnroll,
+    std::size_t kBlockQuota,
+    std::size_t kNumThreads,
+    std::size_t kMaxOccupancy>
+__global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void hicache_transfer_all_layer_lf_pf(
+    const __grid_constant__ HicacheKernelParams params) {
+  using namespace device;
+  using src_ptr_t = std::add_pointer_t<const void* const>;
+
+  static_assert(kNumThreads % kWarpThreads == 0);
+  constexpr auto kWarpThreads = device::kWarpThreads / kUnroll;
+  constexpr auto kWarpsPerBlock = static_cast<uint32_t>(kNumThreads) / kWarpThreads;
+  constexpr auto kWorkers = kWarpsPerBlock * kBlockQuota;
+
+  const auto& [
+    k_cache_dst, v_cache_dst, indices_dst, // dst (page_first buffer)
+    k_ptr_src, v_ptr_src, indices_src,     // src (layer_first via ptr arrays)
+    length, kv_cache_src_stride, dst_layout_dim, num_layers // metadata
+  ] = params;
+  const auto warp_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+
+  constexpr auto kGranularity = 128 / kWarpThreads;
+
+  for (auto i = warp_id; i < length; i += kWorkers) {
+    const auto pos_src = static_cast<const T*>(indices_src)[i];
+    const auto pos_dst = static_cast<const T*>(indices_dst)[i];
+    for (std::size_t layer = 0; layer < num_layers; ++layer) {
+      const auto k_cache_src = static_cast<src_ptr_t>(k_ptr_src)[layer];
+      const auto v_cache_src = static_cast<src_ptr_t>(v_ptr_src)[layer];
+      const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
+      const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+      const auto dst_k = pointer::offset(k_cache_dst, pos_dst * dst_layout_dim + layer * kElementSize);
+      const auto dst_v = pointer::offset(v_cache_dst, pos_dst * dst_layout_dim + layer * kElementSize);
+      const auto vec_k = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_k);
+      const auto vec_v = warp::load_vec<kElementSize, kGranularity, kWarpThreads>(src_v);
+      warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_k, vec_k);
+      warp::store_vec<kElementSize, kGranularity, kWarpThreads>(dst_v, vec_v);
+    }
+  }
+}
+
 template <
     std::size_t kElementSize,
     std::size_t kUnroll,
@@ -236,6 +322,12 @@ struct HiCacheKernel {
   template <typename T>
   static constexpr auto _kernel_all =
       hicache_transfer_all_layer<T, kElementSize, kUnroll, kBlockQuota, kNumThreads, kMaxOccupancy>;
+  template <typename T>
+  static constexpr auto _kernel_one_pf_lf =
+      hicache_transfer_per_layer_pf_lf<T, kElementSize, kUnroll, kBlockQuota, kNumThreads, kMaxOccupancy>;
+  template <typename T>
+  static constexpr auto _kernel_all_lf_pf =
+      hicache_transfer_all_layer_lf_pf<T, kElementSize, kUnroll, kBlockQuota, kNumThreads, kMaxOccupancy>;
 
   static void run_one(
       const tvm::ffi::TensorView k_cache_dst,
@@ -361,6 +453,134 @@ struct HiCacheKernel {
         .num_layers = static_cast<std::size_t>(N.unwrap()),
     };
     const auto kernel = use_int32 ? _kernel_all<int32_t> : _kernel_all<int64_t>;
+    LaunchKernel(num_blocks, kNumThreads, device)(kernel, params);
+  }
+
+  // Page-First (src) to Layer-First (dst) - one layer at a time
+  static void run_one_pf_lf(
+      const tvm::ffi::TensorView k_cache_dst,
+      const tvm::ffi::TensorView v_cache_dst,
+      const tvm::ffi::TensorView indices_dst,
+      const tvm::ffi::TensorView k_cache_src,
+      const tvm::ffi::TensorView v_cache_src,
+      const tvm::ffi::TensorView indices_src,
+      const std::size_t src_layout_dim,
+      const std::size_t layer_id) {
+    using namespace host;
+
+    auto D = SymbolicSize{"head dimension"};
+    auto M = SymbolicSize{"dst kv stride"};
+    auto L = SymbolicSize{"indices length"};
+    auto cache_dtype = SymbolicDType{};
+    auto indices_dtype = SymbolicDType{};
+    auto indices_device = SymbolicDevice{};
+
+    TensorMatcher({-1, D})  //
+        .with_dtype(cache_dtype)
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .verify(k_cache_src)
+        .verify(v_cache_src);
+    TensorMatcher({-1, D})  //
+        .with_strides({M, 1})
+        .with_dtype(cache_dtype)
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .verify(k_cache_dst)
+        .verify(v_cache_dst);
+    TensorMatcher({L})  //
+        .with_dtype<int32_t, int64_t>(indices_dtype)
+        .with_device<kDLCUDA>(indices_device)
+        .verify(indices_src)
+        .verify(indices_dst);
+
+    const auto dtype_size = dtype_bytes(cache_dtype.unwrap());
+    const auto element_bytes = D.unwrap() * dtype_size;
+    RuntimeCheck(kElementSize == element_bytes, "HicacheKernel: cache dimension mismatch.");
+
+    const auto k_cache_dst_ptr = k_cache_dst.data_ptr();
+    const auto v_cache_dst_ptr = v_cache_dst.data_ptr();
+    const auto k_cache_src_ptr = k_cache_src.data_ptr();
+    const auto v_cache_src_ptr = v_cache_src.data_ptr();
+    const auto indices_dst_ptr = indices_dst.data_ptr();
+    const auto indices_src_ptr = indices_src.data_ptr();
+    const auto length = static_cast<std::size_t>(L.unwrap());
+    const auto kv_cache_dst_stride = static_cast<std::size_t>(M.unwrap()) * dtype_size;
+    const auto use_int32 = indices_dtype.unwrap().bits == 32;
+    const auto device = indices_device.unwrap();
+
+    constexpr auto kWorkersPerBlock = kNumThreads / (device::kWarpThreads / kUnroll);
+    const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
+    const auto params = HicacheKernelParams{
+        .k_cache_dst = k_cache_dst_ptr,
+        .v_cache_dst = v_cache_dst_ptr,
+        .indices_dst = indices_dst_ptr,
+        .k_cache_src = k_cache_src_ptr,
+        .v_cache_src = v_cache_src_ptr,
+        .indices_src = indices_src_ptr,
+        .length = length,
+        .kv_cache_src_stride = src_layout_dim,
+        .kv_cache_dst_stride = kv_cache_dst_stride,
+        .num_layers = layer_id,  // reuse num_layers field for layer_id
+    };
+    const auto kernel = use_int32 ? _kernel_one_pf_lf<int32_t> : _kernel_one_pf_lf<int64_t>;
+    LaunchKernel(num_blocks, kNumThreads, device)(kernel, params);
+  }
+
+  // Layer-First (src) to Page-First (dst) - all layers at once
+  static void run_all_lf_pf(
+      const tvm::ffi::TensorView k_cache_dst,
+      const tvm::ffi::TensorView v_cache_dst,
+      const tvm::ffi::TensorView indices_dst,
+      const tvm::ffi::TensorView k_ptr_src,
+      const tvm::ffi::TensorView v_ptr_src,
+      const tvm::ffi::TensorView indices_src,
+      const std::size_t kv_src_stride,
+      const std::size_t dst_layout_dim) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_layers"};
+    auto L = SymbolicSize{"indices length"};
+    auto D = SymbolicSize{"head dimension"};
+    auto cache_dtype = SymbolicDType{};
+    auto indices_dtype = SymbolicDType{};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({N}).with_dtype<uint64_t>().with_device<kDLCUDA>(device_).verify(k_ptr_src).verify(v_ptr_src);
+    TensorMatcher({-1, D})
+        .with_dtype(cache_dtype)
+        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .verify(k_cache_dst)
+        .verify(v_cache_dst);
+    TensorMatcher({L})
+        .with_dtype<int32_t, int64_t>(indices_dtype)
+        .with_device<kDLCUDA>(device_)
+        .verify(indices_src)
+        .verify(indices_dst);
+
+    const auto k_cache_dst_ptr = k_cache_dst.data_ptr();
+    const auto v_cache_dst_ptr = v_cache_dst.data_ptr();
+    const auto k_cache_src_ptr = k_ptr_src.data_ptr();
+    const auto v_cache_src_ptr = v_ptr_src.data_ptr();
+    const auto indices_dst_ptr = indices_dst.data_ptr();
+    const auto indices_src_ptr = indices_src.data_ptr();
+    const auto length = static_cast<std::size_t>(L.unwrap());
+    const auto use_int32 = indices_dtype.unwrap().bits == 32;
+    const auto device = device_.unwrap();
+
+    constexpr auto kWorkersPerBlock = kNumThreads / (device::kWarpThreads / kUnroll);
+    const auto num_blocks = std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
+    const auto params = HicacheKernelParams{
+        .k_cache_dst = k_cache_dst_ptr,
+        .v_cache_dst = v_cache_dst_ptr,
+        .indices_dst = indices_dst_ptr,
+        .k_cache_src = k_cache_src_ptr,
+        .v_cache_src = v_cache_src_ptr,
+        .indices_src = indices_src_ptr,
+        .length = length,
+        .kv_cache_src_stride = kv_src_stride,
+        .kv_cache_dst_stride = dst_layout_dim,
+        .num_layers = static_cast<std::size_t>(N.unwrap()),
+    };
+    const auto kernel = use_int32 ? _kernel_all_lf_pf<int32_t> : _kernel_all_lf_pf<int64_t>;
     LaunchKernel(num_blocks, kNumThreads, device)(kernel, params);
   }
 };
