@@ -78,3 +78,42 @@ python -m sglang_router.launch_router \
   --port 8000
 
 ```
+
+#### gRPC Encoder (EPD)
+
+You can run the encoder as a gRPC server while keeping prefill/decode as HTTP.
+When using gRPC encoders, set `SGLANG_ENCODER_MM_RECEIVER_MODE=grpc` for the
+prefill process so it uses the gRPC receiver.
+
+```bash
+# gRPC encoder
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --encoder-only \
+  --grpc-mode \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30000
+
+# prefill (HTTP) - tell it to use gRPC receiver
+SGLANG_ENCODER_MM_RECEIVER_MODE=grpc \
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --disaggregation-mode prefill \
+  --language-only \
+  --encoder-urls grpc://127.0.0.1:30000 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30002
+
+# decode (HTTP)
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30003
+
+# router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://$PREFILL_HOST:30002 \
+  --decode http://$DECODE_HOST:30003 \
+  --port 8000
+```
