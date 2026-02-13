@@ -8,6 +8,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
+    NunchakuSVDQLinearMethod,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -104,7 +107,7 @@ class TransformerLoader(ComponentLoader):
         safetensors_list: list[str],
         quant_config: Any,
     ) -> None:
-        """Patch Nunchaku scale tensors from safetensors weights.
+        """Patch transformer module with Nunchaku scale tensors from safetensors weights.
 
         For NVFP4 checkpoints, correctness depends on `wtscale` and attention
         `wcscales`. The FSDP loader may skip some of these metadata tensors.
@@ -126,9 +129,6 @@ class TransformerLoader(ComponentLoader):
         try:
             from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
 
-            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
-                NunchakuSVDQLinearMethod,
-            )
         except ImportError:
             logger.warning("Nunchaku is not available; skipping scale patch.")
             return
@@ -213,13 +213,14 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-
         quant_config = self._get_quant_config(server_args)
 
+
+        # get list of safetensors to load
         if quant_config is not None and getattr(
             quant_config, "quantized_model_path", None
         ):
+            # load from quantized_model_path if applicable
             weights_path = quant_config.quantized_model_path
             logger.info("Using quantized model weights from: %s", weights_path)
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
@@ -251,6 +252,8 @@ class TransformerLoader(ComponentLoader):
                     )
                 safetensors_list = [custom_weights_path]
 
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",
             cls_name,
@@ -278,8 +281,7 @@ class TransformerLoader(ComponentLoader):
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
             # TODO(will): make these configurable
-            default_dtype=default_dtype,
-            param_dtype=torch.bfloat16,
+            param_dtype=default_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
@@ -293,6 +295,6 @@ class TransformerLoader(ComponentLoader):
 
         assert (
             next(model.parameters()).dtype == default_dtype
-        ), "Model dtype does not match default dtype"
+        ), f"Model dtype does not match default dtype, {next(model.parameters()).dtype} vs {default_dtype}"
 
         return model

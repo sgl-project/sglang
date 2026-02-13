@@ -72,14 +72,8 @@ try:
         NunchakuSVDQLinearMethod,
     )
 
-    @register_quantization_config("svdquant")
-    class _RegisteredNunchakuConfig(NunchakuConfig):
-        """Alias class to register NunchakuConfig as the 'svdquant' quantization method."""
-
-        pass
 
 except ImportError:
-    _RegisteredNunchakuConfig = None
     NunchakuConfig = None
     NunchakuSVDQLinearMethod = None
     NunchakuAWQLinearMethod = None

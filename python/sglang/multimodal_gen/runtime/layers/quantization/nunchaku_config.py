@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+
 from .base_config import QuantizationConfig, QuantizeMethodBase
 
 SVDQ_W4A4_LAYER_PATTERNS = [
@@ -81,7 +83,6 @@ class NunchakuConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if not isinstance(layer, LinearBase):
             return None
