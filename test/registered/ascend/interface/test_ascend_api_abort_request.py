@@ -57,9 +57,9 @@ class TestAscendApi(CustomTestCase):
             target=send_requests,
             args=('/generate',),
             kwargs={
-                'rid': '10086',
-                'text': 'who are you?',
-                'sampling_params': {'temperature': 0.0, 'max_new_tokens': 1024},
+                "rid": "10086",
+                "text": "who are you?",
+                "sampling_params": {"temperature": 0.0, "max_new_tokens": 1024},
             },
         )
         # Create thread 2: Send an /abort_request to terminate the request with rid=10086
