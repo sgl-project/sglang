@@ -280,12 +280,7 @@ class PiecewiseCudaGraphRunner:
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
                 # Capture
-                try:
-                    self.capture()
-                except RuntimeError as e:
-                    raise Exception(
-                        f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-                    )
+                self.capture()
 
         self.raw_num_tokens = 0
 

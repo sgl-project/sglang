@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +106,7 @@ def set_forward_context(
         yield
     finally:
         _forward_context = None
+
 
 PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "Piecewise CUDA Graph is enabled by default as an experimental feature.\n"
