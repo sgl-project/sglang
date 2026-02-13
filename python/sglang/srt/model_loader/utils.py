@@ -59,14 +59,18 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                 )
             model_module = auto_modules["AutoModel"]
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
-            if not model_module.is_backend_compatible():
+            if hasattr(model_module, "is_backend_compatible") and (
+                not model_module.is_backend_compatible()
+            ):
                 raise ValueError(
                     f"The Transformers implementation of {arch} is not "
                     "compatible with SGLang."
                 )
             architectures[i] = "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
-            if not model_module.is_backend_compatible():
+            if hasattr(model_module, "is_backend_compatible") and (
+                not model_module.is_backend_compatible()
+            ):
                 raise ValueError(
                     f"{arch} has no SGlang implementation and the Transformers "
                     "implementation is not compatible with SGLang."

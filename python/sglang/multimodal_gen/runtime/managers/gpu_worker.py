@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -12,12 +13,22 @@ from setproctitle import setproctitle
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
+    get_tp_rank,
+    get_tp_world_size,
     maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    get_ring_parallel_rank,
+    get_ring_parallel_world_size,
     get_tp_group,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -69,15 +80,14 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
-        # Initialize the distributed environment
+        # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
             enable_cfg_parallel=self.server_args.enable_cfg_parallel,
@@ -85,7 +95,28 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
+            dist_timeout=self.server_args.dist_timeout,
         )
+
+        # set proc title
+        if model_parallel_is_initialized():
+            suffix = ""
+            if get_tp_world_size() != 1:
+                tp_rank = get_tp_rank()
+                suffix += f"_TP{tp_rank}"
+            if get_ulysses_parallel_world_size() != 1:
+                u_rank = get_ulysses_parallel_rank()
+                suffix += f"_U{u_rank}"
+            if get_ring_parallel_world_size() != 1:
+                r_rank = get_ring_parallel_rank()
+                suffix += f"_R{r_rank}"
+            if get_classifier_free_guidance_world_size() != 1:
+                c_rank = get_classifier_free_guidance_rank()
+                suffix += f"_C{c_rank}"
+            setproctitle(f"sgl_diffusion::scheduler{suffix}")
+        else:
+            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
 
@@ -98,6 +129,9 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
+                    self.pipeline.get_module("video_dit"),
+                    self.pipeline.get_module("video_dit_2"),
+                    self.pipeline.get_module("audio_dit"),
                 ],
             ):
                 if isinstance(dit, OffloadableDiTMixin):
@@ -111,6 +145,41 @@ class GPUWorker:
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
 
+    def do_mem_analysis(self, output_batch: OutputBatch):
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+        peak_memory_gb = peak_memory_bytes / (1024**3)
+        remaining_gpu_mem_gb = (
+            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
+        )
+        can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
+        suggested_args = set()
+        component_to_arg = {
+            "vae": "--vae-cpu-offload",
+            "text_encoder": "--text-encoder-cpu-offload",
+            "text_encoder_2": "--text-encoder-cpu-offload",
+            "image_encoder": "--image-encoder-cpu-offload",
+        }
+
+        for component in can_stay_resident:
+            if component == "transformer":
+                if self.server_args.dit_layerwise_offload:
+                    suggested_args.add("--dit-layerwise-offload")
+                elif self.server_args.dit_cpu_offload:
+                    suggested_args.add("--dit-cpu-offload")
+            elif component in component_to_arg:
+                suggested_args.add(component_to_arg[component])
+
+        suggested_args_str = (
+            ", ".join(sorted(suggested_args)) if suggested_args else "None"
+        )
+        logger.info(
+            f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
+            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
+            f"Related offload server args to disable: {suggested_args_str}"
+        )
+
     def execute_forward(self, batch: List[Req]) -> OutputBatch:
         """
         Execute a forward pass.
@@ -120,15 +189,18 @@ class GPUWorker:
         output_batch = None
         try:
             if self.rank == 0:
-                torch.cuda.reset_peak_memory_stats()
+                torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
+            req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
@@ -138,29 +210,33 @@ class GPUWorker:
             else:
                 output_batch = result
 
-            if self.rank == 0:
-                peak_memory_bytes = torch.cuda.max_memory_allocated()
-                output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-                peak_memory_gb = peak_memory_bytes / (1024**3)
-                remaining_gpu_mem_gb = (
-                    current_platform.get_device_total_memory() / (1024**3)
-                    - peak_memory_gb
-                )
-                can_stay_resident = self.get_can_stay_resident_components(
-                    remaining_gpu_mem_gb
-                )
-                logger.info(
-                    f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
-                    f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-                    f"Components that can stay resident: {can_stay_resident}"
-                )
+            if self.rank == 0 and not req.suppress_logs:
+                self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
 
+            # Save output to file and return file path only if requested. Avoid the serialization
+            # and deserialization overhead between scheduler_client and gpu_worker.
+            if req.save_output and req.return_file_paths_only and self.rank == 0:
+                output_paths = save_outputs(
+                    output_batch.output,
+                    req.data_type,
+                    req.fps,
+                    True,
+                    lambda idx: req.output_file_path(len(output_batch.output), idx),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                    output_compression=req.output_compression,
+                )
+                output_batch.output_file_paths = output_paths
+                output_batch.output = None
+
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                # Avoid logging warmup perf records that share the same request_id.
+                if not req.is_warmup:
+                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
@@ -168,8 +244,7 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        return output_batch
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -275,7 +350,8 @@ OOM detected. Possible solutions:
   - If the OOM occurs during runtime:
     1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     2. Enable SP and/or TP
-    3. Enable a sparse-attention backend
+    3. Opt for a sparse-attention backend
+    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
@@ -302,7 +378,8 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     globally_suppress_loggers()
-    set_cuda_arch()
+    if current_platform.is_cuda():
+        set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 
@@ -327,7 +404,15 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except torch.OutOfMemoryError as _e:
-        print(OOM_MSG)
+        logger.warning(OOM_MSG)
         raise
     finally:
+        # Clean up resources to speed up shutdown
+        if "scheduler" in locals():
+            del scheduler
+        gc.collect()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

@@ -76,7 +76,6 @@ class ImageEncodingStage(PipelineStage):
     def move_to_device(self, device):
         fields = [
             "image_processor",
-            "image_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)
@@ -125,15 +124,16 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # 1. neg prompt embeds
-            neg_image_processor_kwargs = (
-                server_args.pipeline_config.prepare_image_processor_kwargs(
-                    batch, neg=True
+            if batch.do_classifier_free_guidance:
+                neg_image_processor_kwargs = (
+                    server_args.pipeline_config.prepare_image_processor_kwargs(
+                        batch, neg=True
+                    )
                 )
-            )
 
-            neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
-            ).to(cuda_device)
+                neg_image_inputs = self.image_processor(
+                    images=image, return_tensors="pt", **neg_image_processor_kwargs
+                ).to(cuda_device)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
@@ -143,20 +143,22 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
-                neg_outputs = self.text_encoder(
-                    input_ids=neg_image_inputs.input_ids,
-                    attention_mask=neg_image_inputs.attention_mask,
-                    pixel_values=neg_image_inputs.pixel_values,
-                    image_grid_thw=neg_image_inputs.image_grid_thw,
-                    output_hidden_states=True,
-                )
+                if batch.do_classifier_free_guidance:
+                    neg_outputs = self.text_encoder(
+                        input_ids=neg_image_inputs.input_ids,
+                        attention_mask=neg_image_inputs.attention_mask,
+                        pixel_values=neg_image_inputs.pixel_values,
+                        image_grid_thw=neg_image_inputs.image_grid_thw,
+                        output_hidden_states=True,
+                    )
             batch.prompt_embeds.append(
                 self.encoding_qwen_image_edit(outputs, image_inputs)
             )
 
-            batch.negative_prompt_embeds.append(
-                self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
-            )
+            if batch.do_classifier_free_guidance:
+                batch.negative_prompt_embeds.append(
+                    self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                )
 
         self.offload_model()
 

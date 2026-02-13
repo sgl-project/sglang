@@ -61,18 +61,17 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
+use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{
-    core::{Worker, UNKNOWN_MODEL_ID},
-    mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager},
-};
+use crate::core::{Worker, UNKNOWN_MODEL_ID};
 
 /// Cache-aware routing policy
 ///
@@ -322,7 +321,7 @@ impl CacheAwarePolicy {
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeInsertOp;
+                    use smg_mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
                         tenant: worker_url.to_string(),
@@ -347,8 +346,13 @@ impl CacheAwarePolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -421,7 +425,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeInsertOp;
+                    use smg_mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
                         tenant: workers[idx].url().to_string(),
@@ -446,7 +450,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Sync removal to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use crate::mesh::tree_ops::TreeRemoveOp;
+                    use smg_mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {
                         tenant: tenant_url.to_string(),
                     });
@@ -508,8 +512,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_cache_aware_with_balanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
@@ -543,6 +547,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Same request should go to same worker (cache hit)
@@ -554,6 +559,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx2);
 
@@ -566,12 +572,13 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx1, idx3);
     }
 
-    #[test]
-    fn test_cache_aware_with_imbalanced_load() {
+    #[tokio::test]
+    async fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
@@ -602,13 +609,13 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, &info).unwrap();
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
 
-    #[test]
-    fn test_cache_aware_worker_removal() {
+    #[tokio::test]
+    async fn test_cache_aware_worker_removal() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0, // Disable eviction thread
             ..Default::default()
@@ -630,20 +637,24 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test1"),
-                ..Default::default()
-            },
-        );
-        policy.select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test2"),
-                ..Default::default()
-            },
-        );
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test1"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("test2"),
+                    ..Default::default()
+                },
+            )
+            .await;
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
@@ -658,15 +669,16 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 1);
     }
 
-    #[test]
-    fn test_cache_aware_sync_tree_operation_to_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_sync_tree_operation_to_mesh() {
         use std::sync::Arc;
 
-        use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
+        use smg_mesh::{stores::StateStores, sync::MeshSyncManager};
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
         let mesh_sync = Arc::new(MeshSyncManager::new(stores, "node1".to_string()));
@@ -696,6 +708,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         // Verify tree operation was synced to mesh (under UNKNOWN_MODEL_ID since no model was specified)
@@ -709,7 +722,7 @@ mod tests {
     fn test_cache_aware_restore_tree_state_from_mesh() {
         use std::sync::Arc;
 
-        use crate::mesh::{
+        use smg_mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},
@@ -768,7 +781,7 @@ mod tests {
     fn test_cache_aware_apply_remote_tree_operation() {
         use std::sync::Arc;
 
-        use crate::mesh::{
+        use smg_mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},
@@ -801,7 +814,7 @@ mod tests {
     fn test_cache_aware_multi_node_consistency() {
         use std::sync::Arc;
 
-        use crate::mesh::{
+        use smg_mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},
@@ -841,8 +854,8 @@ mod tests {
         let _ = tree_state;
     }
 
-    #[test]
-    fn test_cache_aware_without_mesh() {
+    #[tokio::test]
+    async fn test_cache_aware_without_mesh() {
         let config = CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
@@ -867,6 +880,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx, 0);
     }

@@ -205,6 +205,97 @@ def get_oss_repo(dry_run):
     return oss_root, temp_dir
 
 
+def _apply_patch(patch_file, dry_run):
+    """
+    Try to apply a patch, falling back to --3way merge if a clean apply fails.
+
+    Returns True if the patch was applied successfully (clean or via --3way),
+    or raises an exception with full diagnostics if both methods fail.
+    """
+    # --- Attempt 1: clean git apply ---
+    apply_cmd = ["git", "apply", patch_file]
+    print(f"Run: {' '.join(apply_cmd)}")
+    if dry_run:
+        return True
+
+    result = subprocess.run(apply_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("✅ Patch applied cleanly.")
+        return True
+
+    print(f"⚠️  Clean apply failed:\n{result.stderr.strip()}")
+    print("Falling back to git apply --3way ...\n")
+
+    # --- Attempt 2: three-way merge ---
+    threeway_cmd = ["git", "apply", "--3way", patch_file]
+    print(f"Run: {' '.join(threeway_cmd)}")
+    result_3way = subprocess.run(threeway_cmd, capture_output=True, text=True)
+
+    if result_3way.returncode == 0:
+        print("✅ Patch applied via --3way merge (no conflicts).")
+        return True
+
+    # --- Both attempts failed — gather diagnostics ---
+    print(f"❌ --3way merge also failed:\n{result_3way.stderr.strip()}\n")
+
+    # Show which hunks conflict
+    check_cmd = ["git", "apply", "--check", "--verbose", patch_file]
+    print(f"Run: {' '.join(check_cmd)}")
+    check_result = subprocess.run(check_cmd, capture_output=True, text=True)
+    conflict_details = (check_result.stdout + check_result.stderr).strip()
+    print(
+        f"\n--- Conflict details ---\n{conflict_details}\n--- End conflict details ---\n"
+    )
+
+    # Show git diff if --3way left conflict markers
+    diff_result = subprocess.run(["git", "diff"], capture_output=True, text=True)
+    if diff_result.stdout.strip():
+        print(
+            f"\n--- git diff (conflict markers) ---\n"
+            f"{diff_result.stdout.strip()}\n"
+            f"--- End git diff ---\n"
+        )
+
+    # Read the patch content for the summary
+    with open(patch_file, "r", encoding="utf-8") as pf:
+        patch_content = pf.read()
+
+    # Print the patch to stdout so it's visible in the CI logs
+    separator = "=" * 72
+    print(
+        f"\n{separator}\n"
+        f"PATCH CONTENT (apply this manually):\n"
+        f"{separator}\n"
+        f"{patch_content}\n"
+        f"{separator}\n"
+    )
+
+    # Write a rich summary to the GitHub Actions step summary
+    summary_lines = [
+        "\n## ❌ Patch could not be applied automatically\n",
+        "### Conflict details\n",
+        f"```\n{conflict_details}\n```\n",
+    ]
+    if diff_result.stdout.strip():
+        summary_lines.append("### git diff (conflict markers)\n")
+        summary_lines.append(f"```diff\n{diff_result.stdout.strip()}\n```\n")
+    summary_lines.append("### Patch to apply manually\n")
+    summary_lines.append(
+        "<details><summary>Click to expand full patch</summary>\n\n"
+        f"```diff\n{patch_content}\n```\n"
+        "</details>\n"
+    )
+    write_github_step_summary("".join(summary_lines))
+
+    # Reset the working tree so the finally-block cleanup is safe
+    subprocess.run(["git", "checkout", "."], capture_output=True, text=True)
+
+    raise RuntimeError(
+        "Patch could not be applied. See the CI log and GitHub Actions "
+        "step summary for the full patch and conflict details."
+    )
+
+
 def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_run):
     """
     In the OSS repo, create a branch, apply the patch, commit, and push.
@@ -216,10 +307,17 @@ def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_
         os.chdir(oss_root)
 
     try:
-        # Define commands as lists to avoid shell injection issues
-        commands_to_run = [
-            ["git", "checkout", "-b", branch_name],
-            ["git", "apply", patch_file],
+        # Create a new branch
+        checkout_cmd = ["git", "checkout", "-b", branch_name]
+        print(f"Run: {' '.join(checkout_cmd)}")
+        if not dry_run:
+            subprocess.run(checkout_cmd, check=True, capture_output=True, text=True)
+
+        # Apply the patch (with --3way fallback and diagnostics)
+        _apply_patch(patch_file, dry_run)
+
+        # Configure git user and stage changes
+        post_apply_commands = [
             ["git", "config", "user.name", "github-actions[bot]"],
             [
                 "git",
@@ -230,7 +328,7 @@ def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_
             ["git", "add", "."],
         ]
 
-        for cmd_list in commands_to_run:
+        for cmd_list in post_apply_commands:
             print(f"Run: {' '.join(cmd_list)}")
             if not dry_run:
                 subprocess.run(cmd_list, check=True, capture_output=True, text=True)

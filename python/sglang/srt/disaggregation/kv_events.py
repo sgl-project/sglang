@@ -56,16 +56,23 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
+# Medium values for hicache storage tiers
+MEDIUM_GPU = "GPU"
+MEDIUM_CPU = "CPU_PINNED"
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
+    medium: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):

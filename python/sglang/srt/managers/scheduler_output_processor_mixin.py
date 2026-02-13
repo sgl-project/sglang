@@ -44,6 +44,45 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _get_storage_backend_type(self) -> str:
+        """Get storage backend type from tree_cache."""
+        storage_backend_type = "none"
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller and hasattr(cache_controller, "storage_backend"):
+            storage_backend = cache_controller.storage_backend
+            if storage_backend is not None:
+                storage_backend_type = type(storage_backend).__name__
+        return storage_backend_type
+
+    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+        """Get detailed cache breakdown for a request, if available.
+
+        Returns:
+            - None if HiCache is not enabled
+            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
+            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+        """
+        # Only show details if HiCache is enabled
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return None
+
+        # Only show if there are any cached tokens
+        if (
+            req.cached_tokens_device > 0
+            or req.cached_tokens_host > 0
+            or req.cached_tokens_storage > 0
+        ):
+            details = {
+                "device": req.cached_tokens_device,
+                "host": req.cached_tokens_host,
+            }
+            # Only include storage fields if L3 storage is enabled
+            if getattr(self, "enable_hicache_storage", False):
+                details["storage"] = req.cached_tokens_storage
+                details["storage_backend"] = self._get_storage_backend_type()
+            return details
+        return None
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -287,6 +326,13 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
@@ -308,7 +354,10 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i] - 1
+
+            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
 
@@ -332,27 +381,36 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        next_token_ids = result.next_token_ids.tolist()
-        self.num_generated_tokens += len(next_token_ids)
-
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
-        req = batch.reqs[0]
-
-        for next_token_id in next_token_ids:
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.completion_time = time.perf_counter()
+        for idx in range(batch.batch_size()):
+            # If no new tokens generated, meaning the prefilling stage
+            if not result.next_token_ids:
                 break
 
-            self.tree_cache.cache_unfinished_req(req)
+            req = batch.reqs[idx]
+            next_token_ids = result.next_token_ids[idx].tolist()
+            self.num_generated_tokens += len(next_token_ids)
+
+            for _token_idx, next_token_id in enumerate(next_token_ids):
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
+                    break
+
+                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -847,12 +905,14 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
+        spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        output_routed_experts = None
+        routed_experts = None
         customized_info = {}
 
         queue_times = []
@@ -959,6 +1019,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
+
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -975,6 +1039,7 @@ class SchedulerOutputProcessorMixin:
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_acceptance_histogram.append(req.spec_acceptance_histogram)
 
                 if return_logprob:
                     if (
@@ -1049,9 +1114,9 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    if routed_experts is None:
+                        routed_experts = []
+                    routed_experts.append(req.routed_experts)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1070,13 +1135,13 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
+                    spec_acceptance_histogram=spec_acceptance_histogram,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
                     prefill_launch_delay=prefill_launch_delays,
@@ -1093,6 +1158,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
@@ -1107,7 +1173,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    output_routed_experts=output_routed_experts,
+                    routed_experts=routed_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
@@ -1124,6 +1190,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         queue_times = []
         forward_entry_times = []
         prefill_launch_delays = []
@@ -1138,6 +1205,9 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
 
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
@@ -1163,6 +1233,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
+                cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,

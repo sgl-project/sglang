@@ -9,15 +9,18 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
+from sglang.test.test_utils import is_in_amd_ci
 
 register_cuda_ci(est_time=278, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=278, suite="stage-b-test-small-1-gpu-amd")
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
     @classmethod
@@ -32,6 +35,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
     @classmethod

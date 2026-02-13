@@ -43,12 +43,15 @@ def npu_wrapper_rmsnorm_forward(func):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
 
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
             out, residual_out = add_rmsnorm_bias(
                 x,
                 residual,
@@ -190,6 +193,15 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        if not hasattr(self, "_quant_description_normalized"):
+            quant_description = {}
+            for prefix_, value in self.quant_description.items():
+                prefix_ = prefix_.replace("language_model.", "")
+                if "visual" in prefix_:
+                    prefix_ = prefix_.replace("model.", "")
+                quant_description[prefix_] = value
+            self.quant_description = quant_description
+            self._quant_description_normalized = True
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)

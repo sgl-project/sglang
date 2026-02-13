@@ -4,6 +4,7 @@
 pub mod mock_mcp_server;
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod redis_test_server;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_certs;
@@ -17,6 +18,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use data_connector::{
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
 use smg::{
@@ -25,9 +29,6 @@ use smg::{
     core::{
         BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
         WorkerType,
-    },
-    data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
     middleware::TokenBucket,
     policies::PolicyRegistry,
@@ -385,7 +386,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     }
 
     // Initialize MCP manager with empty config
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -509,7 +510,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     }
 
     // Initialize MCP manager with empty config
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -534,7 +535,7 @@ pub async fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Arc<AppContext> {
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
 
     let client = reqwest::Client::new();
 
