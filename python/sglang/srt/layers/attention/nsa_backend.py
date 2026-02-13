@@ -30,8 +30,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     pad_nsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (
-    mla_quantize_and_rope_for_fp8,
     concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1809,7 +1809,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,
-                self.qk_rope_head_dim
+                self.qk_rope_head_dim,
             )
             merge_query = False
 
@@ -2009,6 +2009,7 @@ class NativeSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
+
 
 class NativeSparseAttnMultiStepBackend:
 

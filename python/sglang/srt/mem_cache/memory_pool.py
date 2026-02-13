@@ -1405,7 +1405,8 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = (
-            use_nsa and dtype == torch.float8_e4m3fn
+            use_nsa
+            and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
         # When override_kv_cache_dim is provided with nsa model, we assume the
@@ -1746,8 +1747,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        
-        override_dim = kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
+
+        override_dim = (
+            kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
+        )
 
         super().__init__(
             size,
@@ -1761,7 +1764,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             start_layer,
             end_layer,
             use_nsa=True,
-            override_kv_cache_dim=override_dim
+            override_kv_cache_dim=override_dim,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32

@@ -213,12 +213,12 @@ class ModelRunnerKVCacheMixin:
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
-        kv_cache_dim = kv_lora_rank + qk_rope_head_dim # default mla kv cache dim
-        
+        kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
+
         # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
         if not is_nsa_model:
             return kv_cache_dim
-    
+
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
         # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different

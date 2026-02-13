@@ -19,10 +19,10 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.utils import (
+    concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
-    concat_mla_absorb_q_general,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
@@ -1153,4 +1153,3 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
-

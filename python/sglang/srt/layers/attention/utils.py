@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import is_cuda
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
@@ -10,6 +11,7 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
+
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
@@ -320,19 +322,19 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def mla_quantize_and_rope_for_fp8(
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        pos_ids: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        import flashinfer.rope
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    import flashinfer.rope
 
-        """Quantize and apply RoPE for FP8 attention path.
+    """Quantize and apply RoPE for FP8 attention path.
 
         This function handles the FP8 quantization and RoPE application for MLA attention.
         It takes separate query/key nope and rope components, applies RoPE to the rope parts,
@@ -361,47 +363,48 @@ def mla_quantize_and_rope_for_fp8(
                 - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
                 - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
         """
-        attn_dtype = torch.float8_e4m3fn
-        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+    attn_dtype = torch.float8_e4m3fn
+    q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
 
-        # Allocate output tensors with FP8 dtype
-        # Query output will contain merged nope + rope components
-        q_out = q_rope.new_empty(
-            q_len,
-            num_heads,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=attn_dtype,
-        )
+    # Allocate output tensors with FP8 dtype
+    # Query output will contain merged nope + rope components
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=attn_dtype,
+    )
 
-        # Key outputs maintain original shapes but with FP8 dtype
-        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
-        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+    # Key outputs maintain original shapes but with FP8 dtype
+    k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+    k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
 
-        # Apply RoPE and quantize all components in a single fused kernel call
-        # This kernel handles:
-        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-        # 2. Quantization of all components to FP8 format
-        # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=pos_ids,
-            is_neox=is_neox,
-            quantize_dtype=attn_dtype,
-            # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., kv_lora_rank :],  # RoPE part goes to end
-            k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : kv_lora_rank],  # Nope part goes to beginning
-            k_nope_out=k_nope_out,
-            # Quantization scales (set to 1.0 for no additional scaling)
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
-        )
+    # Apply RoPE and quantize all components in a single fused kernel call
+    # This kernel handles:
+    # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
+    # 2. Quantization of all components to FP8 format
+    # 3. Output placement into pre-allocated tensors
+    flashinfer.rope.mla_rope_quantize_fp8(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=pos_ids,
+        is_neox=is_neox,
+        quantize_dtype=attn_dtype,
+        # Output tensor slicing: q_out contains [nope_part, rope_part]
+        q_rope_out=q_out[..., kv_lora_rank:],  # RoPE part goes to end
+        k_rope_out=k_rope_out,
+        q_nope_out=q_out[..., :kv_lora_rank],  # Nope part goes to beginning
+        k_nope_out=k_nope_out,
+        # Quantization scales (set to 1.0 for no additional scaling)
+        quant_scale_q=1.0,
+        quant_scale_kv=1.0,
+    )
 
-        return q_out, k_nope_out, k_rope_out
+    return q_out, k_nope_out, k_rope_out
+
 
 def concat_mla_absorb_q_general(q_nope, q_rope):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
