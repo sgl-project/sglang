@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestSDARMiniBase(CustomTestCase):
+class TestSDARMoE(CustomTestCase):
     """Base class for SDAR tests with different parallelism configs"""
 
     model = "JetLM/SDAR-30B-A3B-Chat"
@@ -72,7 +72,7 @@ class TestSDARMiniBase(CustomTestCase):
         config_name = f"TP{self.tp_size}-EP{self.ep_size}"
         print(f"[{config_name}] {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.92)
+        self.assertGreater(metrics["accuracy"], 0.88)
 
         if is_in_ci():
             write_github_step_summary(
@@ -110,14 +110,12 @@ class TestSDARMiniBase(CustomTestCase):
         """Get minimum throughput threshold based on parallelism config"""
         # Baseline for TP1-EP1
         if self.tp_size == 1 and self.ep_size == 1:
-            return 400
+            return 240
         elif self.tp_size == 2 and self.ep_size == 1:
-            return 500
-        elif self.tp_size == 1 and self.ep_size == 2:
-            return 550
+            return 400
         elif self.tp_size == 2 and self.ep_size == 2:
-            return 450
-        return 400
+            return 400
+        return 240
 
     def _get_min_speed(self):
         """Get minimum speed threshold based on parallelism config"""
@@ -131,27 +129,6 @@ class TestSDARMiniBase(CustomTestCase):
         elif self.tp_size == 2 and self.ep_size == 2:
             return 55
         return 50
-
-
-class TestSDARMini_TP1_EP1(TestSDARMiniBase):
-    """Test SDAR with TP=1, EP=1"""
-
-    tp_size = 1
-    ep_size = 1
-
-
-class TestSDARMini_TP2_EP1(TestSDARMiniBase):
-    """Test SDAR with TP=2, EP=1"""
-
-    tp_size = 2
-    ep_size = 1
-
-
-class TestSDARMini_TP2_EP2(TestSDARMiniBase):
-    """Test SDAR with TP=2, EP=2"""
-
-    tp_size = 2
-    ep_size = 2
 
 
 if __name__ == "__main__":

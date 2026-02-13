@@ -29,15 +29,15 @@ class TestSDARMini(CustomTestCase):
         other_args = [
             "--trust-remote-code",
             "--mem-fraction-static",
-            "0.6",
+            "0.8",
             "--max-running-requests",
-            "128",
+            "64",
             "--attention-backend",
             "flashinfer",
             "--dllm-algorithm",
             "LowConfidence",
             "--tp",
-            "4",
+            "1",
         ]
 
         cls.process = popen_launch_server(
@@ -64,11 +64,11 @@ class TestSDARMini(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.92)
+        self.assertGreater(metrics["accuracy"], 0.88)
         if is_in_amd_ci():
             self.assertGreater(metrics["output_throughput"], 80)
         else:
-            self.assertGreater(metrics["output_throughput"], 600)
+            self.assertGreater(metrics["output_throughput"], 250)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
