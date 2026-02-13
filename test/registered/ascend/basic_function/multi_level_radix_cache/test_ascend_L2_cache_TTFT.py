@@ -62,7 +62,7 @@ class TestAscendL2CacheTTFT(CustomTestCase):
                 [
                     "--attention-backend",
                     "ascend",
-                 ]
+                ]
             )
             res = run_bench_serving(
                 model=model,

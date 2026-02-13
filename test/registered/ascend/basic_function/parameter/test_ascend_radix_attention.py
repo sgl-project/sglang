@@ -24,7 +24,10 @@ class TestRadixCacheFCFS(CustomTestCase):
     [Test Target] --schedule-policy
     """
 
-    extra_args = ["--schedule-policy", "fcfs", ]
+    extra_args = [
+        "--schedule-policy",
+        "fcfs",
+    ]
 
     @classmethod
     def setUpClass(cls):
@@ -52,12 +55,16 @@ class TestRadixCacheFCFS(CustomTestCase):
 
 
 class TestRadixCacheLPM(TestRadixCacheFCFS):
-    extra_args = ["--schedule-policy", "lpm", ]
+    extra_args = [
+        "--schedule-policy",
+        "lpm",
+    ]
 
 
 class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
     extra_args = [
-        "--schedule-policy", "lpm",
+        "--schedule-policy",
+        "lpm",
         "--disable-overlap-schedule",
     ]
 
