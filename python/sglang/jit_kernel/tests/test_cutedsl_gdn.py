@@ -98,6 +98,10 @@ def test_cutedsl_gdn_precision(B: int):
     assert fail_rate < 1.0, f"Fail rate {fail_rate:.2f}% >= 1%"
 
 
+@pytest.mark.skipif(
+    True,
+    reason="Skip the performance test because the speedup ratio is highly unstable in the CI environment. ",
+)
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton kernel not available")
 @pytest.mark.parametrize("B", [1, 128])
