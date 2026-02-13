@@ -60,7 +60,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        attn_type: "AttentionType" = None,
+        attn_type: Optional[AttentionType] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
