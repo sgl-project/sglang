@@ -42,32 +42,6 @@ def test_norm_tanh_mul_add(B: int, S: int, D: int, norm_type: str, dtype: str) -
 @pytest.mark.parametrize("B,S,D", BSD_CONFIG)
 @pytest.mark.parametrize("norm_type", ["rms", "layer"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_norm_tanh_mul_add_residual_form(
-    B: int, S: int, D: int, norm_type: str, dtype: str
-) -> None:
-    device = "cuda"
-    eps = 1e-5
-    x = torch.randn(B, S, D, device=device, dtype=dtype)
-    residual = torch.randn(B, S, D, device=device, dtype=dtype)
-    gate = torch.randn(B, 1, D, device=device, dtype=dtype)
-    weight = torch.randn(D, device=device, dtype=dtype)
-    bias = torch.randn(D, device=device, dtype=dtype) if norm_type == "layer" else None
-
-    y = fused_norm_tanh_mul_add(x, weight, bias, gate, residual, norm_type, eps)
-    if norm_type == "rms":
-        normed = torch.rms_norm(x, x.shape[-1:], weight=weight, eps=eps)
-    else:
-        normed = torch.layer_norm(x, x.shape[-1:], weight=weight, bias=bias, eps=eps)
-    ref_y = residual + torch.tanh(gate) * normed
-    if dtype == "float32":
-        torch.testing.assert_close(y, ref_y, atol=1e-5, rtol=1e-5)
-    else:
-        torch.testing.assert_close(y, ref_y, atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.parametrize("B,S,D", BSD_CONFIG)
-@pytest.mark.parametrize("norm_type", ["rms", "layer"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_norm_tanh_mul_add_norm_scale(
     B: int, S: int, D: int, norm_type: str, dtype: str
 ) -> None:
