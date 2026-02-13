@@ -2,11 +2,9 @@
 
 use async_trait::async_trait;
 use tracing::{debug, info};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    core::steps::workflow_data::WorkerRemovalWorkflowData,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
-};
+use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
 
 /// Step to update cache-aware policies for remaining workers.
 ///
