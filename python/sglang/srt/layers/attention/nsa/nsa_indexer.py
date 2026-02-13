@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -145,6 +146,7 @@ class Indexer(MultiPlatformOp):
         scale_fmt: Optional[str],
         block_size: int = 128,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        is_neox_style: bool = True,
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -202,7 +204,7 @@ class Indexer(MultiPlatformOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=True,
+            is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
         self.block_size = block_size
@@ -1189,13 +1191,17 @@ class Indexer(MultiPlatformOp):
             )  # [bs, n, d]
             q = torch.cat([q_pe, q_nope], dim=-1)
 
-        indexer_weight_stream = get_indexer_weight_stream()
-        indexer_weight_stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(indexer_weight_stream):
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            indexer_weight_stream = get_indexer_weight_stream()
+            indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(indexer_weight_stream):
+                x = x.view(-1, self.hidden_size)
+                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                weights.record_stream(indexer_weight_stream)
+                weights_event = indexer_weight_stream.record_event()
+        else:
             x = x.view(-1, self.hidden_size)
             weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-            weights.record_stream(indexer_weight_stream)
-            weights_event = indexer_weight_stream.record_event()
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -1277,7 +1283,8 @@ class Indexer(MultiPlatformOp):
 
         if self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
-        torch.npu.current_stream().wait_event(weights_event)
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            torch.npu.current_stream().wait_event(weights_event)
 
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (

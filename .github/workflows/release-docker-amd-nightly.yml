@@ -2,7 +2,7 @@ name: Release Docker Images Nightly (AMD)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 13 * * *'
+    - cron: '0 12 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels

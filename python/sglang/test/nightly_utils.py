@@ -94,6 +94,7 @@ class NightlyBenchmarkRunner:
         json_output_file: str,
         extra_args: Optional[List[str]] = None,
         server_args: Optional[List[str]] = None,
+        enable_profile: bool = True,
     ) -> List[str]:
         """Build the benchmark command with all required arguments.
 
@@ -106,6 +107,7 @@ class NightlyBenchmarkRunner:
             json_output_file: Path to JSON output file
             extra_args: Optional extra arguments to append to command
             server_args: Optional server launch arguments to record in metrics
+            enable_profile: Whether to enable profiling (default True for NVIDIA)
 
         Returns:
             List of command arguments ready for subprocess.run()
@@ -125,14 +127,21 @@ class NightlyBenchmarkRunner:
             "--output-len",
             *[str(x) for x in output_lens],
             "--show-report",
-            "--profile",
-            "--profile-by-stage",
-            "--profile-output-dir",
-            profile_path_prefix,
             f"--pydantic-result-filename={json_output_file}",
             "--no-append-to-github-summary",
             "--trust-remote-code",
         ]
+
+        # Add profiling flags only if enabled (disabled for AMD tests)
+        if enable_profile and profile_path_prefix:
+            command.extend(
+                [
+                    "--profile",
+                    "--profile-by-stage",
+                    "--profile-output-dir",
+                    profile_path_prefix,
+                ]
+            )
 
         if extra_args:
             command.extend(extra_args)
@@ -218,6 +227,8 @@ class NightlyBenchmarkRunner:
         other_args: Optional[List[str]] = None,
         variant: str = "",
         extra_bench_args: Optional[List[str]] = None,
+        enable_profile: bool = True,
+        timeout: Optional[int] = None,
     ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
         """Run a complete benchmark for a single model with server management.
 
@@ -236,6 +247,8 @@ class NightlyBenchmarkRunner:
             other_args: Arguments to pass to server launch
             variant: Optional variant suffix (e.g., "basic", "mtp")
             extra_bench_args: Extra arguments for the benchmark command
+            enable_profile: Whether to enable profiling (default True for NVIDIA)
+            timeout: Optional timeout for server launch (defaults to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
 
         Returns:
             Tuple of (list of BenchmarkResult objects, success_bool, avg_spec_accept_length or None)
@@ -249,7 +262,9 @@ class NightlyBenchmarkRunner:
             model=model_path,
             base_url=self.base_url,
             other_args=other_args or [],
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=(
+                timeout if timeout is not None else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            ),
         )
 
         try:
@@ -273,6 +288,7 @@ class NightlyBenchmarkRunner:
                 json_output_file,
                 extra_args=bench_args,
                 server_args=other_args,
+                enable_profile=enable_profile,
             )
 
             result, cmd_success = self.run_benchmark_command(command, model_description)
