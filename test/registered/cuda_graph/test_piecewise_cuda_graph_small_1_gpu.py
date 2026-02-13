@@ -33,7 +33,7 @@ class TestPiecewiseCudaGraphCorrectness(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[]
+            other_args=[],
         )
 
     @classmethod
@@ -57,8 +57,7 @@ class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
 
     def test_latency(self):
         prefill_latency, _, _ = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            other_args=[]
+            DEFAULT_MODEL_NAME_FOR_TEST, other_args=[]
         )
         self.assertLess(prefill_latency, 0.015)
 
