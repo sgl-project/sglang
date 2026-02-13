@@ -423,7 +423,7 @@ class BailingMoELinearAttention(nn.Module):
         # minimax / seg_la / fla
         # TODO support fla
         self.linear_backend = getattr(config, "linear_backend", "seg_la")
-        logger.info(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
+        logger.debug(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
         self.linear_scale = True if self.linear_backend == "minimax" else False
         self.linear_rope = getattr(config, "linear_rope", True)
         if hasattr(config, "use_linear_silu"):
@@ -740,7 +740,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     alt_stream=alt_stream,
                 )
             else:
-                logger.info(f"==={layer_id=} use gqa")
+                logger.debug(f"layer {layer_id} use gqa")
                 self.attention = BailingMoEAttention(
                     config,
                     quant_config=quant_config,
@@ -895,8 +895,10 @@ class BailingMoELinearModel(nn.Module):
             0 if is_linear_layer(i, self.layer_group_size) else 1
             for i in range(self.num_layers)
         ]
+        num_linear = sum(1 for t in self.decoder_attention_types if t == 0)
+        num_softmax = sum(1 for t in self.decoder_attention_types if t == 1)
         logger.info(
-            f"attention type of layers:{self.decoder_attention_types}, 0 is linear layer and 1 is softmax layer!"
+            f"Layer config: {num_linear} linear layers, {num_softmax} softmax layers"
         )
 
         assert (
@@ -1082,7 +1084,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                             and layer_id >= self.model.start_layer
                         ):
                             layer_ids.add(layer_id)
-        logger.info(f"=====layer_ids {layer_ids}")
+        logger.debug(f"weight loading layer_ids: {layer_ids}")
 
         for layer_id in layer_ids:
             self_attn = (
