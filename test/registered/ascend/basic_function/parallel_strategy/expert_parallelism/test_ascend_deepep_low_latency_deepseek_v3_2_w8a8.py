@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
+
 class TestDeepEpDeepseekV32(CustomTestCase):
     """Testcase: Verify that for the DeepSeek V3.2 model in the single-machine colocation scenario,
     its inference accuracy on the MMLU and GSM8K dataset meets the preset standard when the parameter --deepep-mode low_latency is configured.
