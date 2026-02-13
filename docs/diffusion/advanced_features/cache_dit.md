@@ -175,7 +175,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 ## Environment Variables
 
 All Cache-DiT parameters can be configured via environment variables.
-See [Environment Variables](../../environment_variables.md) for the complete list.
+See [Environment Variables](../references/environment_variables.md) for the complete list.
 
 ## Supported Models
 

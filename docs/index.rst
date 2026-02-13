@@ -79,24 +79,15 @@ Its core features include:
    supported_models/extending/index
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 3
    :caption: SGLang Diffusion
 
    diffusion/index
-   diffusion/installation
-   diffusion/compatibility_matrix
-   diffusion/api/cli
-   diffusion/api/openai_api
-   diffusion/performance/index
-   diffusion/performance/attention_backends
-   diffusion/performance/profiling
-   diffusion/performance/cache/index
-   diffusion/performance/cache/cache_dit
-   diffusion/performance/cache/teacache
-   diffusion/support_new_models
-   diffusion/contributing
-   diffusion/ci_perf
-   diffusion/environment_variables
+   diffusion/get_started/index
+   diffusion/basic_usage/index
+   diffusion/advanced_features/index
+   diffusion/developer_guide/index
+   diffusion/references/index
 
 .. toctree::
    :maxdepth: 1

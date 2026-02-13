@@ -15,6 +15,11 @@ SGLang-Diffusion provides multiple performance optimization strategies to accele
 
 SGLang supports two complementary caching approaches:
 
+| Strategy | Scope | Mechanism | Best For |
+|----------|-------|-----------|----------|
+| **Cache-DiT** | Block-level | Skip individual transformer blocks dynamically | Advanced, higher speedup |
+| **TeaCache** | Timestep-level | Skip entire denoising steps based on L1 similarity | Simple, built-in |
+
 ### Cache-DiT
 
 [Cache-DiT](https://github.com/vipshop/cache-dit) provides block-level caching with advanced strategies. It can achieve up to **1.69x speedup**.
@@ -31,7 +36,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 - **TaylorSeer**: Taylor expansion-based calibration for optimized caching
 - **SCM**: Step-level computation masking for additional speedup
 
-See [Cache-DiT Documentation](cache/cache_dit.md) for detailed configuration.
+See [Cache-DiT Documentation](cache_dit.md) for detailed configuration.
 
 ### TeaCache
 
@@ -44,7 +49,7 @@ TeaCache (Temporal similarity-based caching) accelerates diffusion inference by 
 
 **Supported Models:** Wan (wan2.1, wan2.2), Hunyuan (HunyuanVideo), Z-Image
 
-See [TeaCache Documentation](cache/teacache.md) for detailed configuration.
+See [TeaCache Documentation](teacache.md) for detailed configuration.
 
 ## Attention Backends
 
