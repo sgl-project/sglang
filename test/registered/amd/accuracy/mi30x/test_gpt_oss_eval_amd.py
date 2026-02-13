@@ -68,7 +68,7 @@ GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "0"},
+        env_vars={"SGLANG_USE_AITER": "1"},
     ),
     ModelConfig(
         model_path="lmsys/gpt-oss-120b-bf16",
@@ -86,7 +86,7 @@ GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "0"},
+        env_vars={"SGLANG_USE_AITER": "1"},
     ),
 ]
 
