@@ -27,11 +27,12 @@ class TestAscendGGUFMoE(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
             "ascend",
+            "--tensor-parallel-size",
+            2,
         ]
 
     def test_a_gsm8k(self):

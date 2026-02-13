@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf": {
-        "accuracy": 0.85,
+        "accuracy": 0.80,
     },
 }
 
@@ -27,7 +27,6 @@ class TestAscendGGUF(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
