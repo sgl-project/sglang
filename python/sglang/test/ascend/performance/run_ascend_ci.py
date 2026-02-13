@@ -191,10 +191,9 @@ def monitor_pod_logs(pod_name, namespace=None, timeout=None):
         cmd.extend(["-n", namespace])
 
     # Define multiline pattern to match
-    pattern_lines = [r"^-{70,}$", r"^Ran \d+ test in [\d.]+s$", r"^$", r"^OK$"]
-
-    # Compile regex patterns
+    pattern_lines = [r"^-{70,}$", r"^Ran \d+ tests? in [\d.]+s$", r"^$", r"^(OK|FAILED \(errors=\d+\))$"]
     patterns = [re.compile(line_pattern) for line_pattern in pattern_lines]
+    pattern_ok = re.compile(r"^OK$")
 
     # Set up timeout handling
     if timeout:
@@ -219,6 +218,7 @@ def monitor_pod_logs(pod_name, namespace=None, timeout=None):
             print(f"Timeout set to: {timeout} seconds")
         match_state = 0
         matched = False
+        is_success = False
 
         # Process output
         while process.poll() is None and not matched:
@@ -233,6 +233,8 @@ def monitor_pod_logs(pod_name, namespace=None, timeout=None):
                 match_state += 1
                 if match_state == len(patterns):
                     matched = True
+                    if pattern_ok.match(line):
+                        is_success = True
                     print("\nSuccessfully detected complete test completion pattern!")
             else:
                 match_state = 0
@@ -253,7 +255,10 @@ def monitor_pod_logs(pod_name, namespace=None, timeout=None):
                     )
             else:
                 raise Exception("Monitoring ended but target pattern was not detected")
-        print("Monitoring completed successfully. Script exiting.")
+        elif not is_success:
+            raise Exception("The test result was FAILED!")
+        else:
+            print("The test result was OK!")
 
     except TimeoutException:
         print(f"\nError: Target pattern not detected within {timeout} seconds")
@@ -290,6 +295,8 @@ if __name__ == "__main__":
             response = create_or_update_configmap(cm_name=KUBE_CONFIG_MAP, data=cm_data, namespace=KUBE_NAME_SPACE)
             print(response)
     else:
-        print("Pod not ready, maybe not enough resource")
+        raise Exception(
+            "Pod not ready, maybe not enough resource"
+        )
 
     monitor_pod_logs(MONITOR_POD_NAME, KUBE_NAME_SPACE, LOCAL_TIMEOUT)
