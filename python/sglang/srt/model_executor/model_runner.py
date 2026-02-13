@@ -1537,32 +1537,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def mambaish_config(self):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
-    def can_run_piecewise_cuda_graph(self):
-        if self.is_draft_worker:
-            return False
-
-        if self.server_args.enable_torch_compile:
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph has conflict with torch compile",
-            )
-            return False
-        if self.pp_size > 1:
-            # TODO(yuwei): support PP
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
-            )
-            return False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            # TODO(yuwei): fix the compilation errors for MOE A2A backend
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph due to existing compilation errors",
-            )
-            return False
-        return True
-
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2053,14 +2027,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.piecewise_cuda_graph_runner = None
 
         if self.server_args.disable_piecewise_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
+            )
             return
 
         # Disable piecewise CUDA graph for non-language models
         if not hasattr(self.model, "model"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model is not a language model"
+            )
             return
 
         # Disable piecewise CUDA graph for non capture size
         if not self.server_args.piecewise_cuda_graph_tokens:
+            logger.warning(
+                "Disable piecewise CUDA graph because the capture size is not set"
+            )
             return
 
         # Collect attention layers and moe layers from the model
