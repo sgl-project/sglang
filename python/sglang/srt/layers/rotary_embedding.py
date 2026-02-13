@@ -128,8 +128,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
         ):
+            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
             if _is_cuda or _is_hip:
-                from sgl_kernel import rotary_embedding
+                from sglang.jit_kernel.pos_enc import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -404,6 +406,7 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
+
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
@@ -1825,7 +1828,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 **kwargs,
             )
         if (
-            model_type.startswith("qwen3_vl") or model_type.startswith("qwen3_vl_moe")
+            model_type.startswith("qwen3_vl")
+            or model_type.startswith("qwen3_vl_moe")
+            or model_type.startswith("qwen3_5")
         ) and video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(
                 video_grid_thw, video_grid_thw[:, 0], dim=0
@@ -1925,6 +1930,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen2_vl",
                         "qwen3_vl",
                         "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t, device=position_ids.device)

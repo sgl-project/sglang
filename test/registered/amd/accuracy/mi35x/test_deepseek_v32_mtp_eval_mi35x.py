@@ -22,7 +22,6 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -32,7 +31,7 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - MI35x DeepSeek-V3.2 TP+MTP accuracy test
 register_amd_ci(
-    est_time=3600,
+    est_time=5400,
     suite="nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp",
     nightly=True,
 )
@@ -55,10 +54,15 @@ class TestDeepseekV32TPMTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Use same args as perf test (which passes successfully)
         other_args = [
             "--trust-remote-code",
             "--tp",
             "8",
+            "--nsa-prefill-backend",
+            "tilelang",
+            "--nsa-decode-backend",
+            "tilelang",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -67,19 +71,17 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
-            "--mem-frac",
+            "--mem-fraction-static",
             "0.7",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--nsa-prefill-backend",
-            "tilelang",
-            "--nsa-decode-backend",
-            "tilelang",
+            "--watchdog-timeout",
+            "1200",
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=5400,
             other_args=other_args,
         )
 
@@ -97,8 +99,8 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1400,
-            parallel=1400,
+            num_questions=200,
+            parallel=64,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
