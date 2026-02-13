@@ -128,8 +128,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
         ):
+            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
             if _is_cuda or _is_hip:
-                from sgl_kernel import rotary_embedding
+                from sglang.jit_kernel.pos_enc import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -404,6 +406,7 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
+
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,

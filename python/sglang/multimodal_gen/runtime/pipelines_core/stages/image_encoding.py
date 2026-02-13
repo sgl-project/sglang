@@ -76,8 +76,6 @@ class ImageEncodingStage(PipelineStage):
     def move_to_device(self, device):
         fields = [
             "image_processor",
-            "image_encoder",
-            "text_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)
