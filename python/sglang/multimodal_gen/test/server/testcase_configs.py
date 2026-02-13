@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -151,7 +151,7 @@ class BaselineConfig:
         return self
 
 
-@dataclass
+@dataclass(frozen=True)
 class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
@@ -182,14 +182,6 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
-
-    extras: list[str] = field(default_factory=lambda: [])
-
-    def __post_init__(self):
-        if self.modality == "image":
-            self.custom_validator = "image"
-        elif self.modality == "video":
-            self.custom_validator = "video"
 
 
 @dataclass(frozen=True)
@@ -338,8 +330,6 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     fps=4,
 )
-
-DEFAULT_SMALL_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
@@ -653,17 +643,6 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
-    ),
-    DiffusionTestCase(
-        "fsdp-inference",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL,
-            modality="image",
-            num_gpus=2,
-            warmup=True,
-            extras=["--use-fsdp-inference"],
-        ),
-        T2I_sampling_params,
     ),
 ]
 
