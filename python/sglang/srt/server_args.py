@@ -1512,7 +1512,7 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM"]:
+        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
@@ -1538,6 +1538,7 @@ class ServerArgs:
 
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1589,6 +1590,7 @@ class ServerArgs:
                     )
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
                 sm100_default_attention_backend="triton",
             )
@@ -1622,6 +1624,7 @@ class ServerArgs:
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
@@ -1629,6 +1632,7 @@ class ServerArgs:
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1698,7 +1702,8 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
-        elif self.enable_mamba_extra_buffer():  # extra_buffer
+
+        if self.enable_mamba_extra_buffer():  # extra_buffer
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
@@ -2334,6 +2339,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
+                "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
@@ -5681,6 +5687,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "MiMoV2FlashForCausalLM",

@@ -248,9 +248,9 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
-    SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
-    SGLANG_FORWARD_TIMEOUT_MS = EnvInt(-1)
+    SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -509,6 +509,18 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
     )
+    _deprecated_ms_to_s = {
+        "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
+        "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",
+    }
+    for old_name, new_name in _deprecated_ms_to_s.items():
+        if old_name in os.environ:
+            ms_val = os.environ[old_name]
+            warnings.warn(
+                f"Environment variable {old_name} (in ms) is deprecated, "
+                f"please use {new_name} (in seconds) instead"
+            )
+            os.environ[new_name] = str(float(ms_val) / 1000.0)
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):

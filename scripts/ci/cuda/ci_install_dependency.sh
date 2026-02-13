@@ -26,6 +26,8 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
+# Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
+apt-get update || true
 apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
