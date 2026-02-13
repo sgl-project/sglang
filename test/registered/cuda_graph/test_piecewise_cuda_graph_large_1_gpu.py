@@ -64,6 +64,7 @@ class TestPiecewiseCudaGraphGPTQ(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[]
         )
 
     @classmethod
@@ -99,6 +100,7 @@ class TestPiecewiseCudaGraphAWQ(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[]
         )
 
     @classmethod
