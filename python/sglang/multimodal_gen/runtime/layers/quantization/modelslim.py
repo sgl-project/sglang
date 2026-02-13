@@ -37,7 +37,7 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
-        self.ignore = ignore if ignore is not None else []
+        self.ignore = ignore
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
