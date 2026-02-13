@@ -528,7 +528,7 @@ jobs:
   # MI35x 1-GPU tests - platform-agnostic tests that may work on CDNA4 (gfx950)
   nightly-test-1-gpu-mi35x:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-1-gpu-mi35x')
-    runs-on: linux-mi35x-gpu-1
+    runs-on: linux-mi35x-gpu-1.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -560,7 +560,7 @@ jobs:
   # MI35x 8-GPU Accuracy Tests - GPT-OSS (accuracy only)
   nightly-accuracy-8-gpu-mi35x:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -592,7 +592,7 @@ jobs:
   # MI35x 8-GPU Grok1-INT4 (Accuracy + Performance combined)
   nightly-8-gpu-mi35x-grok1-int4:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-grok1-int4')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -638,7 +638,7 @@ jobs:
   # MI35x 8-GPU Grok2 (Accuracy + Performance combined)
   nightly-8-gpu-mi35x-grok2:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-grok2')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -684,7 +684,7 @@ jobs:
   # MI35x 8-GPU DeepSeek-R1-MXFP4 (Accuracy + Performance combined)
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-deepseek-r1-mxfp4')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -728,7 +728,7 @@ jobs:
   # MI35x 8-GPU DeepSeek-V3.2 Accuracy Test
   nightly-accuracy-8-gpu-mi35x-deepseek-v32:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -761,7 +761,7 @@ jobs:
   # MI35x 8-GPU DeepSeek-V3.2 TP+MTP Accuracy Test
   nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -794,7 +794,7 @@ jobs:
   # MI35x 8-GPU DeepSeek-V3.2 Performance Test (Basic)
   nightly-perf-8-gpu-mi35x-deepseek-v32-basic:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32-basic')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -827,7 +827,7 @@ jobs:
   # MI35x 8-GPU Kimi-K2.5 (Accuracy)
   nightly-8-gpu-mi35x-kimi-k25:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-kimi-k25')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -860,7 +860,7 @@ jobs:
   # MI35x 8-GPU DeepSeek-V3.2 Performance Test (MTP)
   nightly-perf-8-gpu-mi35x-deepseek-v32-mtp:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32-mtp')
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
