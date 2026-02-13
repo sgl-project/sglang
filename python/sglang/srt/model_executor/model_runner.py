@@ -1027,7 +1027,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
             f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
