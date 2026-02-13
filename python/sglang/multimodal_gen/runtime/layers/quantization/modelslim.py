@@ -30,7 +30,13 @@ logger = logging.getLogger(__name__)
 
 class ModelSlimConfig(QuantizationConfig):
     """
-    Config class for ModelSlim Quantization, a NPU-specific quantization type.
+    Config class for ModelSlim Quantization of Diffusion models https://gitcode.com/Ascend/msmodelslim, a NPU-specific quantization type.
+    The quantization method (W8A8, W4A4, etc.) will be automatically parsed from the `quant_model_description.json` config.
+
+    ModelSlim for Diffusion models includes support for various quantization schemes, such as:
+    - W4A4 dynamic linear
+    - W8A8 static linear
+    - W8A8 dynamic linear
     """
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
