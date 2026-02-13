@@ -68,7 +68,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
-    warnings.warn(f"HIP does not support fused_marlin_moe currently.")
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
@@ -198,6 +197,8 @@ class AWQMarlinConfig(QuantizationConfig):
         full_config: dict[str, Any],
     ) -> None:
         super().__init__()
+        if _is_hip:
+            warnings.warn(f"HIP does not support fused_marlin_moe currently.")
         self.pack_factor = 32 // weight_bits  # packed into int32
         self.group_size = group_size
         self.zero_point = zero_point
@@ -627,8 +628,8 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         qzeros_tmp = -(qzeros_tmp - 8)
         qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+        layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
+        layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
 
     def apply(
         self,
@@ -636,9 +637,9 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.qweight
+        qweight = layer.weight
         scales = layer.scales
-        qzeros = layer.qzeros
+        qzeros = layer.zeros
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])

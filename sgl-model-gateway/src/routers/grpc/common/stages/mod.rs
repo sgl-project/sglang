@@ -28,12 +28,12 @@ pub trait PipelineStage: Send + Sync {
 
 mod client_acquisition;
 mod dispatch_metadata;
-pub mod helpers;
+pub(crate) mod helpers;
 mod request_execution;
 mod worker_selection;
 
 // Export stage implementations
-pub use client_acquisition::ClientAcquisitionStage;
-pub use dispatch_metadata::DispatchMetadataStage;
-pub use request_execution::{ExecutionMode, RequestExecutionStage};
-pub use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};
+pub(crate) use client_acquisition::ClientAcquisitionStage;
+pub(crate) use dispatch_metadata::DispatchMetadataStage;
+pub(crate) use request_execution::{ExecutionMode, RequestExecutionStage};
+pub(crate) use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};

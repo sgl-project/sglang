@@ -27,6 +27,8 @@ SUITES = {
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        # unit tests (no server needed)
+        "../test_sampling_params_validate.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -35,6 +37,15 @@ SUITES = {
         # add new 2-gpu test files here
     ],
 }
+
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ]
+}
+
+SUITES.update(suites_ascend)
 
 
 def parse_args():
@@ -81,12 +92,7 @@ def parse_args():
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
+    """Collect test item node IDs from the given files using pytest --collect-only."""
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])
@@ -153,8 +159,10 @@ def run_pytest(files, filter_expr=None):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
-        else:
-            cmd.extend(files)
+        # Always include files to constrain test discovery scope
+        # This prevents pytest from scanning the entire rootdir and
+        # discovering unrelated tests that may have missing dependencies
+        cmd.extend(files)
 
         if i > 0:
             print(

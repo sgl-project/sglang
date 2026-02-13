@@ -11,7 +11,6 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# INT8 quantization kernel tests
 register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu")
 
 

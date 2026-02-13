@@ -3,7 +3,11 @@ import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.core_types import StreamingParseResult
-from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import (
+    Glm47MoeDetector,
+    get_argument_type,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "default")
@@ -1168,5 +1172,676 @@ class TestGlm47MoeDetector(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestGlm4ComplexJsonSchema(unittest.TestCase):
+    """Test complex JSON Schema type inference for GLM function call parsers."""
+
+    def setUp(self):
+        """Set up test tools with complex JSON schemas."""
+        self.tools_with_complex_schema = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "description": "Search query, can be a string or a complex object",
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "filters": {"type": "object"},
+                                        },
+                                    },
+                                ],
+                            },
+                            "priority": {"enum": ["low", "medium", "high"]},
+                            "options": {
+                                "oneOf": [{"type": "string"}, {"type": "number"}]
+                            },
+                            "config": {
+                                "allOf": [
+                                    {"type": "object"},
+                                    {"properties": {"timeout": {"type": "number"}}},
+                                ]
+                            },
+                            "tags": {"type": ["string", "null"]},
+                            "data": {
+                                "type": "object",
+                                "properties": {
+                                    "nested": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "value": {"type": "string"}
+                                                },
+                                            },
+                                        ]
+                                    }
+                                },
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+        ]
+        self.glm4_detector = Glm4MoeDetector()
+        self.glm47_detector = Glm47MoeDetector()
+
+    def test_get_argument_type_simple_type(self):
+        """Test that get_argument_type correctly handles simple type fields."""
+        result = get_argument_type(
+            "get_weather", "location", self.tools_with_complex_schema
+        )
+        self.assertEqual(result, "string")
+
+    def test_get_argument_type_enum_type(self):
+        """Test that get_argument_type correctly identifies enum as string type."""
+        result = get_argument_type(
+            "get_weather", "unit", self.tools_with_complex_schema
+        )
+        # Current implementation returns the direct type field, which is "string" for the enum parameter
+        # But it doesn't handle enum-only schemas properly (without type field)
+        self.assertEqual(result, "string")
+
+    def test_get_argument_type_anyof_type(self):
+        """Test that get_argument_type correctly handles anyOf type fields."""
+        result = get_argument_type("search", "query", self.tools_with_complex_schema)
+        # anyOf with [{"type": "string"}, {"type": "object", ...}] should return "string"
+        self.assertEqual(result, "string")  # Returns first common type
+
+    def test_get_argument_type_oneof_type(self):
+        """Test that get_argument_type correctly handles oneOf type fields."""
+        result = get_argument_type("search", "options", self.tools_with_complex_schema)
+        # oneOf with [{"type": "string"}, {"type": "number"}] should return "string" (prioritizes string)
+        self.assertEqual(result, "string")
+
+    def test_get_argument_type_allof_type(self):
+        """Test that get_argument_type correctly handles allOf type fields."""
+        result = get_argument_type("search", "config", self.tools_with_complex_schema)
+        # allOf with [{"type": "object"}, ...] should return "object"
+        self.assertEqual(result, "object")
+
+    def test_get_argument_type_type_array(self):
+        """Test that get_argument_type correctly handles type arrays."""
+        result = get_argument_type("search", "tags", self.tools_with_complex_schema)
+        # Type arrays should return the first non-null type
+        self.assertEqual(
+            result, "string"
+        )  # ["string", "null"] -> "string" (non-null type)
+
+    def test_glm4_detector_with_complex_schema_anyof(self):
+        """Test GLM4 detector with anyOf schema - should demonstrate current issues."""
+        # This test shows the current behavior with complex schemas
+        text = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n<arg_value>Hello world</arg_value>\n"
+            "<arg_key>priority</arg_key>\n<arg_value>medium</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.glm4_detector.detect_and_parse(
+            text, self.tools_with_complex_schema
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+        # Parse parameters to check if they are correctly handled
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "Hello world")
+        self.assertEqual(params["priority"], "medium")
+
+    def test_glm47_detector_with_complex_schema_anyof(self):
+        """Test GLM47 detector with anyOf schema - should demonstrate current issues."""
+        # This test shows the current behavior with complex schemas
+        text = (
+            "<tool_call>search"
+            "<arg_key>query</arg_key><arg_value>Hello world</arg_value>"
+            "<arg_key>priority</arg_key><arg_value>medium</arg_value>"
+            "</tool_call>"
+        )
+        result = self.glm47_detector.detect_and_parse(
+            text, self.tools_with_complex_schema
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+        # Parse parameters to check if they are correctly handled
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "Hello world")
+        self.assertEqual(params["priority"], "medium")
+
+    def test_glm4_detector_with_enum_values(self):
+        """Test GLM4 detector with enum values in complex schema."""
+        text = (
+            "<tool_call>search\n"
+            "<arg_key>query</arg_key>\n<arg_value>test query</arg_value>\n"
+            "<arg_key>priority</arg_key>\n<arg_value>high</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.glm4_detector.detect_and_parse(
+            text, self.tools_with_complex_schema
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "test query")
+        self.assertEqual(params["priority"], "high")
+
+    def test_glm47_detector_with_enum_values(self):
+        """Test GLM47 detector with enum values in complex schema."""
+        text = (
+            "<tool_call>search"
+            "<arg_key>query</arg_key><arg_value>test query</arg_value>"
+            "<arg_key>priority</arg_key><arg_value>high</arg_value>"
+            "</tool_call>"
+        )
+        result = self.glm47_detector.detect_and_parse(
+            text, self.tools_with_complex_schema
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "test query")
+        self.assertEqual(params["priority"], "high")
+
+    def test_glm4_detector_streaming_with_complex_schema(self):
+        """Test GLM4 detector streaming with complex schema."""
+        chunks = [
+            "<tool_call>search\n",
+            "<arg_key>query</arg_key>\n<arg_value>nested object</arg_value>\n",
+            "<arg_key>priority</arg_key>\n<arg_value>low</arg_value>\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.glm4_detector.parse_streaming_increment(
+                chunk, self.tools_with_complex_schema
+            )
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "search")
+
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params["query"], "nested object")
+        self.assertEqual(params["priority"], "low")
+
+    def test_glm47_detector_streaming_with_complex_schema(self):
+        """Test GLM47 detector streaming with complex schema."""
+        chunks = [
+            "<tool_call>search",
+            "<arg_key>query</arg_key><arg_value>nested object</arg_value>",
+            "<arg_key>priority</arg_key><arg_value>low</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.glm47_detector.parse_streaming_increment(
+                chunk, self.tools_with_complex_schema
+            )
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "search")
+
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params["query"], "nested object")
+        self.assertEqual(params["priority"], "low")
+
+    def test_type_inference_issue_reproduction(self):
+        """Reproduce the issue where complex JSON schemas are not properly handled."""
+        # This test demonstrates the current limitations
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_function",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "complex_param": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "enum_param": {"enum": ["option1", "option2", "option3"]},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # Test that get_argument_type returns appropriate types for complex schemas
+        anyof_result = get_argument_type(
+            "complex_function", "complex_param", complex_tools
+        )
+        enum_result = get_argument_type("complex_function", "enum_param", complex_tools)
+
+        # Verify complex schema types are correctly inferred
+        self.assertEqual(anyof_result, "string")  # anyOf prioritizes string type
+        self.assertEqual(enum_result, "string")  # enum values are strings
+
+    def test_expected_behavior_for_complex_schemas(self):
+        """Test cases that should work but currently fail - demonstrating the issue."""
+        # This test shows what the behavior SHOULD be after the fix
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_function",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "complex_param": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "enum_param": {"enum": ["option1", "option2", "option3"]},
+                            "oneof_param": {
+                                "oneOf": [{"type": "string"}, {"type": "number"}]
+                            },
+                            "allof_param": {
+                                "allOf": [
+                                    {"type": "object"},
+                                    {"properties": {"timeout": {"type": "number"}}},
+                                ]
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # These assertions represent the EXPECTED behavior after implementing RFC improvements
+        # Currently they will fail, demonstrating the issue
+        anyof_result = get_argument_type(
+            "complex_function", "complex_param", complex_tools
+        )
+        enum_result = get_argument_type("complex_function", "enum_param", complex_tools)
+        oneof_result = get_argument_type(
+            "complex_function", "oneof_param", complex_tools
+        )
+        allof_result = get_argument_type(
+            "complex_function", "allof_param", complex_tools
+        )
+
+        # These should pass after implementing the RFC improvements, but will currently fail
+        # This demonstrates the issue exists
+        self.assertIsNotNone(
+            anyof_result, "anyOf should return a type after RFC implementation"
+        )
+        self.assertEqual(
+            enum_result,
+            "string",
+            "enum should return 'string' type after RFC implementation",
+        )
+        self.assertIsNotNone(
+            oneof_result, "oneOf should return a type after RFC implementation"
+        )
+        self.assertIsNotNone(
+            allof_result, "allOf should return a type after RFC implementation"
+        )
+
+    def test_complex_schema_type_inference_scenarios(self):
+        """Test various complex schema scenarios mentioned in the RFC."""
+        # Create tools with different complex schema structures
+        complex_schema_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search_complex",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            # anyOf example - parameter can be string or object
+                            "query": {
+                                "description": "Search query, can be a string or a complex object",
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "text": {"type": "string"},
+                                            "filters": {"type": "object"},
+                                        },
+                                    },
+                                ],
+                            },
+                            # oneOf example - parameter must be one of the specified types
+                            "priority": {
+                                "oneOf": [{"type": "string"}, {"type": "integer"}]
+                            },
+                            # enum example - parameter must be one of the enum values
+                            "category": {"enum": ["news", "sports", "tech"]},
+                            # allOf example - parameter must satisfy all schemas
+                            "config": {
+                                "allOf": [
+                                    {"type": "object"},
+                                    {"properties": {"timeout": {"type": "number"}}},
+                                ]
+                            },
+                            # Type array example
+                            "tags": {"type": ["string", "null"]},
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_data",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            # Complex nested anyOf
+                            "input": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "number"},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": {"type": "string"},
+                                            "value": {},
+                                        },
+                                    },
+                                ]
+                            }
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        # Test each complex type scenario
+        query_type = get_argument_type("search_complex", "query", complex_schema_tools)
+        priority_type = get_argument_type(
+            "search_complex", "priority", complex_schema_tools
+        )
+        category_type = get_argument_type(
+            "search_complex", "category", complex_schema_tools
+        )
+        config_type = get_argument_type(
+            "search_complex", "config", complex_schema_tools
+        )
+        tags_type = get_argument_type("search_complex", "tags", complex_schema_tools)
+        input_type = get_argument_type("get_data", "input", complex_schema_tools)
+
+        # All of these should return appropriate types according to RFC
+        self.assertEqual(query_type, "string")  # anyOf: string | object -> string
+        self.assertEqual(priority_type, "string")  # oneOf: string | integer -> string
+        self.assertEqual(
+            category_type, "string"
+        )  # enum: ["news", "sports", "tech"] -> string
+        self.assertEqual(config_type, "object")  # allOf with object -> object
+        self.assertEqual(
+            tags_type, "string"
+        )  # type array: ["string", "null"] -> string
+        self.assertEqual(
+            input_type, "string"
+        )  # nested anyOf: string | number | object -> string
+
+    def test_glm4_detector_type_handling_with_complex_schema(self):
+        """Test how GLM4 detector handles type inference for complex schemas in practice."""
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "category": {"enum": ["tech", "news", "sports"]},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # Test with string value for anyOf parameter
+        text = (
+            "<tool_call>complex_search\n"
+            "<arg_key>query</arg_key>\n<arg_value>test search</arg_value>\n"
+            "<arg_key>category</arg_key>\n<arg_value>tech</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.glm4_detector.detect_and_parse(text, complex_tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "complex_search")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "test search")
+        self.assertEqual(params["category"], "tech")
+
+    def test_glm47_detector_type_handling_with_complex_schema(self):
+        """Test how GLM47 detector handles type inference for complex schemas in practice."""
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="complex_search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "category": {"enum": ["tech", "news", "sports"]},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # Test with string value for anyOf parameter
+        text = (
+            "<tool_call>complex_search"
+            "<arg_key>query</arg_key><arg_value>test search</arg_value>"
+            "<arg_key>category</arg_key><arg_value>tech</arg_value>"
+            "</tool_call>"
+        )
+        result = self.glm47_detector.detect_and_parse(text, complex_tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "complex_search")
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "test search")
+        self.assertEqual(params["category"], "tech")
+
+    def test_streaming_with_complex_schema_type_inference(self):
+        """Test streaming behavior with complex schema type inference."""
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="stream_test",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "status": {"enum": ["active", "inactive"]},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # Test GLM4 detector streaming
+        chunks = [
+            "<tool_call>stream_test\n",
+            "<arg_key>data</arg_key>\n<arg_value>nested data</arg_value>\n",
+            "<arg_key>status</arg_key>\n<arg_value>active</arg_value>\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.glm4_detector.parse_streaming_increment(chunk, complex_tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "stream_test")
+
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params["data"], "nested data")
+        self.assertEqual(params["status"], "active")
+
+    def test_streaming_with_complex_schema_type_inference_glm47(self):
+        """Test GLM47 streaming behavior with complex schema type inference."""
+        complex_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="stream_test",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                            "status": {"enum": ["active", "inactive"]},
+                        },
+                    },
+                ),
+            )
+        ]
+
+        # Test GLM47 detector streaming
+        chunks = [
+            "<tool_call>stream_test",
+            "<arg_key>data</arg_key><arg_value>nested data</arg_value>",
+            "<arg_key>status</arg_key><arg_value>active</arg_value>",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.glm47_detector.parse_streaming_increment(chunk, complex_tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "stream_test")
+
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params["data"], "nested data")
+        self.assertEqual(params["status"], "active")
+
+    if __name__ == "__main__":
+        unittest.main()

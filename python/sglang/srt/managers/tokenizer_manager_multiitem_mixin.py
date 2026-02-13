@@ -8,6 +8,55 @@ logger = logging.getLogger(__name__)
 
 
 class TokenizerManagerMultiItemMixin:
+    async def score_prompts(
+        self,
+        prompts: Union[str, List[str], List[List[int]]],
+        label_token_ids: List[int],
+        apply_softmax: bool = False,
+        request: Optional[Any] = None,
+    ) -> List[List[float]]:
+        """
+        Score probabilities of specified token IDs after each *full prompt*.
+
+        This is a thin wrapper over `score_request` that treats `prompts` as
+        already-composed inputs (i.e., no query/item concatenation needed).
+
+        Args:
+            prompts: A single prompt string, a list of prompt strings, or a list of
+                pre-tokenized prompt token ID sequences.
+            label_token_ids: Token IDs to compute probabilities for.
+            apply_softmax: Whether to normalize probabilities using softmax.
+            request: Optional FastAPI request object.
+
+        Returns:
+            List of score lists, one for each prompt, each in the order of label_token_ids.
+        """
+        # Text prompts
+        if isinstance(prompts, str) or (
+            isinstance(prompts, list) and (not prompts or isinstance(prompts[0], str))
+        ):
+            return await self.score_request(
+                query="",
+                items=prompts,  # type: ignore[arg-type]
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=False,
+                request=request,
+            )
+
+        # Tokenized prompts
+        if isinstance(prompts, list) and (not prompts or isinstance(prompts[0], list)):
+            return await self.score_request(
+                query=[],
+                items=prompts,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=False,
+                request=request,
+            )
+
+        raise ValueError("Invalid prompts type for score_prompts.")
+
     def _initialize_multi_item_delimiter_text(self):
         """Initialize multi-item delimiter text from token ID after tokenizer is loaded."""
         if (

@@ -128,6 +128,9 @@ def _handle_output_by_index(output, i):
             spec_accepted_tokens=_extract_field_by_index(
                 output, "spec_accepted_tokens", i
             ),
+            spec_acceptance_histogram=_extract_field_by_index(
+                output, "spec_acceptance_histogram", i
+            ),
             queue_time=_extract_field_by_index(output, "queue_time", i),
             forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
             prefill_launch_delay=_extract_field_by_index(
@@ -154,6 +157,9 @@ def _handle_output_by_index(output, i):
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -219,6 +225,9 @@ def _handle_output_by_index(output, i):
             spec_accepted_tokens=_extract_field_by_index(
                 output, "spec_accepted_tokens", i
             ),
+            spec_acceptance_histogram=_extract_field_by_index(
+                output, "spec_acceptance_histogram", i
+            ),
             queue_time=_extract_field_by_index(output, "queue_time", i),
             forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
             prefill_launch_delay=_extract_field_by_index(
@@ -278,8 +287,8 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
-            output_routed_experts=_extract_field_by_index(
-                output, "output_routed_experts", i, check_length=False
+            routed_experts=_extract_field_by_index(
+                output, "routed_experts", i, check_length=False
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False

@@ -9,10 +9,11 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="nightly-1-gpu", nightly=True)
-from sglang.srt.server_args import ServerArgs
+register_amd_ci(est_time=30, suite="nightly-amd-1-gpu", nightly=True)
 
 
 class MockTokenizerManager:

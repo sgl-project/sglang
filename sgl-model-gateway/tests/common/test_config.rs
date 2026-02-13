@@ -3,7 +3,9 @@
 //! Provides pre-configured RouterConfig and MockWorkerConfig builders
 //! for common test scenarios.
 
-use smg::config::{CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig};
+use smg::config::{
+    CircuitBreakerConfig, ManualAssignmentMode, PolicyConfig, RetryConfig, RouterConfig,
+};
 
 use super::mock_worker::{HealthStatus, MockWorkerConfig, WorkerType};
 
@@ -94,11 +96,22 @@ impl TestRouterConfig {
 
     /// Create a manual routing config (for sticky routing tests)
     pub fn manual(port: u16) -> RouterConfig {
+        Self::manual_with_mode(port, ManualAssignmentMode::Random)
+    }
+
+    /// Create a manual routing config with min_group assignment mode
+    pub fn manual_min_group(port: u16) -> RouterConfig {
+        Self::manual_with_mode(port, ManualAssignmentMode::MinGroup)
+    }
+
+    /// Create a manual routing config with specified assignment mode
+    pub fn manual_with_mode(port: u16, assignment_mode: ManualAssignmentMode) -> RouterConfig {
         RouterConfig::builder()
             .regular_mode(vec![])
             .policy(PolicyConfig::Manual {
                 eviction_interval_secs: 60,
                 max_idle_secs: 3600,
+                assignment_mode,
             })
             .host(defaults::HOST)
             .port(port)
@@ -259,6 +272,13 @@ impl TestWorkerConfig {
             response_delay_ms: delay_ms,
             fail_rate: 0.0,
         }
+    }
+
+    /// Create multiple slow workers with sequential ports
+    pub fn slow_workers(start_port: u16, count: u16, delay_ms: u64) -> Vec<MockWorkerConfig> {
+        (0..count)
+            .map(|i| Self::slow(start_port + i, delay_ms))
+            .collect()
     }
 
     /// Create a flaky worker config (for retry/fault tolerance tests)

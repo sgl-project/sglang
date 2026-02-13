@@ -114,7 +114,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group()):
+        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -562,6 +562,10 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().reduce_scatter_tensor(output, input)
+
+
+def attn_tp_all_reduce(input: torch.Tensor):
+    return get_attention_tp_group().all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

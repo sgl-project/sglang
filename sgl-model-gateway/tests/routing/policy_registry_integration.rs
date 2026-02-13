@@ -41,6 +41,7 @@ async fn test_policy_registry_with_router_manager() {
         health_check_interval_secs: 60,
         health_success_threshold: 2,
         health_failure_threshold: 3,
+        disable_health_check: false,
         max_connection_attempts: 20,
         dp_aware: false,
     };
@@ -73,6 +74,7 @@ async fn test_policy_registry_with_router_manager() {
         health_check_interval_secs: 60,
         health_success_threshold: 2,
         health_failure_threshold: 3,
+        disable_health_check: false,
         max_connection_attempts: 20,
         dp_aware: false,
     };
@@ -101,6 +103,7 @@ async fn test_policy_registry_with_router_manager() {
         health_check_interval_secs: 60,
         health_success_threshold: 2,
         health_failure_threshold: 3,
+        disable_health_check: false,
         max_connection_attempts: 20,
         dp_aware: false,
     };

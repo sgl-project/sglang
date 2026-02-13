@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
@@ -131,6 +132,8 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GELUTANH.get():
+            return self.forward_native(x)
         y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
             dim=-1,
@@ -378,15 +381,3 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
     else:
         # adapt bge-reranker
         return nn.Identity()
-
-
-if not (
-    _is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip or _is_xpu
-):
-    logger.info(
-        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.activation import (  # noqa: F401
-        GeluAndMul,
-        SiluAndMul,
-    )

@@ -58,7 +58,7 @@ def test_jit_per_tensor_quant_compare_implementations(
     )
 
 
-@pytest.mark.parametrize("shape", [(4, 8, 64), (2, 16, 128)])
+@pytest.mark.parametrize("shape", [(4, 8, 64), (2, 16, 128), (19260817, 1, 1)])
 def test_jit_per_tensor_quant_supports_3d(shape):
     device = torch.device("cuda")
     x = torch.rand(shape, dtype=torch.bfloat16, device=device)
@@ -74,7 +74,7 @@ def test_jit_per_tensor_quant_supports_3d(shape):
     torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-3, atol=1e-3)
 
     scale = torch.rand(1, dtype=torch.float32, device=device)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x, scale)
+    sglang_out, _ = sglang_scaled_fp8_quant(x, scale)
     torch_out = torch_scaled_fp8_quant(x, scale)
 
     torch.testing.assert_close(

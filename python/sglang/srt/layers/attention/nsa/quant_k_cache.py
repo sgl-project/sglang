@@ -2,15 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.nsa.utils import NSA_QUANT_K_CACHE_FAST
-
 
 def quantize_k_cache(cache_k):
-    # TODO upstream can skip concat([k_nope, k_pe]) since we split them here
-    if NSA_QUANT_K_CACHE_FAST:
-        return _quantize_k_cache_fast_wrapped(cache_k)
-    else:
-        return _quantize_k_cache_slow(cache_k)
+    return _quantize_k_cache_fast_wrapped(cache_k)
 
 
 def quantize_k_cache_separate(
@@ -56,43 +50,13 @@ def quantize_k_cache_separate(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
         )
 
-    # Call fast kernel that directly produces two separate outputs (single Triton kernel)
-    if NSA_QUANT_K_CACHE_FAST:
-        nope_part, rope_part = _quantize_k_cache_fast_separate(
-            k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
-        )
-    else:
-        # Fallback: use existing slow path with post-processing
-        cache_k_concat = torch.cat([k_nope_2d, k_rope_2d], dim=-1)
-        packed_output_4d = quantize_k_cache(cache_k_concat.unsqueeze(1).unsqueeze(1))
-        packed_output = packed_output_4d.squeeze(1).squeeze(1)
-
-        # Convert to uint8 bytes view
-        packed_bytes = packed_output.contiguous().view(torch.uint8)
-
-        # Strict byte-size validation
-        expected_total_bytes = 656  # 512 (nope_fp8) + 16 (scales) + 128 (rope_bf16)
-        if packed_bytes.shape[1] != expected_total_bytes:
-            raise ValueError(
-                f"Packed output has {packed_bytes.shape[1]} bytes, expected {expected_total_bytes}. "
-                f"Original dtype: {packed_output.dtype}, shape: {packed_output.shape}"
-            )
-
-        # Split into nope and rope parts
-        num_tiles = dim_nope // tile_size  # 4
-        nope_part_bytes = dim_nope + num_tiles * 4  # 512 + 16 = 528
-        rope_part_bytes = 128
-
-        nope_part = packed_bytes[:, :nope_part_bytes].unsqueeze(1)
-        rope_part = packed_bytes[
-            :, nope_part_bytes : nope_part_bytes + rope_part_bytes
-        ].unsqueeze(1)
-
-    return nope_part, rope_part
+    return _quantize_k_cache_fast_separate(
+        k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
+    )
 
 
 # Copied from original
-def _quantize_k_cache_slow(
+def _quantize_k_cache_ref(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
     dv: int = 512,
     tile_size: int = 128,
@@ -375,7 +339,7 @@ if __name__ == "__main__":
             device="cuda",
         )
 
-        ref_quant = _quantize_k_cache_slow(input_k_cache)
+        ref_quant = _quantize_k_cache_ref(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
 
         ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)

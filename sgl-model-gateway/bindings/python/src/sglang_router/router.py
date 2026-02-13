@@ -10,6 +10,7 @@ from sglang_router.sglang_router_rs import (
     PyJwtConfig,
     PyOracleConfig,
     PyPostgresConfig,
+    PyRedisConfig,
     PyRole,
 )
 from sglang_router.sglang_router_rs import Router as _Router
@@ -63,6 +64,8 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
         return HistoryBackendType.Oracle
     elif backend_lower == "postgres":
         return HistoryBackendType.Postgres
+    elif backend_lower == "redis":
+        return HistoryBackendType.Redis
     else:
         raise ValueError(f"Unknown history backend: {backend_str}")
 
@@ -262,6 +265,20 @@ class Router:
             )
         args_dict["postgres_config"] = postgres_config
 
+        # Convert Redis config if needed
+        redis_config = None
+        if history_backend == HistoryBackendType.Redis:
+            retention_days = args_dict.get("redis_retention_days", 30)
+            # If retention_days is negative, it means persistent storage (None in Rust)
+            retention_arg = None if retention_days < 0 else retention_days
+
+            redis_config = PyRedisConfig(
+                url=args_dict.get("redis_url"),
+                pool_max=args_dict.get("redis_pool_max", 16),
+                retention_days=retention_arg,
+            )
+        args_dict["redis_config"] = redis_config
+
         # Build control plane auth config
         args_dict["control_plane_auth"] = build_control_plane_auth_config(args_dict)
 
@@ -278,6 +295,9 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            "redis_url",
+            "redis_pool_max",
+            "redis_retention_days",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",

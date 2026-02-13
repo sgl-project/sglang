@@ -42,18 +42,14 @@ class LatentPreparationStage(PipelineStage):
         """
         Prepare initial latent variables for the diffusion process.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with prepared latent variables.
         """
 
-        latent_num_frames = None
         # Adjust video length based on VAE version if needed
-        if hasattr(self, "adjust_video_length"):
-            latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.adjust_video_length(batch, server_args)
 
         batch_size = batch.batch_size
 
@@ -110,16 +106,10 @@ class LatentPreparationStage(PipelineStage):
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
         """
         Adjust video length based on VAE version.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with adjusted video length.
         """
 
         video_length = batch.num_frames
+        latent_num_frames = video_length
         use_temporal_scaling_frames = (
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )

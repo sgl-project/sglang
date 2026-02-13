@@ -1,33 +1,25 @@
 #pragma once
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-
-#include <cstddef>
+#include <sgl_kernel/math.cuh>
 
 // Some warp primitives
 namespace device::warp {
 
+static constexpr uint32_t kFullMask = 0xffffffffu;
+
 template <typename T>
-__forceinline__ __device__ T reduce_sum(T val, uint32_t active_mask = 0xffffffff) {
+SGL_DEVICE T reduce_sum(T value, uint32_t active_mask = kFullMask) {
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1)
-    val += __shfl_xor_sync(active_mask, val, mask, 32);
-  return val;
+    value = value + __shfl_xor_sync(active_mask, value, mask, 32);
+  return value;
 }
 
-template <typename T, std::size_t kThreads = kWarpThreads>
-__forceinline__ __device__ T load(const void* ptr) {
-  return static_cast<const T*>(ptr)[threadIdx.x % kWarpThreads];
-}
-
-template <std::size_t kThreads = kWarpThreads, typename T>
-__forceinline__ __device__ T load(const T* ptr) {
-  return static_cast<const T*>(ptr)[threadIdx.x % kWarpThreads];
-}
-
-template <std::size_t kThreads = kWarpThreads, typename T>
-__forceinline__ __device__ void store(void* ptr, T val) {
-  static_cast<T*>(ptr)[threadIdx.x % kWarpThreads] = val;
+template <typename T>
+SGL_DEVICE T reduce_max(T value, uint32_t active_mask = kFullMask) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1)
+    value = math::max(value, __shfl_xor_sync(active_mask, value, mask, 32));
+  return value;
 }
 
 }  // namespace device::warp

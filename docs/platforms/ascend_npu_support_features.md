@@ -4,485 +4,484 @@ This section describes the basic functions and features supported by the Ascend 
 questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 If you want to know the meaning and usage of each parameter,
-click [Service Arguments](https://docs.sglang.io/advanced_features/server_arguments.html).
+click [Server Arguments](https://docs.sglang.io/advanced_features/server_arguments.html).
 
 ## Model and tokenizer
 
-| Argument                               | Defaults | Options                               |                    A2                    |                    A3                    |
-|----------------------------------------|----------|---------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--model-path`<br/>`--model`           | `None`   | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--tokenizer-path`                     | `None`   | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--tokenizer-mode`                     | `auto`   | `auto`, `slow`                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--tokenizer-worker-num`               | `1`      | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--skip-tokenizer-init`                | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--load-format`                        | `auto`   | `auto`, `safetensors`                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--model-loader-` <br/> `extra-config` | {}       | Type: str                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--trust-remote-code`                  | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--context-length`                     | `None`   | Type: int                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--is-embedding`                       | `False`  | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-multimodal`                  | `None`   | bool flag (set to enable)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--revision`                           | `None`   | Type: str                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--model-impl`                         | `None`   | `auto`, `sglang`,<br/> `transformers` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                               | Defaults | Options                               | Server supported |
+|----------------------------------------|----------|---------------------------------------|:----------------:|
+| `--model-path`<br/>`--model`           | `None`   | Type: str                             |      A2, A3      |
+| `--tokenizer-path`                     | `None`   | Type: str                             |      A2, A3      |
+| `--tokenizer-mode`                     | `auto`   | `auto`, `slow`                        |      A2, A3      |
+| `--tokenizer-worker-num`               | `1`      | Type: int                             |      A2, A3      |
+| `--skip-tokenizer-init`                | `False`  | bool flag (set to enable)             |      A2, A3      |
+| `--load-format`                        | `auto`   | `auto`, `safetensors`                 |      A2, A3      |
+| `--model-loader-` <br/> `extra-config` | {}       | Type: str                             |      A2, A3      |
+| `--trust-remote-code`                  | `False`  | bool flag (set to enable)             |      A2, A3      |
+| `--context-length`                     | `None`   | Type: int                             |      A2, A3      |
+| `--is-embedding`                       | `False`  | bool flag (set to enable)             |      A2, A3      |
+| `--enable-multimodal`                  | `None`   | bool flag (set to enable)             |      A2, A3      |
+| `--revision`                           | `None`   | Type: str                             |      A2, A3      |
+| `--model-impl`                         | `auto`   | `auto`, `sglang`,<br/> `transformers` |      A2, A3      |
 
 ## HTTP server
 
-| Argument                                                          | Defaults    | Options                         |                    A2                    |                    A3                    |
-|-------------------------------------------------------------------|-------------|---------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--host`                                                          | `127.0.0.1` | Type: str                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--port`                                                          | `30000`     | Type: int                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--skip-server-warmup`                                            | `False`     | bool flag <br/>(set to enable)  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--warmups`                                                       | `None`      | Type: str                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--nccl-port`                                                     | `None`      | Type: int                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--fastapi-root-path`                                             | `None`      | Type: int                       |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--grpc-mode`                                                     | `None`      | Type: int                       |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--checkpoint-engine-` <br/> `wait-weights-` <br/> `before-ready` | FALSE       | bool flag <br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument               | Defaults    | Options                   | Server supported |
+|------------------------|-------------|---------------------------|:----------------:|
+| `--host`               | `127.0.0.1` | Type: str                 |      A2, A3      |
+| `--port`               | `30000`     | Type: int                 |      A2, A3      |
+| `--skip-server-warmup` | `False`     | bool flag (set to enable) |      A2, A3      |
+| `--warmups`            | `None`      | Type: str                 |      A2, A3      |
+| `--nccl-port`          | `None`      | Type: int                 |      A2, A3      |
+| `--fastapi-root-path`  | `None`      | Type: str                 |      A2, A3      |
+| `--grpc-mode`          | `False`     | bool flag (set to enable) |      A2, A3      |
 
 ## Quantization and data type
 
-| Argument                                    | Defaults | Options                                 |                    A2                    |                    A3                    |
-|---------------------------------------------|----------|-----------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--dtype`                                   | `auto`   | `auto`,<br/> `float16`,<br/> `bfloat16` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--quantization`                            | `None`   | `modelslim`                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--quantization-param-path`                 | `None`   | Type: str                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--kv-cache-dtype`                          | `auto`   | `auto`                                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-fp32-lm-head`                     | FALSE    | bool flag <br/> (set to enable)         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-quant`                          |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-checkpoint-`<br/>`restore-path` |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-checkpoint-`<br/>`save-path`    |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--modelopt-export-path`                    |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--quantize-and-serve`                      |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--rl-quant-profile`                        |          |                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                    | Defaults | Options                                 | Server supported |
+|---------------------------------------------|----------|-----------------------------------------|:----------------:|
+| `--dtype`                                   | `auto`   | `auto`,<br/> `float16`,<br/> `bfloat16` |      A2, A3      |
+| `--quantization`                            | `None`   | `modelslim`                             |      A2, A3      |
+| `--quantization-param-path`                 | `None`   | Type: str                               | Special For GPU  |
+| `--kv-cache-dtype`                          | `auto`   | `auto`                                  |      A2, A3      |
+| `--enable-fp32-lm-head`                     | `False`  | bool flag <br/> (set to enable)         |      A2, A3      |
+| `--modelopt-quant`                          | `None`   | Type: str                               | Special For GPU  |
+| `--modelopt-checkpoint-`<br/>`restore-path` | `None`   | Type: str                               | Special For GPU  |
+| `--modelopt-checkpoint-`<br/>`save-path`    | `None`   | Type: str                               | Special For GPU  |
+| `--modelopt-export-path`                    | `None`   | Type: str                               | Special For GPU  |
+| `--quantize-and-serve`                      | `False`  | bool flag <br/> (set to enable)         | Special For GPU  |
+| `--rl-quant-profile`                        | `None`   | Type: str                               | Special For GPU  |
 
 ## Memory and scheduling
 
-| Argument                                            | Defaults | Options                        |                    A2                    |                    A3                    |
-|-----------------------------------------------------|----------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--mem-fraction-static`                             | `None`   | Type: float                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-running-requests`                            | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--prefill-max-requests`                            | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-queued-requests`                             | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-total-tokens`                                | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--chunked-prefill-size`                            | `None`   | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-prefill-tokens`                              | `16384`  | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--schedule-policy`                                 | `fcfs`   | `lpm`, `fcfs`                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-priority-`<br/>`scheduling`               | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--schedule-low-priority-`<br/>`values-first`       | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--priority-scheduling-`<br/>`preemption-threshold` | `10`     | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--schedule-conservativeness`                       | `1.0`    | Type: float                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--page-size`                                       | `128`    | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hybrid-kvcache-ratio`                            | `None`   | Optional[float]                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-dynamic-chunking`                         |          |                                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                            | Defaults | Options                        | Server supported |
+|-----------------------------------------------------|----------|--------------------------------|:----------------:|
+| `--mem-fraction-static`                             | `None`   | Type: float                    |      A2, A3      |
+| `--max-running-requests`                            | `None`   | Type: int                      |      A2, A3      |
+| `--prefill-max-requests`                            | `None`   | Type: int                      |      A2, A3      |
+| `--max-queued-requests`                             | `None`   | Type: int                      |      A2, A3      |
+| `--max-total-tokens`                                | `None`   | Type: int                      |      A2, A3      |
+| `--chunked-prefill-size`                            | `None`   | Type: int                      |      A2, A3      |
+| `--max-prefill-tokens`                              | `16384`  | Type: int                      |      A2, A3      |
+| `--schedule-policy`                                 | `fcfs`   | `lpm`, `fcfs`                  |      A2, A3      |
+| `--enable-priority-`<br/>`scheduling`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--schedule-low-priority-`<br/>`values-first`       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--priority-scheduling-`<br/>`preemption-threshold` | `10`     | Type: int                      |      A2, A3      |
+| `--schedule-conservativeness`                       | `1.0`    | Type: float                    |      A2, A3      |
+| `--page-size`                                       | `128`    | Type: int                      |      A2, A3      |
+| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
+| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
 ## Runtime options
 
-| Argument                                           | Defaults | Options                   |                    A2                    |                    A3                    |
-|----------------------------------------------------|----------|---------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--device`                                         | `None`   | Type: str                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--pp-async-batch-depth`                           | `None`   | Type: int                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--stream-interval`                                | `1`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--stream-output`                                  | `False`  | bool flag (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--random-seed`                                    | `None`   | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--watchdog-timeout`                               | `300`    | Type: float               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--soft-watchdog-timeout`                          | `300`    | Type: float               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--dist-timeout`                                   | `None`   | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--base-gpu-id`                                    | `0`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--gpu-id-step`                                    | `1`      | Type: int                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--custom-sigquit-handler`                         | `{}`     |                           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                           | Defaults | Options                   | Server supported |
+|----------------------------------------------------|----------|---------------------------|:----------------:|
+| `--device`                                         | `None`   | Type: str                 |      A2, A3      |
+| `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
+| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
+| `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
+| `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
+| `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
+| `--stream-output`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
+| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
+| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--watchdog-timeout`                               | `300`    | Type: float               |      A2, A3      |
+| `--soft-watchdog-timeout`                          | `300`    | Type: float               |      A2, A3      |
+| `--dist-timeout`                                   | `None`   | Type: int                 |      A2, A3      |
+| `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
+| `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
+| `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| `--custom-sigquit-handler`                         | `None`   | Optional[Callable]        |      A2, A3      |
 
 ## Logging
 
-| Argument                                           | Defaults          | Options                        |                    A2                    |                    A3                    |
-|----------------------------------------------------|-------------------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--log-level`                                      | `info`            | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-level-http`                                 | `None`            | Type: str                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-requests`                                   | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-requests-level`                             | `2`               | `0`, `1`, `2`, `3`             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--log-requests-format`                            | text              | text, json                     |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--crash-dump-folder`                              | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--crash-on-nan`                                   | `False`           | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-metrics-for-`<br/>`all-schedulers`       | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tokenizer-metrics-`<br/>`custom-labels-header`  | `x-custom-labels` | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tokenizer-metrics-`<br/>`allowed-custom-labels` | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-time-to-`<br/>`first-token`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-inter-token-`<br/>`latency`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--bucket-e2e-request-`<br/>`latency`              | `None`            | List[float]                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--collect-tokens-`<br/>`histogram`                | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--prompt-tokens-buckets`                          | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--generation-tokens-buckets`                      | `None`            | List[str]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--gc-warning-threshold-secs`                      | `0.0`             | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--decode-log-interval`                            | `40`              | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-request-time-`<br/>`stats-logging`       | `False`           | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--kv-events-config`                               | `None`            | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                           | Defaults          | Options                        | Server supported |
+|----------------------------------------------------|-------------------|--------------------------------|:----------------:|
+| `--log-level`                                      | `info`            | Type: str                      |      A2, A3      |
+| `--log-level-http`                                 | `None`            | Type: str                      |      A2, A3      |
+| `--log-requests`                                   | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--log-requests-level`                             | `2`               | `0`, `1`, `2`, `3`             |      A2, A3      |
+| `--log-requests-format`                            | text              | text, json                     |      A2, A3      |
+| `--crash-dump-folder`                              | `None`            | Type: str                      |      A2, A3      |
+| `--enable-metrics`                                 | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-metrics-for-`<br/>`all-schedulers`       | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--tokenizer-metrics-`<br/>`custom-labels-header`  | `x-custom-labels` | Type: str                      |      A2, A3      |
+| `--tokenizer-metrics-`<br/>`allowed-custom-labels` | `None`            | List[str]                      |      A2, A3      |
+| `--bucket-time-to-`<br/>`first-token`              | `None`            | List[float]                    |      A2, A3      |
+| `--bucket-inter-token-`<br/>`latency`              | `None`            | List[float]                    |      A2, A3      |
+| `--bucket-e2e-request-`<br/>`latency`              | `None`            | List[float]                    |      A2, A3      |
+| `--collect-tokens-`<br/>`histogram`                | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--prompt-tokens-buckets`                          | `None`            | List[str]                      |      A2, A3      |
+| `--generation-tokens-buckets`                      | `None`            | List[str]                      |      A2, A3      |
+| `--gc-warning-threshold-secs`                      | `0.0`             | Type: float                    |      A2, A3      |
+| `--decode-log-interval`                            | `40`              | Type: int                      |      A2, A3      |
+| `--enable-request-time-`<br/>`stats-logging`       | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--kv-events-config`                               | `None`            | Type: str                      | Special for GPU  |
+| `--enable-trace`                                   | `False`           | bool flag<br/> (set to enable) |      A2, A3      |
+| `--oltp-traces-endpoint`                           | `localhost:4317`  | Type: str                      |      A2, A3      |
 
 ## RequestMetricsExporter configuration
 
-| Argument                              | Defaults | Options |                   A2                   |                   A3                   |
-|---------------------------------------|----------|---------|:--------------------------------------:|:--------------------------------------:|
-| `--export-metrics-to-`<br/>`file`     | FALSE    |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--export-metrics-to-`<br/>`file-dir` |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                              | Defaults | Options                        | Server supported |
+|---------------------------------------|----------|--------------------------------|:----------------:|
+| `--export-metrics-to-`<br/>`file`     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--export-metrics-to-`<br/>`file-dir` | `None`   | Type: str                      |      A2, A3      |
 
 ## API related
 
-| Argument                | Defaults  | Options                                                                                                                         |                    A2                    |                    A3                    |
-|-------------------------|-----------|---------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--api-key`             | `None`    | Type: str                                                                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--served-model-name`   | `None`    | Type: str                                                                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--weight-version`      | `default` | Type: str                                                                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--chat-template`       | `None`    | Type: str                                                                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--completion-template` | `None`    | Type: str                                                                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-cache-report` | `True`    | bool flag<br/> (set to enable)                                                                                                  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--reasoning-parser`    | `None`    | `deepseek-r1`,<br/> `deepseek-v3`,<br/> `glm45`,<br/> `gpt-oss`,<br/> `kimi`,<br/> `qwen3`,<br/> `qwen3-thinking`,<br/> `step3` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--tool-call-parser`    | `None`    | `llama3`,`qwen`                                                                                                                 | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--sampling-defaults`   | `model`   | `openai`, `model`                                                                                                               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tool-server`         | `None`    | Type: str                                                                                                                       |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                | Defaults  | Options                        | Server supported |
+|-------------------------|-----------|--------------------------------|:----------------:|
+| `--api-key`             | `None`    | Type: str                      |      A2, A3      |
+| `--admin-api-key`       | `None`    | Type: str                      |      A2, A3      |
+| `--served-model-name`   | `None`    | Type: str                      |      A2, A3      |
+| `--weight-version`      | `default` | Type: str                      |      A2, A3      |
+| `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
+| `--completion-template` | `None`    | Type: str                      |      A2, A3      |
+| `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
+| `--reasoning-parser`    | `None`    | `deepseek-r1`                  |      A2, A3      |
+| `--tool-call-parser`    | `None`    | `llama`,`pythonic`             |      A2, A3      |
+| `--sampling-defaults`   | `model`   | `openai`, `model`              |      A2, A3      |
 
 ## Data parallelism
 
-| Argument                               | Defaults      | Options                                                     |                    A2                    |                    A3                    |
-|----------------------------------------|---------------|-------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--load-balance-method`                | `round_robin` | `round_robin`,<br/> `shortest_queue`,<br/> `minimum_tokens` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                               | Defaults      | Options                                                   | Server supported |
+|----------------------------------------|---------------|-----------------------------------------------------------|:----------------:|
+| `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                 |      A2, A3      |
+| `--load-balance-method`                | `round_robin` | `round_robin`,<br/> `total_requests`,<br/> `total_tokens` |      A2, A3      |
+| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                            |      A2, A3      |
 
 ## Multi-node distributed serving
 
-| Argument                                  | Defaults | Options   |                    A2                    |                    A3                    |
-|-------------------------------------------|----------|-----------|:----------------------------------------:|:----------------------------------------:|
-| `--dist-init-addr`<br/>`--nccl-init-addr` | `None`   | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--nnodes`                                | `1`      | Type: int | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--node-rank`                             | `0`      | Type: int | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                                  | Defaults | Options   | Server supported |
+|-------------------------------------------|----------|-----------|:----------------:|
+| `--dist-init-addr`<br/>`--nccl-init-addr` | `None`   | Type: str |      A2, A3      |
+| `--nnodes`                                | `1`      | Type: int |      A2, A3      |
+| `--node-rank`                             | `0`      | Type: int |      A2, A3      |
 
 ## Model override args
 
-| Argument                             | Defaults | Options   |                    A2                    |                    A3                    |
-|--------------------------------------|----------|-----------|:----------------------------------------:|:----------------------------------------:|
-| `--json-model-override-`<br/>`args`  | `{}`     | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--preferred-sampling-`<br/>`params` | `None`   | Type: str | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                             | Defaults | Options   | Server supported |
+|--------------------------------------|----------|-----------|:----------------:|
+| `--json-model-override-`<br/>`args`  | `{}`     | Type: str |      A2, A3      |
+| `--preferred-sampling-`<br/>`params` | `None`   | Type: str |      A2, A3      |
 
 ## LoRA
 
-| Argument                 | Defaults | Options                                                                                                                                                     |                    A2                    |                    A3                    |
-|--------------------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--enable-lora`          | `False`  | Bool flag <br/>(set to enable)                                                                                                                              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-lora-rank`        | `None`   | Type: int                                                                                                                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--lora-target-modules`  | `None`   | `q_proj`, <br/>`k_proj`,<br/> `v_proj`,<br/> `o_proj`,<br/> `gate_proj`,<br/> `up_proj`,<br/> `down_proj`,<br/> `qkv_proj`,<br/> `gate_up_proj`,<br/> `all` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--lora-paths`           | `None`   | Type: List[str] /<br/> JSON objects                                                                                                                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-loras-per-batch`  | `8`      | Type: int                                                                                                                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-loaded-loras`     | `None`   | Type: int                                                                                                                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--lora-eviction-policy` | `lru`    | `lru`,<br/> `fifo`                                                                                                                                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--lora-backend`         | `triton` | `triton`,<br/> `csgmv`                                                                                                                                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--max-lora-chunk-size`  | `16`     | `16`, `32`,<br/> `64`, `128`                                                                                                                                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                 | Defaults | Options                             | Server supported |
+|--------------------------|----------|-------------------------------------|:----------------:|
+| `--enable-lora`          | `False`  | Bool flag <br/>(set to enable)      |      A2, A3      |
+| `--max-lora-rank`        | `None`   | Type: int                           |      A2, A3      |
+| `--lora-target-modules`  | `None`   | `all`                               |      A2, A3      |
+| `--lora-paths`           | `None`   | Type: List[str] /<br/> JSON objects |      A2, A3      |
+| `--max-loras-per-batch`  | `8`      | Type: int                           |      A2, A3      |
+| `--max-loaded-loras`     | `None`   | Type: int                           |      A2, A3      |
+| `--lora-eviction-policy` | `lru`    | `lru`,<br/> `fifo`                  |      A2, A3      |
+| `--lora-backend`         | `triton` | `triton`                            |      A2, A3      |
+| `--max-lora-chunk-size`  | `16`     | `16`, `32`,<br/> `64`, `128`        | Special for GPU  |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
 
-| Argument                               | Defaults          | Options                                                                                         |                    A2                    |                    A3                    |
-|----------------------------------------|-------------------|-------------------------------------------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--attention-backend`                  | `None`            | `ascend`                                                                                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--prefill-attention-backend`          | `None`            | `ascend`                                                                                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--decode-attention-backend`           | `None`            | `ascend`                                                                                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--sampling-backend`                   | `None`            | `pytorch`,<br/>`ascend`                                                                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--grammar-backend`                    | `None`            | `xgrammar`                                                                                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--mm-attention-backend`               | `None`            | `ascend_attn`                                                                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--nsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/> `fa3`,<br/> `tilelang`,<br/> `aiter`            |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--nsa-decode-backend`                 | `flashmla_kv`     | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/> `tilelang`,<br/> `aiter`               |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/> `cutlass`,<br/> `triton`,<br/> `aiter` |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-flashinfer-`<br/>`autotune` | `False`           | bool flag<br/> (set to enable)                                                                  |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                               | Defaults          | Options                                                                                        | Server supported |
+|----------------------------------------|-------------------|------------------------------------------------------------------------------------------------|:----------------:|
+| `--attention-backend`                  | `None`            | `ascend`                                                                                       |      A2, A3      |
+| `--prefill-attention-backend`          | `None`            | `ascend`                                                                                       |      A2, A3      |
+| `--decode-attention-backend`           | `None`            | `ascend`                                                                                       |      A2, A3      |
+| `--sampling-backend`                   | `None`            | `pytorch`,<br/>`ascend`                                                                        |      A2, A3      |
+| `--grammar-backend`                    | `None`            | `xgrammar`                                                                                     |      A2, A3      |
+| `--mm-attention-backend`               | `None`            | `ascend_attn`                                                                                  |      A2, A3      |
+| `--nsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/>`fa3`,<br/> `tilelang`,<br/> `aiter`            | Special for GPU  |
+| `--nsa-decode-backend`                 | `fa3`             | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/>`tilelang`,<br/> `aiter`               | Special for GPU  |
+| `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
+| `--disable-flashinfer-`<br/>`autotune` | `False`           | bool flag<br/> (set to enable)                                                                 | Special for GPU  |
 
 ## Speculative decoding
 
-| Argument                                                         | Defaults  | Options                                                               |                    A2                    |                    A3                    |
-|------------------------------------------------------------------|-----------|-----------------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--speculative-algorithm`                                        | `None`    | `EAGLE`,<br/> `EAGLE3`,<br/> `NEXTN`,<br/> `STANDALONE`, <br/>`NGRAM` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                                                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--speculative-draft-load-format`                                |           |                                                                       |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--speculative-num-steps`                                        | `None`    | Type: int                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-eagle-topk`                                       | `None`    | Type: int                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float                                                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float                                                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-token-map`                                        | `None`    | Type: str                                                             |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode`                                              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-moe-runner-`<br/>`backend`                        | `None`    |                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    |                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-draft-attention-backend`                          |           |                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--speculative-draft-model-quantization`                         |           |                                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                                                         | Defaults  | Options                  | Server supported |
+|------------------------------------------------------------------|-----------|--------------------------|:----------------:|
+| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`   |      A2, A3      |
+| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                |      A2, A3      |
+| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                |      A2, A3      |
+| `--speculative-draft-load-format`                                | `None`    | `auto`                   |      A2, A3      |
+| `--speculative-num-steps`                                        | `None`    | Type: int                |      A2, A3      |
+| `--speculative-eagle-topk`                                       | `None`    | Type: int                |      A2, A3      |
+| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                |      A2, A3      |
+| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float              | Special for GPU  |
+| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float              | Special for GPU  |
+| `--speculative-token-map`                                        | `None`    | Type: str                |      A2, A3      |
+| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode` |      A2, A3      |
+| `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                   |      A2, A3      |
+| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`          |      A2, A3      |
+| `--speculative-draft-attention-backend`                          | `None`    | `ascend`                 |      A2, A3      |
+| `--speculative-draft-model-quantization`                         | `None`    | `unquant`                |      A2, A3      |
 
 ## Ngram speculative decoding
 
-| Argument                                           | Defaults   | Options            |                   A2                   |                   A3                   |
-|----------------------------------------------------|------------|--------------------|:--------------------------------------:|:--------------------------------------:|
-| `--speculative-ngram-`<br/>`min-match-window-size` | `1`        | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`max-match-window-size` | `12`       | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                                           | Defaults   | Options            | Server supported |
+|----------------------------------------------------|------------|--------------------|:----------------:|
+| `--speculative-ngram-`<br/>`min-match-window-size` | `1`        | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`max-match-window-size` | `12`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental   |
+| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          |   Experimental   |
 
 ## Expert parallelism
 
-| Argument                                              | Defaults  | Options                                     |                    A2                    |                    A3                    |
-|-------------------------------------------------------|-----------|---------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `tp-size` | Type: int                                   |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--moe-runner-backend`                                | `auto`    | `auto`                                      |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--deepep-config`                                     | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--init-expert-location`                              | `trivial` | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag <br/>(set to enable)              |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--elastic-ep-backend`                                | None      | N/A                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--mooncake-ib-device`                                | None      | N/A                                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                              | Defaults  | Options                                     | Server supported |
+|-------------------------------------------------------|-----------|---------------------------------------------|:----------------:|
+| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   |      A2, A3      |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` |      A2, A3      |
+| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            |      A2, A3      |
+| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      | Special for GPU  |
+| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              | Special for GPU  |
+| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   |      A2, A3      |
+| `--deepep-config`                                     | `None`    | Type: str                                   | Special for GPU  |
+| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |      A2, A3      |
+| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |      A2, A3      |
+| `--init-expert-location`                              | `trivial` | Type: str                                   |      A2, A3      |
+| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
+| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |      A2, A3      |
+| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |      A2, A3      |
+| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |      A2, A3      |
+| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                   |      A2, A3      |
+| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   |      A2, A3      |
+| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          | Special for GPU  |
+| `--mooncake-ib-device`                                | `None`    | Type: str                                   | Special for GPU  |
 
 ## Mamba Cache
 
-| Argument                     | Defaults  | Options                                       |                   A2                   |                   A3                   |
-|------------------------------|-----------|-----------------------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--max-mamba-cache-size`     | `None`    | Type: int                                     | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--mamba-ssm-dtype`          | `float32` | `float32`,<br/> `bfloat16`                    | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--mamba-full-memory-ratio`  | `0.2`     | Type: float                                   | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--mamba-scheduler-strategy` | `auto`    | `auto`, <br/>`no_buffer`,<br/> `extra_buffer` | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--mamba-track-interval`     | `256`     | Type: int                                     | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                     | Defaults  | Options                                       | Server supported |
+|------------------------------|-----------|-----------------------------------------------|:----------------:|
+| `--max-mamba-cache-size`     | `None`    | Type: int                                     |      A2, A3      |
+| `--mamba-ssm-dtype`          | `float32` | `float32`,<br/> `bfloat16`                    |      A2, A3      |
+| `--mamba-full-memory-ratio`  | `0.2`     | Type: float                                   |      A2, A3      |
+| `--mamba-scheduler-strategy` | `auto`    | `auto`, <br/>`no_buffer`,<br/> `extra_buffer` |      A2, A3      |
+| `--mamba-track-interval`     | `256`     | Type: int                                     |      A2, A3      |
 
 ## Hierarchical cache
 
-| Argument                                        | Defaults        | Options                                                            |                    A2                    |                    A3                    |
-|-------------------------------------------------|-----------------|--------------------------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable)                                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-ratio`                               | `2.0`           | Type: float                                                        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-size`                                | `0`             | Type: int                                                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-write-policy`                        | `write_through` | `write_back`,<br/> `write_through`,<br/> `write_through_selective` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--radix-eviction-policy`                       | `lru`           | `lru`, `lfu`                                                       | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`                                                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/> `page_first_kv_split`                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/> `timeout`                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                          |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                        | Defaults        | Options                                                             | Server supported |
+|-------------------------------------------------|-----------------|---------------------------------------------------------------------|:----------------:|
+| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable)                                      |      A2, A3      |
+| `--hicache-ratio`                               | `2.0`           | Type: float                                                         |      A2, A3      |
+| `--hicache-size`                                | `0`             | Type: int                                                           |      A2, A3      |
+| `--hicache-write-policy`                        | `write_through` | `write_back`,<br/> `write_through`,<br/>  `write_through_selective` |      A2, A3      |
+| `--radix-eviction-policy`                       | `lru`           | `lru`,                                     `lfu`                    |      A2, A3      |
+| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                  |      A2, A3      |
+| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`    |      A2, A3      |
+| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                              |      A2, A3      |
+| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/>  `timeout`                | Special for GPU  |
+| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                           | Special for GPU  |
 
 ## LMCache
 
-| Argument           | Defaults | Options                        |                   A2                   |                   A3                   |
-|--------------------|----------|--------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--enable-lmcache` | `False`  | bool flag<br/> (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-
-## Ktransformer server args
-
-| Argument                                     | Defaults | Options |                   A2                   |                   A3                   |
-|----------------------------------------------|----------|---------|:--------------------------------------:|:--------------------------------------:|
-| `--kt-weight-path`                           |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--kt-method`                                |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--kt-cpuinfer`                              |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--kt-threadpool-count`                      |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--kt-num-gpu-experts`                       |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--kt-max-deferred-`<br/>`experts-per-token` |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-
-## Double Sparsity
-
-| Argument                              | Defaults | Options                        |                   A2                   |                   A3                   |
-|---------------------------------------|----------|--------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--enable-double-sparsity`            | `False`  | bool flag<br/> (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--ds-channel-config-path`            | `None`   | Type: str                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--ds-heavy-channel-num`              | `32`     | Type: int                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--ds-heavy-token-num`                | `256`    | Type: int                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--ds-heavy-channel-type`             | `qk`     | Type: str                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--ds-sparse-decode-`<br/>`threshold` | `4096`   | Type: int                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument           | Defaults | Options                        | Server supported |
+|--------------------|----------|--------------------------------|:----------------:|
+| `--enable-lmcache` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 
 ## Offloading
 
-| Argument                  | Defaults | Options   |                    A2                    |                    A3                    |
-|---------------------------|----------|-----------|:----------------------------------------:|:----------------------------------------:|
-| `--cpu-offload-gb`        | `0`      | Type: int | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--offload-group-size`    | `-1`     | Type: int |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--offload-num-in-group`  | `1`      | Type: int |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--offload-prefetch-step` | `1`      | Type: int |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--offload-mode`          | `cpu`    | Type: str |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                  | Defaults | Options   | Server supported |
+|---------------------------|----------|-----------|:----------------:|
+| `--cpu-offload-gb`        | `0`      | Type: int |      A2, A3      |
+| `--offload-group-size`    | `-1`     | Type: int |      A2, A3      |
+| `--offload-num-in-group`  | `1`      | Type: int |      A2, A3      |
+| `--offload-prefetch-step` | `1`      | Type: int |      A2, A3      |
+| `--offload-mode`          | `cpu`    | Type: str |      A2, A3      |
 
 ## Args for multi-item scoring
 
-| Argument                         | Defaults | Options   |                   A2                   |                   A3                   |
-|----------------------------------|----------|-----------|:--------------------------------------:|:--------------------------------------:|
-| `--multi-item-scoring-delimiter` | `None`   | Type: int | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                         | Defaults | Options   | Server supported |
+|----------------------------------|----------|-----------|:----------------:|
+| `--multi-item-scoring-delimiter` | `None`   | Type: int |      A2, A3      |
 
 ## Optimization/debug options
 
-| Argument                                                | Defaults | Options                        |                    A2                    |                    A3                    |
-|---------------------------------------------------------|----------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--cuda-graph-max-bs`                                   | `None`   | Type: int                      |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--cuda-graph-bs`                                       | `None`   | List[int]                      |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disable-tokenizer-`<br/>`batch-encode`               | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-outlines-`<br/>`disk-cache`                  | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                    |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--torch-compile-max-bs`                                | `32`     | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `4096`   | Type: int                      |  **<span style="color: red;">×</span>**  | **<span style="color: green;">√</span>** |
-| `--torchao-config`                                      | ``       | Type: str                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--num-continuous-`<br/>`decode-steps`                  | `1`      | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-shared-`<br/>`experts-fusion`                | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-chunked-`<br/>`prefix-cache`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--numa-node`                                           | `None`   | List[int]                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--enable-fused-qk-`<br/>`norm-rope`                    |          |                                |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
+| Argument                                                | Defaults | Options                        | Server supported |
+|---------------------------------------------------------|----------|--------------------------------|:----------------:|
+| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--cuda-graph-max-bs`                                   | `None`   | Type: int                      |      A2, A3      |
+| `--cuda-graph-bs`                                       | `None`   | List[int]                      |      A2, A3      |
+| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-tokenizer-`<br/>`batch-encode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-outlines-`<br/>`disk-cache`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable) |     Planned      |
+| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                    |     Planned      |
+| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |      A2, A3      |
+| `--torch-compile-max-bs`                                | `32`     | Type: int                      |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `4096`   | Type: int                      |      A2, A3      |
+| `--torchao-config`                                      | ``       | Type: str                      | Special for GPU  |
+| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                      | Special for GPU  |
+| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                      | Special for GPU  |
+| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--disable-shared-`<br/>`experts-fusion`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-chunked-`<br/>`prefix-cache`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |      A2, A3      |
+| `--numa-node`                                           | `None`   | List[int]                      |      A2, A3      |
+| `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
+| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
+| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 
 ## Dynamic batch tokenizer
 
-| Argument                                         | Defaults | Options                        |                    A2                    |                    A3                    |
-|--------------------------------------------------|----------|--------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--enable-dynamic-`<br/>`batch-tokenizer`        | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--dynamic-batch-`<br/>`tokenizer-batch-size`    | `32`     | Type: int                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--dynamic-batch-`<br/>`tokenizer-batch-timeout` | `0.002`  | Type: float                    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                                         | Defaults | Options                        | Server supported |
+|--------------------------------------------------|----------|--------------------------------|:----------------:|
+| `--enable-dynamic-`<br/>`batch-tokenizer`        | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--dynamic-batch-`<br/>`tokenizer-batch-size`    | `32`     | Type: int                      |      A2, A3      |
+| `--dynamic-batch-`<br/>`tokenizer-batch-timeout` | `0.002`  | Type: float                    |      A2, A3      |
 
 ## Debug tensor dumps
 
-| Argument                                   | Defaults | Options   |                   A2                   |                   A3                   |
-|--------------------------------------------|----------|-----------|:--------------------------------------:|:--------------------------------------:|
-| `--debug-tensor-dump-`<br/>`output-folder` | `None`   | Type: str | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--debug-tensor-dump-`<br/>`layers`        |          |           | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--debug-tensor-dump-`<br/>`input-file`    | `None`   | Type: str | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--debug-tensor-dump-`<br/>`inject`        | `False`  | Type: str | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                                   | Defaults | Options   | Server supported |
+|--------------------------------------------|----------|-----------|:----------------:|
+| `--debug-tensor-dump-`<br/>`output-folder` | `None`   | Type: str |      A2, A3      |
+| `--debug-tensor-dump-`<br/>`layers`        | `None`   | List[int] |      A2, A3      |
+| `--debug-tensor-dump-`<br/>`input-file`    | `None`   | Type: str |      A2, A3      |
 
 ## PD disaggregation
 
-| Argument                                                | Defaults   | Options                                             |                    A2                    |                    A3                    |
-|---------------------------------------------------------|------------|-----------------------------------------------------|:----------------------------------------:|:----------------------------------------:|
-| `--disaggregation-mode`                                 | `null`     | `null`,<br/> `prefill`,<br/> `decode`               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disaggregation-transfer-backend`                     | `mooncake` | `mooncake`,<br/> `nixl`,<br/> `ascend`,<br/> `fake` | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disaggregation-decode-tp`                            | `None`     | Type: int                                           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-decode-dp`                            | `None`     | Type: int                                           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-prefill-pp`                           | `1`        | Type: int                                           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-ib-device`                            | `None`     | Type: str                                           |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)                      |  **<span style="color: red;">×</span>**  |  **<span style="color: red;">×</span>**  |
-| `--num-reserved-decode-tokens`                          | `512`      | Type: int                                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                                                | Defaults   | Options                               | Server supported |
+|---------------------------------------------------------|------------|---------------------------------------|:----------------:|
+| `--disaggregation-mode`                                 | `null`     | `null`,<br/> `prefill`,<br/> `decode` |      A2, A3      |
+| `--disaggregation-transfer-backend`                     | `mooncake` | `ascend`                              |      A2, A3      |
+| `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
+| `--disaggregation-decode-tp`                            | `None`     | Type: int                             |      A2, A3      |
+| `--disaggregation-decode-dp`                            | `None`     | Type: int                             |      A2, A3      |
+| `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
+| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
+| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
+| `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
+| `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
 ## Encode prefill disaggregation
 
-| Argument                     | Defaults | Options |                   A2                   |                   A3                   |
-|------------------------------|----------|---------|:--------------------------------------:|:--------------------------------------:|
-| `--encoder-only`             |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--language-only`            |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--encoder-transfer-backend` |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--encoder-urls`             |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                     | Defaults           | Options                                                        | Server supported |
+|------------------------------|--------------------|----------------------------------------------------------------|:----------------:|
+| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
+| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
+| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` |      A2, A3      |
+| `--encoder-urls`             | `[]`               | List[str]                                                      |      A2, A3      |
 
 ## Custom weight loader
 
-| Argument                                                                | Defaults | Options                        |                    A2                    | A3                                       |
-|-------------------------------------------------------------------------|----------|--------------------------------|:----------------------------------------:|------------------------------------------|
-| `--custom-weight-loader`                                                | `None`   | List[str]                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--weight-loader-disable-`<br/>`mmap`                                   | `False`  | bool flag<br/> (set to enable) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| `--remote-instance-weight-`<br/>`loader-seed-instance-ip`               | `None`   | Type: str                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-seed-instance-service-port`     | `None`   | Type: int                      |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-send-weights-group-ports`       | `None`   | Type: JSON<br/> list           |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-backend`                        |          |                                |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
-| `--remote-instance-weight-`<br/>`loader-start-seed-via-transfer-engine` |          |                                |  **<span style="color: red;">×</span>**  | **<span style="color: red;">×</span>**   |
+| Argument                                                                | Defaults | Options                         | Server supported |
+|-------------------------------------------------------------------------|----------|---------------------------------|:----------------:|
+| `--custom-weight-loader`                                                | `None`   | List[str]                       |      A2, A3      |
+| `--weight-loader-disable-`<br/>`mmap`                                   | `False`  | bool flag<br/> (set to enable)  |      A2, A3      |
+| `--remote-instance-weight-`<br/>`loader-seed-instance-ip`               | `None`   | Type: str                       |      A2, A3      |
+| `--remote-instance-weight-`<br/>`loader-seed-instance-service-port`     | `None`   | Type: int                       |      A2, A3      |
+| `--remote-instance-weight-`<br/>`loader-send-weights-group-ports`       | `None`   | Type: JSON<br/> list            |      A2, A3      |
+| `--remote-instance-weight-`<br/>`loader-backend`                        | `nccl`   | `transfer_engine`, <br/> `nccl` |      A2, A3      |
+| `--remote-instance-weight-`<br/>`loader-start-seed-via-transfer-engine` | `False`  | bool flag<br/> (set to enable)  | Special for GPU  |
 
 ## For PD-Multiplexing
 
-| Argument              | Defaults | Options                        |                   A2                   |                   A3                   |
-|-----------------------|----------|--------------------------------|:--------------------------------------:|:--------------------------------------:|
-| `--enable-pdmux`      | `False`  | bool flag<br/> (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--pdmux-config-path` | `None`   | Type: str                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--sm-group-num`      | `8`      | Type: int                      | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument              | Defaults | Options                        | Server supported |
+|-----------------------|----------|--------------------------------|:----------------:|
+| `--enable-pdmux`      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| `--pdmux-config-path` | `None`   | Type: str                      | Special for GPU  |
+| `--sm-group-num`      | `8`      | Type: int                      | Special for GPU  |
 
 ## For Multi-Modal
 
-| Argument                                      | Defaults | Options           | A2                                       | A3                                       |
-|-----------------------------------------------|----------|-------------------|------------------------------------------|------------------------------------------|
-| `--mm-max-concurrent-calls`                   |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
-| `--mm-per-request-timeout`                    |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
-| `--enable-broadcast-mm-`<br/>`inputs-process` |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
-| `--mm-process-config`                         |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
-| `--mm-enable-dp-encoder`                      |          |                   | **<span style="color: red;">×</span>**   | **<span style="color: red;">×</span>**   |
-| `--limit-mm-data-per-request`                 | `None`   | Type: JSON / Dict | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Argument                                      | Defaults | Options                        | Server supported |
+|-----------------------------------------------|----------|--------------------------------|:----------------:|
+| `--mm-max-concurrent-calls`                   | 32       | Type: int                      |      A2, A3      |
+| `--mm-per-request-timeout`                    | 10.0     | Type: float                    |      A2, A3      |
+| `--enable-broadcast-mm-`<br/>`inputs-process` | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--mm-process-config`                         | `None`   | Type: JSON / Dict              |      A2, A3      |
+| `--mm-enable-dp-encoder`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--limit-mm-data-per-request`                 | `None`   | Type: JSON / Dict              |      A2, A3      |
 
 ## For checkpoint decryption
 
-| Argument                        | Defaults | Options |                   A2                   |                   A3                   |
-|---------------------------------|----------|---------|:--------------------------------------:|:--------------------------------------:|
-| `--decrypted-config-file`       |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--decrypted-draft-config-file` |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
-| `--enable-prefix-mm-cache`      |          |         | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                        | Defaults | Options                        | Server supported |
+|---------------------------------|----------|--------------------------------|:----------------:|
+| `--decrypted-config-file`       | `None`   | Type: str                      |      A2, A3      |
+| `--decrypted-draft-config-file` | `None`   | Type: str                      |      A2, A3      |
+| `--enable-prefix-mm-cache`      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
 ## For deterministic inference
 
-| Argument                                  | Defaults | Options                        | A2                                     | A3                                     |
-|-------------------------------------------|----------|--------------------------------|----------------------------------------|----------------------------------------|
-| `--enable-deterministic-`<br/>`inference` | `False`  | bool flag<br/> (set to enable) | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument                                  | Defaults | Options                        | Server supported |
+|-------------------------------------------|----------|--------------------------------|:----------------:|
+| `--enable-deterministic-`<br/>`inference` | `False`  | bool flag<br/> (set to enable) |     Planned      |
 
 ## For registering hooks
 
-| Argument          | Defaults | Options         | A2                                     | A3                                     |
-|-------------------|----------|-----------------|----------------------------------------|----------------------------------------|
-| `--forward-hooks` | `None`   | Type: JSON list | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument          | Defaults | Options         | Server supported |
+|-------------------|----------|-----------------|:----------------:|
+| `--forward-hooks` | `None`   | Type: JSON list |      A2, A3      |
 
 ## Configuration file support
 
-| Argument   | Defaults | Options | A2                                     | A3                                     |
-|------------|----------|---------|----------------------------------------|----------------------------------------|
-| `--config` |          | yaml    | **<span style="color: red;">×</span>** | **<span style="color: red;">×</span>** |
+| Argument   | Defaults | Options   | Server supported |
+|------------|----------|-----------|:----------------:|
+| `--config` | `None`   | Type: str |      A2, A3      |
+
+## Other Params
+
+The following parameters are not supported because the third-party components that depend on are not compatible with the
+NPU, like Ktransformer, checkpoint-engine etc.
+
+| Argument                                                          | Defaults  | Options                   |
+|-------------------------------------------------------------------|-----------|---------------------------|
+| `--checkpoint-engine-` <br/> `wait-weights-` <br/> `before-ready` | `False`   | bool flag (set to enable) |
+| `--kt-weight-path`                                                | `None`    | Type: str                 |
+| `--kt-method`                                                     | `AMXINT4` | Type: str                 |
+| `--kt-cpuinfer`                                                   | `None`    | Type: int                 |
+| `--kt-threadpool-count`                                           | 2         | Type: int                 |
+| `--kt-num-gpu-experts`                                            | `None`    | Type: int                 |
+| `--kt-max-deferred-`<br/>`experts-per-token`                      | `None`    | Type: int                 |
+
+The following parameters have some functional deficiencies on community
+
+| Argument                              | Defaults | Options                        |
+|---------------------------------------|----------|--------------------------------|
+| `--enable-double-sparsity`            | `False`  | bool flag<br/> (set to enable) |
+| `--ds-channel-config-path`            | `None`   | Type: str                      |
+| `--ds-heavy-channel-num`              | `32`     | Type: int                      |
+| `--ds-heavy-token-num`                | `256`    | Type: int                      |
+| `--ds-heavy-channel-type`             | `qk`     | Type: str                      |
+| `--ds-sparse-decode-`<br/>`threshold` | `4096`   | Type: int                      |
+| `--tool-server`                       | `None`   | Type: str                      |

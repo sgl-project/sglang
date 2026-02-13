@@ -253,6 +253,12 @@ class EAGLEDraftExtendCudaGraphRunner:
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
 
+        # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
+        # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
+        num_tokens_for_logprob = (
+            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
+        )
+
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -263,7 +269,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             self.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [bs] * self.dp_size,
+                    [num_tokens_for_logprob] * self.dp_size,
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
@@ -279,7 +285,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             self.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [bs],
+                    [num_tokens_for_logprob],
                     dtype=torch.int32,
                     device=self.input_ids.device,
                 )
@@ -419,7 +425,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs)
+            # V1: pruned_states = bs; V2: pruned_states = num_tokens
+            if self.forward_mode.is_draft_extend_v2():
+                self.global_num_tokens_for_logprob_gpu.fill_(
+                    bs * self.num_tokens_per_bs
+                )
+            else:
+                self.global_num_tokens_for_logprob_gpu.fill_(bs)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:

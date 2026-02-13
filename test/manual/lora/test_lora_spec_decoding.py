@@ -17,28 +17,10 @@ import unittest
 
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
-    LoRAAdaptor,
-    LoRAModelCase,
+    LORA_MODELS_QWEN3,
     run_lora_multiple_batch_on_model_cases,
 )
 from sglang.test.test_utils import CustomTestCase
-
-LORA_MODELS_QWEN3 = [
-    LoRAModelCase(
-        base="Qwen/Qwen3-4B",
-        adaptors=[
-            LoRAAdaptor(
-                name="nissenj/Qwen3-4B-lora-v2",
-                prefill_tolerance=3e-1,
-            ),
-            LoRAAdaptor(
-                name="y9760210/Qwen3-4B-lora_model",
-                prefill_tolerance=3e-1,
-            ),
-        ],
-        max_loras_per_batch=2,
-    ),
-]
 
 
 class TestLoRASpecDecoding(CustomTestCase):
