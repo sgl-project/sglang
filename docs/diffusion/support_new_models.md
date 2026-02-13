@@ -103,4 +103,3 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
     - Register the configs in the central registry ([`registry.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)) via `_register_configs` to enable automatic loading and instantiation for the model. Modules are automatically loaded and injected based on the config and repository structure.
 
 By following this pattern of defining configurations and composing pipelines, you can integrate new diffusion models into SGLang with ease.
-
