@@ -430,7 +430,7 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                 checking_parameters,
                 "127.0.0.1",
                 DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000,
-                60000,
+                60010,
                 remote_instance_loader_backend,
             )
 

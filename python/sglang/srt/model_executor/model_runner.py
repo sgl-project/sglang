@@ -1134,7 +1134,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device_id = torch.device("npu", self.gpu_id)
             backend = "hccl"
         else:
-            device_id = torch.device("cpu")
+            logger.error("Only support gpu or npu.")
+            raise ValueError("Only support gpu or npu.")
         try:
             self._weights_send_group[group_name] = init_custom_process_group(
                 backend=backend,

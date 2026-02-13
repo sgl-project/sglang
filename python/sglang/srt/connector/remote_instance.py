@@ -44,8 +44,10 @@ class RemoteInstanceConnector(BaseConnector):
         master_address = parsed_url.hostname
         master_port = parsed_url.port
         group_name = f"send_weights_{instance_ip}_{master_port}_{tp_rank}"
-        backend = "hccl" if self.device.type == "npu" else "nccl"
-
+        if self.device.type == "cuda":
+            backend = "nccl"
+        elif self.device.type == "npu":
+            backend = "hccl"
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
