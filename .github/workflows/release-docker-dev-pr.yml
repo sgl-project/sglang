@@ -32,6 +32,18 @@ jobs:
             grace_blackwell: 1
             arch_tag: arm64
             version: 12.9.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            arch_tag: x86-cu13
+            version: 13.0.1
+          - runner: arm-docker-build-node
+            platform: linux/arm64
+            build_type: all
+            grace_blackwell: 1
+            arch_tag: arm64-cu13
+            version: 13.0.1
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -98,15 +110,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Create multi-arch manifest
+      - name: Create multi-arch manifests
         run: |
-          # Create PR dev manifest
+          # Create PR dev manifest (CUDA 12.9.1)
           docker buildx imagetools create \
             -t lmsysorg/sglang:dev-pr-${{ inputs.pr_number }} \
             lmsysorg/sglang:dev-x86-pr-${{ inputs.pr_number }} \
             lmsysorg/sglang:dev-arm64-pr-${{ inputs.pr_number }}
 
-          echo "✓ Built Docker image: lmsysorg/sglang:dev-pr-${{ inputs.pr_number }}"
-          echo ""
-          echo "Usage:"
-          echo "  docker pull lmsysorg/sglang:dev-pr-${{ inputs.pr_number }}"
+          # Create PR dev manifest (CUDA 13.0.1)
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:dev-cu13-pr-${{ inputs.pr_number }} \
+            lmsysorg/sglang:dev-x86-cu13-pr-${{ inputs.pr_number }} \
+            lmsysorg/sglang:dev-arm64-cu13-pr-${{ inputs.pr_number }}
+
+          echo "✓ Built Docker images:"
+          echo "  lmsysorg/sglang:dev-pr-${{ inputs.pr_number }}        (CUDA 12.9.1)"
+          echo "  lmsysorg/sglang:dev-cu13-pr-${{ inputs.pr_number }}   (CUDA 13.0.1)"
