@@ -18,8 +18,8 @@ register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 class TestAscendL2CacheInputTextDifferent(CustomTestCase):
     """Testcase: Test enable L2 cache(--enable-hierarchical-cache), inputting different text inference requests
             will not reuse the same text.
-   [Test Category] Parameter
-   [Test Target] --enable-hierarchical-cache
+    [Test Category] Parameter
+    [Test Target] --enable-hierarchical-cache
     """
 
     @classmethod

@@ -1,10 +1,12 @@
-import requests
-import unittest
 import json
 import logging
+import unittest
+
+import requests
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -55,10 +57,7 @@ class TestEnableThinking(CustomTestCase):
         # Test model parameter; configured model returns correct name, unconfigured defaults to "default", reasoning works
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "model": self.model,
-                "prompt": 'who are you?'
-            },
+            json={"model": self.model, "prompt": "who are you?"},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
@@ -70,9 +69,7 @@ class TestEnableThinking(CustomTestCase):
         # The input is in str format
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?'
-            },
+            json={"prompt": "who are you?"},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
@@ -81,9 +78,7 @@ class TestEnableThinking(CustomTestCase):
         list_int = [1, 2, 3, 4]
         response1 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": list_int
-            },
+            json={"prompt": list_int},
         )
         logging.info(f"response1.json:{response1.json()}")
         self.assertEqual(response1.status_code, 200, f"Failed with: {response1.text}")
@@ -92,9 +87,7 @@ class TestEnableThinking(CustomTestCase):
         list_str = ["who is you", "hello world", "ABChello"]
         response2 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": list_str
-            },
+            json={"prompt": list_str},
         )
         logging.info(f"response2.json:{response2.json()}")
         self.assertEqual(response2.status_code, 200, f"Failed with: {response2.text}")
@@ -103,9 +96,7 @@ class TestEnableThinking(CustomTestCase):
         list_list_int = [[14990], [1350, 445, 14990, 1879, 899], [14623, 525, 498, 30]]
         response3 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": list_list_int
-            },
+            json={"prompt": list_list_int},
         )
         logging.info(f"response3.json:{response3.json()}")
         self.assertEqual(response3.status_code, 200, f"Failed with: {response3.text}")
@@ -114,25 +105,21 @@ class TestEnableThinking(CustomTestCase):
         # Test max_completion_tokens parameter; setting to 1 token forces immediate truncation, verify finish_reason is "length"
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                'max_tokens': 1
-            },
+            json={"prompt": "who are you?", "max_tokens": 1},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        logging.info(f"response.json_choices:{response.json()['choices'][0]['finish_reason']}")
+        logging.info(
+            f"response.json_choices:{response.json()['choices'][0]['finish_reason']}"
+        )
         # Assertion output includes length
-        self.assertEqual(response.json()['choices'][0]['finish_reason'], 'length')
+        self.assertEqual(response.json()["choices"][0]["finish_reason"], "length")
 
     def test_model_parameters_stream(self):
         # Test stream parameter; verify streaming response contains both reasoning_content and normal content chunks
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "stream": True
-            },
+            json={"prompt": "who are you?", "stream": True},
         )
         logging.info(f"response.text:{response.text}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
@@ -158,68 +145,59 @@ class TestEnableThinking(CustomTestCase):
         # Test temperature parameter; temperature=0 yields identical outputs across requests, temperature=2 yields varied outputs
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "temperature": 0
-            },
+            json={"prompt": "who are you?", "temperature": 0},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
 
         response1 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "temperature": 0
-            },
+            json={"prompt": "who are you?", "temperature": 0},
         )
         logging.info(f"response1.json:{response1.json()}")
         self.assertEqual(response1.status_code, 200, f"Failed with: {response1.text}")
         # Asser that the configuration temperature is the same and the output response is the same
-        self.assertEqual(response.json()['choices'][0]['text'], response1.json()['choices'][0]['text'])
+        self.assertEqual(
+            response.json()["choices"][0]["text"],
+            response1.json()["choices"][0]["text"]
+        )
 
         response2 = requests.post(
             f"{self.base_url}/v1/completions",
             json={
-                "prompt": 'who are you?',
-                "temperature": 2
-            },
+                "prompt": "who are you?", "temperature": 2},
         )
         logging.info(f"response2.json:{response2.json()}")
         self.assertEqual(response2.status_code, 200, f"Failed with: {response2.text}")
 
         response3 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "temperature": 2
-            },
+            json={"prompt": "who are you?", "temperature": 2},
         )
         logging.info(f"response3.json:{response3.json()}")
         self.assertEqual(response3.status_code, 200, f"Failed with: {response3.text}")
-        self.assertNotEqual(response2.json()['choices'][0]['text'], response3.json()['choices'][0]['text'])
+        self.assertNotEqual(
+            response2.json()["choices"][0]["text"],
+            response3.json()["choices"][0]["text"]
+        )
 
     def test_model_parameters_hidden_states(self):
         # Test return_hidden_states parameter; verify hidden_states field appears when enabled
         response = requests.post(
             f"{self.base_url}/v1/completions",
             json={
-                "prompt": 'who are you?',
-                "return_hidden_states": True
-            },
+                "prompt": "who are you?", "return_hidden_states": True},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertIn("hidden_states", response.json()['choices'][0])
+        self.assertIn("hidden_states", response.json()["choices"][0])
 
     def test_model_parameters_top_k(self):
         # Test top_k parameter; with k=20, outputs vary between identical requests due to token sampling
         response = requests.post(
             f"{self.base_url}/v1/completions",
             json={
-                "prompt": 'who are you?',
-                "top_k": 20
-            },
+                "prompt": "who are you?", "top_k": 20},
         )
         logging.info(f"response.json:{response.json()}")
         logging.info(f"response.text:{response.text}")
@@ -227,15 +205,15 @@ class TestEnableThinking(CustomTestCase):
 
         response1 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "top_k": 20
-            },
+            json={"prompt": "who are you?", "top_k": 20},
         )
         logging.info(f"response1.json:{response1.json()}")
         logging.info(f"response1.text:{response1.text}")
         self.assertEqual(response1.status_code, 200, f"Failed with: {response1.text}")
-        self.assertNotEqual(response.json()['choices'][0]['text'], response1.json()['choices'][0]['text'])
+        self.assertNotEqual(
+            response.json()["choices"][0]["text"],
+            response1.json()["choices"][0]["text"]
+        )
 
     def test_model_parameters_stop_token_ids(self):
         # Test stop_token_ids parameter; verify response stops at specified token ID (13 is a period) and matched_stop field is correct
@@ -245,25 +223,22 @@ class TestEnableThinking(CustomTestCase):
             json={
                 "prompt": 'who are you?',
                 "stop_token_ids": list_ids,
-                "max_tokens": 1024
+                "max_tokens": 1024,
             },
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertEqual(response.json()['choices'][0]['matched_stop'], 13)
+        self.assertEqual(response.json()["choices"][0]["matched_stop"], 13)
 
     def test_model_parameters_rid(self):
         # Test rid parameter; verify response ID matches the requested rid value '10086'
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": 'who are you?',
-                "rid": "10086"
-            },
+            json={"prompt": "who are you?", "rid": "10086"},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertEqual(response.json()['id'], '10086')
+        self.assertEqual(response.json()["id"], '10086')
 
 
 if __name__ == "__main__":
