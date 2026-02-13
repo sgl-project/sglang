@@ -854,8 +854,6 @@ def _set_envs_and_config(server_args: ServerArgs):
             )
 
     # Signal handlers can only be registered from the main thread.
-    # When launch_server is called from a background thread (e.g., in a Ray actor),
-    # skip signal registration to avoid ValueError.
     if threading.current_thread() is threading.main_thread():
         if server_args.custom_sigquit_handler is None:
             # Register the signal handler.
