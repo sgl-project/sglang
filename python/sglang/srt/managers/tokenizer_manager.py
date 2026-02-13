@@ -287,7 +287,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
             else:
-                self.processor = _processor
+                self.processor = self.mm_processor._processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
                 self._initialize_multi_item_delimiter_text()
