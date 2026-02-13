@@ -24,10 +24,7 @@ See: https://github.com/sgl-project/sglang/issues/18421
 from __future__ import annotations
 
 import logging
-import os
-import signal
 import threading
-import time
 from multiprocessing import Process
 from typing import Callable, List, Optional
 
