@@ -170,20 +170,21 @@ class ModelRunnerKVCacheMixin:
                 mamba_state_intermediate_size / (1 << 30)
             )
 
-        if (
-            server_args.disable_radix_cache
-            or server_args.max_mamba_cache_size is not None
-        ):
-            # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
-            if server_args.max_mamba_cache_size is None:
-                if server_args.max_running_requests is not None:
-                    server_args.max_mamba_cache_size = server_args.max_running_requests
-                else:
-                    server_args.max_mamba_cache_size = 512
+        if server_args.max_mamba_cache_size is not None:
+            # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+        elif (
+            server_args.disable_radix_cache
+            and server_args.max_running_requests is not None
+        ):
+            # Use explicitly set max_running_requests when radix cache is disabled
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
