@@ -8,6 +8,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -108,7 +109,7 @@ class TestAbortWithApiKey(CustomTestCase):
         )
 
 
-class TestAbortAll(CustomTestCase):
+class TestAbortAll(AbortAllMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -123,40 +124,6 @@ class TestAbortAll(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def _run_decode(self):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 16000,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
-    def test_abort_all(self):
-        num_requests = 32
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            # ensure the decode has been started
-            time.sleep(2)
-
-            requests.post(
-                self.base_url + "/abort_request",
-                json={
-                    "abort_all": True,
-                },
-            )
-
-            for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
 
 
 class TestAbortAllWithRetraction(CustomTestCase):
@@ -236,7 +203,7 @@ class TestAbortAllWithRetraction(CustomTestCase):
             print("Finished test_abort_all_with_retraction")
 
 
-class TestAbortWithWaitingTimeout(CustomTestCase):
+class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -254,33 +221,6 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def _run_decode(self):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "Today is ",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 512,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
-    def test_waiting_timeout(self):
-        num_requests = 2
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            error_count = 0
-            for future in as_completed(futures):
-                result = future.result()
-                if result.get("object") == "error":
-                    error_count += 1
-                    self.assertEqual(result["code"], 503)
-            self.assertEqual(error_count, 1)
 
 
 class TestAbortWithRunningTimeout(CustomTestCase):
