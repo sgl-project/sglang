@@ -83,10 +83,6 @@ class ModelSlimConfig(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
@@ -100,7 +96,8 @@ class ModelSlimConfig(QuantizationConfig):
             scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
             layer.scheme = scheme
             return ModelSlimLinearMethod(self)
-        return None
+        else:
+            return None
 
     def _get_scheme_from_parts(
         self,
