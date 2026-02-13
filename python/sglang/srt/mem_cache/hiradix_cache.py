@@ -968,7 +968,9 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # evict a node already written to host
+        # GPU -> CPU demotion: do NOT emit BlockRemoved.
+        # Block is still accessible via load_back. Router must continue
+        # routing to this worker for prefix overlap.
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -981,6 +983,9 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
+        # Block deleted entirely (no CPU copy) -- emit BlockRemoved
+        # so the router removes this block from its index.
+        self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -1012,6 +1017,9 @@ class HiRadixCache(RadixCache):
                 )
                 continue
 
+            # Block deleted entirely (GPU already evicted, now CPU freed) --
+            # emit BlockRemoved so the router removes this block from its index.
+            self._record_remove_event(x)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = self.get_child_key_fn(x.key)
@@ -1028,7 +1036,8 @@ class HiRadixCache(RadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-        # todo: more loading policies
+        # CPU -> GPU promotion: no event needed.
+        # Router already considers this block present on the worker.
 
         start_time = time.perf_counter()
         last_hit_node = node
@@ -1067,13 +1076,27 @@ class HiRadixCache(RadixCache):
             host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+            logger.debug(
+                f"[PIN] load_back: first load attempt failed, "
+                f"evicting {len(host_indices)} tokens "
+                f"(evictable_size={self.evictable_size_})"
+            )
+            evict_result = self.evict(EvictParams(num_tokens=len(host_indices)))
+            logger.debug(
+                f"[PIN] load_back: evicted {evict_result.num_tokens_evicted} tokens, "
+                f"retrying load"
+            )
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            logger.warning(
+                f"[PIN] load_back: FAILED to load {len(host_indices)} tokens "
+                f"for node {last_hit_node.id} even after eviction "
+                f"(evictable_size={self.evictable_size_})"
+            )
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
@@ -1328,6 +1351,15 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        if host_hit_length > 0 or len(value) > 0:
+            logger.debug(
+                f"[PIN] match_prefix: device_tokens={len(value)}, "
+                f"host_hit_length={host_hit_length}, "
+                f"key_len={page_aligned_len}, "
+                f"last_device_node={last_node.id}, "
+                f"last_host_node={last_host_node.id}"
+            )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1550,9 +1582,12 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
 
-            # Compute hash_value if storage is enabled
-            if self.enable_storage:
+            # Compute hash_value if storage or kv events are enabled
+            if self.enable_storage or self.enable_kv_cache_events:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+            # Emit BlockStored so the router indexes this block.
+            self._record_store_event(new_node)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
