@@ -38,7 +38,9 @@ class TestPriorityScheduling(CustomTestCase):
         if cls._aborted_request_status_code is None:
             cls._aborted_request_status_code = 503
 
-        def launch_server():
+        with envs.SGLANG_ABORTED_REQUEST_STATUS_CODE.override(
+            cls._aborted_request_status_code
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -52,11 +54,6 @@ class TestPriorityScheduling(CustomTestCase):
                 ),
                 return_stdout_stderr=(cls.stdout, cls.stderr),
             )
-
-        with envs.SGLANG_ABORTED_REQUEST_STATUS_CODE.override(
-            cls._aborted_request_status_code
-        ):
-            launch_server()
 
     @classmethod
     def tearDownClass(cls):

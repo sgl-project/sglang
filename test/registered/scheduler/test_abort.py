@@ -247,7 +247,12 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
         if cls._timed_out_request_status_code is None:
             cls._timed_out_request_status_code = 503
 
-        def launch_server():
+        with (
+            envs.SGLANG_QUEUED_TIMEOUT_MS.override(0.001),
+            envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.override(
+                cls._timed_out_request_status_code
+            ),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -256,14 +261,6 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
                     "--max-running-requests=1",
                 ],
             )
-
-        with (
-            envs.SGLANG_QUEUED_TIMEOUT_MS.override(0.001),
-            envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.override(
-                cls._timed_out_request_status_code
-            ),
-        ):
-            launch_server()
 
     @classmethod
     def tearDownClass(cls):
