@@ -1,8 +1,6 @@
 import json
 import logging
 
-import pytest
-
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
