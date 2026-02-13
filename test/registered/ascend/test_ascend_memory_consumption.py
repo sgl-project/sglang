@@ -35,7 +35,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
 
     def test_memory_consumption(self):
 
-        model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-W8A8"
+        model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-w8a8"
         base_url = DEFAULT_URL_FOR_TEST
 
         ### Calculate initial used memory
@@ -70,7 +70,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         used_memory_after_server_starting = (
             total_npu_memory - free_npu_memory - initial_used_memory
         ) / (1 << 30)
-        self.assertLessEqual(float(used_memory_after_server_starting), 17.00)
+        self.assertLessEqual(float(used_memory_after_server_starting), 16.00)
 
         # Clean up everything
         kill_process_tree(process.pid)
