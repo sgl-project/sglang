@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 logger = init_logger(__name__)
 
 
@@ -128,7 +132,8 @@ class TransformerLoader(ComponentLoader):
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
                 quant_method.process_weights_after_loading(module)
-                torch.npu.empty_cache()
+                if _is_npu:
+                    torch.npu.empty_cache()
 
         assert (
             next(model.parameters()).dtype == default_dtype
