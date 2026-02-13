@@ -1922,28 +1922,32 @@ def sample_generated_shared_prefix_requests(
         range_ratio=range_ratio,
         num=num_groups,
     )
-    question_lens = compute_random_lens(
-        full_len=question_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group * num_turns,
+    question_lens = np.array(
+        compute_random_lens(
+            full_len=question_len,
+            range_ratio=range_ratio,
+            num=num_groups * prompts_per_group * num_turns,
+        )
     ).reshape(num_groups, prompts_per_group, num_turns)
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
+    output_lens = np.array(
+        compute_random_lens(
+            full_len=output_len,
+            range_ratio=range_ratio,
+            num=num_groups * prompts_per_group,
+        )
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
     # Generate system prompts for each group
     system_prompts = [
-        gen_prompt(tokenizer, system_prompt_lens[i].item()) for i in range(num_groups)
+        gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
     ]
 
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
     questions = [
         [
             [
-                gen_prompt(tokenizer, question_lens[g, p, t].item())
+                gen_prompt(tokenizer, int(question_lens[g, p, t]))
                 for t in range(num_turns)
             ]
             for p in range(prompts_per_group)
@@ -1976,7 +1980,7 @@ def sample_generated_shared_prefix_requests(
                 if getattr(args, "gsp_fast_prepare", False)
                 else len(tokenizer.encode(turn_prompts[0]))
             )
-            output_len_val = output_lens[group_idx, prompt_idx].item()
+            output_len_val = int(output_lens[group_idx, prompt_idx])
 
             input_requests.append(
                 DatasetRow(
