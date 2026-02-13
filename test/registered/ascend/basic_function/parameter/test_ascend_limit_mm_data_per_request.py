@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import unittest
+
 import requests
 
 from sglang.srt.utils import kill_process_tree
@@ -41,7 +42,7 @@ def popen_launch_server_wrapper(base_url, model, other_args):
 
 class TestLimitMMDatePerRequest(CustomTestCase):
     """Testcase: Configuring '--limit-mm-data-per-request {"image":1, "video":1}' to send different multimodal inference requests,
-       each containing multiple multimodal input data, with verfication ensuring that only one data point is processed at a time
+       each containing multiple multimodal input data, with verification ensuring that only one data point is processed at a time
 
     [Test Category] Parameter
     [Test Target] --limit-mm-data-per-request
@@ -108,11 +109,11 @@ class TestLimitMMDatePerRequest(CustomTestCase):
             },
         ]
         response = requests.post(
-            self.base_url + '/chat/completions',
+            self.base_url + "/chat/completions",
             json={
                 "messages": messages,
                 "temperature": 0,
-                "max_completion_tokens": 1024
+                "max_completion_tokens": 1024,
             },
         )
         assert response.status_code == 200
@@ -139,11 +140,11 @@ class TestLimitMMDatePerRequest(CustomTestCase):
             },
         ]
         response1 = requests.post(
-            self.base_url + '/chat/completions',
+            self.base_url + "/chat/completions",
             json={
                 "messages": messages1,
                 "temperature": 0,
-                "max_completion_tokens": 1024
+                "max_completion_tokens": 1024,
             },
         )
         assert response1.status_code == 400
@@ -170,11 +171,11 @@ class TestLimitMMDatePerRequest(CustomTestCase):
             },
         ]
         response2 = requests.post(
-            self.base_url + '/chat/completions',
+            self.base_url + "/chat/completions",
             json={
                 "messages": messages2,
                 "temperature": 0,
-                "max_completion_tokens": 1024
+                "max_completion_tokens": 1024,
             },
         )
         assert response2.status_code == 400

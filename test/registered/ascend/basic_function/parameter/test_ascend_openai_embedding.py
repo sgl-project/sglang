@@ -29,7 +29,12 @@ class TestOpenAIEmbedding(CustomTestCase):
         cls.api_key = "sk-123456"
 
         # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics", "--attention-backend", "ascend"]
+        other_args = [
+            "--is-embedding",
+            "--enable-metrics",
+            "--attention-backend",
+            "ascend",
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

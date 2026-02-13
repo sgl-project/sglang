@@ -42,7 +42,8 @@ class TestAscendBasic(CustomTestCase):
 
     def test_ascend_sleep_on_idle(self):
         pid = run_command(
-            f"ps -ef | grep -E 'sglang::scheduler' | grep -v grep | grep -w {self.process.pid} | tr -s ' '|cut -d' ' -f2")
+            f"ps -ef | grep -E 'sglang::scheduler' | grep -v grep | grep -w {self.process.pid} | tr -s ' '|cut -d' ' -f2"
+        )
         self.cpu = run_command(f"ps -p {pid.strip()} -o %cpu --no-headers | xargs")
         self.cpu_float = float(self.cpu.strip())
         run_command(f"echo {self.cpu_float} > ./cpu.txt")
@@ -98,8 +99,11 @@ class TestSleepOnIdle(CustomTestCase):
 
     def test_add_sleep_on_idle(self):
         pid_sleep_on = run_command(
-            f"ps -ef | grep -E 'sglang::scheduler' | grep -v grep | grep -w {self.process.pid} | tr -s ' '|cut -d' ' -f2")
-        self.cpu_sleep_on = run_command(f"ps -p {pid_sleep_on.strip()} -o %cpu --no-headers | xargs")
+            f"ps -ef | grep -E 'sglang::scheduler' | grep -v grep | grep -w {self.process.pid} | tr -s ' '|cut -d' ' -f2"
+        )
+        self.cpu_sleep_on = run_command(
+            f"ps -p {pid_sleep_on.strip()} -o %cpu --no-headers | xargs"
+        )
         self.cpu_sleep_on_float = float(self.cpu_sleep_on.strip())
 
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
@@ -121,7 +125,11 @@ class TestSleepOnIdle(CustomTestCase):
     def test_reducation_cpu(self):
         # Comparing CPU usage with and without sleep-on-idle configuration
         cpu_float = float(run_command(f"cat ./cpu.txt"))
-        self.assertGreater(cpu_float, self.cpu_sleep_on_float, f"CPU usage shoule drop with --sleep-on-idle")
+        self.assertGreater(
+            cpu_float,
+            self.cpu_sleep_on_float,
+       f"CPU usage should drop with --sleep-on-idle",
+        )
 
 
 if __name__ == "__main__":

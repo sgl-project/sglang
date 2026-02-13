@@ -156,16 +156,15 @@ class TestEnableThinking(CustomTestCase):
         )
         logging.info(f"response1.json:{response1.json()}")
         self.assertEqual(response1.status_code, 200, f"Failed with: {response1.text}")
-        # Asser that the configuration temperature is the same and the output response is the same
+        # Assert that the configuration temperature is the same and the output response is the same
         self.assertEqual(
             response.json()["choices"][0]["text"],
-            response1.json()["choices"][0]["text"]
+            response1.json()["choices"][0]["text"],
         )
 
         response2 = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": "who are you?", "temperature": 2},
+            json={"prompt": "who are you?", "temperature": 2},
         )
         logging.info(f"response2.json:{response2.json()}")
         self.assertEqual(response2.status_code, 200, f"Failed with: {response2.text}")
@@ -178,15 +177,14 @@ class TestEnableThinking(CustomTestCase):
         self.assertEqual(response3.status_code, 200, f"Failed with: {response3.text}")
         self.assertNotEqual(
             response2.json()["choices"][0]["text"],
-            response3.json()["choices"][0]["text"]
+            response3.json()["choices"][0]["text"],
         )
 
     def test_model_parameters_hidden_states(self):
         # Test return_hidden_states parameter; verify hidden_states field appears when enabled
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": "who are you?", "return_hidden_states": True},
+            json={"prompt": "who are you?", "return_hidden_states": True},
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
@@ -196,8 +194,7 @@ class TestEnableThinking(CustomTestCase):
         # Test top_k parameter; with k=20, outputs vary between identical requests due to token sampling
         response = requests.post(
             f"{self.base_url}/v1/completions",
-            json={
-                "prompt": "who are you?", "top_k": 20},
+            json={"prompt": "who are you?", "top_k": 20},
         )
         logging.info(f"response.json:{response.json()}")
         logging.info(f"response.text:{response.text}")
@@ -212,7 +209,7 @@ class TestEnableThinking(CustomTestCase):
         self.assertEqual(response1.status_code, 200, f"Failed with: {response1.text}")
         self.assertNotEqual(
             response.json()["choices"][0]["text"],
-            response1.json()["choices"][0]["text"]
+            response1.json()["choices"][0]["text"],
         )
 
     def test_model_parameters_stop_token_ids(self):
@@ -221,7 +218,7 @@ class TestEnableThinking(CustomTestCase):
         response = requests.post(
             f"{self.base_url}/v1/completions",
             json={
-                "prompt": 'who are you?',
+                "prompt": "who are you?",
                 "stop_token_ids": list_ids,
                 "max_tokens": 1024,
             },
@@ -238,7 +235,7 @@ class TestEnableThinking(CustomTestCase):
         )
         logging.info(f"response.json:{response.json()}")
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertEqual(response.json()["id"], '10086')
+        self.assertEqual(response.json()["id"], "10086")
 
 
 if __name__ == "__main__":
