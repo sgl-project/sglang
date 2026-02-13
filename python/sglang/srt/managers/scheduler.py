@@ -1062,6 +1062,22 @@ class Scheduler(
             ]
         )
 
+    def _check_forward_timeout_for_running_batch(self):
+        # NOTE: this should be called before a batch is launched,
+        # as current spec-v1 still filters batch inside verify stage.
+        timeout_ms = envs.SGLANG_FORWARD_TIMEOUT_MS.get()
+        if timeout_ms <= 0:
+            return
+        if self.running_batch.is_empty():
+            return
+
+        deadline = time.perf_counter() - timeout_ms / 1000.0
+        for req in self.running_batch.reqs:
+            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                req.to_finish = FINISH_ABORT(
+                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1823,6 +1839,7 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
+        self._check_forward_timeout_for_running_batch()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
