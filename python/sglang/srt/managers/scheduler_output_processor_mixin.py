@@ -83,6 +83,31 @@ class SchedulerOutputProcessorMixin:
             return details
         return None
 
+    def _defer_release_kv_cache(self: Scheduler, req: Req):
+        """Defer releasing a request's KV cache pool slot.
+
+        In overlap scheduling, the next batch (already launched on the forward
+        stream) may still be reading from req_to_token[req.req_pool_idx].
+        Instead of freeing immediately, we append to a deferred list that is
+        flushed at the start of the next process_batch_result_decode, after
+        copy_done.synchronize() guarantees the forward stream has finished.
+        """
+        self._deferred_kv_release_reqs.append(req)
+
+    def _flush_deferred_kv_releases(self: Scheduler):
+        """Flush the deferred KV cache release list.
+
+        Must be called after copy_done.synchronize() so that the forward
+        stream is guaranteed to have finished reading from the rows being freed.
+        """
+        for req in self._deferred_kv_release_reqs:
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if not self.decode_offload_manager.offload_kv_cache(req):
+                    release_kv_cache(req, self.tree_cache)
+            else:
+                release_kv_cache(req, self.tree_cache)
+        self._deferred_kv_release_reqs.clear()
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -420,6 +445,12 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # Flush deferred KV releases from the previous iteration. Now that
+        # copy_done has been synchronized, the forward stream that was reading
+        # from these req_to_token rows has finished.
+        if self.enable_overlap:
+            self._flush_deferred_kv_releases()
+
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
@@ -470,7 +501,13 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                if self.enable_overlap:
+                    # Defer the release: the next batch is already running on
+                    # the forward stream and may still read req_to_token for
+                    # this request.  The slot will be freed at the start of
+                    # the next process_batch_result_decode call.
+                    self._defer_release_kv_cache(req)
+                elif self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)

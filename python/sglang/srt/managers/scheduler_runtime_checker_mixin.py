@@ -329,6 +329,11 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
+        # Flush any deferred KV releases. During idle, no batch is running on
+        # the forward stream, so it is always safe.
+        if self.enable_overlap:
+            self._flush_deferred_kv_releases()
+
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
