@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     make_layers,
 )
+from sglang.srt.utils.common import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -896,9 +897,9 @@ class BailingMoELinearModel(nn.Module):
             for i in range(self.num_layers)
         ]
         num_linear = sum(1 for t in self.decoder_attention_types if t == 0)
-        num_softmax = sum(1 for t in self.decoder_attention_types if t == 1)
-        logger.info(
-            f"Layer config: {num_linear} linear layers, {num_softmax} softmax layers"
+        num_full = sum(1 for t in self.decoder_attention_types if t == 1)
+        rank0_log(
+            f"Layer config: {num_linear} linear attention layers, {num_full} full attention layers"
         )
 
         assert (
@@ -932,11 +933,6 @@ class BailingMoELinearModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
-
-        linear_layer_nums = sum(
-            1 for i in range(self.num_layers) if self.decoder_attention_types[i] == 0
-        )
-        logger.info(f"linear_layer_nums={linear_layer_nums}")
 
         norm_kwargs = {}
         if hasattr(config, "rms_norm_eps"):
