@@ -209,13 +209,15 @@ class WeightsUpdater:
                 _load_weights_into_module(module, weights_iter)
                 updated_modules.append(module_name)
             except Exception as e:
+                rollback_list = updated_modules + [module_name]
                 logger.error(
                     f"Weight update failed for module '{module_name}': {e}. "
-                    f"Rolling back {len(updated_modules)} already updated module(s): "
-                    f"{updated_modules}.",
+                    f"Rolling back {len(rollback_list)} module(s) "
+                    f"(including partially-loaded '{module_name}'): "
+                    f"{rollback_list}.",
                     exc_info=True,
                 )
-                self._rollback(updated_modules)
+                self._rollback(rollback_list)
                 return False, (
                     f"Failed to update module '{module_name}': {e}. "
                     f"All modules rolled back to original weights."
