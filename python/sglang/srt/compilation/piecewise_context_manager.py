@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
-
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
