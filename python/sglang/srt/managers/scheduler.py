@@ -1063,14 +1063,8 @@ class Scheduler(
         )
 
     def _check_forward_timeout_for_running_batch(self):
-        """Check forward timeout for the running batch and set to_finish.
-
-        Called at the start of the event loop (same timing as abort) so
-        that check_finished() in subsequent forward passes handles timeout
-        together with abort. This avoids creating finished_reason after
-        verify has already set topk_p, which would cause a length mismatch
-        in EagleDraftInput.filter_batch().
-        """
+        # NOTE: this should be called before a batch is launched,
+        # as current spec-v1 still filters batch inside verify stage.
         timeout_ms = envs.SGLANG_FORWARD_TIMEOUT_MS.get()
         if timeout_ms <= 0:
             return

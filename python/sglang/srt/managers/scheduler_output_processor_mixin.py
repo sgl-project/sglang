@@ -159,8 +159,6 @@ class SchedulerOutputProcessorMixin:
             hidden_state_offset = 0
 
             # Check finish conditions
-            # Forward timeout is checked at the start of the event loop
-            # (same timing as abort). See _check_forward_timeout_for_running_batch().
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -445,8 +443,6 @@ class SchedulerOutputProcessorMixin:
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
-        # Forward timeout is checked at the start of the event loop (same
-        # timing as abort), not here. See _check_forward_timeout_for_running_batch().
 
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
