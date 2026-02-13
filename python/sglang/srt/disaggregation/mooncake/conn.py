@@ -829,6 +829,7 @@ class MooncakeKVManager(CommonKVManager):
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
+                            and self.pp_size == 1
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
