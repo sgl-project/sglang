@@ -1,5 +1,6 @@
 import os
 import unittest
+
 import requests
 
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
