@@ -941,6 +941,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.server_args.remote_instance_weight_loader_seed_instance_service_port,
                         self.server_args.remote_instance_weight_loader_send_weights_group_ports,
                         instance_ip,
+                        self.model_config.is_draft_model,
                     ),
                 )
                 t.start()
