@@ -53,6 +53,7 @@ def enable_piecewise_cuda_graph():
     finally:
         _in_piecewise_cuda_graph = False
 
+
 @contextmanager
 def set_pcg_capture_stream(stream: torch.cuda.Stream):
     global _pcg_capture_stream
