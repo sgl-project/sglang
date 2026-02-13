@@ -18,9 +18,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestRevision(CustomTestCase):
     """Testcase：Verify set --revision parameter, the inference request is successfully processed.
 
-   [Test Category] Parameter
-   [Test Target] --revision
-   """
+    [Test Category] Parameter
+    [Test Target] --revision
+    """
 
     revision = "33e62acdd07cd7d6635badd529aa0a3467bb9c6a"
     model = PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH

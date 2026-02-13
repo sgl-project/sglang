@@ -1,16 +1,18 @@
-import unittest
-import requests
 import os
 import glob
-from sglang.test.ascend.test_ascend_utils import run_command
+import unittest
+
+import requests
+
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import run_command
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -18,9 +20,10 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestDownloadDir(CustomTestCase):
     """Testcase：Verify set --download-dir parameter, the parameter take effect and the inference request is successfully processed.
 
-       [Test Category] Parameter
-       [Test Target] --download-dir
-       """
+    [Test Category] Parameter
+    [Test Target] --download-dir
+    """
+
     model = "Qwen/Qwen2-0.5B-Instruct"
     download_dir = "./weight"
 
@@ -56,6 +59,7 @@ class TestDownloadDir(CustomTestCase):
                     "max_new_tokens": 32,
                 },
             },
+
             timeout=30
         )
         self.assertEqual(response.status_code, 200)
@@ -65,10 +69,13 @@ class TestDownloadDir(CustomTestCase):
         weight_suffixes = ("*.safetensors", "*.bin", "*.pth")
         weight_files = []
         for suffix in weight_suffixes:
-            weight_files.extend(glob.glob(os.path.join(self.download_dir, "**", suffix), recursive=True))
+            weight_files.extend(
+                glob.glob(os.path.join(self.download_dir, "**", suffix), recursive=True)
+            )
         self.assertGreater(
             len(weight_files),
             0,
+
             msg=f"--download-dir {self.download_dir} No model weight"
         )
 

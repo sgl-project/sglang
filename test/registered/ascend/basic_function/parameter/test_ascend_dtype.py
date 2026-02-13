@@ -18,9 +18,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestDtype(CustomTestCase):
     """Testcase：Verify set --dtype is half or float16 or bfloat16, request inference successful.
 
-   [Test Category] Parameter
-   [Test Target] --dtype
-   """
+    [Test Category] Parameter
+    [Test Target] --dtype
+    """
 
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
