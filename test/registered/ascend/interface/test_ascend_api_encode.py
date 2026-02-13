@@ -119,11 +119,11 @@ class TestAscendApi(CustomTestCase):
         )
         response_json = response.json()
         logger.info(
-            "Test 04 response type: %s, first item meta_info: %s", 
+            "Test 04 response type: %s, first item meta_info: %s",
             type(response_json),
             response_json[0].get("meta_info", {}),
         )
-        
+
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response_json), len(request_rids))
         for idx, result in enumerate(response_json):
