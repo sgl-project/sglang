@@ -1232,6 +1232,83 @@ def expand_topk_with_shared_expert(
 # ============== Main API ==============
 
 
+def compute_static_rank_load(
+    logical_count: Tensor,
+    physical_to_logical_map: Tensor,
+    world_size: int,
+) -> Tensor:
+    """Compute per-layer static rank load from EPLB historical statistics.
+
+    Given historical ``logical_count`` (average expert utilisation from the EPLB
+    recorder) and the current ``physical_to_logical_map``, this function produces
+    a ``[num_layers, world_size]`` float tensor where entry ``[l, r]`` estimates
+    the *relative* workload that EP rank ``r`` will carry in MoE layer ``l``.
+
+    The returned tensor is suitable for :pymethod:`DeepEPWaterfillBalancer.set_static_weights`.
+    It allows the forward path to **skip the runtime all_reduce** and use these
+    pre-computed weights for waterfill sampling instead.
+
+    **Expert replication handling** (critical for correctness):
+    Multiple physical experts may map to the same logical expert (EPLB
+    replication).  We divide each logical expert's historical count by its
+    replica count so that load is split evenly across all physical copies.
+
+    Args:
+        logical_count: ``[num_layers, num_logical_experts]`` float/int tensor.
+            Average token count per logical expert across recent history.
+            If the raw recording has shape ``[num_samples, num_layers, num_logical_experts]``,
+            caller should average over samples first.
+        physical_to_logical_map: ``[num_layers, num_physical_experts]`` int tensor.
+            Maps each physical expert slot to its logical expert id.
+        world_size: Number of EP ranks.
+
+    Returns:
+        ``[num_layers, world_size]`` float64 tensor with per-rank workload estimates.
+    """
+    num_layers, num_physical_experts = physical_to_logical_map.shape
+    num_logical_experts = logical_count.shape[-1]
+    experts_per_rank = num_physical_experts // world_size
+
+    device = physical_to_logical_map.device
+    logical_count = logical_count.to(device=device, dtype=torch.float64)
+    physical_to_logical_map = physical_to_logical_map.to(device=device)
+
+    # Step 1: Compute replica count per logical expert per layer.
+    # replica_counts[l, e] = number of physical experts mapped to logical expert e in layer l.
+    ones = torch.ones(
+        num_layers, num_physical_experts, dtype=torch.float64, device=device
+    )
+    replica_counts = torch.zeros(
+        num_layers, num_logical_experts, dtype=torch.float64, device=device
+    )
+    replica_counts.scatter_add_(1, physical_to_logical_map.long(), ones)
+    # Avoid division by zero for unused logical experts.
+    replica_counts = replica_counts.clamp(min=1.0)
+
+    # Step 2: Per-physical-expert load = logical_count[logical_id] / replica_count[logical_id].
+    # Gather logical counts for each physical expert position.
+    mapped_logical_ids = (
+        physical_to_logical_map.long()
+    )  # [num_layers, num_physical_experts]
+    physical_load = torch.gather(
+        logical_count, 1, mapped_logical_ids
+    )  # [num_layers, num_phys]
+    physical_replica = torch.gather(
+        replica_counts, 1, mapped_logical_ids
+    )  # [num_layers, num_phys]
+    physical_load = (
+        physical_load / physical_replica
+    )  # [num_layers, num_physical_experts]
+
+    # Step 3: Aggregate per rank (sum across experts_per_rank experts per rank).
+    # Reshape to [num_layers, world_size, experts_per_rank] and sum the last dim.
+    per_rank_load = physical_load.view(num_layers, world_size, experts_per_rank).sum(
+        dim=2
+    )
+
+    return per_rank_load  # [num_layers, world_size]
+
+
 class DeepEPWaterfillBalancer:
     """
     Waterfill load balancer for DeepEP-based shared expert dispatch.
@@ -1270,6 +1347,7 @@ class DeepEPWaterfillBalancer:
         world_size: int,
         rank: int,
         routed_scaling_factor: float = 1.0,
+        static_rank_load: Optional[Tensor] = None,
         **kwargs,
     ):
         # Store original routed expert count
@@ -1300,6 +1378,62 @@ class DeepEPWaterfillBalancer:
         self.my_shared_expert_id = (
             self.rank * self.new_experts_per_rank + self.old_experts_per_rank
         )
+
+        # Static per-rank load derived from EPLB historical statistics.
+        # Shape: [world_size], dtype float64/int64. When set, forward_deepep_waterfill
+        # can skip the runtime all_reduce and use these weights directly.
+        self.static_rank_load: Optional[Tensor] = static_rank_load
+
+    # -------- Static weight helpers --------
+
+    def has_static_weights(self) -> bool:
+        """Return True if static EPLB-derived weights are available."""
+        return self.static_rank_load is not None
+
+    def set_static_weights(self, static_rank_load: Tensor) -> None:
+        """Replace static per-rank load weights (e.g. after EPLB rebalance)."""
+        assert static_rank_load.shape == (
+            self.world_size,
+        ), f"Expected shape ({self.world_size},), got {static_rank_load.shape}"
+        self.static_rank_load = static_rank_load.to(dtype=torch.float64)
+        w = self.static_rank_load
+        w_sum = w.sum().clamp(min=1.0)
+        self._static_rank_load_normalized = w / w_sum
+
+    def estimate_global_counts(
+        self,
+        local_routed_counts: Tensor,
+        topk: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """Estimate global routed counts and local_tokens_per_rank without all_reduce.
+
+        Uses ``self.static_rank_load`` to scale the locally-observed total into
+        per-rank estimates, removing the need for the runtime ``all_reduce``.
+        All operations stay on GPU — no ``.item()`` or GPU→CPU sync.
+
+        Args:
+            local_routed_counts: ``[world_size]`` int64 – routed counts from this rank.
+            topk: Number of routed experts per token (e.g. 8).
+
+        Returns:
+            estimated_global_routed: ``[world_size]`` int64.
+            estimated_local_tokens: ``[world_size]`` int64 (uniform assumption).
+        """
+        assert self.static_rank_load is not None
+        device = local_routed_counts.device
+
+        local_total_routed = local_routed_counts.sum()
+        estimated_global_total = local_total_routed * self.world_size
+
+        w = self._static_rank_load_normalized
+        estimated_global_routed = (w * estimated_global_total.double()).to(torch.int64)
+
+        local_num_tokens = local_total_routed // max(topk, 1)
+        estimated_local_tokens = local_num_tokens.expand(self.world_size).to(
+            torch.int64
+        )
+
+        return estimated_global_routed, estimated_local_tokens
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank from local topk_ids.

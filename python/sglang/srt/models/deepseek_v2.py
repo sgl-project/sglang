@@ -1126,6 +1126,73 @@ class DeepseekV2MoE(nn.Module):
                     new_w2_scale.squeeze(0)
                 )
 
+    def _maybe_init_static_waterfill_weights(self):
+        """Compute / refresh static EPLB-derived per-rank weights if needed.
+
+        Detects EPLB rebalance via physical_to_logical_map data pointer change.
+        """
+        if not self._enable_deepep_waterfill:
+            return
+        balancer = self.deepep_waterfill_balancer
+        if balancer is None:
+            return
+
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+        from sglang.srt.layers.moe.deepep_waterfill import compute_static_rank_load
+
+        server_args = get_global_server_args()
+        init_loc = getattr(server_args, "init_expert_location", "trivial")
+        if not init_loc or init_loc == "trivial":
+            return
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+
+        cur_ptr = metadata.physical_to_logical_map.data_ptr()
+        prev_ptr = getattr(self, "_eplb_map_data_ptr", None)
+        if prev_ptr == cur_ptr and balancer.has_static_weights():
+            return
+
+        try:
+            data_dict = torch.load(init_loc, weights_only=True)
+            logical_count_raw = data_dict["logical_count"]
+            if not isinstance(logical_count_raw, torch.Tensor):
+                logical_count_raw = torch.tensor(logical_count_raw)
+            if logical_count_raw.dim() == 3:
+                logical_count_raw = logical_count_raw.float().mean(dim=0)
+            elif logical_count_raw.dim() != 2:
+                logger.warning(
+                    "Unexpected logical_count dim=%d, skipping static weights",
+                    logical_count_raw.dim(),
+                )
+                return
+
+            physical_to_logical_map = metadata.physical_to_logical_map
+            all_rank_load = compute_static_rank_load(
+                logical_count_raw,
+                physical_to_logical_map,
+                balancer.world_size,
+            )
+
+            layer_idx = int(self.layer_id)
+            if layer_idx < all_rank_load.shape[0]:
+                layer_load = all_rank_load[layer_idx]
+                if layer_load.sum() > 0:
+                    balancer.set_static_weights(layer_load)
+                    self._eplb_map_data_ptr = cur_ptr
+                    logger.info(
+                        "Static waterfill weights set for layer %d: %s",
+                        layer_idx,
+                        layer_load.tolist(),
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to init static waterfill weights for layer %s: %s",
+                self.layer_id,
+                e,
+            )
+
     def get_moe_weights(self):
         # EPLB only manages routed experts. In DeepEP Waterfill mode, we add one extra
         # local expert slot per rank for the shared expert. Exclude that shared slot
@@ -1888,6 +1955,14 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.distributed import get_moe_ep_group
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
+        if not getattr(self, "_static_wf_init_done", False):
+            self._maybe_init_static_waterfill_weights()
+            if (
+                self.deepep_waterfill_balancer is not None
+                and self.deepep_waterfill_balancer.has_static_weights()
+            ):
+                self._static_wf_init_done = True
+
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
 
@@ -1928,21 +2003,25 @@ class DeepseekV2MoE(nn.Module):
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id) is not None
         )
 
+        _use_static_weights = (
+            self.deepep_waterfill_balancer is not None
+            and self.deepep_waterfill_balancer.has_static_weights()
+        )
+
         if num_tokens == 0:
-            # Participate in the fused all_reduce for global routed counts
-            # + local token counts (one-hot encoded in second half).
-            _ep_group_0t = get_moe_ep_group().device_group
-            _ep_world_0t = torch.distributed.get_world_size(group=_ep_group_0t)
-            _ep_rank_0t = torch.distributed.get_rank(group=_ep_group_0t)
-            dummy_buf = torch.zeros(_ep_world_0t * 2, dtype=torch.int64, device=device)
-            # Second half: one-hot encode local_num_tokens (0 for this rank).
-            dummy_buf[_ep_world_0t + _ep_rank_0t] = 0
-            torch.distributed.all_reduce(
-                dummy_buf,
-                op=torch.distributed.ReduceOp.SUM,
-                group=_ep_group_0t,
-            )
-            # Participate in debug collectives so ranks with tokens don't hang.
+            if not _use_static_weights:
+                _ep_group_0t = get_moe_ep_group().device_group
+                _ep_world_0t = torch.distributed.get_world_size(group=_ep_group_0t)
+                _ep_rank_0t = torch.distributed.get_rank(group=_ep_group_0t)
+                dummy_buf = torch.zeros(
+                    _ep_world_0t * 2, dtype=torch.int64, device=device
+                )
+                dummy_buf[_ep_world_0t + _ep_rank_0t] = 0
+                torch.distributed.all_reduce(
+                    dummy_buf,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=_ep_group_0t,
+                )
             if debug_waterfill_eplb:
                 group = get_moe_ep_group().device_group
                 ep_world = torch.distributed.get_world_size(group=group)
@@ -2073,37 +2152,43 @@ class DeepseekV2MoE(nn.Module):
         topk_ids = topk_output.topk_ids  # [N, 8]
         topk_weights = topk_output.topk_weights  # [N, 8]
 
-        # Count local routed tokens and AllReduce for global counts (waterfill)
         local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(
             topk_ids
         )
-        # Fused all_reduce: global routed counts + local token counts in one op.
-        # Layout: [local_routed_counts (ep_world) | one-hot local_num_tokens (ep_world)]
-        # After SUM reduction: first half = global_routed_counts,
-        #                      second half = local_tokens_per_rank.
-        _ep_group = get_moe_ep_group().device_group
-        _ep_world = torch.distributed.get_world_size(group=_ep_group)
-        _ep_rank = torch.distributed.get_rank(group=_ep_group)
-        _fused_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
-        _fused_buf[:_ep_world] = local_routed_counts
-        if not torch.cuda.is_current_stream_capturing():
-            _fused_buf[_ep_world + _ep_rank] = num_tokens
-        if profile_waterfill_timing:
-            evt_allreduce_s.record()
-        torch.distributed.all_reduce(
-            _fused_buf,
-            op=torch.distributed.ReduceOp.SUM,
-            group=_ep_group,
-        )
-        global_routed_counts = _fused_buf[:_ep_world]
-        if not torch.cuda.is_current_stream_capturing():
-            local_tokens_per_rank = _fused_buf[_ep_world:]
-        else:
-            # During CUDA graph capture, fall back to uniform assumption.
-            local_tokens_per_rank = None
 
-        if profile_waterfill_timing:
-            evt_allreduce_e.record()
+        if _use_static_weights:
+            topk = topk_ids.shape[1]
+            if profile_waterfill_timing:
+                evt_allreduce_s.record()
+            global_routed_counts, local_tokens_per_rank = (
+                self.deepep_waterfill_balancer.estimate_global_counts(
+                    local_routed_counts, topk
+                )
+            )
+            if profile_waterfill_timing:
+                evt_allreduce_e.record()
+        else:
+            _ep_group = get_moe_ep_group().device_group
+            _ep_world = torch.distributed.get_world_size(group=_ep_group)
+            _ep_rank = torch.distributed.get_rank(group=_ep_group)
+            _fused_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
+            _fused_buf[:_ep_world] = local_routed_counts
+            if not torch.cuda.is_current_stream_capturing():
+                _fused_buf[_ep_world + _ep_rank] = num_tokens
+            if profile_waterfill_timing:
+                evt_allreduce_s.record()
+            torch.distributed.all_reduce(
+                _fused_buf,
+                op=torch.distributed.ReduceOp.SUM,
+                group=_ep_group,
+            )
+            global_routed_counts = _fused_buf[:_ep_world]
+            if not torch.cuda.is_current_stream_capturing():
+                local_tokens_per_rank = _fused_buf[_ep_world:]
+            else:
+                local_tokens_per_rank = None
+            if profile_waterfill_timing:
+                evt_allreduce_e.record()
 
         # Waterfill assignment and expand topk to 9 columns
         if profile_waterfill_timing:
@@ -2257,6 +2342,7 @@ class DeepseekV2MoE(nn.Module):
                 msg = (
                     f"[deepep_eplb_load] mode=waterfill layer={self.layer_id} "
                     f"ep_rank={ep_rank}/{ep_world} stage={stage} "
+                    f"static_wf={int(_use_static_weights)} "
                     f"total={t_this} max={t_max} avg={t_avg:.2f} "
                     f"imbal={imbal:.3f}x"
                 )
