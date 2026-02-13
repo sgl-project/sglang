@@ -116,27 +116,9 @@ class LayerwiseOffloadManager:
         # 1. collect and group tensors by layer and dtype
         layer_groups: Dict[int, Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]] = {}
         all_tensors = list(chain(named_parameters, named_buffers))
-
-        # detect shared storage across layers to avoid unsafe offload
-        storage_to_layer: Dict[int, int] = {}
-        shared_storage_keys: Set[int] = set()
         for name, tensor in all_tensors:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
-                continue
-            storage_key = self._get_storage_key(tensor)
-            prev_layer = storage_to_layer.get(storage_key)
-            if prev_layer is None:
-                storage_to_layer[storage_key] = layer_idx
-            elif prev_layer != layer_idx:
-                shared_storage_keys.add(storage_key)
-
-        for name, tensor in all_tensors:
-            layer_idx = self._match_layer_idx(name)
-            if layer_idx is None or layer_idx >= self.num_layers:
-                continue
-            storage_key = self._get_storage_key(tensor)
-            if storage_key in shared_storage_keys:
                 continue
             layer_groups.setdefault(layer_idx, {}).setdefault(tensor.dtype, []).append(
                 (name, tensor)
