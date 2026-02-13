@@ -1557,8 +1557,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
-                is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if getattr(state.obj, "stream", False):
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1573,8 +1572,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 }
 
             elif isinstance(recv_obj, BatchTokenIDOutput):
-                is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.stream_output and is_stream:
+                if getattr(state.obj, "stream", False):
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
