@@ -888,42 +888,45 @@ class ServerArgs:
 
     def _handle_piecewise_cuda_graph(self):
         # Disable piecewise cuda graph with following conditions:
-        # 1. Speculative decoding
+        # 1. Disable Model Arch
+        if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+            self.disable_piecewise_cuda_graph = True
+        # 2. Speculative decoding
         if self.speculative_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
-        # 2. DP attention
+        # 3. DP attention
         if self.enable_dp_attention:
             self.disable_piecewise_cuda_graph = True
-        # 3. Torch compile
+        # 4. Torch compile
         if self.enable_torch_compile:
             self.disable_piecewise_cuda_graph = True
-        # 4. Pipeline parallelism
+        # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 5. Non-CUDA hardware (AMD, NPU, etc.)
+        # 6. Non-CUDA hardware (AMD, NPU, etc.)
         if is_hip() or is_npu():
             self.disable_piecewise_cuda_graph = True
-        # 6. MoE A2A backend
+        # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
-        # 7. LoRA
+        # 8. LoRA
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
-        # 8. Multimodal / VLM models
+        # 9. Multimodal / VLM models
         if self.get_model_config().is_multimodal:
             self.disable_piecewise_cuda_graph = True
-        # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
+        # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if (
             self.load_format == "gguf"
             or self.quantization == "gguf"
             or check_gguf_file(self.model_path)
         ):
             self.disable_piecewise_cuda_graph = True
-        # 10. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
+        # 11. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
         if self.dllm_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
-        # 11. CPU offload (state_dict() in forward path breaks dynamo)
-        if self.cpu_offload_gb > 0:
+        # 12. CPU offload (breaks dynamo)
+        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
