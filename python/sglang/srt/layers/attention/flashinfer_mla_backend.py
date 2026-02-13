@@ -28,6 +28,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
+    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -243,7 +244,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if is_sm100_supported():
+        if is_sm100_supported() or is_sm120_supported():
             self.fmha_backend = "cutlass"
         else:
             self.fmha_backend = "auto"
