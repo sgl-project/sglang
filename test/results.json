@@ -1,0 +1,15 @@
+[
+  {
+    "timestamp": "2026-02-12T06:21:50.757562",
+    "model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "metrics": {
+      "en": 0.868,
+      "en:std": 0.33849076796864047,
+      "group_latin": 0.868,
+      "group_latin:std": 0.33849076796864047,
+      "score:std": 0.33849076796864047,
+      "score": 0.868
+    },
+    "score": 0.868
+  }
+]
