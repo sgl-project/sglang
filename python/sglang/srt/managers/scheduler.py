@@ -1062,7 +1062,7 @@ class Scheduler(
             ]
         )
 
-    def _check_running_timeout(self):
+    def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
         # as current spec-v1 still filters batch inside verify stage.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
@@ -1839,7 +1839,7 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
-        self._check_running_timeout()
+        self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
