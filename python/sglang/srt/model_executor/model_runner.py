@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.configs import (
+    BailingHybridConfig,
     FalconH1Config,
     JetNemotronConfig,
     JetVLMConfig,
@@ -1550,6 +1551,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def hybrid_lightning_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, BailingHybridConfig):
+            return config
+        return None
+
+    @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config.get_text_config()
         if isinstance(
@@ -1597,7 +1605,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
+        return (
+            self.mamba2_config
+            or self.hybrid_gdn_config
+            or self.kimi_linear_config
+            or self.hybrid_lightning_config
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.is_draft_worker:

@@ -584,7 +584,13 @@ class ModelRunnerKVCacheMixin:
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
-                        [0] if self.is_draft_worker else config.full_attention_layer_ids
+                        [0]
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i in config.full_attention_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ]
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,

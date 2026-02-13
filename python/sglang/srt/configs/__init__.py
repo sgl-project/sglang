@@ -1,4 +1,5 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
+from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
@@ -30,6 +31,7 @@ from sglang.srt.configs.step3p5 import Step3p5Config
 
 __all__ = [
     "AfmoeConfig",
+    "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "DbrxConfig",
