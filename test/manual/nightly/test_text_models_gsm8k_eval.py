@@ -77,7 +77,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     model=model_setup.model_path,
                     other_args=other_args,
                     base_url=self.base_url,
-                    timeout=1200,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 )
 
                 try:
