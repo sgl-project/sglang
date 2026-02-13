@@ -6,6 +6,7 @@ import unittest
 import sgl_kernel_npu
 import torch
 import torch_npu
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 assert sgl_kernel_npu is not None
@@ -15,7 +16,7 @@ assert torch_npu is not None
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
