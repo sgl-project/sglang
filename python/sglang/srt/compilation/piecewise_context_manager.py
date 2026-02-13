@@ -59,6 +59,7 @@ class ForwardContext:
         self.attention_layer = None
         self.quant_config = None
         self.moe_layers = None
+        self.moe_fusions = None
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -71,6 +72,9 @@ class ForwardContext:
 
     def set_moe_layers(self, layers: List[Any]):
         self.moe_layers = layers
+
+    def set_moe_fusions(self, fusions: List[Any]):
+        self.moe_fusions = fusions
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -88,6 +92,7 @@ def set_forward_context(
     attention_layers: List[Any],
     quant_config: Any,
     moe_layers: List[Any],
+    moe_fusions: List[Any],
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -95,6 +100,7 @@ def set_forward_context(
     _forward_context.set_attention_layers(attention_layers)
     _forward_context.set_quant_config(quant_config)
     _forward_context.set_moe_layers(moe_layers)
+    _forward_context.set_moe_fusions(moe_fusions)
     try:
         yield
     finally:
