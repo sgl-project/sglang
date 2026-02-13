@@ -3,10 +3,10 @@ from dataclasses import dataclass, field
 import torch
 from diffusers.image_processor import VaeImageProcessor
 
-from python.sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
-from python.sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,

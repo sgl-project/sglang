@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.configs import (
+    BailingHybridConfig,
     FalconH1Config,
     JetNemotronConfig,
     JetVLMConfig,
@@ -289,6 +290,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         nccl_port: int,
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
+        attn_cp_rank: Optional[int] = None,
+        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -302,9 +305,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
-        self.dp_size = server_args.dp_size
+        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dp_rank = moe_dp_rank
+        self.moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -585,8 +592,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                else server_args.max_running_requests // (self.dp_size)
             ),
             self.req_to_token_pool.size,
         )
@@ -796,8 +802,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
+                attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                attention_context_model_parallel_size=self.attn_cp_size,
+                moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
@@ -1550,6 +1559,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def hybrid_lightning_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, BailingHybridConfig):
+            return config
+        return None
+
+    @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config.get_text_config()
         if isinstance(
@@ -1597,7 +1613,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
+        return (
+            self.mamba2_config
+            or self.hybrid_gdn_config
+            or self.kimi_linear_config
+            or self.hybrid_lightning_config
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.is_draft_worker:
