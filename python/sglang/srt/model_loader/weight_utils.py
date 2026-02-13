@@ -751,12 +751,8 @@ def safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
-                # NOTE(xiuyu): safetensors.torch.load() may return keys in a
-                # different order per TP-shard file. Sort to ensure that cross-rank
-                # collectives (e.g. all_gather in sync_quantize_weight) stay
-                # aligned across TP ranks.
-                for name in sorted(result.keys()):
-                    yield name, result[name]
+                for name, param in result.items():
+                    yield name, param
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
@@ -850,31 +846,23 @@ def multi_thread_safetensors_weights_iterator(
         return safetensors.torch.load_file(st_file, device="cpu")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Yield in deterministic order to keep cross-rank collectives aligned.
-        future_to_idx = {
-            executor.submit(_load_file, st_file): idx
-            for idx, st_file in enumerate(hf_weights_files)
-        }
-        results_by_idx: Dict[int, dict] = {}
+        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
 
         if enable_tqdm:
             futures_iter = tqdm(
-                concurrent.futures.as_completed(future_to_idx),
+                concurrent.futures.as_completed(futures),
                 total=len(hf_weights_files),
                 desc="Multi-thread loading shards",
                 disable=not enable_tqdm,
                 bar_format=BAR_FORMAT,
             )
         else:
-            futures_iter = concurrent.futures.as_completed(future_to_idx)
+            futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            results_by_idx[future_to_idx[future]] = future.result()
-
-        for idx in range(len(hf_weights_files)):
-            state_dict = results_by_idx[idx]
-            for name in sorted(state_dict.keys()):
-                yield name, state_dict[name]
+            state_dict = future.result()
+            for name, param in state_dict.items():
+                yield name, param
 
 
 def _load_pt_file(bin_file: str) -> dict:
