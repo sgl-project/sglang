@@ -130,6 +130,8 @@ class TransformerLoader(ComponentLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
+                if _is_npu:
+                    torch.npu.config.allow_internal_format=True
                 quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
