@@ -5087,6 +5087,14 @@ class ServerArgs:
             f"Invalid value: '{self.served_model_name}'"
         )
 
+        # FlashInfer allreduce fusion: mnnvl backend requires Blackwell (SM100)
+        if self.flashinfer_allreduce_fusion_backend == "mnnvl":
+            if not is_sm100_supported():
+                raise ValueError(
+                    "FlashInfer allreduce fusion backend 'mnnvl' is only supported on Blackwell GPUs (SM100). "
+                    "On Hopper (SM90) or other architectures, use --flashinfer-allreduce-fusion-backend=trtllm or --flashinfer-allreduce-fusion-backend=auto instead."
+                )
+
         # Check LoRA
         self.check_lora_server_args()
 
