@@ -104,9 +104,11 @@ class SchedulerMetricsMixin:
         )
 
         if self.enable_metrics:
-            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
                 engine_type = "prefill"
-            elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
+            elif (
+                self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
+            ):
                 engine_type = "decode"
             else:
                 engine_type = "unified"
