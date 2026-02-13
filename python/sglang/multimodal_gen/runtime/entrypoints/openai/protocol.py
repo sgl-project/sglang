@@ -43,6 +43,8 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     negative_prompt: Optional[str] = None
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
     rollout: Optional[bool] = False
     rollout_sde_type: Optional[str] = "sde"
@@ -90,6 +92,8 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     output_path: Optional[str] = None
     rollout: Optional[bool] = False
     rollout_sde_type: Optional[str] = "sde"
