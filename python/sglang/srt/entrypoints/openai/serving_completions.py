@@ -20,7 +20,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
-    process_hidden_states_from_ret,    
+    process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
     to_openai_style_logprobs,
