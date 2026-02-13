@@ -55,7 +55,7 @@ class TestAscendApi(CustomTestCase):
         # Create thread 1: Send a long-running /generate request with rid=10086
         thread1 = threading.Thread(
             target=send_requests,
-            args=('/generate',),
+            args=("/generate",),
             kwargs={
                 "rid": "10086",
                 "text": "who are you?",
