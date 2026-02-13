@@ -130,7 +130,7 @@ class Lfm2Attention(nn.Module):
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_scaling=config.rope_parameters.get("rope_scaling"),
+            rope_scaling=config.rope_parameters,
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),

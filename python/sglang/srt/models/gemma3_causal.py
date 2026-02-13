@@ -177,7 +177,7 @@ class Gemma3Attention(nn.Module):
         else:
             # Global attention. Use the values in config.json.
             self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
-            self.rope_scaling = config.rope_parameters.get("rope_scaling")
+            self.rope_scaling = config.rope_parameters
             self.sliding_window = None
 
         self.attn = RadixAttention(
@@ -325,7 +325,7 @@ class Gemma3RotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         if rope_scaling is not None:
             self.rope_type = rope_scaling.get(
                 "rope_type", rope_scaling.get("type", "default")

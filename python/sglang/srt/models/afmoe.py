@@ -315,7 +315,7 @@ class AfmoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)

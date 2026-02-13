@@ -596,7 +596,7 @@ class MiniMaxM2Attention(nn.Module):
         )
 
         # Setup RoPE with partial rotary dimension
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,  # Use partial rotary dimension

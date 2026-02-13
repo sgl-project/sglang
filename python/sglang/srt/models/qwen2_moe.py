@@ -440,7 +440,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
         dual_chunk_attention_config = getattr(

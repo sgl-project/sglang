@@ -65,7 +65,7 @@ class MiMoV2MTPLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         rope_theta = config.rope_parameters.get("rope_theta", 1000000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
         self.self_attn = MiMoV2Attention(

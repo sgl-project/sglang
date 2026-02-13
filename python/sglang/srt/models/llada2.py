@@ -478,7 +478,7 @@ class LLaDA2MoeAttention(nn.Module):
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
             base=config.rope_parameters.get("rope_theta", 10000),
-            rope_scaling=config.rope_parameters.get("rope_scaling"),
+            rope_scaling=config.rope_parameters,
         )
 
         self.attn = RadixAttention(

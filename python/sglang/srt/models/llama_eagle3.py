@@ -111,7 +111,7 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         self.is_mrope_enabled = (
             rope_scaling is not None and "mrope_section" in rope_scaling
         )

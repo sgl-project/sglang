@@ -380,7 +380,7 @@ class GptOssDecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads

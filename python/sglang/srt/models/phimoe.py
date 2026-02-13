@@ -349,7 +349,7 @@ class PhiMoEDecoderLayer(nn.Module):
             layer_id=layer_id,
             attention_bias=config.attention_bias,
             quant_config=quant_config,
-            rope_scaling=config.rope_parameters.get("rope_scaling"),
+            rope_scaling=config.rope_parameters,
             prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = PhiMoE(

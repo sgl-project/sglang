@@ -167,7 +167,7 @@ class LoopCoderAttention(nn.Module):
         )
 
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(
             config, "max_position_embeddings", max_position
         )

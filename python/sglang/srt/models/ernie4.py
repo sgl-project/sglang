@@ -156,7 +156,7 @@ class Ernie4DecoderLayer(nn.Module):
     ):
         super().__init__()
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         # Self attention.
         self.self_attn = Ernie4Attention(

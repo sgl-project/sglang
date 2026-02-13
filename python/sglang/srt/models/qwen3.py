@@ -214,7 +214,7 @@ class Qwen3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = config.rope_parameters.get("rope_theta", 1000000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(

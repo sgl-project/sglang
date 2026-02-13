@@ -574,7 +574,7 @@ class MiMoV2DecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         rope_theta = config.rope_parameters.get("rope_theta", 1000000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
         if self.is_swa_layer():

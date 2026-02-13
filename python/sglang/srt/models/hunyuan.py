@@ -402,7 +402,7 @@ class HunYuanDecoderLayer(nn.Module):
             else config.intermediate_size[layer_id]
         )
         rope_theta = config.rope_parameters.get("rope_theta", 10000)
-        rope_scaling = config.rope_parameters.get("rope_scaling")
+        rope_scaling = config.rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
