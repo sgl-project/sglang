@@ -99,7 +99,6 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
