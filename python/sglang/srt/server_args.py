@@ -4996,10 +4996,16 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        host_map = {
+            "0.0.0.0": "127.0.0.1",
+            "::": "::1",
+        }
+        host = host_map.get(self.host, self.host)
+
+        if is_valid_ipv6_address(host):
+            return f"http://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"http://{host}:{self.port}"
 
     def get_model_config(self):
         # Lazy init to avoid circular import
