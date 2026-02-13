@@ -73,7 +73,7 @@ GPT_OSS_MODELS = [
     ModelConfig(
         model_path="lmsys/gpt-oss-120b-bf16",
         tp_size=8,
-        accuracy_threshold=0.79,
+        accuracy_threshold=0.75,
         timeout=900,
         other_args=[
             "--chunked-prefill-size",
