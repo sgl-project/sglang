@@ -153,6 +153,9 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
 
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool = False
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -364,6 +367,12 @@ class SamplingParams:
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.warning(error_msg)
+
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -738,6 +747,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -806,9 +827,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass
