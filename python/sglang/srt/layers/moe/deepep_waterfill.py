@@ -1389,6 +1389,11 @@ class DeepEPWaterfillBalancer:
         # can skip the runtime all_reduce and use these weights directly.
         self.static_rank_load: Optional[Tensor] = static_rank_load
 
+        # Pre-allocated buffers to avoid per-layer tensor allocations in the
+        # hot path.  Lazily initialised on first use (device may not be known
+        # at __init__ time).
+        self._counts_buf: Optional[Tensor] = None  # [world_size], int64
+
     # -------- Static weight helpers --------
 
     def has_static_weights(self) -> bool:
@@ -1449,9 +1454,30 @@ class DeepEPWaterfillBalancer:
         num_routed_experts to calculate experts_per_rank for rank assignment.
         """
         if HAS_TRITON and topk_ids.is_cuda:
-            return count_routed_per_rank_triton(
-                topk_ids, self.num_routed_experts, self.world_size
+            # Reuse pre-allocated buffer to avoid per-layer torch.zeros allocation.
+            if self._counts_buf is None:
+                self._counts_buf = torch.zeros(
+                    self.world_size, dtype=torch.int64, device=topk_ids.device
+                )
+            buf = self._counts_buf
+            buf.zero_()
+            num_tokens = topk_ids.shape[0]
+            topk = topk_ids.shape[1]
+            experts_per_rank = self.num_routed_experts // self.world_size
+            if num_tokens == 0:
+                return buf
+            BLOCK_SIZE = 256
+            grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+            _count_routed_per_rank_kernel[grid](
+                topk_ids,
+                buf,
+                num_tokens,
+                topk,
+                experts_per_rank,
+                self.world_size,
+                BLOCK_SIZE=BLOCK_SIZE,
             )
+            return buf
         else:
             return count_routed_per_rank_pytorch(
                 topk_ids, self.num_routed_experts, self.world_size

@@ -2163,15 +2163,14 @@ class DeepseekV2MoE(nn.Module):
             # preserve the correct relative ordering.  Scaling by static weights
             # adds noise since each rank computes a different "estimated global"
             # — the local counts are a more honest signal.
-            # No all_reduce, no GPU→CPU sync.
+            # No all_reduce, no GPU→CPU sync, no tensor allocation.
+            # Skip local_tokens_per_rank: it's uniform across ranks (same value
+            # for all r), so adding it to routed_counts shifts all gaps equally
+            # without changing the argmin or proportional weights.
             if profile_waterfill_timing:
                 evt_allreduce_s.record()
             global_routed_counts = local_routed_counts
-            topk = topk_ids.shape[1]
-            local_num_tokens = local_routed_counts.sum() // max(topk, 1)
-            local_tokens_per_rank = local_num_tokens.expand(
-                self.deepep_waterfill_balancer.world_size
-            ).to(torch.int64)
+            local_tokens_per_rank = None
             if profile_waterfill_timing:
                 evt_allreduce_e.record()
         else:
