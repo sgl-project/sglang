@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.kernels.post_process import dllm_post_process_fused
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -19,6 +20,9 @@ class LowConfidence(DllmAlgorithm):
     ):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
+        self.use_triton_post_process = config.algorithm_config.get(
+            "use_triton_post_process", True
+        )
 
     def run(
         self,
@@ -49,45 +53,58 @@ class LowConfidence(DllmAlgorithm):
             start_list.append(start)
 
         for _ in range(self.block_size):
-            mask_index = forward_batch.input_ids == self.mask_id
-            if torch.sum(mask_index).item() == 0:
-                break
-
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
+
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
                 curr_block_end = curr_block_start + self.block_size
                 block_input_ids = forward_batch.input_ids[
                     curr_block_start:curr_block_end,
                 ]
-                block_mask_index = block_input_ids == self.mask_id
-                if torch.sum(block_mask_index).item() == 0:
-                    continue
                 curr_logits = logits_output.full_logits[
                     curr_block_start:curr_block_end,
                 ]
 
-                x = torch.argmax(curr_logits, dim=-1)
-                p = torch.squeeze(
-                    torch.gather(
-                        F.softmax(curr_logits, dim=-1),
-                        dim=-1,
-                        index=torch.unsqueeze(x, -1),
-                    ),
-                    -1,
-                )
-                x = torch.where(block_mask_index, x, block_input_ids)
-                confidence = torch.where(block_mask_index, p, -np.inf)
+                if self.use_triton_post_process:
+                    # Fused Triton kernel: softmax + argmax + threshold + fallback
+                    # all on-device, no GPU-CPU sync per block
+                    dllm_post_process_fused(
+                        curr_logits,
+                        block_input_ids,
+                        self.mask_id,
+                        self.threshold,
+                    )
+                else:
+                    # Original PyTorch implementation
+                    block_mask_index = block_input_ids == self.mask_id
+                    if torch.sum(block_mask_index).item() == 0:
+                        continue
+                    x = torch.argmax(curr_logits, dim=-1)
+                    p = torch.squeeze(
+                        torch.gather(
+                            F.softmax(curr_logits, dim=-1),
+                            dim=-1,
+                            index=torch.unsqueeze(x, -1),
+                        ),
+                        -1,
+                    )
+                    x = torch.where(block_mask_index, x, block_input_ids)
+                    confidence = torch.where(block_mask_index, p, -np.inf)
 
-                transfer_index = confidence > self.threshold
+                    transfer_index = confidence > self.threshold
 
-                if transfer_index.sum().item() == 0:
-                    _, select_index = torch.topk(confidence, k=1)
-                    transfer_index[select_index] = True
+                    if transfer_index.sum().item() == 0:
+                        _, select_index = torch.topk(confidence, k=1)
+                        transfer_index[select_index] = True
 
-                block_input_ids[transfer_index] = x[transfer_index]
+                    block_input_ids[transfer_index] = x[transfer_index]
+
+            # Check once per iteration (single sync) whether any masks remain
+            mask_count = (forward_batch.input_ids == self.mask_id).sum().item()
+            if mask_count == 0:
+                break
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
