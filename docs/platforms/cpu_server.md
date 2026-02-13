@@ -207,8 +207,7 @@ Notes:
 3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
     To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
     For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
-    and setting the maximum batch size to 4. Currently the maximum applicable batch size
-    for optimizing with `torch.compile` is 16.
+    and setting the maximum batch size to 4.
 
 4. A warmup step is automatically triggered when the service is started.
     The server is ready when you see the log `The server is fired up and ready to roll!`.
