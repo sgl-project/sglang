@@ -36,6 +36,8 @@ export SGLANG_SET_CPU_AFFINITY=1
 ASCEND_RT_VISIBLE_DEVICES=$(echo $ASCEND_VISIBLE_DEVICES | tr ',' '\n' | sort -n | tr '\n' ',')
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES%,}
 export ASCEND_VISIBLE_DEVICES=""
+export HCCL_HOST_SOCKET_PORT_RANGE="auto"
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 unset https_proxy
 unset http_proxy
