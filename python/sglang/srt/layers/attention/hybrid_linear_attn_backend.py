@@ -651,7 +651,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
     def forward_decode(
         self,
         layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
@@ -701,7 +700,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
         v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+        return fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
@@ -718,11 +717,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             is_kda=True,
         )
 
-        self._track_mamba_state_decode(
-            forward_batch, layer_cache.conv, ssm_states, cache_indices
-        )
-
-        return core_attn_out
 
     def forward_extend(
         self,
@@ -810,10 +804,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
-        )
-
-        self._track_mamba_state_extend(
-            forward_batch, mamba_cache_params.conv, ssm_states, cache_indices
         )
 
         return core_attn_out

@@ -99,21 +99,34 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
-
-        self.topk = TopK(
-            top_k=config.num_experts_per_token,
-            renormalize=moe_renormalize,
-            use_grouped_topk=True,
-            num_expert_group=config.num_expert_group,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-            # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
-        )
+        if not _is_npu:
+            self.topk = TopK(
+                top_k=config.num_experts_per_token,
+                renormalize=moe_renormalize,
+                use_grouped_topk=True,
+                num_expert_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+                # and requires the output format to be standard. We use quant_config to determine the output format.
+                output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            )
+        else:
+            self.topk = TopK(
+                top_k=config.num_experts_per_token,
+                renormalize=False,
+                use_grouped_topk=True,
+                num_expert_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=True,
+                output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            )
 
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -425,6 +438,42 @@ class KimiDeltaAttention(nn.Module):
 
         return self.o_proj(core_attn_out)[0]
 
+class KimiMLAAttentionNpuAdapter:
+    def __init__(self, *args, **kwargs):
+        self.attn = KimiMLAAttention(*args, **kwargs)
+        from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import forward_mha_core_npu,forward_dsa_core_npu
+        from sglang.srt.models.deepseek_common.attention_forward_methods import AttnForwardMethod
+
+    def forward_core(self, intermediate_state):
+        hidden_states, attn_forward_method, forward_batch, inner_state = (
+            intermediate_state
+        )
+        if inner_state is None:
+            return hidden_states
+
+        if attn_forward_method == AttnForwardMethod.MHA:
+            return self.forward_normal_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
+            return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
+            return self.forward_normal_one_shot_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA:
+            return self.forward_absorb_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+            return self.forward_absorb_fused_mla_rope_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_NPU:
+            return forward_mha_core_npu(self, *inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_NPU:
+            return self.forward_absorb_core(*inner_state, llama_4_scaling=None)
+        elif attn_forward_method == AttnForwardMethod.DSA_NPU:
+            return forward_dsa_core_npu(self, *inner_state)
+        else:
+            raise NotImplementedError
+
+    def __getattr__(self, name):
+        return getattr(self.attn, name)
 
 class KimiDecoderLayer(nn.Module):
     def __init__(
@@ -450,54 +499,36 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
             )
         else:
-            self.self_attn = KimiMLAAttention(
-                layer_id=layer_idx,
-                hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                config=config,
-                qk_nope_head_dim=config.qk_nope_head_dim,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-                v_head_dim=config.v_head_dim,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=config.kv_lora_rank,
-                skip_rope=True,
-            )
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
-                    forward_dsa_core_npu,
-                    forward_mha_core_npu,
+            if not _is_npu:
+                self.self_attn = KimiMLAAttention(
+                    layer_id=layer_idx,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    config=config,
+                    qk_nope_head_dim=config.qk_nope_head_dim,
+                    qk_rope_head_dim=config.qk_rope_head_dim,
+                    v_head_dim=config.v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=config.kv_lora_rank,
+                    skip_rope=True,
                 )
-                from sglang.srt.models.deepseek_common.attention_forward_methods import AttnForwardMethod
-                def forward_core(self, intermediate_state):
-                    hidden_states, attn_forward_method, forward_batch, inner_state = (
-                        intermediate_state
-                    )
-                    if inner_state is None:
-                        return hidden_states
-
-                    if attn_forward_method == AttnForwardMethod.MHA:
-                        return self.forward_normal_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
-                        return self.forward_normal_chunked_kv_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
-                        return self.forward_normal_one_shot_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MLA:
-                        return self.forward_absorb_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
-                        return self.forward_absorb_fused_mla_rope_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
-                        return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MHA_NPU:
-                        return forward_mha_core_npu(self, *inner_state)
-                    elif attn_forward_method == AttnForwardMethod.MLA_NPU:
-                        return self.forward_absorb_core(*inner_state, llama_4_scaling=None)
-                    elif attn_forward_method == AttnForwardMethod.DSA_NPU:
-                        return forward_dsa_core_npu(self, *inner_state)
-                    else:
-                        raise NotImplementedError
-                self.self_attn.forward_core = forward_core.__get__(self.self_attn)
+            else:
+                self.self_attn = KimiMLAAttentionNpuAdapter(
+                    layer_id=layer_idx,
+                    hidden_size=self.hidden_size,
+                    num_heads=config.num_attention_heads,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    config=config,
+                    qk_nope_head_dim=config.qk_nope_head_dim,
+                    qk_rope_head_dim=config.qk_rope_head_dim,
+                    v_head_dim=config.v_head_dim,
+                    q_lora_rank=config.q_lora_rank,
+                    kv_lora_rank=config.kv_lora_rank,
+                    skip_rope=True,
+                )
         if (
             self.is_moe
             and config.num_experts is not None
