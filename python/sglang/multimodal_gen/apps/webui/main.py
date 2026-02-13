@@ -29,16 +29,38 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
 
     import gradio as gr
 
+    def resolve_model_repo_id(model_path: str) -> str:
+        from pathlib import Path
+
+        from huggingface_hub.utils import HFValidationError, validate_repo_id
+
+        try:
+            validate_repo_id(model_path)
+            return model_path
+        except HFValidationError:
+            pass
+
+        p = Path(model_path).expanduser()
+        parts = p.parts
+
+        if len(parts) < 2:
+            raise ValueError(f"Invalid model_path: {model_path}")
+
+        candidate = f"{parts[-2]}/{parts[-1]}"
+        validate_repo_id(candidate)  # let it raise if invalid
+        return candidate
+
+    repo_id = resolve_model_repo_id(server_args.model_path)
     if envs.SGLANG_USE_MODELSCOPE.get():
         from modelscope.hub.api import HubApi
 
         api = HubApi()
-        model_info_obj = api.model_info(server_args.model_path)
+        model_info_obj = api.model_info(repo_id)
         task_name = model_info_obj.tasks[0]["Name"].replace("-synthesis", "")
     else:
         from huggingface_hub import model_info
 
-        task_name = model_info(server_args.model_path).pipeline_tag
+        task_name = model_info(repo_id).pipeline_tag
 
     # init client
     sync_scheduler_client.initialize(server_args)
