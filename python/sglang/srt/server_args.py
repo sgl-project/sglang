@@ -1538,6 +1538,7 @@ class ServerArgs:
 
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1589,6 +1590,7 @@ class ServerArgs:
                     )
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
                 sm100_default_attention_backend="triton",
             )
@@ -1622,6 +1624,7 @@ class ServerArgs:
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
@@ -1629,6 +1632,7 @@ class ServerArgs:
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1698,7 +1702,8 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
-        elif self.enable_mamba_extra_buffer():  # extra_buffer
+
+        if self.enable_mamba_extra_buffer():  # extra_buffer
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
