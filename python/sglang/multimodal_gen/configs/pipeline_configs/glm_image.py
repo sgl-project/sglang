@@ -5,6 +5,8 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -24,6 +26,10 @@ class GlmImagePipelineConfig(ImagePipelineConfig):
     vae_tiling: bool = False
 
     vae_sp: bool = False
+
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (T5Config(),)
+    )
 
     dit_config: DiTConfig = field(default_factory=GlmImageDitConfig)
     # VAE
