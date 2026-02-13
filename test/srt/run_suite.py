@@ -135,6 +135,7 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gguf.py", 400),
         TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
@@ -146,6 +147,7 @@ suite_ascend = {
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
+        TestFile("ascend/test_ascend_gguf_moe.py", 400),
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
         TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
         TestFile("ascend/test_ascend_tp2_bf16.py", 400),

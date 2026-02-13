@@ -5,6 +5,7 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
+from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -668,24 +669,33 @@ class FusedMoE(torch.nn.Module):
             expert_id=expert_id,
         )
 
-    def _weight_loader_impl(
+    def _load_gguf_weight(
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
-        weight_name: str,
         shard_id: str,
         expert_id: int,
-    ) -> None:
-        tp_rank = self.moe_tp_rank
+        tp_rank: int,
+    ) -> bool:
+        """Handle GGUF weight loading.
 
-        # Special case for GGUF weights
+        Args:
+            param: The parameter to load the weight into.
+            loaded_weight: The weight tensor to load.
+            shard_id: The shard ID (w1, w2, or w3).
+            expert_id: The expert ID.
+            tp_rank: The tensor parallel rank.
+
+        Returns:
+            True if the weight was handled as a GGUF weight, False otherwise.
+        """
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
 
         if is_gguf_weight_type:
             # Store weight type for this expert
             param.weight_type = loaded_weight.item()
-            return
+            return True
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
@@ -704,6 +714,22 @@ class FusedMoE(torch.nn.Module):
             key = (expert_id, shard_id)
             param.expert_data_map[key] = loaded_weight
             param.data_container.append(loaded_weight)
+            return True
+
+        return False
+
+    def _weight_loader_impl(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        tp_rank = self.moe_tp_rank
+
+        # Special case for GGUF weights
+        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -1155,7 +1181,6 @@ class FusedMoE(torch.nn.Module):
 
         This materializes GGUF UninitializedParameters from their data_containers.
         """
-        from torch.nn.parameter import UninitializedParameter
 
         for name, param in list(self.named_parameters()):
             is_gguf_weight = getattr(param, "is_gguf_weight", False)
