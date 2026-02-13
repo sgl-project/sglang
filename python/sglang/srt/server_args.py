@@ -599,6 +599,7 @@ class ServerArgs:
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     disable_piecewise_cuda_graph: bool = False
+    enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: Optional[int] = None
@@ -910,6 +911,11 @@ class ServerArgs:
                 self.piecewise_cuda_graph_compiler = "eager"
 
     def _handle_piecewise_cuda_graph(self):
+        # Skip auto-disable when enforce flag is set (for testing)
+        if self.enforce_piecewise_cuda_graph:
+            self.disable_piecewise_cuda_graph = False
+            return
+
         # Disable piecewise cuda graph with following conditions:
         # 1. Disable Model Arch
         if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
@@ -953,6 +959,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 13. Deterministic inference
         if self.enable_deterministic_inference:
+            self.disable_piecewise_cuda_graph = True
+        # 14. PD disaggregation
+        if self.disaggregation_mode != "null":
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -4628,6 +4637,11 @@ class ServerArgs:
             "--disable-piecewise-cuda-graph",
             action="store_true",
             help="Disable piecewise cuda graph for extend/prefill.",
+        )
+        parser.add_argument(
+            "--enforce-piecewise-cuda-graph",
+            action="store_true",
+            help="Enforce piecewise cuda graph, skipping all auto-disable conditions. Used for testing.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
