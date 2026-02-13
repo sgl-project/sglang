@@ -48,6 +48,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -105,22 +106,6 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
-
-
-def _copy_or_rebind_param(
-    module: torch.nn.Module, name: str, new_value: torch.Tensor
-) -> None:
-    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
-    new_value = new_value.detach()
-    param = getattr(module, name, None)
-    if isinstance(param, Parameter):
-        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
-            param.data.copy_(new_value)
-        else:
-            param.data = new_value
-        param.requires_grad_(False)
-    else:
-        setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
 def _sglang_fp4_gemm_fake(
@@ -1179,10 +1164,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
         # Keep per-shard scales intact for hot reload; derive scalar params below.
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
         )
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
 
@@ -1235,15 +1220,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            _copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
-            _copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
+            copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
         weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
         layer.weights_padding_cols = weights_padding_cols
-        _copy_or_rebind_param(layer, "weight", weight)
+        copy_or_rebind_param(layer, "weight", weight)
 
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
@@ -1267,7 +1252,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale_ndim == 2
             else padded_scales.reshape(B, M_padded, K_padded)
         )
-        _copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
+        copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
 
     def apply(
         self,
@@ -1550,22 +1535,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
         # Create shared parameters
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer,
             "g1_alphas",
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
         )
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer,
             "g2_alphas",
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
         )
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer,
             "w13_input_scale_quant",
             (1 / w13_input_scale).to(torch.float32),
         )
-        _copy_or_rebind_param(
+        copy_or_rebind_param(
             layer,
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
@@ -1628,7 +1613,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            _copy_or_rebind_param(
+            copy_or_rebind_param(
                 layer, "w13_blockscale_swizzled", w13_blockscale_swizzled
             )
 
@@ -1642,21 +1627,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "but padding is also implemented for gated activations"
                 )
 
-                _copy_or_rebind_param(
+                copy_or_rebind_param(
                     layer,
                     "w13_weight",
                     torch.nn.functional.pad(
                         w13_weight, (0, 0, 0, intermediate_size_pad)
                     ),
                 )
-                _copy_or_rebind_param(
+                copy_or_rebind_param(
                     layer,
                     "w2_weight",
                     torch.nn.functional.pad(
                         layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
                     ),
                 )
-                _copy_or_rebind_param(
+                copy_or_rebind_param(
                     layer,
                     "w2_weight_scale",
                     torch.nn.functional.pad(
@@ -1666,7 +1651,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            _copy_or_rebind_param(
+            copy_or_rebind_param(
                 layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
             )
 

@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
@@ -40,20 +41,6 @@ elif is_cuda_alike():
     from sgl_kernel import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
-
-
-def _copy_or_rebind_param(module: Module, name: str, new_value: torch.Tensor) -> None:
-    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
-    new_value = new_value.detach()
-    param = getattr(module, name, None)
-    if isinstance(param, Parameter):
-        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
-            param.data.copy_(new_value)
-        else:
-            param.data = new_value
-        param.requires_grad_(False)
-    else:
-        setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
@@ -165,19 +152,19 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     )
 
     # Set flashinfer parameters
-    _copy_or_rebind_param(
+    copy_or_rebind_param(
         layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
     )
-    _copy_or_rebind_param(
+    copy_or_rebind_param(
         layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
     )
-    _copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
-    _copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
+    copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
+    copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
 
     # Compute additional scaling factor needed for TRT-LLM
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
-    _copy_or_rebind_param(
+    copy_or_rebind_param(
         layer,
         "g1_scale_c",
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
