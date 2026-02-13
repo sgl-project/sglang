@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=800, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=800, suite="nightly-8-gpu-b200")
 
 FULL_DEEPSEEK_V32_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
 
