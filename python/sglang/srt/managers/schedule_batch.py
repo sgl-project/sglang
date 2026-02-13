@@ -46,7 +46,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -507,7 +509,7 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
-class Req:
+class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -768,6 +770,11 @@ class Req:
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # Acceptance histogram for speculative decoding.
+        # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+        # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+        self.spec_acceptance_histogram: List[int] = []
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
@@ -804,9 +811,7 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
-        self.dllm_ids = []
-        self.dllm_block_offset = 0
-        self.dllm_config = dllm_config
+        self.init_diffusion_llm(dllm_config)
 
     @property
     def seqlen(self) -> int:
@@ -858,6 +863,18 @@ class Req:
         )
         self.last_tic = now
 
+    def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
+        """Update the speculative decoding acceptance histogram.
+
+        Args:
+            accepted_draft_tokens: Number of draft tokens accepted in this step.
+        """
+        if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
+            self.spec_acceptance_histogram.extend(
+                [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
+            )
+        self.spec_acceptance_histogram[accepted_draft_tokens] += 1
+
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
@@ -868,23 +885,10 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def is_dllm(self):
-        return self.dllm_config is not None
-
-    def _init_fill_ids_for_dllm(self):
-        if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
-        else:
-            self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
-        self.fill_ids = self.dllm_ids
-
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
+            self.determine_dllm_phase()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -1194,62 +1198,6 @@ class Req:
         )
 
 
-class DllmStagingReqs:
-    def __init__(self, dllm_config: Optional[DllmConfig] = None):
-        self.dllm_config = dllm_config
-        self.max_running_reqs = (
-            dllm_config.max_running_requests if dllm_config is not None else 1
-        )
-        self.reqs: List[Req] = []
-
-    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
-        assert self.dllm_config is not None, "Diffusion LLM config is not set."
-
-        if isinstance(req, DllmStagingReqs):
-            reqs_to_add = req.reqs
-        elif isinstance(req, list):
-            reqs_to_add = req
-        else:
-            reqs_to_add = [req]
-
-        num_to_add = len(reqs_to_add)
-
-        # Sanity check:
-        if self.check_redundant_reqs(reqs_to_add):
-            raise RuntimeError("Redundant requests detected in dLLM requests.")
-
-        if len(self.reqs) + num_to_add > self.max_running_reqs:
-            raise RuntimeError(
-                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
-            )
-
-        self.reqs.extend(reqs_to_add)
-
-    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
-        existing_rids: Set[str] = {r.rid for r in self.reqs}
-        return any(req.rid in existing_rids for req in reqs)
-
-    def init_next_round(self):
-        for req in self.reqs:
-            req.init_next_round_input()
-
-    def non_empty(self) -> bool:
-        return self.dllm_config is not None and len(self.reqs) > 0
-
-    def empty(self) -> bool:
-        return self.dllm_config is None or len(self.reqs) == 0
-
-    def update_chunked_status(self):
-        for req in self.reqs:
-            req.is_chunked += 1
-
-    def filter_finished_reqs(self):
-        self.reqs = [req for req in self.reqs if not req.finished()]
-
-    def __iter__(self):
-        return iter(self.reqs)
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1370,11 +1318,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
-    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     @classmethod
     def init_new(
@@ -1387,7 +1335,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1413,7 +1360,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
-            dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
         )
 
@@ -2316,6 +2262,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
         )
 
     def maybe_evict_swa(self):
