@@ -95,7 +95,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
     )
 
 

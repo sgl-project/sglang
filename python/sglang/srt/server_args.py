@@ -491,6 +491,9 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    flashinfer_allreduce_fusion_backend: Optional[
+        Literal["auto", "trtllm", "mnnvl"]
+    ] = None
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -826,6 +829,11 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
+        if self.enable_flashinfer_allreduce_fusion and self.flashinfer_allreduce_fusion_backend is None:
+            self.flashinfer_allreduce_fusion_backend = "auto"
+        self.enable_flashinfer_allreduce_fusion = False
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -1650,7 +1658,7 @@ class ServerArgs:
             device_name and "H20" in device_name and "H200" not in device_name
         )
         if (
-            not self.enable_flashinfer_allreduce_fusion
+            self.flashinfer_allreduce_fusion_backend is None
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -1666,7 +1674,7 @@ class ServerArgs:
             and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
-            self.enable_flashinfer_allreduce_fusion = True
+            self.flashinfer_allreduce_fusion_backend = "auto"
 
     def _handle_mamba_radix_cache(
         self,
@@ -4018,11 +4026,19 @@ class ServerArgs:
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
+            "--flashinfer-allreduce-fusion-backend",
+            type=str,
+            choices=["auto", "trtllm", "mnnvl"],
+            default=None,
+            help="Enable FlashInfer allreduce fusion and choose backend. When not set, the feature is disabled. "
+            "Options: 'auto' (choose best), 'trtllm', 'mnnvl'. "
+            "Fuses allreduce with Residual + RMSNorm for supported MoE models.",
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
-            help="Enable FlashInfer allreduce fusion with Residual RMSNorm. "
-            "Use SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND environment variable to force backend selection: "
-            "'auto' (default), 'trtllm', or 'mnnvl'.",
+            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
+            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
             "--deepep-mode",
