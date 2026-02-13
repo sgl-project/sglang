@@ -144,10 +144,10 @@ spec:
             mountPath: /root/script
           - name: share
             mountPath: /data
-          - name: cache
+          - name: share
             mountPath: /root/.cache
             subPath: ascend-ci-share-pkking-sglang
-          - name: sglang-source-code
+          - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_path }}
         volumes:
@@ -155,9 +155,6 @@ spec:
           hostPath:
             path: /root/script
         - name: share
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
-        - name: cache
           persistentVolumeClaim:
             claimName: sglang-guiyang004
         - name: ascend-910-config
@@ -169,9 +166,6 @@ spec:
         - name: localtime
           hostPath:
             path: /etc/localtime
-        - name: sglang-source-code
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
@@ -231,10 +225,10 @@ spec:
             mountPath: /root/script
           - name: share
             mountPath: /data
-          - name: cache
+          - name: share
             mountPath: /root/.cache
             subPath: ascend-ci-share-pkking-sglang
-          - name: sglang-source-code
+          - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_path }}
         volumes:
@@ -242,9 +236,6 @@ spec:
           hostPath:
             path: /root/script
         - name: share
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
-        - name: cache
           persistentVolumeClaim:
             claimName: sglang-guiyang004
         - name: ascend-910-config
@@ -256,9 +247,6 @@ spec:
         - name: localtime
           hostPath:
             path: /etc/localtime
-        - name: sglang-source-code
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
@@ -320,10 +308,10 @@ spec:
             mountPath: /root/script
           - name: share
             mountPath: /data
-          - name: cache
+          - name: share
             mountPath: /root/.cache
             subPath: ascend-ci-share-pkking-sglang
-          - name: sglang-source-code
+          - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_path }}
         volumes:
@@ -331,9 +319,6 @@ spec:
           hostPath:
             path: /root/script
         - name: share
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
-        - name: cache
           persistentVolumeClaim:
             claimName: sglang-guiyang004
         - name: ascend-910-config
@@ -345,9 +330,6 @@ spec:
         - name: localtime
           hostPath:
             path: /etc/localtime
-        - name: sglang-source-code
-          persistentVolumeClaim:
-            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
