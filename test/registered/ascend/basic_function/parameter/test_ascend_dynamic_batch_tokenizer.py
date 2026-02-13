@@ -1,5 +1,5 @@
 import logging
-import unittest 
+import unittest
 from types import SimpleNamespace
 
 import requests
@@ -36,11 +36,12 @@ BASE_OTHER_ARGS = [
     "--dynamic-batch-tokenizer-batch-size",
     "4",
     "--dynamic-batch-tokenizer-batch-timeout",
-    "0", 
+    "0",
     "--log-level",
-    "debug"
+    "debug",
 ]
 MODEL_NAME = QWEN3_32B_WEIGHTS_PATH
+
 
 def launch_server_with_tokenizer_timeout(
     model_name, base_url, tokenizer_timeout, other_args_base
@@ -127,7 +128,7 @@ class TestQwenPPTieWeightsAccuracyTokenizerTimeout1(BaseQwenTest):
             MODEL_NAME,
             cls.base_url,
             tokenizer_timeout=1,
-            other_args_base=BASE_OTHER_ARGS
+            other_args_base=BASE_OTHER_ARGS,
         )
 
     @classmethod
