@@ -1,23 +1,20 @@
 import os
 import unittest
 from shutil import copy2
+
 import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=400,
-    suite="nightly-1-npu-a3",
-    nightly=True,
-    disabled="run failed",
-)
+register_npu_ci(est_time=100, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestEnableTokenizerModeSlow(CustomTestCase):
@@ -34,7 +31,11 @@ class TestEnableTokenizerModeSlow(CustomTestCase):
     def setUpClass(cls):
         cls.model_path = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.tokenizer_path = "/tmp"
-        cls.file_names = ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
+        cls.file_names = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ]
         for file_name in cls.file_names:
             if not os.path.exists(cls.tokenizer_path + "/" + file_name):
                 copy2(cls.model_path + "/" + file_name, cls.tokenizer_path)
@@ -84,7 +85,9 @@ class TestEnableTokenizerModeSlow(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["tokenizer_path"], self.tokenizer_path)
         self.assertEqual(response.json()["tokenizer_mode"], self.tokenizer_mode)
-        self.assertEqual(response.json()["tokenizer_worker_num"], self.tokenizer_worker_num)
+        self.assertEqual(
+            response.json()["tokenizer_worker_num"], self.tokenizer_worker_num
+        )
 
 
 class TestEnableTokenizerModeAuto(TestEnableTokenizerModeSlow):

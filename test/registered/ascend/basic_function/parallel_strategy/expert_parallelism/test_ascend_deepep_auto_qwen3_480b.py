@@ -2,10 +2,12 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ascend.test_ascend_utils import QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+
+from sglang.test.ascend.test_ascend_utils import QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -13,9 +15,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-from sglang.test.ci.ci_register import register_npu_ci
-
 register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
+
 
 class TestDeepEpQwen(CustomTestCase):
     """
@@ -36,25 +37,43 @@ class TestDeepEpQwen(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--nnodes", "1",
-                "--node-rank", "0",
-                "--attention-backend", "ascend",
-                "--device", "npu",
-                "--quantization", "modelslim",
-                "--max-running-requests", 96,
-                "--context-length", 8192,
-                "--dtype", "bfloat16",
-                "--chunked-prefill-size", 28672,
-                "--max-prefill-tokens", 458880,
+                "--nnodes",
+                "1",
+                "--node-rank",
+                "0",
+                "--attention-backend",
+                "ascend",
+                "--device",
+                "npu",
+                "--quantization",
+                "modelslim",
+                "--max-running-requests",
+                96,
+                "--context-length",
+                8192,
+                "--dtype",
+                "bfloat16",
+                "--chunked-prefill-size",
+                28672,
+                "--max-prefill-tokens",
+                458880,
                 "--disable-radix-cache",
-                "--moe-a2a-backend", "deepep",
-                "--deepep-mode", "auto",
-                "--tp-size", 16,
-                "--dp-size", 4,
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-mode",
+                "auto",
+                "--tp-size",
+                16,
+                "--dp-size",
+                4,
                 "--enable-dp-attention",
                 "--enable-dp-lm-head",
-                "--mem-fraction-static", 0.7,
-                "--cuda-graph-bs", 16, 20, 24,
+                "--mem-fraction-static",
+                0.7,
+                "--cuda-graph-bs",
+                16,
+                20,
+                24,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",

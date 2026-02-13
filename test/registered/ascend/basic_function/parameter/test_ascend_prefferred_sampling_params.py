@@ -18,9 +18,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestPrefrredSample(CustomTestCase):
     """Testcase：Verify set --preferred-sampling-params parameter, the inference request is successfully processed.
 
-   [Test Category] Parameter
-   [Test Target] --preferred-sampling-params
-   """
+    [Test Category] Parameter
+    [Test Target] --preferred-sampling-params
+    """
 
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 

@@ -18,9 +18,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestDisableCudaGraphPadding(CustomTestCase):
     """Testcase：Verify set --disable-cuda-graph-padding parameter, the inference request is successfully processed.
 
-   [Test Category] Parameter
-   [Test Target] --disable-cuda-graph-padding
-   """
+    [Test Category] Parameter
+    [Test Target] --disable-cuda-graph-padding
+    """
 
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 

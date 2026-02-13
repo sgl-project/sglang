@@ -1,14 +1,16 @@
 import os
 import unittest
+
 import numpy
+
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -16,9 +18,10 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestDebugTensorInputFile(CustomTestCase):
     """Testcase：Verify set --debug-tensor-dump-input-file parameter, after warm up the process will be killed .
 
-       [Test Category] Parameter
-       [Test Target] --debug-tensor-dump-input-file
-       """
+    [Test Category] Parameter
+    [Test Target] --debug-tensor-dump-input-file
+    """
+
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
     def test_tensor_input_file(self):

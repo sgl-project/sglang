@@ -1,15 +1,16 @@
 import unittest
 
 import requests
-from sglang.test.ascend.test_ascend_utils import PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
+
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -17,23 +18,22 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestDisableFastImageProcessor(CustomTestCase):
     """Testcase：Verify set --disable-fast-image-processor, can normally handle multimodal (picture+text) requests.
 
-       [Test Category] Parameter
-       [Test Target] --disable-fast-image-processor
-       """
+    [Test Category] Parameter
+    [Test Target] --disable-fast-image-processor
+    """
     model = PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
     IMAGE_SGL_LOGO_URL = "https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20241022/emyrja/dog_and_girl.jpeg"
 
     @classmethod
     def setUpClass(cls):
-        other_args = (
-            [
-                "--disable-fast-image-processor",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--trust-remote-code",
-            ]
-        )
+        other_args = [
+            "--disable-fast-image-processor",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--trust-remote-code",
+        ]
+
         cls.process = popen_launch_server(
             cls.model,
             DEFAULT_URL_FOR_TEST,
