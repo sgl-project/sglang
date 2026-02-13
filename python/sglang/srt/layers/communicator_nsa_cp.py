@@ -32,8 +32,8 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather_into_tensor,
-    attn_tp_reduce_scatter_tensor,
+    attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -157,7 +157,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 get_local_dp_buffer(),
                 hidden_states,
             )
-            attn_tp_all_gather_into_tensor(
+            attn_cp_all_gather_into_tensor(
                 hidden_states,
                 local_hidden_states,
             )
@@ -203,8 +203,8 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states
-            hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-                context.attn_tp_rank
+            hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
+                context.attn_cp_rank
             ]
-            attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+            attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         return hidden_states, residual
