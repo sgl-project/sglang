@@ -57,7 +57,6 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             cls.model_path,
             cls.base_url,
             timeout=3 * DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-
             other_args=other_args,
         )
 

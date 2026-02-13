@@ -35,7 +35,7 @@ class TestOpenAIEmbedding(CustomTestCase):
             "--is-embedding",
             "--enable-metrics",
             "--attention-backend",
-            "ascend"
+            "ascend",
         ]
         cls.process = popen_launch_server(
             cls.model,

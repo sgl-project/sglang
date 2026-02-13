@@ -1,8 +1,11 @@
 import os
 import unittest
 from types import SimpleNamespace
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import (
+    QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k
 from sglang.test.run_eval import run_eval
