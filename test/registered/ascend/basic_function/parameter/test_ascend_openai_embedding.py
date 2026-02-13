@@ -1,14 +1,16 @@
 import unittest
+
 import openai
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import GTE_QWEN2_1_5B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=50, suite="nightly-1-npu-a3", nightly=True)
 
@@ -29,7 +31,12 @@ class TestOpenAIEmbedding(CustomTestCase):
         cls.api_key = "sk-123456"
 
         # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics", "--attention-backend", "ascend"]
+        other_args = [
+            "--is-embedding",
+            "--enable-metrics",
+            "--attention-backend",
+            "ascend",
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

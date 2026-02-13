@@ -89,7 +89,7 @@ class TestAscendDeleteCkptAfterLoading(CustomTestCase):
         # Verify the weight directory is deleted after loading
         self.assertFalse(
             os.path.exists(self.back_up_model_path),
-            "--delete-ckpt-after-loading is not taking effect."
+            "--delete-ckpt-after-loading is not taking effect.",
         )
 
 
