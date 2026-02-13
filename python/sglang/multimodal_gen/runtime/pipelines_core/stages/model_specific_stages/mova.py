@@ -156,8 +156,8 @@ class MOVADenoisingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if get_global_server_args().enable_cfg_parallel:
-            return StageParallelismType.CFG_PARALLEL
+        # Always REPLICATED: CFG parallel is handled internally (pos/neg split
+        # + cfg_model_parallel_all_reduce), matching the Wan/SGLang paradigm.
         return StageParallelismType.REPLICATED
 
     def _predict(
@@ -703,7 +703,7 @@ class MOVADenoisingStage(PipelineStage):
         - Before unpatchify, sequences are gathered back
         """
         model_dtype = visual_dit.time_embedding.fc_in.weight.dtype
-        device = visual_latents.device
+        device = get_local_torch_device()
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
