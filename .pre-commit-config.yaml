@@ -14,6 +14,7 @@ repos:
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        exclude: ^python/sglang/test/data/
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
