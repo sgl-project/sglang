@@ -1130,8 +1130,11 @@ class DeepseekV2MoE(nn.Module):
         """Compute / refresh static EPLB-derived per-rank weights if needed.
 
         Detects EPLB rebalance via physical_to_logical_map data pointer change.
+        Set SGLANG_DISABLE_STATIC_WATERFILL=1 to force dynamic (all_reduce) path.
         """
         if not self._enable_deepep_waterfill:
+            return
+        if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
             return
         balancer = self.deepep_waterfill_balancer
         if balancer is None:
