@@ -327,6 +327,12 @@ def encode_messages(
             idx + len(context), full_messages, thinking_mode=thinking_mode
         )
 
+    if not full_messages or full_messages[-1]["role"] not in ("user", "developer"):
+        prompt += "<｜Assistant｜>"
+        prompt += (
+            thinking_start_token if thinking_mode == "thinking" else thinking_end_token
+        )
+
     return prompt
 
 
