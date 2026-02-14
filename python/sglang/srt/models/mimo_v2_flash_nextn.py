@@ -229,6 +229,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)

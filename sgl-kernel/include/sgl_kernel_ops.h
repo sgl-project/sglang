@@ -937,15 +937,6 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     torch::Tensor& scale_factor);
 
 /*
- * From fast-hadamard-transform
- */
-torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
-
-/*
  * From flashmla
  */
 std::vector<at::Tensor> get_mla_decoding_metadata(
@@ -1006,15 +997,3 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
-
-/*
- * From csrc/sgl_diffusion/elementwise
- */
-torch::Tensor timestep_embedding(
-    const torch::Tensor& t,
-    torch::Tensor& output,
-    int64_t dim,
-    bool flip_sin_to_cos,
-    double downscale_freq_shift,
-    double scale,
-    int64_t max_period);

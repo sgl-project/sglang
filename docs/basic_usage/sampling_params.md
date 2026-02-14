@@ -74,7 +74,7 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
 | json_schema     | `Optional[str] = None`          | JSON schema for structured outputs.                                                                                                            |
 | regex           | `Optional[str] = None`          | Regex for structured outputs.                                                                                                                  |
 | ebnf            | `Optional[str] = None`          | EBNF for structured outputs.                                                                                                                   |
-| structural_tag  | `Optional[str] = None`          | The structal tag for structured outputs.                                                                                                       |
+| structural_tag  | `Optional[str] = None`          | The structural tag for structured outputs.                                                                                                       |
 
 ### Other options
 

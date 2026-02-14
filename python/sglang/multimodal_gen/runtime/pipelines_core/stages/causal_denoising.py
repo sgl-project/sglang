@@ -270,7 +270,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                                 ),  # type: ignore
                                 patch_size=server_args.pipeline_config.dit_config.patch_size,  # type: ignore
                                 STA_param=batch.STA_param,  # type: ignore
-                                VSA_sparsity=server_args.VSA_sparsity,  # type: ignore
+                                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,  # type: ignore
                                 device=get_local_torch_device(),  # type: ignore
                             )  # type: ignore
                             assert (

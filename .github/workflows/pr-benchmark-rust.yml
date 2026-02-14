@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_gateway_dependencies.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -80,27 +80,6 @@ jobs:
             sccache_version: "v0.12.0"
             artifact_name: request-processing-results
             artifact_path: criterion/benchmark_summary/
-          - name: Tokenizer
-            bench_name: tokenizer_benchmark
-            bench_args: ""
-            runner: ubuntu-latest
-            sccache_version: "v0.12.0"
-            artifact_name: tokenizer-results
-            artifact_path: criterion/tokenizer*/
-          - name: Tool Parser
-            bench_name: tool_parser_benchmark
-            bench_args: ""
-            runner: ubuntu-latest
-            sccache_version: "v0.12.0"
-            artifact_name: tool-parser-results
-            artifact_path: criterion/tool_parser*/
-          - name: Tree
-            bench_name: tree_benchmark
-            bench_args: "benchmark_summary"
-            runner: 4-gpu-a10
-            sccache_version: "v0.10.0"
-            artifact_name: tree-results
-            artifact_path: criterion/benchmark_summary*/
           - name: Manual Policy
             bench_name: manual_policy_benchmark
             bench_args: ""
@@ -117,7 +96,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_gateway_dependencies.sh
+          bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -204,9 +183,6 @@ jobs:
           echo "" >> summary.md
 
           generate_section "Request Processing" "request-processing-results" 60
-          generate_section "Tokenizer" "tokenizer-results" 100
-          generate_section "Tool Parser" "tool-parser-results" 100
-          generate_section "Radix Tree (Cache-Aware Routing)" "tree-results" 50
           generate_section "Manual Policy (Sticky Sessions)" "manual-policy-results" 100
 
           echo -e "---\n_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
