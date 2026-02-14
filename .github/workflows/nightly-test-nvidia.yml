@@ -389,6 +389,7 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GPU_CONFIG: "1-gpu-runner"
 
         timeout-minutes: 60
         run: |
@@ -397,6 +398,24 @@ jobs:
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2
+
+      - name: Collect diffusion performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/save_diffusion_metrics.py \
+            --gpu-config 1-gpu-runner \
+            --run-id ${{ github.run_id }} \
+            --output python/diffusion-metrics-1gpu-partition-${{ matrix.part }}.json \
+            --results-json python/diffusion-results.json
+
+      - name: Upload diffusion metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-metrics-1gpu-partition-${{ matrix.part }}
+          path: python/diffusion-metrics-1gpu-partition-${{ matrix.part }}.json
+          retention-days: 90
+          if-no-files-found: ignore
 
 
   nightly-test-multimodal-server-2-gpu:
@@ -422,6 +441,7 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GPU_CONFIG: "2-gpu-runner"
 
         timeout-minutes: 60
         run: |
@@ -430,6 +450,24 @@ jobs:
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2
+
+      - name: Collect diffusion performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/save_diffusion_metrics.py \
+            --gpu-config 2-gpu-runner \
+            --run-id ${{ github.run_id }} \
+            --output python/diffusion-metrics-2gpu-partition-${{ matrix.part }}.json \
+            --results-json python/diffusion-results.json
+
+      - name: Upload diffusion metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-metrics-2gpu-partition-${{ matrix.part }}
+          path: python/diffusion-metrics-2gpu-partition-${{ matrix.part }}.json
+          retention-days: 90
+          if-no-files-found: ignore
 
   # B200 Performance tests - 4 GPU
   nightly-test-perf-4-gpu-b200:
@@ -475,12 +513,14 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
-  # Consolidate performance metrics from all 8-GPU jobs
+  # Consolidate performance metrics from all jobs
   consolidate-metrics:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-b200
+      - nightly-test-multimodal-server-1-gpu
+      - nightly-test-multimodal-server-2-gpu
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -491,7 +531,7 @@ jobs:
       - name: Download all partition metrics
         uses: actions/download-artifact@v4
         with:
-          pattern: metrics-*
+          pattern: "*metrics-*"
           path: metrics/
           merge-multiple: true
 
