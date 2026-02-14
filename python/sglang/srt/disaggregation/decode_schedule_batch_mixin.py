@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -119,6 +118,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
+                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
