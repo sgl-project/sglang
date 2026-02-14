@@ -21,7 +21,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -67,6 +67,22 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+
+        # Embedding LoRA keeps weights unsharded and relies on the base
+        # output being all-reduced before adding the LoRA result. This is
+        # incompatible with input_scattered mode (DeepSeek-v2 MLA), where
+        # the base output is NOT all-reduced.
+        if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            if get_attn_tp_context().allow_input_scattered:
+                raise ValueError(
+                    "VocabParallelEmbeddingWithLoRA is not compatible with "
+                    "input_scattered mode (e.g., DeepSeek-v2 MLA with "
+                    "--enable-attn-tp-input-scattered). Please disable "
+                    "input_scattered or remove embed_tokens from LoRA "
+                    "target modules."
+                )
 
         self.output_offset = torch.tensor(
             [0, self.embed_dim],
@@ -186,33 +202,28 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # LoRA A weights (rank, vocab_size) are not sliced for embedding
-        # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA A weights (rank, vocab_size) are kept unsharded.
+        # Each rank does a full embedding lookup; the result is complete
+        # on every rank and added to the already all-reduced base output.
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # LoRA B weights (embedding_dim, rank) would be sliced along embedding dimension for TP>1
-        # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA B weights (embedding_dim, rank) are kept unsharded.
+        # The base embedding output is all-reduced (full embedding_dim),
+        # so LoRA B must also produce full embedding_dim.
+        return B
 
 
 class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     """
-    Parallel LM Head layer with LoRA support (simplified for TP=1).
+    Parallel LM Head layer with LoRA support.
 
     The LM head computes logits = hidden_states @ (W + B @ A)^T
+
+    With TP > 1, lm_head is column-parallel: each rank holds
+    weight (vocab_size/tp_size, hidden_size) and produces a shard
+    of logits.  LoRA A is kept unsharded (rank, hidden_size) while
+    LoRA B is sliced along the vocab dimension to (vocab_size/tp_size, rank).
     """
 
     def __init__(
@@ -224,11 +235,40 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
-        self.output_offset = torch.tensor(
-            [0, self.vocab_size],
-            dtype=torch.int32,
-            device=next(base_layer.parameters()).device,
-        )
+
+        tp_size = base_layer.tp_size if hasattr(base_layer, "tp_size") else 1
+
+        # lm_head LoRA keeps A unsharded and shards B along the vocab
+        # dimension, matching the column-parallel base output.  This is
+        # incompatible with input_scattered mode where the all-reduce is
+        # skipped.
+        if tp_size > 1:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            if get_attn_tp_context().allow_input_scattered:
+                raise ValueError(
+                    "ParallelLMHeadWithLoRA is not compatible with "
+                    "input_scattered mode (e.g., DeepSeek-v2 MLA with "
+                    "--enable-attn-tp-input-scattered). Please disable "
+                    "input_scattered or remove lm_head from LoRA "
+                    "target modules."
+                )
+
+            self.shard_vocab_size = get_lm_head_lora_b_shard_size(
+                self.vocab_size,
+                shard_indices=base_layer.shard_indices,
+            )
+            self.output_offset = torch.tensor(
+                [0, self.shard_vocab_size],
+                dtype=torch.int32,
+                device=next(base_layer.parameters()).device,
+            )
+        else:
+            self.output_offset = torch.tensor(
+                [0, self.vocab_size],
+                dtype=torch.int32,
+                device=next(base_layer.parameters()).device,
+            )
 
     def set_lora_info(
         self,
@@ -278,24 +318,22 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return A
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # LoRA A weights (rank, hidden_size) are kept unsharded.
+        # Each rank receives full hidden_states, so A operates on full input.
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For TP=1, no slicing needed
-        # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        # return B
-        if tp_rank > 1:
-            raise NotImplementedError(
-                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
-                f"Got tp_size={tp_rank}"
-            )
+        # lm_head is column-parallel: each rank produces vocab_size/tp_size (shard_vocab_size)
+        # logits.  LoRA B (vocab_size, rank) must be sliced along the vocab
+        # dimension to match the sharded base output.
+        # Uses the base layer's shard_indices for the actual vocab range on
+        # this rank, staying consistent with base model weight sharding.
+        tp_size = self.base_layer.tp_size if hasattr(self.base_layer, "tp_size") else 1
+        if tp_size <= 1:
+            return B
+        start_idx = self.base_layer.shard_indices.org_vocab_start_index
+        end_idx = self.base_layer.shard_indices.org_vocab_end_index
+        return B[start_idx:end_idx, :]
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):

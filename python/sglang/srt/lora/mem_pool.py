@@ -14,6 +14,7 @@ from sglang.srt.lora.utils import (
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
+    get_lm_head_lora_b_shard_size,
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
@@ -99,6 +100,17 @@ class LoRAMemoryPool:
             EMPTY_SLOT
         ] * self.max_loras_per_batch
 
+        # Cache lm_head shard_indices from the base model so that buffer
+        # allocation uses the same sharding as the base ParallelLMHead layer.
+        self.lm_head_shard_indices = None
+        if "lm_head" in target_modules and tp_size > 1:
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+            for _, module in base_model.named_modules():
+                if isinstance(module, ParallelLMHead):
+                    self.lm_head_shard_indices = module.shard_indices
+                    break
+
         self.init_buffers(base_model)
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
@@ -154,7 +166,8 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
-        # Have not imp self.tp_size > 1 yet.
+        # Embedding LoRA A is kept unsharded (full vocab) across TP ranks.
+        # Each rank does a full lookup; no vocab-dimension splitting needed.
         return (
             self.max_loras_per_batch,
             max_lora_dim,
@@ -192,7 +205,13 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
-        # Have not imp self.tp_size > 1 yet.
+        # lm_head is column-parallel so B is sharded; embed_tokens B stays
+        # unsharded (base output is all-reduced to full embed_dim).
+        if module_name == "lm_head":
+            output_dim = get_lm_head_lora_b_shard_size(
+                output_dim,
+                shard_indices=self.lm_head_shard_indices,
+            )
         return (
             self.max_loras_per_batch,
             output_dim,
@@ -296,8 +315,8 @@ class LoRAMemoryPool:
         lora_adapters: Dict[str, LoRAAdapter],
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         lora_refs: Dict[str, LoRARef],
-        lora_embed_tokens_module: Dict[str, BaseLayerWithLoRA],
-        lora_lm_head_module: Dict[str, BaseLayerWithLoRA],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
@@ -377,8 +396,8 @@ class LoRAMemoryPool:
         buffer_id: int,
         lora_adapter: LoRAAdapter,
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
-        lora_embed_tokens_module: Dict[str, BaseLayerWithLoRA],
-        lora_lm_head_module: Dict[str, BaseLayerWithLoRA],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
@@ -485,13 +504,8 @@ class LoRAMemoryPool:
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
                     lora_b_weights = weights
-                    # [to-do] support TP
-                    # if self.tp_size > 1:
-                    #     cur_module = lora_embeddings_modules[target_module]
-                    #     for module_name, module in cur_module:
-                    #         lora_b_weights = module.slice_lora_b_weights(
-                    #             lora_b_weights, self.tp_rank
-                    #         )
+                    # TP is supported by keeping embedding LoRA B unsharded;
+                    # no slicing needed.
 
                     buffer_view = self.embedding_B_buffer[target_module][
                         buffer_id, :, :lora_rank
@@ -516,18 +530,15 @@ class LoRAMemoryPool:
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
                     lora_b_weights = weights
-                    # [to-do] support TP
-                    # if self.tp_size > 1:
-                    #     cur_module = lora_embeddings_modules[target_module]
-                    #     for module_name, module in cur_module:
-                    #         lora_b_weights = module.slice_lora_b_weights(
-                    #             lora_b_weights, self.tp_rank
-                    #         )
+                    # Slice B along vocab dimension for this TP rank
+                    if self.tp_size > 1 and lora_lm_head_module is not None:
+                        lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
+                            lora_b_weights, self.tp_rank
+                        )
 
                     buffer_view = self.lm_head_B_buffer[target_module][
-                        # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
                         buffer_id,
-                        : (org_vocab_size + self.lora_added_tokens_size),
+                        : lora_b_weights.shape[0],
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)

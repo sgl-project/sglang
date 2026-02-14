@@ -156,6 +156,25 @@ EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
 
 
+def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
+    """Get the LoRA B output dimension for lm_head, accounting for TP.
+
+    lm_head is column-parallel, so its LoRA B must be sharded along the
+    vocab dimension to match the base output.  When shard_indices is
+    provided, the returned size reflects the base model's actual per-rank
+    vocab partition.
+
+    Args:
+        output_dim: Full (unsharded) output dimension (vocab_size).
+        shard_indices: VocabParallelEmbeddingShardIndices from the base
+            ParallelLMHead layer.  When provided, returns the per-rank
+            org vocab size from the base model's actual sharding.
+    """
+    if shard_indices is not None:
+        return shard_indices.num_org_elements
+    return output_dim
+
+
 def generate_sequence_lengths(
     forward_batch: ForwardBatch, device: Optional[torch.device] = None
 ) -> torch.Tensor:
