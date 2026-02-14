@@ -1267,6 +1267,9 @@ multimodal_model_archs = [
 piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV32ForCausalLM",
     "Qwen3NextForCausalLM",
+    "GlmMoeDsaForCausalLM",
+    "BailingMoeV2_5ForCausalLM",
+    "LLaDAModelLM",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
