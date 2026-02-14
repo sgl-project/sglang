@@ -79,12 +79,28 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * (self.model_config.head_dim + self.model_config.v_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if self.model_config.is_hybrid_swa:
+                full_layers_num = len(self.model_config.full_attention_layer_ids)
+                swa_layers_num = len(self.model_config.swa_attention_layer_ids)
+
+                full_per_token = self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ) * (self.model_config.head_dim + self.model_config.v_head_dim)
+
+                swa_per_token = self.model_config.get_swa_num_kv_heads(
+                    get_attention_tp_size()
+                ) * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+
+                cell_size = (
+                    full_per_token * full_layers_num + swa_per_token * swa_layers_num
+                ) * kv_size
+            else:
+                cell_size = (
+                    self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    * (self.model_config.head_dim + self.model_config.v_head_dim)
+                    * num_layers
+                    * kv_size
+                )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -94,17 +110,6 @@ class ModelRunnerKVCacheMixin:
                 k = self.model_config.head_dim
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
-                )
-
-            if "MiMoV2FlashForCausalLM" in self.model_config.hf_config.architectures:
-                cell_size += (
-                    self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-                    * (
-                        self.model_config.hf_text_config.swa_head_dim
-                        + self.model_config.hf_text_config.swa_v_head_dim
-                    )
-                    * len(self.model_config.swa_attention_layer_ids)
-                    * kv_size
                 )
         return cell_size
 
@@ -165,20 +170,21 @@ class ModelRunnerKVCacheMixin:
                 mamba_state_intermediate_size / (1 << 30)
             )
 
-        if (
-            server_args.disable_radix_cache
-            or server_args.max_mamba_cache_size is not None
-        ):
-            # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
-            if server_args.max_mamba_cache_size is None:
-                if server_args.max_running_requests is not None:
-                    server_args.max_mamba_cache_size = server_args.max_running_requests
-                else:
-                    server_args.max_mamba_cache_size = 512
+        if server_args.max_mamba_cache_size is not None:
+            # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+        elif (
+            server_args.disable_radix_cache
+            and server_args.max_running_requests is not None
+        ):
+            # Use explicitly set max_running_requests when radix cache is disabled
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
@@ -225,21 +231,59 @@ class ModelRunnerKVCacheMixin:
             )
             return
 
-        # Algorithm:
-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-        # - Find total # of tokens available across layers.
-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-        # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+        # Use unified memory-based allocation for all hybrid SWA models.
+        #
+        # Let:
+        #   F = Full layer per-token memory
+        #   S = SWA layer per-token memory (may differ from F)
+        #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
+        #
+        # The profile phase computed:
+        #   cell_size = F * n_full + S * n_swa
+        #   max_total_num_tokens = rest_memory / cell_size
+        #   => total_memory = max_total_num_tokens * (F * n_full + S * n_swa)
+        #
+        # We need to solve:
+        #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
+        #   swa_tokens = full_tokens * r
+        #
+        # Solution:
+        #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
+        #               = max_total_num_tokens * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
+
+        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+
+        # Full layer per-token memory
+        full_per_token = (
+            self.model_config.get_num_kv_heads(get_attention_tp_size())
+            * (self.model_config.head_dim + self.model_config.v_head_dim)
+            * kv_size
+        )
+
+        # SWA layer per-token memory
+        swa_per_token = (
+            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+            * kv_size
+        )
+
+        # Total memory available from profile
+        total_memory = self.max_total_num_tokens * (
+            full_per_token * full_layers_num + swa_per_token * swa_layers_num
+        )
+
+        # Solve the equations
+        denominator = (
+            full_per_token * full_layers_num
+            + swa_full_tokens_ratio * swa_per_token * swa_layers_num
+        )
         assert (
             denominator > 0
-        ), f"Invalid denominator={denominator} for swa_full_tokens_ratio={swa_full_tokens_ratio} and swa_layers_num={swa_layers_num} and full_layers_num={full_layers_num}"
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
+        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+
+        self.full_max_total_num_tokens = int(total_memory / denominator)
         self.swa_max_total_num_tokens = int(
             self.full_max_total_num_tokens * swa_full_tokens_ratio
         )
@@ -541,7 +585,13 @@ class ModelRunnerKVCacheMixin:
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
-                        [0] if self.is_draft_worker else config.full_attention_layer_ids
+                        [0]
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i in config.full_attention_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ]
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,

@@ -45,7 +45,6 @@ find . -name '*.ipynb' -exec nbstripout {} \;
 # After these checks pass, push your changes and open a PR on your branch
 pre-commit run --all-files
 ```
----
 
 ## Documentation Style Guidelines
 
@@ -55,3 +54,71 @@ pre-commit run --all-files
   - Reuse the launched server as much as possible to reduce server launch time.
 - Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
 - Follow the existing examples to learn how to launch a server, send a query and other common styles.
+
+## Documentation Build, Deployment, and CI
+
+The SGLang documentation pipeline is based on **Sphinx** and supports rendering Jupyter notebooks (`.ipynb`) into HTML/Markdown for web display. Detailed logits can be found in the [Makefile](./Makefile).
+
+### Notebook Execution (`make compile`)
+
+The `make compile` target is responsible for executing notebooks before rendering:
+
+* Finds all `.ipynb` files under `docs/` (excluding `_build/`)
+* Executes notebooks in parallel using GNU Parallel, with a relatively small `--mem-fraction-static`
+* Wraps execution with `retry` to reduce flaky failures
+* Executes notebooks via `jupyter nbconvert --execute --inplace`
+* Records execution timing in `logs/timing.log`
+
+This step ensures notebooks contain up-to-date outputs with each commit in the main branch before rendering.
+
+### Web Rendering (`make html`)
+
+After compilation, Sphinx builds the website:
+
+* Reads Markdown, reStructuredText, and Jupyter notebooks
+* Renders them into HTML pages
+* Outputs the website into:
+
+```
+docs/_build/html/
+```
+
+This directory is the source for online documentation hosting.
+
+### Markdown Export (`make markdown`)
+
+To support downstream consumers, we add a **new Makefile target**:
+
+```bash
+make markdown
+```
+
+This target:
+
+* Does **not modify** `make compile`
+* Scans all `.ipynb` files (excluding `_build/`)
+* Converts notebooks directly to Markdown using `jupyter nbconvert --to markdown`
+* Writes Markdown artifacts into the existing build directory:
+
+```
+docs/_build/html/markdown/<relative-path>.md
+```
+
+Example:
+
+```
+docs/advanced_features/lora.ipynb
+→ docs/_build/html/markdown/advanced_features/lora.md
+```
+
+### CI Execution
+
+In our [CI](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docs.yml), the documentation pipeline first gets all the executed results and renders HTML and Markdown by:
+
+```bash
+make compile    # execute notebooks (ensure outputs are up to date)
+make html       # build website as usual
+make markdown   # export markdown artifacts into _build/html/markdown
+```
+
+Then, the compiled results are forced pushed to [sgl-project.io](https://github.com/sgl-project/sgl-project.github.io) for rendering. In other words, sgl-project.io is push-only. All the changes of SGLang docs should be made directly in SGLang main repo, then push to the sgl-project.io.

@@ -8,6 +8,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,7 +19,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=51, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestAbort(CustomTestCase):
@@ -63,7 +64,52 @@ class TestAbort(CustomTestCase):
         )
 
 
-class TestAbortAll(CustomTestCase):
+class TestAbortWithApiKey(CustomTestCase):
+    def workload_func(self, base_url, model, api_key: str):
+        def process_func():
+            def run_one(_):
+                prompt = """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """
+
+                response = requests.post(
+                    f"{base_url}/generate",
+                    json={
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 2048,
+                        },
+                    },
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                response.json()
+
+            with ThreadPoolExecutor(16) as executor:
+                list(executor.map(run_one, list(range(16))))
+
+        p = multiprocessing.Process(target=process_func)
+        p.start()
+        time.sleep(0.5)
+        p.terminate()
+        time.sleep(10)
+
+    def test_memory_leak_with_api_key(self):
+        api_key = "test-api-key"
+        run_and_check_memory_leak(
+            lambda base_url, model: self.workload_func(base_url, model, api_key),
+            disable_radix_cache=False,
+            enable_mixed_chunk=False,
+            disable_overlap=False,
+            chunked_prefill_size=8192,
+            assert_has_abort=True,
+            api_key=api_key,
+        )
+
+
+class TestAbortAll(AbortAllMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -78,40 +124,6 @@ class TestAbortAll(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def _run_decode(self):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 16000,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
-    def test_abort_all(self):
-        num_requests = 32
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            # ensure the decode has been started
-            time.sleep(2)
-
-            requests.post(
-                self.base_url + "/abort_request",
-                json={
-                    "abort_all": True,
-                },
-            )
-
-            for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
 
 
 class TestAbortAllWithRetraction(CustomTestCase):
@@ -153,6 +165,8 @@ class TestAbortAllWithRetraction(CustomTestCase):
                     "max_new_tokens": 4000,
                     "ignore_eos": True,
                 },
+                "return_logprob": True,
+                "top_logprobs_num": 3,
             },
         )
         return response.json()
@@ -173,30 +187,49 @@ class TestAbortAllWithRetraction(CustomTestCase):
             )
 
             abort_in_queue_count = 0
-            abort_in_queue_with_none_empty_text = 0
+            abort_in_queue_with_partial_gen = 0
 
             for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
-                if (
-                    future.result()["meta_info"]["finish_reason"]["message"]
-                    == "Abort in waiting queue"
-                ):
+                result = future.result()
+                meta_info = result["meta_info"]
+                finish_reason = meta_info.get("finish_reason", {})
+
+                self.assertEqual(finish_reason.get("type"), "abort")
+
+                if finish_reason.get("message") == "Abort in waiting queue":
                     abort_in_queue_count += 1
-                    if len(future.result()["output_ids"]) > 0:
-                        abort_in_queue_with_none_empty_text += 1
-            assert abort_in_queue_count > 0
-            assert abort_in_queue_with_none_empty_text > 0
+                    output_ids = result.get("output_ids", [])
+
+                    if len(output_ids) > 0:
+                        abort_in_queue_with_partial_gen += 1
+
+                        self.assertEqual(
+                            meta_info.get("completion_tokens"), len(output_ids)
+                        )
+                        self.assertGreater(len(result.get("text", "")), 0)
+                        self.assertIsNotNone(meta_info.get("weight_version"))
+                        self.assertGreater(meta_info.get("e2e_latency"), 0)
+                        for logprob_key in [
+                            "output_token_logprobs",
+                            "output_top_logprobs",
+                        ]:
+                            self.assertEqual(
+                                len(meta_info.get(logprob_key, [])),
+                                len(output_ids),
+                                f"Length of '{logprob_key}' should match output_ids length",
+                            )
+
+            self.assertGreater(abort_in_queue_count, 0)
+            self.assertGreater(abort_in_queue_with_partial_gen, 0)
             print("Finished test_abort_all_with_retraction")
 
 
-class TestAbortWithQueueTimeout(CustomTestCase):
+class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_QUEUED_TIMEOUT_MS.override(1):
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -210,7 +243,27 @@ class TestAbortWithQueueTimeout(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def _run_decode(self):
+
+class TestAbortWithRunningTimeout(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(
+            0.001
+        ), envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--skip-server-warmup"],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_running_timeout(self):
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -222,20 +275,9 @@ class TestAbortWithQueueTimeout(CustomTestCase):
                 },
             },
         )
-        return response.json()
-
-    def test_queue_timeout(self):
-        num_requests = 2
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            error_count = 0
-            for future in as_completed(futures):
-                result = future.result()
-                if result.get("object") == "error":
-                    error_count += 1
-                    self.assertEqual(result["code"], 503)
-            self.assertEqual(error_count, 1)
+        result = response.json()
+        self.assertEqual(result["object"], "error")
+        self.assertEqual(result["code"], 503)
 
 
 if __name__ == "__main__":

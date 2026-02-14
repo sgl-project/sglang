@@ -4,8 +4,10 @@ from typing import List
 
 import torch
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -21,7 +23,11 @@ logger = logging.getLogger(__name__)
 class AscendTransferEngine(MooncakeTransferEngine):
 
     def __init__(
-        self, hostname: str, npu_id: int, disaggregation_mode: DisaggregationMode
+        self,
+        hostname: str,
+        npu_id: int,
+        disaggregation_mode: DisaggregationMode,
+        disaggregation_decode_enable_fake_auto: bool,
     ):
         if import_error is not None:
             logger.warning(
@@ -32,6 +38,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.engine = TransferEngine()
         self.hostname = hostname
         self.npu_id = npu_id
+        self.disaggregation_decode_enable_fake_auto = (
+            disaggregation_decode_enable_fake_auto
+        )
 
         # Centralized storage address of the AscendTransferEngine
         self.store_url = os.getenv("ASCEND_MF_STORE_URL")
@@ -67,6 +76,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 output_tensor_list, tmp_tensor, group=get_tp_group().device_group
             )
         """Initialize the ascend transfer instance."""
+        if self.disaggregation_decode_enable_fake_auto:
+            logger.info(
+                "Ascend Transfer Engine is not initialized in decode fake transfer mode."
+            )
+            return
+
         ret_value = self.engine.initialize(
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
         )
