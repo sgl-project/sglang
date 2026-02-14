@@ -217,7 +217,7 @@ class Glm4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters.get("rope_theta", 1000000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 0.5)
         bias = getattr(config, "attention_bias", True)

@@ -559,7 +559,7 @@ class Qwen3MoeAttention(nn.Module):
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
-            theta = self.config.rope_parameters.get("rope_theta", 10000.0)
+            theta = self.config.rope_parameters["rope_theta"]
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
             )

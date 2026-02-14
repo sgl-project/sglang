@@ -2231,7 +2231,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
         if hasattr(config, "rope_parameters"):
-            rope_theta = config.rope_parameters.get("rope_theta")
+            rope_theta = config.rope_parameters["rope_theta"]
             assert rope_theta is not None, f"rope_theta not found in config: {config}"
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None

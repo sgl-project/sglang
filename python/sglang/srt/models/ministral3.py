@@ -103,7 +103,7 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
-            rope_theta=config.rope_parameters.get("rope_theta", 1000000.0),
+            rope_theta=config.rope_parameters["rope_theta"],
             rope_scaling=config.rope_parameters,  # rope_scaling is rope_parameters in Ministral3Config
             max_position_embeddings=getattr(
                 config, "original_max_position_embeddings", 16384
