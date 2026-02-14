@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -12,8 +13,10 @@ from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
+    get_sp_group,
     get_sp_world_size,
     get_tp_world_size,
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
@@ -311,6 +314,19 @@ class WanTransformerBlock(nn.Module):
         self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
+        self_attn_backends = supported_attention_backends
+        cross_attn_backends = supported_attention_backends
+        if (
+            supported_attention_backends is not None
+            and AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+            in supported_attention_backends
+        ):
+            cross_attn_backends = supported_attention_backends.copy()
+            cross_attn_backends.remove(AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN)
+            logger.warning_once(
+                "Sparse Video Gen 2 attention backend is not supported for cross-attention; "
+                "removing SPARSE_VIDEO_GEN_2_ATTN from cross-attention backends."
+            )
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=self.local_num_heads,
@@ -327,7 +343,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
                 causal=False,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=self_attn_backends,
                 prefix=f"{prefix}.attn1",
             )
 
@@ -362,7 +378,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -371,7 +387,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -773,6 +789,29 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         self.layer_names = ["blocks"]
 
+    @lru_cache(maxsize=1)
+    def _compute_rope_for_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start,
+            token_start + local_len,
+            device=device,
+            dtype=torch.long,
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.rotary_emb.forward_uncached(positions)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -783,6 +822,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
+        if forward_batch is not None:
+            sequence_shard_enabled = (
+                forward_batch.enable_sequence_shard and self.sp_size > 1
+            )
+        else:
+            sequence_shard_enabled = False
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
@@ -805,25 +850,58 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # The rotary embedding layer correctly handles SP offsets internally.
-        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
-            (
-                post_patch_num_frames * self.sp_size,
-                post_patch_height,
-                post_patch_width,
-            ),
-            shard_dim=0,
-            start_frame=0,
-            device=hidden_states.device,
-        )
-        assert freqs_cos.dtype == torch.float32
-        assert freqs_cos.device == hidden_states.device
-        freqs_cis = (
-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
-        )
+        if not sequence_shard_enabled:
+            # The rotary embedding layer correctly handles SP offsets internally.
+            freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
+                (
+                    post_patch_num_frames * self.sp_size,
+                    post_patch_height,
+                    post_patch_width,
+                ),
+                shard_dim=0,
+                start_frame=0,
+                device=hidden_states.device,
+            )
+            assert freqs_cos.dtype == torch.float32
+            assert freqs_cos.device == hidden_states.device
+            freqs_cis = (
+                (freqs_cos.float(), freqs_sin.float())
+                if freqs_cos is not None
+                else None
+            )
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        # shape is [B, T' * H' * W', C]
+        seq_len_orig = hidden_states.shape[1]
+        seq_shard_pad = 0
+        if sequence_shard_enabled:
+            if seq_len_orig % self.sp_size != 0:
+                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+                pad = torch.zeros(
+                    (batch_size, seq_shard_pad, hidden_states.shape[2]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                hidden_states = torch.cat([hidden_states, pad], dim=1)
+            sp_rank = get_sp_group().rank_in_group
+            local_seq_len = hidden_states.shape[1] // self.sp_size
+            hidden_states = hidden_states.view(
+                batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
+            )
+            hidden_states = hidden_states[:, sp_rank, :, :]
+
+            frame_stride = post_patch_height * post_patch_width
+            freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
+                local_seq_len,
+                sp_rank,
+                frame_stride,
+                post_patch_width,
+                hidden_states.device,
+            )
+            freqs_cis = (freqs_cos.float(), freqs_sin.float())
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
@@ -854,7 +932,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)
-            if current_platform.is_mps()
+            if not current_platform.is_amp_supported()
             else encoder_hidden_states
         )  # cast to orig_dtype for MPS
 
@@ -881,6 +959,13 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
         self.cnt += 1
+
+        if sequence_shard_enabled:
+            hidden_states = hidden_states.contiguous()
+            hidden_states = sequence_model_parallel_all_gather(hidden_states, dim=1)
+            if seq_shard_pad > 0:
+                hidden_states = hidden_states[:, :seq_len_orig, :]
+
         # 5. Output norm, projection & unpatchify
         if temb.dim() == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
