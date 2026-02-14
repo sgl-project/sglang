@@ -597,9 +597,22 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
+    _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
+
+
+def _fix_special_tokens_pattern(tokenizer):
+    """Fix https://github.com/huggingface/transformers/pull/42563 which defaults
+    special_tokens_pattern to "cls_sep", inserting None into token IDs when
+    cls_token/sep_token are undefined (e.g. Kimi-VL's TikTokenTokenizer).
+    """
+    pattern = getattr(tokenizer, "special_tokens_pattern", None)
+    if pattern == "cls_sep" and (
+        tokenizer.cls_token_id is None or tokenizer.sep_token_id is None
+    ):
+        tokenizer.special_tokens_pattern = "none"
 
 
 # Some models doesn't have an available processor, e.g.: InternVL
@@ -697,6 +710,7 @@ def get_processor(
             raise e
     tokenizer = get_tokenizer_from_processor(processor)
 
+    _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     return processor
 
