@@ -2761,8 +2761,8 @@ class Scheduler(
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        if hasattr(decode_req, "kv_cache_cpu"):
-                            del decode_req.kv_cache_cpu
+                        assert hasattr(decode_req, "kv_cache_cpu")
+                        del decode_req.kv_cache_cpu
                         self.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
