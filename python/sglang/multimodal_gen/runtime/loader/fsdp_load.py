@@ -252,6 +252,9 @@ def load_model_from_full_model_state_dict(
     # sort parameter names to ensure all ranks process parameters in the same order
     sorted_param_names = sorted(custom_param_sd.keys())
 
+    requires_grad = False
+
+    # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
         full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
@@ -322,15 +325,14 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        # Preserve requires_grad flag from meta parameter. Quantized weights
-        # (e.g., int8/FP8) must have requires_grad=False to avoid PyTorch
-        # complaining about non-floating Parameters requiring gradients.
-        requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+
+        requires_grad = False
         sharded_sd[target_param_name] = nn.Parameter(
             sharded_tensor, requires_grad=requires_grad
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
+    # parameters in nn.Module that doesn't exist in safetensor files
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
@@ -342,6 +344,7 @@ def load_model_from_full_model_state_dict(
         "bias",  # Allow bias parameters to be initialized when missing in checkpoint
     ]  # Can be extended as needed
     for new_param_name in unused_keys:
+        # check unallowed missing params
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
             logger.error(
                 "Unsupported new parameter: %s. Allowed patterns: %s",
