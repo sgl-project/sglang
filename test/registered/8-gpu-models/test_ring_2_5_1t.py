@@ -25,6 +25,7 @@ class TestRing2_5_1T(unittest.TestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
             "--watchdog-timeout=300000",
+            "--soft-watchdog-timeout=300000",
         ]
 
         variants = [
