@@ -285,13 +285,11 @@ class LayerwiseOffloadManager:
         When layerwise offload (--dit-layerwise-offload) is enabled, the
         offload manager replaces GPU parameters with small torch.empty((1,))
         placeholders while real weights live in consolidated pinned CPU
-        buffers.  A naive param.data.copy_() would fail with a shape
-        mismatch.  Instead, this method writes new weights directly into
-        the CPU buffers, bypassing the placeholders entirely.  For any
-        layer that happens to be resident on GPU at update time, the live
-        GPU tensor is also updated so the change takes effect immediately.
-        This requires no extra GPU memory and does not disturb the offload
-        state.
+        buffers.
+        
+        The refit process writes new weights directly into the CPU buffers,
+        bypassing the placeholders.  For any layer that happens to be resident
+        on the GPU at update time, the live GPU tensor is also updated.
 
         Args:
             weight_dict: Mapping of parameter name to new weight tensor.
@@ -301,7 +299,7 @@ class LayerwiseOffloadManager:
 
         Raises:
             ValueError: If a weight's shape does not match the recorded
-                metadata (i.e. the real shape, not the placeholder shape).
+                metadata (i.e., the real shape, not the placeholder shape).
         """
         if not self.enabled:
             return None
