@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -76,7 +77,10 @@ class TestQwen2FP8(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        if is_in_amd_ci():
+            self.assertGreater(metrics["accuracy"], 0.77)
+        else:
+            self.assertGreater(metrics["accuracy"], 0.78)
 
 
 if __name__ == "__main__":

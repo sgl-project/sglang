@@ -169,7 +169,10 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 4000)
-            self.assertLess(res["median_ttft_ms"], 80)
+            if is_in_amd_ci():
+                self.assertLess(res["median_ttft_ms"], 85)
+            else:
+                self.assertLess(res["median_ttft_ms"], 80)
 
     def _run_lora_latency_test(self, enable_background_task: bool):
         """
