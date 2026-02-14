@@ -469,9 +469,9 @@ def iter_materialized_weights(module: torch.nn.Module):
     """Yield (name, tensor) pairs with materialized weights, even under offload.
 
     When layerwise offload is active, module.named_parameters() returns
-    (1,) placeholders for offloaded layers.  This helper reads the
+    (1,) placeholders for offloaded layers.  This function reads the
     actual data from the offload manager's CPU buffers and chains it with
-    the non-offloaded parameters so callers always see real tensors.
+    the non-offloaded parameters.
     """
     offload_managers: list = []
     if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
