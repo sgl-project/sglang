@@ -76,16 +76,20 @@ void extend_attention_kernel_impl(
     int tid = at::get_thread_num();
     // s_i and s_delta: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(s_i);
+    float* __restrict__ s_delta = s_i;
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
+    // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
+    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+    scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
+    fill_stub(s_delta2, 0.f, BLOCK_M * BLOCK_N);
 
     alignas(64) float s_prime[BLOCK_M];
     alignas(64) float m_prime[BLOCK_M];
@@ -177,12 +181,16 @@ void extend_attention_kernel_impl(
 
             // s_delta <- exp(s_i - m_i)
             at::vec::map<float>(
-                [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+                [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); },
+                s_delta + row * BLOCK_N,
+                s_i + row * BLOCK_N,
+                n_size);
 
             // s' <- s' * m_delta + sum(s_delta)
             s_prime[row] *= m_delta;
             s_prime[row] +=
-                at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_i + row * BLOCK_N, n_size);
+                at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+
             m_prime[row] = m_i;
 
             // v' <- v' * m_delta
@@ -193,12 +201,12 @@ void extend_attention_kernel_impl(
                 head_size_v);
 
             // pad s_delta with 0 first and then convert to scalar_t
-            fill_stub(s_i + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-            copy_stub<scalar_t, BLOCK_N>(s_delta + row * BLOCK_N, s_i + row * BLOCK_N);
+            fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+            copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
           }
         } else {
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+              s_i, s_i, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
         }
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -219,7 +227,7 @@ void extend_attention_kernel_impl(
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
             /* add_C */ true,
-            /* A     */ s_delta,
+            /* A     */ s_delta2,
             /* B     */ Btmp,
             /* C     */ v_prime);
       }
@@ -289,12 +297,15 @@ void extend_attention_kernel_impl(
 
               // s_delta <- exp(s_i - m_i)
               at::vec::map<float>(
-                  [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+                  [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); },
+                  s_delta + row * BLOCK_N,
+                  s_i + row * BLOCK_N,
+                  n_size);
 
               // s' <- s' * m_delta + sum(s_delta)
               s_prime[row] *= m_delta;
               s_prime[row] +=
-                  at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_i + row * BLOCK_N, n_size);
+                  at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
 
               m_prime[row] = m_i;
 
@@ -306,12 +317,12 @@ void extend_attention_kernel_impl(
                   head_size_v);
 
               // pad s_delta with 0 first and then convert to scalar_t
-              fill_stub(s_i + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-              copy_stub<scalar_t, BLOCK_N>(s_delta + row * BLOCK_N, s_i + row * BLOCK_N);
+              fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+              copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
             }
           } else {
             flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-                s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+                s_i, s_i, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
           }
 
           // get value and pack
@@ -332,7 +343,7 @@ void extend_attention_kernel_impl(
               /* ldb   */ head_size_v,
               /* ldc   */ head_size_v,
               /* add_C */ true,
-              /* A     */ s_delta,
+              /* A     */ s_delta2,
               /* B     */ Btmp,
               /* C     */ v_prime);
         }  // loop with seq_len_extend
@@ -361,6 +372,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   const int size_per_thread =
       /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
       /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
+      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
       /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
 
   buffer.resize_({num_threads, size_per_thread});
@@ -551,18 +563,14 @@ void extend_attention_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      if (sliding_window_size > 0) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(32, 32);
-      } else {
-        if (max_len_extend <= 256) {
-          LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
-        } else if (max_len_extend <= 1024) {
-          LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
-        } else if (max_len_extend <= 4096) {
-          LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
-        } else {  // max_len_extend > 4096
-          LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
-        }
+      if (max_len_extend <= 256) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
+      } else if (max_len_extend <= 1024) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+      } else if (max_len_extend <= 4096) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
+      } else {  // max_len_extend > 4096
+        LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
       }
     });
   });

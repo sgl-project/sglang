@@ -328,19 +328,6 @@ class TestExtendAttention(CustomTestCase):
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
 
     def test_extend_attention(self):
-        for has_sink in [True, False]:
-            for sliding_window in [None, 10, 128]:
-                if not has_sink and sliding_window is not None:
-                    continue
-                self._test_extend_attention_once(
-                    1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False
-                )
-                self._test_extend_attention_once(
-                    1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False
-                )
-                self._test_extend_attention_once(
-                    1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
-                )
         for is_mla in [True, False]:
             for is_cross_attn in [True, False]:
                 if is_mla and is_cross_attn:
@@ -356,6 +343,19 @@ class TestExtendAttention(CustomTestCase):
                 )
                 self._test_extend_attention_once(
                     1, 9000, 16, 1, 32, 32, None, False, is_mla, is_cross_attn
+                )
+        for has_sink in [True, False]:
+            for sliding_window in [None, 10, 128]:
+                if not has_sink and sliding_window is not None:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
                 )
 
 

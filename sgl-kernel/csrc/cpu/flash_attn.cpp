@@ -156,7 +156,7 @@ void flash_attn_kernel_impl(
         }
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+            s_i, s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
@@ -333,7 +333,7 @@ void flash_attn_varlen_kernel_impl(
         }
 
         flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+            s_i, s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
         // get value and pack
         pack_vnni2<scalar_t>(
