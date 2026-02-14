@@ -24,8 +24,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear, \
-    MergedColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear, RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -707,6 +709,7 @@ class QwenImageCrossAttention(nn.Module):
                 self.inner_dim,
                 self.dim,
                 bias=out_bias,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out",
             )
@@ -720,6 +723,7 @@ class QwenImageCrossAttention(nn.Module):
                     self.inner_dim,
                     self.dim,
                     bias=out_bias,
+                    gather_output=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
@@ -758,6 +762,7 @@ class QwenImageCrossAttention(nn.Module):
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
+
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
         img_key = img_key.unflatten(-1, (self.num_heads, -1))
@@ -862,6 +867,7 @@ class QwenImageTransformerBlock(nn.Module):
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
@@ -887,6 +893,7 @@ class QwenImageTransformerBlock(nn.Module):
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
@@ -940,7 +947,6 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch: 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch: 2 * actual_batch]
-
             if _is_cuda:
                 if not x.is_contiguous():
                     x = x.contiguous()
@@ -988,8 +994,8 @@ class QwenImageTransformerBlock(nn.Module):
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
-        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
+        img_mod_params = self.img_mod[1](temb_img_silu)[0]  # [B, 6*dim]
+        txt_mod_params = self.txt_mod[1](temb_txt_silu)[0]  # [B, 6*dim]
 
         if (
             self.quant_config is not None
