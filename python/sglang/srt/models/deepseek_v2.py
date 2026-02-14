@@ -621,14 +621,19 @@ class DeepseekV2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         # NOTE:
-        # - `num_fused_shared_experts` controls the built-in "shared experts fusion optimization"
-        #   for DeepSeek V3/R1 on some backends.
-        # - DeepEP Waterfill is a separate mechanism that also fuses shared expert into the MoE
-        #   dispatch/compute/combine path (as an extra MoE slot routed through DeepEP).
+        # `num_fused_shared_experts` indicates that shared experts are fused into the MoE
+        # path. This is set to n_shared_experts (typically 1) for both:
+        #   - Standard/AMD path: kernel-level fusion (TopK appends shared expert ID,
+        #     MoE kernel handles it internally).
+        #   - DeepEP Waterfill path: dispatch-level fusion (Waterfill balancer adds shared
+        #     expert slot during dispatch preparation, topk=9).
         #
-        # When DeepEP Waterfill is enabled, shared expert is fused into the MoE path (topk=9 via
-        # dispatch-time expansion), but we DO NOT use the built-in shared experts fusion
-        # optimization inside TopK / MoE kernels.
+        # `num_fused_shared_experts_in_moe_impl` controls the kernel-internal fusion only.
+        # Waterfill sets this to 0 (kernel doesn't know about shared experts; Waterfill
+        # handles the routing dynamically).
+        #
+        # When `num_fused_shared_experts > 0`, shared expert weights are loaded directly
+        # into the MoE expert array (no separate shared_experts MLP module needed).
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -648,12 +653,9 @@ class DeepseekV2MoE(nn.Module):
         # serializing the shared expert into the dispatch pipeline.
         # V2 can be activated EITHER via --enable-deepep-waterfill + SGLANG_WATERFILL_V2=1,
         # OR via just SGLANG_WATERFILL_V2=1 with DeepEP backend and shared experts.
-        _v2_env = os.environ.get("SGLANG_WATERFILL_V2", "") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
+        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
+
+        _v2_env = is_waterfill_v2_enabled()
         waterfill_v2 = _v2_env and (
             will_enable_deepep_waterfill
             or (get_moe_a2a_backend().is_deepep() and n_shared_experts > 0)
@@ -673,9 +675,8 @@ class DeepseekV2MoE(nn.Module):
                 else n_shared_experts
             )
         self._waterfill_v2 = waterfill_v2
-        # Built-in fused shared experts optimization (TopK append + kernel support) is distinct
-        # from DeepEP Waterfill. In Waterfill mode, we keep the built-in optimization off and
-        # let Waterfill generate the shared expert slot during dispatch preparation.
+        # Kernel-level fusion flag: controls TopK append + MoE kernel shared expert
+        # handling. Waterfill uses 0 (handles shared expert in its own dispatch path).
         num_fused_shared_experts_in_moe_impl = (
             0 if will_enable_deepep_waterfill else self.num_fused_shared_experts
         )
@@ -712,10 +713,9 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
         # Check if DeepEP Waterfill will be enabled (need to know before creating experts).
-        #
-        # IMPORTANT: Waterfill is itself a "shared expert fusion" mode (shared expert is routed
-        # through DeepEP as an extra MoE slot). Therefore, we should NOT gate Waterfill on
-        # `num_fused_shared_experts == 0` (which refers to the built-in fusion optimization).
+        # Waterfill is a "shared expert fusion" mode — shared expert is routed through
+        # DeepEP as an extra MoE slot. Both waterfill and standard fusion set
+        # num_fused_shared_experts=1; they differ only in the kernel-level mechanism.
         self._will_enable_deepep_waterfill = will_enable_deepep_waterfill
 
         # Waterfill: expand num_experts to include shared expert per rank
@@ -776,10 +776,16 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        # Create separate shared_experts MLP only when:
+        # - shared experts exist
+        # - they are NOT fused into the MoE kernel (num_fused_shared_experts_in_moe_impl == 0)
+        # - Waterfill is NOT enabled (waterfill fuses shared expert into MoE via weight
+        #   loading name-remap; no separate MLP needed)
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
             and num_fused_shared_experts_in_moe_impl == 0
+            and not will_enable_deepep_waterfill
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -876,32 +882,11 @@ class DeepseekV2MoE(nn.Module):
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
             )
-            # When static EPLB is enabled (init-expert-location != trivial), routed experts are
-            # typically already better balanced and/or more locality-friendly. In that setting,
-            # the probabilistic sampling step in Waterfill can over-send shared tokens remote
-            # (many candidate ranks), increasing communication and hurting E2E throughput.
-            # Disable sampling and use deterministic argmin (with tie-breaking to local).
-            server_args = get_global_server_args()
-            init_loc = getattr(server_args, "init_expert_location", "trivial")
-            static_eplb_enabled = bool(init_loc) and (init_loc != "trivial")
-            # Make Waterfill more conservative under static EPLB to avoid perturbing
-            # already-balanced routed load (and to reduce remote shared-token dispatch).
-            # Scale with nnodes: cross-node dispatch is more expensive than cross-rank
-            # within the same node, so penalize remote more aggressively on multi-node.
-            nnodes = getattr(server_args, "nnodes", 1)
-            local_preference_factor = (
-                (1.0 + 0.2 * nnodes) if static_eplb_enabled else 1.0
-            )
-            enable_sampling = not static_eplb_enabled
-            adaptive_k_threshold = 1.15 if static_eplb_enabled else 0.0
             self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
                 num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
-                rank=get_moe_expert_parallel_rank(),  # Use EP rank, not TP rank!
+                rank=get_moe_expert_parallel_rank(),
                 routed_scaling_factor=self.routed_scaling_factor,
-                local_preference_factor=local_preference_factor,
-                enable_sampling=enable_sampling,
-                adaptive_k_threshold=adaptive_k_threshold,
             )
 
             # Store the number of local *physical* routed experts (without the shared slot) for
@@ -936,195 +921,6 @@ class DeepseekV2MoE(nn.Module):
                 self._rebalance_experts_per_rank,
                 self._rebalance_imbalance_threshold,
             )
-
-    def _copy_shared_expert_weights_to_moe(self):
-        """
-        Copy shared expert weights to the MoE layer's expert weights.
-
-        In Waterfill mode, shared expert is fused as a real routed expert.
-        Each rank has (old_experts_per_rank + 1) experts:
-        - [0, old_experts_per_rank-1]: routed experts
-        - [old_experts_per_rank]: shared expert (copied from self.shared_experts)
-
-        This should be called after model weights are loaded.
-        """
-        if not self._enable_deepep_waterfill:
-            return
-
-        if not hasattr(self, "shared_experts"):
-            logger.warning(
-                "DeepEP Waterfill enabled but `shared_experts` module is missing "
-                "(layer_id=%s). Shared expert weights will NOT be copied into MoE.",
-                self.layer_id,
-            )
-            return
-
-        # Local shared expert index = old_experts_per_rank (e.g., 32)
-        local_shared_idx = self._old_experts_per_rank
-
-        # Copy w13 (gate_up) weights and scales
-        if hasattr(self.experts, "w13_weight") and hasattr(
-            self.shared_experts, "gate_up_proj"
-        ):
-            src_weight = self.shared_experts.gate_up_proj.weight.data
-            dst_weight = self.experts.w13_weight.data[local_shared_idx]
-
-            if src_weight.shape != dst_weight.shape:
-                logger.warning(
-                    "DeepEP Waterfill shared weight copy skipped due to shape mismatch "
-                    "(layer_id=%s, local_shared_idx=%s, w13 src=%s dst=%s).",
-                    self.layer_id,
-                    local_shared_idx,
-                    tuple(src_weight.shape),
-                    tuple(dst_weight.shape),
-                )
-                return
-            self.experts.w13_weight.data[local_shared_idx].copy_(src_weight)
-
-            # Copy FP8 scale if present (for FP8 models)
-            if hasattr(self.experts, "w13_weight_scale_inv") and hasattr(
-                self.shared_experts.gate_up_proj, "weight_scale_inv"
-            ):
-                src_scale = self.shared_experts.gate_up_proj.weight_scale_inv.data
-                dst_scale = self.experts.w13_weight_scale_inv.data[local_shared_idx]
-                if src_scale.shape == dst_scale.shape:
-                    self.experts.w13_weight_scale_inv.data[local_shared_idx].copy_(
-                        src_scale
-                    )
-            elif hasattr(self.experts, "w13_weight_scale") and hasattr(
-                self.shared_experts.gate_up_proj, "weight_scale"
-            ):
-                # Per-tensor scale
-                src_scale = self.shared_experts.gate_up_proj.weight_scale.data
-                self.experts.w13_weight_scale.data[local_shared_idx].copy_(src_scale)
-        else:
-            logger.warning(
-                "DeepEP Waterfill cannot copy shared gate_up (w13) weights: missing "
-                "attrs on experts/shared_experts (layer_id=%s).",
-                self.layer_id,
-            )
-
-        # Copy w2 (down) weights and scales
-        if hasattr(self.experts, "w2_weight") and hasattr(
-            self.shared_experts, "down_proj"
-        ):
-            src_weight = self.shared_experts.down_proj.weight.data
-            dst_weight = self.experts.w2_weight.data[local_shared_idx]
-
-            if src_weight.shape != dst_weight.shape:
-                logger.warning(
-                    "DeepEP Waterfill shared weight copy skipped due to shape mismatch "
-                    "(layer_id=%s, local_shared_idx=%s, w2 src=%s dst=%s).",
-                    self.layer_id,
-                    local_shared_idx,
-                    tuple(src_weight.shape),
-                    tuple(dst_weight.shape),
-                )
-                return
-            self.experts.w2_weight.data[local_shared_idx].copy_(src_weight)
-
-            # Copy FP8 scale if present
-            if hasattr(self.experts, "w2_weight_scale_inv") and hasattr(
-                self.shared_experts.down_proj, "weight_scale_inv"
-            ):
-                src_scale = self.shared_experts.down_proj.weight_scale_inv.data
-                dst_scale = self.experts.w2_weight_scale_inv.data[local_shared_idx]
-                if src_scale.shape == dst_scale.shape:
-                    self.experts.w2_weight_scale_inv.data[local_shared_idx].copy_(
-                        src_scale
-                    )
-            elif hasattr(self.experts, "w2_weight_scale") and hasattr(
-                self.shared_experts.down_proj, "weight_scale"
-            ):
-                src_scale = self.shared_experts.down_proj.weight_scale.data
-                self.experts.w2_weight_scale.data[local_shared_idx].copy_(src_scale)
-        else:
-            logger.warning(
-                "DeepEP Waterfill cannot copy shared down (w2) weights: missing "
-                "attrs on experts/shared_experts (layer_id=%s).",
-                self.layer_id,
-            )
-
-        # After copying weights, check if we need to requant to ue8m0 format
-        # This is needed because process_weights_after_loading() has already
-        # requanted other experts to ue8m0, but our copied weights might be
-        # in a different format.
-        if hasattr(self.experts, "w13_weight_scale_inv"):
-            moe_scale_inv = self.experts.w13_weight_scale_inv
-            moe_is_ue8m0 = (
-                hasattr(moe_scale_inv, "format_ue8m0") and moe_scale_inv.format_ue8m0
-            )
-
-            # Check if shared_experts scale is already ue8m0
-            shared_is_ue8m0 = False
-            if hasattr(self.shared_experts.gate_up_proj, "weight_scale_inv"):
-                shared_scale = self.shared_experts.gate_up_proj.weight_scale_inv
-                shared_is_ue8m0 = (
-                    hasattr(shared_scale, "format_ue8m0") and shared_scale.format_ue8m0
-                )
-
-            # Only requant if MoE is ue8m0 but shared is not
-            if moe_is_ue8m0 and not shared_is_ue8m0:
-                from sglang.srt.layers.quantization.fp8_utils import (
-                    requant_weight_ue8m0,
-                )
-
-                # Get block size from quant_config
-                weight_block_size = [128, 128]  # Default
-                if (
-                    hasattr(self.experts, "quant_config")
-                    and self.experts.quant_config is not None
-                ):
-                    if hasattr(self.experts.quant_config, "weight_block_size"):
-                        weight_block_size = self.experts.quant_config.weight_block_size
-                elif (
-                    hasattr(self.experts, "quant_method")
-                    and self.experts.quant_method is not None
-                ):
-                    if (
-                        hasattr(self.experts.quant_method, "quant_config")
-                        and self.experts.quant_method.quant_config is not None
-                    ):
-                        if hasattr(
-                            self.experts.quant_method.quant_config, "weight_block_size"
-                        ):
-                            weight_block_size = (
-                                self.experts.quant_method.quant_config.weight_block_size
-                            )
-
-                # Requant w13 for expert at local_shared_idx
-                w13_weight_expert = self.experts.w13_weight.data[local_shared_idx]
-                w13_scale_expert = self.experts.w13_weight_scale_inv.data[
-                    local_shared_idx
-                ]
-                new_w13_weight, new_w13_scale = requant_weight_ue8m0(
-                    w13_weight_expert.unsqueeze(0),
-                    w13_scale_expert.unsqueeze(0),
-                    weight_block_size,
-                )
-                self.experts.w13_weight.data[local_shared_idx].copy_(
-                    new_w13_weight.squeeze(0)
-                )
-                self.experts.w13_weight_scale_inv.data[local_shared_idx].copy_(
-                    new_w13_scale.squeeze(0)
-                )
-
-                # Requant w2 for expert at local_shared_idx
-                w2_weight_expert = self.experts.w2_weight.data[local_shared_idx]
-                w2_scale_expert = self.experts.w2_weight_scale_inv.data[
-                    local_shared_idx
-                ]
-                new_w2_weight, new_w2_scale = requant_weight_ue8m0(
-                    w2_weight_expert.unsqueeze(0),
-                    w2_scale_expert.unsqueeze(0),
-                    weight_block_size,
-                )
-                self.experts.w2_weight.data[local_shared_idx].copy_(
-                    new_w2_weight.squeeze(0)
-                )
-                self.experts.w2_weight_scale_inv.data[local_shared_idx].copy_(
-                    new_w2_scale.squeeze(0)
-                )
 
     def _maybe_init_static_waterfill_weights(self):
         """Compute / refresh static EPLB-derived per-rank weights if needed.
@@ -4642,11 +4438,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif get_moe_expert_parallel_world_size() > 1 and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif (
+            get_moe_expert_parallel_world_size() > 1
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+            and not get_global_server_args().enable_deepep_waterfill
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
+        elif (
+            disable_reason is None
+            and get_moe_a2a_backend().is_deepep()
+            and not get_global_server_args().enable_deepep_waterfill
+        ):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
@@ -4906,15 +4708,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
-
-        # Copy shared expert weights to MoE layer for Waterfill mode
-        if not is_nextn:
-            for layer_id in range(self.model.start_layer, self.model.end_layer):
-                layer = self.model.layers[layer_id]
-                if hasattr(layer, "mlp") and hasattr(
-                    layer.mlp, "_copy_shared_expert_weights_to_moe"
-                ):
-                    layer.mlp._copy_shared_expert_weights_to_moe()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 

@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
-import os
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -531,18 +530,20 @@ class FusedMoE(torch.nn.Module):
         #
         # So, when Waterfill is enabled, we must map checkpoint expert_id using the
         # ORIGINAL experts_per_rank (old_epr), not the expanded one.
-        _waterfill_v2 = os.environ.get("SGLANG_WATERFILL_V2", "") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
+        # Shared expert (expert_id >= old_num_global_routed_experts) maps to the last slot
+        # (old_epr) on EVERY rank.
+        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
+
+        _waterfill_v2 = is_waterfill_v2_enabled()
         if (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
-            and self.num_fused_shared_experts == 0
             and not _waterfill_v2
         ):
+            # Compute original (pre-expansion) routed expert counts.
+            # With num_fused_shared_experts passed through from model level, the
+            # FusedMoE may see num_fused_shared_experts=0 (kernel doesn't handle
+            # fusion) but num_experts includes the extra ep_size slots.
             old_num_global_routed_experts = num_global_routed_experts - self.moe_ep_size
             if (
                 old_num_global_routed_experts > 0
@@ -551,10 +552,14 @@ class FusedMoE(torch.nn.Module):
                 old_num_local_routed_experts = (
                     old_num_global_routed_experts // self.moe_ep_size
                 )
+                # Routed experts: map using original experts_per_rank
                 start_idx = self.moe_ep_rank * old_num_local_routed_experts
                 end_idx = (self.moe_ep_rank + 1) * old_num_local_routed_experts
                 if start_idx <= expert_id < end_idx:
                     return expert_id - start_idx
+                # Shared expert: maps to old_num_local_routed_experts on ALL ranks
+                if expert_id >= old_num_global_routed_experts:
+                    return old_num_local_routed_experts
                 return -1
 
         start_idx = self.moe_ep_rank * num_local_routed_experts
@@ -609,8 +614,24 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if expert_id >= self.num_experts - self.num_fused_shared_experts:
-            # This is a shared expert.
+        # Waterfill expands num_experts by moe_ep_size (272 = 256 + 16) with
+        # num_fused_shared_experts=0, so shared expert 256 must be detected via
+        # old_num_global_routed_experts = num_experts - moe_ep_size, not num_experts.
+        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
+
+        _waterfill_v2 = is_waterfill_v2_enabled()
+        _is_waterfill = (
+            get_global_server_args().enable_deepep_waterfill
+            and get_moe_a2a_backend().is_deepep()
+            and not _waterfill_v2
+        )
+        num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
+        if _is_waterfill:
+            shared_expert_threshold = num_global_routed_experts - self.moe_ep_size
+        else:
+            shared_expert_threshold = num_global_routed_experts
+
+        if expert_id >= shared_expert_threshold:
             physical_expert_ids = [expert_id]
         else:
             require_global_experts = getattr(

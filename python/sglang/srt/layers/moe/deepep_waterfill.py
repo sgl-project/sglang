@@ -35,6 +35,7 @@ Key Design:
    - Avoids fragmented computation across ranks
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -47,6 +48,11 @@ LOCAL_SHARED_MARKER = -1
 # Local preference factor used by waterfill assignment.
 # Set to 1.0 to disable the bias and use pure argmin over routed_counts.
 LOCAL_PREFERENCE_FACTOR = 1.1
+
+
+def is_waterfill_v2_enabled() -> bool:
+    return os.environ.get("SGLANG_WATERFILL_V2", "") not in ("", "0", "false", "False")
+
 
 # Try to import Triton for GPU-optimized kernels
 try:
@@ -364,78 +370,6 @@ if HAS_TRITON:
         )
 
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask
-
-    @triton.jit
-    def _count_destinations_kernel(
-        destination_ptr,  # [num_tokens] - destination rank for each token
-        counts_ptr,  # [world_size] - output counts (atomic add)
-        num_tokens,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """Count tokens per destination rank using atomic operations."""
-        pid = tl.program_id(0)
-        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = token_idx < num_tokens
-
-        dest = tl.load(destination_ptr + token_idx, mask=mask, other=0)
-
-        # Use atomic add to count
-        # Note: This creates contention but is simpler than reduction
-        for i in range(BLOCK_SIZE):
-            if tl.arange(0, BLOCK_SIZE)[i] < num_tokens - pid * BLOCK_SIZE:
-                d = tl.load(destination_ptr + pid * BLOCK_SIZE + i)
-                tl.atomic_add(counts_ptr + d, 1)
-
-    @triton.jit
-    def _masked_scatter_add_kernel(
-        output_ptr,  # [N, H] - output tensor to add to
-        input_ptr,  # [num_selected, H] - packed input tensor
-        prefix_ptr,  # [N] - exclusive prefix sum of mask
-        mask_ptr,  # [N] - boolean mask
-        num_tokens,
-        hidden_size: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-    ):
-        """
-        Scatter-add packed input to output using mask, without explicit indices.
-
-        For each position where mask[i] is True:
-            output[i, :] += input[prefix[i], :]
-
-        prefix[i] = number of True values in mask[:i] (exclusive prefix sum)
-        """
-        token_idx = tl.program_id(0)
-        if token_idx >= num_tokens:
-            return
-
-        is_selected = tl.load(mask_ptr + token_idx)
-        if not is_selected:
-            return
-
-        # Get packed index from exclusive prefix sum
-        packed_idx = tl.load(prefix_ptr + token_idx)
-
-        # Process hidden dimension in blocks
-        for h_start in range(0, hidden_size, BLOCK_H):
-            h_idx = h_start + tl.arange(0, BLOCK_H)
-            h_mask = h_idx < hidden_size
-
-            # Load from packed input
-            input_val = tl.load(
-                input_ptr + packed_idx * hidden_size + h_idx, mask=h_mask, other=0.0
-            )
-
-            # Load current output
-            output_val = tl.load(
-                output_ptr + token_idx * hidden_size + h_idx, mask=h_mask, other=0.0
-            )
-
-            # Store sum
-            tl.store(
-                output_ptr + token_idx * hidden_size + h_idx,
-                output_val + input_val,
-                mask=h_mask,
-            )
 
     @triton.jit
     def _identify_shared_expert_kernel(
@@ -832,6 +766,7 @@ if HAS_TRITON:
                 torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
                 torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
                 torch.empty(0, dtype=torch.bool, device=device),
+                torch.zeros(world_size, dtype=torch.int32, device=device),
             )
 
         # Pre-allocate outputs
@@ -949,51 +884,6 @@ if HAS_TRITON:
         )
 
         return counts
-
-    def masked_scatter_add_triton(
-        output: Tensor,
-        input: Tensor,
-        mask: Tensor,
-    ) -> None:
-        """
-        Scatter-add packed input to output using mask (in-place).
-
-        Equivalent to:
-            indices = mask.nonzero(as_tuple=True)[0]
-            output.index_add_(0, indices, input)
-
-        But avoids the expensive nonzero() call by using prefix sum.
-
-        Args:
-            output: [N, H] tensor to add to
-            input: [num_selected, H] packed tensor where num_selected = mask.sum()
-            mask: [N] boolean mask
-        """
-        num_tokens = output.shape[0]
-        hidden_size = output.shape[1]
-
-        if input.shape[0] == 0:
-            return
-
-        # Compute exclusive prefix sum of mask (int64 for indexing)
-        mask_int = mask.to(torch.int64)
-        # Exclusive prefix sum: prefix[i] = sum(mask[:i])
-        prefix = torch.zeros(num_tokens + 1, dtype=torch.int64, device=mask.device)
-        torch.cumsum(mask_int, dim=0, out=prefix[1:])
-        prefix = prefix[:-1]  # Now prefix[i] = count of True in mask[:i]
-
-        BLOCK_H = min(hidden_size, 256)
-        grid = (num_tokens,)
-
-        _masked_scatter_add_kernel[grid](
-            output,
-            input,
-            prefix,
-            mask,
-            num_tokens,
-            hidden_size,
-            BLOCK_H=BLOCK_H,
-        )
 
     def assign_shared_destination_triton(
         topk_ids: Tensor,
@@ -1353,7 +1243,6 @@ class DeepEPWaterfillBalancer:
         rank: int,
         routed_scaling_factor: float = 1.0,
         static_rank_load: Optional[Tensor] = None,
-        **kwargs,
     ):
         # Store original routed expert count
         self.num_routed_experts = num_routed_experts
