@@ -3,6 +3,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+# Safety timeout for all HTTP requests to prevent CI from hanging forever.
+_REQUEST_TIMEOUT = 60
+
 
 class AbortAllMixin:
     """Test /abort_request with abort_all=True.
@@ -28,6 +31,7 @@ class AbortAllMixin:
                         "ignore_eos": True,
                     },
                 },
+                timeout=_REQUEST_TIMEOUT,
             )
             return response.json()
 
@@ -39,12 +43,15 @@ class AbortAllMixin:
             requests.post(
                 self.base_url + "/abort_request",
                 json={"abort_all": True},
-            )
+                timeout=10,
+            ).raise_for_status()
 
             for future in as_completed(futures):
                 self.assertEqual(
                     future.result()["meta_info"]["finish_reason"]["type"], "abort"
                 )
+
+            self.assertIsNone(self.process.poll())
 
 
 class WaitingTimeoutMixin:
@@ -70,6 +77,7 @@ class WaitingTimeoutMixin:
                         "ignore_eos": True,
                     },
                 },
+                timeout=_REQUEST_TIMEOUT,
             )
             return response.json()
 
@@ -84,6 +92,7 @@ class WaitingTimeoutMixin:
                     self.assertEqual(result["code"], 503)
 
             self.assertEqual(error_count, 1)
+            self.assertIsNone(self.process.poll())
 
 
 class RunningTimeoutTwoWaveMixin:
@@ -116,6 +125,7 @@ class RunningTimeoutTwoWaveMixin:
                         "ignore_eos": True,
                     },
                 },
+                timeout=_REQUEST_TIMEOUT,
             )
             return response.json()
 
