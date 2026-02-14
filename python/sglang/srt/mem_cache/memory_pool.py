@@ -683,7 +683,7 @@ class KVCache(abc.ABC):
             "page_first": KVCache.PAGE_FIRST_LAYOUT,
             "page_head": KVCache.PAGE_HEAD_LAYOUT,
         }
-        layout = layout if layout == "auto" else default_layout
+        layout = default_layout if layout == "auto" else layout
         return COMMON_MAPPING.get(layout, layout)
 
     @staticmethod
