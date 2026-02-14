@@ -437,6 +437,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if loaded_weight.dim() == 2 and is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -511,6 +514,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if loaded_weight.dim() == 2 and is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -698,8 +704,10 @@ class FusedMoE(torch.nn.Module):
             else loaded_weight
         )
 
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+        if shard_id not in ("w1", "w2", "w3", "w13"):
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3', 'w13'] but got {shard_id}."
+            )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if self.use_flashinfer_trtllm_moe and (
@@ -714,7 +722,7 @@ class FusedMoE(torch.nn.Module):
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0, "w13": 0}
 
         expert_data = param.data[expert_id]
 
@@ -859,6 +867,16 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+            )
+            return
+        if "bias" in weight_name:
+            self._load_model_weight_or_group_weight_scale(
+                shard_id=shard_id,
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+                is_bias=True,
             )
             return
 
@@ -1086,6 +1104,38 @@ class FusedMoE(torch.nn.Module):
                 "w13",
             ),
             ("experts.w2_weight_scale", f"experts.{ckpt_down_proj_scale_name}", "w2"),
+        ]
+
+    @classmethod
+    def make_expert_params_mapping_fused_gptoss_gptq(
+        cls,
+        num_experts: int,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+    ):
+        return [
+            # (param_name, weight_name, expert_id, shard_id)
+            (
+                (
+                    f"experts.w13_{param_name}"
+                    if weight_name in [ckpt_gate_up_proj_name]
+                    else f"experts.w2_{param_name}"
+                ),
+                f"experts.{weight_name}.{expert_id}.{param_name}",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id, weight_name, param_name in [
+                ("w13", ckpt_gate_up_proj_name, "qweight"),
+                ("w2", ckpt_down_proj_name, "qweight"),
+                ("w13", ckpt_gate_up_proj_name, "bias"),
+                ("w2", ckpt_down_proj_name, "bias"),
+                ("w13", ckpt_gate_up_proj_name, "qzeros"),
+                ("w2", ckpt_down_proj_name, "qzeros"),
+                ("w13", ckpt_gate_up_proj_name, "scales"),
+                ("w2", ckpt_down_proj_name, "scales"),
+            ]
         ]
 
     @classmethod

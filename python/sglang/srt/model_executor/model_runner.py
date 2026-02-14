@@ -937,7 +937,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
         )
-        if self.device == "cpu":
+        if self.device == "cpu" and self.tp_size > 1:
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )
