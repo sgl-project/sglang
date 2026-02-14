@@ -176,7 +176,9 @@ class Gemma3Attention(nn.Module):
         if self.is_sliding:
             # Local attention. Override the values in config.json.
             if is_nested:
-                self.rope_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)
+                self.rope_theta = rope_params["sliding_attention"].get(
+                    "rope_theta", 10000.0
+                )
             else:
                 self.rope_theta = getattr(config, "rope_local_base_freq", 10000.0)
             self.rope_scaling = {"rope_type": "default"}
@@ -186,9 +188,13 @@ class Gemma3Attention(nn.Module):
         else:
             # Global attention. Use the values in config.json.
             if is_nested:
-                self.rope_theta = rope_params["full_attention"].get("rope_theta", 1000000.0)
+                self.rope_theta = rope_params["full_attention"].get(
+                    "rope_theta", 1000000.0
+                )
             else:
-                self.rope_theta = rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+                self.rope_theta = (
+                    rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+                )
             self.rope_scaling = {"rope_type": "default"}
             self.sliding_window = None
 
@@ -403,9 +409,18 @@ class Gemma3RotaryEmbedding(nn.Module):
                 base = 10000.0
         else:
             base = rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float
+                )
+                / dim
+            )
         )
         return inv_freq, 1.0
 
@@ -494,16 +509,24 @@ class Gemma3TextModel(PreTrainedModel):
             local_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)
         else:
             # v4 flat format fallback
-            global_theta = rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+            global_theta = (
+                rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+            )
             local_theta = getattr(config, "rope_local_base_freq", 10000.0)
 
         global_config = copy.deepcopy(config)
-        global_config.rope_parameters = {"rope_type": "default", "rope_theta": global_theta}
+        global_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": global_theta,
+        }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
 
         local_config = copy.deepcopy(config)
-        local_config.rope_parameters = {"rope_type": "default", "rope_theta": local_theta}
+        local_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": local_theta,
+        }
         self.rotary_emb_local = Gemma3RotaryEmbedding(config=local_config)
 
         self.layers = make_layers(
