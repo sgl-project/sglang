@@ -240,6 +240,42 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
         self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
 
+    def _get_lm_head_batch_info(self, num_tokens: int):
+        """Resolve and validate the active lm_head batch_info.
+
+        When the logits processor calls lm_head in multiple passes
+        (chunked logprobs), _lm_head_pass_idx selects a precomputed
+        per-pass batch_info.  Otherwise the full-pruned batch_info is used.
+
+        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
+        """
+        pass_idx = self.lora_backend._lm_head_pass_idx
+        if (
+            pass_idx is not None
+            and self.lora_backend.lm_head_pass_batch_infos is not None
+        ):
+            batch_info = self.lora_backend.lm_head_pass_batch_infos[pass_idx]
+        else:
+            batch_info = self.lora_backend.lm_head_batch_info
+
+        if batch_info is not None:
+            if batch_info.use_cuda_graph:
+                raise RuntimeError(
+                    "lm_head LoRA with pruned batch info is not supported "
+                    "under CUDA graph. lm_head pruning should only occur "
+                    "during extend, which does not use CUDA graph."
+                )
+            if num_tokens != batch_info.expected_tokens:
+                raise RuntimeError(
+                    f"lm_head LoRA input token count mismatch: got "
+                    f"{num_tokens} tokens but lm_head_batch_info expects "
+                    f"{batch_info.expected_tokens}. This likely means "
+                    f"a pruning step in LogitsProcessor._get_pruned_states is "
+                    f"not reflected in get_lm_head_pruned_lens()."
+                )
+
+        return batch_info
+
     def apply_lora(
         self,
         base_output: torch.Tensor,
@@ -252,25 +288,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
         """
-        lm_head_batch_info = self.lora_backend.lm_head_batch_info
-        if lm_head_batch_info is not None:
-            if lm_head_batch_info.use_cuda_graph:
-                raise RuntimeError(
-                    "lm_head LoRA with pruned batch info is not supported "
-                    "under CUDA graph. lm_head pruning should only occur "
-                    "during extend, which does not use CUDA graph."
-                )
-            actual_tokens = hidden_states.shape[0]
-            if actual_tokens != lm_head_batch_info.expected_tokens:
-                raise RuntimeError(
-                    f"lm_head LoRA input token count mismatch: got "
-                    f"{actual_tokens} tokens but lm_head_batch_info expects "
-                    f"{lm_head_batch_info.expected_tokens}. This is likely caused by logprobs "
-                    f"chunking in LogitsProcessor (disable with "
-                    f"--disable-logprobs-chunk) or an additional pruning step "
-                    f"in LogitsProcessor._get_pruned_states that is not "
-                    f"reflected in get_lm_head_pruned_lens()."
-                )
+        lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
 
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
@@ -301,6 +319,23 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
+
+    # ------------------------------------------------------------------
+    # Multi-pass lm_head support (chunked logprobs)
+    # ------------------------------------------------------------------
+
+    def set_lm_head_pass(self, pass_idx: int):
+        """Set the active lm_head pass index before a logprobs chunk.
+
+        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        each chunk's _get_logits call.  _get_lm_head_batch_info() will
+        resolve to lm_head_pass_batch_infos[pass_idx].
+        """
+        self.lora_backend._lm_head_pass_idx = pass_idx
+
+    def reset_lm_head_pass(self):
+        """Reset the lm_head pass index after all passes are done."""
+        self.lora_backend._lm_head_pass_idx = None
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed

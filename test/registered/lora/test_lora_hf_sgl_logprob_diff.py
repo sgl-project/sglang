@@ -28,6 +28,7 @@ Usage:
 """
 
 import multiprocessing as mp
+import os
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,10 +48,13 @@ register_amd_ci(
     suite="stage-b-test-small-1-gpu-amd",
 )
 # Test configuration constants
+BASE_MODEL = "meta-llama/Llama-2-7b-hf"
+LORA_PATHS = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
 LORA_BACKEND = "csgmv"
 DISABLE_CUDA_GRAPH = False
 LORA_TARGET_MODULES = None
 LOGPROB_THRESHOLD = 1e-01
+MAX_NEW_TOKENS = 32
 
 # Default test prompts
 DEFAULT_TEST_PROMPTS = [
@@ -442,7 +446,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         model_path: str,
         lora_paths: List[str],
         prompts: List[str],
-        max_new_tokens: int = 32,
+        max_new_tokens: int = MAX_NEW_TOKENS,
         torch_dtype: torch.dtype = torch.float16,
         lora_backend: str = LORA_BACKEND,
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
@@ -506,31 +510,50 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Basic test comparing HF and SGLang LoRA logprobs with small model.
         """
-        model_path = "meta-llama/Llama-2-7b-hf"
-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use fewer prompts for faster testing
 
         self._run_comparison_test(
-            model_path=model_path,
-            lora_paths=lora_paths,
+            model_path=BASE_MODEL,
+            lora_paths=LORA_PATHS,
             prompts=prompts,
-            max_new_tokens=32,
         )
 
     def test_lora_logprob_comparison_full(self):
         """
         Full test comparing HF and SGLang LoRA logprobs with all prompts.
         """
-        model_path = "meta-llama/Llama-2-7b-hf"
-        lora_paths = ["yushengsu/sglang_lora_logprob_diff_without_tuning"]
-        prompts = DEFAULT_TEST_PROMPTS
-
         self._run_comparison_test(
-            model_path=model_path,
-            lora_paths=lora_paths,
-            prompts=prompts,
-            max_new_tokens=32,
+            model_path=BASE_MODEL,
+            lora_paths=LORA_PATHS,
+            prompts=DEFAULT_TEST_PROMPTS,
         )
+
+    def test_lora_logprob_comparison_chunked(self):
+        """
+        Test with logprobs chunking enabled and a small chunk size so that
+        even short prompts trigger the multi-pass lm_head LoRA path.
+        """
+        saved = {}
+        env_overrides = {
+            "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK": "true",
+            "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "4",
+        }
+        for key, val in env_overrides.items():
+            saved[key] = os.environ.get(key)
+            os.environ[key] = val
+
+        try:
+            self._run_comparison_test(
+                model_path=BASE_MODEL,
+                lora_paths=LORA_PATHS,
+                prompts=DEFAULT_TEST_PROMPTS,
+            )
+        finally:
+            for key, orig in saved.items():
+                if orig is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = orig
 
 
 if __name__ == "__main__":

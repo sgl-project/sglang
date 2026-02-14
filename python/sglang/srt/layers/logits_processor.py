@@ -692,6 +692,12 @@ class LogitsProcessor(nn.Module):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
 
+            # Notify lm_head LoRA about the current chunk so it can swap
+            # to the precomputed per-chunk batch_info.  This is a no-op
+            # for non-LoRA lm_head modules.
+            if hasattr(lm_head, "set_lm_head_pass"):
+                lm_head.set_lm_head_pass(i)
+
             # Get indices for this chunk
             chunk_mask = (input_logprob_indices >= start_idx) & (
                 input_logprob_indices < end_idx
@@ -795,6 +801,10 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+
+        # Restore the full-pruned lm_head batch_info after chunk iteration.
+        if hasattr(lm_head, "reset_lm_head_pass"):
+            lm_head.reset_lm_head_pass()
 
         # Concatenate the results
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)

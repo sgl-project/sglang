@@ -309,8 +309,30 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             self.lm_head_batch_info = self._build_lm_head_batch_info(
                 lm_head_segments, batch_info, chunk_size, pruned_total
             )
+
+            # Precompute per-pass batch_infos for logprobs chunking
+            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
+            if pass_segments is not None:
+                self.lm_head_pass_batch_infos = []
+                for seg_wi, seg_lens_list in pass_segments:
+                    pass_total = sum(seg_lens_list)
+                    pass_chunk_size = self._determine_chunk_size_for_tokens(pass_total)
+                    chunked_segments = merge_and_chunk_segments(
+                        seg_wi, seg_lens_list, chunk_size=pass_chunk_size
+                    )
+                    self.lm_head_pass_batch_infos.append(
+                        self._build_lm_head_batch_info(
+                            chunked_segments,
+                            batch_info,
+                            pass_chunk_size,
+                            pass_total,
+                        )
+                    )
+            else:
+                self.lm_head_pass_batch_infos = None
         else:
             self.lm_head_batch_info = None
+            self.lm_head_pass_batch_infos = None
 
     def _build_lm_head_batch_info(
         self,

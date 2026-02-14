@@ -1,4 +1,5 @@
 import dataclasses
+from typing import List, Tuple
 
 import torch
 
@@ -10,7 +11,11 @@ from sglang.srt.lora.triton_ops import (
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    get_lm_head_pruned_lens,
+    merge_and_chunk_segments,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -233,20 +238,59 @@ class TritonLoRABackend(BaseLoRABackend):
         pruned_lens = get_lm_head_pruned_lens(forward_batch)
 
         if pruned_lens is not None:
-            pruned_seg_lens = torch.tensor(
-                pruned_lens, dtype=torch.int32, device=self.device
+            pruned_total = sum(pruned_lens)
+            lm_head_segments = merge_and_chunk_segments(
+                weight_indices, pruned_lens, chunk_size=pruned_total
             )
-            pruned_seg_indptr = torch.zeros(
-                (bs + 1,), dtype=torch.int32, device=self.device
+            self.lm_head_batch_info = self._build_lm_head_batch_info(
+                lm_head_segments, batch_info, pruned_total
             )
-            pruned_seg_indptr[1:] = torch.cumsum(pruned_seg_lens, dim=0)
 
-            self.lm_head_batch_info = dataclasses.replace(
-                batch_info,
-                max_len=max(pruned_lens),
-                seg_lens=pruned_seg_lens,
-                seg_indptr=pruned_seg_indptr,
-                expected_tokens=sum(pruned_lens),
-            )
+            # Precompute per-pass batch_infos for logprobs chunking
+            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
+            if pass_segments is not None:
+                self.lm_head_pass_batch_infos = []
+                for seg_wi, seg_lens_list in pass_segments:
+                    pass_total = sum(seg_lens_list)
+                    merged_segments = merge_and_chunk_segments(
+                        seg_wi, seg_lens_list, chunk_size=pass_total
+                    )
+                    self.lm_head_pass_batch_infos.append(
+                        self._build_lm_head_batch_info(
+                            merged_segments, batch_info, pass_total
+                        )
+                    )
+            else:
+                self.lm_head_pass_batch_infos = None
         else:
             self.lm_head_batch_info = None
+            self.lm_head_pass_batch_infos = None
+
+    def _build_lm_head_batch_info(
+        self,
+        lm_head_segments: Tuple[List[int], List[int]],
+        batch_info: LoRABatchInfo,
+        expected_tokens: int,
+    ) -> LoRABatchInfo:
+        """Build a LoRABatchInfo for pruned lm_head input."""
+        seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
+        num_segments = len(seg_weight_indices_cpu)
+
+        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32, device=self.device)
+        seg_indptr = torch.zeros(
+            (num_segments + 1,), dtype=torch.int32, device=self.device
+        )
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+        return dataclasses.replace(
+            batch_info,
+            bs=num_segments,
+            num_segments=num_segments,
+            max_len=max(seg_lens_cpu),
+            seg_lens=seg_lens,
+            seg_indptr=seg_indptr,
+            weight_indices=torch.tensor(
+                seg_weight_indices_cpu, dtype=torch.int32, device=self.device
+            ),
+            expected_tokens=expected_tokens,
+        )

@@ -265,3 +265,51 @@ def merge_and_chunk_segments(
             seg_lens.append(remainder)
 
     return seg_weight_indices, seg_lens
+
+
+def build_lm_head_pass_segments(
+    weight_indices: List[int],
+    pruned_lens: List[int],
+    logprobs_chunk_size: int,
+) -> List[Tuple[List[int], List[int]]]:
+    """
+    Precompute per-pass segment info for lm_head LoRA logprobs processing.
+
+    When LogitsProcessor uses chunked logprobs processing
+    (process_input_logprobs_by_chunk), pruned hidden states are split into
+    fixed-size passes.  Each pass needs its own segmentation
+    (weight_indices, seg_lens) so that lm_head LoRA operates on the
+    correct adapter assignments per pass.
+
+    Args:
+        weight_indices: Per-sequence adapter indices.
+        pruned_lens: Per-sequence pruned token counts.
+        logprobs_chunk_size: Fixed pass size used by LogitsProcessor.
+
+    Returns:
+        List of (seg_weight_indices, seg_lens) tuples, one per pass.
+    """
+    # Expand to per-token weight index
+    token_wi: List[int] = []
+    for wi, pl in zip(weight_indices, pruned_lens):
+        token_wi.extend([wi] * pl)
+    total = len(token_wi)
+    num_passes = (total + logprobs_chunk_size - 1) // logprobs_chunk_size
+
+    result: List[Tuple[List[int], List[int]]] = []
+    for i in range(num_passes):
+        start = i * logprobs_chunk_size
+        end = min((i + 1) * logprobs_chunk_size, total)
+
+        # Run-length encode the pass's adapter indices
+        seg_wi: List[int] = []
+        seg_lens: List[int] = []
+        for t in range(start, end):
+            if seg_wi and seg_wi[-1] == token_wi[t]:
+                seg_lens[-1] += 1
+            else:
+                seg_wi.append(token_wi[t])
+                seg_lens.append(1)
+        result.append((seg_wi, seg_lens))
+
+    return result
