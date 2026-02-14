@@ -82,18 +82,19 @@ def maybe_load_fsdp_model(
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
+    default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
     mp_policy = MixedPrecisionPolicy(
-        param_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
+        default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
     )
 
     set_mixed_precision_policy(
-        param_dtype=param_dtype,
+        param_dtype=default_torch_dtype,
         reduce_dtype=reduce_dtype,
         output_dtype=output_dtype,
         mp_policy=mp_policy,
     )
 
-    with set_default_torch_dtype(param_dtype), torch.device("meta"):
+    with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
         model = model_cls(**init_params)
 
     # Check if we should use FSDP
@@ -270,7 +271,6 @@ def load_model_from_full_model_state_dict(
                 continue
 
         target_dtype = param_dtype if param_dtype else full_tensor.dtype
-
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)

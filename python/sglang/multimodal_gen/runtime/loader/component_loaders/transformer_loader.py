@@ -249,8 +249,6 @@ class TransformerLoader(ComponentLoader):
         else:
             param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
-
-        print(f"{param_dtype=}")
         safetensors_list = self.get_list_of_safetensors_to_load(
             server_args, component_model_path
         )
@@ -295,8 +293,11 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
-        assert (
-            next(model.parameters()).dtype == param_dtype
-        ), f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
+        # considering the existent of mixed-precision models (e.g., nunchaku)
+        if (
+            next(model.parameters()).dtype != param_dtype
+        ):
+            logger.warning(
+                f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}")
 
         return model
