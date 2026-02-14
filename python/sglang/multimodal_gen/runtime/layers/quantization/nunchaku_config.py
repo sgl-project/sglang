@@ -2,6 +2,7 @@
 import json
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Optional
 
 import torch
@@ -30,6 +31,16 @@ SKIP_QUANTIZATION_PATTERNS = [
     "rotary",
     "pos_embed",
 ]
+
+
+@lru_cache(maxsize=1)
+def is_nunchaku_available() -> bool:
+    try:
+        import nunchaku  # noqa
+
+        return True
+    except Exception:
+        return False
 
 
 @dataclass

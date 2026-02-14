@@ -375,6 +375,12 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
+@lru_cache(maxsize=1)
+def get_log_level() -> int:
+    root = logging.getLogger()
+    return root.level
+
+
 def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
     original_levels = {}
 

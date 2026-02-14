@@ -126,12 +126,7 @@ class TransformerLoader(ComponentLoader):
             )
             return
 
-        try:
-            from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
-
-        except ImportError:
-            logger.warning("Nunchaku is not available; skipping scale patch.")
-            return
+        from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
 
         state_dict = self._load_state_dict_safe(safetensors_list[0])
         if state_dict is None:
@@ -213,7 +208,7 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        quant_config = self._get_quant_config(server_args)
+        quant_config = server_args.nunchaku_config
 
         # get list of safetensors to load
         if quant_config is not None and getattr(

@@ -17,12 +17,12 @@ from enum import Enum
 from typing import Any, Optional
 
 import addict
-import torch
 import yaml
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.layers.quantization import NunchakuConfig
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -371,8 +371,23 @@ class ServerArgs:
 
     def adjust_quant_config(self):
         """validate and adjust"""
+
+        # nunchaku
         self.nunchaku_config.validate()
         self.nunchaku_config.adjust_config()
+
+        ncfg = self.nunchaku_config
+        if not ncfg.enable_svdquant:
+            return
+        if not ncfg.quantized_model_path:
+            return
+
+        self.nunchaku_config = NunchakuConfig(
+            precision=self.nunchaku_config.quantization_precision,
+            rank=self.nunchaku_config.quantization_rank,
+            act_unsigned=self.nunchaku_config.quantization_act_unsigned,
+            quantized_model_path=self.nunchaku_config.quantized_model_path,
+        )
 
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
@@ -996,30 +1011,30 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
-        if self.nunchaku_config.enable_svdquant:
-            if not current_platform.is_cuda():
-                raise ValueError(
-                    "Nunchaku SVDQuant is only supported on NVIDIA CUDA GPUs "
-                    "(Ampere SM8x or SM12x)."
-                )
-
-            device_count = torch.cuda.device_count()
-
-            unsupported: list[str] = []
-            for i in range(device_count):
-                major, minor = torch.cuda.get_device_capability(i)
-                if major == 9:
-                    unsupported.append(f"cuda:{i} (SM{major}{minor}, Hopper)")
-                elif major not in (8, 12):
-                    unsupported.append(f"cuda:{i} (SM{major}{minor})")
-
-            if unsupported:
-                raise ValueError(
-                    "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
-                    "Hopper (SM90) is not supported. "
-                    f"Unsupported devices: {', '.join(unsupported)}. "
-                    "Disable it with --enable-svdquant false."
-                )
+        # if self.nunchaku_config.enable_svdquant:
+        #     if not current_platform.is_cuda():
+        #         raise ValueError(
+        #             "Nunchaku SVDQuant is only supported on NVIDIA CUDA GPUs "
+        #             "(Ampere SM8x or SM12x)."
+        #         )
+        #
+        #     device_count = torch.cuda.device_count()
+        #
+        #     unsupported: list[str] = []
+        #     for i in range(device_count):
+        #         major, minor = torch.cuda.get_device_capability(i)
+        #         if major == 9:
+        #             unsupported.append(f"cuda:{i} (SM{major}{minor}, Hopper)")
+        #         elif major not in (8, 12):
+        #             unsupported.append(f"cuda:{i} (SM{major}{minor})")
+        #
+        #     if unsupported:
+        #         raise ValueError(
+        #             "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
+        #             "Hopper (SM90) is not supported. "
+        #             f"Unsupported devices: {', '.join(unsupported)}. "
+        #             "Disable it with --enable-svdquant false."
+        #         )
 
         # layerwise offload
         if current_platform.is_mps():
