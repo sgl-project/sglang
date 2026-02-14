@@ -64,6 +64,7 @@ if _is_cuda:
         enable_sgl_per_token_group_quant_8bit = False
 
 if _is_hip:
+    _has_vllm = False
     if _use_aiter:
         try:
             from aiter import (  # v0.1.3
@@ -76,8 +77,11 @@ if _is_hip:
     else:
         try:
             import vllm._C  # noqa: F401
+
+            _has_vllm = True
         except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+            # Fallback: vllm not available, will use native PyTorch implementation
+            _has_vllm = False
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +223,7 @@ def _per_token_group_quant_8bit_raw(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor.
@@ -635,7 +639,7 @@ def static_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
         dtype: The dype of output tensor.
@@ -1537,6 +1541,37 @@ Raises:
 """
 if _is_hip:
 
+    def _native_dynamic_per_token_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        M, N = input.shape
+        eps = 1e-12
+        # Compute per-token scale
+        absmax = input.abs().max(dim=1, keepdim=True).values
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        scale.copy_(scale_val)
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        eps = 1e-12
+        absmax = input.abs().max()
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        # Use copy_ instead of fill_ with .item() to avoid CPU-GPU sync
+        scale.view(-1).copy_(scale_val.view(-1))
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_static_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        # Use tensor directly instead of .item() to avoid CPU-GPU sync
+        output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
@@ -1557,16 +1592,20 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                         output, input.contiguous(), scale, None
                     )
+                else:
+                    _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                else:
+                    _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1574,8 +1613,10 @@ if _is_hip:
             ), f"Expected scalar scale, got numel={scale.numel()}"
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            else:
+            elif _has_vllm:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+            else:
+                _native_static_quant_fp8(output, input, scale)
 
         return output, scale
 

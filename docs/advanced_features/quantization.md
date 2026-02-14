@@ -191,18 +191,81 @@ python3 -m sglang.launch_server \
 
 #### Using [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer)
 
-NVIDIA Model Optimizer (ModelOpt) provides advanced quantization techniques optimized for NVIDIA hardware. SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
+NVIDIA Model Optimizer (ModelOpt) provides advanced quantization techniques optimized for NVIDIA hardware.
+
+**Offline vs. Online Quantization:**
+
+SGLang supports two modes for ModelOpt.
+
+* **Offline Quantization (pre-quantized):**
+    * **Usage:** Download a pre-quantized model from Hugging Face or run `hf_ptq.py` once to create a new quantized checkpoint. Then load this quantized checkpoint.
+    * **Pros:** Fast server startup, quantization can be validated before deployment, efficient resource usage.
+    * **Cons:** Requires an extra preparation step.
+
+* **Online Quantization (quant and serve):**
+    * **Usage:** Load a standard BF16/FP16 model and add a flag. The engine applies quantization *on startup*.
+    * **Pros:** Convenient (no new checkpoint needed).
+    * **Cons:** **High startup time**, increases VRAM usage during initialization (risk of OOM).
+
+The following sections guide you through using the Offline path: loading pre-quantized models or creating your own checkpoints.
+
+##### Using Pre-Quantized Checkpoints
+
+If a model is already quantized (e.g., from Hugging Face), you can load it directly.
+
+* **FP8 Models:**
+    Use `--quantization modelopt_fp8`.
+    ```bash
+    python3 -m sglang.launch_server \
+        --model-path nvidia/Llama-3.1-8B-Instruct-FP8 \
+        --quantization modelopt_fp8 \
+        --port 30000
+    ```
+
+* **FP4 Models:**
+    Use `--quantization modelopt_fp4`.
+    ```bash
+    python3 -m sglang.launch_server \
+        --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
+        --quantization modelopt_fp4 \
+        --port 30000
+    ```
+
+##### Creating Your Own Quantized Checkpoints
+
+If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
+
+**Why quantize?**
+- Reduce VRAM usage
+- Higher throughput and lower latency
+- More flexible deployment (on smaller GPUs)
+
+**What can be quantized?**
+- The entire model
+- MLP layers only
+- KV cache
+
+**Key options in `hf_ptq.py`:**
+
+`--qformat`: Quantization formats `fp8`, `nvfp4`, `nvfp4_mlp_only`
+
+`--kv_cache_qformat`: KV cache quantization format (default: `fp8`)
+
+**Note:** The default `kv_cache_qformat` may not be optimal for all use cases. Consider setting this explicitly.
+
+**Hardware requirements:** Hopper and higher are recommended. Insufficient GPU memory may cause weight offloading, resulting in extremely long quantization time.
+
+For detailed usage and supported model architectures, see [NVIDIA Model Optimizer LLM PTQ](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq).
+
+SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
+
 
 ##### Installation
 
-First, install ModelOpt. You can either install it directly or as an optional SGLang dependency:
+First, install ModelOpt:
 
 ```bash
-# Option 1: Install ModelOpt directly
 pip install nvidia-modelopt
-
-# Option 2: Install SGLang with ModelOpt support (recommended)
-pip install sglang[modelopt]
 ```
 
 ##### Quantization and Export Workflow
@@ -277,20 +340,33 @@ Or using the Python API:
 ```python
 import sglang as sgl
 
-# Deploy exported ModelOpt quantized model
-llm = sgl.Engine(
-    model_path="./quantized_tinyllama_fp8",
-    quantization="modelopt"
-)
+def main():
+    # Deploy exported ModelOpt quantized model
+    llm = sgl.Engine(
+        model_path="./quantized_tinyllama_fp8",
+        quantization="modelopt",
+    )
 
-# Run inference
-prompts = ["Hello, how are you?", "What is the capital of France?"]
-sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 100}
-outputs = llm.generate(prompts, sampling_params)
+    # Run inference
+    prompts = [
+        "Hello, how are you?",
+        "What is the capital of France?",
+    ]
+    sampling_params = {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "max_new_tokens": 100,
+    }
 
-for i, output in enumerate(outputs):
-    print(f"Prompt: {prompts[i]}")
-    print(f"Output: {output.outputs[0].text}")
+    outputs = llm.generate(prompts, sampling_params)
+
+    for i, output in enumerate(outputs):
+        print(f"Prompt: {prompts[i]}")
+        print(f"Output: {output['text']}")
+
+if __name__ == "__main__":
+    main()
+
 ```
 
 ##### Advanced Features

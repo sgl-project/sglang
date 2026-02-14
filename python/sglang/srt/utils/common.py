@@ -1000,6 +1000,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1055,10 +1057,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -1096,7 +1113,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.2")
+        min_version: Minimum version required (e.g., "0.6.3")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise

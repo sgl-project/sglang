@@ -13,13 +13,12 @@ pub use discover_models::{
     group_models_into_cards, infer_model_type_from_id, DiscoverModelsStep, ModelInfo,
     ModelsResponse,
 };
+use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
 use crate::{
-    app_context::AppContext,
-    core::steps::workflow_data::ExternalWorkerWorkflowData,
+    app_context::AppContext, core::steps::workflow_data::ExternalWorkerWorkflowData,
     protocols::worker_spec::WorkerConfigRequest,
-    workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
 
 /// Create external worker registration workflow definition.
