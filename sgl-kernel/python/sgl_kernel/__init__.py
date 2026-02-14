@@ -99,7 +99,6 @@ from sgl_kernel.moe import (
     kimi_k2_moe_fused_gate,
     moe_align_block_size,
     moe_fused_gate,
-    moe_lora_align_block_size,
     moe_sum,
     moe_sum_reduce,
     prepare_moe_input,

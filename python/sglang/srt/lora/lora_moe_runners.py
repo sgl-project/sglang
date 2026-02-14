@@ -71,7 +71,7 @@ if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import (  # noqa: F401
         moe_align_block_size as sgl_moe_align_block_size,
     )
-    from sgl_kernel import moe_lora_align_block_size
+    from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 
 
 @dataclass

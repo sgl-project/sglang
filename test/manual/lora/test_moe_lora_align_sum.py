@@ -7,7 +7,7 @@ import torch
 # ---------------------------------------------------------
 # IMPORT PREBUILT KERNEL
 # ---------------------------------------------------------
-from sgl_kernel import moe_lora_align_block_size
+from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 
 
 def round_up(x, base):
