@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -30,10 +31,25 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     return hasher.hexdigest()
 
 
+def hash_str_to_int64(hash_str: str) -> int:
+    """Convert SHA256 hex string to signed 64-bit integer for events.
+
+    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
+    """
+    # Take first 16 hex chars to get 64-bit value
+    uint64_val = int(hash_str[:16], 16)
+    # Convert to signed int64 range [-2^63, 2^63-1]
+    if uint64_val >= 2**63:
+        return uint64_val - 2**64
+    return uint64_val
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
     tp_size: int
+    pp_rank: int
+    pp_size: int
     is_mla_model: bool
     is_page_first_layout: bool
     model_name: Optional[str]
@@ -65,7 +81,7 @@ class HiCacheStorage(ABC):
     ) -> List[bool]:
         """
         Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
+        Returns a list of booleans indicating success for each key.
         """
         pass
 
@@ -76,8 +92,8 @@ class HiCacheStorage(ABC):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
+        Store multiple key-value pairs.
+        Returns a list of booleans indicating success for each key.
         """
         pass
 
@@ -171,7 +187,7 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
+        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,

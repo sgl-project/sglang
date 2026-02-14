@@ -128,6 +128,12 @@ def run_test(tp_size, batch_size, model_config, check=False):
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
 
+    enable_es = (False, False)
+    if torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H200":
+        enable_es = (False, True)
+    elif torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H20":
+        enable_es = (True, True)
+
     # --- Lambdas for Benchmarking ---
     cutlass_lambda = lambda: cutlass_fused_experts_fp8(
         x,
@@ -150,6 +156,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        enable_es=enable_es,
     )
 
     topk_output = StandardTopKOutput(
@@ -234,6 +241,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 expert_offsets,
                 problem_sizes1,
                 problem_sizes2,
+                enable_es=enable_es,
             )
 
             # Run Triton version (requires original shape weights, use inplace=False)

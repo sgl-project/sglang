@@ -23,13 +23,14 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
@@ -47,10 +48,12 @@ class DotsVLMForCausalLM(nn.Module):
         self.config = config
         self.image_token_id = config.im_span_id
         self.video_token_id = config.video_span_id
+        self.pp_group = get_pp_group()
 
-        self.language_model = DeepseekV2ForCausalLM(
-            config.language_config, quant_config
-        )
+        if not config.encoder_only:
+            self.language_model = DeepseekV2ForCausalLM(
+                config.language_config, quant_config
+            )
 
         # Initialize vision tower (matching transformers naming for weight compatibility)
         self.vision_tower = DotsVisionTransformer(config.vision_config)
@@ -102,18 +105,19 @@ class DotsVLMForCausalLM(nn.Module):
                 language_weights.append((name, loaded_weight))
 
         # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
+        if not self.config.language_only:
+            vision_state_dict = dict(vision_weights)
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, loaded_weight in vision_state_dict.items():
+                if name not in params_dict:
+                    raise ValueError(f"Weight {name} not found in params_dict")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                weight_loader(param, loaded_weight)
 
         # Load language model weights
-        if language_weights:
+        if not self.config.encoder_only and language_weights:
             self.language_model.load_weights(language_weights)
 
     @classmethod
@@ -158,15 +162,25 @@ class DotsVLMForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        **kwargs: object,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            multimodal_model=self,
-            language_model=self.language_model,
-        )
+        if self.pp_group.is_first_rank:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                multimodal_model=self,
+                language_model=self.language_model,
+            )
+
+        else:
+            hidden_states = self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         return hidden_states
 
 

@@ -47,9 +47,9 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.8 \
   --context-length 8192
 ```
-The quantization and limited context length (`--dtype half --context-length 8192`) are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). A detailed explanation can be found in [Server Arguments](../backend/server_arguments.md).
+The quantization and limited context length (`--dtype half --context-length 8192`) are due to the limited computational resources in [Nvidia jetson kit](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/). A detailed explanation can be found in [Server Arguments](../advanced_features/server_arguments.md).
 
-After launching the engine, refer to [Chat completions](https://docs.sglang.ai/backend/openai_api_completions.html#Usage) to test the usability.
+After launching the engine, refer to [Chat completions](https://docs.sglang.io/basic_usage/openai_api_completions.html#Usage) to test the usability.
 * * * * *
 Running quantization with TorchAO
 -------------------------------------

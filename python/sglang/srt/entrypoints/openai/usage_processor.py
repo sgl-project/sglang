@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import UsageInfo
+from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
 
 
 @final
@@ -10,9 +10,9 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
+        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
 
     @staticmethod
     def calculate_response_usage(
@@ -30,7 +30,8 @@ class UsageProcessor:
         cached_details = None
         if enable_cache_report:
             cached_total = sum(
-                r["meta_info"].get("cached_tokens", 0) for r in responses
+                responses[i]["meta_info"].get("cached_tokens", 0)
+                for i in range(0, len(responses), n_choices)
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
@@ -55,7 +56,9 @@ class UsageProcessor:
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
-            UsageProcessor._details_if_cached(sum(cached_tokens.values()))
+            UsageProcessor._details_if_cached(
+                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+            )
             if enable_cache_report
             else None
         )
@@ -70,7 +73,7 @@ class UsageProcessor:
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
-        cached_tokens: Optional[Dict[str, int]] = None,
+        cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(

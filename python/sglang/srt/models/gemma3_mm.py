@@ -18,12 +18,13 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
 from transformers import Gemma3Config, PreTrainedModel
 
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -36,7 +37,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     flatten_nested_list,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -212,71 +213,62 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
     def prepare_attn_masks(
         self,
+        forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         mask_dtype: torch.dtype,
-        **kwargs,
-    ) -> Dict:
+    ):
         """Prepare attention masks for multimodal inputs."""
-        kwargs["has_images"] = True
-
-        # Distinguish sequences by position id 0
-        start_indices = (positions == 0).cpu().nonzero()
-        num_seqs = len(start_indices)
-        seq_lens = []
-
-        for i in range(num_seqs):
-            start_idx = start_indices[i].item()
-            if i < num_seqs - 1:
-                end_idx = start_indices[i + 1].item()
-            else:
-                end_idx = len(input_ids)
-            seq_lens.append(end_idx - start_idx)
-
-        kwargs["seq_lens"] = seq_lens
-
-        # Create attention masks
-        global_attn_masks = []
-        local_attn_masks = []
-        sliding_window = self.config.text_config.interleaved_sliding_window
-
-        start_idx = 0
-        for seq_len in seq_lens:
-            end_idx = start_idx + seq_len
-            input_token_ids = input_ids[start_idx:end_idx]
-            start_idx = end_idx
-
-            # Create global causal mask
-            global_attn_mask = torch.empty(
-                1,
-                1,
-                seq_len,
-                seq_len,
-                dtype=mask_dtype,
-                device=input_ids.device,
+        if isinstance(forward_batch.attn_backend, TritonAttnBackend):
+            assert forward_batch.forward_mode == ForwardMode.EXTEND
+            bidirectional_attn_masks_list = []
+            bidirectional_attn_mask_indptr = torch.zeros(
+                forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
             )
-            global_attn_mask.fill_(float("-inf"))
-            global_attn_mask = global_attn_mask.triu(diagonal=1)
 
-            # Consider bidirectional attention between image tokens
-            img_mask = torch.zeros_like(global_attn_mask)
-            img_pos = input_token_ids == self.config.image_token_index
-            img_mask[:, :, :, img_pos] += 1
-            img_mask[:, :, img_pos, :] += 1
-            global_attn_mask = torch.where(img_mask == 2, 0, global_attn_mask)
-            global_attn_masks.append(global_attn_mask)
+            for i in range(forward_batch.batch_size):
+                bidirectional_attn_mask = torch.empty(
+                    forward_batch.extend_seq_lens[i],
+                    forward_batch.extend_seq_lens[i]
+                    + forward_batch.extend_prefix_lens[i],
+                    dtype=mask_dtype,
+                    device=input_ids.device,
+                )
+                bidirectional_attn_mask.fill_(1)
+                bidirectional_attn_mask = bidirectional_attn_mask.tril(
+                    diagonal=forward_batch.extend_prefix_lens[i]
+                )
 
-            # Create local causal mask with sliding window
-            local_attn_mask = torch.ones_like(global_attn_mask)
-            local_attn_mask = torch.tril(local_attn_mask, diagonal=-sliding_window)
-            local_attn_mask = torch.where(
-                local_attn_mask == 0, global_attn_mask, float("-inf")
-            )
-            local_attn_masks.append(local_attn_mask)
+                # Consider bidirectional attention between image tokens
+                mm_inputs = forward_batch.mm_inputs[i]
+                for mm_item in mm_inputs.mm_items:
+                    if mm_item.is_image():
+                        for im_begin, im_end in mm_item.offsets:
+                            if (
+                                im_begin >= forward_batch.extend_prefix_lens[i]
+                            ):  # compatible with radix cache
+                                bidirectional_attn_mask[
+                                    im_begin
+                                    - forward_batch.extend_prefix_lens[i] : im_end
+                                    + 1
+                                    - forward_batch.extend_prefix_lens[i],
+                                    im_begin : im_end + 1,
+                                ] = 1
+                bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
+                bidirectional_attn_mask_indptr[i + 1] = (
+                    bidirectional_attn_mask_indptr[i]
+                    + bidirectional_attn_mask.nelement()
+                )
 
-        kwargs["global_attn_masks"] = global_attn_masks
-        kwargs["local_attn_masks"] = local_attn_masks
-        return kwargs
+            if bidirectional_attn_masks_list:
+                bidirectional_attn_masks = torch.cat(
+                    bidirectional_attn_masks_list, dim=0
+                )
+                forward_batch.attn_backend.forward_metadata.mask_indptr = (
+                    bidirectional_attn_mask_indptr
+                )
+                forward_batch.attn_backend.forward_metadata.custom_mask = (
+                    bidirectional_attn_masks
+                )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -290,15 +282,26 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.
+        Supports both raw image pixel values and precomputed embeddings.
 
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         # Process images one by one to handle flatten_batch=True constraint in vision_tower
         all_pixel_values = flatten_nested_list([item.feature for item in items])
-        vision_outputs_list = []
+
+        final_features_list = []
 
         for pixel_values_batch in all_pixel_values:
+            if (
+                pixel_values_batch.dim() == 3
+                and pixel_values_batch.shape[-1] == self.config.text_config.hidden_size
+            ):
+                final_features_list.append(
+                    pixel_values_batch.to(self.language_model.device)
+                )
+                continue
+
             # Normalize input shape to [batch_size, channels, height, width]
             if pixel_values_batch.dim() == 5:
                 pixel_values_batch = pixel_values_batch.squeeze(0)
@@ -309,20 +312,29 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
                 )
 
-            # Process each image in the batch
+            # Process each image in the batch through Vision Tower
+            batch_vision_outputs = []
             batch_size = pixel_values_batch.shape[0]
+
             for i in range(batch_size):
                 pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
                     device=self.vision_tower.device, dtype=self.language_model.dtype()
                 )
                 vision_output = self.vision_tower(pixel_values=pixel_value)
-                vision_outputs_list.append(vision_output)
+                batch_vision_outputs.append(vision_output)
 
-        # Concatenate all vision outputs
-        vision_outputs = torch.cat(vision_outputs_list, dim=0)
-        image_features = self.multi_modal_projector(vision_outputs)
-        return image_features
+            if batch_vision_outputs:
+                vision_outputs_cat = torch.cat(batch_vision_outputs, dim=0)
+
+                projected_features = self.multi_modal_projector(vision_outputs_cat)
+                final_features_list.append(projected_features)
+
+        # Concatenate all features (all are now in text space)
+        if final_features_list:
+            return torch.cat(final_features_list, dim=0)
+        else:
+            return torch.tensor([], device=self.language_model.device)
 
     @torch.no_grad()
     def forward(
@@ -381,6 +393,18 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             llm_input_ids[special_image_mask] = 0
         else:
             llm_input_ids = input_ids
+
+        # NOTE: As described in https://huggingface.co/blog/gemma3#multimodality, in the prefill stage of Gemma-3, image tokens use bidirectional attention. Currently, only the TritonAttnBackend supports bidirectional attention; other backends have not yet implemented this. Bidirectional attention is incompatible with CUDA Graph and chunked prefill.
+        if (
+            forward_batch.forward_mode
+            == ForwardMode.EXTEND  # only Extend mode is supported for now
+            and forward_batch.contains_image_inputs()  # Gemma-3 only supports image as mm inputs
+        ):
+            self.prepare_attn_masks(
+                forward_batch,
+                llm_input_ids,
+                mask_dtype=torch.bool,
+            )
 
         hs = general_mm_embed_routine(
             input_ids=llm_input_ids,

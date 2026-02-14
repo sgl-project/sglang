@@ -186,7 +186,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            # tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+            tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
             tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
         else:
@@ -221,7 +221,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 )  # token-index  # token-index  # feature-index
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
-                # tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
+                tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
                 new_conv_state = tl.where(
                     mask, conv_state, loaded_x
                 )  # BUG in 'tl.where'  which requires a barrier before this
@@ -578,6 +578,7 @@ def _causal_conv1d_update_kernel(
     conv_state_indices_ptr,
     num_accepted_tokens_ptr,
     intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
     retrieve_parent_token_ptr,
@@ -602,6 +603,7 @@ def _causal_conv1d_update_kernel(
     stride_inter_step: tl.constexpr,
     stride_inter_dim: tl.constexpr,
     stride_inter_win: tl.constexpr,
+    stride_intermediate_state_indices: tl.constexpr,
     stride_retrieve_next_token_seq: tl.constexpr,
     stride_retrieve_next_token_token: tl.constexpr,
     stride_retrieve_next_sibling_seq: tl.constexpr,
@@ -639,6 +641,11 @@ def _causal_conv1d_update_kernel(
         conv_state_batch_coord = tl.load(
             conv_state_indices_ptr + idx_seq * stride_state_indices
         ).to(tl.int64)
+        if SAVE_INTERMEDIATE:
+            intermediate_state_batch_coord = tl.load(
+                intermediate_state_indices_ptr
+                + idx_seq * stride_intermediate_state_indices
+            ).to(tl.int64)
     else:
         conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:  # noqa
@@ -721,7 +728,7 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    # tl.debug_barrier()
+    tl.debug_barrier()
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
 
@@ -847,7 +854,7 @@ def _causal_conv1d_update_kernel(
                     # Layout: [seq(cache line), step, dim, win(K-1)]
                     base_ptr = (
                         intermediate_conv_window_ptr
-                        + conv_state_batch_coord * stride_inter_seq
+                        + intermediate_state_batch_coord * stride_inter_seq
                         + idx_token * stride_inter_step
                         + idx_feats * stride_inter_dim
                     )
@@ -934,7 +941,7 @@ def _causal_conv1d_update_kernel(
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
                     intermediate_conv_window_ptr
-                    + conv_state_batch_coord * stride_inter_seq
+                    + intermediate_state_batch_coord * stride_inter_seq
                     + idx_token * stride_inter_step
                     + idx_feats * stride_inter_dim
                 )
@@ -980,6 +987,7 @@ def causal_conv1d_update(
     conv_state_indices: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
     retrieve_next_token: Optional[torch.Tensor] = None,
     retrieve_next_sibling: Optional[torch.Tensor] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
@@ -1040,6 +1048,8 @@ def causal_conv1d_update(
             assert conv_state.size(0) >= batch
         else:
             assert (batch,) == conv_state_indices.shape
+            assert intermediate_state_indices is not None
+            assert (batch,) == intermediate_state_indices.shape
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
@@ -1055,6 +1065,11 @@ def causal_conv1d_update(
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    )
+    stride_intermediate_state_indices = (
+        intermediate_state_indices.stride(0)
+        if intermediate_state_indices is not None
+        else 0
     )
     if num_accepted_tokens is not None:
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
@@ -1117,6 +1132,7 @@ def causal_conv1d_update(
         conv_state_indices,
         num_accepted_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
+        intermediate_state_indices,
         retrieve_next_token,
         retrieve_next_sibling,
         retrieve_parent_token,
@@ -1141,6 +1157,7 @@ def causal_conv1d_update(
         stride_inter_step,
         stride_inter_dim,
         stride_inter_win,
+        stride_intermediate_state_indices,
         stride_retrieve_next_token_seq,
         stride_retrieve_next_token_token,
         stride_retrieve_next_sibling_seq,

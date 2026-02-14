@@ -83,9 +83,9 @@ async def process_sample(
     assert image is not None
     image_path = sample["image_path"]
     extra_body = None if lora_path is None else {"lora_path": lora_path}
-    response = await client.chat.completions.create(
-        model="default",
-        messages=[
+    payload = {
+        "model": "default",
+        "messages": [
             {
                 "role": "user",
                 "content": [
@@ -95,11 +95,11 @@ async def process_sample(
                 ],
             }
         ],
-        temperature=0,
-        max_completion_tokens=sampling_params["max_new_tokens"],
-        max_tokens=sampling_params["max_new_tokens"],
-        extra_body=extra_body,
-    )
+        "extra_body": extra_body,
+    }
+    if sampling_params:
+        payload.update(sampling_params)
+    response = await client.chat.completions.create(**payload)
     return sample, response.choices[0].message.content
 
 

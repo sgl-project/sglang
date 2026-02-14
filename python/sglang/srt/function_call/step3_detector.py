@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -406,31 +405,3 @@ class Step3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
-
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        """
-        Build EBNF grammar for Step3 tool call format.
-        """
-        # Custom call rule for steptml format
-        call_rule_fmt = (
-            '"function" "<｜tool_sep｜>" "<steptml:invoke name=\\"{name}\\">" '
-            '{arguments_rule} "</steptml:invoke>"'
-        )
-
-        # Custom key-value rule for steptml parameters
-        key_value_rule_fmt = (
-            '"<steptml:parameter name=\\"{key}\\">" {valrule} "</steptml:parameter>"'
-        )
-
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            individual_call_start_token=self.tool_call_begin,
-            individual_call_end_token=self.tool_call_end,
-            tool_call_separator="",
-            function_format="xml",
-            call_rule_fmt=call_rule_fmt,
-            key_value_rule_fmt=key_value_rule_fmt,
-            key_value_separator="",
-        )

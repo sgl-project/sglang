@@ -3,9 +3,7 @@ import math
 import unittest
 
 # TODO: use interface in cpu.py
-import sgl_kernel
 import torch
-import torch.nn as nn
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -68,8 +66,6 @@ class TestSharedExpert(CustomTestCase):
             None,
             None,
             None,
-            None,
-            None,
             False,
         )
 
@@ -125,8 +121,6 @@ class TestSharedExpert(CustomTestCase):
             False,
             w1_s,
             w2_s,
-            None,
-            None,
             None,
             False,
         )
@@ -198,8 +192,6 @@ class TestSharedExpert(CustomTestCase):
             w1s,
             w2s,
             [BLOCK_N, BLOCK_K],
-            None,
-            None,
             True,
         )
 

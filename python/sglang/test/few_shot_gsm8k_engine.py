@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 
 import sglang as sgl
+from sglang.srt.utils import get_or_create_event_loop
 from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
@@ -89,7 +90,7 @@ def run_eval(args):
     # Run requests
     tic = time.perf_counter()
 
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
 
     outputs = loop.run_until_complete(
         concurrent_generate(engine, prompts, sampling_param)

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 PROCESSOR_MAPPING = {}
 
 
-def import_processors(package_name: str):
+def import_processors(package_name: str, overwrite: bool = False):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
@@ -32,15 +32,22 @@ def import_processors(package_name: str):
             ):
                 assert hasattr(cls, "models")
                 for arch in getattr(cls, "models"):
+                    if overwrite:
+                        for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+                            if model_cls.__name__ == arch.__name__:
+                                del PROCESSOR_MAPPING[model_cls]
+                                break
                     PROCESSOR_MAPPING[arch] = cls
 
 
 def get_mm_processor(
-    hf_config, server_args: ServerArgs, processor, transport_mode
+    hf_config, server_args: ServerArgs, processor, transport_mode, **kwargs
 ) -> BaseMultimodalProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
-            return processor_cls(hf_config, server_args, processor, transport_mode)
+            return processor_cls(
+                hf_config, server_args, processor, transport_mode, **kwargs
+            )
 
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"

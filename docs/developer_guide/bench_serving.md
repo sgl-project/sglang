@@ -1,4 +1,4 @@
-## Bench Serving Guide
+# Bench Serving Guide
 
 This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
@@ -332,7 +332,7 @@ python3 -m sglang.bench_serving \
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
-  --model mode-name \
+  --model model-name \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \

@@ -20,7 +20,7 @@ class MockModelRunner:
         attention_arch = AttentionArch.MLA
         self.device = "cuda"
         self.dtype = torch.float16
-        self.is_hybrid = False
+        self.is_hybrid_swa = False
         context_len = 2048
         self.model_config = type(
             "ModelConfig",
@@ -28,6 +28,8 @@ class MockModelRunner:
             {
                 "context_len": context_len,
                 "attention_arch": attention_arch,
+                "is_encoder_decoder": False,
+                "is_local_attention_model": False,
             },
         )
         self.sliding_window_size = None

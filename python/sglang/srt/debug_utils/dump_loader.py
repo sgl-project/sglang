@@ -47,22 +47,36 @@ def read_meta(directory):
 
     rows = []
     for p in directory.glob("*.pt"):
-        full_kwargs = {}
-        for kv in p.stem.split("___"):
-            k, v = kv.split("=")
-            full_kwargs[k] = v
-        rows.append(
-            {
-                "filename": str(p.name),
-                **full_kwargs,
-            }
-        )
+        try:
+            full_kwargs = {}
+            for kv in p.stem.split("___"):
+                k, v = kv.split("=")
+                full_kwargs[k] = v
+            rows.append(
+                {
+                    "filename": str(p.name),
+                    **full_kwargs,
+                }
+            )
+        except Exception as e:
+            print(f"[DumpLoader] skip loading {p} due to error {e}")
 
     df = pl.DataFrame(rows)
     df = df.with_columns(
         pl.col("forward_pass_id").cast(int),
         pl.col("rank").cast(int),
         pl.col("dump_index").cast(int),
+    )
+    df = _add_duplicate_index(df)
+    df = df.sort("rank", "dump_index")
+    return df
+
+
+def _add_duplicate_index(df: pl.DataFrame) -> pl.DataFrame:
+    group_cols = [c for c in df.columns if c not in ["filename", "dump_index"]]
+    df = df.sort(group_cols + ["dump_index"])
+    df = df.with_columns(
+        pl.cum_count("dump_index").over(group_cols).sub(1).alias("duplicate_index")
     )
     return df
 
@@ -72,12 +86,20 @@ def find_row(df, conditions: Dict[str, Any]):
         functools.reduce(
             lambda a, b: a & b,
             [
-                pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col])
+                (
+                    pl.col(col)
+                    == _cast_to_polars_dtype(conditions[col], df.schema[col])
+                    if conditions[col] is not None
+                    else pl.col(col).is_null()
+                )
                 for col in conditions.keys()
+                if col in df.columns
             ],
         )
     )
-    assert len(df_sub) <= 1
+    if len(df_sub) > 1:
+        print(f"find_row find ambiguous results: {df_sub=}")
+        return None
     return df_sub.to_dicts()[0] if len(df_sub) > 0 else None
 
 
