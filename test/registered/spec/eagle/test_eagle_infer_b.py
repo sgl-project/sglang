@@ -371,7 +371,7 @@ class TestEAGLERunningTimeout(RunningTimeoutTwoWaveMixin, EagleServerBase):
 
     @classmethod
     def setUpClass(cls):
-        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(5):
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(3):
             super().setUpClass()
 
 
