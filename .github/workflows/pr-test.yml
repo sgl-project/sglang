@@ -62,6 +62,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
 
 permissions:
   actions: write
