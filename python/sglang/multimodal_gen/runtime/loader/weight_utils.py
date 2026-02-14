@@ -343,14 +343,9 @@ def compute_weights_checksum(
 ) -> str:
     """Compute a SHA-256 checksum for a set of (name, tensor) pairs.
 
-    Helper function for verifying the correctness of weight refitting
-    (update_weights_from_disk). After a refit, callers can compare the
-    checksum of the in-GPU model weights against the checksum of the
-    on-disk tensors to confirm they match exactly.
-
-    Parameters are sorted by name so the digest is deterministic
-    regardless of iteration order.  Raw bytes are hashed directly
-    (no dtype conversion) for speed and fidelity.
+    Used to verify the correctness of weight refitting. After a refit,
+    compare the checksum of the in-GPU model weights against the checksum
+    of the on-disk tensors or the tensors in the training engine.
     """
     hasher = hashlib.sha256()
     for name, tensor in sorted(named_params, key=lambda x: x[0]):
