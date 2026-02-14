@@ -54,6 +54,26 @@ class ShutdownReq:
     pass
 
 
+@dataclasses.dataclass
+class StartProfileReq:
+    """Request to start profiling in GPU Worker process."""
+
+    output_dir: Optional[str] = None
+    profile_id: Optional[str] = None
+    activities: Optional[List[str]] = None
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
+
+
+@dataclasses.dataclass
+class StopProfileReq:
+    """
+    Request to stop profiling and save traces in GPU Worker process.
+    """
+
+    export_trace: bool = True
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
