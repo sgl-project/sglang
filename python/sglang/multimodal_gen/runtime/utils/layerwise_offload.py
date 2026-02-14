@@ -104,8 +104,8 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return
 
-        named_parameters = list(self.model.named_parameters(remove_duplicate=False))
-        named_buffers = list(self.model.named_buffers(remove_duplicate=False))
+        named_parameters = list(self.model.named_parameters())
+        named_buffers = list(self.model.named_buffers())
         self._named_parameters = dict(named_parameters)
         self._named_buffers = dict(named_buffers)
 
