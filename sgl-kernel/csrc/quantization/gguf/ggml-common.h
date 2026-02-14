@@ -964,11 +964,11 @@ static __device__ __forceinline__ dst_t convert_from_half(half val) {
 
 template <>
 __device__ __forceinline__ c10::BFloat16 convert_from_half<c10::BFloat16>(half val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 || defined(USE_MUSA)
   return __float2bfloat16(__half2float(val));
 #else
   return __half2float(val);
-#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 || defined(USE_MUSA)
 }
 
 template <>

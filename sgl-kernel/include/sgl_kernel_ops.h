@@ -129,6 +129,8 @@ int64_t cutlass_mla_get_workspace_size(
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void musa_fused_add_rms_norm(
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
