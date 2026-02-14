@@ -1,8 +1,12 @@
-"""
-Tests for update_weights_from_disk API in SGLang diffusion server.
+"""Tests for diffusion `update_weights_from_disk`.
 
 This module verifies the ability to update model weights in place without restarting
 the server, which is critical for RL workflows and iterative fine-tuning scenarios.
+
+Author:
+
+Menyang Liu, https://github.com/dreamyang-liu
+Chenyang Zhao, https://github.com/zhaochenyang20
 
 We use two model pairs for testing (base model / instruct model pairs):
 
@@ -12,11 +16,6 @@ We use two model pairs for testing (base model / instruct model pairs):
 These model pairs share the same architecture, but not every module is
 guaranteed to have different weights between base and update models.
 Some modules can be identical across the pair.
-
-Author:
-
-Menyang Liu, https://github.com/dreamyang-liu
-Chenyang Zhao, https://github.com/zhaochenyang20
 
 =============================================================================
 
@@ -138,20 +137,17 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in
 
 logger = init_logger(__name__)
 
-# Model pairs for weight update tests: (default_model, update_model, ci_weight).
-# The server starts with default_model; tests update weights to update_model.
-# ci_weight controls how likely each pair is to be selected in CI runs.
 _ALL_MODEL_PAIRS: list[tuple[str, str, float]] = [
     (
         "black-forest-labs/FLUX.2-klein-base-4B",
         "black-forest-labs/FLUX.2-klein-4B",
         5.0,
     ),
-    # (
-    #     "Qwen/Qwen-Image",
-    #     "Qwen/Qwen-Image-2512",
-    #     1.0,  # Qwen Image is large; run it less often in CI.
-    # ),
+    (
+        "Qwen/Qwen-Image",
+        "Qwen/Qwen-Image-2512",
+        1.0,  # Qwen Image is large; run it less often in CI.
+    ),
 ]
 
 
@@ -174,6 +170,7 @@ def _select_model_pairs() -> list[tuple[str, str]]:
 
 
 _ACTIVE_MODEL_PAIRS = _select_model_pairs()
+_PAIR_IDS = [p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS]
 
 
 @functools.lru_cache(maxsize=None)
@@ -285,7 +282,72 @@ def _prepare_corrupted_model(
             )
 
 
-class TestUpdateWeightsFromDisk:
+class _UpdateWeightsApiMixin:
+    def _get_base_url(self, ctx: ServerContext) -> str:
+        return f"http://localhost:{ctx.port}"
+
+    def _update_weights(
+        self,
+        base_url: str,
+        model_path: str,
+        flush_cache: bool = True,
+        target_modules: list[str] | None = None,
+        timeout: int = 300,
+    ) -> tuple[dict, int]:
+        payload = {"model_path": model_path, "flush_cache": flush_cache}
+        if target_modules is not None:
+            payload["target_modules"] = target_modules
+        response = requests.post(
+            f"{base_url}/update_weights_from_disk",
+            json=payload,
+            timeout=timeout,
+        )
+        return response.json(), response.status_code
+
+    def _get_weights_checksum(
+        self,
+        base_url: str,
+        module_names: list[str] | None = None,
+        timeout: int = 300,
+    ) -> dict:
+        payload = {}
+        if module_names is not None:
+            payload["module_names"] = module_names
+        response = requests.post(
+            f"{base_url}/get_weights_checksum",
+            json=payload,
+            timeout=timeout,
+        )
+        assert (
+            response.status_code == 200
+        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
+        return response.json()
+
+    def _assert_server_matches_model_on_changed_modules(
+        self,
+        base_url: str,
+        base_model: str,
+        update_model: str,
+        expected_model: str,
+    ) -> None:
+        all_checksums = self._get_weights_checksum(base_url)
+        module_names = [k for k, v in all_checksums.items() if v != "not_found"]
+        changed_modules = _get_modules_with_different_checksums(
+            base_model, update_model, module_names
+        )
+        if not changed_modules:
+            pytest.skip("No checksum-different shared modules in model pair")
+        for name in changed_modules:
+            server_cs = all_checksums.get(name)
+            expected_cs = _compute_checksum_from_disk(expected_model, name)
+            assert server_cs == expected_cs, (
+                f"Checksum mismatch on '{name}'\n"
+                f"  expected({expected_model}): {expected_cs}\n"
+                f"  server: {server_cs}"
+            )
+
+
+class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     """Test suite for update_weights_from_disk API and corrupted-weight rollback.
 
     Uses a class-scoped server fixture so the server is torn down at class end,
@@ -295,7 +357,7 @@ class TestUpdateWeightsFromDisk:
     @pytest.fixture(
         scope="class",
         params=_ACTIVE_MODEL_PAIRS,
-        ids=[p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS],
+        ids=_PAIR_IDS,
     )
     def diffusion_server_no_offload(self, request):
         """Start a diffusion server (no offload) for this test class.
@@ -341,73 +403,6 @@ class TestUpdateWeightsFromDisk:
         yield tmpdir
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _get_base_url(self, ctx: ServerContext) -> str:
-        return f"http://localhost:{ctx.port}"
-
-    def _update_weights(
-        self,
-        base_url: str,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-        timeout: int = 300,
-    ) -> tuple[dict, int]:
-        """Call update_weights_from_disk API."""
-        payload = {
-            "model_path": model_path,
-            "flush_cache": flush_cache,
-        }
-        if target_modules is not None:
-            payload["target_modules"] = target_modules
-
-        response = requests.post(
-            f"{base_url}/update_weights_from_disk",
-            json=payload,
-            timeout=timeout,
-        )
-        return response.json(), response.status_code
-
-    def _get_weights_checksum(
-        self,
-        base_url: str,
-        module_names: list[str] | None = None,
-        timeout: int = 300,
-    ) -> dict:
-        """Call get_weights_checksum API and return the checksum dict."""
-        payload = {}
-        if module_names is not None:
-            payload["module_names"] = module_names
-
-        response = requests.post(
-            f"{base_url}/get_weights_checksum",
-            json=payload,
-            timeout=timeout,
-        )
-        assert (
-            response.status_code == 200
-        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
-        return response.json()
-
-    def _assert_server_checksums_match_base_disk(
-        self, base_url: str, default_model: str, update_model: str
-    ) -> None:
-        """Assert changed modules on server match base model disk (server healthy)."""
-        all_checksums = self._get_weights_checksum(base_url, module_names=None)
-        module_names = [k for k in all_checksums if all_checksums.get(k) != "not_found"]
-        changed_modules = _get_modules_with_different_checksums(
-            default_model, update_model, module_names
-        )
-        if not changed_modules:
-            pytest.skip("No checksum-different shared modules in model pair")
-
-        for name in changed_modules:
-            server_cs = all_checksums.get(name)
-            base_disk_cs = _compute_checksum_from_disk(default_model, name)
-            assert server_cs == base_disk_cs, (
-                f"Server checksum for '{name}' should match base model disk (server healthy)\n"
-                f"  base_disk: {base_disk_cs}\n  server:    {server_cs}"
-            )
-
     def test_update_weights_from_disk_default(self, diffusion_server_no_offload):
         """Base→instruct with flush_cache=True; verify before/after; rollback to base.
 
@@ -439,17 +434,6 @@ class TestUpdateWeightsFromDisk:
             base_url, module_names=["transformer"]
         )["transformer"]
         instruct_disk = _compute_checksum_from_disk(update_model, "transformer")
-
-        print(f"\n{'='*60}")
-        print("Checksum test (base→instruct with flush_cache=True)")
-        print(f"  before (gpu):   {before_checksum}")
-        print(f"  base (disk):    {base_disk}")
-        print(f"  after (gpu):   {after_checksum}")
-        print(f"  instruct (disk): {instruct_disk}")
-        print(f"  before==base_disk: {before_checksum == base_disk}")
-        print(f"  after==instruct_disk: {after_checksum == instruct_disk}")
-        print(f"  before!=after: {before_checksum != after_checksum}")
-        print(f"{'='*60}")
 
         assert before_checksum == base_disk, (
             f"Before-update checksum should match base model disk\n"
@@ -580,8 +564,8 @@ class TestUpdateWeightsFromDisk:
 
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
-        self._assert_server_checksums_match_base_disk(
-            base_url, default_model, update_model
+        self._assert_server_matches_model_on_changed_modules(
+            base_url, default_model, update_model, default_model
         )
 
     def test_update_weights_missing_model_path(self, diffusion_server_no_offload):
@@ -598,8 +582,8 @@ class TestUpdateWeightsFromDisk:
         )
 
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
-        self._assert_server_checksums_match_base_disk(
-            base_url, default_model, update_model
+        self._assert_server_matches_model_on_changed_modules(
+            base_url, default_model, update_model, default_model
         )
 
     def test_update_weights_nonexistent_module(self, diffusion_server_no_offload):
@@ -620,8 +604,8 @@ class TestUpdateWeightsFromDisk:
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent module"
         assert "not found in pipeline" in result.get("message", "")
-        self._assert_server_checksums_match_base_disk(
-            base_url, default_model, update_model
+        self._assert_server_matches_model_on_changed_modules(
+            base_url, default_model, update_model, default_model
         )
 
     def test_corrupted_weights_rollback(
@@ -696,19 +680,6 @@ class TestUpdateWeightsFromDisk:
         )
         logger.info(f"Post-rollback checksums: {post_rollback_checksums}")
 
-        print(f"\n{'='*80}")
-        print("Corrupted-weight rollback test (transformer, vae)")
-        for module in sorted(update_checksums.keys()):
-            update_cs = update_checksums.get(module, "N/A")
-            rollback_cs = post_rollback_checksums.get(module, "N/A")
-            base_cs = base_checksums.get(module, "N/A")
-            match = "OK" if update_cs == rollback_cs else "MISMATCH"
-            print(f"  [{match}] {module}")
-            print(f"        base:     {base_cs}")
-            print(f"        update:   {update_cs}")
-            print(f"        rollback: {rollback_cs}")
-        print(f"{'='*80}")
-
         for module in update_checksums:
             assert post_rollback_checksums.get(module) == update_checksums[module], (
                 f"Module '{module}' checksum mismatch after rollback\n"
@@ -726,25 +697,17 @@ class TestUpdateWeightsFromDisk:
         assert status_code == 200 and result.get(
             "success"
         ), f"Failed to reset to base after rollback: {result.get('message')}"
-        self._assert_server_checksums_match_base_disk(
-            base_url, default_model, update_model
+        self._assert_server_matches_model_on_changed_modules(
+            base_url, default_model, update_model, default_model
         )
 
 
-class TestUpdateWeightsFromDiskWithOffload:
+class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
     """Test update_weights_from_disk with layerwise offload enabled."""
 
-    @pytest.fixture(
-        scope="class",
-        params=_ACTIVE_MODEL_PAIRS,
-        ids=[p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS],
-    )
+    @pytest.fixture(scope="class", params=_ACTIVE_MODEL_PAIRS, ids=_PAIR_IDS)
     def diffusion_server_with_offload(self, request):
-        """Start a diffusion server with layerwise offload enabled.
-
-        Disk checksums are already cached by diffusion_server_no_offload
-        (which runs first), so no background precomputation is needed here.
-        """
+        """Start a diffusion server with layerwise offload enabled."""
         default_model, update_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
@@ -763,61 +726,6 @@ class TestUpdateWeightsFromDiskWithOffload:
         finally:
             ctx.cleanup()
 
-    def _get_base_url(self, ctx: ServerContext) -> str:
-        return f"http://localhost:{ctx.port}"
-
-    def _update_weights(
-        self, base_url: str, model_path: str, **kwargs
-    ) -> tuple[dict, int]:
-        payload = {"model_path": model_path, **kwargs}
-        response = requests.post(
-            f"{base_url}/update_weights_from_disk",
-            json=payload,
-            timeout=kwargs.get("timeout", 300),
-        )
-        return response.json(), response.status_code
-
-    def _get_weights_checksum(
-        self,
-        base_url: str,
-        module_names: list[str] | None = None,
-        timeout: int = 300,
-    ) -> dict:
-        """Call get_weights_checksum API and return the checksum dict."""
-        payload = {}
-        if module_names is not None:
-            payload["module_names"] = module_names
-
-        response = requests.post(
-            f"{base_url}/get_weights_checksum",
-            json=payload,
-            timeout=timeout,
-        )
-        assert (
-            response.status_code == 200
-        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
-        return response.json()
-
-    def _assert_server_checksums_match_instruct_disk(
-        self, base_url: str, default_model: str, update_model: str
-    ) -> None:
-        """Assert changed modules on server match update model disk (server healthy)."""
-        all_checksums = self._get_weights_checksum(base_url, module_names=None)
-        module_names = [k for k in all_checksums if all_checksums.get(k) != "not_found"]
-        changed_modules = _get_modules_with_different_checksums(
-            default_model, update_model, module_names
-        )
-        if not changed_modules:
-            pytest.skip("No checksum-different shared modules in model pair")
-
-        for name in changed_modules:
-            server_cs = all_checksums.get(name)
-            instruct_disk_cs = _compute_checksum_from_disk(update_model, name)
-            assert server_cs == instruct_disk_cs, (
-                f"Server checksum for '{name}' should match instruct model disk\n"
-                f"  instruct_disk: {instruct_disk_cs}\n  server:       {server_cs}"
-            )
-
     def test_update_weights_with_offload_enabled(self, diffusion_server_with_offload):
         """Offload: base→instruct update; no Shape mismatch; checksums == instruct disk."""
         ctx, default_model, update_model = diffusion_server_with_offload
@@ -830,8 +738,8 @@ class TestUpdateWeightsFromDiskWithOffload:
         message = result.get("message", "")
         assert "Shape mismatch" not in message, f"Shape mismatch detected: {message}"
 
-        self._assert_server_checksums_match_instruct_disk(
-            base_url, default_model, update_model
+        self._assert_server_matches_model_on_changed_modules(
+            base_url, default_model, update_model, update_model
         )
 
 
