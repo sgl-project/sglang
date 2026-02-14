@@ -1,15 +1,14 @@
+import os
 from typing import Any
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 
 
 class VisionLanguageEncoderLoader(ComponentLoader):
-    """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
+    """Loader for vision language encoder via SGLang Engine."""
 
     component_names = ["vision_language_encoder"]
     expected_library = "transformers"
@@ -21,20 +20,20 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         transformers_or_diffusers: str = "vision_language_encoder",
     ) -> Any:
         if transformers_or_diffusers == "vision_language_encoder":
-            from transformers import GlmImageForConditionalGeneration
+            from sglang import Engine
 
-            config = get_hf_config(
-                component_model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+            model_root = os.path.dirname(component_model_path)
+            processor_path = os.path.join(model_root, "processor")
+
+            engine = Engine(
+                model_path=component_model_path,
+                tokenizer_path=processor_path,
+                mem_fraction_static=0.8,
+                enable_multimodal=True,
+                disable_cuda_graph=True,
+                tp_size=server_args.tp_size if server_args.tp_size > 0 else 1,
             )
-            model = GlmImageForConditionalGeneration.from_pretrained(
-                component_model_path,
-                config=config,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-            ).to(get_local_torch_device())
-            return model
+            return engine
         else:
             raise ValueError(
                 f"Unsupported library for VisionLanguageEncoder: {transformers_or_diffusers}"
