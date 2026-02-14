@@ -22,6 +22,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -192,9 +193,31 @@ class KimiDeltaAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = quant_config is None
-        if self.do_fuse_qkvbfg:
+        # Use fused qkv_proj like qwen3 does
+        from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+        attn_tp_rank = get_attention_tp_rank()
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_k_heads,
+            bias=False,
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            v_head_size=self.head_v_dim,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
+        # Store sizes for splitting qkv tensor
+        self.q_size = divide(self.num_heads * self.head_dim, self.attn_tp_size)
+        self.k_size = divide(self.num_k_heads * self.head_dim, self.attn_tp_size)
+        self.v_size = divide(self.num_v_heads * self.head_v_dim, self.attn_tp_size)
+
+        # TODO: support fusion with quant for bfg projections
+        self.do_fuse_bfg = quant_config is None
+        if self.do_fuse_bfg:
             self.qkvb_sizes = [
                 projection_size,
                 projection_size,
@@ -202,42 +225,20 @@ class KimiDeltaAttention(nn.Module):
                 self.num_heads,
             ]
             self.fg_sizes = [self.head_dim, self.head_dim]
-            self.fused_qkvbfg_proj = MergedColumnParallelRepeatedLinear(
+            self.fused_bfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
-                self.qkvb_sizes,
+                [self.num_heads],
                 self.fg_sizes,
                 quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkvbfg_proj",
+                prefix=f"{prefix}.fused_bfg_a_proj",
             )
-            self.split_sizes = [x // self.tp_size for x in self.qkvb_sizes] + [
+            self.split_sizes_bfg = [self.num_heads // self.tp_size] + [
                 2 * self.head_dim
             ]
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
                 2, self.head_dim, projection_size, dtype=config.dtype
             )
         else:
-            self.q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
-            )
-            self.k_proj = ColumnParallelLinear(
-                self.hidden_size,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.k_proj",
-            )
-            self.v_proj = ColumnParallelLinear(
-                self.hidden_size,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.v_proj",
-            )
-
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -356,30 +357,37 @@ class KimiDeltaAttention(nn.Module):
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
-        q_proj_states = self.q_proj(hidden_states)[0]
-        k_proj_states = self.k_proj(hidden_states)[0]
-        v_proj_states = self.v_proj(hidden_states)[0]
+        # Compute fused qkv projection
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        # Compute beta, forget_gate, and g_proj_states
         beta = self.b_proj(hidden_states)[0]
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+
         return (
-            (q_proj_states, k_proj_states, v_proj_states),
+            qkv,  # Return as single tensor instead of tuple
             beta,
             forget_gate,
             g_proj_states,
         )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        fused_states = self.fused_qkvbfg_proj(hidden_states)
-        q_proj_states, k_proj_states, v_proj_states, beta, fg_a_states = torch.split(
-            fused_states, self.split_sizes, dim=-1
+        # Compute fused qkv projection
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        # Compute fused bfg projections
+        fused_bfg_states = self.fused_bfg_a_proj(hidden_states)
+        beta, fg_a_states = torch.split(
+            fused_bfg_states, self.split_sizes_bfg, dim=-1
         )
         # use batch matmul to calculate forget_gate and g_proj_states
         forget_gate, g_proj_states = self.fused_fg_b_proj(
             fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         )
+
         return (
-            (q_proj_states, k_proj_states, v_proj_states),
+            qkv,  # Return as single tensor instead of tuple
             beta,
             forget_gate,
             g_proj_states,
@@ -392,7 +400,7 @@ class KimiDeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> None:
-        if self.do_fuse_qkvbfg:
+        if self.do_fuse_bfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
             )
@@ -682,16 +690,18 @@ class KimiLinearForCausalLM(nn.Module):
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
-            (".fused_qkvbfg_proj", ".q_proj", 0),
-            (".fused_qkvbfg_proj", ".k_proj", 1),
-            (".fused_qkvbfg_proj", ".v_proj", 2),
-            (".fused_qkvbfg_proj", ".b_proj", 3),
-            (".fused_qkvbfg_proj", ".f_a_proj", 4),
-            (".fused_qkvbfg_proj", ".g_a_proj", 5),
+            # Map separate qkv weights to fused qkv_proj
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            # Map bfg weights to fused projections
+            (".fused_bfg_a_proj", ".b_proj", 0),
+            (".fused_bfg_a_proj", ".f_a_proj", 1),
+            (".fused_bfg_a_proj", ".g_a_proj", 2),
             (".fused_fg_b_proj", ".f_b_proj", 0),
             (".fused_fg_b_proj", ".g_b_proj", 1),
         ]
-        fuse_qkvbfg_keys = {x[1] for x in stacked_params_mapping[2:]}
+        fuse_bfg_keys = {x[1] for x in stacked_params_mapping[5:]}
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -726,10 +736,18 @@ class KimiLinearForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                if weight_name in fuse_qkvbfg_keys:
+                # Check if this is a bfg fusion weight
+                if weight_name in fuse_bfg_keys:
                     layer_id = int(name.split(".")[2])
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    # Only load fused weights if fusion is enabled
+                    if hasattr(layer, "do_fuse_bfg") and not layer.do_fuse_bfg:
+                        continue
+                # qkv_proj weights are always loaded (fusion is always used for qkv)
+                if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
+                    # Check if this is a kda layer
+                    layer_id = int(name.split(".")[2])
+                    if not self.config.is_kda_layer(layer_id):
                         continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.

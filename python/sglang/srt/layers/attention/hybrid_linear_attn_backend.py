@@ -659,13 +659,18 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
     def forward_decode(
         self,
         layer: RadixLinearAttention,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,
     ):
-        assert isinstance(mixed_qkv, Tuple)
-        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
+        # Split concatenated qkv tensor into q, k, v
+        q_proj_states, k_proj_states, v_proj_states = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+
         (q_conv_weights, k_conv_weights, v_conv_weights) = layer.conv_weights
         (q_conv_bias, k_conv_bias, v_conv_bias) = layer.bias
 
@@ -729,7 +734,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
@@ -738,8 +743,13 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             causal_conv1d_fn,
         )
 
-        assert isinstance(mixed_qkv, Tuple)
-        (q_proj_states, k_proj_states, v_proj_states) = mixed_qkv
+        # Split concatenated qkv tensor into q, k, v
+        q_proj_states, k_proj_states, v_proj_states = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+
         (q_conv_weights, k_conv_weights, v_conv_weights) = layer.conv_weights
         (q_conv_bias, k_conv_bias, v_conv_bias) = layer.bias
 
@@ -841,7 +851,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
@@ -851,8 +861,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-
-        assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -899,12 +907,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
         **kwargs,  # Unused, for compatibility with HybridLinearAttnBackend
     ):
-        assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
@@ -1571,7 +1578,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1603,7 +1610,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         q: Optional[torch.Tensor] = None,  # For full attention
         k: Optional[torch.Tensor] = None,  # For full attention
         v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
         a: Optional[torch.Tensor] = None,  # For GDN linear attention
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
@@ -1635,11 +1642,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         layer: RadixAttention = None,
         forward_batch: ForwardBatch = None,
         save_kv_cache: bool = True,
-        mixed_qkv: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-        ] = None,  # For GDN linear attention
-        a: Optional[torch.Tensor] = None,  # For GDN linear attention
-        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
@@ -1647,15 +1652,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                # KDA:
-                if isinstance(mixed_qkv, tuple):
-                    return mixed_qkv[0].new_empty(
-                        mixed_qkv[0].shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
-                else:  # GDN:
-                    return mixed_qkv.new_empty(
-                        mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
-                    )
+                # Linear attention (both KDA and GDN use tensor format)
+                return mixed_qkv.new_empty(
+                    mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
+                )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
