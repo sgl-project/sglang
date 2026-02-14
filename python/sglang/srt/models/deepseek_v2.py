@@ -1678,7 +1678,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q_nope_out,
                 )
             else:
-                if self.w_kc.dtype == torch.float8_e4m3fn:
+                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
 
                     q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=q_nope,
