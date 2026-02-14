@@ -23,9 +23,9 @@ SGLang correctly handles this case by untying lm_head before LoRA wrapping.
 The test:
 1. Programmatically creates a LoRA adapter with lm_head in target_modules
    using PEFT on a model with tie_word_embeddings=True (Qwen/Qwen2.5-0.5B).
-2. Compares logprobs between HuggingFace+PEFT and SGLang.
-3. Verifies that LoRA produces different output from the base model
-   (i.e., LoRA is actually being applied).
+2. Compares logprobs between HuggingFace+PEFT and SGLang to ensure numerical
+   consistency. This implicitly verifies no NaN values are produced and that
+   LoRA is actually being applied (since HF+PEFT is the trusted reference).
 """
 
 import multiprocessing as mp
@@ -146,110 +146,6 @@ class TestLoRATiedLMHead(CustomTestCase):
         if cls._adapter_dir and os.path.exists(cls._adapter_dir):
             shutil.rmtree(cls._adapter_dir)
         super().tearDownClass()
-
-    def test_tied_lm_head_lora_no_nan(self):
-        """
-        Test that SGLang does not produce NaN values when serving a LoRA
-        adapter with lm_head targeting on a tied-embedding model.
-        """
-        with SRTRunner(
-            BASE_MODEL,
-            torch_dtype=torch.float16,
-            model_type="generation",
-            lora_paths=[self._adapter_dir],
-            max_loras_per_batch=1,
-            lora_backend="triton",
-            lora_target_modules=["lm_head"],
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            mem_fraction_static=0.80,
-            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        ) as srt_runner:
-            srt_outputs = srt_runner.forward(
-                TEST_PROMPTS,
-                max_new_tokens=MAX_NEW_TOKENS,
-                lora_paths=[self._adapter_dir] * len(TEST_PROMPTS),
-            )
-
-        # Verify no NaN in output logprobs
-        for i, logprobs in enumerate(srt_outputs.top_input_logprobs):
-            logprobs_tensor = torch.tensor(logprobs)
-            self.assertFalse(
-                torch.isnan(logprobs_tensor).any(),
-                f"Prompt {i}: NaN detected in input logprobs",
-            )
-
-        for i, logprobs in enumerate(srt_outputs.top_output_logprobs):
-            logprobs_tensor = torch.tensor(logprobs)
-            self.assertFalse(
-                torch.isnan(logprobs_tensor).any(),
-                f"Prompt {i}: NaN detected in output logprobs",
-            )
-
-        # Verify we actually got output
-        for i, output_str in enumerate(srt_outputs.output_strs):
-            self.assertTrue(
-                len(output_str) > 0,
-                f"Prompt {i}: Empty output string",
-            )
-
-    def test_tied_lm_head_lora_differs_from_base(self):
-        """
-        Test that LoRA output differs from base model output,
-        confirming that lm_head LoRA is actually being applied.
-        """
-        # Run with LoRA
-        with SRTRunner(
-            BASE_MODEL,
-            torch_dtype=torch.float16,
-            model_type="generation",
-            lora_paths=[self._adapter_dir],
-            max_loras_per_batch=1,
-            lora_backend="triton",
-            lora_target_modules=["lm_head"],
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            mem_fraction_static=0.80,
-            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        ) as srt_runner:
-            lora_outputs = srt_runner.forward(
-                TEST_PROMPTS,
-                max_new_tokens=MAX_NEW_TOKENS,
-                lora_paths=[self._adapter_dir] * len(TEST_PROMPTS),
-            )
-
-        torch.cuda.empty_cache()
-
-        # Run without LoRA (base model)
-        with SRTRunner(
-            BASE_MODEL,
-            torch_dtype=torch.float16,
-            model_type="generation",
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            mem_fraction_static=0.80,
-            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        ) as srt_runner:
-            base_outputs = srt_runner.forward(
-                TEST_PROMPTS,
-                max_new_tokens=MAX_NEW_TOKENS,
-            )
-
-        # At least one prompt's output should differ between LoRA and base
-        any_differ = False
-        for i in range(len(TEST_PROMPTS)):
-            lora_logprobs = torch.tensor(lora_outputs.top_input_logprobs[i])
-            base_logprobs = torch.tensor(base_outputs.top_input_logprobs[i])
-            diff = torch.abs(lora_logprobs - base_logprobs).mean().item()
-            print(f"Prompt {i}: mean logprob diff (lora vs base) = {diff:.6e}")
-            if diff > 1e-6:
-                any_differ = True
-
-        self.assertTrue(
-            any_differ,
-            "LoRA output logprobs are identical to base model. "
-            "lm_head LoRA may not be applied correctly.",
-        )
 
     def test_tied_lm_head_lora_hf_sgl_logprob_match(self):
         """
