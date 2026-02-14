@@ -21,11 +21,6 @@ MASK_ID = VOCAB_SIZE - 1
 THRESHOLD = 0.95
 
 
-# ============================================================================
-# Lightweight mocks (avoid importing heavy sglang server modules)
-# ============================================================================
-
-
 @dataclass
 class MockLogitsProcessorOutput:
     next_token_logits: Optional[torch.Tensor] = None
@@ -46,7 +41,6 @@ class MockForwardBatch:
 
 
 class MockModelRunner:
-    """Mock model runner that returns deterministic random logits."""
 
     def __init__(self, vocab_size: int, seed: int = 42):
         self.vocab_size = vocab_size
@@ -68,11 +62,6 @@ class MockModelRunner:
         )
         logits_output = MockLogitsProcessorOutput(full_logits=logits)
         return MockModelRunnerOutput(logits_output=logits_output, can_run_graph=True)
-
-
-# ============================================================================
-# Loop helpers (mirror LowConfidence.run logic)
-# ============================================================================
 
 
 def _run_loop_pytorch(
@@ -161,21 +150,11 @@ def _run_loop_triton(
     return input_ids.clone(), start_list
 
 
-# ============================================================================
-# Test class
-# ============================================================================
-
-
 class TestDllmTritonKernel(CustomTestCase):
-    """Correctness tests for the dLLM fused Triton post-process kernel."""
 
     @classmethod
     def setUpClass(cls):
         cls.device = torch.device("cuda")
-
-    # ------------------------------------------------------------------
-    # Kernel-level tests
-    # ------------------------------------------------------------------
 
     def test_kernel_all_masked(self):
         """All positions masked — kernel must fill every slot."""
@@ -247,10 +226,6 @@ class TestDllmTritonKernel(CustomTestCase):
         dllm_post_process_fused(logits, ids_tr, MASK_ID, THRESHOLD)
 
         self.assertTrue(torch.equal(out_pt, ids_tr))
-
-    # ------------------------------------------------------------------
-    # Full-loop tests (mirror LowConfidence.run)
-    # ------------------------------------------------------------------
 
     def test_loop_single_batch(self):
         """Single-batch loop: Triton and PyTorch must converge identically."""

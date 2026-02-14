@@ -68,8 +68,6 @@ class LowConfidence(DllmAlgorithm):
                 ]
 
                 if self.use_triton_post_process:
-                    # Fused Triton kernel: softmax + argmax + threshold + fallback
-                    # all on-device, no GPU-CPU sync per block
                     dllm_post_process_fused(
                         curr_logits,
                         block_input_ids,
@@ -77,7 +75,7 @@ class LowConfidence(DllmAlgorithm):
                         self.threshold,
                     )
                 else:
-                    # Original PyTorch implementation
+                    # PyTorch fallback
                     block_mask_index = block_input_ids == self.mask_id
                     if torch.sum(block_mask_index).item() == 0:
                         continue

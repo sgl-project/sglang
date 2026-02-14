@@ -1,25 +1,4 @@
-"""
-Triton kernels for dLLM post-processing optimization.
-
-This module provides fused kernels to optimize the dLLM decoding loop, replacing
-multiple PyTorch operations (softmax, argmax, gather, where, topk, index_update)
-with a single kernel launch.
-
-Key optimizations:
-1. Fuse softmax + argmax + gather into a single pass using online softmax
-2. Eliminate multiple kernel launches and memory round-trips
-3. Reduce register pressure for better occupancy
-4. Skip computation for non-masked positions
-5. Fallback logic (when no token exceeds threshold) handled on-device
-   via atomic transfer counter + lightweight fallback kernel,
-   avoiding GPU-CPU sync in the wrapper
-
-Performance (NVIDIA GeForce RTX 5070 Laptop GPU, block_size=32, vocab_size=128000,
-           PyTorch 2.9.1+cu130, Triton 3.6.0):
-- PyTorch reference: ~1.17 ms
-- Triton fused:      ~0.13 ms
-- Speedup:           ~8.8x
-"""
+"""Fused Triton kernels for dLLM post-processing."""
 
 from typing import Tuple
 
@@ -27,36 +6,24 @@ import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------------------------
-# Triton kernels
-# ---------------------------------------------------------------------------
-
 
 @triton.jit
 def _dllm_post_process_kernel(
-    logits_ptr,  # [block_size, vocab_size], input logits
-    input_ids_ptr,  # [block_size], input/output token ids
-    transfer_out_ptr,  # [block_size], output: transfer flags
-    confidence_out_ptr,  # [block_size], output: confidence scores
-    argmax_out_ptr,  # [block_size], output: argmax token ids
-    num_transfers_ptr,  # [1], output: atomic counter for number of transfers
-    mask_id: tl.constexpr,  # mask token id
-    threshold: tl.constexpr,  # confidence threshold for transfer
-    block_size,  # number of positions in the block
-    vocab_size,  # vocabulary size
-    logits_stride,  # stride for logits rows
-    BLOCK_V: tl.constexpr,  # tile size for vocab dimension
+    logits_ptr,
+    input_ids_ptr,
+    transfer_out_ptr,
+    confidence_out_ptr,
+    argmax_out_ptr,
+    num_transfers_ptr,
+    mask_id: tl.constexpr,
+    threshold: tl.constexpr,
+    block_size,
+    vocab_size,
+    logits_stride,
+    BLOCK_V: tl.constexpr,
 ):
-    """
-    Fused kernel for dLLM post-processing.
-
-    For each position (row):
-    1. If not masked: skip computation, output original token
-    2. If masked:
-       a. Compute argmax and softmax probability using online algorithm
-       b. Compare probability with threshold
-       c. Update input_ids if above threshold
-
+    """Fused softmax + argmax + threshold transfer for each masked position.
+    Unmasked positions are skipped. Uses online softmax for numerical stability.
     """
     row_idx = tl.program_id(0)
 
@@ -65,18 +32,18 @@ def _dllm_post_process_kernel(
 
     row_start = row_idx * logits_stride
 
-    # Load current input_id for this position
+    # Load current input_id
     input_id = tl.load(input_ids_ptr + row_idx)
     is_masked = input_id == mask_id
 
-    # Fast path: if not masked, skip expensive softmax computation
+    # Skip non-masked positions
     if not is_masked:
         tl.store(transfer_out_ptr + row_idx, 0)
         tl.store(confidence_out_ptr + row_idx, -float("inf"))
         tl.store(argmax_out_ptr + row_idx, input_id)
         return
 
-    # Online algorithm for stable softmax + argmax in single pass
+    # Online softmax + argmax in single pass
     max_val = -float("inf")
     exp_sum = 0.0
     argmax_idx = 0
@@ -124,10 +91,8 @@ def _dllm_fallback_kernel(
     num_transfers_ptr,
     block_size,
 ):
-    """
-    Fallback kernel: if the main kernel produced zero transfers,
-    find the position with maximum confidence and force-accept it.
-    Single-thread kernel (grid=1).
+    """If no transfers occurred, force-accept the highest-confidence position.
+    Single-thread kernel (grid=1), exits immediately when num_transfers > 0.
     """
     num_transfers = tl.load(num_transfers_ptr)
     if num_transfers > 0:
@@ -163,11 +128,6 @@ _dllm_post_process_kernel_autotuned = triton.autotune(
 )(_dllm_post_process_kernel)
 
 
-# ---------------------------------------------------------------------------
-# Python wrapper
-# ---------------------------------------------------------------------------
-
-
 def dllm_post_process_fused(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -175,24 +135,9 @@ def dllm_post_process_fused(
     threshold: float,
     autotune: bool = True,
 ) -> None:
-    """
-    Fused dLLM post-processing using optimized Triton kernel.
-
-    Modifies input_ids **in-place**: for each masked position, if the model's
-    argmax probability exceeds *threshold* the mask is replaced with the
-    predicted token.  When no position exceeds the threshold a fallback
-    kernel forces the single highest-confidence position to be accepted,
-    guaranteeing progress.
-
-    The entire operation (softmax, argmax, threshold, fallback) runs on-device
-    with no GPU-CPU synchronisation.
-
-    Args:
-        logits: Model output logits [block_size, vocab_size]
-        input_ids: Current token ids [block_size], modified in-place
-        mask_id: The mask token id
-        threshold: Confidence threshold for transfer
-        autotune: Whether to use autotuned kernel (default: True)
+    """Fused dLLM post-processing. Modifies input_ids in-place: masked positions
+    whose argmax probability exceeds *threshold* are replaced with the predicted
+    token. A fallback kernel guarantees at least one transfer per call.
     """
     block_size, vocab_size = logits.shape
     device = logits.device
@@ -242,8 +187,7 @@ def dllm_post_process_fused(
             num_warps=4,
         )
 
-    # Launch fallback kernel unconditionally -- it exits immediately
-    # if num_transfers > 0, so the cost is negligible.
+    # Fallback: exits immediately if num_transfers > 0
     _dllm_fallback_kernel[(1,)](
         input_ids,
         confidence,
@@ -254,7 +198,6 @@ def dllm_post_process_fused(
     )
 
 
-# Alias for backward compatibility
 dllm_post_process = dllm_post_process_fused
 
 
@@ -264,11 +207,7 @@ def dllm_post_process_pytorch(
     mask_id: int,
     threshold: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """
-    Reference PyTorch implementation for correctness verification and fallback.
-
-    This is the original implementation that the Triton kernel replaces.
-    """
+    """Reference PyTorch implementation for correctness verification."""
     import torch.nn.functional as F
 
     block_mask_index = input_ids == mask_id
