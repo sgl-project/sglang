@@ -53,8 +53,6 @@ void extend_attention_kernel_impl(
     bool is_cross_attn,
     bool has_encoder_lens,
     bool has_sink) {
-  using Vec = at::vec::Vectorized<float>;
-
   // strides
   const int o_strideM = num_heads * head_size_v;
   const int o_strideH = head_size_v;
@@ -74,22 +72,21 @@ void extend_attention_kernel_impl(
     data_index_init(begin, bs, batches, head_id, num_heads, mb, MB);
 
     int tid = at::get_thread_num();
-    // s_i and s_delta: [BLOCK_M, BLOCK_N]
+    // s_i: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    float* __restrict__ s_delta = s_i;
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
-    // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+    // s_delta: [BLOCK_M, BLOCK_N]
+    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
 
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
+    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(s_delta + BLOCK_M * BLOCK_N);
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
-    fill_stub(s_delta2, 0.f, BLOCK_M * BLOCK_N);
+    fill_stub(s_delta, 0.f, BLOCK_M * BLOCK_N);
 
     alignas(64) float s_prime[BLOCK_M];
     alignas(64) float m_prime[BLOCK_M];
@@ -159,55 +156,18 @@ void extend_attention_kernel_impl(
             /* B     */ Btmp,
             /* C     */ s_i);
 
-        if (sliding_window_size > 0) {
-          const Vec scale_vec = Vec(sm_scale);
-          for (int row = 0; row < m_size; ++row) {
+        for (int row = 0; row < m_size; ++row) {
+          if (sliding_window_size > 0) {
             int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
             if (last_col >= n + n_size) {
               continue;
             }
             fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
-            // s_i <- s_i * scale
-            at::vec::map<float>(
-                [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-            // m_i: max value per row
-            float m_i = at::vec::reduce_all<float>(
-                [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-            m_i = std::max(m_i, m_prime[row]);
-
-            // m_delta <- exp(m' - m_i)
-            float m_delta = std::exp(m_prime[row] - m_i);
-
-            // s_delta <- exp(s_i - m_i)
-            at::vec::map<float>(
-                [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); },
-                s_delta + row * BLOCK_N,
-                s_i + row * BLOCK_N,
-                n_size);
-
-            // s' <- s' * m_delta + sum(s_delta)
-            s_prime[row] *= m_delta;
-            s_prime[row] +=
-                at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-            m_prime[row] = m_i;
-
-            // v' <- v' * m_delta
-            at::vec::map<float>(
-                [m_delta](Vec x) { return x * Vec(m_delta); },
-                v_prime + row * head_size_v,
-                v_prime + row * head_size_v,
-                head_size_v);
-
-            // pad s_delta with 0 first and then convert to scalar_t
-            fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-            copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
           }
-        } else {
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-              s_i, s_i, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
         }
+
         // get value and pack
         pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
@@ -227,7 +187,7 @@ void extend_attention_kernel_impl(
             /* ldb   */ head_size_v,
             /* ldc   */ head_size_v,
             /* add_C */ true,
-            /* A     */ s_delta2,
+            /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
       }
@@ -272,57 +232,16 @@ void extend_attention_kernel_impl(
             }
           }
 
-          if (sliding_window_size > 0) {
-            const Vec scale_vec = Vec(sm_scale);
-            for (int row = 0; row < m_size; ++row) {
-              if (row + m + 1 >= n + sliding_window_size - 1 && row + m + 1 < n + sliding_window_size + n_size) {
-                fill_stub(
-                    s_i + row * BLOCK_N,
-                    -std::numeric_limits<float>::infinity(),
-                    row + m - n - sliding_window_size + 1);
-              } else if (row + m + 1 >= n + sliding_window_size) {
-                continue;
-              }
-              // s_i <- s_i * scale
-              at::vec::map<float>(
-                  [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
-
-              // m_i: max value per row
-              float m_i = at::vec::reduce_all<float>(
-                  [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-              m_i = std::max(m_i, m_prime[row]);
-
-              // m_delta <- exp(m' - m_i)
-              float m_delta = std::exp(m_prime[row] - m_i);
-
-              // s_delta <- exp(s_i - m_i)
-              at::vec::map<float>(
-                  [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); },
-                  s_delta + row * BLOCK_N,
-                  s_i + row * BLOCK_N,
-                  n_size);
-
-              // s' <- s' * m_delta + sum(s_delta)
-              s_prime[row] *= m_delta;
-              s_prime[row] +=
-                  at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
-
-              m_prime[row] = m_i;
-
-              // v' <- v' * m_delta
-              at::vec::map<float>(
-                  [m_delta](Vec x) { return x * Vec(m_delta); },
-                  v_prime + row * head_size_v,
-                  v_prime + row * head_size_v,
-                  head_size_v);
-
-              // pad s_delta with 0 first and then convert to scalar_t
-              fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-              copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
+          for (int row = 0; row < m_size; ++row) {
+            if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size - 1 &&
+                row + m + 1 < n + sliding_window_size + n_size) {
+              fill_stub(
+                  s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), row + m - n - sliding_window_size + 1);
+            } else if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size) {
+              continue;
             }
-          } else {
             flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-                s_i, s_i, s_delta2, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+                s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
           }
 
           // get value and pack
@@ -343,7 +262,7 @@ void extend_attention_kernel_impl(
               /* ldb   */ head_size_v,
               /* ldc   */ head_size_v,
               /* add_C */ true,
-              /* A     */ s_delta2,
+              /* A     */ s_delta,
               /* B     */ Btmp,
               /* C     */ v_prime);
         }  // loop with seq_len_extend
