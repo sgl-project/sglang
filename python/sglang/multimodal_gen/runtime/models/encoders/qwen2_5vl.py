@@ -798,6 +798,8 @@ class Qwen2_5_VLModel(nn.Module):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if not isinstance(image_embeds, torch.Tensor):
+            image_embeds = image_embeds.last_hidden_state
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()
