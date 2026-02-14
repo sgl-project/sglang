@@ -26,12 +26,48 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _extract_url_data(mm_data) -> List[str]:
+    """Extract URLs from multimodal data, handling various input formats.
+
+    Follows the pattern from the video/audio EPD PR (#17824).
+    The native /generate API passes raw strings or dicts from JSON,
+    while the OpenAI-compatible API creates ImageData objects.
+
+    Supports per-item:
+    - str: Direct URL or base64 data URI
+    - dict: {"url": "..."} or {"image_url": "..."} format from JSON
+    - ImageData: Object with .url attribute (from OpenAI-compatible API)
+    """
+    if mm_data is None:
+        return []
+    if not isinstance(mm_data, list):
+        mm_data = [mm_data]
+
+    urls = []
+    for item in mm_data:
+        if isinstance(item, str):
+            urls.append(item)
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("image_url")
+            if not url:
+                raise ValueError(
+                    f"Dict image data must contain 'url' or 'image_url' key: {item}"
+                )
+            urls.append(url)
+        elif isinstance(item, ImageData):
+            urls.append(item.url)
+        else:
+            raise ValueError(f"Unsupported image data type: {type(item)}")
+    return urls
 
 
 class EmbeddingData:
@@ -593,10 +629,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        if type(obj.image_data) != list:
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        image_urls = _extract_url_data(obj.image_data)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
         if image_urls and len(image_urls) > 0:
@@ -628,10 +661,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if type(img_data) != list:
-                img_data = [img_data.url]
-            else:
-                img_data = [img.url for img in img_data]
+            img_data = _extract_url_data(img_data)
             asyncio.create_task(
                 self.encode(req_id, img_data, embedding_port, "encode", "send")
             )
