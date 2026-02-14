@@ -1,10 +1,11 @@
 import unittest
 
-from sglang.test.ascend.performance.test_ascend_performance_utils import (
-    TestAscendMultiNodePdSepTestCaseBase,
+from sglang.test.ascend.e2e.test_ascend_performance_utils import (
+    TestAscendPerfMultiNodePdSepTestCaseBase,
     DEEPSEEK_R1_W4A8_PER_CHANNEL_MODEL_PATH,
-    NIC_NAME, ROUND_ROBIN
+    ROUND_ROBIN
 )
+from sglang.test.ascend.e2e.test_ascend_multi_node_utils import NIC_NAME
 
 MODEL_CONFIG = {
     "model_path": DEEPSEEK_R1_W4A8_PER_CHANNEL_MODEL_PATH,
@@ -90,7 +91,7 @@ MODEL_CONFIG = {
 }
 
 
-class TestDeepSeekR1W4A8(TestAscendMultiNodePdSepTestCaseBase):
+class TestDeepSeekR1W4A8(TestAscendPerfMultiNodePdSepTestCaseBase):
     model_config = MODEL_CONFIG
     dataset_name = "random"
     max_concurrency = 384

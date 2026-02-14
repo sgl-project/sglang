@@ -85,11 +85,13 @@ jobs:
           # export SGLANG_SET_CPU_AFFINITY=1
 
           install_sglang_from_source=${{ inputs.install_sglang_from_source }}
-          if [ "${install_sglang_from_source}" = "true" ];then
+          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
             echo "Install sglang from source"
             commit_id=${{ github.sha }}
             echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
             export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
+          else
+            echo "Use sglang from image: ${{ inputs.image }}"
           fi
 
           # Set environment of cann

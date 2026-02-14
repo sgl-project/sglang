@@ -1,0 +1,199 @@
+name: 'e2e nightly test pd-separation (Ascend NPU)'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: false
+        type: string
+        default: linux-aarch64-a3-0
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      prefill_size:
+        required: false
+        type: number
+        default: 0
+        description: number of prefill nodes for pd-separation
+      decode_size:
+        required: false
+        type: number
+        default: 0
+        description: number of decode nodes for pd-separation
+      router_size:
+        required: false
+        type: number
+        default: 0
+        description: number of router nodes for pd-separation
+      node_size:
+        required: false
+        type: number
+        default: 0
+        description: number of nodes for pd-mix
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+      image:
+        required: false
+        type: string
+        description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:v0.5.6-ascend-a3"
+      install_sglang_from_source:
+        required: false
+        type: boolean
+        default: true
+        description: use sglang from source code or from docker image
+      prefill_decode_deployment:
+        required: true
+        type: string
+        description: "The deployment of prefill and decode nodes. ['separation', 'mix']"
+
+concurrency:
+  group: ascend-nightly-multi-node-pd-separation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+      env:
+        KUBECONFIG: /data/ascend-ci-share-pkking-sglang/.cache/kb.yaml
+        KUBECTL: /data/ascend-ci-share-pkking-sglang/.cache/kubectl
+        NAMESPACE: sgl-project
+        KUBE_JOB_TYPE: multi-pd-separation
+        KUBE_JOB_NAME: ascend-sglang-perf-test
+        SGLANG_IS_IN_CI: true
+        ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
+        SGLANG_USE_MODELSCOPE: true
+        HF_ENDPOINT: https://hf-mirror.com
+    steps:
+      - name: Install system denpendencies
+        run: |
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2-cli
+
+      - name: Install kubernetes
+        run: |
+          # Install kubernetes
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+          cp $KUBECTL /usr/local/sbin/
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare code for testing
+        run: |
+          # copy source code to shared-disk
+          current_path=$(pwd)
+          target_path=/root/.cache/tests/sglang
+          rm -rf ${target_path}
+          mkdir -p ${target_path}
+          cp -r ${current_path}/* ${target_path}/
+
+      - name: Clear resources
+        run: |
+          cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+
+          pod_name_prefix="${KUBE_JOB_NAME}-"
+          echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
+          while true; do
+            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds..."
+              sleep 30
+              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+            else
+              echo "No sglang job exist, start test case..."
+              break
+            fi
+          done
+
+      - name: Run test
+        timeout-minutes: 300
+        run: |
+          # sglang_source_relative_path is shared-disk path
+          sglang_source_relative_path=tests/sglang
+          sglang_source_path=/root/.cache/${sglang_source_relative_path}
+          echo "Source code path: ${sglang_source_path}"
+
+          # mkdir for output data
+          current_date=$(date +%Y%m%d)
+          test_data_output_path=/root/.cache/tests/output/perf/${current_date}
+          mkdir -p ${test_data_output_path}
+
+          # make a metrics data file
+          test_case="${{ inputs.test_case }}"
+          tc_name=${test_case##*/}
+          tc_name=${tc_name%.*}
+          metrics_data_file=${test_data_output_path}/${tc_name}.txt
+          echo "Metrics file: ${metrics_data_file}"
+
+          cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+          CMD=(
+            python3 -u run_ascend_ci.py
+            --env ci
+            --image ${{ inputs.image }}
+            --sglang-source-relative-path ${sglang_source_relative_path}
+            --metrics-data-file ${metrics_data_file}
+            --test-case ${test_case}
+            --kube-name-space ${NAMESPACE}
+            --kube-job-type ${KUBE_JOB_TYPE}
+            --kube-job-name-prefix ${KUBE_JOB_NAME}
+          )
+
+          prefill_decode_deployment="${{ inputs.prefill_decode_deployment }}"
+          if [ "$prefill_decode_deployment" = "separation" ];then
+            CMD+=(
+              --prefill-size ${{ inputs.prefill_size }}
+              --decode-size ${{ inputs.decode_size }}
+              --router-size ${{ inputs.router_size }}
+            )
+          elif [ "$prefill_decode_deployment" = "mix" ];then
+            CMD+=(
+              --node-size ${{ inputs.node_size }}
+            )
+          else
+            echo "Unsupported deployment type: ${prefill_decode_deployment}"
+            exit 1
+          fi
+
+          if [ "$SGLANG_IS_IN_CI" = "true" ] || [ "$SGLANG_IS_IN_CI" = "True" ];then
+            echo "Run test in ci."
+            CMD+=(--sglang-is-in-ci)
+          fi
+
+          install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
+          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
+            echo "Install sglang from source."
+            CMD+=(--install-sglang-from-source)
+            commit_id=${{ github.sha }}
+            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+          else
+            echo "Use sglang from image: ${{ inputs.image }}"
+          fi
+
+          echo "Run command: ${CMD[*]}"
+          eval "${CMD[*]}"
+
+      - name: Post process
+        if: always()
+        run: |
+          cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
+          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+
+          pod_name_prefix="${KUBE_JOB_NAME}-"
+          echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
+          while true; do
+            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds..."
+              sleep 30
+              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+            else
+              echo "No sglang job exist, start test case..."
+              break
+            fi
+          done

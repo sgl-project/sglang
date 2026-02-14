@@ -36,6 +36,7 @@ export SGLANG_TEST_MAX_RETRY=0
 export SGLANG_SET_CPU_AFFINITY=1
 ASCEND_RT_VISIBLE_DEVICES=$(echo $ASCEND_VISIBLE_DEVICES | tr ',' '\n' | sort -n | tr '\n' ',')
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES%,}
+echo "ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
 export ASCEND_VISIBLE_DEVICES=""
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
 export HCCL_NPU_SOCKET_PORT_RANGE="auto"
@@ -47,7 +48,7 @@ unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
 # use sglang from source or from image
-if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ];then
+if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ] || [ "${INSTALL_SGLANG_FROM_SOURCE}" = "True" ];then
     echo "Use sglang from source: ${sglang_source_path}"
     export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
 else
@@ -67,8 +68,8 @@ echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
 tc_name=${tc_name%.*}
 current_date=$(date +%Y%m%d)
-log_path="/root/.cache/tests/debug/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
-if [ "${SGLANG_IS_IN_CI}" = "true" ];then
+log_path="/root/sglang/debug/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
     log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
 fi
 rm -rf ${log_path}
@@ -80,11 +81,12 @@ echo "Finished test case ${test_case}"
 source_plog_path="/root/ascend/log/debug/plog"
 if [ -d "$source_plog_path" ];then
     echo "Plog files found. Begin to backup them."
-    target_plog_path="/root/.cache/tests/debug/logs/plog/${tc_name}/${HOSTNAME}"
-    if [ "${SGLANG_IS_IN_CI}" = "true" ];then
+    target_plog_path="/root/sglang/debug/logs/plog/${tc_name}/${HOSTNAME}"
+    if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
         target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
     fi
     rm -rf ${target_plog_path}
     mkdir -p ${target_plog_path}
     cp ${source_plog_path}/* ${target_plog_path}
 fi
+

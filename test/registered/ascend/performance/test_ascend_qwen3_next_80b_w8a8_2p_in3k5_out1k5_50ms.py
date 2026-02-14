@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.ascend.performance.test_ascend_performance_utils import (
-    TestPerformanceTestCaseBase,
-    NIC_NAME,
+from sglang.test.ascend.e2e.test_ascend_performance_utils import (
+    TestAscendPerformanceTestCaseBase,
     QWEN3_NEXT_80B_A3B_W8A8_MODEL_PATH
 )
+from sglang.test.ascend.e2e.test_ascend_multi_node_utils import NIC_NAME
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1800, suite="nightly-4-npu-a3", nightly=True)
@@ -38,7 +38,7 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     "--chunked-prefill-size", -1,
 ]
 
-class TestQwen3Next80BA3B(TestPerformanceTestCaseBase):
+class TestQwen3Next80BA3B(TestAscendPerformanceTestCaseBase):
     model = QWEN3_NEXT_80B_A3B_W8A8_MODEL_PATH
     other_args = QWEN3_NEXT_80B_A3B_OTHER_ARGS
     envs = QWEN3_NEXT_80B_A3B_ENVS

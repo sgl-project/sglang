@@ -1,76 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rings-config-ascend-sglang-test
-  namespace: {{ name_space }}
-  labels:
-    ring-controller.atlas: ascend-1980
-data:
-  hccl.json: |
-    {
-        "status":"initializing"
-    }
-
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
   name: {{ kube_config_map }}
   namespace: {{ name_space }}
 data: {}
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ascend-sglang-configmap-access
-  namespace: {{ name_space }}
-rules:
-- apiGroups: [""]
-  resources: ["configmaps"]
-  resourceNames: ["{{ kube_config_map }}"]
-  verbs: ["get", "update", "patch"]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ascend-sglang-configmap-binding
-  namespace: {{ name_space }}
-subjects:
-- kind: ServiceAccount
-  name: default
-  namespace: {{ name_space }}
-roleRef:
-  kind: Role
-  name: ascend-sglang-configmap-access
-  apiGroup: rbac.authorization.k8s.io
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ascend-sglang-pod-access
-  namespace: {{ name_space }}
-rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list"]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ascend-sglang-pod-binding
-  namespace: {{ name_space }}
-subjects:
-- kind: ServiceAccount
-  name: default
-  namespace: {{ name_space }}
-roleRef:
-  kind: Role
-  name: ascend-sglang-pod-access
-  apiGroup: rbac.authorization.k8s.io
 
 ---
 apiVersion: batch.volcano.sh/v1alpha1
@@ -127,46 +60,46 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/sglang/python/sglang/test/ascend/performance/run_ascend_testcase.sh {{ test_case }}
+               bash /root/sglang/python/sglang/test/ascend/e2e/run_ascend_testcase.sh {{ test_case }}
           resources:
             requests:
               huawei.com/ascend-1980: 16
             limits:
               huawei.com/ascend-1980: 16
           volumeMounts:
-          - name: ascend-910-config
-            mountPath: /user/serverid/devindex/config
           - name: ascend-driver
             mountPath: /usr/local/Ascend/driver
           - name: localtime
             mountPath: /etc/localtime
-          - name: kube-config
-            mountPath: /root/script
           - name: share
-            mountPath: /data
+            mountPath: /data/ascend-ci-share-pkking-sglang
           - name: share
             mountPath: /root/.cache
           - name: share
             mountPath: /root/sglang
-            subPath: {{ sglang_source_path }}
+            subPath: {{ sglang_source_relative_path }}
         volumes:
-        - name: kube-config
-          hostPath:
-            path: /root/script
         - name: share
           persistentVolumeClaim:
             claimName: sglang-guiyang004
-        - name: ascend-910-config
-          configMap:
-            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver
         - name: localtime
           hostPath:
             path: /etc/localtime
+        {% if env == "debug" %}
+        tolerations:
+          - key: "instance"
+            operator: "Equal"
+            value: "npu-class-service"
+            effect: "NoSchedule"
+        {% endif %}
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
+          {% if env == "debug" %}
+          nodestatus: debug
+          {% endif %}
         restartPolicy: OnFailure
   - name: "sglang-decode"
     replicas: {{ decode_size }}
@@ -207,46 +140,46 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/sglang/python/sglang/test/ascend/performance/run_ascend_testcase.sh {{ test_case }}
+               bash /root/sglang/python/sglang/test/ascend/e2e/run_ascend_testcase.sh {{ test_case }}
           resources:
             requests:
               huawei.com/ascend-1980: 16
             limits:
               huawei.com/ascend-1980: 16
           volumeMounts:
-          - name: ascend-910-config
-            mountPath: /user/serverid/devindex/config
           - name: ascend-driver
             mountPath: /usr/local/Ascend/driver
           - name: localtime
             mountPath: /etc/localtime
-          - name: kube-config
-            mountPath: /root/script
           - name: share
-            mountPath: /data
+            mountPath: /data/ascend-ci-share-pkking-sglang
           - name: share
             mountPath: /root/.cache
           - name: share
             mountPath: /root/sglang
-            subPath: {{ sglang_source_path }}
+            subPath: {{ sglang_source_relative_path }}
         volumes:
-        - name: kube-config
-          hostPath:
-            path: /root/script
         - name: share
           persistentVolumeClaim:
             claimName: sglang-guiyang004
-        - name: ascend-910-config
-          configMap:
-            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver
         - name: localtime
           hostPath:
             path: /etc/localtime
+        {% if env == "debug" %}
+        tolerations:
+          - key: "instance"
+            operator: "Equal"
+            value: "npu-class-service"
+            effect: "NoSchedule"
+        {% endif %}
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
+          {% if env == "debug" %}
+          nodestatus: debug
+          {% endif %}
         restartPolicy: OnFailure
   - name: "sglang-router"
     replicas: {{ router_size }}
@@ -289,44 +222,44 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/sglang/python/sglang/test/ascend/performance/run_ascend_testcase.sh {{ test_case }}
+               bash /root/sglang/python/sglang/test/ascend/e2e/run_ascend_testcase.sh {{ test_case }}
           resources:
             requests:
               cpu: "4"
             limits:
               cpu: "4"
           volumeMounts:
-          - name: ascend-910-config
-            mountPath: /user/serverid/devindex/config
           - name: ascend-driver
             mountPath: /usr/local/Ascend/driver
           - name: localtime
             mountPath: /etc/localtime
-          - name: kube-config
-            mountPath: /root/script
           - name: share
-            mountPath: /data
+            mountPath: /data/ascend-ci-share-pkking-sglang
           - name: share
             mountPath: /root/.cache
           - name: share
             mountPath: /root/sglang
-            subPath: {{ sglang_source_path }}
+            subPath: {{ sglang_source_relative_path }}
         volumes:
-        - name: kube-config
-          hostPath:
-            path: /root/script
         - name: share
           persistentVolumeClaim:
             claimName: sglang-guiyang004
-        - name: ascend-910-config
-          configMap:
-            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver
         - name: localtime
           hostPath:
             path: /etc/localtime
+        {% if env == "debug" %}
+        tolerations:
+          - key: "instance"
+            operator: "Equal"
+            value: "npu-class-service"
+            effect: "NoSchedule"
+        {% endif %}
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
+          {% if env == "debug" %}
+          nodestatus: debug
+          {% endif %}
         restartPolicy: OnFailure
