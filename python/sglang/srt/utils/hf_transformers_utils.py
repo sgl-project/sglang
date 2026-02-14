@@ -127,6 +127,20 @@ def download_from_hf(
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def get_rope_config(config):
+    """Get (rope_theta, rope_scaling) from config, supporting both v4 and v5.
+
+    In transformers v5, rope_theta/rope_scaling are accessed via the computed
+    property config.rope_parameters. Trust-remote-code configs or parent configs
+    passed to sub-models may not have this property or may return None.
+    Falls back to the v4-style config.rope_theta / config.rope_scaling attributes.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return config.rope_theta, getattr(config, "rope_scaling", None)
+
+
 def _patch_text_config(parent_config: PretrainedConfig, text_config):
     """Synchronize standard attributes between parent config and text sub-config.
 
@@ -138,6 +152,11 @@ def _patch_text_config(parent_config: PretrainedConfig, text_config):
     so we propagate in both directions when an attribute is missing.
     (See https://github.com/huggingface/transformers/pull/41541)
     """
+    # Some models store text_config as a plain dict rather than a
+    # PretrainedConfig object. Skip patching in that case.
+    if isinstance(text_config, dict):
+        return text_config
+
     _ATTRS_TO_PROPAGATE = [
         "pad_token_id",
         "bos_token_id",
