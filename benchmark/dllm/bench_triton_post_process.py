@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""
-Benchmark and correctness test for dLLM post-processing Triton kernel.
-
-This script:
-1. Verifies correctness by comparing Triton kernel output with PyTorch reference
-2. Benchmarks performance of Triton vs PyTorch implementation
-3. Supports NCU profiling mode
-
-Usage:
-    # Basic test and benchmark
-    python benchmark/dllm/bench_triton_post_process.py
-
-    # NCU profiling (run with ncu)
-    ncu --set full -o dllm_post_process python benchmark/dllm/bench_triton_post_process.py --ncu
-
-    # Specific configuration
-    python benchmark/dllm/bench_triton_post_process.py --block-size 32 --vocab-size 128000
-"""
+"""Benchmark dLLM post-processing Triton kernel vs PyTorch reference."""
 
 import argparse
 import time

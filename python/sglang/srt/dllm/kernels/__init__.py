@@ -1,4 +1,4 @@
-"""dLLM Triton kernels for low-confidence algorithm post-processing optimization."""
+"""dLLM post-processing kernels."""
 
 from sglang.srt.dllm.kernels.post_process import (
     dllm_post_process,
