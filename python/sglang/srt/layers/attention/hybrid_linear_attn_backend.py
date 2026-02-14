@@ -664,7 +664,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        # Split concatenated qkv tensor into q, k, v
         q_proj_states, k_proj_states, v_proj_states = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],
@@ -743,7 +742,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             causal_conv1d_fn,
         )
 
-        # Split concatenated qkv tensor into q, k, v
         q_proj_states, k_proj_states, v_proj_states = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],

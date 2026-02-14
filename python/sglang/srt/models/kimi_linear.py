@@ -193,7 +193,6 @@ class KimiDeltaAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        # Use fused qkv_proj like qwen3 does
         from sglang.srt.layers.dp_attention import get_attention_tp_rank
 
         attn_tp_rank = get_attention_tp_rank()
@@ -210,31 +209,24 @@ class KimiDeltaAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
-        # Store sizes for splitting qkv tensor
-        self.q_size = divide(self.num_heads * self.head_dim, self.attn_tp_size)
-        self.k_size = divide(self.num_k_heads * self.head_dim, self.attn_tp_size)
-        self.v_size = divide(self.num_v_heads * self.head_v_dim, self.attn_tp_size)
-
         # TODO: support fusion with quant for bfg projections
         self.do_fuse_bfg = quant_config is None
         if self.do_fuse_bfg:
-            self.qkvb_sizes = [
-                projection_size,
-                projection_size,
-                projection_size,
-                self.num_heads,
-            ]
-            self.fg_sizes = [self.head_dim, self.head_dim]
+            # Fuse b_proj (column parallel) with f_a_proj and g_a_proj (replicated)
+            # Output: [beta (num_heads/tp_size), f_a (head_dim), g_a (head_dim)]
             self.fused_bfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
-                [self.num_heads],
-                self.fg_sizes,
+                [self.num_heads],  # Column parallel: beta
+                [self.head_dim, self.head_dim],  # Replicated: f_a, g_a
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_bfg_a_proj",
             )
-            self.split_sizes_bfg = [self.num_heads // self.tp_size] + [
-                2 * self.head_dim
+            # Sizes after TP split: [num_heads/tp_size, 2*head_dim]
+            self.split_sizes_bfg = [
+                divide(self.num_heads, self.tp_size),
+                2 * self.head_dim,
             ]
+            # Batched linear for f_b and g_b projections
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
                 2, self.head_dim, projection_size, dtype=config.dtype
             )
@@ -357,7 +349,6 @@ class KimiDeltaAttention(nn.Module):
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
-        # Compute fused qkv projection
         qkv, _ = self.qkv_proj(hidden_states)
 
         # Compute beta, forget_gate, and g_proj_states
@@ -366,14 +357,13 @@ class KimiDeltaAttention(nn.Module):
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
 
         return (
-            qkv,  # Return as single tensor instead of tuple
+            qkv,
             beta,
             forget_gate,
             g_proj_states,
         )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        # Compute fused qkv projection
         qkv, _ = self.qkv_proj(hidden_states)
 
         # Compute fused bfg projections
@@ -387,7 +377,7 @@ class KimiDeltaAttention(nn.Module):
         )
 
         return (
-            qkv,  # Return as single tensor instead of tuple
+            qkv,
             beta,
             forget_gate,
             g_proj_states,
