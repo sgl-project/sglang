@@ -342,22 +342,33 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
+        accept_length_per_req_cpu = []
+        num_accepted_tokens = 0
         stride = self.draft_worker.speculative_num_draft_tokens
 
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            # In overlap mode, a finished/retracted request may still appear in one delayed batch.
+            # Do not count this delayed pass into speculative metrics, otherwise accept stats are biased lower.
+            if self.enable_overlap and (req.finished() or req.is_retracted):
+                predict_tokens.append([])
+                accept_length_per_req_cpu.append(0)
+                continue
+
+            accept_len = accept_lens[i]
+            req.kv_committed_len += accept_len
+            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_len])
             req.spec_verify_ct += 1
 
-            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
+            accepted_draft_tokens = accept_len - 1
+            num_accepted_tokens += accepted_draft_tokens
+            accept_length_per_req_cpu.append(accepted_draft_tokens)
             req.spec_accepted_tokens += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+        result.num_accepted_tokens = num_accepted_tokens
+        result.accept_length_per_req_cpu = accept_length_per_req_cpu
 
         return predict_tokens
 
@@ -433,9 +444,14 @@ class SchedulerOutputProcessorMixin:
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
+        active_batch_size = sum(
+            1
+            for req in batch.reqs
+            if not (self.enable_overlap and (req.finished() or req.is_retracted))
+        )
+        self.num_generated_tokens += active_batch_size
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(active_batch_size, result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
