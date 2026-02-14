@@ -75,10 +75,6 @@ class LayerwiseOffloadManager:
 
         self._initialize()
 
-    @staticmethod
-    def _get_storage_key(tensor: torch.Tensor) -> int:
-        return tensor.untyped_storage().data_ptr()
-
     def _acquire_gpu_buffer(self, dtype: torch.dtype, numel: int) -> torch.Tensor:
         pool_by_dtype = self._gpu_buffer_pool.setdefault(dtype, {})
         bucket = pool_by_dtype.get(numel)
