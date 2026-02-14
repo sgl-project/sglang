@@ -289,7 +289,7 @@ def fused_norm_scale_shift(
       where norm is either layernorm or rmsnorm.
 
     Expects:
-      - x: B, S, D]
+      - x: [B, S, D]
       - weight/bias: None, [D]
       - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - norm_type: str, "layer" or "rms"
