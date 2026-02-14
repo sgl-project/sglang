@@ -29,7 +29,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-    NunchakuConfig, is_nunchaku_available,
+    NunchakuConfig,
+    is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -50,8 +51,8 @@ _is_cuda = current_platform.is_cuda()
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
-except Exception:  # pragma: no cover - optional dependency
-    NunchakuFeedForward = None  # type: ignore[assignment]
+except Exception:
+    NunchakuFeedForward = None
 
 
 def _get_qkv_projections(
@@ -262,14 +263,6 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-
-        # self.rope = NDRotaryEmbedding(
-        #     rope_dim_list=axes_dim,
-        #     rope_theta=theta,
-        #     use_real=False,
-        #     repeat_interleave_real=False,
-        #     dtype=torch.float32 if current_platform.is_mps() or current_platform.is_musa() else torch.float64,
-        # )
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
@@ -932,8 +925,6 @@ class QwenImageTransformerBlock(nn.Module):
             }
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
-        print(f"{type(self.img_mlp)=}")
-        print(f"{self.img_mlp.net=}")
 
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
