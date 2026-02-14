@@ -47,9 +47,8 @@ class AbortAllMixin:
             ).raise_for_status()
 
             for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
+                result = future.result()
+                self.assertEqual(result["meta_info"]["finish_reason"]["type"], "abort")
 
             self.assertIsNone(self.process.poll())
 

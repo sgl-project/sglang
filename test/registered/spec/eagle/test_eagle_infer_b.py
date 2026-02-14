@@ -353,6 +353,7 @@ class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
 
 
 class TestEAGLEAbortAll(AbortAllMixin, EagleServerBase):
+    abort_all_max_new_tokens = 4000
     extra_args = ["--max-running-requests=8"]
 
 
