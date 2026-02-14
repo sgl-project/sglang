@@ -387,7 +387,7 @@ template <typename T>
 inline const T* unwrap_data_ptr(const tvm::ffi::TensorView& tensor, const char* name) {
   using namespace host;
   if (tensor.data_ptr()) {
-    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   }
   return static_cast<const T*>(tensor.data_ptr());
 }
@@ -405,7 +405,7 @@ template <typename T>
 inline T* unwrap_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* name) {
   using namespace host;
   if (tensor.data_ptr()) {
-    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   }
   return static_cast<T*>(tensor.data_ptr());
 }
@@ -420,13 +420,14 @@ inline T* unwrap_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* na
  * @return Typed pointer to the tensor data, or nullptr if optional has no value
  */
 template <typename T>
-inline const T* unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+inline const T*
+unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
   using namespace host;
   if (!optional_tensor.has_value()) {
     return nullptr;
   }
   const auto& tensor = optional_tensor.value();
-  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   return static_cast<const T*>(tensor.data_ptr());
 }
 
@@ -440,13 +441,14 @@ inline const T* unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::Tens
  * @return Typed mutable pointer to the tensor data, or nullptr if optional has no value
  */
 template <typename T>
-inline T* unwrap_optional_data_ptr_mut(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+inline T*
+unwrap_optional_data_ptr_mut(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
   using namespace host;
   if (!optional_tensor.has_value()) {
     return nullptr;
   }
   const auto& tensor = optional_tensor.value();
-  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   return static_cast<T*>(tensor.data_ptr());
 }
 
@@ -524,7 +526,8 @@ struct FusedMetadataCopyKernel {
                 .seqlens_expanded = unwrap_optional_data_ptr<int32_t>(seqlens_expanded_src, "seqlens_expanded_src"),
                 .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
                 .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
-                .flashmla_num_splits = unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
                 .flashmla_metadata = unwrap_optional_data_ptr<int32_t>(flashmla_metadata_src, "flashmla_metadata_src"),
             },
         .dst =
@@ -536,8 +539,10 @@ struct FusedMetadataCopyKernel {
                 .seqlens_expanded = unwrap_optional_data_ptr_mut<int32_t>(seqlens_expanded_dst, "seqlens_expanded_dst"),
                 .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst, "nsa_cu_seqlens_k_dst"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst, "real_page_table_dst"),
-                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst, "flashmla_num_splits_dst"),
-                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst, "flashmla_metadata_dst"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst, "flashmla_num_splits_dst"),
+                .flashmla_metadata =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst, "flashmla_metadata_dst"),
             },
         .forward_mode = FORWARD_MODE,
         .bs = bs,
@@ -546,7 +551,8 @@ struct FusedMetadataCopyKernel {
         .seqlens_expanded_size = seqlens_expanded_size,
         .page_indices_rows = static_cast<int>(page_indices_src.shape()[0]),
         .page_table_1_stride = static_cast<int>(page_table_1_dst.shape()[1]),
-        .real_page_table_cols = real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
+        .real_page_table_cols =
+            real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
         .real_page_table_dst_stride =
             real_page_table_dst.has_value() ? static_cast<int>(real_page_table_dst.value().stride(0)) : 0,
         .flashmla_metadata_size =
@@ -645,7 +651,8 @@ struct FusedMetadataCopyMultiKernel {
                 .seqlens_expanded = nullptr,  // Not used in multi-backend DECODE mode
                 .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
                 .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
-                .flashmla_num_splits = unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
                 .flashmla_metadata = unwrap_optional_data_ptr<int32_t>(flashmla_metadata_src, "flashmla_metadata_src"),
             },
         .dst0 =
@@ -657,8 +664,10 @@ struct FusedMetadataCopyMultiKernel {
                 .seqlens_expanded = nullptr,
                 .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst0, "nsa_cu_seqlens_k_dst0"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst0, "real_page_table_dst0"),
-                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst0, "flashmla_num_splits_dst0"),
-                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst0, "flashmla_metadata_dst0"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst0, "flashmla_num_splits_dst0"),
+                .flashmla_metadata =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst0, "flashmla_metadata_dst0"),
             },
         .dst1 =
             {
@@ -669,8 +678,10 @@ struct FusedMetadataCopyMultiKernel {
                 .seqlens_expanded = nullptr,
                 .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst1, "nsa_cu_seqlens_k_dst1"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst1, "real_page_table_dst1"),
-                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst1, "flashmla_num_splits_dst1"),
-                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst1, "flashmla_metadata_dst1"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst1, "flashmla_num_splits_dst1"),
+                .flashmla_metadata =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst1, "flashmla_metadata_dst1"),
             },
         .dst2 =
             {
@@ -681,14 +692,17 @@ struct FusedMetadataCopyMultiKernel {
                 .seqlens_expanded = nullptr,
                 .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst2, "nsa_cu_seqlens_k_dst2"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst2, "real_page_table_dst2"),
-                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst2, "flashmla_num_splits_dst2"),
-                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst2, "flashmla_metadata_dst2"),
+                .flashmla_num_splits =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst2, "flashmla_num_splits_dst2"),
+                .flashmla_metadata =
+                    unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst2, "flashmla_metadata_dst2"),
             },
         .bs = bs,
         .max_len = max_len,
         .seqlens_expanded_size = seqlens_expanded_size,
         .page_table_1_stride = static_cast<int>(page_table_1_dst0.shape()[1]),
-        .real_page_table_cols = real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
+        .real_page_table_cols =
+            real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
         .real_page_table_dst_stride =
             real_page_table_dst0.has_value() ? static_cast<int>(real_page_table_dst0.value().stride(0)) : 0,
         .flashmla_metadata_size =
