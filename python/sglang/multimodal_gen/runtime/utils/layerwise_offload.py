@@ -250,7 +250,7 @@ class LayerwiseOffloadManager:
         self._gpu_layers.discard(layer_idx)
 
     @torch.compiler.disable
-    def release_all(self, clear_pool: bool = True) -> None:
+    def release_all(self) -> None:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
@@ -259,9 +259,7 @@ class LayerwiseOffloadManager:
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx, force=True)
 
-        if clear_pool:
-            self._gpu_buffer_pool.clear()
-            self._layer_gpu_buffers.clear()
+        self._gpu_buffer_pool.clear()
 
     @torch.compiler.disable
     def load_all_layers(self) -> None:
