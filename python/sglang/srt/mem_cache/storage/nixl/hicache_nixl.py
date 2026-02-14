@@ -708,11 +708,12 @@ class HiCacheNixl(HiCacheStorage):
             key_list, _, ptr_list, element_size_list = self._get_location_and_size_list_from_meta(keys, host_indices)
             return key_list, [], ptr_list, element_size_list
         else:
-            # non zero copy
+            # non zero copy: NIXL still requires contiguous tensors for transfer
             target_tensors = [ 
                 self.mem_pool_host.get_data_page(
                     host_indices[i * self.mem_pool_host.page_size], flat=False
-                ) for i in range(page_num)
+                ).contiguous()
+                for i in range(page_num)
             ]
 
             key_list = [ self._get_suffixed_key(key) for key in keys]
