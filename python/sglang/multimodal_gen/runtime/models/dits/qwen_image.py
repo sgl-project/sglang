@@ -5,6 +5,7 @@
 import functools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import diffusers
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-    NunchakuConfig,
+    NunchakuConfig, is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -48,13 +49,9 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
 
 try:
-    # Optional dependency: only required when SVDQuant is enabled.
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
-
-    _NUNCHAKU_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     NunchakuFeedForward = None  # type: ignore[assignment]
-    _NUNCHAKU_AVAILABLE = False
 
 
 def _get_qkv_projections(
@@ -89,6 +86,124 @@ def _get_qkv_projections(
             txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
+
+
+class GELU(nn.Module):
+    r"""
+    GELU activation function with tanh approximation support with `approximate="tanh"`.
+
+    Parameters:
+        dim_in (`int`): The number of channels in the input.
+        dim_out (`int`): The number of channels in the output.
+        approximate (`str`, *optional*, defaults to `"none"`): If `"tanh"`, use tanh approximation.
+        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict.
+    """
+
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        approximate: str = "none",
+        bias: bool = True,
+        quant_config=None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in,
+            dim_out,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "",
+        )
+        self.approximate = approximate
+
+    def forward(self, hidden_states):
+        hidden_states = self.proj(hidden_states)
+        return F.gelu(hidden_states[0], approximate=self.approximate)
+
+
+class FeedForward(nn.Module):
+    r"""
+    A feed-forward layer.
+
+    Parameters:
+        dim (`int`): The number of channels in the input.
+        dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
+        mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
+        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
+        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        mult: int = 4,
+        activation_fn: str = "geglu",
+        inner_dim=None,
+        bias: bool = True,
+        quant_config=None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        if activation_fn == "gelu":
+            act_fn = GELU(
+                dim,
+                inner_dim,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.0" if prefix else "",
+            )
+        if activation_fn == "gelu-approximate":
+            act_fn = GELU(
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.0" if prefix else "",
+            )
+        else:
+            raise NotImplementedError(
+                f"activation_fn '{activation_fn}' is not supported."
+            )
+
+        self.net = nn.ModuleList([])
+        self.net.append(act_fn)
+        self.net.append(nn.Identity())
+        row_linear = RowParallelLinear(
+            inner_dim,
+            dim_out,
+            bias=True,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.net.2" if prefix else "",
+        )
+        # For quantized MLP, override act_unsigned on the second linear (post-GELU).
+        # After GELU, activations are non-negative, so unsigned quantization improves
+        # quality for INT4. This matches nunchaku's NunchakuFeedForward behavior.
+        if (
+            quant_config is not None
+            and hasattr(quant_config, "precision")
+            and hasattr(row_linear, "act_unsigned")
+        ):
+            row_linear.act_unsigned = quant_config.precision != "nvfp4"
+        self.net.append(row_linear)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -733,7 +848,7 @@ class QwenImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: Optional[QuantizationConfig] | NunchakuConfig = None,
         prefix: str = "",
         zero_cond_t: bool = False,
     ):
@@ -757,6 +872,7 @@ class QwenImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
+
         self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = QwenImageCrossAttention(
@@ -769,9 +885,6 @@ class QwenImageTransformerBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.img_mlp = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
-        )
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
@@ -787,31 +900,40 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
-        )
+
         # Utils
         self.fuse_mul_add = MulAdd()
 
-        if (
+        nunchaku_enabled = (
             quant_config is not None
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "svdquant"
-        ):
-            if not _NUNCHAKU_AVAILABLE:
-                logger.warning(
-                    "NunchakuConfig provided but `nunchaku` package is not available; "
-                    "keeping standard FeedForward layers."
-                )
-            else:
-                assert NunchakuFeedForward is not None
-                nunchaku_kwargs = {
-                    "precision": quant_config.precision,
-                    "rank": quant_config.rank,
-                    "act_unsigned": quant_config.act_unsigned,
-                }
-                self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
-                self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
+            and is_nunchaku_available()
+        )
+        ff_class = (
+            diffusers.models.attention.FeedForward if nunchaku_enabled else FeedForward
+        )
+        self.img_mlp = ff_class(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+        )
+        self.txt_mlp = ff_class(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+        )
+
+        if nunchaku_enabled:
+            nunchaku_kwargs = {
+                "precision": quant_config.precision,
+                "rank": quant_config.rank,
+                "act_unsigned": quant_config.act_unsigned,
+            }
+            self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
+            self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
+        print(f"{type(self.img_mlp)=}")
+        print(f"{self.img_mlp.net=}")
 
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
