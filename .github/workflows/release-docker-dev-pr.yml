@@ -4,11 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to build from'
-        required: true
-        type: string
-      pr_branch:
-        description: 'PR branch name to build from (e.g., my-feature-branch or refs/pull/123/head)'
+        description: 'PR number to build from (works with both internal and fork PRs)'
         required: true
         type: string
 
@@ -43,7 +39,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_branch }}
+          ref: refs/pull/${{ inputs.pr_number }}/head
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main

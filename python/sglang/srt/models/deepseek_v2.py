@@ -72,6 +72,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -1097,9 +1099,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
         if self.nsa_enable_prefill_cp and self.use_nsa:
-            attn_tp_rank = 0
-            attn_tp_size = 1
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1150,6 +1150,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         if self.use_nsa:
+            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1162,6 +1163,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 scale_fmt="ue8m0",
                 block_size=128,
                 rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
                 prefix=add_prefix("indexer", prefix),
                 quant_config=quant_config,
                 layer_id=layer_id,
@@ -1191,13 +1193,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
+            is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=False,
+                is_neox_style=is_neox_style,
                 device=get_global_server_args().device,
             )
 
@@ -2227,9 +2230,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        if hasattr(config, "rope_parameters"):
+            rope_theta = config.rope_parameters.get("rope_theta")
+            assert rope_theta is not None, f"rope_theta not found in config: {config}"
+            rope_type = config.rope_parameters.get("rope_type")
+            rope_scaling = config.rope_parameters if rope_type != "default" else None
+        else:
+            rope_theta = config.rope_theta
+            rope_scaling = config.rope_scaling
+        max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
@@ -2503,7 +2512,7 @@ class DeepseekV2Model(nn.Module):
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -2818,8 +2827,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = self.cp_size = None
 
