@@ -107,6 +107,7 @@ openmetrics-parser = "0.4.4"
 arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
+smg-grpc-client = "1.0.0"
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
@@ -124,7 +125,6 @@ sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
 
 [build-dependencies]
-tonic-prost-build = "0.14.2"
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 
