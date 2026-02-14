@@ -1,8 +1,16 @@
 """
-Tests for update_weights_from_disk API in SGLang-D (diffusion engine).
+Tests for update_weights_from_disk API in SGLang diffusion server.
 
-This module verifies the ability to hot update model weights without restarting
+This module verifies the ability to update model weights in place without restarting
 the server, which is critical for RL workflows and iterative fine-tuning scenarios.
+
+We use two model pairs for testing (before / after update model pairs):
+
+- FLUX.2-klein-base-4B / FLUX.2-klein-4B
+- Qwen/Qwen-Image / Qwen/Qwen-Image-2512
+
+These models are with the same model architecture and different number
+of parameters. Only weights are different.
 
 Author:
 
@@ -10,54 +18,66 @@ Menyang Liu, https://github.com/dreamyang-liu
 Chenyang Zhao, https://github.com/zhaochenyang20
 
 =============================================================================
-Test organization: 10 test cases in 2 classes
-=============================================================================
 
-Class 1 uses a class-scoped server fixture (diffusion_server_no_offload) that
-is torn down when the class ends, freeing both the port and GPU memory before
-Class 2 starts its own offload-enabled server on the same port.
+Test organization:
+
+10 test cases in 2 classes;
+two model pairs are tested locally, one in CI.
+
+=============================================================================
 
 Class 1: TestUpdateWeightsFromDisk                  (8 tests) — API contract, checksum & rollback
 Class 2: TestUpdateWeightsFromDiskWithOffload       (2 tests) — Offload-aware update
 
-Tests are ordered lighter-first so developers get fast feedback during iteration.
+-----------------------------------------------------------------------------
 
------------------------------------------------------------------------------
 Class 1: TestUpdateWeightsFromDisk
------------------------------------------------------------------------------
-Purpose: Validate the update_weights_from_disk API contract, request/response shape,
-error handling, checksum verification, and corrupted-weight rollback.  All 8 tests
-run against one server (fixture: diffusion_server_no_offload).
+
+Validate the update_weights_from_disk API contract, request/response shape,
+error handling, checksum verification, and corrupted-weight rollback.
 
   • test_update_weights_with_flush_cache
-    Explicit flush_cache=True; must succeed. Ensures the flush_cache parameter
-    is accepted and applied.
+
+    Explicit flush_cache=True; must succeed (200, success=True). Ensures the
+    flush_cache parameter is accepted and the update completes.
+
+    TODO: Currently, TeaCache can not be verified whether it was flushed
+    since no cache-state API is exposed.
 
   • test_update_weights_without_flush_cache
+
     Explicit flush_cache=False; must succeed. Ensures updates work when not
-    flushing TeaCache.
+    requesting TeaCache flush.
 
   • test_update_weights_nonexistent_model
-    model_path set to a non-existent path; must fail (success=False). Verifies
-    all-or-nothing / rollback semantics when load fails.
+
+    model_path set to a non-existent path; must fail (400, success=False).
+    Also, verifies that the update fails and the model is rolled back to the
+    original weights.
 
   • test_update_weights_missing_model_path
+
     Request body empty (no model_path); must return 400. Validates required
     parameter checks.
 
   • test_update_weights_specific_modules
-    target_modules=["transformer"]; must return 200. Verifies partial module
-    update (target_modules parameter).
+
+    Randomly selects a subset of pipeline modules as target_modules, then asserts:
+    (1) updated modules' checksums match the update model's disk checksums;
+    (2) non-updated modules' checksums are unchanged (same before and after).
 
   • test_update_weights_nonexistent_module
+
     target_modules=["nonexistent_module"]; must return 400 and message containing
     "not found in pipeline". Validates rejection of invalid module names.
 
   • test_update_weights_checksum_matches
+
     Updates weights to the update model. Verifies the post-update checksum
     matches the update model's disk checksum.
 
   • test_corrupted_weights_rollback
+
     Verify all-or-nothing rollback semantics when loading corrupted weights.
     Builds a corrupted model directory by copying the base model and truncating
     the vae safetensors. Requests an update with target_modules=["transformer",
@@ -198,6 +218,19 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     assert safetensors_files, f"No safetensors files in {weights_dir}"
 
     return compute_weights_checksum(safetensors_weights_iterator(safetensors_files))
+
+
+def _get_modules_with_weights_on_disk(
+    model_path: str, module_names: list[str]
+) -> list[str]:
+    """Return module names that have safetensors on disk for the given model."""
+    local_path = maybe_download_model(model_path)
+    result = []
+    for name in module_names:
+        weights_dir = find_weights_dir(local_path, name)
+        if weights_dir and _list_safetensors_files(weights_dir):
+            result.append(name)
+    return result
 
 
 def _prepare_corrupted_model(
@@ -363,7 +396,11 @@ class TestUpdateWeightsFromDisk:
         return response.json()
 
     def test_update_weights_with_flush_cache(self, diffusion_server_no_offload):
-        """Test updating weights with flush_cache=True."""
+        """Test updating weights with flush_cache=True.
+
+        Verifies the API accepts flush_cache=True and returns success; does not
+        assert that TeaCache was actually reset (server does not expose cache state).
+        """
         ctx, _default_model, update_model = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
@@ -420,22 +457,67 @@ class TestUpdateWeightsFromDisk:
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
 
     def test_update_weights_specific_modules(self, diffusion_server_no_offload):
-        """Test updating only specific modules (e.g., transformer only)."""
-        ctx, _default_model, update_model = diffusion_server_no_offload
+        """Partial update: random subset of modules updated; checksums verified.
+
+        Randomly picks a non-empty subset of modules that have weights on disk
+        for the update model, performs update_weights_from_disk with that
+        target_modules, then asserts:
+        - Updated modules: in-memory checksum == update model disk checksum.
+        - Non-updated modules: checksum unchanged (before == after).
+        """
+        ctx, default_model, update_model = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
-        # Try to update only transformer module
+        # Reset to base model so we start from a known state.
+        self._update_weights(base_url, default_model)
+
+        # All pipeline module names (from server).
+        all_checksums = self._get_weights_checksum(base_url, module_names=None)
+        all_module_names = [k for k in all_checksums if all_checksums[k] != "not_found"]
+        if not all_module_names:
+            pytest.skip("No updatable modules reported by server")
+
+        # Only consider modules that exist on disk for the update model.
+        candidates = _get_modules_with_weights_on_disk(update_model, all_module_names)
+        if not candidates:
+            pytest.skip("Update model has no weight dirs for any pipeline module")
+
+        # Random non-empty subset (fixed seed for reproducibility).
+        random.seed(42)
+        k = random.randint(1, len(candidates))
+        target_modules = random.sample(candidates, k)
+        target_set = set(target_modules)
+        logger.info(
+            "Partial update test: target_modules=%s (unchanged: %s)",
+            target_modules,
+            [m for m in all_module_names if m not in target_set],
+        )
+
+        before_checksums = self._get_weights_checksum(base_url, module_names=None)
+
         result, status_code = self._update_weights(
             base_url,
             update_model,
-            target_modules=["transformer"],
+            target_modules=target_modules,
         )
-        logger.info(f"Update specific modules result: {result}")
+        assert status_code == 200, f"Update failed: {result}"
+        assert result.get("success", False), f"Update failed: {result.get('message')}"
 
-        # This might fail if the model doesn't have a transformer module
-        # or if weights for only transformer aren't available
-        # The test verifies the API handles target_modules parameter
-        assert status_code == 200
+        after_checksums = self._get_weights_checksum(base_url, module_names=None)
+
+        for name in all_module_names:
+            if name in target_set:
+                disk_cs = _compute_checksum_from_disk(update_model, name)
+                assert after_checksums.get(name) == disk_cs, (
+                    f"Updated module '{name}': checksum should match update model disk\n"
+                    f"  disk: {disk_cs}\n  gpu:  {after_checksums.get(name)}"
+                )
+            else:
+                assert after_checksums.get(name) == before_checksums.get(name), (
+                    f"Non-updated module '{name}': checksum must be unchanged\n"
+                    f"  before: {before_checksums.get(name)}\n"
+                    f"  after:  {after_checksums.get(name)}"
+                )
 
     def test_update_weights_nonexistent_module(self, diffusion_server_no_offload):
         """Test that requesting a non-existent module name fails with a clear error."""
