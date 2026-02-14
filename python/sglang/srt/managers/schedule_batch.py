@@ -961,18 +961,21 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def tail_str(self) -> str:
+    def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
+            # When multiple tokens are accepted at once (e.g. speculative decoding),
+            # the tail window must be large enough to cover both the new tokens and
+            # the stop string that may span a token boundary.
             max_len_tail_str = max(
-                self.sampling_params.stop_str_max_len + 1,
-                self.sampling_params.stop_regex_max_len + 1,
+                self.sampling_params.stop_str_max_len + new_accepted_len,
+                self.sampling_params.stop_regex_max_len + new_accepted_len,
             )
 
-        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        tail_len = min(max_len_tail_str, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -982,7 +985,7 @@ class Req(ReqDllmMixin):
         if not self.sampling_params.stop_strs:
             return False
 
-        tail_str = self.tail_str()
+        tail_str = self.tail_str() # FIXME: do we need to pass in new_accepted_len here?
 
         # Early return if tail_str is empty
         if not tail_str:
@@ -1028,12 +1031,12 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_str_based_finish(self):
+    def _check_str_based_finish(self, new_accepted_len: int):
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str()
+            tail_str = self.tail_str(new_accepted_len)
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
@@ -1098,7 +1101,7 @@ class Req(ReqDllmMixin):
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        if self._check_str_based_finish():
+        if self._check_str_based_finish(new_accepted_len):
             return
 
     def reset_for_retract(self):
