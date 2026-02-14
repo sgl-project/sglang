@@ -468,7 +468,49 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return StreamingParseResult(calls=calls, normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+    ) -> Dict[str, Any]:
+        """Build structural tag for Qwen3 Coder format."""
+        tags = []
+        triggers = set()
+
+        for tool in tools:
+            name = tool.function.name
+            if not name:
+                continue
+
+            begin = f"<tool_call>\n<function={name}>\n"
+            end = "\n</function>\n</tool_call>"
+            trigger = "<tool_call>"
+
+            # Always include schema for parameter validation
+            schema = tool.function.parameters or {}
+
+            tags.append(
+                {
+                    "begin": begin,
+                    "content": {
+                        "type": "qwen_xml_parameter",
+                        "json_schema": schema,
+                    },
+                    "end": end,
+                }
+            )
+            triggers.add(trigger)
+
+        return {
+            "format": {
+                "type": "triggered_tags",
+                "triggers": list(triggers),
+                "tags": tags,
+                "at_least_one": at_least_one,
+            }
+        }
