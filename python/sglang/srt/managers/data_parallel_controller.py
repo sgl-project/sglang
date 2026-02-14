@@ -533,7 +533,7 @@ class DataParallelController:
         # Set default bootstrap_room if in FAKE auto mode and room is None
         if (
             req.bootstrap_room is None
-            and self.server_args.disaggregation_decode_enable_fake_auto
+            and self.server_args.disaggregation_transfer_backend == "fake"
         ):
             req.bootstrap_room = self.round_robin_counter
             self.round_robin_counter = (self.round_robin_counter + 1) % len(

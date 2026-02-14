@@ -26,7 +26,6 @@ class AscendKVManager(MooncakeKVManager):
             hostname=local_ip,
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
-            disaggregation_decode_enable_fake_auto=self.disaggregation_decode_enable_fake_auto,
         )
 
     def register_buffer_to_engine(self):
