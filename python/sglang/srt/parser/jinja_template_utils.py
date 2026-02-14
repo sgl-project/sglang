@@ -190,6 +190,11 @@ def process_content_for_template_format(
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
+                elif chunk_type == "input_text":
+                    # Normalize Responses API "input_text" to Chat API "text"
+                    processed_content_parts.append(
+                        {"type": "text", "text": chunk.get("text", "")}
+                    )
                 else:
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)
@@ -204,7 +209,7 @@ def process_content_for_template_format(
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
+            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
                 text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
