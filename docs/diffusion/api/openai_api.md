@@ -393,3 +393,26 @@ Notes:
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
     ```
 5.  Generate with LoRA B...
+
+### Adjust Output Quality
+
+The server supports adjusting output quality and compression levels for both image and video generation through the `output-quality` and `output-compression` parameters.
+
+#### Parameters
+
+- **`output-quality`** (string, optional): Preset quality level that automatically sets compression. **Default is `"default"`**. Valid values:
+  - `"maximum"`: Highest quality (100)
+  - `"high"`: High quality (90)
+  - `"medium"`: Medium quality (55)
+  - `"low"`: Lower quality (35)
+  - `"default"`: Auto-adjust based on media type (50 for video, 75 for image)
+
+- **`output-compression`** (integer, optional): Direct compression level override (0-100). **Default is `None`**. When provided (not `None`), takes precedence over `output-quality`.
+  - `0`: Lowest quality, smallest file size
+  - `100`: Highest quality, largest file size
+
+#### Notes
+
+- **Precedence**: When both `output-quality` and `output-compression` are provided, `output-compression` takes precedence
+- **Format Support**: Quality settings apply to JPEG, and video formats. PNG uses lossless compression and ignores these settings
+- **File Size vs Quality**: Lower compression values (or "low" quality preset) produce smaller files but may show visible artifacts

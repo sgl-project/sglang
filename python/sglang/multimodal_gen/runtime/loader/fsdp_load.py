@@ -54,7 +54,6 @@ def maybe_load_fsdp_model(
     device: torch.device,
     hsdp_replicate_dim: int,
     hsdp_shard_dim: int,
-    default_dtype: torch.dtype,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     cpu_offload: bool = False,
@@ -63,8 +62,15 @@ def maybe_load_fsdp_model(
     pin_cpu_memory: bool = True,
     strict: bool = True,
 ) -> torch.nn.Module:
-    """
-    Load the model with FSDP if is training, else load the model without FSDP.
+    """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
+
+    Args:
+        param_dtype: Data type for model parameters, also used for:
+            - Model initialization context (set_default_torch_dtype)
+            - FSDP mixed precision policy
+            - Weight loading and casting
+        reduce_dtype: Data type for gradient reduction in FSDP mixed precision.
+        strict: If True, enforce strict state dict loading (all keys must match).
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -79,7 +85,7 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_torch_dtype(default_dtype), torch.device("meta"):
+    with set_default_torch_dtype(param_dtype), torch.device("meta"):
         model = model_cls(**init_params)
 
     # Check if we should use FSDP
@@ -120,7 +126,7 @@ def maybe_load_fsdp_model(
         model,
         weight_iterator,
         device,
-        default_dtype,
+        param_dtype,
         strict=strict,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
@@ -272,7 +278,16 @@ def load_model_from_full_model_state_dict(
             else:
                 sharded_tensor = full_tensor
 
-            if cpu_offload:
+            # Important: `cpu_offload` is intended for FSDP-managed parameter movement.
+            # If a parameter is not sharded into a DTensor (i.e., no `device_mesh`), FSDP
+            # will NOT manage it. Offloading it here would leave CPU parameters that
+            # later participate in GPU kernels (e.g., conv/embedding), causing device/dtype
+            # mismatches like "Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type)".
+            #
+            # Therefore:
+            # - For non-FSDP models, keep the historical behavior (allow CPU offload).
+            # - For FSDP models, do NOT offload non-sharded parameters here.
+            if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
@@ -309,7 +324,7 @@ def load_model_from_full_model_state_dict(
             sharded_tensor = torch.zeros_like(
                 meta_sharded_param, device=device, dtype=param_dtype
             )
-            if cpu_offload:
+            if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
             # Initialize with zeros and distribute

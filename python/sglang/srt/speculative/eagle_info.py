@@ -426,9 +426,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
