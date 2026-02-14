@@ -566,7 +566,7 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
-        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim

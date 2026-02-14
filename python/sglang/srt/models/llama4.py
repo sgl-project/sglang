@@ -362,7 +362,7 @@ class Llama4DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = config.max_position_embeddings
         self.attn_tp_size = get_attention_tp_size()

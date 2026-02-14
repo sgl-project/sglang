@@ -124,7 +124,7 @@ class Lfm2Attention(nn.Module):
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = config.rope_parameters.get("rope_theta", 10000)
+            rope_theta = config.rope_parameters["rope_theta"]
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,

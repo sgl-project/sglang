@@ -336,7 +336,7 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

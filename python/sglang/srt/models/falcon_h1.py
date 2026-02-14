@@ -133,7 +133,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rope_scaling = config.rope_parameters
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)

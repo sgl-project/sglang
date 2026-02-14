@@ -171,7 +171,7 @@ class CohereAttention(nn.Module):
         self.max_position_embeddings = getattr(
             config, "model_max_length", None
         ) or getattr(config, "max_position_embeddings", 8192)
-        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.rope_scaling = config.rope_parameters
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qkv_proj = QKVParallelLinear(

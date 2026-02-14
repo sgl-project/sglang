@@ -176,7 +176,7 @@ class Gemma3Attention(nn.Module):
             self.sliding_window = get_attention_sliding_window_size(config)
         else:
             # Global attention. Use the values in config.json.
-            self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+            self.rope_theta = config.rope_parameters["rope_theta"]
             self.rope_scaling = config.rope_parameters
             self.sliding_window = None
 

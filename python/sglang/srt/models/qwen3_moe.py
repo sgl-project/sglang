@@ -120,7 +120,7 @@ def compute_yarn_parameters(
     if rope_scaling is None:
         return 1.0, 0, 0, 1.0
 
-    base = config.rope_parameters.get("rope_theta", 10000)
+    base = config.rope_parameters["rope_theta"]
     partial_rotary_factor = (
         config.partial_rotary_factor
         if hasattr(config, "partial_rotary_factor")
@@ -681,7 +681,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(

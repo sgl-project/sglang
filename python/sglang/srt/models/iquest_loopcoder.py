@@ -166,7 +166,7 @@ class LoopCoderAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(
             config, "max_position_embeddings", max_position

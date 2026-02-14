@@ -314,7 +314,7 @@ class AfmoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)

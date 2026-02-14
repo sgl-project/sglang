@@ -164,7 +164,7 @@ class OrionDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = OrionAttention(
