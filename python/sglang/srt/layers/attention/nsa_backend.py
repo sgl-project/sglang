@@ -16,6 +16,10 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_mtp_verification import (
+    verify_multi_backend_fused_metadata_copy,
+    verify_single_backend_fused_metadata_copy,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
@@ -62,6 +66,15 @@ else:
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+
+# Control whether to use fused metadata copy kernel (default: enabled)
+# Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
+_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get()
+
+# Control whether to verify fused metadata copy against individual copies (default: disabled)
+# Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
+# This will crash with detailed error message if any inconsistency is detected
+_VERIFY_FUSED_METADATA_COPY = envs.SGLANG_VERIFY_FUSED_METADATA_COPY.get()
 
 
 @dataclass(frozen=True)
@@ -300,6 +313,8 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        # Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT), controlled by env var.
+        self._force_attn_forward_mla: bool = envs.SGLANG_NSA_FORCE_MLA.get()
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -1125,55 +1140,150 @@ class NativeSparseAttnBackend(
 
         metadata = self.decode_cuda_graph_metadata[bs]
 
-        # Copy basic seqlens
-        metadata.cache_seqlens_int32.copy_(precomputed.cache_seqlens)
-        metadata.cu_seqlens_k[1:].copy_(precomputed.cu_seqlens_k[1:])
+        # Track whether fused kernel succeeded
+        fused_kernel_succeeded = False
 
-        # Mode-specific copy logic
-        if forward_mode.is_decode_or_idle():
-            # Decode mode
-            metadata.page_table_1[:, : precomputed.max_len].copy_(
-                precomputed.page_indices
-            )
-            metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
-            # seqlens_expanded is same as cache_seqlens (already copied)
+        # Use fused CUDA kernel for all copy operations
+        if _USE_FUSED_METADATA_COPY:
+            try:
+                from sglang.jit_kernel.fused_metadata_copy import (
+                    fused_metadata_copy_cuda,
+                )
 
-        elif forward_mode.is_target_verify():
-            # Target verify mode
-            metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
-                precomputed.page_indices
-            )
-            metadata.nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
-            metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
+                # Map forward_mode to integer enum
+                if forward_mode.is_decode_or_idle():
+                    mode_int = 0  # DECODE
+                elif forward_mode.is_target_verify():
+                    mode_int = 1  # TARGET_VERIFY
+                elif forward_mode.is_draft_extend():
+                    mode_int = 2  # DRAFT_EXTEND
+                else:
+                    raise ValueError(f"Unsupported forward_mode: {forward_mode}")
 
-        elif forward_mode.is_draft_extend():
-            # Draft extend mode
-            rows = precomputed.page_indices.shape[0]
-            cols = precomputed.max_seqlen_k
-            metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
+                # Prepare FlashMLA tensors if needed
+                flashmla_num_splits_src = None
+                flashmla_num_splits_dst = None
+                flashmla_metadata_src = None
+                flashmla_metadata_dst = None
+                if precomputed.flashmla_metadata is not None:
+                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
+                    flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
+                    flashmla_metadata_src = (
+                        precomputed.flashmla_metadata.flashmla_metadata
+                    )
+                    flashmla_metadata_dst = metadata.flashmla_metadata.flashmla_metadata
 
+                # Call fused kernel
+                fused_metadata_copy_cuda(
+                    # Source tensors
+                    precomputed.cache_seqlens,
+                    precomputed.cu_seqlens_k,
+                    precomputed.page_indices,
+                    precomputed.nsa_cache_seqlens,
+                    precomputed.seqlens_expanded,
+                    precomputed.nsa_cu_seqlens_k,
+                    precomputed.real_page_table,
+                    flashmla_num_splits_src,
+                    flashmla_metadata_src,
+                    # Destination tensors
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_k,
+                    metadata.page_table_1,
+                    metadata.nsa_cache_seqlens_int32,
+                    metadata.nsa_seqlens_expanded,
+                    metadata.nsa_cu_seqlens_k,
+                    (
+                        metadata.real_page_table
+                        if precomputed.real_page_table is not None
+                        else None
+                    ),
+                    flashmla_num_splits_dst,
+                    flashmla_metadata_dst,
+                    # Parameters
+                    mode_int,
+                    bs,
+                    precomputed.max_len,
+                    precomputed.max_seqlen_k,
+                    precomputed.seqlens_expanded_size,
+                )
+
+                # Successfully used fused kernel
+                fused_kernel_succeeded = True
+
+                # Verification: compare fused kernel results against individual copies
+                if _VERIFY_FUSED_METADATA_COPY:
+                    verify_single_backend_fused_metadata_copy(
+                        metadata=metadata,
+                        precomputed=precomputed,
+                        forward_mode=forward_mode,
+                        bs=bs,
+                        flashmla_num_splits_src=flashmla_num_splits_src,
+                        flashmla_metadata_src=flashmla_metadata_src,
+                        flashmla_num_splits_dst=flashmla_num_splits_dst,
+                        flashmla_metadata_dst=flashmla_metadata_dst,
+                    )
+            except ImportError:
+                print(
+                    "Warning: Fused metadata copy kernel not available, falling back to individual copies."
+                )
+            except Exception as e:
+                print(
+                    f"Warning: Fused metadata copy kernel failed with error: {e}, falling back to individual copies."
+                )
+
+        # Fallback to individual copy operations if fused kernel disabled or failed
+        if not fused_kernel_succeeded:
+            # Copy basic seqlens
+            metadata.cache_seqlens_int32.copy_(precomputed.cache_seqlens)
+            metadata.cu_seqlens_k[1:].copy_(precomputed.cu_seqlens_k[1:])
+
+            # Mode-specific copy logic
+            if forward_mode.is_decode_or_idle():
+                # Decode mode
+                metadata.page_table_1[:, : precomputed.max_len].copy_(
+                    precomputed.page_indices
+                )
+                metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
+                # seqlens_expanded is same as cache_seqlens (already copied)
+
+            elif forward_mode.is_target_verify():
+                # Target verify mode
+                metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
+                    precomputed.page_indices
+                )
+                metadata.nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
+                metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
+
+            elif forward_mode.is_draft_extend():
+                # Draft extend mode
+                rows = precomputed.page_indices.shape[0]
+                cols = precomputed.max_seqlen_k
+                metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
+
+                size = precomputed.seqlens_expanded_size
+                metadata.nsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
+                metadata.nsa_cache_seqlens_int32[:size].copy_(
+                    precomputed.nsa_cache_seqlens
+                )
+
+            # Copy NSA cu_seqlens
             size = precomputed.seqlens_expanded_size
-            metadata.nsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-            metadata.nsa_cache_seqlens_int32[:size].copy_(precomputed.nsa_cache_seqlens)
+            metadata.nsa_cu_seqlens_k[1 : 1 + size].copy_(
+                precomputed.nsa_cu_seqlens_k[1 : 1 + size]
+            )
 
-        # Copy NSA cu_seqlens
-        size = precomputed.seqlens_expanded_size
-        metadata.nsa_cu_seqlens_k[1 : 1 + size].copy_(
-            precomputed.nsa_cu_seqlens_k[1 : 1 + size]
-        )
+            # Copy real page table
+            if precomputed.real_page_table is not None:
+                rows, cols = precomputed.real_page_table.shape
+                metadata.real_page_table[:rows, :cols].copy_(
+                    precomputed.real_page_table
+                )
 
-        # Copy real page table
-        if precomputed.real_page_table is not None:
-            rows, cols = precomputed.real_page_table.shape
-            metadata.real_page_table[:rows, :cols].copy_(precomputed.real_page_table)
-        else:
-            # real_page_table is same as page_table_1 (already copied)
-            pass
-
-        # Copy FlashMLA metadata
-        if precomputed.flashmla_metadata is not None:
-            flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-            flashmla_metadata.copy_(precomputed.flashmla_metadata)
+            # Copy FlashMLA metadata in fallback path
+            if precomputed.flashmla_metadata is not None:
+                size = precomputed.seqlens_expanded_size
+                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
+                flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
         self.forward_metadata = metadata
 
@@ -1837,6 +1947,8 @@ class NativeSparseAttnBackend(
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
+        if self._force_attn_forward_mla:
+            self.use_mha = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
@@ -1954,15 +2066,163 @@ class NativeSparseAttnMultiStepBackend:
                 spec_info=forward_batch.spec_info,
             )
 
-            # Fast copy to each backend (1-2x faster than computing N times)
-            for i in range(self.speculative_num_steps):
-                self.attn_backends[
-                    i
-                ].init_forward_metadata_replay_cuda_graph_from_precomputed(
-                    bs=bs,
-                    precomputed=precomputed,
-                    forward_mode=ForwardMode.DECODE,
-                )
+            # Use multi-backend fused copy when we have 3 or more backends
+            # This is 3x faster than calling the single-backend copy 3 times
+            if self.speculative_num_steps >= 3:
+                try:
+                    from sglang.jit_kernel.fused_metadata_copy import (
+                        fused_metadata_copy_multi_cuda,
+                    )
+
+                    metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
+                    metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
+                    metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
+
+                    # Set nsa_prefill_impl for first 3 backends (required by the method)
+                    for i in range(3):
+                        self.attn_backends[i].set_nsa_prefill_impl(forward_batch=None)
+
+                    # Prepare FlashMLA tensors if needed
+                    flashmla_num_splits_src = None
+                    flashmla_metadata_src = None
+                    flashmla_num_splits_dst0 = None
+                    flashmla_num_splits_dst1 = None
+                    flashmla_num_splits_dst2 = None
+                    flashmla_metadata_dst0 = None
+                    flashmla_metadata_dst1 = None
+                    flashmla_metadata_dst2 = None
+
+                    if precomputed.flashmla_metadata is not None:
+                        flashmla_num_splits_src = (
+                            precomputed.flashmla_metadata.num_splits
+                        )
+                        flashmla_metadata_src = (
+                            precomputed.flashmla_metadata.flashmla_metadata
+                        )
+                        flashmla_num_splits_dst0 = (
+                            metadata0.flashmla_metadata.num_splits
+                        )
+                        flashmla_num_splits_dst1 = (
+                            metadata1.flashmla_metadata.num_splits
+                        )
+                        flashmla_num_splits_dst2 = (
+                            metadata2.flashmla_metadata.num_splits
+                        )
+                        flashmla_metadata_dst0 = (
+                            metadata0.flashmla_metadata.flashmla_metadata
+                        )
+                        flashmla_metadata_dst1 = (
+                            metadata1.flashmla_metadata.flashmla_metadata
+                        )
+                        flashmla_metadata_dst2 = (
+                            metadata2.flashmla_metadata.flashmla_metadata
+                        )
+
+                    # Call the multi-backend fused kernel for first 3 backends
+                    fused_metadata_copy_multi_cuda(
+                        # Source tensors
+                        precomputed.cache_seqlens,
+                        precomputed.cu_seqlens_k,
+                        precomputed.page_indices,
+                        precomputed.nsa_cache_seqlens,
+                        precomputed.nsa_cu_seqlens_k,
+                        precomputed.real_page_table,
+                        flashmla_num_splits_src,
+                        flashmla_metadata_src,
+                        # Destination tensors for backend 0
+                        metadata0.cache_seqlens_int32,
+                        metadata0.cu_seqlens_k,
+                        metadata0.page_table_1,
+                        metadata0.nsa_cache_seqlens_int32,
+                        metadata0.nsa_cu_seqlens_k,
+                        (
+                            metadata0.real_page_table
+                            if precomputed.real_page_table is not None
+                            else None
+                        ),
+                        flashmla_num_splits_dst0,
+                        flashmla_metadata_dst0,
+                        # Destination tensors for backend 1
+                        metadata1.cache_seqlens_int32,
+                        metadata1.cu_seqlens_k,
+                        metadata1.page_table_1,
+                        metadata1.nsa_cache_seqlens_int32,
+                        metadata1.nsa_cu_seqlens_k,
+                        (
+                            metadata1.real_page_table
+                            if precomputed.real_page_table is not None
+                            else None
+                        ),
+                        flashmla_num_splits_dst1,
+                        flashmla_metadata_dst1,
+                        # Destination tensors for backend 2
+                        metadata2.cache_seqlens_int32,
+                        metadata2.cu_seqlens_k,
+                        metadata2.page_table_1,
+                        metadata2.nsa_cache_seqlens_int32,
+                        metadata2.nsa_cu_seqlens_k,
+                        (
+                            metadata2.real_page_table
+                            if precomputed.real_page_table is not None
+                            else None
+                        ),
+                        flashmla_num_splits_dst2,
+                        flashmla_metadata_dst2,
+                        # Parameters
+                        bs,
+                        precomputed.max_len,
+                        precomputed.seqlens_expanded_size,
+                    )
+
+                    # Verification: compare fused kernel results against individual copies
+                    if _VERIFY_FUSED_METADATA_COPY:
+                        verify_multi_backend_fused_metadata_copy(
+                            metadata0=metadata0,
+                            metadata1=metadata1,
+                            metadata2=metadata2,
+                            precomputed=precomputed,
+                            bs=bs,
+                            flashmla_num_splits_src=flashmla_num_splits_src,
+                            flashmla_metadata_src=flashmla_metadata_src,
+                        )
+
+                    # Copy remaining backends one by one (if > 3 backends)
+                    for i in range(3, self.speculative_num_steps):
+                        self.attn_backends[
+                            i
+                        ].init_forward_metadata_replay_cuda_graph_from_precomputed(
+                            bs=bs,
+                            precomputed=precomputed,
+                            forward_mode=ForwardMode.DECODE,
+                        )
+                except (ImportError, Exception) as e:
+                    # Fallback to loop if multi-backend kernel not available or fails
+                    if isinstance(e, ImportError):
+                        print(
+                            "Warning: Multi-backend fused metadata copy kernel not available, falling back to loop."
+                        )
+                    else:
+                        print(
+                            f"Warning: Multi-backend fused metadata copy kernel failed with error: {e}, falling back to loop."
+                        )
+                    for i in range(self.speculative_num_steps):
+                        self.attn_backends[
+                            i
+                        ].init_forward_metadata_replay_cuda_graph_from_precomputed(
+                            bs=bs,
+                            precomputed=precomputed,
+                            forward_mode=ForwardMode.DECODE,
+                        )
+            else:
+                # Less than 3 backends: copy to each backend individually
+                for i in range(self.speculative_num_steps):
+                    self.attn_backends[
+                        i
+                    ].init_forward_metadata_replay_cuda_graph_from_precomputed(
+                        bs=bs,
+                        precomputed=precomputed,
+                        forward_mode=ForwardMode.DECODE,
+                    )
         else:
             # Fallback: compute metadata separately for each backend
             for i in range(self.speculative_num_steps):
