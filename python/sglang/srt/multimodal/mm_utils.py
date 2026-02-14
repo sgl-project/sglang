@@ -573,11 +573,17 @@ def run_dp_sharded_mrope_vision_model(
             if isinstance(image_embeds_local, list):
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
-            out_dim = getattr(vision_model.config, "hidden_size", None)
-            image_embeds_local = torch.empty(
-                (0, embed_dim_reduction_factor, out_dim),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+            # Handle empty case
+            dummy_image_idxs_local = image_to_tp_rank[
+                cum_gpu_sample_counts[0] : cum_gpu_sample_counts[1]
+            ]
+            dummy_local_grid_thw_list = [
+                grid_thw_list[i] for i in dummy_image_idxs_local
+            ]
+            # out_dim = getattr(vision_model.config, "hidden_size", None)
+            # image_embeds_local shape is [0, embed_dim_reduction_factor, out_dim]
+            image_embeds_local = vision_model(
+                pixel_values_local, torch.tensor(dummy_local_grid_thw_list)
             )
     else:
         if pixel_values_local.shape[0] > 0:
@@ -587,10 +593,15 @@ def run_dp_sharded_mrope_vision_model(
             )
         else:
             # Handle empty case
-            image_embeds_local = torch.empty(
-                (0, vision_model.out_hidden_size),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+            dummy_image_idxs_local = image_to_tp_rank[
+                cum_gpu_sample_counts[0] : cum_gpu_sample_counts[1]
+            ]
+            dummy_local_grid_thw_list = [
+                grid_thw_list[i] for i in dummy_image_idxs_local
+            ]
+            # image_embeds_local shape is [0, vision_model.out_hidden_size]
+            image_embeds_local = vision_model(
+                pixel_values_local, torch.tensor(dummy_local_grid_thw_list)
             )
 
     # Pad the output based on max_len_per_rank

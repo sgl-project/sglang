@@ -540,6 +540,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw_list = grid_thw.tolist()
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if x.shape[0] == 0:
+            empty_image_embeds_local = torch.empty(
+                (0, self.out_hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            return empty_image_embeds_local
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
@@ -592,6 +599,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw_list = grid_thw.tolist()
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if x.shape[0] == 0:
+            empty_image_embeds_local = torch.empty(
+                (0, self.out_hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            return empty_image_embeds_local
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
