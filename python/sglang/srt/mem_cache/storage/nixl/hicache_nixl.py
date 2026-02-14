@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorage, 
+    HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
@@ -239,7 +239,7 @@ class HiCacheNixl(HiCacheStorage):
         if target_sizes and (len(target_sizes) != len(target_locations)):
             logger.error("Mismatch between number of target_locations and target_sizes")
             return [None] * len(keys)
-        
+
         if target_sizes:
             dest = list(zip(target_locations, target_sizes))
         else:
@@ -254,7 +254,7 @@ class HiCacheNixl(HiCacheStorage):
         else:
             success = self._execute_transfer(dest, suffixed_keys, "READ")
         return target_locations if success and not target_sizes else [None] * len(keys)
-        
+
     def set(
         self,
         key: str,
@@ -314,14 +314,16 @@ class HiCacheNixl(HiCacheStorage):
             "page_first_direct",
         ]
 
-        logger.info(f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}")
+        logger.info(
+            f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}"
+        )
 
     def exists(self, key: str) -> bool:
         results = self.batch_get([key])
         return results[0] is not None
 
     def batch_exists(
-        self, 
+        self,
         keys: List[str],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> int:
@@ -329,13 +331,15 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
-            key_multiplier = 1 if not self.is_mla_model else 2  # MLA model only has k buffer, no separate v buffer
+            key_multiplier = (
+                1 if not self.is_mla_model else 2
+            )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_multiplier = 1
-        
+
         # obtain list of tuples by calling self.registration.create_query_tuples()
-        tuples =[]
+        tuples = []
         for key in key_list:
             tuples += self.registration.create_query_tuples(
                 key,
@@ -357,7 +361,7 @@ class HiCacheNixl(HiCacheStorage):
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
         # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
         key_list = []
-        
+
         for key_ in keys:
             suffixed_key = self._get_suffixed_key(key_)
             if self.is_mla_model:
@@ -368,59 +372,71 @@ class HiCacheNixl(HiCacheStorage):
 
         return key_list
 
-    def _get_location_and_size_list_from_meta(self, keys: List[str], host_indices: torch.Tensor):
-        # zero copy: mem_pool_host.get_data_page() does not work due to non-contiguous tensors, causing issues for NIXL transfer
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
-        key_list = self._get_key_list_from_meta(keys)
-            
-        if len(key_list) != len(ptr_list):
-            logger.error(f"HiCacheNixl: mismatch between number of keys and number of buffer meta entries, keys: {len(keys)}, key_list: {len(key_list)}, buffer meta entries: {len(ptr_list)}")
-            return [], [], [], []
-            
-        return key_list, [], ptr_list, element_size_list
-    
-    def _batch_get_preprocess(
-        self, 
-        keys: List[str], 
-        host_indices: torch.Tensor
+    def _get_location_and_size_list_from_meta(
+        self, keys: List[str], host_indices: torch.Tensor
     ):
+        # zero copy: mem_pool_host.get_data_page() does not work due to non-contiguous tensors, causing issues for NIXL transfer
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
+            host_indices
+        )
+        key_list = self._get_key_list_from_meta(keys)
+
+        if len(key_list) != len(ptr_list):
+            logger.error(
+                f"HiCacheNixl: mismatch between number of keys and number of buffer meta entries, keys: {len(keys)}, key_list: {len(key_list)}, buffer meta entries: {len(ptr_list)}"
+            )
+            return [], [], [], []
+
+        return key_list, [], ptr_list, element_size_list
+
+    def _batch_get_preprocess(self, keys: List[str], host_indices: torch.Tensor):
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if len(keys) == 0 or len(keys) != page_num:
-            logger.warning(f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}")
+            logger.warning(
+                f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}"
+            )
             return [], [], [], []
 
         if self.is_zero_copy:
-            key_list, _, ptr_list, element_size_list = self._get_location_and_size_list_from_meta(keys, host_indices)
+            key_list, _, ptr_list, element_size_list = (
+                self._get_location_and_size_list_from_meta(keys, host_indices)
+            )
             return key_list, [], ptr_list, element_size_list
         else:
-            # non zero copy: create contiguous, temporary tensors 
-            target_tensors = [ 
-                self.mem_pool_host.get_dummy_flat_data_page() for i in range(page_num) 
+            # non zero copy: create contiguous, temporary tensors
+            target_tensors = [
+                self.mem_pool_host.get_dummy_flat_data_page() for i in range(page_num)
             ]
 
-            key_list = [ self._get_suffixed_key(key) for key in keys]
-            ptr_list = [ tensor.data_ptr() for tensor in target_tensors ]
-            element_size_list = [ tensor.numel() * tensor.element_size() for tensor in target_tensors ]
+            key_list = [self._get_suffixed_key(key) for key in keys]
+            ptr_list = [tensor.data_ptr() for tensor in target_tensors]
+            element_size_list = [
+                tensor.numel() * tensor.element_size() for tensor in target_tensors
+            ]
 
             return key_list, target_tensors, ptr_list, element_size_list
-    
+
     def _batch_get_zero_copy_impl(
         self,
         keys: List[str],
-        key_strs: List[str], 
+        key_strs: List[str],
         target_tensors: List[torch.Tensor],
-        target_locations: List[int], 
-        target_sizes: List[int]
+        target_locations: List[int],
+        target_sizes: List[int],
     ) -> List[int]:
-        
+
         if not key_strs or not target_locations or not target_sizes:
             return [False] * len(keys)
-        
-        if (len(key_strs) != len(target_locations)) or (len(target_sizes) != len(target_locations)):
-            logger.error("Mismatch between number of key_strs, target_locations and target_sizes")
+
+        if (len(key_strs) != len(target_locations)) or (
+            len(target_sizes) != len(target_locations)
+        ):
+            logger.error(
+                "Mismatch between number of key_strs, target_locations and target_sizes"
+            )
             return [False] * len(keys)
-        
+
         if self.is_zero_copy:
             dest = list(zip(target_locations, target_sizes))
         else:
@@ -433,21 +449,21 @@ class HiCacheNixl(HiCacheStorage):
             success = self._execute_transfer(dest, key_strs, "READ")
 
         return [True] * len(key_strs) if success else [False] * len(key_strs)
-    
+
     def _batch_get_postprocess(
-        self, 
-        host_indices: torch.Tensor, 
-        target_tensors: List[torch.Tensor], 
-        results: List[bool]
+        self,
+        host_indices: torch.Tensor,
+        target_tensors: List[torch.Tensor],
+        results: List[bool],
     ) -> List[bool]:
-        
+
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if self.is_zero_copy:
             # zero copy: update final results based on the boolean results from NIXL transfer
             if self.is_mla_model:
                 return results
-            else: 
+            else:
                 results = [
                     (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
                 ]
@@ -458,12 +474,11 @@ class HiCacheNixl(HiCacheStorage):
                 if not results[i]:
                     break
                 self.mem_pool_host.set_from_flat_data_page(
-                    host_indices[i * self.mem_pool_host.page_size], 
-                    target_tensors[i]
+                    host_indices[i * self.mem_pool_host.page_size], target_tensors[i]
                 )
 
             return results
-    
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -471,10 +486,14 @@ class HiCacheNixl(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
 
-        key_strs, target_tensors, buffer_ptrs, buffer_sizes = self._batch_get_preprocess(keys, host_indices)
+        key_strs, target_tensors, buffer_ptrs, buffer_sizes = (
+            self._batch_get_preprocess(keys, host_indices)
+        )
 
         if not key_strs or not buffer_ptrs or not buffer_sizes:
-            logger.error("HiCacheNixl batch_get_v1: preprocessing failed, empty key_strs, buffer_ptrs or buffer_sizes")
+            logger.error(
+                "HiCacheNixl batch_get_v1: preprocessing failed, empty key_strs, buffer_ptrs or buffer_sizes"
+            )
             return [False] * len(keys)
 
         start_time = time.perf_counter()
@@ -486,61 +505,70 @@ class HiCacheNixl(HiCacheStorage):
         end_time = time.perf_counter()
         elapsed_time_ms = (end_time - start_time) * 1000
         total_bytes = sum(s for s in buffer_sizes if s is not None)
-        
-        logger.debug(f"HiCacheNixl batch_get_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s")
+
+        logger.debug(
+            f"HiCacheNixl batch_get_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s"
+        )
 
         return self._batch_get_postprocess(host_indices, target_tensors, results_get)
 
-    def _batch_set_preprocess(
-        self, 
-        keys: List[str], 
-        host_indices: torch.Tensor
-    ):
+    def _batch_set_preprocess(self, keys: List[str], host_indices: torch.Tensor):
 
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if len(keys) == 0 or len(keys) != page_num:
-            logger.warning(f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}")
+            logger.warning(
+                f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}"
+            )
             return [], [], [], []
-        
+
         target_tensors = [
             self.mem_pool_host.get_data_page(
                 host_indices[i * self.mem_pool_host.page_size], flat=False
-            ) for i in range(page_num)
+            )
+            for i in range(page_num)
         ]
 
         if self.is_zero_copy:
-            key_list, _, ptr_list, element_size_list = self._get_location_and_size_list_from_meta(keys, host_indices)
+            key_list, _, ptr_list, element_size_list = (
+                self._get_location_and_size_list_from_meta(keys, host_indices)
+            )
             return key_list, [], ptr_list, element_size_list
         else:
             # non zero copy: NIXL still requires contiguous tensors for transfer
-            target_tensors = [ 
+            target_tensors = [
                 self.mem_pool_host.get_data_page(
                     host_indices[i * self.mem_pool_host.page_size], flat=False
                 ).contiguous()
                 for i in range(page_num)
             ]
 
-            key_list = [ self._get_suffixed_key(key) for key in keys]
-            ptr_list = [ tensor.data_ptr() for tensor in target_tensors ]
-            element_size_list = [ tensor.numel() * tensor.element_size() for tensor in target_tensors ]
+            key_list = [self._get_suffixed_key(key) for key in keys]
+            ptr_list = [tensor.data_ptr() for tensor in target_tensors]
+            element_size_list = [
+                tensor.numel() * tensor.element_size() for tensor in target_tensors
+            ]
 
             return key_list, target_tensors, ptr_list, element_size_list
-        
+
     def _batch_set_zero_copy_impl(
         self,
         keys: List[str],
-        key_strs: List[str], 
+        key_strs: List[str],
         target_tensors: List[torch.Tensor],
-        target_locations: List[int], 
-        target_sizes: List[int]
+        target_locations: List[int],
+        target_sizes: List[int],
     ) -> List[int]:
-        
+
         if not key_strs or not target_locations or not target_sizes:
             return [False] * len(keys)
-        
-        if (len(key_strs) != len(target_locations)) or (len(target_sizes) != len(target_locations)):
-            logger.error("Mismatch between number of key_strs, target_locations and target_sizes")
+
+        if (len(key_strs) != len(target_locations)) or (
+            len(target_sizes) != len(target_locations)
+        ):
+            logger.error(
+                "Mismatch between number of key_strs, target_locations and target_sizes"
+            )
             return [False] * len(keys)
 
         if self.is_zero_copy:
@@ -554,7 +582,9 @@ class HiCacheNixl(HiCacheStorage):
                 file_path = self.file_manager.get_file_path(key)
                 # New file per set, to be updated when partial writes is added to HiCache
                 if not self.file_manager.create_file(file_path):
-                    logger.error(f"******** Failed to create file {file_path} *********")
+                    logger.error(
+                        f"******** Failed to create file {file_path} *********"
+                    )
                     return False
                 file_paths.append(file_path)
             success = self._execute_transfer(src, file_paths, "WRITE")
@@ -562,7 +592,6 @@ class HiCacheNixl(HiCacheStorage):
             success = self._execute_transfer(src, key_strs, "WRITE")
 
         return [True] * len(keys) if success else [False] * len(keys)
-
 
     def batch_set_v1(
         self,
@@ -573,22 +602,28 @@ class HiCacheNixl(HiCacheStorage):
 
         if len(keys) == 0:
             return []
-        
-        key_strs, target_tensors, buffer_ptrs, buffer_sizes = self._batch_set_preprocess(keys, host_indices)
+
+        key_strs, target_tensors, buffer_ptrs, buffer_sizes = (
+            self._batch_set_preprocess(keys, host_indices)
+        )
 
         if not key_strs or not buffer_ptrs or not buffer_sizes:
-            logger.error("HiCacheNixl batch_set_v1: preprocessing failed, empty key_strs, buffer_ptrs or buffer_sizes")
+            logger.error(
+                "HiCacheNixl batch_set_v1: preprocessing failed, empty key_strs, buffer_ptrs or buffer_sizes"
+            )
             return [False] * len(keys)
 
         start_time = time.perf_counter()
 
         results_set = self._batch_set_zero_copy_impl(
-                keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes
-            )
-        
+            keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes
+        )
+
         end_time = time.perf_counter()
         elapsed_time_ms = (end_time - start_time) * 1000
         total_bytes = sum(s for s in buffer_sizes if s is not None)
-        logger.debug(f"HiCacheNixl batch_set_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s")
+        logger.debug(
+            f"HiCacheNixl batch_set_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s"
+        )
 
         return results_set

@@ -246,7 +246,9 @@ class NixlFileManager:
                     os.remove(os.path.join(root, file))
             logger.debug(f"Cleared all files in base directory: {self.base_dir}")
         except Exception as e:
-            logger.error(f"Failed to clear files in base directory {self.base_dir}: {e}")
+            logger.error(
+                f"Failed to clear files in base directory {self.base_dir}: {e}"
+            )
 
     def get_file_path(self, key: str) -> str:
         """Get full file path for a given key."""
