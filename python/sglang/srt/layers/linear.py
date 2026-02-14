@@ -36,7 +36,14 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -1316,6 +1323,9 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
+        self.gemm_ar_attn_op = None
+        self.gemm_ar_mlp_op = None
+
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -1410,6 +1420,15 @@ class RowParallelLinear(LinearBase):
                 param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_, skip_all_reduce=False):
+        if get_int_env_var("SGL_USE_TP_OVERLAP", 0) == 1:
+            if self.gemm_ar_attn_op:
+                output = self.gemm_ar_attn_op.forward(input_, self.weight, self.bias)
+            else:
+                output = self.gemm_ar_mlp_op.forward(input_, self.weight, self.bias)
+
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
