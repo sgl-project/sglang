@@ -177,12 +177,10 @@ if _use_aiter_gfx95:
         fused_qk_rope_cat_and_cache_mla,
         get_dsv3_gemm_output_zero_allocator_size,
     )
-if _is_hip:
-    from sglang.srt.layers.rocm_linear_utils import (
-        # aiter_dsv3_router_gemm,
-        fused_qk_rope_cat_and_cache_mla,
-        # get_dsv3_gemm_output_zero_allocator_size,
-    )
+
+if _use_aiter:
+    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_cpu and _is_cpu_amx_available:
