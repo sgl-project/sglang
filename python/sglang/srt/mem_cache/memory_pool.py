@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import is_sm100_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -235,7 +236,9 @@ class MambaPool:
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
-
+        # Force disable CUTEDSL_GDN_DECODE_TRANSPOSE if SM100 is not supported
+        if not is_sm100_supported():
+            envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.set(False)
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.enable_custom_mem_pool
@@ -261,6 +264,11 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+            # -> K contiguous
+            if envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get():
+                temporal_state = (
+                    temporal_state.transpose(-2, -1).contiguous().transpose(-2, -1)
+                )
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
@@ -276,6 +284,12 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
+                if envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get():
+                    intermediate_ssm_state_cache = (
+                        intermediate_ssm_state_cache.transpose(-2, -1)
+                        .contiguous()
+                        .transpose(-2, -1)
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
