@@ -213,7 +213,7 @@ if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 if is_h200_system():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 360000
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
