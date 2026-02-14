@@ -127,6 +127,33 @@ def download_from_hf(
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def _patch_text_config(parent_config: PretrainedConfig, text_config):
+    """Synchronize standard attributes between parent config and text sub-config.
+
+    In transformers v5, the "untangle config" refactor removed automatic
+    inheritance of top-level PretrainedConfig attributes (pad_token_id,
+    tie_word_embeddings, etc.) from sub-configs. Downstream code expects
+    these attributes to be present on both configs (some models pass the
+    parent directly to the language model, others pass the text sub-config),
+    so we propagate in both directions when an attribute is missing.
+    (See https://github.com/huggingface/transformers/pull/41541)
+    """
+    _ATTRS_TO_PROPAGATE = [
+        "pad_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "tie_word_embeddings",
+    ]
+    for attr in _ATTRS_TO_PROPAGATE:
+        parent_has = hasattr(parent_config, attr)
+        text_has = hasattr(text_config, attr)
+        if parent_has and not text_has:
+            setattr(text_config, attr, getattr(parent_config, attr))
+        elif text_has and not parent_has:
+            setattr(parent_config, attr, getattr(text_config, attr))
+    return text_config
+
+
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
@@ -141,20 +168,22 @@ def get_hf_text_config(config: PretrainedConfig):
             setattr(config, "dtype", torch.float16)
             return config
 
+    text_config = None
+
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
         # `num_attention_heads` (among others). Assert here to fail early
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
-        return config.text_config
+        text_config = config.text_config
 
     if hasattr(config, "llm_config"):
         # PointsV1.5 Chat Model
         assert hasattr(config.llm_config, "num_attention_heads")
-        return config.llm_config
+        text_config = config.llm_config
 
     if hasattr(config, "language_config"):
-        return config.language_config
+        text_config = config.language_config
     if hasattr(config, "thinker_config"):
         # qwen2.5 omni
         thinker_config = config.thinker_config
@@ -164,12 +193,16 @@ def get_hf_text_config(config: PretrainedConfig):
                 "torch_dtype",
                 getattr(thinker_config, "torch_dtype", None),
             )
-            return thinker_config.text_config
-        return thinker_config
+            text_config = thinker_config.text_config
+        else:
+            text_config = thinker_config
+
     if hasattr(config, "llm_config"):
-        return config.llm_config
-    else:
-        return config
+        text_config = config.llm_config
+
+    if text_config is not None:
+        return _patch_text_config(config, text_config)
+    return config
 
 
 # Temporary hack for DeepSeek-V3.2 model
