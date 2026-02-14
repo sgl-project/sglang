@@ -1,4 +1,5 @@
 import inspect
+import logging
 import os
 from copy import deepcopy
 from typing import Any
@@ -8,6 +9,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+    is_nunchaku_available,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
     NunchakuSVDQLinearMethod,
 )
@@ -24,7 +28,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -112,7 +116,7 @@ class TransformerLoader(ComponentLoader):
         For NVFP4 checkpoints, correctness depends on `wtscale` and attention
         `wcscales`. The FSDP loader may skip some of these metadata tensors.
         """
-        if not self._is_svdquant_config(quant_config):
+        if not self._is_svdquant_config(quant_config) or not is_nunchaku_available():
             return
 
         if not safetensors_list:
@@ -165,55 +169,15 @@ class TransformerLoader(ComponentLoader):
         if num_wcscales > 0:
             logger.info("Patched wcscales for %d layers", num_wcscales)
 
-    def _get_quant_config(self, server_args: ServerArgs) -> Any:
-        ncfg = getattr(server_args, "nunchaku_config", None)
-        if ncfg is None:
-            return None
-        if not getattr(ncfg, "enable_svdquant", False):
-            return None
-        if not getattr(ncfg, "quantized_model_path", None):
-            return None
-
-        from sglang.multimodal_gen.runtime.loader.nunchaku_loader import (
-            create_nunchaku_config_from_server_args,
-        )
-
-        return create_nunchaku_config_from_server_args(server_args)
-
-    def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
-    ):
-        """Load the transformer based on the model path, and inference args."""
-        config = get_diffusers_component_config(model_path=component_model_path)
-        hf_config = deepcopy(config)
-        cls_name = config.pop("_class_name")
-        if cls_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported."
-            )
-
-        component_name = _normalize_component_type(component_name)
-        server_args.model_paths[component_name] = component_model_path
-
-        if component_name in ("transformer", "video_dit"):
-            pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
-            pipeline_dit_config_attr = "audio_dit_config"
-        else:
-            raise ValueError(f"Invalid module name: {component_name}")
-        # Config from Diffusers supersedes sgl_diffusion's model config
-        dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
-        dit_config.update_model_arch(config)
-
-        model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
-
+    def get_list_of_safetensors_to_load(
+        self, server_args: ServerArgs, component_model_path: str
+    ) -> list[str]:
+        """
+        get list of safetensors to load
+        """
         quant_config = server_args.nunchaku_config
 
-        # get list of safetensors to load
-        if quant_config is not None and getattr(
-            quant_config, "quantized_model_path", None
-        ):
+        if quant_config is not None and quant_config.quantized_model_path:
             # load from quantized_model_path if applicable
             weights_path = quant_config.quantized_model_path
             logger.info("Using quantized model weights from: %s", weights_path)
@@ -246,13 +210,49 @@ class TransformerLoader(ComponentLoader):
                     )
                 safetensors_list = [custom_weights_path]
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        return safetensors_list
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
+    ):
+        """Load the transformer based on the model path, and inference args."""
+        config = get_diffusers_component_config(model_path=component_model_path)
+        hf_config = deepcopy(config)
+        cls_name = config.pop("_class_name")
+        if cls_name is None:
+            raise ValueError(
+                "Model config does not contain a _class_name attribute. "
+                "Only diffusers format is supported."
+            )
+
+        component_name = _normalize_component_type(component_name)
+        server_args.model_paths[component_name] = component_model_path
+
+        if component_name in ("transformer", "video_dit"):
+            pipeline_dit_config_attr = "dit_config"
+        elif component_name in ("audio_dit",):
+            pipeline_dit_config_attr = "audio_dit_config"
+        else:
+            raise ValueError(f"Invalid module name: {component_name}")
+        # Config from Diffusers supersedes sgl_diffusion's model config
+        dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
+        dit_config.update_model_arch(config)
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+
+        param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        quant_config = server_args.nunchaku_config
+        safetensors_list = self.get_list_of_safetensors_to_load(
+            server_args, component_model_path
+        )
 
         logger.info(
-            "Loading %s from %s safetensors files, default_dtype: %s",
+            "Loading %s from %s safetensors files %s, param_dtype: %s",
             cls_name,
             len(safetensors_list),
-            default_dtype,
+            f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
+            param_dtype,
         )
 
         # Load the model using FSDP loader
@@ -264,6 +264,15 @@ class TransformerLoader(ComponentLoader):
         ):
             init_params["quant_config"] = quant_config
 
+        cpu_offload = server_args.dit_cpu_offload
+        # if self._is_svdquant_config(quant_config) and is_nunchaku_available():
+        #     if cpu_offload:
+        #         logger.warning(
+        #             "Disabling dit_cpu_offload for Nunchaku SVDQuant to avoid "
+        #             "CPU-resident quantized weights."
+        #         )
+        #     cpu_offload = False
+
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
@@ -271,11 +280,11 @@ class TransformerLoader(ComponentLoader):
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=server_args.dit_cpu_offload,
+            cpu_offload=cpu_offload,
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
             # TODO(will): make these configurable
-            param_dtype=torch.bfloat16,
+            param_dtype=param_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
@@ -288,7 +297,7 @@ class TransformerLoader(ComponentLoader):
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         assert (
-            next(model.parameters()).dtype == default_dtype
-        ), f"Model dtype does not match default dtype, {next(model.parameters()).dtype} vs {default_dtype}"
+            next(model.parameters()).dtype == param_dtype
+        ), f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
 
         return model

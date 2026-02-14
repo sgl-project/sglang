@@ -6,6 +6,9 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+    is_nunchaku_available,
+)
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -19,9 +22,6 @@ except ImportError:
     svdq_gemm_w4a4_cuda = None
     awq_gemv_w4a16_cuda = None
     svdq_quantize_w4a4_act_fuse_lora_cuda = None
-    _NUNCHAKU_OPS_AVAILABLE = False
-else:
-    _NUNCHAKU_OPS_AVAILABLE = True
 
 
 class NunchakuSVDQLinearMethod(LinearMethodBase):
@@ -170,7 +170,7 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
-            not _NUNCHAKU_OPS_AVAILABLE
+            not is_nunchaku_available()
             or svdq_quantize_w4a4_act_fuse_lora_cuda is None
             or svdq_gemm_w4a4_cuda is None
         ):
@@ -279,7 +279,7 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not _NUNCHAKU_OPS_AVAILABLE or awq_gemv_w4a16_cuda is None:
+        if not is_nunchaku_available() or awq_gemv_w4a16_cuda is None:
             raise ImportError(
                 "nunchaku is required for AWQ linear method. "
                 "Install with: pip install nunchaku"
