@@ -267,7 +267,7 @@ class EagleVerifyInputV2Mixin:
         (which contains spec decoding information).
         """
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
             accept_length = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
