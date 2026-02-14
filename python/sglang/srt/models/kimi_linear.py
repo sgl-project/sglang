@@ -46,7 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import make_layers, is_npu
+from sglang.srt.utils import is_npu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 _is_npu = is_npu()
