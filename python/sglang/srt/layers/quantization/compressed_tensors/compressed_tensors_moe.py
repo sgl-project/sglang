@@ -32,6 +32,9 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    FlashInferTrtllmFp8MoeQuantInfo,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -52,6 +55,7 @@ from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
     replace_parameter,
+    swap_w13_to_w31,
     swizzle_blockscale,
 )
 from sglang.srt.utils import (
@@ -603,6 +607,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
+        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations"
@@ -864,11 +869,27 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.BLOCK
+            and self.use_flashinfer_trtllm
+        ):
+            layer.w13_weight = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight_scale.data),
+                requires_grad=False,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
@@ -917,16 +938,31 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
-            )
+            if self.use_flashinfer_trtllm:
+                quant_info = FlashInferTrtllmFp8MoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    global_num_experts=layer.num_experts,
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    routing_method_type=layer.routing_method_type,
+                    block_quant=self.block_quant,
+                    weight_block_k=self.quant_config.weight_block_size[1],
+                    w13_weight_scale_inv=layer.w13_weight_scale,
+                    w2_weight_scale_inv=layer.w2_weight_scale,
+                )
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8_w8a8=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a13_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    block_shape=self.weight_block_size,
+                )
             return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(

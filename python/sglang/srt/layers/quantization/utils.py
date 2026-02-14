@@ -565,6 +565,12 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
+def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
+    return (
+        x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
+    )
+
+
 def swizzle_blockscale(scale: torch.Tensor):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
