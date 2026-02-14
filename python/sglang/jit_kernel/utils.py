@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import pathlib
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
 import torch
@@ -11,12 +10,32 @@ if TYPE_CHECKING:
     from tvm_ffi import Module
 
 
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
-@lru_cache()
+@cache_once
 def _resolve_kernel_path() -> pathlib.Path:
     cur_dir = pathlib.Path(__file__).parent.resolve()
 
@@ -143,26 +162,6 @@ def load_jit(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
-
-
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-def cache_once(fn: F) -> F:
-    """
-    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
-    So we manually implement a simple cache_once decorator to replace it.
-    """
-    result_map = {}
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
-        if key not in result_map:
-            result_map[key] = fn(*args, **kwargs)
-        return result_map[key]
-
-    return wrapper  # type: ignore
 
 
 @cache_once

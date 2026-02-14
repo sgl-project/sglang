@@ -14,9 +14,11 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -61,9 +63,12 @@ class FunctionCallParser:
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
+        "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
+        "hermes": HermesDetector,
+        "gigachat3": GigaChat3Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):

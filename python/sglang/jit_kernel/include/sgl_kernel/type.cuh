@@ -37,6 +37,8 @@ struct dtype_trait {};
   static_assert(true)
 
 SGL_REGISTER_DTYPE_TRAIT(fp32_t, fp32x2_t, SGL_REGISTER_TYPE_END;  //
+                         SGL_REGISTER_FROM_FUNCTION(fp16_t, __half2float);
+                         SGL_REGISTER_FROM_FUNCTION(bf16_t, __bfloat162float);
                          SGL_REGISTER_UNARY_FUNCTION(abs, fabsf);
                          SGL_REGISTER_UNARY_FUNCTION(sqrt, sqrtf);
                          SGL_REGISTER_UNARY_FUNCTION(rsqrt, rsqrtf);

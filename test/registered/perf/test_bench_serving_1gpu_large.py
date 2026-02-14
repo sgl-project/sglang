@@ -4,7 +4,8 @@ Performance tests for single GPU that need H200 (80GB) - FP8 and EAGLE tests.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
@@ -16,7 +17,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-large-1-gpu-performance")
+register_cuda_ci(est_time=300, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=300, suite="stage-b-test-large-1-gpu-amd")
 
 
 class TestBenchServing1GPULarge(CustomTestCase):
@@ -38,6 +40,7 @@ class TestBenchServing1GPULarge(CustomTestCase):
             else:
                 self.assertGreater(res["output_throughput"], 4300)
 
+    @unittest.skipIf(is_hip(), "Skip Eagle test for ROCm")
     def test_online_latency_eagle(self):
         res = run_bench_serving(
             model=DEFAULT_TARGET_MODEL_EAGLE,

@@ -1758,17 +1758,8 @@ class SGLangFailuresAnalyzer:
                             test_data = test_info["test_data"]
                             job_data = test_info["job_data"]
 
-                            # Truncate names
-                            test_display = (
-                                test_file
-                                if len(test_file) <= 30
-                                else test_file[:27] + "..."
-                            )
-                            job_display = (
-                                job_name
-                                if len(job_name) <= 25
-                                else job_name[:22] + "..."
-                            )
+                            test_display = test_file
+                            job_display = job_name
 
                             # Get first and last failure from job level
                             first_failure = job_data.get("first_failure_in_streak")
@@ -1851,16 +1842,8 @@ class SGLangFailuresAnalyzer:
                             failed_runs = test_info["failed_runs"]
                             total_test_runs = test_info["total_test_runs"]
 
-                            test_display = (
-                                test_file
-                                if len(test_file) <= 30
-                                else test_file[:27] + "..."
-                            )
-                            job_display = (
-                                job_name
-                                if len(job_name) <= 25
-                                else job_name[:22] + "..."
-                            )
+                            test_display = test_file
+                            job_display = job_name
 
                             # Build history links
                             recent_runs = test_data.get("recent_runs", [])
