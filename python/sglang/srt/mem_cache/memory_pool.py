@@ -664,7 +664,7 @@ class KVCache(abc.ABC):
     PAGE_HEAD_LAYOUT = "NHBLD"
 
     def get_supported_layouts(self) -> List[str]:
-        """Return the supported layout of the KV cache, either "kv" or "k,v"."""
+        """Return the supported layout of the KV cache."""
         return [self.LAYER_FIRST_LAYOUT]  # by default, layer first must be supported
 
     def check_layout(self, layout: str) -> None:
