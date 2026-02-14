@@ -8,12 +8,14 @@ use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
+use smg_grpc_client::sglang_proto::generate_complete::MatchedStop::{
+    MatchedStopStr, MatchedTokenId,
+};
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::{
-    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
