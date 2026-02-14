@@ -52,12 +52,13 @@ on:
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{branch}-{pr_sha}-{stage}
+  # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
+  # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
+  #   (without it, both resolve the branch segment to 'main' and block each other)
   # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
   # - pr_head_sha isolates /rerun-stage from main branch runs
   # - target_stage allows parallel stage dispatches to run independently
-  # This ensures pull_request and workflow_dispatch on same branch cancel each other
-  group: pr-test-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
