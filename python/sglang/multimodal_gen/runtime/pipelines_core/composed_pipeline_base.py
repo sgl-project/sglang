@@ -274,10 +274,10 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            # Use custom VAE path if provided, otherwise use default path.
+            # Use custom VAE path if provided, otherwise use default path
             if module_name == "vae" and server_args.vae_path is not None:
                 component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally.
+                # Download from HuggingFace Hub if path doesn't exist locally
                 if not os.path.exists(component_model_path):
                     component_model_path = maybe_download_model(component_model_path)
                 logger.info(
@@ -293,7 +293,6 @@ class ComposedPipelineBase(ABC):
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
-            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
             self.memory_usages[load_module_name] = memory_usage
 
