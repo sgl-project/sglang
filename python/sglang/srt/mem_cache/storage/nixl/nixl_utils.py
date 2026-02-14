@@ -63,7 +63,7 @@ class NixlBackendConfig:
             config_data = self.config
 
         for key, value in config_data.items():
-            initparams[key] = value
+            initparams[key] = str(value)
 
         return initparams
 
