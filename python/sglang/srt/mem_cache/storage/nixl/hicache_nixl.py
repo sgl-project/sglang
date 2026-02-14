@@ -302,6 +302,9 @@ class HiCacheNixl(HiCacheStorage):
     # zero copy + non-zero-copy version for get, set, exists, batch_exists
     ############################################################################
 
+    def clear(self) -> None:
+        self.file_manager.clear()
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
 
