@@ -215,7 +215,6 @@ class TransformerLoader(ComponentLoader):
 
         quant_config = self._get_quant_config(server_args)
 
-
         # get list of safetensors to load
         if quant_config is not None and getattr(
             quant_config, "quantized_model_path", None
