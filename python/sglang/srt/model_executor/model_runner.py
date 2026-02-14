@@ -764,7 +764,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
+        # Allow external orchestrators (e.g. trainpi) to override the distributed
+        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
+        # env-vars and an externally-created TCPStore, completely avoiding port
+        # conflicts with intra-host collocation.
+        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        if dist_init_method_override:
+            dist_init_method = dist_init_method_override
+        elif self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
