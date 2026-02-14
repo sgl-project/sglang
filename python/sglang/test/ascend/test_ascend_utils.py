@@ -110,6 +110,9 @@ EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
 )
+MINIMAX_M2_WEIGHTS_PATH = s.path.join(
+    MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16"
+)
 
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
