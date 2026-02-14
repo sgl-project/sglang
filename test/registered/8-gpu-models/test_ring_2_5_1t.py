@@ -19,7 +19,6 @@ class TestRing2_5_1T(unittest.TestCase):
     """
 
     def test_ring_2_5_1t(self):
-        """Run accuracy test for Ring-2.5-1T."""
         base_args = [
             "--tp=8",
             "--trust-remote-code",
