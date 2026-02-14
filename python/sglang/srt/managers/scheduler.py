@@ -2202,11 +2202,6 @@ class Scheduler(
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
             logger.warning(msg_prefix + msg_details)
-            if retracted_reqs:
-                logger.info(
-                    "Retracted request ids: %s",
-                    [req.rid for req in retracted_reqs],
-                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
