@@ -1147,6 +1147,15 @@ class MiniCPMV4_0(MiniCPMBaseModel):
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
+    def get_embed_and_head(self):
+        """Get embedding and lm_head weights for EAGLE3 support."""
+        return self.llm.get_embed_and_head()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Set layers to capture for EAGLE3 speculative decoding."""
+        self.capture_aux_hidden_states = True
+        self.llm.set_eagle3_layers_to_capture(layer_ids)
+
 
 class MiniCPMV4_5(MiniCPMBaseModel):
     packed_modules_mapping = {
