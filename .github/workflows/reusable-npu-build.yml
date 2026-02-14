@@ -1,0 +1,153 @@
+name: Reusable NPU Docker Build Workflow
+
+on:
+  workflow_call:
+    inputs:
+      image_tag_prefix:
+        required: true
+        type: string
+      is_nightly:
+        required: false
+        type: boolean
+        default: false
+      is_release:
+        required: false
+        type: boolean
+        default: false
+      version:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            platform: linux/arm64
+            cann_version: "8.5.0"
+            device_type: "910b"
+            tag_suffix: arm64-cann8.5.0-910b
+          - runner: ubuntu-22.04
+            platform: linux/amd64
+            cann_version: "8.5.0"
+            device_type: "910b"
+            tag_suffix: x86-cann8.5.0-910b
+          - runner: ubuntu-22.04-arm
+            platform: linux/arm64
+            cann_version: "8.5.0"
+            device_type: "a3"
+            tag_suffix: arm64-cann8.5.0-a3
+          - runner: ubuntu-22.04
+            platform: linux/amd64
+            cann_version: "8.5.0"
+            device_type: "a3"
+            tag_suffix: x86-cann8.5.0-a3
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+            tool-cache: true
+            docker-images: true
+            android: true
+            dotnet: true
+            haskell: true
+            large-packages: true
+            swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+            username: ${{ secrets.DOCKERHUB_USERNAME }}
+            password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Image
+        run: |
+            docker buildx build \
+              --platform ${{ matrix.platform }} \
+              --push \
+              -f docker/npu.Dockerfile \
+              --build-arg SGLANG_KERNEL_NPU_TAG=2026.01.28 \
+              --build-arg CANN_VERSION=${{ matrix.cann_version }} \
+              --build-arg DEVICE_TYPE=${{ matrix.device_type }} \
+              -t lmsysorg/sglang:${{ inputs.image_tag_prefix }}-${{ matrix.tag_suffix }} \
+              --no-cache \
+              .
+
+  create-manifests:
+    runs-on: ubuntu-22.04
+    needs: [build]
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    strategy:
+      matrix:
+        device_type: ["910b", "a3"]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          if [ "${{ inputs.is_release }}" = "true" ]; then
+            docker buildx imagetools create \
+              -t lmsysorg/sglang:${{ inputs.image_tag_prefix }}-cann8.5.0-${{ matrix.device_type }} \
+              -t lmsysorg/sglang:latest-cann8.5.0-${{ matrix.device_type }} \
+              lmsysorg/sglang:${{ inputs.image_tag_prefix }}-x86-cann8.5.0-${{ matrix.device_type }} \
+              lmsysorg/sglang:${{ inputs.image_tag_prefix }}-arm64-cann8.5.0-${{ matrix.device_type }}
+          elif [ "${{ inputs.is_nightly }}" = "true" ]; then
+            docker buildx imagetools create \
+              -t lmsysorg/sglang:nightly-cann8.5.0-${{ matrix.device_type }} \
+              -t lmsysorg/sglang:nightly-cann8.5.0-${{ matrix.device_type }}-$(date +%Y%m%d)-${GITHUB_SHA:0:8} \
+              lmsysorg/sglang:nightly-x86-cann8.5.0-${{ matrix.device_type }} \
+              lmsysorg/sglang:nightly-arm64-cann8.5.0-${{ matrix.device_type }}
+          else
+            docker buildx imagetools create \
+              -t lmsysorg/sglang:${{ inputs.image_tag_prefix }}-cann8.5.0-${{ matrix.device_type }} \
+              lmsysorg/sglang:${{ inputs.image_tag_prefix }}-x86-cann8.5.0-${{ matrix.device_type }} \
+              lmsysorg/sglang:${{ inputs.image_tag_prefix }}-arm64-cann8.5.0-${{ matrix.device_type }}
+          fi
+
+      - name: Cleanup Old Nightly Builds
+        if: ${{ inputs.is_nightly }}
+        run: |
+          # Get JWT token for Docker Hub API
+          TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' https://hub.docker.com/v2/users/login/ | jq -r .token)
+
+          # Get all tags for the repository
+          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
+
+          # Extract tags that match our pattern and sort by last_updated timestamp (most recent first)
+          TAGS=$(echo "$TAGS_RESPONSE" | jq -r '.results[] | select(.name | startswith("nightly-cann8.5.0-${{ matrix.device_type }}-")) | "\(.last_updated)|\(.name)"' | sort -r | cut -d'|' -f2)
+
+          # Count total tags and keep only the 14 most recent
+          TAG_COUNT=$(echo "$TAGS" | wc -l)
+          if [ "$TAG_COUNT" -gt 14 ]; then
+            echo "Found $TAG_COUNT nightly builds, keeping only the 14 most recent"
+            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +15)
+            echo "Tags to delete: $TAGS_TO_DELETE"
+
+            # Delete old tags
+            for tag in $TAGS_TO_DELETE; do
+              echo "Deleting tag: $tag"
+              curl -X DELETE \
+                -H "Authorization: JWT $TOKEN" \
+                "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
+            done
+          else
+            echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
+          fi
