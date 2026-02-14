@@ -417,6 +417,9 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "auto"
 
+    attn_cp_size: int = 1
+    moe_dp_size: int = 1
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -744,6 +747,9 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+
+        # Handle context parallelism.
+        self._handle_context_parallelism()
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
@@ -1512,7 +1518,7 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM"]:
+        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
@@ -1538,6 +1544,7 @@ class ServerArgs:
 
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1589,6 +1596,7 @@ class ServerArgs:
                     )
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=True,
                 sm100_default_attention_backend="triton",
             )
@@ -1608,8 +1616,8 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.2
-                    if check_pkg_version_at_least("flashinfer-python", "0.6.2"):
+                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.3
+                    if check_pkg_version_at_least("flashinfer-python", "0.6.3"):
                         self.moe_runner_backend = "flashinfer_trtllm"
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
@@ -1622,6 +1630,7 @@ class ServerArgs:
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
@@ -1629,6 +1638,7 @@ class ServerArgs:
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
+                support_mamba_cache=True,
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="flashinfer",
             )
@@ -1698,7 +1708,8 @@ class ServerArgs:
             assert (
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
-        elif self.enable_mamba_extra_buffer():  # extra_buffer
+
+        if self.enable_mamba_extra_buffer():  # extra_buffer
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
@@ -2037,6 +2048,32 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+    def _handle_context_parallelism(self):
+        if self.attn_cp_size > 1:
+            # The tp_size is the world size, not the real tensor parallel size
+            assert (
+                self.tp_size % self.attn_cp_size == 0
+            ), "tp_size must be divisible by attn_cp_size"
+            assert (
+                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
+            ), "tp_size must be divisible by dp_size * attn_cp_size"
+            assert self.pp_size == 1, "PP is not supported with context parallelism"
+
+        if self.moe_dp_size > 1:
+            # The tp_size is the world size, not the real tensor parallel size
+            assert (
+                self.tp_size % self.moe_dp_size == 0
+            ), "tp_size must be divisible by moe_dp_size"
+            assert (
+                self.ep_size * self.moe_dp_size <= self.tp_size
+            ), "ep_size * moe_dp_size must be less than or equal to tp_size"
+            assert self.pp_size == 1, "PP is not supported with context parallelism"
+
+            if self.ep_size > 1:
+                assert (
+                    self.ep_size * self.moe_dp_size == self.tp_size
+                ), "ep_size * moe_dp_size must be equal to tp_size"
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -2334,6 +2371,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
+                "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
@@ -3234,6 +3272,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--attention-context-parallel-size",
+            "--attn-cp-size",
+            type=int,
+            default=ServerArgs.attn_cp_size,
+            help="The attention context parallelism size.",
+        )
+        parser.add_argument(
+            "--moe-data-parallel-size",
+            "--moe-dp-size",
+            type=int,
+            default=ServerArgs.moe_dp_size,
+            help="The moe data parallelism size.",
         )
         parser.add_argument(
             "--pipeline-parallel-size",
@@ -4983,6 +5035,8 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.pp_size = args.pipeline_parallel_size
+        args.attn_cp_size = args.attention_context_parallel_size
+        args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
@@ -5681,6 +5735,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "MiMoV2FlashForCausalLM",

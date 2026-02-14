@@ -98,6 +98,11 @@ ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
 ARG ARCH=x86_64
 ARG USE_CCACHE=1
+# Parallelism knobs (override via --build-arg)
+#   BUILD_JOBS: number of parallel compilation units (ninja -j)
+#   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
+ARG BUILD_JOBS=0
+ARG NVCC_THREADS=32
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
@@ -121,13 +126,18 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
       export CMAKE_BUILD_PARALLEL_LEVEL=2; \
       export NINJAFLAGS="-j2"; \
       echo "ARM detected: Using extra conservative settings (2 parallel jobs)"; \
+    elif [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then \
+      export CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}; \
     else \
-      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) / 3 )) 48" | awk '{print ($1 < $2) ? $1 : $2}'); \
+      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
-      export CMAKE_ARGS="--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
+      export CMAKE_ARGS="${CMAKE_ARGS} --profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
     fi; \
+    echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"; \
+    echo "CMAKE_ARGS=${CMAKE_ARGS}"; \
     ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation; \
     ./rename_wheels.sh; \
     if [ -n "${ENABLE_BUILD_PROFILE:-}" ] && [ -f /sgl-kernel/build/.ninja_log ]; then \
