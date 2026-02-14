@@ -82,13 +82,6 @@ class HiCacheNixl(HiCacheStorage):
 
         self.registration = NixlRegistration(self.agent)
 
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
-        super().register_mem_pool_host(mem_pool_host)
-        self.is_zero_copy = self.mem_pool_host.layout in [
-            "page_first",
-            "page_first_direct",
-        ]
-
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -141,12 +134,6 @@ class HiCacheNixl(HiCacheStorage):
                 logger.error("Failed to register objects")
                 return False
 
-        logger.debug(f"---- buffer type: {type(buffers[0])}")
-
-        # logger.debug(f"Prepared transfer tuples: \n")
-        # for i, tup in enumerate(tuples[:min(20, len(tuples))]):
-        #     logger.debug(f"\t {i}: {tup}\n")
-
         # Prepare transfer descriptors
         if isinstance(buffers[0], torch.Tensor):
             tensor_sizes = [
@@ -156,7 +143,7 @@ class HiCacheNixl(HiCacheStorage):
             host_descs = self.agent.get_xfer_descs(buffers)
 
             if direction == "READ" or direction == "WRITE":
-                logger.debug(f"+++++ register buffers for {direction=} Tensor: {hex(id(buffers))}")
+                # register buffer to avoid calling initialize_xfer twice due to missing registration
                 self.register_buffers(buffers)
 
         elif isinstance(buffers[0], tuple):
@@ -166,7 +153,7 @@ class HiCacheNixl(HiCacheStorage):
             )
 
             if direction == "READ" or direction == "WRITE":
-                logger.debug(f"+++++ register buffers for {direction=} tuple {hex(id(buffers))}")
+                # register buffer to avoid calling initialize_xfer twice due to missing registration
                 self.register_buffers(buffers)
 
         else:
@@ -182,8 +169,6 @@ class HiCacheNixl(HiCacheStorage):
 
         # Initialize transfer, default assumption that tensor was registered
 
-        logger.debug( f"to initialize xfer: {direction} transfer with {host_descs.descCount()} local host descs, and remote storage descs: {storage_descs.descCount()} for {direction=} with buffers: {hex(id(buffers))}, and {len(keys)} keys, with mem_type: {self.backend_selector.mem_type}")
-
         try:
             xfer_req = self.agent.initialize_xfer(
                 direction, host_descs, storage_descs, self.agent_name
@@ -194,8 +179,6 @@ class HiCacheNixl(HiCacheStorage):
                 logger.error("Failed to register tensors/buffers")
                 return False
 
-            logger.debug( f"Re-attempting to initialize transfer after registering buffers: exception caught {e_first}")
-
             try:
                 xfer_req = self.agent.initialize_xfer(
                     direction, host_descs, storage_descs, self.agent_name
@@ -203,10 +186,6 @@ class HiCacheNixl(HiCacheStorage):
             except Exception as e:
                 logger.error(f"Failed to create transfer request: {e}")
                 return False
-            finally:
-                logger.debug(f"+++++ after re-attempting, register buffers for {direction=} : {hex(id(buffers))}, successfully registered buffers and initialized transfer.")
-        finally:
-            logger.debug(f"+++++ Transfer initialized successfully: {direction=} : {hex(id(buffers))}, successfully initialized transfer request: {xfer_req}")
 
         # Execute transfer and wait for its completion
         try:
@@ -244,32 +223,6 @@ class HiCacheNixl(HiCacheStorage):
             result = self.batch_get([key], [target_location])
         return result[0] if result else None
 
-    def are_tensors_contiguous_in_memory(self, tensors: List[torch.Tensor]) -> bool:
-        if not tensors:
-            return False
-
-        # Ensure all tensors are contiguous internally
-        for i, t in enumerate(tensors):
-            if not t.is_contiguous():
-                print(f"Tensor {i} is not internally contiguous.")
-                return False
-
-        # Sort tensors by memory address
-        tensors = sorted(tensors, key=lambda t: t.data_ptr())
-
-        for i in range(len(tensors) - 1):
-            current = tensors[i]
-            next_tensor = tensors[i + 1]
-
-            current_start = current.data_ptr()
-            current_end = current_start + current.numel() * current.element_size()
-            next_start = next_tensor.data_ptr()
-
-            if current_end != next_start:
-                return False
-
-        return True
-
     def batch_get(
         self,
         keys: List[str],
@@ -282,22 +235,6 @@ class HiCacheNixl(HiCacheStorage):
         # To be removed, being compatible with the current API
         if not target_locations:
             return [None] * len(keys)
-        
-        # print a portion of target_locations for debugging
-        logger.debug(f"HiCacheNixl batch_get(): to fetch {len(keys)} keys from HiCacheNixl storage with target_locations sample: {len(target_locations)}")
-
-        # print element type, size, numel of target_locations if they are tensors for debugging
-        # if isinstance(target_locations[0], torch.Tensor):
-        #     for i, loc in enumerate(target_locations[:min(20, len(target_locations))]):
-        #         logger.debug(f"\t target_location {i}: dtype={loc.dtype}, size={loc.size()}, {loc.element_size()} bytes per element, device: {loc.device}, numel={loc.numel()}")
-
-        for i, v in enumerate(target_locations):
-                if isinstance(v, torch.Tensor) and not v.is_contiguous():
-                    logger.debug(f"batch_get: target {i} is a NON-CONTIGUOUS tensor with dtype={v.dtype}, size={v.size()}, {v.element_size()} bytes per element, device: {v.device}, numel={v.numel()}, contiguous: {v.is_contiguous()}")
-
-        # tensors = sorted(target_locations, key=lambda t: t.data_ptr())
-        # for i, t in enumerate(tensors):
-        #     logger.debug(f"\t{i} target_location tensor contiguous {t.is_contiguous() if isinstance(t, torch.Tensor) else 'N/A'} data_ptr: {t.data_ptr():X} length in bytes: {t.numel() * t.element_size()} end ptr: {t.data_ptr() + t.numel() * t.element_size():X}")
 
         if target_sizes and (len(target_sizes) != len(target_locations)):
             logger.error("Mismatch between number of target_locations and target_sizes")
@@ -343,20 +280,6 @@ class HiCacheNixl(HiCacheStorage):
 
         if not values:
             values = list(zip(target_locations, target_sizes))
-        else:
-            # # check if each tensor in values is contiguous in memory for optimization
-            # for i, v in enumerate(values):
-            #     if isinstance(v, torch.Tensor):
-            #         logger.debug(f"Value {i} is a tensor with dtype={v.dtype}, size={v.size()}, {v.element_size()} bytes per element, device: {v.device}, numel={v.numel()}, contiguous: {v.is_contiguous()}")
-            #     else:
-            #         logger.debug(f"Value {i} is a tuple of (target_location, target_size): {v}")
-            for i, v in enumerate(values):
-                if isinstance(v, torch.Tensor) and not v.is_contiguous():
-                    logger.debug(f"batch_set: Value {i} is a NON-CONTIGUOUS tensor with dtype={v.dtype}, size={v.size()}, {v.element_size()} bytes per element, device: {v.device}, numel={v.numel()}, contiguous: {v.is_contiguous()}")
-            
-            # check if the tensors in values are contiguous in memory for optimization
-            if isinstance(values[0], torch.Tensor):
-                logger.debug(f"batch_set: Values are {'contiguous' if self.are_tensors_contiguous_in_memory(values) else 'NOT contiguous'} in memory for optimization.")
 
         # Add suffix to keys
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
@@ -373,6 +296,22 @@ class HiCacheNixl(HiCacheStorage):
             return self._execute_transfer(values, file_paths, "WRITE")
         else:  # mem_type == "OBJ"
             return self._execute_transfer(values, suffixed_keys, "WRITE")
+
+    ############################################################################
+    # batch_*_v1 functions
+    # zero copy + non-zero-copy version for get, set, exists, batch_exists
+    ############################################################################
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        super().register_mem_pool_host(mem_pool_host)
+
+        # enable zero-copy automatically if mem layout is page_first or page_first_direct
+        self.is_zero_copy = self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+        ]
+
+        logger.info(f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}")
 
     def exists(self, key: str) -> bool:
         results = self.batch_get([key])
@@ -412,137 +351,6 @@ class HiCacheNixl(HiCacheStorage):
                 return i // key_multiplier
         return len(query_res) // key_multiplier
 
-    ############################################################################
-    # pseudo zero copy version of get and set
-    ############################################################################
-
-    def _batch_get_preprocess_pseudo(self, keys, host_indices):
-
-        page_num = len(host_indices) // self.mem_pool_host.page_size
-
-        # host_indices to kv_buffers for NIXL transfer
-        values = (
-            [
-                self.mem_pool_host.get_data_page(
-                    host_indices[i * self.mem_pool_host.page_size], flat=False
-                )
-                for i in range(page_num)
-            ]
-        )
-
-        for i, v in enumerate(values):
-            if isinstance(v, torch.Tensor):
-                logger.debug(f"Preprocess value {i} is a tensor with dtype={v.dtype}, size={v.size()}, {v.element_size()} bytes per element, device: {v.device}, numel={v.numel()}, contiguous: {v.is_contiguous()}")
-            else:
-                logger.debug(f"Preprocess value {i} is a tuple of (target_location, target_size): {v}")
-        
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
-
-        logger.debug(f"HiCacheNixl batch_get_preprocess: prepared host buffers for NIXL transfer with \n\t keys: {keys}, \n\tptr_list: {ptr_list}, \n\t element_size_list: {element_size_list}")
-
-        return keys, values
-
-    def _batch_get_postprocess_pseudo(self, host_indices, values, results):
-        # postprocess results if needed, currently just returns the boolean results as is
-
-        return results
-    
-    def batch_get_v1_pseudo(
-        self,
-        keys: List[str],
-        host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        
-        print(f"HiCacheNixl batch_get_v1 called with: \n\t {len(keys)} keys {keys}, \n\t {len(host_indices)} host_indices")
-
-        # print a portion of host_indices for debugging
-        # print(f"HiCacheNixl batch_get_v1 host_indices sample: {host_indices[:min(20, len(host_indices))]}")
-
-        print(f"HiCacheNixl batch_get_v1 host_indices dtype: {host_indices.dtype}, size: {host_indices.size()}, {host_indices.element_size()} bytes per element, device: {host_indices.device}, numel: {host_indices.numel()}")
-
-        # print a small portion of host_indices for debugging
-        # print(f"HiCacheNixl batch_get_v1 host_indices sample: {host_indices[:min(20, len(host_indices))]}")
-
-        # print element type, size, numel of host_indices for debugging
-        # for i, idx in enumerate(host_indices[:min(20, len(host_indices))]):
-            # print(f"\t host_index {i}: dtype={idx.dtype}, size={idx.size()}, numel={idx.numel()}")
-
-        # print the continuity of host_indices for debugging
-        if len(host_indices) > 1:
-            continuity = all(
-                host_indices[i] + 1 == host_indices[i + 1] for i in range(len(host_indices) - 1)
-            )
-            print(f"HiCacheNixl batch_get_v1 host_indices continuity: {continuity}")
-
-        start_time = time.perf_counter()
-
-        keys, values = self._batch_get_preprocess(keys, host_indices)
-
-        # print(f"HiCacheNixl batch_get_v1 after preprocess: \n\t {len(keys)} keys: {keys}, \n\t {len(values)} values")
-
-        results_batch_get = self.batch_get(keys, values)
-        results = [True if res is not None else False for res in results_batch_get]
-
-        end_time = time.perf_counter()
-        elapsed_time_ms = (end_time - start_time) * 1000
-
-        total_bytes = sum(v.numel() * v.element_size() for v in values if isinstance(v, torch.Tensor))
-        logger.debug(f"HiCacheNixl batch_get_v1 total bytes transferred: {all(results)}, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s")
-
-        return self._batch_get_postprocess(host_indices, values, results)
-    
-    def _batch_set_preprocess_pseudo(self, keys, host_indices):
-        page_num = len(host_indices) // self.mem_pool_host.page_size
-
-        values = [
-            self.mem_pool_host.get_data_page(
-                host_indices[i * self.mem_pool_host.page_size], flat=False
-            )
-            for i in range(page_num)
-        ]
-
-        for i, v in enumerate(values):
-            if isinstance(v, torch.Tensor):
-                logger.debug(f"Preprocess value {i} is a tensor with dtype={v.dtype}, size={v.size()}, {v.element_size()} bytes per element, device: {v.device}, numel={v.numel()}, contiguous: {v.is_contiguous()}")
-            else:
-                logger.debug(f"Preprocess value {i} is a tuple of (target_location, target_size): {v}")
-        
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
-
-        logger.debug(f"HiCacheNixl batch_get_preprocess: prepared host buffers for NIXL transfer with \n\t keys: {keys}, \n\tptr_list: {ptr_list}, \n\t element_size_list: {element_size_list}")
-
-
-        return keys, values
-
-    def batch_set_v1_pseudo(
-        self,
-        keys: List[str],
-        host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
-    ) -> List[bool]:
-        
-        logger.debug(f"HiCacheNixl batch_set_v1 called with: \n\t {len(keys)} keys {keys}, \n\t {len(host_indices)} host_indices")
-
-        logger.debug(f"HiCacheNixl batch_set_v1 host_indices dtype: {host_indices.dtype}, size: {host_indices.size()}, {host_indices.element_size()} bytes per element, device: {host_indices.device}, numel: {host_indices.numel()}")
-
-        logger.debug(f"HiCacheNixl batch_set_v1 extra_info: {extra_info}")
-        
-        keys, values = self._batch_set_preprocess(keys, host_indices)
-
-        results_batch_set = self.batch_set(keys, values)
-
-        logger.debug(f"HiCacheNixl batch_set_v1 completed batch_set with result: {results_batch_set}")
-
-        # batch_set returns a single boolean for the whole batch, so we replicate it for each key
-        results = [results_batch_set] * len(keys)  
-
-        return results
-
-    ############################################################################
-    # zero copy version of get and set
-    ############################################################################
-    
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
         # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
         key_list = []
@@ -573,7 +381,6 @@ class HiCacheNixl(HiCacheStorage):
         keys: List[str], 
         host_indices: torch.Tensor
     ):
-
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if len(keys) == 0 or len(keys) != page_num:
@@ -610,9 +417,6 @@ class HiCacheNixl(HiCacheStorage):
         if (len(key_strs) != len(target_locations)) or (len(target_sizes) != len(target_locations)):
             logger.error("Mismatch between number of key_strs, target_locations and target_sizes")
             return [False] * len(keys)
-        
-        # print a portion of target_locations for debugging
-        logger.debug(f"HiCacheNixl batch_get_zero_copy_impl: constructed key list for NIXL transfer based on keys and suffix with keys: {len(keys)}, key_list: {len(key_strs)}, target_locations: {len(target_locations)}, target_sizes: {len(target_sizes)}")
         
         if self.is_zero_copy:
             dest = list(zip(target_locations, target_sizes))
@@ -663,8 +467,6 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-
-        logger.debug(f"HiCacheNixl batch_get_v1 called with: {len(keys)} keys {len(host_indices)} host_indices")
 
         key_strs, target_tensors, buffer_ptrs, buffer_sizes = self._batch_get_preprocess(keys, host_indices)
 
@@ -737,10 +539,7 @@ class HiCacheNixl(HiCacheStorage):
         if (len(key_strs) != len(target_locations)) or (len(target_sizes) != len(target_locations)):
             logger.error("Mismatch between number of key_strs, target_locations and target_sizes")
             return [False] * len(keys)
-        
-        # print a portion of target_locations for debugging
-        logger.debug(f"HiCacheNixl batch_set_zero_copy_impl: constructed key list for NIXL transfer based on keys and suffix with keys: {len(keys)}, key_list: {len(key_strs)}, target_locations: {len(target_locations)}, target_sizes: {len(target_sizes)}")
-        
+
         if self.is_zero_copy:
             src = list(zip(target_locations, target_sizes))
         else:
