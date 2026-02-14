@@ -72,6 +72,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
                 other_args = list(model_setup.extra_args)
+                other_args.append("--enable-piecewise-cuda-graph")
                 error_message = None
 
                 if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
