@@ -6,7 +6,7 @@ Welcome to **SGLang**! We appreciate your interest in contributing. This guide p
 
 ### Prepare Environment
 
-Before contributing, please ensure that your environment is set up correctly. Follow the steps in the [Installation Guide](../platforms/ascend_npu.md) to install the necessary dependencies. we recommend [using docker](../platforms/ascend_npu.md#method-2-using-docker-image) to build the environment.
+Before contributing, please ensure that your environment is set up correctly. Follow the steps in the [Installation Guide](../platforms/ascend_npu.md) to install the necessary dependencies. We recommend [using docker](../platforms/ascend_npu.md#method-2-using-docker-image) to build the environment.
 
 ### Fork and clone the repository
 

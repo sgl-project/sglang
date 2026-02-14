@@ -446,10 +446,19 @@ def enable_cache_on_dual_transformer(
         compute_steps = sum(primary_config.steps_computation_mask)
         cache_steps = len(primary_config.steps_computation_mask) - compute_steps
         logger.info(
-            "  SCM enabled: %d compute steps, %d cache steps, policy=%s",
+            "  SCM enabled for primary transformer: %d compute steps, %d cache steps, policy=%s",
             compute_steps,
             cache_steps,
             primary_config.steps_computation_policy,
+        )
+    if secondary_config.steps_computation_mask:
+        compute_steps = sum(secondary_config.steps_computation_mask)
+        cache_steps = len(secondary_config.steps_computation_mask) - compute_steps
+        logger.info(
+            "  SCM enabled for secondary transformer: %d compute steps, %d cache steps, policy=%s",
+            compute_steps,
+            cache_steps,
+            secondary_config.steps_computation_policy,
         )
 
     parallelism_config = _build_parallelism_config(sp_group, tp_group)
@@ -508,3 +517,60 @@ def enable_cache_on_dual_transformer(
                 context_manager._sglang_tp_sp_group = tp_sp_group
 
     return transformer, transformer_2
+
+
+def refresh_context_on_transformer(
+    transformer: torch.nn.Module,
+    num_inference_steps: int,
+    scm_preset: str | None = None,
+    verbose: bool = False,
+) -> None:
+    """Refresh cache-dit context for transformer."""
+    cache_dit.refresh_context(
+        transformer,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_inference_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
+    )
+    logger.debug(f"cache-dit refreshed on transformer (steps={num_inference_steps})")
+
+
+def refresh_context_on_dual_transformer(
+    transformer: torch.nn.Module,
+    transformer_2: torch.nn.Module,
+    num_high_noise_steps: int,
+    num_low_noise_steps: int,
+    scm_preset: str | None = None,
+    verbose: bool = False,
+) -> None:
+    """Refresh cache-dit context for dual transformers."""
+    cache_dit.refresh_context(
+        transformer,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_high_noise_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_high_noise_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
+    )
+    cache_dit.refresh_context(
+        transformer_2,
+        cache_config=DBCacheConfig().reset(
+            num_inference_steps=num_low_noise_steps,
+            steps_computation_mask=cache_dit.steps_mask(
+                mask_policy=scm_preset, total_steps=num_low_noise_steps
+            ),
+            steps_computation_policy=scm_preset,
+        ),
+        verbose=verbose,
+    )
+    logger.debug(
+        f"cache-dit refreshed on dual transformers (steps={num_high_noise_steps}, {num_low_noise_steps})"
+    )

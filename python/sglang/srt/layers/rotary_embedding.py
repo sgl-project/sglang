@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -36,7 +37,10 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+    from sglang.jit_kernel.rope import (
+        FusedSetKVBufferArg,
+        apply_rope_with_cos_sin_cache_inplace,
+    )
 else:
     FusedSetKVBufferArg = None
 
@@ -124,8 +128,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
         ):
+            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
             if _is_cuda or _is_hip:
-                from sgl_kernel import rotary_embedding
+                from sglang.jit_kernel.pos_enc import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -400,6 +406,7 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
+
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
@@ -799,6 +806,191 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+class FourierRotaryEmbedding(nn.Module):
+    """Fourier RotaryEmbedding extended."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        num_kv_heads: int,
+        *,
+        fope_init_factor: float = 0.1,
+        fope_sep_head: bool = True,
+        num_inv_freq: int = None,
+        device: Optional[str] = "cuda",
+    ) -> None:
+        self.fope_init_factor = fope_init_factor
+        self.fope_sep_head = fope_sep_head
+        self.num_inv_freq = num_inv_freq
+        self.num_kv_heads = num_kv_heads
+        self.device = device
+
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+
+        self.fope_init_factor = fope_init_factor
+        self.fope_sep_head = fope_sep_head
+        self.num_inv_freq = num_inv_freq
+        self.num_kv_heads = num_kv_heads
+
+        self.inv_freq: torch.Tensor
+        self.register_buffer(
+            "inv_freq", self._compute_inv_freq(self.base), persistent=False
+        )
+        self.input_dim = self.inv_freq.shape[-1]
+        self.output_dim = self.inv_freq.shape[-1]
+        self.cos_coef = nn.Parameter(
+            torch.empty(
+                self.num_kv_heads, self.input_dim, self.output_dim, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        self.sin_coef = nn.Parameter(
+            torch.empty(
+                self.num_kv_heads, self.input_dim, self.output_dim, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer(
+            "cos_sin_cache", self._compute_cos_sin_cache(), persistent=False
+        )
+        # update cos_sin_cache after update weights
+        self.update_buffer = False
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        """Compute the inverse frequency."""
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.int64).to(
+                    device=self.device, dtype=torch.float
+                )
+                / self.rotary_dim
+            )
+        )
+
+        assert (
+            inv_freq[:-1] > inv_freq[1:]
+        ).all(), "Expected inv_freq to be in decreasing order"
+
+        inv_freq_idx_selected = torch.ones_like(inv_freq, dtype=torch.bool)
+        if self.num_inv_freq is not None:
+            inv_freq_idx_selected[self.num_inv_freq :] = False
+        else:
+            inv_freq_idx_selected = inv_freq > (
+                2.0 * torch.pi / self.max_position_embeddings
+            )
+
+        inv_freq = inv_freq[inv_freq_idx_selected]
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the cos and sin cache."""
+
+        t = torch.arange(
+            self.max_position_embeddings, dtype=torch.float, device=self.device
+        )
+
+        freqs = torch.einsum("i,j -> ij", t, self.inv_freq)
+        if self.fope_sep_head:
+            pos_cos = freqs.cos().unsqueeze(0).expand(self.num_kv_heads, -1, -1)
+            pos_sin = freqs.sin().unsqueeze(0).expand(self.num_kv_heads, -1, -1)
+        else:
+            pos_cos = freqs.cos()
+            pos_sin = freqs.sin()
+
+        if self.fope_sep_head:
+            sin = torch.einsum("htD, hDd -> thd", pos_sin, self.sin_coef.float())
+            cos = torch.einsum("htD, hDd -> thd", pos_cos, self.cos_coef.float())
+        else:
+            sin = torch.einsum("tD, Dd -> td", pos_sin, self.sin_coef.float())
+            cos = torch.einsum("tD, Dd -> td", pos_cos, self.cos_coef.float())
+
+        sin = F.pad(
+            input=sin,
+            pad=(0, self.head_size // 2 - sin.size(-1)),
+            mode="constant",
+            value=1,
+        )
+        cos = F.pad(
+            input=cos,
+            pad=(0, self.head_size // 2 - cos.size(-1)),
+            mode="constant",
+            value=1,
+        )
+
+        sin = torch.cat((sin, sin), dim=-1)
+        cos = torch.cat((cos, cos), dim=-1)
+
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.update_buffer:
+            self.cos_sin_cache = self._compute_cos_sin_cache()
+            self.update_buffer = True
+
+        query = query.unflatten(-1, (-1, self.head_size))
+        key = key.unflatten(-1, (-1, self.head_size))
+        positions_with_offsets = (
+            torch.add(positions, offsets) if offsets is not None else positions
+        )
+        cos_sin = torch.index_select(self.cos_sin_cache, 0, positions_with_offsets).to(
+            dtype=query.dtype
+        )
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        assert (
+            query.dim() == key.dim() == 3
+        ), "Expected query key (seq_len, heads, head_dim)"
+        assert cos.dim() <= 3 and sin.dim() <= 3
+
+        need_reshape = False
+        if cos.dim() == 3:
+            # for fope
+            need_reshape = True
+            query_shape = query.shape
+            key_shape = key.shape
+            cos = cos.flatten(0, 1)
+            sin = sin.flatten(0, 1)
+            seq_len = cos.size(0)
+            query = query.reshape(seq_len, -1, query.size(-1))
+            key = key.reshape(seq_len, -1, key.size(-1))
+
+        query, key = apply_rotary_pos_emb_native(query, key, cos, sin)
+
+        if need_reshape:
+            query = query.reshape(query_shape)
+            key = key.reshape(key_shape)
+        return query.flatten(-2), key.flatten(-2)
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        s += f", fope_init_factor={self.fope_init_factor}, fope_sep_head={self.fope_sep_head}"
+        s += f", num_inv_freq={self.num_inv_freq}, num_kv_heads={self.num_kv_heads}"
+        return s
 
 
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
@@ -1636,7 +1828,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 **kwargs,
             )
         if (
-            model_type.startswith("qwen3_vl") or model_type.startswith("qwen3_vl_moe")
+            model_type.startswith("qwen3_vl")
+            or model_type.startswith("qwen3_vl_moe")
+            or model_type.startswith("qwen3_5")
         ) and video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(
                 video_grid_thw, video_grid_thw[:, 0], dim=0
@@ -1736,6 +1930,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen2_vl",
                         "qwen3_vl",
                         "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t, device=position_ids.device)
@@ -2900,6 +3096,19 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                )
+            elif rope_scaling.get("use_fope", False):
+                rotary_emb = FourierRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    num_kv_heads=rope_scaling["num_kv_heads"],
+                    fope_init_factor=rope_scaling.get("fope_init_factor", 0.1),
+                    fope_sep_head=rope_scaling.get("fope_sep_head", True),
+                    num_inv_freq=rope_scaling.get("num_inv_freq", None),
                 )
             else:
                 rotary_emb = RotaryEmbedding(

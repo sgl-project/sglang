@@ -1505,12 +1505,12 @@ def sample_custom_requests(
     return filtered_dataset
 
 
-def compute_random_lens(full_len: int, range_ratio: float, num: int):
+def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,
         size=num,
-    )
+    ).tolist()
 
 
 def sample_random_requests(
@@ -1597,8 +1597,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
+                    prompt_len=input_lens[i],
+                    output_len=output_lens[i],
                 )
             )
     else:
@@ -1606,8 +1606,9 @@ def sample_random_requests(
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
         input_requests = []
         for i in range(num_prompts):
+            # Use int() to convert numpy.int64 to native Python int for JSON serialization
             input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
+                int((offsets[i] + i + j) % tokenizer.vocab_size)
                 for j in range(input_lens[i])
             ]
             if return_text:
@@ -1615,8 +1616,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
+                    prompt_len=input_lens[i],
+                    output_len=output_lens[i],
                 )
             )
 
