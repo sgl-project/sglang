@@ -344,6 +344,7 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    device_mem_layout: str = "auto"
 
     # Runtime options
     device: Optional[str] = None
@@ -3288,6 +3289,12 @@ class ServerArgs:
             nargs="+",
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+        )
+        parser.add_argument(
+            "--device-mem-layout",
+            type=str,
+            default=ServerArgs.device_mem_layout,
+            help="The layout of device memory pool.",
         )
 
         # Runtime options
