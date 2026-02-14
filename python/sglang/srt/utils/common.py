@@ -27,6 +27,7 @@ import itertools
 import json
 import logging
 import math
+import multiprocessing
 import os
 import pickle
 import platform
@@ -2284,6 +2285,9 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
 
 
 class MultiprocessingSerializer:
+
+    GLOBAL_AUTHKEY = "SGLANG_IPC_GLOBAL_AUTHKEY"
+
     @staticmethod
     def serialize(obj, output_str: bool = False):
         """
@@ -2296,6 +2300,11 @@ class MultiprocessingSerializer:
         Returns:
             bytes or str: The serialized object.
         """
+        # HMAC key for integrity verification
+        multiprocessing.current_process().authkey = (
+            MultiprocessingSerializer.GLOBAL_AUTHKEY.encode()
+        )
+
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
@@ -2318,6 +2327,11 @@ class MultiprocessingSerializer:
         Returns:
             The deserialized Python object.
         """
+        # HMAC key for integrity verification
+        multiprocessing.current_process().authkey = (
+            MultiprocessingSerializer.GLOBAL_AUTHKEY.encode()
+        )
+
         if isinstance(data, str):
             # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
