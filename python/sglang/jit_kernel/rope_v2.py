@@ -72,8 +72,8 @@ def fused_rope_inplace_with_kvcache(
     """
     Fused inplace RoPE + KV cache store.
 
-    Applies rotary position embedding to q and k inplace, then stores
-    the rotated k and the original v into paged KV cache at the given locations.
+    Applies rotary position embedding to q inplace. For k, applies RoPE and
+    stores the result in k_cache. The original v is also stored in v_cache.
 
     Args:
         q: Query tensor of shape [num_tokens, num_qo_heads, head_dim].
