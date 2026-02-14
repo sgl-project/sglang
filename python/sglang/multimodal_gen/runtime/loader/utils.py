@@ -145,6 +145,18 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+def find_weights_dir(local_path: str, module_name: str) -> str | None:
+    """Locate the safetensors directory for module_name under local_path.
+
+    Diffusion models store weights in per-module subdirectories (e.g.
+    transformer/, vae/, text_encoder/).
+    """
+    dir_path = os.path.join(local_path, module_name)
+    if os.path.exists(dir_path):
+        return dir_path
+    return None
+
+
 def get_memory_usage_of_component(module) -> float | None:
     """
     returned value is in GB, rounded to 2 decimal digits

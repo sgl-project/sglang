@@ -308,9 +308,7 @@ For context parallel in DeepSeek V3.2 model, we provide two different modes of s
 
 ### In sequence splitting
 
-The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
-
-The communication group for context parallel reuses the one for attention tp, thus `cp_size` equals `atten_tp_size = tp_size / dp_size`.
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
 
 Note that in sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
@@ -323,7 +321,7 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example:
 ```bash
 # In-seq splitting mode launched with EP + DP
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
 ```
 
 ### Round robin splitting (default setting)
@@ -337,7 +335,7 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example usage:
 ```bash
 # Launch with FusedMoe + CP8
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
@@ -361,6 +359,7 @@ python3 -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
@@ -384,6 +383,7 @@ python3 -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
@@ -411,6 +411,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
@@ -436,6 +437,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \

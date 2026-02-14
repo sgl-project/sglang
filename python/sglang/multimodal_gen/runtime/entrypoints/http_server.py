@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_ap
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -218,6 +219,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(weights_api.router)
 
     app.state.server_args = server_args
     return app
