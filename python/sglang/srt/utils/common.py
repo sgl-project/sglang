@@ -2861,6 +2861,14 @@ def flatten_nested_list(nested_list):
         return [nested_list]
 
 
+def has_valid_data(data) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return any(has_valid_data(item) for item in flatten_nested_list(data))
+    return True
+
+
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
         (forward_mode is not None)
