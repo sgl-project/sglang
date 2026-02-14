@@ -2095,6 +2095,8 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                self.maybe_release_mamba_cache(req)
+
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -2191,6 +2193,25 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def maybe_release_mamba_cache(self, req: Req) -> None:
+        """Release mamba slot if allocated via COW but scheduling failed.
+
+        Without this, the slot remains held by a waiting request, causing
+        check_memory() to detect a "memory leak" and crash the server.
+        The next schedule round will re-allocate safely via match_prefix().
+
+        Note: In disaggregation DECODE mode, mamba state is transferred from PREFILL and
+        is not recoverable if freed, so we do not free it here. To avoid false-positive
+        leak checks in this situation, self_check_during_idle skips memory checking when
+        the waiting queue is not empty.
+        """
+        if (
+            req.mamba_pool_idx is not None
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
+            req.mamba_pool_idx = None
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -2795,6 +2816,20 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+
+            # Abort requests already retracted to CPU cache
+            if self.disagg_decode_prealloc_queue.retracted_queue:
+                remaining_retracted = []
+                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
+                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                        assert hasattr(decode_req, "kv_cache_cpu")
+                        del decode_req.kv_cache_cpu
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=decode_req.rid), decode_req
+                        )
+                    else:
+                        remaining_retracted.append(decode_req)
+                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
