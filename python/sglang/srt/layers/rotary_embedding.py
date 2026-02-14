@@ -128,8 +128,10 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
         ):
+            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
             if _is_cuda or _is_hip:
-                from sgl_kernel import rotary_embedding
+                from sglang.jit_kernel.pos_enc import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -404,6 +406,7 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
+
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
@@ -1825,7 +1828,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 **kwargs,
             )
         if (
-            model_type.startswith("qwen3_vl") or model_type.startswith("qwen3_vl_moe")
+            model_type.startswith("qwen3_vl")
+            or model_type.startswith("qwen3_vl_moe")
+            or model_type.startswith("qwen3_5")
         ) and video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(
                 video_grid_thw, video_grid_thw[:, 0], dim=0
@@ -1925,6 +1930,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen2_vl",
                         "qwen3_vl",
                         "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t, device=position_ids.device)
@@ -2703,6 +2710,83 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_pos_ids
 
 
+# Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L554
+class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
+    """MRoPE-enabled rotary embedding with YaRN context scaling."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+        *,
+        mrope_section: Optional[List[int]] = None,
+        mrope_interleaved: bool = False,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        truncate: bool = True,
+    ) -> None:
+        self.scaling_factor = scaling_factor
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.truncate = truncate
+        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        super().__init__(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            mrope_section=mrope_section,
+            mrope_interleaved=mrope_interleaved,
+        )
+
+    def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
+        pos_freqs = self.base ** (
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+        )
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+
+        low, high = _yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            self.rotary_dim,
+            self.base,
+            self.max_position_embeddings,
+            self.truncate,
+        )
+        inv_freq_mask = (
+            1
+            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+        ) * self.extrapolation_factor
+        inv_freq = (
+            inv_freq_interpolation * (1 - inv_freq_mask)
+            + inv_freq_extrapolation * inv_freq_mask
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.scaling_factor)
+        t = torch.arange(
+            self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
+        )
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos() * self.mscale
+        sin = freqs.sin() * self.mscale
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+
 class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
     """3D rotary positional embedding. [h w h w h w h w... t t t...]"""
 
@@ -3155,16 +3239,30 @@ def get_rope(
                 in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
             }
             extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
-            rotary_emb = YaRNScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                original_max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-                **extra_kwargs,
-            )
+            if "mrope_section" in rope_scaling:
+                rotary_emb = YaRNScalingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    **extra_kwargs,
+                )
+            else:
+                rotary_emb = YaRNScalingRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    **extra_kwargs,
+                )
         elif scaling_type == "deepseek_yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]

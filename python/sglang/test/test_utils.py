@@ -855,7 +855,9 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        env = env.copy()
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
