@@ -13,6 +13,11 @@ import requests
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.kits.abort_timeout_kit import (
+    AbortAllMixin,
+    RunningTimeoutTwoWaveMixin,
+    WaitingTimeoutMixin,
+)
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
@@ -345,6 +350,30 @@ class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
         "--dtype=float16",
         "--max-running-requests=8",
     ]
+
+
+class TestEAGLEAbortAll(AbortAllMixin, EagleServerBase):
+    abort_all_max_new_tokens = 4000
+    extra_args = ["--max-running-requests=8"]
+
+
+class TestEAGLEWaitingTimeout(WaitingTimeoutMixin, EagleServerBase):
+    extra_args = ["--max-running-requests=1"]
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
+            super().setUpClass()
+
+
+class TestEAGLERunningTimeout(RunningTimeoutTwoWaveMixin, EagleServerBase):
+    # Regression test for https://github.com/sgl-project/sglang/pull/18760
+    extra_args = ["--max-running-requests=16"]
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(3):
+            super().setUpClass()
 
 
 if __name__ == "__main__":
