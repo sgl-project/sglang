@@ -14,6 +14,6 @@ class UpdateWeightFromDiskReqInput:
 
 @dataclass
 class GetWeightsChecksumReqInput:
-    """Request to compute SHA-256 checksum of loaded module weights."""
+    """Compute SHA-256 checksum of loaded module weights for verification."""
 
     module_names: list[str] | None = None
