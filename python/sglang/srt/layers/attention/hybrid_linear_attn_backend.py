@@ -717,7 +717,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             is_kda=True,
         )
 
-
     def forward_extend(
         self,
         layer: RadixLinearAttention,
