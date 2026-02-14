@@ -24,7 +24,8 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear, \
+    MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -279,9 +280,9 @@ class QwenEmbedRope(nn.Module):
             (
                 1.0
                 / torch.pow(
-                    theta,
-                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
-                )
+                theta,
+                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+            )
             ).to(device=device),
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
@@ -349,7 +350,7 @@ class QwenEmbedRope(nn.Module):
                 max_vid_index = max(height, width, max_vid_index)
 
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0).to(device=device)
         return vid_freqs, txt_freqs
 
@@ -362,20 +363,20 @@ class QwenEmbedRope(nn.Module):
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
+            freqs_pos[0][idx: idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -437,9 +438,9 @@ class QwenEmbedLayer3DRope(nn.Module):
             (
                 1.0
                 / torch.pow(
-                    theta,
-                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
-                )
+                theta,
+                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+            )
             ).to(device=device),
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
@@ -503,7 +504,7 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         max_vid_index = max(max_vid_index, layer_num)
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
@@ -515,20 +516,20 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
+            freqs_pos[0][idx: idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -562,14 +563,14 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -630,30 +631,30 @@ class QwenImageCrossAttention(nn.Module):
 
         if self.use_fused_qkv:
             # Use fused QKV projection for nunchaku quantization
-            self.to_qkv = ReplicatedLinear(
+            self.to_qkv = MergedColumnParallelLinear(
                 dim,
-                self.inner_dim * 3,
+                [self.inner_dim] * 3,
                 bias=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_qkv",
             )
         else:
             # Use separate Q/K/V projections for non-quantized models
-            self.to_q = ReplicatedLinear(
+            self.to_q = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_q",
             )
-            self.to_k = ReplicatedLinear(
+            self.to_k = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_k",
             )
-            self.to_v = ReplicatedLinear(
+            self.to_v = ColumnParallelLinear(
                 dim,
                 self.inner_dim,
                 bias=True,
@@ -670,30 +671,30 @@ class QwenImageCrossAttention(nn.Module):
 
             if self.use_fused_added_qkv:
                 # Use fused QKV projection for nunchaku quantization
-                self.to_added_qkv = ReplicatedLinear(
+                self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
-                    self.inner_dim * 3,
+                    [self.inner_dim] * 3,
                     bias=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_added_qkv",
                 )
             else:
                 # Use separate Q/K/V projections for non-quantized models
-                self.add_q_proj = ReplicatedLinear(
+                self.add_q_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_q_proj",
                 )
-                self.add_k_proj = ReplicatedLinear(
+                self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_k_proj",
                 )
-                self.add_v_proj = ReplicatedLinear(
+                self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=True,
@@ -702,7 +703,7 @@ class QwenImageCrossAttention(nn.Module):
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(
+            self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
                 self.dim,
                 bias=out_bias,
@@ -715,7 +716,7 @@ class QwenImageCrossAttention(nn.Module):
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(
+                ColumnParallelLinear(
                     self.inner_dim,
                     self.dim,
                     bias=out_bias,
@@ -857,7 +858,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
@@ -882,7 +883,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
@@ -932,13 +933,13 @@ class QwenImageTransformerBlock(nn.Module):
             actual_batch = x.shape[0]
             shift0, shift1 = (
                 shift[:actual_batch],
-                shift[actual_batch : 2 * actual_batch],
+                shift[actual_batch: 2 * actual_batch],
             )
             scale0, scale1 = (
                 scale[:actual_batch],
-                scale[actual_batch : 2 * actual_batch],
+                scale[actual_batch: 2 * actual_batch],
             )
-            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch: 2 * actual_batch]
 
             if _is_cuda:
                 if not x.is_contiguous():
@@ -1011,6 +1012,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
+
         # Process image stream - norm1 + modulation
 
         img_normed = self.img_norm1(hidden_states)

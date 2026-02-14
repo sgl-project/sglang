@@ -294,10 +294,9 @@ class TransformerLoader(ComponentLoader):
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
-        if (
-            next(model.parameters()).dtype != param_dtype
-        ):
+        if next(model.parameters()).dtype != param_dtype:
             logger.warning(
-                f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}")
+                f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
+            )
 
         return model
