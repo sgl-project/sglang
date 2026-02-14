@@ -880,6 +880,8 @@ class MHATokenToKVPool(KVCache):
                 )
             # make the desired order by permutation
             self._kv_storage = self._kv_storage.permute(orders)
+            # flatten the (num_page, page_size) dims
+            self._kv_storage = self._kv_storage.flatten(2, 3)
             self.k_buffer = [self._kv_storage[0, i] for i in range(self.layer_num)]
             self.v_buffer = [self._kv_storage[1, i] for i in range(self.layer_num)]
 
