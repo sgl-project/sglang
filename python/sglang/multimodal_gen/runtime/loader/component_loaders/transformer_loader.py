@@ -240,9 +240,17 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-
         quant_config = server_args.nunchaku_config
+
+        if quant_config is not None:
+            # respect dtype from checkpoint
+            # TODO: improve the condition
+            param_dtype = None
+        else:
+            param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+
+        print(f"{param_dtype=}")
         safetensors_list = self.get_list_of_safetensors_to_load(
             server_args, component_model_path
         )
@@ -264,15 +272,6 @@ class TransformerLoader(ComponentLoader):
         ):
             init_params["quant_config"] = quant_config
 
-        cpu_offload = server_args.dit_cpu_offload
-        # if self._is_svdquant_config(quant_config) and is_nunchaku_available():
-        #     if cpu_offload:
-        #         logger.warning(
-        #             "Disabling dit_cpu_offload for Nunchaku SVDQuant to avoid "
-        #             "CPU-resident quantized weights."
-        #         )
-        #     cpu_offload = False
-
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
@@ -280,7 +279,7 @@ class TransformerLoader(ComponentLoader):
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=cpu_offload,
+            cpu_offload=server_args.dit_cpu_offload,
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
             # TODO(will): make these configurable

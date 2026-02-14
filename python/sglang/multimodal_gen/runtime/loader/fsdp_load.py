@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
@@ -99,8 +100,6 @@ def maybe_load_fsdp_model(
     use_fsdp = fsdp_inference
 
     # Disable FSDP for MPS as it's not compatible
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
     if current_platform.is_mps():
         use_fsdp = False
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
@@ -216,7 +215,7 @@ def load_model_from_full_model_state_dict(
     model: FSDPModule | torch.nn.Module,
     full_sd_iterator: Generator[tuple[str, torch.Tensor], None, None],
     device: torch.device,
-    param_dtype: torch.dtype,
+    param_dtype: torch.dtype | None,
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
@@ -228,7 +227,7 @@ def load_model_from_full_model_state_dict(
         model (Union[FSDPModule, torch.nn.Module]): Model to generate fully qualified names for cpu_state_dict
         full_sd_iterator (Generator): an iterator yielding (param_name, tensor) pairs
         device (torch.device): device used to move full state dict tensors
-        param_dtype (torch.dtype): dtype used to move full state dict tensors
+        param_dtype (torch.dtype): dtype used to move full state dict tensors. If none, respect original dtype from checkpoint
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
@@ -270,13 +269,7 @@ def load_model_from_full_model_state_dict(
                 )
                 continue
 
-        # Preserve original dtypes for parameters where it matters (e.g.,
-        # quantized weights and metadata such as int8/FP8).
-        # tensor's dtype differs from `param_dtype`, its original dtype is preserved.
-        if full_tensor.dtype == param_dtype:
-            target_dtype = param_dtype
-        else:
-            target_dtype = full_tensor.dtype
+        target_dtype = param_dtype if param_dtype else full_tensor.dtype
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)

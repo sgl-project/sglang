@@ -312,7 +312,7 @@ class ServerArgs:
     disable_autocast: bool | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
-    nunchaku_config: NunchakuSVDQuantArgs = field(
+    nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
     )
 
@@ -377,9 +377,9 @@ class ServerArgs:
         self.nunchaku_config.adjust_config()
 
         ncfg = self.nunchaku_config
-        if not ncfg.enable_svdquant:
-            return
-        if not ncfg.quantized_model_path:
+        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
+            # if nunchaku is not applied
+            self.nunchaku_config = None
             return
 
         self.nunchaku_config = NunchakuConfig(
