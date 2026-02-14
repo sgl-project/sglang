@@ -32,10 +32,16 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -48,7 +54,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+
+_is_npu = is_npu()
 
 
 class DbrxRouter(nn.Module):
@@ -100,6 +109,21 @@ class DbrxExperts(nn.Module):
         self.top_k = config.ffn_config.moe_top_k
         self.d_model = config.d_model
         self.intermediate_size = config.ffn_config.ffn_hidden_size // self.tp_size
+        if is_npu:
+            self.num_experts = self.num_total_experts
+            self.hidden_size = self.d_model
+            self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+            self.moe_runner_config = MoeRunnerConfig(inplace=True)
+            if quant_config is None:
+                self.quant_method: Optional[QuantizeMethodBase] = (
+                    UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                )
+                self.quant_method.create_moe_runner(self, self.moe_runner_config)
+            else:
+                self.quant_method: Optional[QuantizeMethodBase] = (
+                    quant_config.get_quant_method(self, prefix)
+                )
+            assert self.quant_method is not None
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -110,38 +134,72 @@ class DbrxExperts(nn.Module):
             self.top_k,
             renormalize=True,
         )
-        self.moe_runner_config = MoeRunnerConfig(inplace=True)
-        self.ws = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                2 * self.intermediate_size,
-                self.d_model,
-                device="cuda",
-                dtype=self.params_dtype,
+        if _is_npu:
+            device = get_global_server_args().device
+            self.w13_weight = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    2 * self.intermediate_size,
+                    self.d_model,
+                    device=device,
+                    dtype=self.params_dtype,
+                )
             )
-        )
-        self.w2s = nn.Parameter(
-            torch.empty(
-                self.num_total_experts,
-                self.d_model,
-                self.intermediate_size,
-                device="cuda",
-                dtype=self.params_dtype,
+            self.w2_weight = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    self.d_model,
+                    self.intermediate_size,
+                    device=device,
+                    dtype=self.params_dtype,
+                )
             )
-        )
 
-        set_weight_attrs(
-            self.ws,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
-        set_weight_attrs(
-            self.w2s,
-            {
-                "weight_loader": self.weight_loader,
-            },
-        )
+            set_weight_attrs(
+                self.w13_weight,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+            set_weight_attrs(
+                self.w2_weight,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.moe_runner_config = MoeRunnerConfig(inplace=True)
+            self.ws = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    2 * self.intermediate_size,
+                    self.d_model,
+                    device="cuda",
+                    dtype=self.params_dtype,
+                )
+            )
+            self.w2s = nn.Parameter(
+                torch.empty(
+                    self.num_total_experts,
+                    self.d_model,
+                    self.intermediate_size,
+                    device="cuda",
+                    dtype=self.params_dtype,
+                )
+            )
+
+            set_weight_attrs(
+                self.ws,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
+            set_weight_attrs(
+                self.w2s,
+                {
+                    "weight_loader": self.weight_loader,
+                },
+            )
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
@@ -177,13 +235,28 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            topk_output,
-            self.moe_runner_config,
-        )
+        if _is_npu:
+            dispatch_output = StandardDispatchOutput(
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=topk_output,
+            )
+
+            final_hidden_states = self.quant_method.apply(
+                layer=self, dispatch_output=dispatch_output
+            )
+            if isinstance(
+                final_hidden_states, CombineInput
+            ):  # Fused MoE methods return a CombineInput object.
+                final_hidden_states = final_hidden_states.hidden_states
+        else:
+            final_hidden_states = fused_moe(
+                hidden_states,
+                self.ws,
+                self.w2s,
+                topk_output,
+                self.moe_runner_config,
+            )
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -429,13 +502,22 @@ class DbrxForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        expert_params_mapping = [
-            (
-                "ws" if weight_name in ["w1", "v1"] else "w2s",
-                f"experts.mlp.{weight_name}",
-            )
-            for weight_name in ["w1", "v1", "w2"]
-        ]
+        if _is_npu:
+            expert_params_mapping = [
+                (
+                    "w13_weight" if weight_name in ["w1", "v1"] else "w2_weight",
+                    f"experts.mlp.{weight_name}",
+                )
+                for weight_name in ["w1", "v1", "w2"]
+            ]
+        else:
+            expert_params_mapping = [
+                (
+                    "ws" if weight_name in ["w1", "v1"] else "w2s",
+                    f"experts.mlp.{weight_name}",
+                )
+                for weight_name in ["w1", "v1", "w2"]
+            ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             for param_name, weight_name in expert_params_mapping:
