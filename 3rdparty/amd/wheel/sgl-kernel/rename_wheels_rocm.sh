@@ -16,11 +16,8 @@ for wheel in "${wheel_files[@]}"; do
     fi
 
     # Detect ROCm version and add appropriate suffix
-    if ls /opt | grep -q "7.0"; then
-        new_wheel="${intermediate_wheel/-cp${cp_version}/+rocm700-cp${cp_version}}"
-    else
-        new_wheel="$intermediate_wheel"
-    fi
+    ver_abrv=$(realpath /opt/rocm-* | sed -e 's/.*-//' -e 's/\.//g')
+    new_wheel=${intermediate_wheel/-cp${cp_version}/+rocm${ver_abrv}-cp${cp_version}}
 
     if [[ "$wheel" != "$new_wheel" ]]; then
         echo "Renaming $wheel to $new_wheel"
