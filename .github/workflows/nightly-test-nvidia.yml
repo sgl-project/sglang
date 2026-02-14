@@ -120,6 +120,25 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
+
       - name: Run test
         timeout-minutes: 30
         env:
@@ -200,6 +219,25 @@ jobs:
         run: |
           cd test
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
+
+      - name: Publish traces to storage repo
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          TRACE_ARGS=""
+          for dir in test/performance_profiles_*/; do
+            [ -d "$dir" ] && TRACE_ARGS="$TRACE_ARGS --traces-dir $dir"
+          done
+          if [ -n "$TRACE_ARGS" ]; then
+            python3 scripts/ci/utils/publish_traces.py $TRACE_ARGS
+            find test/performance_profiles_*/ -name '*.json.gz' -delete
+          else
+            echo "No trace directories found, skipping publish"
+          fi
 
       - name: Collect performance metrics
         if: always()
