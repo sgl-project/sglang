@@ -98,8 +98,9 @@ class WaitingTimeoutMixin:
 class RunningTimeoutTwoWaveMixin:
     """Test running timeout with a two-wave pattern.
 
-    Sends two waves with different forward_entry_time so that only wave 1
-    times out. Regression test for https://github.com/sgl-project/sglang/pull/18760
+    Sends two waves with different forward_entry_time so that timeouts are
+    triggered in separate batches. Regression test for
+    https://github.com/sgl-project/sglang/pull/18760
 
     Server needs SGLANG_REQ_RUNNING_TIMEOUT and sufficient --max-running-requests
     to hold both waves.
@@ -108,7 +109,7 @@ class RunningTimeoutTwoWaveMixin:
     running_timeout_num_wave1: int = 8
     running_timeout_num_wave2: int = 8
     running_timeout_sleep: float = 3
-    running_timeout_max_new_tokens: int = 512
+    running_timeout_max_new_tokens: int = 1024
 
     def test_running_timeout_no_crash(self):
         num_wave1 = self.running_timeout_num_wave1
