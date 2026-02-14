@@ -132,29 +132,24 @@ jobs:
           echo "Metrics file: ${metrics_data_file}"
 
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          CMD=(
-            python3 -u run_ascend_ci.py
-            --env ci
-            --image ${{ inputs.image }}
-            --sglang-source-relative-path ${sglang_source_relative_path}
-            --metrics-data-file ${metrics_data_file}
-            --test-case ${test_case}
-            --kube-name-space ${NAMESPACE}
-            --kube-job-type ${KUBE_JOB_TYPE}
-            --kube-job-name-prefix ${KUBE_JOB_NAME}
-          )
+          CMD="python3 -u run_ascend_ci.py \
+            --env ci \
+            --image ${{ inputs.image }} \
+            --sglang-source-relative-path ${sglang_source_relative_path} \
+            --metrics-data-file ${metrics_data_file} \
+            --test-case ${test_case} \
+            --kube-name-space ${NAMESPACE} \
+            --kube-job-type ${KUBE_JOB_TYPE} \
+            --kube-job-name-prefix ${KUBE_JOB_NAME}"
 
           prefill_decode_deployment="${{ inputs.prefill_decode_deployment }}"
           if [ "$prefill_decode_deployment" = "separation" ];then
-            CMD+=(
-              --prefill-size ${{ inputs.prefill_size }}
-              --decode-size ${{ inputs.decode_size }}
-              --router-size ${{ inputs.router_size }}
-            )
+            CMD="${CMD} \
+              --prefill-size ${{ inputs.prefill_size }} \
+              --decode-size ${{ inputs.decode_size }} \
+              --router-size ${{ inputs.router_size }}"
           elif [ "$prefill_decode_deployment" = "mix" ];then
-            CMD+=(
-              --node-size ${{ inputs.node_size }}
-            )
+            CMD="${CMD} --node-size ${{ inputs.node_size }}"
           else
             echo "Unsupported deployment type: ${prefill_decode_deployment}"
             exit 1
@@ -162,21 +157,21 @@ jobs:
 
           if [ "$SGLANG_IS_IN_CI" = "true" ] || [ "$SGLANG_IS_IN_CI" = "True" ];then
             echo "Run test in ci."
-            CMD+=(--sglang-is-in-ci)
+            CMD="${CMD} --sglang-is-in-ci"
           fi
 
           install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
           if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
             echo "Install sglang from source."
-            CMD+=(--install-sglang-from-source)
+            CMD="${CMD} --install-sglang-from-source"
             commit_id=${{ github.sha }}
             echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
           else
             echo "Use sglang from image: ${{ inputs.image }}"
           fi
 
-          echo "Run command: ${CMD[*]}"
-          eval "${CMD[*]}"
+          echo "Run command: ${CMD}"
+          eval "${CMD}"
 
       - name: Post process
         if: always()
