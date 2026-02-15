@@ -58,6 +58,11 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
+# Fixed step size for spec kernels to avoid recompilation
+_SPEC_STEP_SIZE = next_power_of_2(512)
+_SPEC_MAX_NUM_LOOPS = 8  # Support up to 4096 batch size
+
+
 @triton.jit
 def create_extend_after_decode_spec_info(
     verified_id,
@@ -65,17 +70,34 @@ def create_extend_after_decode_spec_info(
     accept_lens,
     positions,
     new_verified_id,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
+    max_accept_len: tl.constexpr,
 ):
+    """Create spec info for extend after decode phase.
+
+    Computes cumulative accept lengths and positions for each request.
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     pid = tl.program_id(axis=0)
-    offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
     accept_length = tl.load(accept_lens + pid)
 
-    accept_len_cumsum = tl.sum(
-        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
-    )
+    # Loop to accumulate accept_len_cumsum up to pid (exclusive)
+    accept_len_cumsum = 0
+    accept_len_cumsum = accept_len_cumsum.to(tl.int64)
+
+    num_loops = (pid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < pid
+            values = tl.load(accept_lens + loop_start + offset, mask=mask, other=0)
+            accept_len_cumsum += tl.sum(values)
+
     positions_ptr = positions + accept_len_cumsum
+    offsets = tl.arange(0, max_accept_len)
     mask = offsets < accept_length
     tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
 
@@ -92,18 +114,32 @@ def assign_req_to_token_pool(
     end_offset,
     out_cache_loc,
     pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
 ):
+    """Assign cache locations to req_to_token pool.
+
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
     kv_start = tl.load(start_offset + pid)
     kv_end = tl.load(end_offset + pid)
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
+    # Loop to accumulate out_offset up to pid (exclusive)
+    out_offset = 0
+    out_offset = out_offset.to(tl.int64)
+
+    num_loops = (pid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < pid
+            s = tl.load(start_offset + loop_start + offset, mask=mask, other=0)
+            e = tl.load(end_offset + loop_start + offset, mask=mask, other=0)
+            out_offset += tl.sum(e - s)
 
     out_cache_ptr = out_cache_loc + out_offset
 
@@ -134,7 +170,8 @@ def assign_req_to_token_pool_func(
         end_offset,
         out_cache_loc,
         req_to_token.shape[1],
-        next_power_of_2(batch_size),
+        _SPEC_STEP_SIZE,
+        _SPEC_MAX_NUM_LOOPS,
     )
 
 
@@ -154,9 +191,14 @@ def assign_draft_cache_locs(
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
     page_size: tl.constexpr,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
     iter_upper: tl.constexpr,
 ):
+    """Assign draft cache locations for speculative decoding.
+
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
@@ -164,9 +206,19 @@ def assign_draft_cache_locs(
         copy_len = topk * speculative_num_steps
         out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
     else:
-        bs_offset = tl.arange(0, bs_upper)
+        # Loop to accumulate cum_copy_len up to pid (exclusive)
+        cum_copy_len = 0
+        cum_copy_len = cum_copy_len.to(tl.int64)
+        num_loops = (pid + step_size - 1) // step_size
+        for i in range(max_num_loops):
+            if i < num_loops:
+                loop_start = i * step_size
+                offset = tl.arange(0, step_size)
+                mask = (loop_start + offset) < pid
+                values = tl.load(extend_lens + loop_start + offset, mask=mask, other=0)
+                cum_copy_len += tl.sum(values)
+
         copy_len = tl.load(extend_lens + pid)
-        cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
         out_cache_ptr = out_cache_loc + cum_copy_len
 
     # Part 1: Copy from out_cache_loc to req_to_token
@@ -258,11 +310,17 @@ def generate_draft_decode_kv_indices(
     pool_len: tl.constexpr,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
     iter_upper: tl.constexpr,
-    num_tokens_upper: tl.constexpr,
+    num_tokens_step_size: tl.constexpr,
+    num_tokens_max_loops: tl.constexpr,
     page_size: tl.constexpr,
 ):
+    """Generate KV indices for draft decode phase.
+
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
@@ -276,10 +334,21 @@ def generate_draft_decode_kv_indices(
     kv_indptr += kv_indptr_stride * iters
     iters += 1
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
+    # Loop to accumulate cum_seq_len up to bid (exclusive)
+    cum_seq_len = 0
+    cum_seq_len = cum_seq_len.to(tl.int64)
+    num_loops = (bid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < bid
+            values = tl.load(
+                paged_kernel_lens + loop_start + offset, mask=mask, other=0
+            )
+            cum_seq_len += tl.sum(values)
+
     seq_len = tl.load(paged_kernel_lens + bid)
-    cum_seq_len = tl.sum(seq_lens)
 
     # Update kv_indices
     kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
@@ -317,14 +386,22 @@ def generate_draft_decode_kv_indices(
 
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 
-    # Update kv_indptr
-    bs_offset = tl.arange(0, num_tokens_upper)
-
+    # Update kv_indptr - use loop for positions accumulation
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
-    base = tl.sum(positions)
+
+    base = 0
+    base = base.to(tl.int64)
+    num_loops_tokens = (zid + num_tokens_step_size - 1) // num_tokens_step_size
+    for i in range(num_tokens_max_loops):
+        if i < num_loops_tokens:
+            loop_start = i * num_tokens_step_size
+            offset = tl.arange(0, num_tokens_step_size)
+            mask = (loop_start + offset) < zid
+            values = tl.load(positions + loop_start + offset, mask=mask, other=0)
+            base += tl.sum(values)
+
     tl.store(kv_indptr + zid, base + zid * iters)
 
 
@@ -362,15 +439,32 @@ def get_target_cache_loc(
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
 ):
+    """Get target cache locations for verified tokens.
+
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     bid = tl.program_id(axis=0)
     offset = tl.arange(0, num_verify_tokens_upper)
-    bs_offset = tl.arange(0, bs_upper)
+
+    # Loop to accumulate accept_len_all up to bid (exclusive)
+    accept_len_sum = 0
+    accept_len_sum = accept_len_sum.to(tl.int64)
+    num_loops = (bid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            loop_offset = tl.arange(0, step_size)
+            mask = (loop_start + loop_offset) < bid
+            values = tl.load(
+                accept_length + loop_start + loop_offset, mask=mask, other=0
+            )
+            accept_len_sum += tl.sum(values)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    tgt_cache_loc_start = tl.sum(accept_len_all) + bid
+    tgt_cache_loc_start = accept_len_sum + bid
     copy_len = tl.load(accept_length + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
@@ -381,11 +475,23 @@ def get_target_cache_loc(
         mask=offset < copy_len,
     )
 
+    # Loop to accumulate to_free_num_slots_all up to bid (exclusive)
+    to_free_sum = 0
+    to_free_sum = to_free_sum.to(tl.int64)
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            loop_offset = tl.arange(0, step_size)
+            mask = (loop_start + loop_offset) < bid
+            values = tl.load(
+                to_free_num_slots + loop_start + loop_offset, mask=mask, other=0
+            )
+            to_free_sum += tl.sum(values)
+
     # write the second part to to_free_num_pages
-    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
     to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
     out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
-    to_free_slots_start = tl.sum(to_free_num_slots_all)
+    to_free_slots_start = to_free_sum
 
     copy_len = to_free_num_slots_cur
     out_cache_loc_row = tl.load(
@@ -425,19 +531,44 @@ def filter_finished_cache_loc_kernel(
     tgt_cache_loc,
     accept_length,
     accept_length_filter,
-    bs_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
+    """Filter finished cache locations.
+
+    Uses loop-based accumulation to avoid recompilation on batch size changes.
+    """
     bid = tl.program_id(0)
-    bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    old_start = tl.sum(accept_length_all) + bid
+    # Loop to accumulate accept_length_all up to bid (exclusive)
+    accept_sum = 0
+    accept_sum = accept_sum.to(tl.int64)
+    num_loops = (bid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < bid
+            values = tl.load(accept_length + loop_start + offset, mask=mask, other=0)
+            accept_sum += tl.sum(values)
 
-    accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
-    )
-    new_start = tl.sum(accept_length_filter_all)
+    old_start = accept_sum + bid
+
+    # Loop to accumulate accept_length_filter_all up to bid (exclusive)
+    filter_sum = 0
+    filter_sum = filter_sum.to(tl.int64)
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < bid
+            values = tl.load(
+                accept_length_filter + loop_start + offset, mask=mask, other=0
+            )
+            filter_sum += tl.sum(values)
+
+    new_start = filter_sum
 
     copy_len = tl.load(accept_length_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)

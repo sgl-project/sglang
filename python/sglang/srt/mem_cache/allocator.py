@@ -317,26 +317,37 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
+    step_size_bs: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
+    sum_num_new_pages = 0
+    sum_num_new_pages = sum_num_new_pages.to(tl.int64)
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = seq_len - 1
 
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
+    # Loop to accumulate sum_num_new_pages up to pid (inclusive)
+    num_loops_bs = (pid + 1 + step_size_bs - 1) // step_size_bs
+    for i in range(num_loops_bs):
+        start = i * step_size_bs
+        offset = tl.arange(0, step_size_bs)
+        mask = (start + offset) <= pid
+
+        s_lens = tl.load(seq_lens_ptr + start + offset, mask=mask, other=0)
+        p_lens = s_lens - 1
+        # For masked-out elements, set p_lens = s_lens to get 0 new pages
+        p_lens = tl.where(mask, p_lens, s_lens)
+
+        pgs_after = (s_lens + page_size - 1) // page_size
+        pgs_before = (p_lens + page_size - 1) // page_size
+        new_pgs = pgs_after - pgs_before
+        sum_num_new_pages += tl.sum(new_pgs)
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
     ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
     if num_page_start_loc_self == 0:
@@ -370,6 +381,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
+        self.bs_step = next_power_of_2(512)
         self.clear()
 
     def alloc(self, need_size: int):
@@ -469,7 +481,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
+            self.bs_step,
             self.page_size,
         )
 
