@@ -33,7 +33,7 @@ class TestPiecewiseCudaGraphCorrectness(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-piecewise-cuda-graph"],
+            other_args=[],
         )
 
     @classmethod
@@ -57,8 +57,7 @@ class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
 
     def test_latency(self):
         prefill_latency, _, _ = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            other_args=["--enable-piecewise-cuda-graph"],
+            DEFAULT_MODEL_NAME_FOR_TEST, other_args=[]
         )
         self.assertLess(prefill_latency, 0.015)
 
@@ -76,7 +75,6 @@ class TestPiecewiseCudaGraphLlama31FP4(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--quantization",
                 "modelopt_fp4",
                 "--mem-fraction-static",
@@ -112,7 +110,6 @@ class TestPiecewiseCudaGraphDeepSeek(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--piecewise-cuda-graph-max-tokens",
@@ -152,7 +149,6 @@ class TestPiecewiseCudaGraphFP8(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--quantization",
                 "modelopt_fp8",
                 "--kv-cache-dtype",
@@ -191,7 +187,6 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--disable-radix-cache",
@@ -232,7 +227,6 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--disable-radix-cache",
@@ -273,7 +267,6 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            enable_piecewise_cuda_graph=True,
             piecewise_cuda_graph_compiler="eager",
         )
         out = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0]["embedding"]
@@ -284,7 +277,7 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
             model_path=model_path,
             enable_multimodal=True,
             is_embedding=True,
-            enable_piecewise_cuda_graph=False,
+            disable_piecewise_cuda_graph=True,
         )
         out_without_pcg = engine.encode([text], image_data=[DEFAULT_IMAGE_URL])[0][
             "embedding"
