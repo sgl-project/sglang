@@ -2231,6 +2231,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_prompt_paddings=[req.dllm_prompt_padding for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
@@ -2410,6 +2411,7 @@ class ModelWorkerBatch:
 
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
+    dllm_prompt_paddings: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
 
     # For constrained decoding

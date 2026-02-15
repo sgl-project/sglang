@@ -22,6 +22,7 @@ class ReqDllmMixin:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.dllm_prompt_padding = 0
 
         if self.dllm_config is not None:
             if len(self.origin_input_ids) < self.dllm_config.block_size:
@@ -56,10 +57,30 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
+            if hasattr(self.dllm_config,"use_lpadding") and self.dllm_config.use_lpadding:
+                prompt_pad_len = ((len(self.origin_input_ids) + self.dllm_config.block_size - 1) // 
+                                self.dllm_config.block_size) * self.dllm_config.block_size - len(self.origin_input_ids)
+                if hasattr(self.dllm_config, "pad_id"):
+                    self.dllm_ids = (
+                    [
+                    self.dllm_config.pad_id,
+                    ]
+                    * prompt_pad_len
+                    + self.origin_input_ids
+                    + [
+                    self.dllm_config.mask_id,
+                    ]
+                    * self.dllm_config.block_size
+                    )
+                    self.dllm_prompt_padding = prompt_pad_len
+                else:
+                    raise AttributeError(
+                    "DllmConfig object has no attribute pad_id for use_lpadding")
+            else:
+                self.dllm_ids = (
+                    self.origin_input_ids
+                    + [self.dllm_config.mask_id] * self.dllm_config.block_size
+                )
         else:
             self.dllm_block_offset += self.dllm_config.block_size
             self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
