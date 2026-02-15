@@ -1056,7 +1056,9 @@ class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+    def __init__(
+        self, quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
+    ):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -1065,7 +1067,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
         self.group_size = config.group_size
-        self.actorder = config.actorder
+
+        if _is_hip:
+            assert (
+                config.strategy == "group"
+            ), "channelwise is not supported by simple kernel"
+            assert (
+                config.actorder != "group"
+            ), "grouped actorder isn't supported by simple kernel"
+        else:
+            self.actorder = config.actorder
+
         assert config.symmetric, "Only symmetric quantization is supported for MoE"
 
         if not (
@@ -1073,12 +1085,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             and self.num_bits in WNA16_SUPPORTED_BITS
         ):
             raise ValueError(
-                "For Fused MoE layers, only ",
-                f"{CompressionFormat.pack_quantized.value} ",
-                "is supported for the following bits: ",
-                f"{WNA16_SUPPORTED_BITS}",
+                f"For Fused MoE layers, only "
+                f"{CompressionFormat.pack_quantized.value} "
+                f"is supported for the following bits: "
+                f"{WNA16_SUPPORTED_BITS}"
             )
-        self.num_gpu_experts = num_gpu_experts
 
     def create_weights(
         self,
@@ -1089,6 +1100,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
@@ -1119,16 +1131,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight_packed", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # In the case where we have actorder/g_idx,
-        # we do not partition the w2 scales
-        load_full_w2 = self.actorder and self.group_size != -1
-
-        if load_full_w2:
-            w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
-        else:
+        if _is_hip:
+            load_full_w2 = False
             w2_scales_size = intermediate_size_per_partition
-
-        self.is_k_full = (not self.actorder) or layer.moe_tp_size == 1
+            self.is_k_full = True
+        else:
+            load_full_w2 = self.actorder and self.group_size != -1
+            if load_full_w2:
+                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+            else:
+                w2_scales_size = intermediate_size_per_partition
+            self.is_k_full = (not self.actorder) or layer.moe_tp_size == 1
 
         if self.strategy == "channel":
             num_groups_w2 = num_groups_w13 = 1
@@ -1215,7 +1228,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         layer.a13_scale = None
         layer.a2_scale = None
-        layer.marlin_state = GPTQMarlinState.REPACK
+
+        if not _is_hip:
+            layer.marlin_state = GPTQMarlinState.REPACK
 
         if not hasattr(layer, "_original_shapes"):
             layer._original_shapes = {}
@@ -1229,6 +1244,22 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_hip:
+            layer.w13_weight_packed = torch.nn.Parameter(
+                layer.w13_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
+                requires_grad=False,
+            )
+            layer.w2_weight_packed = torch.nn.Parameter(
+                layer.w2_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                layer.w13_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                layer.w2_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
+            )
+            return
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
@@ -1278,7 +1309,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
             replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
             replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-
         else:
             layer.w13_weight_g_idx = torch.nn.Parameter(
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
@@ -1357,19 +1387,38 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, router_logits = topk_output
+
+        if _is_hip:
+            from vllm.model_executor.layers.fused_moe import fused_experts
+
+            output = fused_experts(
+                x,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                use_int4_w4a16=self.num_bits == 4,
+                use_int8_w8a16=self.num_bits == 8,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[0, self.group_size],
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         # Get expert_map for EP support
         expert_map = None
