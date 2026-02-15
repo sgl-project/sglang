@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 import os
 from copy import deepcopy
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
+    get_metadata_from_safetensors_file,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -48,6 +50,7 @@ class TransformerLoader(ComponentLoader):
         if nunchaku_config is not None and nunchaku_config.quantized_model_path:
             # load from quantized_model_path if applicable
             weights_path = nunchaku_config.quantized_model_path
+
             logger.info("Using quantized model weights from: %s", weights_path)
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
                 safetensors_list = [weights_path]
@@ -96,6 +99,18 @@ class TransformerLoader(ComponentLoader):
             # respect dtype from checkpoint
             # TODO: improve the condition
             param_dtype = None
+
+            # check if the specified nunchaku quantized model path matches with the specified model path
+            original_dit_cls_name = json.loads(
+                get_metadata_from_safetensors_file(
+                    nunchaku_config.quantized_model_path
+                ).get("config")
+            )["_class_name"]
+            specified_dit_cls_name = str(model_cls.__name__)
+            if original_dit_cls_name != specified_dit_cls_name:
+                raise Exception(
+                    f"Class name of DiT specified in nunchaku quantized model_path: {original_dit_cls_name} does not match that of specified DiT name: {specified_dit_cls_name}"
+                )
         else:
             param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
@@ -111,8 +126,6 @@ class TransformerLoader(ComponentLoader):
             param_dtype,
         )
 
-        # Load the model using FSDP loader
-        assert server_args.hsdp_shard_dim is not None
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
         if (
             nunchaku_config is not None
@@ -120,6 +133,7 @@ class TransformerLoader(ComponentLoader):
         ):
             init_params["quant_config"] = nunchaku_config
 
+        # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,

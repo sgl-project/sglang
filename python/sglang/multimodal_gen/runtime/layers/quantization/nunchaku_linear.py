@@ -6,9 +6,6 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
-    is_nunchaku_available,
-)
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -169,15 +166,6 @@ class NunchakuSVDQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if (
-            not is_nunchaku_available()
-            or svdq_quantize_w4a4_act_fuse_lora_cuda is None
-            or svdq_gemm_w4a4_cuda is None
-        ):
-            raise ImportError(
-                "nunchaku is required for SVDQ linear method. "
-                "Please ensure nunchaku is installed correctly."
-            )
 
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
@@ -279,11 +267,6 @@ class NunchakuAWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not is_nunchaku_available() or awq_gemv_w4a16_cuda is None:
-            raise ImportError(
-                "nunchaku is required for AWQ linear method. "
-                "Install with: pip install nunchaku"
-            )
 
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
