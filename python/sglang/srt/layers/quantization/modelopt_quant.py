@@ -461,6 +461,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         input_size_per_partition: int,
         output_partition_sizes: List[int],
+        input_size: Optional[int],
+        output_size: Optional[int],
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
