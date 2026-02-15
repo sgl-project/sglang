@@ -27,6 +27,7 @@ LLaVA-NeXT : https://llava-vl.github.io/blog/2024-01-30-llava-next/
 LLaVA-Onevision : https://arxiv.org/pdf/2408.03326
 
 """
+
 import ast
 import itertools
 import math
@@ -519,7 +520,7 @@ def run_dp_sharded_mrope_vision_model(
     # image_to_tp_rank = [0, 2, 1, 3]
     # gpu_sample_counts = [1, 3]
     # grouped_pixel_values_len = [1000, 350]
-    (image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len) = (
+    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
         get_dp_encoder_lb_assignment(patches_per_image, tp_size)
     )
 

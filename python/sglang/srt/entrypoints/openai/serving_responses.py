@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
+
 from __future__ import annotations
 
 import asyncio
