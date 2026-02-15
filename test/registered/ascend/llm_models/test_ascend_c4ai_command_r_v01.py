@@ -1,90 +1,39 @@
-import os
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.test_ascend_utils import (
+    C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH,
+    C4AI_COMMAND_R_V01_WEIGHTS_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(
-    est_time=400,
-    suite="nightly-2-npu-a3",
-    nightly=True,
-    disabled="The accuracy test result is 0.",
-)
+register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
-class TestC4AI(CustomTestCase):
-    model = "/root/.cache/modelscope/hub/models/CohereForAI/c4ai-command-r-v01"
-    accuracy = 0.05
+class TestC4AI(GSM8KAscendMixin, CustomTestCase):
+    """Testcase: Verify that the inference accuracy of the CohereForAI/c4ai-command-r-v01 model on the GSM8K dataset is no less than 0.55.
 
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        chat_template_path = "/__w/sglang/sglang/test/nightly/ascend/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
+    [Test Category] Model
+    [Test Target] CohereForAI/c4ai-command-r-v01
+    """
 
-        other_args = [
-            "--trust-remote-code",
-            "--mem-fraction-static",
-            "0.8",
-            "--attention-backend",
-            "ascend",
-            "--disable-cuda-graph",
-            "--chat-template",
-            chat_template_path,
-            "--tp-size",
-            "2",
-            "--dtype",
-            "bfloat16",
-        ]
-        env = os.environ.copy()
-        env.update(
-            {
-                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-                "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24666",
-                "HCCL_BUFFSIZE": "200",
-                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "24",
-                "USE_VLLM_CUSTOM_ALLREDUCE": "1",
-                "HCCL_EXEC_TIMEOUT": "200",
-                "STREAMS_PER_DEVICE": "32",
-                "SGLANG_ENABLE_TORCH_COMPILE": "1",
-            }
-        )
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-            env=env,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        self.assertGreater(
-            metrics["accuracy"],
-            self.accuracy,
-            f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {self.accuracy}',
-        )
+    model = C4AI_COMMAND_R_V01_WEIGHTS_PATH
+    accuracy = 0.55
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.8",
+        "--attention-backend",
+        "ascend",
+        "--disable-cuda-graph",
+        "--chat-template",
+        C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH,
+        "--tp-size",
+        "2",
+        "--dtype",
+        "bfloat16",
+    ]
 
 
 if __name__ == "__main__":
