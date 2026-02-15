@@ -1127,10 +1127,6 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False

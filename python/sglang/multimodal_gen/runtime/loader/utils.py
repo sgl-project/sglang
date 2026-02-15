@@ -86,6 +86,8 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
+            continue
         reverse_param_names_mapping[target_param_name] = (
             source_param_name,
             merge_index,
