@@ -3774,13 +3774,28 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+def get_libnuma():
+    libnuma = None
 
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+        try:
+            libnuma = ctypes.CDLL(libnuma_so)
+        except OSError as e:
+            logger.error(f"{e}")
+            libnuma = None
+        if libnuma is not None:
+            break
+    return libnuma
+
+
+def numa_bind_to_node(node: int):
+    libnuma = get_libnuma()
+
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.error("numa not available on this system, skip bind action")
+    else:
+        libnuma.numa_run_on_node(ctypes.c_int(node))
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
@@ -4089,13 +4104,13 @@ def get_numa_node_count() -> int:
     Returns:
         int: The number of NUMA nodes.
     """
-    libnuma = ctypes.CDLL("libnuma.so")
+    libnuma = get_libnuma()
     return libnuma.numa_max_node() + 1
 
 
 def is_numa_available() -> bool:
     try:
-        libnuma = ctypes.CDLL("libnuma.so")
+        libnuma = get_libnuma()
         return libnuma.numa_available() >= 0
     except Exception:
         return False
