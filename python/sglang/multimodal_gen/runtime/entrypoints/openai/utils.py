@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 
+OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+
 
 @dataclasses.dataclass
 class SetLoraReq:
@@ -237,6 +239,7 @@ async def process_generation_batch(
                     ),
                     audio=result.audio,
                     audio_sample_rate=audio_sample_rate,
+                    output_compression=batch.output_compression,
                 )
             else:
                 save_file_path_list = save_outputs(
@@ -251,6 +254,7 @@ async def process_generation_batch(
                         )
                     ),
                     audio_sample_rate=audio_sample_rate,
+                    output_compression=batch.output_compression,
                 )
 
     total_time = time.perf_counter() - total_start_time
@@ -302,3 +306,9 @@ def add_common_data_to_response(
     response["id"] = request_id
 
     return response
+
+
+def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+    if output_quality == "default":
+        return 50 if data_type == DataType.VIDEO else 75
+    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)

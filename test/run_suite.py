@@ -72,6 +72,8 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.AMD: [
         "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
@@ -120,8 +122,10 @@ def auto_partition(files: List[CIRegistry], rank, size):
     if not files or size <= 0:
         return []
 
-    # Sort files by estimated_time in descending order (LPT heuristic)
-    sorted_files = sorted(files, key=lambda f: f.est_time, reverse=True)
+    # Sort files by estimated_time in descending order (LPT heuristic).
+    # Use filename as tie-breaker to ensure deterministic partitioning
+    # regardless of glob ordering.
+    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
 
     partitions = [[] for _ in range(size)]
     partition_sums = [0.0] * size
