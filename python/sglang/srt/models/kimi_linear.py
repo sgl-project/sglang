@@ -726,7 +726,7 @@ class KimiLinearForCausalLM(nn.Module):
                     layer_id = int(name.split(".")[2])
                     layer = self.model.layers[layer_id].self_attn
                     # Only load fused weights if fusion is enabled
-                    if hasattr(layer, "do_fuse_bfg") and not layer.do_fuse_bfg:
+                    if not getattr(layer, "do_fuse_bfg", False):
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
