@@ -2,13 +2,14 @@
 Fused FP8 quantization + paged KV cache write kernel for TRTLLM MHA backend.
 
 This kernel fuses the following operations:
-1. FP8 quantization of K and V tensors (from BF16/FP16 to FP8)
+1. FP8 quantization of Q, K and V tensors (from BF16/FP16 to FP8)
 2. Per-token or per-page scale computation
 3. Writing quantized K/V to paged KV cache layout
+4. In-place FP8 conversion of Q tensor (written to pre-allocated output buffer)
 
 Performance benefits:
 - Eliminates intermediate FP8 tensors in memory
-- Reduces kernel launch overhead
+- Reduces kernel launch overhead (single kernel for Q, K, V quantization)
 - Better memory bandwidth utilization
 """
 
@@ -82,6 +83,56 @@ def _process_kv_tensor(
         )
 
         tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+
+
+@triton.jit
+def _process_q_tensor(
+    token_id,
+    head_block_id,
+    q_ptr,
+    q_out_ptr,
+    num_q_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    q_out_stride_token: tl.constexpr,
+    q_out_stride_head: tl.constexpr,
+    q_out_stride_dim: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Process a block of heads for Q tensor (cast to FP8, no cache write)."""
+    head_idx = head_block_id * BLOCK_HEAD
+
+    for dim_idx in range(0, head_dim, BLOCK_DIM):
+        head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
+        dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
+
+        head_mask = head_offsets < num_q_heads
+        dim_mask = dim_offsets < head_dim
+        mask = head_mask[:, None] & dim_mask[None, :]
+
+        # Load from Q input
+        q_offsets = (
+            token_id * q_stride_token
+            + head_offsets[:, None] * q_stride_head
+            + dim_offsets[None, :] * q_stride_dim
+        )
+
+        block = tl.load(q_ptr + q_offsets, mask=mask, other=0.0)
+
+        # Cast to FP8 (no scale for Q, equivalent to q.to(fp8))
+        block_fp8 = block.to(tl.float8e4nv)
+
+        # Write to Q output buffer
+        q_out_offsets = (
+            token_id * q_out_stride_token
+            + head_offsets[:, None] * q_out_stride_head
+            + dim_offsets[None, :] * q_out_stride_dim
+        )
+
+        tl.store(q_out_ptr + q_out_offsets, block_fp8, mask=mask)
 
 
 @triton.jit
@@ -196,6 +247,151 @@ def _fused_fp8_set_kv_buffer_kernel(
             v_cache_stride_offset,
             v_cache_stride_head,
             v_cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+
+
+@triton.jit
+def _fused_fp8_set_qkv_buffer_kernel(
+    # Q tensor (input and output)
+    q_ptr,  # [num_tokens, num_q_heads, head_dim] input
+    q_out_ptr,  # [num_tokens, num_q_heads, head_dim] output FP8
+    # K and V tensors (same stride assumed)
+    k_ptr,  # [num_tokens, num_kv_heads, head_dim]
+    v_ptr,  # [num_tokens, num_kv_heads, head_dim]
+    # Output KV cache buffers (FP8 paged layout, same stride assumed)
+    k_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
+    v_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
+    # Cache location indices
+    cache_loc_ptr,  # [num_tokens] -> token to cache location mapping
+    # Scalar inverse scales for K/V quantization
+    inv_k_scale,  # float scalar inverse scale for K
+    inv_v_scale,  # float scalar inverse scale for V
+    use_provided_scale: tl.constexpr,  # whether to use provided scale for K/V
+    # Tensor dimensions
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    # Strides for Q (input and output share the same stride)
+    q_stride_token: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    # Strides for K/V input (K and V share the same stride)
+    kv_stride_token: tl.constexpr,
+    kv_stride_head: tl.constexpr,
+    kv_stride_dim: tl.constexpr,
+    # Strides for KV cache (K cache and V cache share the same stride)
+    cache_stride_page: tl.constexpr,
+    cache_stride_offset: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    # Block sizes
+    BLOCK_HEAD: tl.constexpr,  # Number of heads per block
+    BLOCK_DIM: tl.constexpr,  # Head dimension block size
+):
+    """
+    Fused FP8 quantization kernel for Q, K, V tensors.
+
+    - Q: cast to FP8 and write to q_out (no cache)
+    - K, V: cast to FP8 with optional scale and write to paged KV cache
+
+    Grid: (num_tokens, 2 * Bkv + Bq) where Bkv = cdiv(num_kv_heads, BLOCK_HEAD)
+    Block mapping:
+      [0, Bkv)                -> K, head_block = block_id
+      [Bkv, 2*Bkv)            -> V, head_block = block_id - Bkv
+      [2*Bkv, 2*Bkv + Bq)     -> Q, head_block = block_id - 2*Bkv
+    """
+    # Get program IDs
+    token_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    # Compute number of head blocks
+    num_kv_head_blocks = tl.cdiv(num_kv_heads, BLOCK_HEAD)
+
+    # Determine which tensor to process based on block_id
+    if block_id < num_kv_head_blocks:
+        # Process K tensor
+        head_block_id = block_id
+
+        # Get cache location for this token
+        cache_loc = tl.load(cache_loc_ptr + token_id)
+        page_id = cache_loc // page_size
+        page_offset = cache_loc % page_size
+
+        inv_scale = inv_k_scale if use_provided_scale else 1.0
+
+        _process_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            k_ptr,
+            k_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            kv_stride_token,
+            kv_stride_head,
+            kv_stride_dim,
+            cache_stride_page,
+            cache_stride_offset,
+            cache_stride_head,
+            cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+    elif block_id < 2 * num_kv_head_blocks:
+        # Process V tensor
+        head_block_id = block_id - num_kv_head_blocks
+
+        # Get cache location for this token
+        cache_loc = tl.load(cache_loc_ptr + token_id)
+        page_id = cache_loc // page_size
+        page_offset = cache_loc % page_size
+
+        inv_scale = inv_v_scale if use_provided_scale else 1.0
+
+        _process_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            v_ptr,
+            v_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            kv_stride_token,
+            kv_stride_head,
+            kv_stride_dim,
+            cache_stride_page,
+            cache_stride_offset,
+            cache_stride_head,
+            cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+    else:
+        # Process Q tensor
+        head_block_id = block_id - 2 * num_kv_head_blocks
+
+        _process_q_tensor(
+            token_id,
+            head_block_id,
+            q_ptr,
+            q_out_ptr,
+            num_q_heads,
+            head_dim,
+            q_stride_token,
+            q_stride_head,
+            q_stride_dim,
+            q_stride_token,
+            q_stride_head,
+            q_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
         )
@@ -502,3 +698,164 @@ def _naive_fp8_set_kv_buffer(
         page_offsets = cache_loc % page_size
         k_cache[page_ids, page_offsets] = k
         v_cache[page_ids, page_offsets] = v
+
+
+def fused_fp8_set_qkv_buffer(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_loc: torch.Tensor,
+    q_out: torch.Tensor,
+    inv_k_scale: Optional[float] = None,
+    inv_v_scale: Optional[float] = None,
+    page_size: int = 16,
+) -> None:
+    """Fused FP8 quantization for Q, K, V. Writes Q to q_out, K/V to cache."""
+    num_tokens = k.shape[0]
+    if num_tokens == 0:
+        return
+
+    # Cache is always 3D: [total_slots, num_kv_heads, head_dim]
+    _, num_kv_heads, head_dim = k_cache.shape
+    num_q_heads = q_out.shape[1]
+
+    # Normalize to 3D if needed
+    # Q needs contiguous() because it may come from QKV split with non-contiguous stride,
+    # and the kernel uses a single set of Q strides for both input and output.
+    q_3d = q if q.ndim == 3 else q.view(num_tokens, num_q_heads, head_dim)
+    q_3d = q_3d.contiguous()
+    k_3d = k if k.ndim == 3 else k.view(num_tokens, num_kv_heads, head_dim)
+    v_3d = v if v.ndim == 3 else v.view(num_tokens, num_kv_heads, head_dim)
+
+    assert k_3d.stride() == v_3d.stride(), "K and V must have the same stride"
+    assert (
+        k_cache.stride() == v_cache.stride()
+    ), "K and V cache must have the same stride"
+
+    # Compute cache strides (3D layout)
+    cache_stride_page = k_cache.stride(0) * page_size
+    cache_stride_offset = k_cache.stride(0)
+    cache_stride_head = k_cache.stride(1)
+    cache_stride_dim = k_cache.stride(2)
+
+    # Block sizes and grid
+    BLOCK_HEAD = 8
+    BLOCK_DIM = min(head_dim, 128)
+    num_kv_head_blocks = (num_kv_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
+    num_q_head_blocks = (num_q_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
+    grid = (num_tokens, 2 * num_kv_head_blocks + num_q_head_blocks)
+
+    use_provided_scale = inv_k_scale is not None and inv_v_scale is not None
+    inv_k_scale_val = inv_k_scale if use_provided_scale else 1.0
+    inv_v_scale_val = inv_v_scale if use_provided_scale else 1.0
+
+    _fused_fp8_set_qkv_buffer_kernel[grid](
+        q_3d,
+        q_out,
+        k_3d,
+        v_3d,
+        k_cache,
+        v_cache,
+        cache_loc,
+        inv_k_scale_val,
+        inv_v_scale_val,
+        use_provided_scale,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_3d.stride(0),
+        q_3d.stride(1),
+        q_3d.stride(2),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        k_3d.stride(2),
+        cache_stride_page,
+        cache_stride_offset,
+        cache_stride_head,
+        cache_stride_dim,
+        BLOCK_HEAD=BLOCK_HEAD,
+        BLOCK_DIM=BLOCK_DIM,
+    )
+
+
+if __name__ == "__main__":
+    # Simple test for fused_fp8_set_qkv_buffer kernel
+    print("Testing fused_fp8_set_qkv_buffer kernel...")
+
+    # Test parameters
+    num_tokens = 32
+    num_q_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    total_slots = 1024
+    page_size = 16
+
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    # Create input tensors
+    q = torch.randn(num_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+
+    # Create cache tensors (FP8)
+    k_cache = torch.zeros(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+    v_cache = torch.zeros(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+
+    # Create output tensor for Q
+    q_out = torch.zeros(
+        num_tokens, num_q_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+
+    # Create cache locations (sequential for simplicity)
+    cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+    # Create inverse scales
+    inv_k_scale = 1.0
+    inv_v_scale = 1.0
+
+    # Run the kernel
+    fused_fp8_set_qkv_buffer(
+        q, k, v, k_cache, v_cache, cache_loc, q_out, inv_k_scale, inv_v_scale, page_size
+    )
+
+    # Verify results
+    # Check Q output
+    q_expected = q.to(torch.float8_e4m3fn)
+    q_match = torch.allclose(
+        q_out.to(torch.float32), q_expected.to(torch.float32), rtol=1e-2, atol=1e-2
+    )
+    print(f"Q output matches expected: {q_match}")
+
+    # Check K cache
+    k_expected = k.to(torch.float8_e4m3fn)
+    k_match = torch.allclose(
+        k_cache[cache_loc].to(torch.float32),
+        k_expected.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print(f"K cache matches expected: {k_match}")
+
+    # Check V cache
+    v_expected = v.to(torch.float8_e4m3fn)
+    v_match = torch.allclose(
+        v_cache[cache_loc].to(torch.float32),
+        v_expected.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print(f"V cache matches expected: {v_match}")
+
+    if q_match and k_match and v_match:
+        print("All tests passed!")
+    else:
+        print("Some tests failed!")
+        exit(1)
