@@ -28,7 +28,7 @@
 
 import functools
 from collections import OrderedDict
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -52,167 +52,75 @@ _is_flashinfer_available = (
 )
 
 
-def _apply_rotary_emb_naive(
-    x: torch.Tensor,
+def _rope_impl_naive(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     is_neox_style: bool = False,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [batch_size, seq_len, num_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    # [seq_len, 1, head_dim // 2]
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     cos = cos.float().unsqueeze(1)
     sin = sin.float().unsqueeze(1)
-    if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-    else:
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-    o1 = (x1.float() * cos - x2.float() * sin).to(dtype=x.dtype)
-    o2 = (x2.float() * cos + x1.float() * sin).to(dtype=x.dtype)
-    if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    def _rope(x):
+        if is_neox_style:
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+        else:
+            x1, x2 = x[..., 0::2], x[..., 1::2]
+
+        o1 = (x1.float() * cos - x2.float() * sin).to(dtype=x.dtype)
+        o2 = (x2.float() * cos + x1.float() * sin).to(dtype=x.dtype)
+
+        if is_neox_style:
+            return torch.cat((o1, o2), dim=-1)
+        else:
+            return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    q_out = _rope(q)
+    if k is not None:
+        k_out = _rope(k)
+        return q_out, k_out
+    return q_out
 
 
-def _apply_rotary_emb_triton(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool = False,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [batch_size, seq_len, num_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.float()
-    sin = sin.float()
-    return apply_rotary_embedding(x, cos, sin, is_neox_style)
-
-
-def _apply_rotary_emb_flashinfer(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool = False,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [batch_size, seq_len, num_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    # TODO(triple-mu): The current FlashInfer kernel path introduces redundant computation for K.
-    k = torch.empty_like(x)
-    x, _ = _apply_rotary_emb_qk_flashinfer(x, k, cos, sin, is_neox_style=is_neox_style)
-    return x
-
-
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool = False,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [batch_size, seq_len, num_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    if _is_flashinfer_available:
-        return _apply_rotary_emb_flashinfer(x, cos, sin, is_neox_style=is_neox_style)
-    else:
-        try:
-            return _apply_rotary_emb_triton(x, cos, sin, is_neox_style=is_neox_style)
-        except Exception:
-            return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
-
-
-def _apply_rotary_emb_qk_naive(
+def _rope_impl_triton(
     q: torch.Tensor,
-    k: torch.Tensor,
+    k: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     is_neox_style: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Args:
-        q: [batch_size, seq_len, num_q_heads, head_dim]
-        k: [batch_size, seq_len, num_kv_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.float()
-    sin = sin.float()
-    return (
-        _apply_rotary_emb(q, cos, sin, is_neox_style=is_neox_style),
-        _apply_rotary_emb(k, cos, sin, is_neox_style=is_neox_style),
-    )
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    cos, sin = cos.float(), sin.float()
+
+    if k is not None:
+        return apply_rotary_embedding_qk(q, k, cos, sin, is_neox_style)
+    else:
+        return apply_rotary_embedding(q, cos, sin, is_neox_style)
 
 
-def _apply_rotary_emb_qk_triton(
+def _rope_impl_flashinfer(
     q: torch.Tensor,
-    k: torch.Tensor,
+    k: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     is_neox_style: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Args:
-        q: [batch_size, seq_len, num_q_heads, head_dim]
-        k: [batch_size, seq_len, num_kv_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.float()
-    sin = sin.float()
-    return apply_rotary_embedding_qk(q, k, cos, sin, is_neox_style)
-
-
-def _apply_rotary_emb_qk_flashinfer(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Args:
-        q: [batch_size, seq_len, num_q_heads, head_dim]
-        k: [batch_size, seq_len, num_kv_heads, head_dim]
-        cos: [seq_len, head_dim // 2]
-        sin: [seq_len, head_dim // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     q = q.contiguous()
-    k = k.contiguous()
-    cos_sin_cache = torch.cat([cos, sin], dim=-1).float()
-    if q.dim() > 3:
-        bsz, seq_len, num_q_heads, head_dim = q.shape
+    if k is not None:
+        k = k.contiguous()
     else:
+        k = torch.empty_like(q)
+
+    cos_sin_cache = torch.cat([cos, sin], dim=-1).float()
+
+    if q.dim() == 3:
         seq_len, num_q_heads, head_dim = q.shape
         bsz = 1
+    else:
+        bsz, seq_len, num_q_heads, head_dim = q.shape
+
     num_kv_heads = k.size(-2)
+
     pos_1d = torch.arange(seq_len, device=q.device, dtype=torch.long)
     positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
 
@@ -224,10 +132,36 @@ def _apply_rotary_emb_qk_flashinfer(
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox_style,
     )
-    return q, k
+
+    if k is not None:
+        return q, k
+    return q
 
 
-def _apply_rotary_emb_qk(
+def apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    if _is_flashinfer_available:
+        return _rope_impl_flashinfer(x, None, cos, sin, is_neox_style)
+    else:
+        try:
+            return _rope_impl_triton(x, None, cos, sin, is_neox_style)
+        except Exception:
+            return _rope_impl_naive(x, None, cos, sin, is_neox_style)
+
+
+def apply_rotary_emb_qk(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -236,20 +170,20 @@ def _apply_rotary_emb_qk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Args:
-        q: [batch_size, seq_len, num_q_heads, head_dim]
-        k: [batch_size, seq_len, num_kv_heads, head_dim]
+        q: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
+        k: [batch_size, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
         cos: [seq_len, head_dim // 2]
         sin: [seq_len, head_dim // 2]
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
     if _is_flashinfer_available:
-        return _apply_rotary_emb_qk_flashinfer(q, k, cos, sin, is_neox_style)
+        return _rope_impl_flashinfer(q, k, cos, sin, is_neox_style)
     else:
         try:
-            return _apply_rotary_emb_qk_triton(q, k, cos, sin, is_neox_style)
+            return _rope_impl_triton(q, k, cos, sin, is_neox_style)
         except Exception:
-            return _apply_rotary_emb_qk_naive(q, k, cos, sin, is_neox_style)
+            return _rope_impl_naive(q, k, cos, sin, is_neox_style)
 
 
 @CustomOp.register("rotary_embedding")
@@ -325,14 +259,14 @@ class RotaryEmbedding(CustomOp):
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
