@@ -111,6 +111,10 @@ DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
 )
 
+KIMI_LINEAR_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "moonshotai/Kimi-Linear-48B-A3B-Instruct"
+)
+
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
 GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
