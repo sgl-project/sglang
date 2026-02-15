@@ -441,7 +441,8 @@ COPY docker/configs/.zshrc /root/.zshrc
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
         rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda; \
     fi
 
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
