@@ -18,6 +18,13 @@ Typical characteristics:
 1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS / FlashInfer / DeepGEMM (or similarly heavy stacks), implement it in `sglang/sgl-kernel`.
 2. **Lightweight kernels go to `jit_kernel`.** If it is small and can be compiled independently, implement it here.
 
+## Stop and use `sgl-kernel` instead (important)
+
+Do **not** add a new kernel under `jit_kernel` if any of the following applies:
+
+- It directly depends on CUTLASS / FlashInfer (or other heavyweight third-party stacks)
+- It requires complex link-time integration, large template instantiations, or AOT-style packaging
+
 In addition, every new JIT kernel must ship with:
 
 - **Tests** (pytest)
