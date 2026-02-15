@@ -442,6 +442,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
@@ -457,6 +458,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
@@ -494,6 +496,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
+                prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
@@ -611,6 +614,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
@@ -641,6 +645,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
                 encoder_lens=encoder_lens,
@@ -670,6 +675,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens_cpu=seq_lens.cpu() - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=True,
                 encoder_lens=encoder_lens,
@@ -710,6 +716,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -722,6 +729,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
+                prefix_lens_cpu=None,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -734,6 +742,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens_cpu=(
+                    seq_lens_cpu[:bs] - self.dllm_config.block_size
+                    if seq_lens_cpu is not None
+                    else None
+                ),
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -1208,6 +1221,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1224,6 +1238,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1232,10 +1247,15 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         if use_ragged:
-            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
-            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            if prefix_lens_cpu is not None:
+                # Avoid CUDA sync from .item() by using CPU lengths when available.
+                if isinstance(prefix_lens_cpu, torch.Tensor):
+                    paged_kernel_lens_sum = int(prefix_lens_cpu.sum())
+                else:
+                    paged_kernel_lens_sum = int(sum(prefix_lens_cpu))
+            else:
+                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -1264,6 +1284,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1313,6 +1334,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
