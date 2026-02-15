@@ -232,11 +232,7 @@ def fuse_scale_shift_kernel(
     assert x.is_cuda and scale.is_cuda
     assert x.is_contiguous()
 
-    if x.dim() == 2:
-        B = 1
-        L, C = x.shape
-    else:
-        B, L, C = x.shape
+    B, L, C = x.shape
     output = torch.empty_like(x)
 
     if scale.dim() == 4:

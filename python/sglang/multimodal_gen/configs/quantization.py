@@ -7,6 +7,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+    is_nunchaku_available,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
 
@@ -27,7 +33,7 @@ class NunchakuSVDQuantArgs:
     quantization_rank: int | None = None
     quantization_act_unsigned: bool = False
 
-    def adjust_config(self) -> None:
+    def _adjust_config(self) -> None:
         """infer precision and rank from filename if not provided"""
         if self.quantized_model_path and not self.enable_svdquant:
             self.enable_svdquant = True
@@ -65,12 +71,44 @@ class NunchakuSVDQuantArgs:
                 )
 
     def validate(self) -> None:
+        self._adjust_config()
+
+        if self.enable_svdquant:
+            if not current_platform.is_cuda():
+                raise ValueError(
+                    "Nunchaku SVDQuant is only supported on NVIDIA CUDA GPUs "
+                    "(Ampere SM8x or SM12x)."
+                )
+
+            device_count = torch.cuda.device_count()
+
+            unsupported: list[str] = []
+            for i in range(device_count):
+                major, minor = torch.cuda.get_device_capability(i)
+                if major == 9:
+                    unsupported.append(f"cuda:{i} (SM{major}{minor}, Hopper)")
+                elif major not in (8, 12):
+                    unsupported.append(f"cuda:{i} (SM{major}{minor})")
+
+            if unsupported:
+                raise ValueError(
+                    "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
+                    "Hopper (SM90) is not supported. "
+                    f"Unsupported devices: {', '.join(unsupported)}. "
+                    "Disable it with --enable-svdquant false."
+                )
+
         if not self.enable_svdquant:
             return
 
         if not self.quantized_model_path:
             raise ValueError(
                 "--enable-svdquant requires --quantized-model-path to be set"
+            )
+
+        if not is_nunchaku_available():
+            raise ValueError(
+                "Nunchaku is enabled, but not installed. Please refer to https://nunchaku.tech/docs/nunchaku/installation/installation.html for detailed installation methods."
             )
 
         if self.quantization_precision not in ("int4", "nvfp4"):

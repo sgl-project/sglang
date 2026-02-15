@@ -9,9 +9,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-    is_nunchaku_available,
-)
+from sglang.multimodal_gen.runtime.layers.quantization import NunchakuConfig
 from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
     NunchakuSVDQLinearMethod,
 )
@@ -39,24 +37,6 @@ class TransformerLoader(ComponentLoader):
 
     component_names = ["transformer", "audio_dit", "video_dit"]
     expected_library = "diffusers"
-
-    def _is_svdquant_config(self, quant_config: Any) -> bool:
-        return (
-            quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "svdquant"
-        )
-
-    def _load_state_dict_safe(self, weights_path: str) -> dict | None:
-        try:
-            return safetensors_load_file(weights_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to load weights from %s for Nunchaku scale patch: %s",
-                weights_path,
-                exc,
-            )
-            return None
 
     def _patch_native_svdq_linear(
         self, module: nn.Module, tensor: Any, svdq_linear_cls: type
@@ -109,16 +89,13 @@ class TransformerLoader(ComponentLoader):
         self,
         model: nn.Module,
         safetensors_list: list[str],
-        quant_config: Any,
+        nunchaku_config: NunchakuConfig | None,
     ) -> None:
         """Patch transformer module with Nunchaku scale tensors from safetensors weights.
 
         For NVFP4 checkpoints, correctness depends on `wtscale` and attention
         `wcscales`. The FSDP loader may skip some of these metadata tensors.
         """
-        if not self._is_svdquant_config(quant_config) or not is_nunchaku_available():
-            return
-
         if not safetensors_list:
             return
 
@@ -132,7 +109,7 @@ class TransformerLoader(ComponentLoader):
 
         from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
 
-        state_dict = self._load_state_dict_safe(safetensors_list[0])
+        state_dict = safetensors_load_file(safetensors_list[0])
         if state_dict is None:
             return
 
@@ -192,24 +169,6 @@ class TransformerLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {weights_path}")
 
-        # Check if we should use custom initialization weights
-        custom_weights_path = getattr(
-            server_args, "init_weights_from_safetensors", None
-        )
-        if custom_weights_path is not None:
-            logger.info(
-                "Using custom initialization weights from: %s", custom_weights_path
-            )
-            if os.path.isdir(custom_weights_path):
-                safetensors_list = _list_safetensors_files(custom_weights_path)
-            else:
-                if not custom_weights_path.endswith(".safetensors"):
-                    raise ValueError(
-                        f"Custom initialization weights must be a .safetensors file or directory, "
-                        f"got: {custom_weights_path}"
-                    )
-                safetensors_list = [custom_weights_path]
-
         return safetensors_list
 
     def load_customized(
@@ -240,9 +199,9 @@ class TransformerLoader(ComponentLoader):
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        quant_config = server_args.nunchaku_config
+        nunchaku_config = server_args.nunchaku_config
 
-        if quant_config is not None:
+        if nunchaku_config is not None:
             # respect dtype from checkpoint
             # TODO: improve the condition
             param_dtype = None
@@ -265,10 +224,10 @@ class TransformerLoader(ComponentLoader):
         assert server_args.hsdp_shard_dim is not None
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
         if (
-            quant_config is not None
+            nunchaku_config is not None
             and "quant_config" in inspect.signature(model_cls.__init__).parameters
         ):
-            init_params["quant_config"] = quant_config
+            init_params["quant_config"] = nunchaku_config
 
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
@@ -287,8 +246,8 @@ class TransformerLoader(ComponentLoader):
             strict=False,
         )
 
-        if quant_config is not None:
-            self._patch_nunchaku_scales(model, safetensors_list, quant_config)
+        if nunchaku_config is not None:
+            self._patch_nunchaku_scales(model, safetensors_list, nunchaku_config)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)

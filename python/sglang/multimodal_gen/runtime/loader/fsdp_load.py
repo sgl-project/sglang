@@ -41,10 +41,8 @@ def _make_param_like(
     actual_param: torch.nn.Parameter, tensor: torch.Tensor
 ) -> torch.nn.Parameter:
     cls = actual_param.__class__
-    # IMPORTANT: nn.Parameter defaults to requires_grad=True, which is illegal
-    # for non-floating/complex dtypes (e.g., int8/FP8 quantized weights).
-    # Always create with requires_grad=False here, and let callers opt-in
-    # only when the dtype supports it.
+    # nn.Parameter defaults to requires_grad=True, which is illegal for non-floating/complex dtypes (e.g., int8/FP8
+    # quantized weights).
     try:
         new_param = cls.__new__(cls, tensor, requires_grad=False)
     except TypeError:
@@ -330,12 +328,13 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
+    # from nunchaku
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
         "wtscale",
-        "bias",  # Allow bias parameters to be initialized when missing in checkpoint
-    ]  # Can be extended as needed
+        "bias",
+    ]
     for new_param_name in unused_keys:
         # check unallowed missing params
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):

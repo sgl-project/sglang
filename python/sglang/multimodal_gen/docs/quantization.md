@@ -37,7 +37,7 @@ Nunchaku supports two quantization precisions:
 pip install nunchaku
 ```
 
-For more installation information, please refer to the [Nunchaku Official Documentation](https://nunchaku.tech/docs/nunchaku/).
+For more installation information, please refer to the [Nunchaku Official Documentation](https://nunchaku.tech/docs/nunchaku/installation/installation.html).
 
 #### 2. Download Quantized Models
 
