@@ -105,14 +105,14 @@ def get_normalized_target_modules(
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
 
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
-    an empty set (the caller should rely on --lora-target-modules from the CLI
-    to determine the concrete module set).
+    {"all"} as a sentinel value (the caller should check for "all" and fall
+    back to the CLI --lora-target-modules to determine the concrete module set).
     """
     # Handle PEFT shorthand strings — these cannot be resolved to concrete
-    # module names without inspecting the base model, so we return an empty
-    # set and let the caller fall back to the CLI --lora-target-modules.
+    # module names without inspecting the base model, so we return {"all"}
+    # and let the caller fall back to the CLI --lora-target-modules.
     if isinstance(target_modules, str):
-        return set()
+        return {"all"}
 
     params_mapping = {
         "q_proj": "qkv_proj",
