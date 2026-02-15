@@ -45,6 +45,11 @@ class BaseFormatDetector(ABC):
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
 
+        # When an unknown tool name is detected and forwarding is off,
+        # enter discard mode to silently consume tokens until eot_token,
+        # matching non-streaming behavior where the whole block is skipped.
+        self._discarding_unknown_tool = False
+
         # Token configuration (override in subclasses)
         self.bot_token = ""
         self.eot_token = ""
@@ -134,6 +139,20 @@ class BaseFormatDetector(ABC):
 
         For incompatible formats, detectors should override this method with custom logic.
         """
+        # Discard mode: consume tokens silently until end-of-tool token,
+        # so the entire unknown tool call block is skipped (not emitted).
+        if self._discarding_unknown_tool:
+            self._buffer += new_text
+            eot_pos = self._buffer.find(self.eot_token)
+            if eot_pos != -1:
+                remaining = self._buffer[eot_pos + len(self.eot_token) :]
+                self._buffer = ""
+                self._discarding_unknown_tool = False
+                if remaining:
+                    return self.parse_streaming_increment(remaining, tools)
+                return StreamingParseResult()
+            return StreamingParseResult()
+
         # Append new text to buffer
         self._buffer += new_text
         current_text = self._buffer
@@ -194,13 +213,28 @@ class BaseFormatDetector(ABC):
 
                 # Validate tool name if present
                 if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
-                    return StreamingParseResult()
+                    logger.warning(
+                        f"Model attempted to call undefined function: {obj['name']}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        # Enter discard mode: keep buffering until eot_token
+                        # so the entire tool call block is silently skipped,
+                        # consistent with non-streaming parse_base_json.
+                        self._discarding_unknown_tool = True
+                        self.current_tool_id = -1
+                        self.current_tool_name_sent = False
+                        if self.streamed_args_for_tool:
+                            self.streamed_args_for_tool.pop()
+                        # Check if eot_token is already in the buffer
+                        eot_pos = current_text.find(self.eot_token)
+                        if eot_pos != -1:
+                            remaining = current_text[eot_pos + len(self.eot_token) :]
+                            self._buffer = ""
+                            self._discarding_unknown_tool = False
+                            if remaining:
+                                return self.parse_streaming_increment(remaining, tools)
+                            return StreamingParseResult()
+                        return StreamingParseResult()
 
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
@@ -223,7 +257,10 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                if function_name and (
+                    function_name in self._tool_indices
+                    or envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
