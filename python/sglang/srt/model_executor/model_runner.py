@@ -33,6 +33,7 @@ from torch import nn
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -764,7 +765,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
+        # Allow external orchestrators (e.g. trainpi) to override the distributed
+        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
+        # env-vars and an externally-created TCPStore, completely avoiding port
+        # conflicts with intra-host collocation.
+        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        if dist_init_method_override:
+            dist_init_method = dist_init_method_override
+        elif self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
@@ -1594,6 +1602,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
+
+        if isinstance(config, GraniteMoeHybridConfig):
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(config, "layer_types", [])
+            )
+            if not has_mamba:
+                return None
+            else:
+                return config
+
         return None
 
     @property
@@ -2159,7 +2178,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)
             elif hasattr(layer, "linear_attn"):
-                self.attention_layers.append(layer.linear_attn)
+                if hasattr(layer.linear_attn, "attn"):
+                    self.attention_layers.append(layer.linear_attn.attn)
+                else:
+                    self.attention_layers.append(layer.linear_attn)
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):

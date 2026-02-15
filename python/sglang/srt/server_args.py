@@ -1616,8 +1616,8 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.2
-                    if check_pkg_version_at_least("flashinfer-python", "0.6.2"):
+                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.3
+                    if check_pkg_version_at_least("flashinfer-python", "0.6.3"):
                         self.moe_runner_backend = "flashinfer_trtllm"
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
@@ -1634,6 +1634,19 @@ class ServerArgs:
                 support_mamba_cache_extra_buffer=False,
                 sm100_default_attention_backend="triton",
             )
+
+        elif model_arch == "GraniteMoeHybridForCausalLM":
+            hf_config = self.get_model_config().hf_config
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(hf_config, "layer_types", [])
+            )
+            if has_mamba:
+                self._handle_mamba_radix_cache(
+                    model_arch=model_arch,
+                    support_mamba_cache_extra_buffer=False,
+                    sm100_default_attention_backend="triton",
+                )
 
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
