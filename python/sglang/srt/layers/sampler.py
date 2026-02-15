@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+_CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+_BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
 class Sampler(nn.Module):
@@ -123,52 +126,9 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            if can_sample_directly_from_probs:
-                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
-                batch_next_token_ids = sampling_from_probs_torch(
-                    probs,
-                    sampling_seed=sampling_info.sampling_seed,
-                    positions=positions,
-                )
-            else:
-                if get_global_server_args().sampling_backend == "flashinfer":
-                    if sampling_info.need_min_p_sampling:
-                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                        batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, sampling_info.min_ps
-                        )
-                    else:
-                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            filter_apply_order="joint",
-                            check_nan=self.use_nan_detection,
-                        )
-                elif get_global_server_args().sampling_backend == "pytorch":
-                    # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
-                        sampling_info.sampling_seed,
-                        positions,
-                    )
-                elif get_global_server_args().sampling_backend == "ascend":
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
-                    )
+            batch_next_token_ids = self._sample_from_probs(
+                probs, sampling_info, positions, can_sample_directly_from_probs
+            )
 
             if return_logprob:
                 if get_global_server_args().rl_on_policy_target is not None:
@@ -185,23 +145,77 @@ class Sampler(nn.Module):
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
-            if any(x > 0 for x in top_logprobs_nums):
-                (
-                    logits_output.next_token_top_logprobs_val,
-                    logits_output.next_token_top_logprobs_idx,
-                ) = get_top_logprobs(logprobs, top_logprobs_nums)
-
-            if any(x is not None for x in token_ids_logprobs):
-                (
-                    logits_output.next_token_token_ids_logprobs_val,
-                    logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
-
-            logits_output.next_token_logprobs = logprobs[
-                torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+            self._attach_logprobs_to_output(
+                logits_output,
+                logprobs,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                sampling_info,
                 batch_next_token_ids,
-            ]
+            )
 
+        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+
+        return batch_next_token_ids
+
+    def _sample_from_probs(
+        self,
+        probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+        can_sample_directly_from_probs: bool,
+    ) -> torch.Tensor:
+        if can_sample_directly_from_probs:
+            # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+            batch_next_token_ids = sampling_from_probs_torch(
+                probs,
+                sampling_seed=sampling_info.sampling_seed,
+                positions=positions,
+            )
+        else:
+            if get_global_server_args().sampling_backend == "flashinfer":
+                if sampling_info.need_min_p_sampling:
+                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    batch_next_token_ids = min_p_sampling_from_probs(
+                        probs, sampling_info.min_ps
+                    )
+                else:
+                    batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                        probs.contiguous(),
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        filter_apply_order="joint",
+                        check_nan=self.use_nan_detection,
+                    )
+            elif get_global_server_args().sampling_backend == "pytorch":
+                # A slower fallback implementation with torch native operations.
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    positions,
+                )
+            elif get_global_server_args().sampling_backend == "ascend":
+                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                )
+            else:
+                raise ValueError(
+                    f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
+                )
+        return batch_next_token_ids
+
+    def _sync_token_ids_across_tp(
+        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+    ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
@@ -216,7 +230,32 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
-        return batch_next_token_ids
+    def _attach_logprobs_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logprobs: torch.Tensor,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+    ):
+        # Attach logprobs to logits_output (in-place modification)
+        if any(x > 0 for x in top_logprobs_nums):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+
+        if any(x is not None for x in token_ids_logprobs):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+
+        logits_output.next_token_logprobs = logprobs[
+            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+            batch_next_token_ids,
+        ]
 
     def compute_logprobs_only(
         self,
@@ -266,6 +305,42 @@ class Sampler(nn.Module):
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+
+
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """Register a custom sampler factory for a backend string."""
+
+    if not backend:
+        raise ValueError("backend must be a non-empty string")
+
+    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    SAMPLING_BACKEND_CHOICES.add(backend)
+    _CUSTOM_SAMPLER_FACTORIES[backend] = factory
+
+
+def create_sampler(backend: Optional[str] = None) -> "Sampler":
+    """Create a sampler honoring custom backend registrations."""
+
+    server_args = get_global_server_args()
+    backend = backend or (server_args.sampling_backend if server_args else None)
+
+    if backend in _CUSTOM_SAMPLER_FACTORIES:
+        sampler = _CUSTOM_SAMPLER_FACTORIES[backend]()
+        if not isinstance(sampler, Sampler):
+            raise TypeError(
+                f"Custom sampler factory for backend '{backend}' must return a Sampler"
+            )
+        return sampler
+
+    if backend is None or backend in _BUILT_IN_SAMPLING_BACKENDS:
+        return Sampler()
+
+    raise ValueError(
+        f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
+    )
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
@@ -414,27 +489,6 @@ def top_p_normalize_probs_torch(
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
 
-def get_top_logprobs(
-    logprobs: torch.Tensor,
-    top_logprobs_nums: List[int],
-):
-    max_k = max(top_logprobs_nums)
-    ret = logprobs.topk(max_k, dim=1)
-    values = ret.values.tolist()
-    indices = ret.indices.tolist()
-
-    output_top_logprobs_val = []
-    output_top_logprobs_idx = []
-    for i, k in enumerate(top_logprobs_nums):
-        output_top_logprobs_val.append(values[i][:k])
-        output_top_logprobs_idx.append(indices[i][:k])
-
-    return (
-        output_top_logprobs_val,
-        output_top_logprobs_idx,
-    )
-
-
 def get_token_ids_logprobs_batch_optimized(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[List[int]],
@@ -521,23 +575,6 @@ def get_token_ids_logprobs_batch_optimized(
             output_token_ids_logprobs_idx.append([])
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
-
-
-def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List[int]]):
-    output_token_ids_logprobs_val = []
-    output_token_ids_logprobs_idx = []
-    for i, token_ids in enumerate(token_ids_logprobs):
-        if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
-            output_token_ids_logprobs_idx.append(token_ids)
-        else:
-            output_token_ids_logprobs_val.append([])
-            output_token_ids_logprobs_idx.append([])
-
-    return (
-        output_token_ids_logprobs_val,
-        output_token_ids_logprobs_idx,
-    )
 
 
 def apply_custom_logit_processor(

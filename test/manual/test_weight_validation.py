@@ -11,7 +11,7 @@ import struct
 import tempfile
 import unittest
 
-from sglang.srt.model_loader.weight_validation import (
+from sglang.srt.model_loader.ci_weight_validation import (
     _check_index_files_exist,
     _validate_sharded_model,
 )

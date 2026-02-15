@@ -1,4 +1,4 @@
-use sgl_model_gateway::core::metrics_aggregator::{aggregate_metrics, MetricPack};
+use smg::core::metrics_aggregator::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {

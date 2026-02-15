@@ -35,8 +35,6 @@ class TestAscendMlaHicache(CustomTestCase):
             0.8,
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "modelslim",
             "--tp-size",
             4,
             "--enable-hierarchical-cache",

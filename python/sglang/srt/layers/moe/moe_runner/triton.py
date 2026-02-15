@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -32,25 +32,38 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))
+_use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
+_is_xpu = is_xpu()
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+
+    if _is_hip:
+        _has_vllm = False
+        if _use_aiter:
+            try:
+                from aiter import moe_sum
+            except ImportError:
+                raise ImportError(
+                    "aiter is required when SGLANG_USE_AITER is set to True"
+                )
+        else:
+            try:
+                from vllm import _custom_ops as vllm_ops  # moe_sum
+
+                _has_vllm = True
+            except ImportError:
+                # Fallback: vllm not available, will use triton moe_sum
+                _has_vllm = False
 elif _is_cpu and _is_cpu_amx_available:
     pass
-elif _is_hip:
-    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
-
-    if _use_aiter:
-        try:
-            from aiter import moe_sum
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+elif _is_xpu:
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import (  # noqa: F401
         moe_align_block_size as sgl_moe_align_block_size,
     )
@@ -115,10 +128,11 @@ class TritonRunnerCore(MoeRunnerCore):
 
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            _swiglu_gpt_oss_sigmoid_alpha,
+            _swiglu_silu_clamp_mul,
             invoke_fused_moe_kernel,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
-            swiglu_with_alpha_and_limit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -201,12 +215,14 @@ class TritonRunnerCore(MoeRunnerCore):
         if activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_alpha,
-                    gemm1_limit,
+                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+                    intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
                 )
-            elif _is_cuda:
+            elif gemm1_limit is not None:
+                intermediate_cache2 = _swiglu_silu_clamp_mul(
+                    intermediate_cache1.view(-1, N), gemm1_limit
+                )
+            elif _is_cuda or _is_hip or _is_xpu:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
@@ -215,7 +231,7 @@ class TritonRunnerCore(MoeRunnerCore):
         elif activation == "gelu":
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda:
+            if _is_cuda or _is_hip:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.gelu_and_mul(
@@ -305,11 +321,24 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
-            else:
+            elif _has_vllm:
                 vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
+            else:
+                # Fallback: use triton moe_sum when vllm is not available
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
+        elif _is_xpu:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),

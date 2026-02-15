@@ -36,19 +36,24 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.radio import RadioModel
+from sglang.srt.multimodal.evs import EVS, EVSConfig
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 
-class NemotronH_Nano_VL_V2(nn.Module):
+class NemotronH_Nano_VL_V2(EVS):
+    @staticmethod
+    def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
+        return EVSConfig(video_pruning_rate=config.video_pruning_rate)
+
     def __init__(
         self,
         config: NemotronH_Nano_VL_V2_Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        super().__init__(config)
 
         self.downsample_ratio = config.downsample_ratio
         self.language_model = NemotronHForCausalLM(

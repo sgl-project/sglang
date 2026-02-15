@@ -3,7 +3,7 @@
 //! This module contains all code specific to regular tokenizer-based models,
 //! including pipeline stages, response processing, and streaming.
 
-pub mod processor;
-pub mod responses;
-pub mod stages;
-pub mod streaming;
+pub(crate) mod processor;
+pub(crate) mod responses;
+pub(crate) mod stages;
+pub(crate) mod streaming;

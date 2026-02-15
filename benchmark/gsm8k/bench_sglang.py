@@ -6,6 +6,7 @@ import re
 import time
 
 import numpy as np
+from datasets import load_dataset
 
 from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
@@ -47,12 +48,31 @@ def main(args):
     # Select backend
     set_default_backend(select_sglang_backend(args))
 
+    # Load tokenizer if enable_thinking is set
+    tokenizer = None
+    if args.enable_thinking:
+        from transformers import AutoTokenizer
+
+        assert (
+            args.tokenizer_path is not None
+        ), "--tokenizer-path is required when --enable-thinking is set"
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_path, trust_remote_code=True
+        )
+
     # Read data
-    data_path = args.data_path
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    if not os.path.isfile(data_path):
-        data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
+    if args.platinum:
+        print("Loading GSM8K Platinum dataset from HuggingFace...")
+        dataset = load_dataset("madrylab/gsm8k-platinum", "main", split="test")
+        lines = [
+            {"question": item["question"], "answer": item["answer"]} for item in dataset
+        ]
+    else:
+        data_path = args.data_path
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        if not os.path.isfile(data_path):
+            data_path = download_and_cache_file(url)
+        lines = list(read_jsonl(data_path))
 
     # Construct prompts
     num_questions = args.num_questions
@@ -62,7 +82,16 @@ def main(args):
     questions = []
     labels = []
     for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
+        raw_question = few_shot_examples + get_one_example(lines, i, False)
+        if tokenizer is not None:
+            messages = [{"role": "user", "content": raw_question}]
+            raw_question = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        questions.append(raw_question)
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
     arguments = [{"question": q} for q in questions]
@@ -75,9 +104,11 @@ def main(args):
 
     @sgl.function
     def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
+        s += question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer",
+            max_tokens=args.max_new_tokens,
+            stop=["Question", "Assistant:", "<|separator|>"],
         )
 
     #####################################
@@ -88,7 +119,8 @@ def main(args):
     tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         arguments,
-        temperature=0,
+        temperature=args.temperature,
+        top_p=args.top_p,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -125,7 +157,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "gsm8k",
+            "task": "gsm8k-platinum" if args.platinum else "gsm8k",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
@@ -144,5 +176,24 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode by wrapping prompts with chat template",
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Path to tokenizer (required when --enable-thinking is set)",
+    )
+    parser.add_argument(
+        "--platinum",
+        action="store_true",
+        help="Use GSM8K Platinum dataset (drop-in replacement with corrected labels)",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)

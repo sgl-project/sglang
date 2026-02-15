@@ -18,7 +18,7 @@ use crate::routers::{
 /// Chat request building stage
 ///
 /// Extracts chat-specific request building logic from the old unified RequestBuildingStage.
-pub struct ChatRequestBuildingStage {
+pub(crate) struct ChatRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
@@ -108,7 +108,9 @@ impl PipelineStage for ChatRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(proto_request);
+        ctx.state.proto_request = Some(
+            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
+        );
         Ok(None)
     }
 

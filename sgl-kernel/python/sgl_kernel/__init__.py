@@ -78,7 +78,13 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
-from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_cpu,
+    causal_conv1d_fwd,
+    causal_conv1d_update,
+    causal_conv1d_update_cpu,
+    chunk_gated_delta_rule_cpu,
+)
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,

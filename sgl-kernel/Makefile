@@ -1,5 +1,16 @@
 .PHONY: help check-deps install-deps tree ln submodule install build clean rebuild test format update
 
+# ---------------------------
+# Build resource controls
+# ---------------------------
+# By default, build uses all available CPU cores, but users can override:
+#   make build MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+NPROC ?= $(shell nproc 2>/dev/null || echo 1)
+MAX_JOBS ?= $(NPROC)
+CMAKE_BUILD_PARALLEL_LEVEL ?= $(MAX_JOBS)
+UV_BUILD_DIR ?= build
+CMAKE_POLICY_VERSION_MINIMUM ?= 3.5
+
 # Show help for each target
 help: ## Show this help message
 	@echo "Available targets:"
@@ -25,7 +36,13 @@ install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
 build: install-deps submodule ## Build and install wheel package
-	@rm -rf dist/* || true && CMAKE_POLICY_VERSION_MINIMUM=3.5 MAX_JOBS=$(nproc) CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
+	@rm -rf dist/* || true && \
+		CMAKE_POLICY_VERSION_MINIMUM=$(CMAKE_POLICY_VERSION_MINIMUM) \
+		MAX_JOBS=$(MAX_JOBS) \
+		CMAKE_BUILD_PARALLEL_LEVEL=$(CMAKE_BUILD_PARALLEL_LEVEL) \
+		CMAKE_ARGS="$(CMAKE_ARGS)" \
+		uv build --wheel -Cbuild-dir=$(UV_BUILD_DIR) . --verbose --color=always --no-build-isolation && \
+		pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info

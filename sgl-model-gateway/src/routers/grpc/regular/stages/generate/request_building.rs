@@ -18,7 +18,7 @@ use crate::routers::{
 /// Generate request building stage
 ///
 /// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
-pub struct GenerateRequestBuildingStage {
+pub(crate) struct GenerateRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
@@ -103,7 +103,9 @@ impl PipelineStage for GenerateRequestBuildingStage {
             }
         }
 
-        ctx.state.proto_request = Some(proto_request);
+        ctx.state.proto_request = Some(
+            crate::routers::grpc::proto_wrapper::ProtoRequest::Generate(proto_request),
+        );
         Ok(None)
     }
 
