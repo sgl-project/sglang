@@ -1207,7 +1207,7 @@ class ServerArgs:
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_NSA_FORCE_MLA.set(True)
                     logger.warning(
-                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on SM100."
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
@@ -1372,7 +1372,7 @@ class ServerArgs:
                 if is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
-                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                        "Detected Blackwell and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
                 elif (
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")
@@ -1874,7 +1874,7 @@ class ServerArgs:
         ):
             if not is_blackwell_supported():
                 raise ValueError(
-                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
                 )
 
             if self.page_size not in [32, 64]:
