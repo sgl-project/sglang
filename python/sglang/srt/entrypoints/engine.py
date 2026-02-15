@@ -680,6 +680,34 @@ class Engine(EngineBase):
             self.tokenizer_manager.unload_lora_adapter(obj, None)
         )
 
+    async def async_load_lora_adapter(
+        self, lora_name: str, lora_path: str, pinned: bool = False
+    ):
+        """
+        Asynchronous version of load_lora_adapter.
+
+        See load_lora_adapter() for detailed documentation.
+        """
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+            pinned=pinned,
+        )
+
+        return await self.tokenizer_manager.load_lora_adapter(obj, None)
+
+    async def async_unload_lora_adapter(self, lora_name: str):
+        """
+        Asynchronous version of unload_lora_adapter.
+
+        See unload_lora_adapter() for detailed documentation.
+        """
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        return await self.tokenizer_manager.unload_lora_adapter(obj, None)
+
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
