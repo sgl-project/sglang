@@ -2010,7 +2010,7 @@ def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
-    port = 29500 + os.getpid() % 1000
+    port = find_available_port(29500)
 
     processes = []
     for rank in range(world_size):
