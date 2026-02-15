@@ -45,14 +45,17 @@ from sglang.srt.utils.common import rank0_log
 
 if not is_cpu() and not is_npu():
     # fix import error on CPU device, no impacts when non-CPU path
-    from sglang.jit_kernel.cutedsl_gdn import (
-        cutedsl_fused_sigmoid_gating_delta_rule_update,
-    )
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
     from sglang.srt.layers.attention.fla.kda import chunk_kda
+
+if is_cuda():
+    # cutedsl_gdn requires NVIDIA CUTLASS (not available on ROCm/HIP)
+    from sglang.jit_kernel.cutedsl_gdn import (
+        cutedsl_fused_sigmoid_gating_delta_rule_update,
+    )
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -829,7 +832,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get() and is_cuda()
         rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
         self._kernel_func = (
             cutedsl_fused_sigmoid_gating_delta_rule_update

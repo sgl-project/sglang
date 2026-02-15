@@ -27,15 +27,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 try:
+    # Core kernels used by both decode and non-PS prefill paths.
     from aiter import (
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
-        get_ps_metadata_info_v1,
-        get_ps_metadata_v1,
         mha_batch_prefill_func,
-        mla_prefill_ps_asm_fwd,
-        mla_reduce_v1,
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
@@ -43,6 +40,21 @@ except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
+
+# Optional PS/fp8 prefill kernels: newer aiter builds provide these symbols, but
+# some environments ship older builds. Keep decode/non-PS paths available.
+try:
+    from aiter import (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+        mla_reduce_v1,
+    )
+except ImportError:
+    get_ps_metadata_info_v1 = None
+    get_ps_metadata_v1 = None
+    mla_prefill_ps_asm_fwd = None
+    mla_reduce_v1 = None
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
@@ -54,10 +66,32 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
-# Use fp8 prefill only on gfx95
-_use_fp8_prefill_attn = (
-    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+_has_fp8_prefill_ps_kernels = all(
+    x is not None
+    for x in (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+        mla_reduce_v1,
+    )
 )
+
+# Use fp8 prefill only on gfx95 and when optional PS kernels are available.
+_use_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
+    and is_gfx95_supported()
+    and _has_fp8_prefill_ps_kernels
+)
+
+if (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
+    and is_gfx95_supported()
+    and not _has_fp8_prefill_ps_kernels
+):
+    logger.warning(
+        "SGLANG_AITER_FP8_PREFILL_ATTN is enabled but optional AITER PS kernels "
+        "are unavailable; falling back to non-PS prefill path."
+    )
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
@@ -123,7 +157,11 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        self.v_head_dim = getattr(model_runner.model_config, "v_head_dim", None)
+        if self.v_head_dim is None or self.v_head_dim <= 0:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -132,6 +170,18 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+
+        # CK `mha_batch_prefill` is unsupported for head_dim > 128 in many ROCm
+        # deployments. Use triton extend_attention_fwd directly to avoid
+        # runtime JIT-probe overhead and startup instability.
+        self._use_ck_batch_prefill = True
+        if not skip_prefill and (not self.use_mla) and self.head_dim > 128:
+            self._use_ck_batch_prefill = False
+            logger.warning(
+                "CK batch_prefill is disabled for head_dim=%d, "
+                "falling back to triton extend kernel",
+                self.head_dim,
+            )
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -1520,6 +1570,33 @@ class AiterAttnBackend(AttentionBackend):
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
+
+            if not self._use_ck_batch_prefill:
+                # CK mha_batch_prefill kernel does not support head_dim > 128.
+                # Fall back to the triton extend_attention_fwd kernel.
+                o = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                self.extend_attention_fwd(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    None,  # custom_mask
+                    True,  # is_causal
+                    None,  # mask_indptr
+                    self.forward_metadata.max_q_len,
+                    layer.scaling,
+                    logit_cap=self.logits_soft_cap,
+                )
+                return o
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
