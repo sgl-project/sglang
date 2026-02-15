@@ -46,7 +46,8 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
-          USE_CCACHE: 0
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
 
       - name: Upload to PyPI
         working-directory: sgl-kernel
@@ -139,7 +140,8 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
-          USE_CCACHE: 0
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
