@@ -9,6 +9,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+from sglang.srt.layers.attention.fla.utils import IS_GLUON_SUPPORTED
+
+if IS_GLUON_SUPPORTED:
+    from sglang.srt.layers.attention.fla.gluon import TensorDescriptor, gl
+    from sglang.srt.layers.attention.fla.gluon.wy_fast_gluon import (
+        recompute_w_u_fwd_kernel_gluon,
+    )
 
 
 # @triton.autotune(
@@ -128,28 +135,73 @@ def recompute_w_u_fwd(
     BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    recompute_w_u_fwd_kernel[(NT, B * H)](
-        k=k,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        g=g_cumsum,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
-    )
+
+    if IS_GLUON_SUPPORTED:
+        # tma desc init
+        kw_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BK], gl.float16)
+        vu_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BV], gl.float16)
+        A_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BT], gl.float16)
+        k_desc = TensorDescriptor.from_tensor(k, [1, BT, 1, BK], kw_layout)
+        v_desc = TensorDescriptor.from_tensor(v, [1, BT, 1, BV], vu_layout)
+        A_desc = TensorDescriptor.from_tensor(A, [1, BT, 1, BT], A_layout)
+        if cu_seqlens is not None:
+            w_layout = gl.NVMMASharedLayout.get_default_for([BT, BK], gl.float16)
+            w_desc = TensorDescriptor.from_tensor(
+                w.view(B * T, H * K), [1, BK], w_layout
+            )
+            u_layout = gl.NVMMASharedLayout.get_default_for([BT, BV], gl.float16)
+            u_desc = TensorDescriptor.from_tensor(
+                u.view(B * T, H * V), [1, BV], u_layout
+            )
+        else:
+            w_desc = TensorDescriptor.from_tensor(w, [1, BT, 1, BK], kw_layout)
+            u_desc = TensorDescriptor.from_tensor(u, [1, BT, 1, BV], vu_layout)
+
+        recompute_w_u_fwd_kernel_gluon[(NT, B * H)](
+            k_desc=k_desc,
+            v_desc=v_desc,
+            w_desc=w_desc,
+            u_desc=u_desc,
+            A_desc=A_desc,
+            beta=beta,
+            g=g_cumsum,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            HK=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            USE_G=g_cumsum is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+        )
+    else:
+        recompute_w_u_fwd_kernel[(NT, B * H)](
+            k=k,
+            v=v,
+            beta=beta,
+            w=w,
+            u=u,
+            A=A,
+            g=g_cumsum,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+            num_stages=3,
+        )
     return w, u
 
 
