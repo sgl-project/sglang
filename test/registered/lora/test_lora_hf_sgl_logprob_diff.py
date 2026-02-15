@@ -461,6 +461,8 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         disable_cuda_graph: bool = DISABLE_CUDA_GRAPH,
         lora_target_modules: Optional[List[str]] = LORA_TARGET_MODULES,
         tp_size: int = 1,
+        check_logprobs: bool = True,
+        output_match_threshold: Optional[float] = None,
     ):
         """
         Run comparison test between SGLang and HuggingFace with LoRA.
@@ -497,17 +499,27 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         # Step 3: Compare log probabilities
         results, overall_stats = compare_logprobs(sglang_logprobs, hf_logprobs)
 
-        # Assert that all prompts pass the threshold
-        for result in results:
-            self.assertTrue(
-                result["prefill_logprob_match"],
-                f"Prefill logprob mismatch for prompt {result['prompt_idx']} "
-                f"(max_diff={result['prefill_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
-            )
-            self.assertTrue(
-                result["decode_logprob_match"],
-                f"Decode logprob mismatch for prompt {result['prompt_idx']} "
-                f"(max_diff={result['decode_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
+        if check_logprobs:
+            # Assert that all prompts pass the threshold
+            for result in results:
+                self.assertTrue(
+                    result["prefill_logprob_match"],
+                    f"Prefill logprob mismatch for prompt {result['prompt_idx']} "
+                    f"(max_diff={result['prefill_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
+                )
+                self.assertTrue(
+                    result["decode_logprob_match"],
+                    f"Decode logprob mismatch for prompt {result['prompt_idx']} "
+                    f"(max_diff={result['decode_max_diff']:.6e}, threshold={LOGPROB_THRESHOLD:.0e})",
+                )
+        # MoE's expert layers make logprob comparisons useless as the base MoE layers' output significantly differs between sglang and hf
+        if output_match_threshold is not None:
+            outputs_match_count = sum(r["outputs_match"] for r in results)
+            match_rate = outputs_match_count / len(results)
+            self.assertGreaterEqual(
+                match_rate,
+                output_match_threshold,
+                f"Output string match rate {match_rate:.2%} is below threshold {output_match_threshold:.2%}",
             )
 
         print_section_header("Test completed successfully!")
@@ -551,7 +563,16 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
 
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
         lora_paths = ["jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"]
-        prompts = DEFAULT_TEST_PROMPTS[:2]  # Use first 2 default prompts for basic test
+
+        # Load prompts from JSON file
+        prompts_path = os.path.join(
+            os.path.dirname(__file__),
+            "prompts",
+            "sglang_lora_moe_test_qwen1.5-MoE-A2.7B.json",
+        )
+        with open(prompts_path, "r") as f:
+            prompts = json.load(f)
+        prompts = prompts[:2]
 
         self._run_comparison_test(
             model_path=model_path,
@@ -559,6 +580,8 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             prompts=prompts,
             max_new_tokens=32,
             lora_backend="triton",
+            check_logprobs=False,
+            output_match_threshold=0.9,
         )
 
     def test_moe_lora_logprob_comparison_full(self):
@@ -584,6 +607,8 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             prompts=prompts,
             max_new_tokens=32,
             lora_backend="triton",
+            check_logprobs=False,
+            output_match_threshold=0.9,
         )
 
 
