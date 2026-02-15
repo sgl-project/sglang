@@ -1650,7 +1650,6 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                # Linear attention (both KDA and GDN use tensor format)
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )

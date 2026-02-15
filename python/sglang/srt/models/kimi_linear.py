@@ -196,11 +196,9 @@ class KimiDeltaAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        # Fuse b+f_a+g_a (qkv uses separate QKVParallelLinear for efficiency)
         # TODO: support fusion with quant
         self.do_fuse_bfg = quant_config is None
 
-        # QKVParallelLinear handles q, k, v fusion optimally (no cat overhead)
         attn_tp_rank = get_attention_tp_rank()
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -229,12 +227,10 @@ class KimiDeltaAttention(nn.Module):
                 divide(self.num_heads, self.tp_size),  # beta
                 2 * self.head_dim,  # f_a + g_a
             ]
-            # Batched linear for f_b and g_b projections
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
                 2, self.head_dim, projection_size, dtype=config.dtype
             )
         else:
-            # Unfused bfg path: separate projections (for quantized models)
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -368,7 +364,6 @@ class KimiDeltaAttention(nn.Module):
         )
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
-        # QKV projection (always fused via QKVParallelLinear)
         qkv, _ = self.qkv_proj(hidden_states)
 
         # Fused bfg projections
@@ -731,17 +726,12 @@ class KimiLinearForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                # Check if this is a bfg fusion weight
                 if weight_name in fuse_bfg_keys:
                     layer_id = int(name.split(".")[2])
-                    # Check if this is a kda layer
-                    if not self.config.is_kda_layer(layer_id):
-                        continue
                     layer = self.model.layers[layer_id].self_attn
                     # Only load fused weights if fusion is enabled
                     if hasattr(layer, "do_fuse_bfg") and not layer.do_fuse_bfg:
                         continue
-                # qkv_proj weights are always loaded (qkv fusion is always used)
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
                     if not self.config.is_kda_layer(layer_id):
