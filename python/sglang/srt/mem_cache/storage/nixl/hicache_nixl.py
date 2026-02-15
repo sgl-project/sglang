@@ -319,8 +319,8 @@ class HiCacheNixl(HiCacheStorage):
         )
 
     def exists(self, key: str) -> bool:
-        results = self.batch_get([key])
-        return results[0] is not None
+        results = self.batch_exists([key])
+        return results > 0
 
     def batch_exists(
         self,
@@ -331,12 +331,12 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
-            key_multiplier = (
+            key_denominator = (
                 1 if not self.is_mla_model else 2
             )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
-            key_multiplier = 1
+            key_denominator = 1
 
         # obtain list of tuples by calling self.registration.create_query_tuples()
         tuples = []
@@ -355,8 +355,8 @@ class HiCacheNixl(HiCacheStorage):
 
         for i in range(len(query_res)):
             if query_res[i] is None:
-                return i // key_multiplier
-        return len(query_res) // key_multiplier
+                return i // key_denominator
+        return len(query_res) // key_denominator
 
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
         # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
@@ -467,7 +467,7 @@ class HiCacheNixl(HiCacheStorage):
                 results = [
                     (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
                 ]
-                return results[:page_num]
+                return results
         else:
             # non zero copy: copy data from temporary tensors to mem_pool_host page by page
             for i in range(page_num):
@@ -522,13 +522,6 @@ class HiCacheNixl(HiCacheStorage):
             )
             return [], [], [], []
 
-        target_tensors = [
-            self.mem_pool_host.get_data_page(
-                host_indices[i * self.mem_pool_host.page_size], flat=False
-            )
-            for i in range(page_num)
-        ]
-
         if self.is_zero_copy:
             key_list, _, ptr_list, element_size_list = (
                 self._get_location_and_size_list_from_meta(keys, host_indices)
@@ -558,7 +551,7 @@ class HiCacheNixl(HiCacheStorage):
         target_tensors: List[torch.Tensor],
         target_locations: List[int],
         target_sizes: List[int],
-    ) -> List[int]:
+    ) -> List[bool]:
 
         if not key_strs or not target_locations or not target_sizes:
             return [False] * len(keys)
@@ -585,7 +578,7 @@ class HiCacheNixl(HiCacheStorage):
                     logger.error(
                         f"******** Failed to create file {file_path} *********"
                     )
-                    return False
+                    return [False] * len(keys)
                 file_paths.append(file_path)
             success = self._execute_transfer(src, file_paths, "WRITE")
         else:  # mem_type == "OBJ"
