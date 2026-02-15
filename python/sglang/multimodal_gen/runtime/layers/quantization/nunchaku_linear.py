@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs

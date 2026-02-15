@@ -2,7 +2,7 @@
 
 from typing import Literal, get_args
 
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
 
@@ -23,17 +23,7 @@ def register_quantization_config(quantization: str):
     Args:
         quantization (str): The quantization method name.
 
-    Examples:
-        >>> from sglang.multimodal_gen.runtime.layers.quantization import register_quantization_config
-        >>> from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
-        >>> from sglang.multimodal_gen.runtime.layers.quantization.base_config import QuantizationConfig
-        >>>
-        >>> @register_quantization_config("my_quant")
-        ... class MyQuantConfig(QuantizationConfig):
-        ...     pass
-        >>>
-        >>> get_quantization_config("my_quant")
-        <class 'MyQuantConfig'>
+
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):
@@ -63,29 +53,9 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-try:
-    from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-        NunchakuConfig,
-    )
-    from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
-        NunchakuAWQLinearMethod,
-        NunchakuSVDQLinearMethod,
-    )
-
-
-except ImportError:
-    NunchakuConfig = None
-    NunchakuSVDQLinearMethod = None
-    NunchakuAWQLinearMethod = None
-
-
 __all__ = [
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",
     "QUANTIZATION_METHODS",
-    # Nunchaku exports
-    "NunchakuConfig",
-    "NunchakuSVDQLinearMethod",
-    "NunchakuAWQLinearMethod",
 ]

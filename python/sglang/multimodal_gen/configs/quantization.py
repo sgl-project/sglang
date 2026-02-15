@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform

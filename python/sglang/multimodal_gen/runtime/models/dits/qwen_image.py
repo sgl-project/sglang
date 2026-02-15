@@ -31,10 +31,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     is_nunchaku_available,
 )

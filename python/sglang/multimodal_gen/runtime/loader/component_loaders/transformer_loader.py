@@ -5,13 +5,10 @@ from copy import deepcopy
 from typing import Any
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
-from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.layers.quantization import NunchakuConfig
-from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_linear import (
-    NunchakuSVDQLinearMethod,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -38,125 +35,19 @@ class TransformerLoader(ComponentLoader):
     component_names = ["transformer", "audio_dit", "video_dit"]
     expected_library = "diffusers"
 
-    def _patch_native_svdq_linear(
-        self, module: nn.Module, tensor: Any, svdq_linear_cls: type
-    ) -> bool:
-        if (
-            isinstance(module, svdq_linear_cls)
-            and getattr(module, "wtscale", None) is not None
-        ):
-            module.wtscale = tensor
-            return True
-        return False
-
-    def _patch_sglang_svdq_linear(
-        self, module: nn.Module, tensor: Any, svdq_method_cls: type
-    ) -> bool:
-        quant_method = getattr(module, "quant_method", None)
-        if not isinstance(quant_method, svdq_method_cls):
-            return False
-
-        existing = getattr(module, "wtscale", None)
-        if isinstance(existing, nn.Parameter):
-            with torch.no_grad():
-                existing.data.copy_(tensor.to(existing.data.dtype))
-        else:
-            module.wtscale = tensor
-
-        # Keep alpha in sync (kernel reads `layer._nunchaku_alpha`)
-        try:
-            module._nunchaku_alpha = float(tensor.detach().cpu().item())
-        except Exception:
-            module._nunchaku_alpha = None
-        return True
-
-    def _patch_sglang_svdq_wcscales(
-        self, module: nn.Module, tensor: Any, svdq_method_cls: type
-    ) -> bool:
-        quant_method = getattr(module, "quant_method", None)
-        if not isinstance(quant_method, svdq_method_cls):
-            return False
-
-        existing = getattr(module, "wcscales", None)
-        if isinstance(existing, nn.Parameter):
-            with torch.no_grad():
-                existing.data.copy_(tensor.to(existing.data.dtype))
-        else:
-            module.wcscales = tensor
-        return True
-
-    def _patch_nunchaku_scales(
-        self,
-        model: nn.Module,
-        safetensors_list: list[str],
-        nunchaku_config: NunchakuConfig | None,
-    ) -> None:
-        """Patch transformer module with Nunchaku scale tensors from safetensors weights.
-
-        For NVFP4 checkpoints, correctness depends on `wtscale` and attention
-        `wcscales`. The FSDP loader may skip some of these metadata tensors.
-        """
-        if not safetensors_list:
-            return
-
-        if len(safetensors_list) != 1:
-            logger.warning(
-                "Nunchaku scale patch expects a single safetensors file, "
-                "but got %d files. Skipping.",
-                len(safetensors_list),
-            )
-            return
-
-        from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
-
-        state_dict = safetensors_load_file(safetensors_list[0])
-        if state_dict is None:
-            return
-
-        num_wtscale = 0
-        num_wcscales = 0
-        for name, module in model.named_modules():
-            wt = state_dict.get(f"{name}.wtscale")
-            if wt is not None:
-                if self._patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
-                    num_wtscale += 1
-                elif self._patch_sglang_svdq_linear(
-                    module, wt, NunchakuSVDQLinearMethod
-                ):
-                    num_wtscale += 1
-
-            wc = state_dict.get(f"{name}.wcscales")
-            if wc is not None:
-                # Some modules may have wcscales as a direct attribute/Parameter.
-                existing = getattr(module, "wcscales", None)
-                if isinstance(existing, nn.Parameter):
-                    with torch.no_grad():
-                        existing.data.copy_(wc.to(existing.data.dtype))
-                    num_wcscales += 1
-                elif existing is not None:
-                    setattr(module, "wcscales", wc)
-                    num_wcscales += 1
-                elif self._patch_sglang_svdq_wcscales(
-                    module, wc, NunchakuSVDQLinearMethod
-                ):
-                    num_wcscales += 1
-
-        if num_wtscale > 0:
-            logger.info("Patched wtscale for %d layers", num_wtscale)
-        if num_wcscales > 0:
-            logger.info("Patched wcscales for %d layers", num_wcscales)
-
     def get_list_of_safetensors_to_load(
         self, server_args: ServerArgs, component_model_path: str
     ) -> list[str]:
         """
-        get list of safetensors to load
-        """
-        quant_config = server_args.nunchaku_config
+        get list of safetensors to load.
 
-        if quant_config is not None and quant_config.quantized_model_path:
+        For some quantization framework, if --quantized-model-path is provided, load from this path instead of main model
+        """
+        nunchaku_config = server_args.nunchaku_config
+
+        if nunchaku_config is not None and nunchaku_config.quantized_model_path:
             # load from quantized_model_path if applicable
-            weights_path = quant_config.quantized_model_path
+            weights_path = nunchaku_config.quantized_model_path
             logger.info("Using quantized model weights from: %s", weights_path)
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
                 safetensors_list = [weights_path]
@@ -247,7 +138,7 @@ class TransformerLoader(ComponentLoader):
         )
 
         if nunchaku_config is not None:
-            self._patch_nunchaku_scales(model, safetensors_list, nunchaku_config)
+            _patch_nunchaku_scales(model, safetensors_list)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
