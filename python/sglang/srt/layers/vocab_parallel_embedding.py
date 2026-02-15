@@ -224,7 +224,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 tp_rank = get_tensor_model_parallel_rank()
                 self.tp_size = get_tensor_model_parallel_world_size()
         else:
-            assert use_attn_tp_group is False
+            if use_attn_tp_group:
+                logger.warning("not in tp_mode, use_attn_tp_group will not work")
             tp_rank = 0
             self.tp_size = 1
 
