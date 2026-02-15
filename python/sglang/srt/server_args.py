@@ -399,8 +399,8 @@ class ServerArgs:
     export_metrics_to_file_dir: Optional[str] = None
 
     # API related
-    api_key: Optional[str] = None
-    admin_api_key: Optional[str] = None
+    api_key: Optional[str] = dataclasses.field(default=None, repr=False)
+    admin_api_key: Optional[str] = dataclasses.field(default=None, repr=False)
     served_model_name: Optional[str] = None
     weight_version: str = "default"
     chat_template: Optional[str] = None

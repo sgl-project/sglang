@@ -23,6 +23,10 @@ register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
 TEST_CUSTOM_HEADER_VALUE = "test-header-value-67890"
+TEST_AUTHORIZATION_HEADER_VALUE = "Bearer sk-top-secret"
+TEST_PROXY_AUTHORIZATION_HEADER_VALUE = "Basic cHJveHktdXNlcjpzZWNyZXQ="
+TEST_X_API_KEY_HEADER_VALUE = "x-demo-secret"
+TEST_API_KEY_HEADER_VALUE = "api-demo-secret"
 
 
 class BaseTestRequestLogger:
@@ -186,6 +190,71 @@ class TestCustomHeaderViaEnvVar(BaseTestRequestLogger, CustomTestCase):
             content,
             f"Default header value not found in {source_name}",
         )
+
+
+class TestSensitiveHeadersViaEnvVar(BaseTestRequestLogger, CustomTestCase):
+    """Test that sensitive headers are masked when added via env var."""
+
+    log_requests_format = "text"
+    env_vars = {
+        "SGLANG_LOG_REQUEST_HEADERS": "authorization,proxy-authorization,x-api-key"
+    }
+    request_headers = {
+        "X-SMG-Routing-Key": TEST_ROUTING_KEY,
+        "Authorization": TEST_AUTHORIZATION_HEADER_VALUE,
+        "Proxy-Authorization": TEST_PROXY_AUTHORIZATION_HEADER_VALUE,
+        "X-API-Key": TEST_X_API_KEY_HEADER_VALUE,
+    }
+
+    def _verify_logs(self, content: str, source_name: str):
+        with self.subTest(source_name=source_name, check="default-header-name"):
+            self.assertIn(
+                "x-smg-routing-key",
+                content,
+                f"Default header should still be in whitelist in {source_name}",
+            )
+        with self.subTest(source_name=source_name, check="default-header-value"):
+            self.assertIn(
+                TEST_ROUTING_KEY,
+                content,
+                f"Default header value not found in {source_name}",
+            )
+
+        for header_name, raw_value in [
+            ("authorization", TEST_AUTHORIZATION_HEADER_VALUE),
+            ("proxy-authorization", TEST_PROXY_AUTHORIZATION_HEADER_VALUE),
+            ("x-api-key", TEST_X_API_KEY_HEADER_VALUE),
+        ]:
+            with self.subTest(
+                header_name=header_name,
+                source_name=source_name,
+                check="header-name-present",
+            ):
+                self.assertIn(
+                    header_name,
+                    content,
+                    f"Sensitive header name '{header_name}' not found in {source_name}",
+                )
+            with self.subTest(
+                header_name=header_name,
+                source_name=source_name,
+                check="header-masked",
+            ):
+                self.assertIn(
+                    f"'{header_name}': '***'",
+                    content,
+                    f"Sensitive header '{header_name}' is not masked in {source_name}",
+                )
+            with self.subTest(
+                header_name=header_name,
+                source_name=source_name,
+                check="header-not-leaked",
+            ):
+                self.assertNotIn(
+                    raw_value,
+                    content,
+                    f"Sensitive header '{header_name}' leaked in {source_name}",
+                )
 
 
 if __name__ == "__main__":
