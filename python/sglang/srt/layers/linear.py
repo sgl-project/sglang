@@ -226,7 +226,7 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
+                torch.zeros(self.output_size, dtype=self.params_dtype)
             )
             set_weight_attrs(
                 self.bias,

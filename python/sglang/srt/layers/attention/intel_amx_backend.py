@@ -68,19 +68,21 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        if save_kv_cache and k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         _, max_extend_len = self.forward_metadata
-
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -96,6 +98,10 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
+            layer.is_cross_attention,
+            layer.sliding_window_size + 1,
+            forward_batch.encoder_lens,
+            sinks,
         )
         return o
 
@@ -107,6 +113,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         attn_logits, _ = self.forward_metadata
 
@@ -116,7 +123,11 @@ class IntelAMXAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
-
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -124,15 +135,18 @@ class IntelAMXAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             k,
             v,
-            forward_batch.out_cache_loc,
+            cache_loc,
             attn_logits,
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             layer.scaling,
             layer.logit_cap,
+            layer.is_cross_attention,
+            layer.sliding_window_size + 1,
+            forward_batch.encoder_lens,
+            sinks,
         )
-
         return o
 
     def support_triton(self):

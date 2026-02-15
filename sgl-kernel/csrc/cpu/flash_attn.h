@@ -100,44 +100,42 @@ struct flash_attn_softmax {
       int n_size,
       int padded_n_size,
       int head_size_v,
-      const float sm_scale) {
+      const float sm_scale,
+      int row) {
     using Vec = at::vec::Vectorized<float>;
     const Vec scale_vec = Vec(sm_scale);
     float* s_delta = s_i;
-    for (int row = 0; row < m_size; ++row) {
-      // s_i <- s_i * scale
-      at::vec::map<float>(
-          [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+    // s_i <- s_i * scale
+    at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
 
-      // m_i: max value per row
-      float m_i = at::vec::reduce_all<float>(
-          [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
-      m_i = std::max(m_i, m_prime[row]);
+    // m_i: max value per row
+    float m_i =
+        at::vec::reduce_all<float>([](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
+    m_i = std::max(m_i, m_prime[row]);
 
-      // m_delta <- exp(m' - m_i)
-      float m_delta = std::exp(m_prime[row] - m_i);
+    // m_delta <- exp(m' - m_i)
+    float m_delta = std::exp(m_prime[row] - m_i);
 
-      // s_delta <- exp(s_i - m_i)
-      at::vec::map<float>(
-          [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
+    // s_delta <- exp(s_i - m_i)
+    at::vec::map<float>(
+        [m_i](Vec x) { return (x - Vec(m_i)).fexp_u20(); }, s_delta + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
 
-      // s' <- s' * m_delta + sum(s_delta)
-      s_prime[row] *= m_delta;
-      s_prime[row] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
+    // s' <- s' * m_delta + sum(s_delta)
+    s_prime[row] *= m_delta;
+    s_prime[row] += at::vec::reduce_all<float>([](Vec& x, Vec& y) { return x + y; }, s_delta + row * BLOCK_N, n_size);
 
-      m_prime[row] = m_i;
+    m_prime[row] = m_i;
 
-      // v' <- v' * m_delta
-      at::vec::map<float>(
-          [m_delta](Vec x) { return x * Vec(m_delta); },
-          v_prime + row * head_size_v,
-          v_prime + row * head_size_v,
-          head_size_v);
+    // v' <- v' * m_delta
+    at::vec::map<float>(
+        [m_delta](Vec x) { return x * Vec(m_delta); },
+        v_prime + row * head_size_v,
+        v_prime + row * head_size_v,
+        head_size_v);
 
-      // pad s_delta with 0 first and then convert to scalar_t
-      fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-      copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
-    }
+    // pad s_delta with 0 first and then convert to scalar_t
+    fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+    copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
   }
 };
 
@@ -154,7 +152,8 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
       int n_size,
       int padded_n_size,
       int head_size_v,
-      const float sm_scale) {
+      const float sm_scale,
+      int row) {
     float* s_delta = s_i;
     const __m512 vscale = _mm512_set1_ps(sm_scale);
 
@@ -174,71 +173,70 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
 
     const __m512 vneg_inf = _mm512_set1_ps(NEG_INF);
 
-    for (int m = 0; m < m_size; ++m) {
-      vmax = vneg_inf;
+    int m = row;
+    vmax = vneg_inf;
 
-      // s_i <- s_i * scale
-      int n = 0;
-      for (; n <= n_size - 16; n += 16) {
-        va = _mm512_mul_ps(_mm512_loadu_ps(s_i + m * BLOCK_N + n), vscale);
-        vmax = _mm512_max_ps(va, vmax);
-      }
-      if (n_remainder > 0) {
-        va = _mm512_mul_ps(_mm512_mask_loadu_ps(vneg_inf, vmask, s_i + m * BLOCK_N + n), vscale);
-        vmax = _mm512_max_ps(va, vmax);
-      }
+    // s_i <- s_i * scale
+    int n = 0;
+    for (; n <= n_size - 16; n += 16) {
+      va = _mm512_mul_ps(_mm512_loadu_ps(s_i + m * BLOCK_N + n), vscale);
+      vmax = _mm512_max_ps(va, vmax);
+    }
+    if (n_remainder > 0) {
+      va = _mm512_mul_ps(_mm512_mask_loadu_ps(vneg_inf, vmask, s_i + m * BLOCK_N + n), vscale);
+      vmax = _mm512_max_ps(va, vmax);
+    }
 
-      // m_i: max value per row
-      float m_i = _mm512_reduce_max_ps(vmax);
-      vmax = _mm512_set1_ps(m_i);
+    // m_i: max value per row
+    float m_i = _mm512_reduce_max_ps(vmax);
+    vmax = _mm512_set1_ps(m_i);
 
-      // m_delta <- exp(m' - m_i)
-      float m_delta = std::exp(m_prime[m] - m_i);
+    // m_delta <- exp(m' - m_i)
+    float m_delta = std::exp(m_prime[m] - m_i);
 
-      // s_delta <- exp(s_i - m_i)
-      vsum = _mm512_setzero_ps();
-      for (n = 0; n <= n_size - 16; n += 16) {
-        va = _mm512_mul_ps(_mm512_loadu_ps(s_i + m * BLOCK_N + n), vscale);
-        va = _mm512_fexp_u20_ps(_mm512_sub_ps(va, vmax));
-        vsum = _mm512_add_ps(vsum, va);
+    // s_delta <- exp(s_i - m_i)
+    vsum = _mm512_setzero_ps();
+    for (n = 0; n <= n_size - 16; n += 16) {
+      va = _mm512_mul_ps(_mm512_loadu_ps(s_i + m * BLOCK_N + n), vscale);
+      va = _mm512_fexp_u20_ps(_mm512_sub_ps(va, vmax));
+      vsum = _mm512_add_ps(vsum, va);
 
-        vb = (__m256i)(_mm512_cvtneps_pbh(va));
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(s_delta2 + m * BLOCK_N + n), vb);
-      }
-      if (n_remainder > 0) {
-        va = _mm512_mul_ps(_mm512_mask_loadu_ps(vneg_inf, vmask, s_i + m * BLOCK_N + n), vscale);
-        va = _mm512_fexp_u20_ps(_mm512_sub_ps(va, vmax));
-        vsum = _mm512_add_ps(vsum, va);
+      vb = (__m256i)(_mm512_cvtneps_pbh(va));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(s_delta2 + m * BLOCK_N + n), vb);
+    }
+    if (n_remainder > 0) {
+      va = _mm512_mul_ps(_mm512_mask_loadu_ps(vneg_inf, vmask, s_i + m * BLOCK_N + n), vscale);
+      va = _mm512_fexp_u20_ps(_mm512_sub_ps(va, vmax));
+      vsum = _mm512_add_ps(vsum, va);
 
-        vb = (__m256i)(_mm512_cvtneps_pbh(va));
-        _mm256_mask_storeu_epi16(reinterpret_cast<__m256i*>(s_delta2 + m * BLOCK_N + n), vmask, vb);
-      }
+      vb = (__m256i)(_mm512_cvtneps_pbh(va));
+      _mm256_mask_storeu_epi16(reinterpret_cast<__m256i*>(s_delta2 + m * BLOCK_N + n), vmask, vb);
+    }
 
-      // s' <- s' * m_delta + sum(s_delta)
-      s_prime[m] *= m_delta;
-      s_prime[m] += _mm512_reduce_add_ps(vsum);
+    // s' <- s' * m_delta + sum(s_delta)
+    s_prime[m] *= m_delta;
+    s_prime[m] += _mm512_reduce_add_ps(vsum);
 
-      m_prime[m] = m_i;
+    m_prime[m] = m_i;
 
-      // pad s_delta with 0, pad_size range from [0, 32)
-      int pad_size = padded_n_size - n_size;
-      if (pad_size > 0) {
-        const __m512i vzero = _mm512_setzero_si512();
-        __mmask32 vmask2 = (1ULL << pad_size) - 1;
-        _mm512_mask_storeu_epi16(reinterpret_cast<__m512i*>(s_delta2 + m * BLOCK_N + n_size), vmask2, vzero);
-      }
+    // pad s_delta with 0, pad_size range from [0, 32)
+    int pad_size = padded_n_size - n_size;
+    if (pad_size > 0) {
+      const __m512i vzero = _mm512_setzero_si512();
+      __mmask32 vmask2 = (1ULL << pad_size) - 1;
+      _mm512_mask_storeu_epi16(reinterpret_cast<__m512i*>(s_delta2 + m * BLOCK_N + n_size), vmask2, vzero);
+    }
 
-      // v' <- v' * m_delta
-      vmdelta = _mm512_set1_ps(m_delta);
-      int k = 0;
-      for (; k <= head_size_v - 16; k += 16) {
-        va = _mm512_mul_ps(_mm512_loadu_ps(v_prime + m * head_size_v + k), vmdelta);
-        _mm512_storeu_ps(reinterpret_cast<__m512*>(v_prime + m * head_size_v + k), va);
-      }
-      if (v_remainder > 0) {
-        va = _mm512_mul_ps(_mm512_maskz_loadu_ps(vmask1, v_prime + m * head_size_v + k), vmdelta);
-        _mm512_mask_storeu_ps(reinterpret_cast<__m512*>(v_prime + m * head_size_v + k), vmask1, va);
-      }
+    // v' <- v' * m_delta
+    vmdelta = _mm512_set1_ps(m_delta);
+    int k = 0;
+    for (; k <= head_size_v - 16; k += 16) {
+      va = _mm512_mul_ps(_mm512_loadu_ps(v_prime + m * head_size_v + k), vmdelta);
+      _mm512_storeu_ps(reinterpret_cast<__m512*>(v_prime + m * head_size_v + k), va);
+    }
+    if (v_remainder > 0) {
+      va = _mm512_mul_ps(_mm512_maskz_loadu_ps(vmask1, v_prime + m * head_size_v + k), vmdelta);
+      _mm512_mask_storeu_ps(reinterpret_cast<__m512*>(v_prime + m * head_size_v + k), vmask1, va);
     }
   }
 };
