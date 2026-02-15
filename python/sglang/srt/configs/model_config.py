@@ -1231,6 +1231,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "Molmo2ForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
