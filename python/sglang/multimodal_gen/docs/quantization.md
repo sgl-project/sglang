@@ -68,12 +68,8 @@ SGLang features **smart auto-detection** for Nunchaku models. In most cases, you
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --num-gpus 1 \
   --prompt "change the raccoon to a cute cat" \
-  --width 1024 \
-  --height 1024 \
   --save-output \
-  --attention-backend torch_sdpa \
   --quantized-model-path /path/to/svdq-int4_r32-qwen-image.safetensors
 ```
 
@@ -91,7 +87,6 @@ Example with manual overrides:
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --num-gpus 1 \
   --prompt "a beautiful sunset" \
   --enable-svdquant \
   --quantized-model-path /path/to/custom_model.safetensors \
