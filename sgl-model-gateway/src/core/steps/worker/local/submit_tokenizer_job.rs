@@ -41,6 +41,12 @@ impl StepExecutor<LocalWorkerWorkflowData> for SubmitTokenizerJobStep {
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
+        // Check if tokenizer loading is disabled
+        if app_context.router_config.disable_tokenizer_autoload {
+            debug!("Tokenizer loading is disabled, skipping tokenizer registration for worker");
+            return Ok(StepResult::Success);
+        }
+
         // Get job queue
         let job_queue = match app_context.worker_job_queue.get() {
             Some(queue) => queue,
