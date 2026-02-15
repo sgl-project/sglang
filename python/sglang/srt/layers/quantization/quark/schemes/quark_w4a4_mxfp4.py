@@ -5,7 +5,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
+from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -20,7 +20,7 @@ __all__ = ["QuarkW4A4MXFP4"]
 OCP_MX_BLOCK_SIZE = 32
 
 
-class QuarkW4A4MXFP4(QuarkScheme):
+class QuarkW4A4MXFP4(QuarkLinearScheme):
 
     def __init__(
         self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
