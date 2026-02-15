@@ -54,6 +54,9 @@ class SiluAndMul(CustomOp):
         out = torch_npu.npu_swiglu(x)
         return out
 
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.SwishGLU()(x)
+
 
 @CustomOp.register("gelu_and_mul")
 class GeluAndMul(CustomOp):
