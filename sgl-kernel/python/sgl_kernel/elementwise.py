@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
+import flashinfer.norm
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
 
@@ -14,7 +15,7 @@ def rmsnorm(
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    r"""Root mean square normalization.
+    r"""Root mean square normalization (JIT-compiled FlashInfer implementation).
 
     ``out[i] = (input[i] / RMS(input)) * weight[i]``
 
@@ -38,12 +39,7 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    if out is None:
-        out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
-    return out
+    return flashinfer.norm.rmsnorm(input, weight, eps, out, enable_pdl)
 
 
 def fused_add_rmsnorm(
@@ -53,7 +49,7 @@ def fused_add_rmsnorm(
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
-    r"""Fused add root mean square normalization.
+    r"""Fused add root mean square normalization (JIT-compiled FlashInfer implementation).
 
     Step 1:
     ``residual[i] += input[i]``
@@ -76,11 +72,7 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    flashinfer.norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 def gemma_rmsnorm(
@@ -90,7 +82,7 @@ def gemma_rmsnorm(
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    r"""Gemma-style root mean square normalization.
+    r"""Gemma-style root mean square normalization (JIT-compiled FlashInfer implementation).
 
     ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
 
@@ -114,12 +106,7 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if out is None:
-        out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
-    return out
+    return flashinfer.norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
 
 
 def gemma_fused_add_rmsnorm(
@@ -129,7 +116,7 @@ def gemma_fused_add_rmsnorm(
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
-    r"""Gemma-style fused add root mean square normalization.
+    r"""Gemma-style fused add root mean square normalization (JIT-compiled FlashInfer implementation).
 
     Step 1:
     ``residual[i] += input[i]``
@@ -152,11 +139,7 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    flashinfer.norm.gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
