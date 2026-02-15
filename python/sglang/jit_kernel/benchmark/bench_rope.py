@@ -108,9 +108,9 @@ def sglang_rope_v2(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope_v2 import fused_rope_inplace
+    from sglang.jit_kernel.rope import apply_rope_inplace
 
-    fused_rope_inplace(q, k, COS_SIN_CACHE, positions, is_neox=is_neox)
+    apply_rope_inplace(q, k, COS_SIN_CACHE, positions, is_neox=is_neox)
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +129,11 @@ def rope_v0_store(
     is_neox: bool,
 ) -> None:
     from sglang.jit_kernel.kvcache import store_cache
-    from sglang.jit_kernel.rope_v2 import fused_rope_inplace
+    from sglang.jit_kernel.rope import apply_rope_inplace
 
     head_size = q.shape[-1]
     row_dim = k.shape[-2] * head_size
-    fused_rope_inplace(
+    apply_rope_inplace(
         positions=positions,
         q=q,
         k=k,
@@ -191,9 +191,9 @@ def rope_v2_store(
     out_loc: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope_v2 import fused_rope_inplace_with_kvcache
+    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
-    fused_rope_inplace_with_kvcache(
+    apply_rope_inplace_with_kvcache(
         q, k, v, k_cache, v_cache, COS_SIN_CACHE, positions, out_loc, is_neox=is_neox
     )
 

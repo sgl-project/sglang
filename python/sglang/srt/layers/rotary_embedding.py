@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,13 +37,11 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
+if TYPE_CHECKING:
+    from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
 if _is_cuda:
-    from sglang.jit_kernel.rope import (
-        FusedSetKVBufferArg,
-        apply_rope_with_cos_sin_cache_inplace,
-    )
-else:
-    FusedSetKVBufferArg = None
+    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
@@ -364,17 +362,11 @@ class RotaryEmbedding(MultiPlatformOp):
         if not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
+                q=query,
+                k=key,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                # Compatible with old sgl-kernel
-                **(
-                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
-                    if fused_set_kv_buffer_arg is not None
-                    else {}
-                ),
+                fused_args=fused_set_kv_buffer_arg,
             )
         else:
             assert (
