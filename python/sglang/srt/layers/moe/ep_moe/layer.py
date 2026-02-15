@@ -132,6 +132,7 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
+                and self.quant_config is not None
                 and self.quant_config.get_name() == "modelopt_fp4"
             )
         ):
@@ -218,6 +219,16 @@ class DeepEPMoE(FusedMoE):
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output) and (
+            get_moe_runner_backend().is_flashinfer_cutedsl()
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_fp4"
+        ):
+            # Route through the unified MoeRunner framework (Stage 3 adoption):
+            # ModelOpt NVFP4 + FlashInfer CuteDSL owns its forward implementation
+            # in `moe_runner/flashinfer_cutedsl.py`.
+            return super().run_moe_core(dispatch_output)
+
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
@@ -231,12 +242,7 @@ class DeepEPMoE(FusedMoE):
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if (
-                get_moe_runner_backend().is_flashinfer_cutedsl()
-                and self.quant_config.get_name() == "modelopt_fp4"
-            ):
-                output = self.forward_flashinfer_cutedsl(dispatch_output)
-            elif self.use_w4afp8:
+            if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
@@ -299,22 +305,6 @@ class DeepEPMoE(FusedMoE):
             ),
             expert_mask=self.expert_mask,
         )
-
-    def forward_flashinfer_cutedsl(
-        self,
-        dispatch_output: DeepEPLLDispatchOutput,
-    ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
-        assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
-
-        output = self.quant_method.apply_without_routing_weights(
-            layer=self,
-            x=(hidden_states, hidden_states_scale),
-            masked_m=masked_m,
-            moe_runner_config=self.moe_runner_config,
-        )
-        return output
 
     def forward_cutlass_w4afp8(
         self,
