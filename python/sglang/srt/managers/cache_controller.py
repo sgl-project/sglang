@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import NSATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -479,6 +480,20 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            self.nsa_extra_supported = isinstance(
+                self.mem_pool_host, NSATokenToKVPoolHost
+            ) and all(
+                hasattr(self.storage_backend, fn)
+                for fn in (
+                    "batch_get_extra",
+                    "batch_set_extra",
+                    "batch_exists_extra",
+                )
+            )
+            if self.nsa_extra_supported:
+                self.page_get_func = self._page_get_nsa_extra
+                self.page_set_func = self._page_set_nsa_extra
+
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -511,6 +526,7 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.nsa_extra_supported = False
             raise
 
     def detach_storage_backend(self):
@@ -563,6 +579,7 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self.nsa_extra_supported = False
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -802,6 +819,84 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
+    @staticmethod
+    def _count_consecutive_true(results: List[bool]) -> int:
+        for i, ok in enumerate(results):
+            if not ok:
+                return i
+        return len(results)
+
+    def _kv_get_pages(self, hash_values, host_indices, extra_info=None) -> int:
+        if self.storage_backend_type == "mooncake":
+            results = self.storage_backend.batch_get_v1(
+                hash_values, host_indices, extra_info
+            )
+            return self._count_consecutive_true(results)
+
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
+        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        if page_data is None:
+            return 0
+        success_pages = 0
+        for i in range(len(hash_values)):
+            if page_data[i] is None:
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size], page_data[i]
+            )
+            success_pages += 1
+        return success_pages
+
+    def _kv_set_pages(self, hash_values, host_indices, extra_info=None) -> bool:
+        if self.storage_backend_type == "mooncake":
+            return all(
+                self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+            )
+        data = [
+            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(hash_values))
+        ]
+        return self.storage_backend.batch_set(hash_values, data)
+
+    def _page_get_nsa_extra(
+        self, operation, hash_values, host_indices, extra_info=None
+    ):
+        kv_pages = self._kv_get_pages(hash_values, host_indices, extra_info)
+        if kv_pages == 0:
+            return
+        num_pages = kv_pages
+        staging = torch.empty(
+            (
+                num_pages,
+                self.mem_pool_host.layer_num,
+                self.mem_pool_host.indexer_page_stride_size,
+            ),
+            dtype=self.mem_pool_host.indexer_dtype,
+            device=self.mem_pool_host.device,
+        )
+        buffers = [staging[i] for i in range(num_pages)]
+        results = self.storage_backend.batch_get_extra(
+            hash_values[:num_pages], buffers, extra_info
+        )
+        idx_pages = self._count_consecutive_true(results)
+        completed_pages = min(kv_pages, idx_pages)
+        if completed_pages > 0:
+            self.mem_pool_host.unpack_indexer_pages(
+                host_indices[: completed_pages * self.page_size],
+                staging[:completed_pages],
+            )
+        operation.increment(completed_pages * self.page_size)
+
+    def _page_set_nsa_extra(self, hash_values, host_indices, extra_info=None) -> bool:
+        if not self._kv_set_pages(hash_values, host_indices, extra_info):
+            return False
+        staging = self.mem_pool_host.pack_indexer_pages(host_indices)
+        buffers = [staging[i] for i in range(len(hash_values))]
+        results = self.storage_backend.batch_set_extra(hash_values, buffers, extra_info)
+        return all(results)
+
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
         dummy_page_dst = [
@@ -898,6 +993,11 @@ class HiCacheController:
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if getattr(self, "nsa_extra_supported", False):
+                hit_idx_num = self.storage_backend.batch_exists_extra(
+                    batch_hashes, extra_info
+                )
+                hit_page_num = min(hit_page_num, hit_idx_num)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
