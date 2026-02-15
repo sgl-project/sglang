@@ -1,10 +1,12 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+import collections
 import concurrent.futures
 import fnmatch
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -33,7 +35,10 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -48,6 +53,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
+    is_cpu,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -178,6 +184,8 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
 
@@ -688,35 +696,11 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def decrypt(fn, key):
-    raise NotImplementedError()
-
-
-def safetensors_encrypted_weights_iterator(
-    hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
-):
-    raise NotImplementedError()
-
-
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
     disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files.
-
-    If is_all_weights_sharded is True, it uses more optimize read by reading an
-    entire file instead of reading each tensor one by one.
-    """
-    if decryption_key:
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
-        return
-
+    """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -730,8 +714,8 @@ def safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    yield name, param
+                for name in sorted(result.keys()):
+                    yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
@@ -795,25 +779,10 @@ def fastsafetensors_weights_iterator(
 
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
-    max_workers: int = 4,
+    max_workers: int,
     disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files.
-
-    If is_all_weights_sharded is True, it uses more optimize read by reading an
-    entire file instead of reading each tensor one by one.
-    """
-    if decryption_key:
-        logger.warning(
-            "Multi-Thread loading is not working for encrypted safetensor weights."
-        )
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
-        return
-
+    """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -821,12 +790,8 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return result
+                return safetensors.torch.load(f.read())
+        return safetensors.torch.load_file(st_file, device="cpu")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -846,6 +811,64 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+
+
+def buffered_multi_thread_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    max_workers: int,
+    disable_mmap: bool = False,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-threaded safetensor loader with bounded memory via a sliding window.
+
+    At most (max_workers + 1) shard files are in-flight at any time:
+    max_workers loading concurrently + 1 prefetched and ready to yield.
+    Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    """
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(st_file: str):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+        return result
+
+    # Sliding window: max_workers loading + 1 prefetched.
+    buffer_size = max_workers + 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        file_iter = iter(hf_weights_files)
+        pending: collections.deque = collections.deque()
+
+        # Seed the buffer.
+        for st_file in itertools.islice(file_iter, buffer_size):
+            pending.append(executor.submit(_load_file, st_file))
+
+        with tqdm(
+            total=len(hf_weights_files),
+            desc="Multi-thread loading shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ) as pbar:
+            while pending:
+                future = pending.popleft()
+                state_dict = future.result()
+                del future  # let GC reclaim the Future's internal result
+
+                # Replenish: submit the next file to keep the buffer full.
+                next_file = next(file_iter, None)
+                if next_file is not None:
+                    pending.append(executor.submit(_load_file, next_file))
+
+                for name in sorted(state_dict.keys()):
+                    yield name, state_dict[name]
+                del state_dict
+                pbar.update(1)
 
 
 def _load_pt_file(bin_file: str) -> dict:
@@ -889,7 +912,7 @@ def pt_weights_iterator(
 
 def multi_thread_pt_weights_iterator(
     hf_weights_files: List[str],
-    max_workers: int = 4,
+    max_workers: int,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model bin/pt files."""
     enable_tqdm = (
@@ -1025,9 +1048,25 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
 
-        return default_weight_loader(param, loaded_weight)
+        if (
+            is_cpu()
+            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and loaded_weight.dim() == 1
+        ):
+            param_data = param.data  # view copy on param for uneven padding
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data,
+                loaded_weight,
+                0,  # param_data_start
+                start_idx,
+                shard_axis,
+                shard_size,
+            )
+            return default_weight_loader(param_data, loaded_weight)
+        else:
+            loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+            return default_weight_loader(param, loaded_weight)
 
     return loader
 
