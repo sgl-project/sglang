@@ -796,7 +796,10 @@ class Scheduler(
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+        self.try_preemption = (
+            self.enable_priority_scheduling
+            and not self.server_args.disable_try_preemption_by_priority
+        )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -1985,6 +1988,7 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
@@ -2136,6 +2140,9 @@ class Scheduler(
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
+        self.num_running_reqs_by_priority = self._count_reqs_by_priority(
+            self.running_batch.reqs
+        )
 
         # Record metrics
         for req in can_run_list:
