@@ -174,10 +174,10 @@ class TboAttnBackend(AttentionBackend):
         getattr(child_right, fn_name)(**args_right)
 
     def get_cuda_graph_seq_len_fill_value(self):
-        ans = self.primary.get_cuda_graph_seq_len_fill_value()
+        answer = self.primary.get_cuda_graph_seq_len_fill_value()
         for child in self.children:
-            assert ans == child.get_cuda_graph_seq_len_fill_value()
-        return ans
+            assert answer == child.get_cuda_graph_seq_len_fill_value()
+        return answer
 
     def forward_extend(self, *args, **kwargs):
         return self.primary.forward_extend(*args, **kwargs)
@@ -229,7 +229,7 @@ def _init_forward_metadata_cuda_graph_split(
 
     else:
         output_spec_info = None
-    ans = dict(
+    answer = dict(
         bs=output_bs,
         req_pool_indices=req_pool_indices[seq_slice],
         seq_lens=seq_lens[seq_slice],
@@ -244,14 +244,14 @@ def _init_forward_metadata_cuda_graph_split(
         assert (
             capture_num_tokens == bs * token_num_per_seq
         ), "Only support num_tokens==bs * token_num_per_seq for target-verify or decode mode"
-        ans.update(
+        answer.update(
             dict(
                 num_tokens=output_bs * token_num_per_seq,
             )
         )
     elif fn_name == "init_forward_metadata_replay_cuda_graph":
         output_seq_lens_cpu = replay_seq_lens_cpu[seq_slice]
-        ans.update(
+        answer.update(
             dict(
                 seq_lens_sum=output_seq_lens_cpu.sum().item(),
                 seq_lens_cpu=output_seq_lens_cpu,
@@ -260,4 +260,4 @@ def _init_forward_metadata_cuda_graph_split(
     else:
         raise NotImplementedError
 
-    return ans
+    return answer

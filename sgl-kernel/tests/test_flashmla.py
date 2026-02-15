@@ -342,14 +342,14 @@ def test_flashmla_prefill(
     sm_scale = 1 / math.sqrt(576)
     torch.cuda.synchronize()
 
-    ans_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
+    answer_out, answer_max_logits, answer_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
     )
 
-    ans_out, ans_max_logits, ans_lse = (
-        ans_out.float(),
-        ans_max_logits.float(),
-        ans_lse.float(),
+    answer_out, answer_max_logits, answer_lse = (
+        answer_out.float(),
+        answer_max_logits.float(),
+        answer_lse.float(),
     )
 
     torch.cuda.synchronize()
@@ -358,14 +358,14 @@ def test_flashmla_prefill(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(ans_out, ref_out, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(answer_out, ref_out, atol=8e-4, rtol=2.01 / 128)
     torch.testing.assert_close(
-        ans_max_logits,
+        answer_max_logits,
         ref_max_logits,
         atol=1e-6,
         rtol=2.01 / 65536,
     )
-    torch.testing.assert_close(ans_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
+    torch.testing.assert_close(answer_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
@@ -499,7 +499,7 @@ def test_flash_mla_decode(
     )
     torch.cuda.synchronize()
 
-    out_ans, lse_ans = flash_mla_with_kvcache(
+    out_answer, lse_answer = flash_mla_with_kvcache(
         q,
         blocked_k if not is_fp8 else blocked_k_quantized,  # type: ignore
         block_table,
@@ -515,8 +515,8 @@ def test_flash_mla_decode(
     out_ref, lse_ref = reference_torch_decode(
         cache_seqlens, block_table, q, blocked_k, dv, is_causal, abs_indices
     )
-    torch.testing.assert_close(out_ans, out_ref, atol=8e-4, rtol=2.01 / 128)
-    torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
+    torch.testing.assert_close(out_answer, out_ref, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(lse_answer, lse_ref, atol=1e-6, rtol=8.01 / 65536)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")

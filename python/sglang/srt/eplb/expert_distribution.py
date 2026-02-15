@@ -576,13 +576,13 @@ def _convert_per_token_to_global_physical_count(
     index = topk_ids_layer_major.masked_fill(~mask, 0).long()
     src = mask.int()
 
-    ans = torch.zeros(
+    answer = torch.zeros(
         (num_layers, num_physical_experts),
         dtype=_topk_ids_of_layer.dtype,
         device=_topk_ids_of_layer.device,
     )
-    ans.scatter_add_(dim=1, index=index, src=src)
-    return ans
+    answer.scatter_add_(dim=1, index=index, src=src)
+    return answer
 
 
 def _convert_local_to_global_physical_count(
@@ -595,11 +595,11 @@ def _convert_local_to_global_physical_count(
     device = local_physical_count.device
     num_layers, _ = local_physical_count.shape
 
-    ans = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
-    ans[
+    answer = torch.zeros((num_layers, num_physical_experts), dtype=dtype, device=device)
+    answer[
         :, num_local_physical_experts * rank : num_local_physical_experts * (rank + 1)
     ] = local_physical_count
-    return ans
+    return answer
 
 
 # --------------------------------------- Accumulator -----------------------------------------

@@ -136,11 +136,11 @@ def test_quantize_to_fp4(
     out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
 
     out, out_scale = scaled_fp4_quant(x, global_scale)
-    scale_ans = recover_swizzled_scales(out_scale, m, n)
-    out_ans = cast_from_fp4(out, m, n)
+    scale_answer = recover_swizzled_scales(out_scale, m, n)
+    out_answer = cast_from_fp4(out, m, n)
 
-    torch.testing.assert_close(out_ans, out_ref)
-    torch.testing.assert_close(scale_ans, scale_ref)
+    torch.testing.assert_close(out_answer, out_ref)
+    torch.testing.assert_close(scale_answer, scale_ref)
 
 
 @pytest.mark.skipif(
@@ -163,11 +163,11 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
     out, out_scale = scaled_fp4_quant(x, global_scale)
 
-    scale_ans = recover_swizzled_scales(out_scale, m, n)
-    out_ans = cast_from_fp4(out, m, n)
+    scale_answer = recover_swizzled_scales(out_scale, m, n)
+    out_answer = cast_from_fp4(out, m, n)
 
-    torch.testing.assert_close(out_ans, out_ref)
-    torch.testing.assert_close(scale_ans, scale_ref)
+    torch.testing.assert_close(out_answer, out_ref)
+    torch.testing.assert_close(scale_answer, scale_ref)
 
 
 @pytest.mark.skipif(
@@ -203,8 +203,8 @@ def test_quantize_to_fp4_grouped(shape):
         # Recover swizzled scales to linear layout and drop padded values, so
         # no extra checks on padding are needed.
         scale_ref = recover_swizzled_scales(a_scale_interleaved, m, k)
-        scale_ans = recover_swizzled_scales(output_scales[i], m, k)
-        torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+        scale_answer = recover_swizzled_scales(output_scales[i], m, k)
+        torch.testing.assert_close(scale_ref[: mask[i]], scale_answer[: mask[i]])
 
 
 @pytest.mark.skipif(
@@ -252,8 +252,8 @@ def test_silu_and_mul_quantize_to_fp4_grouped(shape):
         torch.testing.assert_close(ref_output[i, : mask[i]], output[i, : mask[i]])
         # We need to recover the swizzled scales to linear layout before applying mask slice.
         scale_ref = recover_swizzled_scales(ref_output_scales[i], m, k)
-        scale_ans = recover_swizzled_scales(output_scales[i], m, k)
-        torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+        scale_answer = recover_swizzled_scales(output_scales[i], m, k)
+        torch.testing.assert_close(scale_ref[: mask[i]], scale_answer[: mask[i]])
 
 
 if __name__ == "__main__":

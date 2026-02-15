@@ -76,7 +76,7 @@ async def tree_search_async(question, num_branches, call_generate):
 
     solutions = []
     for sol in ref_states:
-        ans = await get_final_answer_async(sol, num_branches, call_generate)
-        solutions.append(ans)
+        answer = await get_final_answer_async(sol, num_branches, call_generate)
+        solutions.append(answer)
 
     return solutions
