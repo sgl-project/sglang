@@ -128,6 +128,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
+$PIP_CMD uninstall torch || true
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Fix CUDA version mismatch between torch and torchaudio.
@@ -219,19 +220,6 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     fi
 else
     $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
-fi
-
-# Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
-if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
-        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
-    else
-        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
-    fi
-else
-    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 $PIP_CMD uninstall xformers || true
 
