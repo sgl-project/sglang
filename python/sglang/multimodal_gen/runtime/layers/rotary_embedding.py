@@ -152,7 +152,7 @@ def _apply_rotary_emb(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    if _is_flashinfer_available:
+    if _is_flashinfer_available and x.dtype in {torch.bfloat16, torch.float16}:
         return _rope_impl_flashinfer(x, None, cos, sin, is_neox_style)
     else:
         try:
@@ -177,7 +177,11 @@ def _apply_rotary_emb_qk(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    if _is_flashinfer_available:
+    if (
+        _is_flashinfer_available
+        and q.dtype in {torch.bfloat16, torch.float16}
+        and k.dtype in {torch.bfloat16, torch.float16}
+    ):
         return _rope_impl_flashinfer(q, k, cos, sin, is_neox_style)
     else:
         try:
