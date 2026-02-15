@@ -363,7 +363,7 @@ __global__ void moe_lora_align_block_size_kernel(
       max_num_tokens_padded,
       max_num_m_blocks,
       lora_id,
-      num_experts, // inactive_expert_id padding
+      -1, // inactive_expert_id padding
       topk_num,
       &token_mask[(lora_id * num_tokens)],
       has_expert_map);
@@ -474,7 +474,7 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
       numel,
       max_num_tokens_padded,
       max_num_m_blocks,
-      num_experts, // inactive_expert_id padding
+      -1, // inactive_expert_id padding
       lora_id,
       topk_num,
       &token_mask[(lora_id * num_tokens)],
