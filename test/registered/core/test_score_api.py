@@ -164,7 +164,7 @@ class TestScoreAPI(CustomTestCase):
                 label_token_ids=label_token_ids,
                 apply_softmax=True,
                 item_first=case["item_first"],
-            )
+            ).scores
 
             # Get scores from HuggingFace using the same parameters
             hf_scores = self.compute_hf_scores(
@@ -193,7 +193,7 @@ class TestScoreAPI(CustomTestCase):
                 items=texts,
                 label_token_ids=label_token_ids,
                 apply_softmax=True,
-            )
+            ).scores
 
             self.assertEqual(
                 len(scores),
@@ -245,7 +245,7 @@ class TestScoreAPI(CustomTestCase):
                 items=items,
                 label_token_ids=label_token_ids,
                 apply_softmax=True,
-            )
+            ).scores
 
             # Verify we got results
             self.assertEqual(len(scores), len(items))
@@ -306,15 +306,18 @@ class TestScoreAPI(CustomTestCase):
         label_token_ids = [9454, 2753]  # "Yes" and "No" tokens
 
         # Get scores using SGLang
-        scores = self.engine.score(
+        result = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
         )
+        scores = result.scores
+        prompt_tokens = result.prompt_tokens
 
         # Verify we get the expected number of scores
         self.assertEqual(len(scores), len(items), "Should get one score list per item")
+        self.assertEqual(prompt_tokens, 63, "Should have correct prompt_tokens")
 
         # Verify each score list has the correct length
         for i, score_list in enumerate(scores):
@@ -348,14 +351,14 @@ class TestScoreAPI(CustomTestCase):
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
-        )
+        ).scores
 
         scores2 = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
-        )
+        ).scores
 
         # Results should be identical (deterministic)
         self.assertEqual(len(scores1), len(scores2), "Should get same number of items")
@@ -391,7 +394,7 @@ class TestScoreAPI(CustomTestCase):
                     items=items,
                     label_token_ids=label_token_ids,
                     apply_softmax=True,
-                )
+                ).scores
 
                 self.assertEqual(
                     len(scores), len(items), f"Should get {len(items)} score lists"
@@ -411,14 +414,17 @@ class TestScoreAPI(CustomTestCase):
         items = []
         label_token_ids = [1, 2]
 
-        scores = self.engine.score(
+        result = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
         )
+        scores = result.scores
+        prompt_tokens = result.prompt_tokens
 
         self.assertEqual(len(scores), 0, "Should return empty list for empty items")
+        self.assertEqual(prompt_tokens, 0, "Should return 0 for empty items")
 
     def test_multi_item_scoring_single_item(self):
         """Test multi-item scoring with single item (should work like regular scoring)."""
@@ -426,18 +432,21 @@ class TestScoreAPI(CustomTestCase):
         items = ["Paris"]
         label_token_ids = [1, 2, 3]
 
-        scores = self.engine.score(
+        result = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
         )
+        scores = result.scores
+        prompt_tokens = result.prompt_tokens
 
         self.assertEqual(len(scores), 1, "Should get one score list")
         self.assertEqual(
             len(scores[0]), len(label_token_ids), "Should have correct number of scores"
         )
         self.assertAlmostEqual(sum(scores[0]), 1.0, places=6)
+        self.assertEqual(prompt_tokens, 11, "Should have correct prompt_tokens")
 
     def test_multi_item_scoring_different_queries(self):
         """Test multi-item scoring with different types of queries."""
@@ -459,7 +468,7 @@ class TestScoreAPI(CustomTestCase):
                     items=items,
                     label_token_ids=label_token_ids,
                     apply_softmax=True,
-                )
+                ).scores
 
                 self.assertEqual(
                     len(scores),
@@ -490,7 +499,7 @@ class TestScoreAPI(CustomTestCase):
                     items=items,
                     label_token_ids=label_token_ids,
                     apply_softmax=True,
-                )
+                ).scores
 
                 self.assertEqual(len(scores), len(items))
 
@@ -513,7 +522,7 @@ class TestScoreAPI(CustomTestCase):
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=False,  # No softmax
-        )
+        ).scores
 
         self.assertEqual(len(scores), len(items))
 
@@ -537,7 +546,7 @@ class TestScoreAPI(CustomTestCase):
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
-        )
+        ).scores
 
         self.assertEqual(len(scores), len(items), "Should handle large batches")
 
@@ -556,7 +565,7 @@ class TestScoreAPI(CustomTestCase):
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
-        )
+        ).scores
 
         self.assertEqual(len(scores), len(items))
 

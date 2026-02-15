@@ -1038,6 +1038,18 @@ class TestOpenAIV1Score(CustomTestCase):
                 msg=f"Score {i} probabilities should sum to 1",
             )
 
+        # Verify usage
+        self.assertIn("usage", response, "Response should have a 'usage' field")
+        self.assertGreater(response["usage"]["prompt_tokens"], 0)
+        self.assertEqual(
+            response["usage"]["prompt_tokens"], response["usage"]["total_tokens"]
+        )
+        self.assertEqual(
+            response["usage"]["completion_tokens"],
+            0,
+            "completion_tokens should be 0 for /v1/score",
+        )
+
     def test_score_token_input(self):
         """Test scoring with token IDs input"""
         query = "The capital of France is"
@@ -1087,6 +1099,18 @@ class TestOpenAIV1Score(CustomTestCase):
                 places=6,
                 msg=f"Score {i} probabilities should sum to 1",
             )
+
+        # Verify usage
+        self.assertIn("usage", response, "Response should have a 'usage' field")
+        self.assertGreater(response["usage"]["prompt_tokens"], 0)
+        self.assertEqual(
+            response["usage"]["prompt_tokens"], response["usage"]["total_tokens"]
+        )
+        self.assertEqual(
+            response["usage"]["completion_tokens"],
+            0,
+            "completion_tokens should be 0 for /v1/score",
+        )
 
     def test_score_error_handling(self):
         """Test error handling for invalid inputs"""
