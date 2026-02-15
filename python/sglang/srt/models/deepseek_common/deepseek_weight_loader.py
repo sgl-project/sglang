@@ -52,6 +52,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_fp8_fnuz,
     _is_hip,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
@@ -499,7 +500,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        _is_cuda
+                        (_is_cuda or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
