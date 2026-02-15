@@ -351,6 +351,20 @@ class RotaryEmbedding(MultiPlatformOp):
                 positions, query, key, offsets, fused_set_kv_buffer_arg
             )
 
+    def forward_hip(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The fallback JIT kernel depends on CUDA toolchain discovery in tvm_ffi.
+        # On ROCm-only environments this can fail with missing CUDA_HOME.
+        return self.forward_native(
+            positions, query, key, offsets, fused_set_kv_buffer_arg
+        )
+
     def forward_cuda(
         self,
         positions: torch.Tensor,
@@ -1725,6 +1739,16 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_hip(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_cuda(
         self,
