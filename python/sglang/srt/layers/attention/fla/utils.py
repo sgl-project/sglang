@@ -14,6 +14,8 @@ import torch
 import triton
 from packaging import version
 
+from sglang.srt.utils.common import torch_release
+
 logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
@@ -204,11 +206,6 @@ def checkpoint(fn):
     return wrapper
 
 
-@lru_cache(maxsize=None)
-def check_pytorch_version(version_s: str = "2.4") -> bool:
-    return version.parse(torch.__version__) >= version.parse(version_s)
-
-
 def _cpu_device_warning():
     import warnings
 
@@ -309,7 +306,7 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return False
 
 
-if check_pytorch_version("2.4"):
+if torch_release >= (2, 4):
     device = "cuda" if device == "cpu" else device
     autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
     autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)

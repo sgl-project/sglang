@@ -2,6 +2,9 @@
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__
+#include <cuda.h>
+#if CUDA_VERSION <= 12010
+
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")
 #pragma push_macro("__builtin_LINE")
@@ -18,13 +21,16 @@
 
 #define consteval constexpr
 
-#include <source_location>
+#include "source_location.h"
 
 #undef consteval
 #pragma pop_macro("__cpp_consteval")
 #pragma pop_macro("_NODISCARD")
-#else
-#include <source_location>
+#else  // __CUDACC__ && CUDA_VERSION > 12010
+#include "source_location.h"
+#endif
+#else  // no __CUDACC__
+#include "source_location.h"
 #endif
 
 #include <dlpack/dlpack.h>
@@ -33,14 +39,16 @@
 #include <cstddef>
 #include <ostream>
 #include <ranges>
-#include <source_location>
 #include <sstream>
 #include <utility>
 
 namespace host {
 
-struct DebugInfo : public std::source_location {
-  DebugInfo(std::source_location loc = std::source_location::current()) : std::source_location(loc) {}
+template <typename>
+inline constexpr bool dependent_false_v = false;
+
+struct DebugInfo : public source_location_t {
+  DebugInfo(source_location_t loc = source_location_t::current()) : source_location_t(loc) {}
 };
 
 struct PanicError : public std::runtime_error {
@@ -113,16 +121,14 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T, std::integral... U>
-inline auto offset(T* ptr, U... offset) -> void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+inline auto offset(void* ptr, U... offset) -> void* {
+  return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T, std::integral... U>
-inline auto offset(const T* ptr, U... offset) -> const void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<const char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+inline auto offset(const void* ptr, U... offset) -> const void* {
+  return static_cast<const T*>(ptr) + (... + offset);
 }
 
 }  // namespace pointer

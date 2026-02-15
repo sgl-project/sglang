@@ -9,10 +9,17 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to checkout"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
-  group: nightly-test-intel-${{ github.ref }}
-  cancel-in-progress: true
+  group: nightly-test-intel-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # Placeholder for Intel GPU tests

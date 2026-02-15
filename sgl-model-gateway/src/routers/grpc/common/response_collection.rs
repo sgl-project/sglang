@@ -21,7 +21,7 @@ use crate::routers::{
 ///
 /// # Returns
 /// Vector of GenerateComplete responses, one per index (n parameter)
-pub async fn collect_responses(
+pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {

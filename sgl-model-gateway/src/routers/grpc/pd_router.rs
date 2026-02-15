@@ -8,7 +8,10 @@ use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType},
+    core::{
+        is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
+    },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::RouterTrait,
@@ -77,8 +80,8 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing generate request for model: {:?} (PD mode)",
-            model_id
+            "Processing generate request for model: {} (PD mode)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
         // Clone values needed for retry closure
@@ -135,8 +138,8 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing chat completion request for model: {:?} (PD mode)",
-            model_id
+            "Processing chat completion request for model: {} (PD mode)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
         // Clone values needed for retry closure

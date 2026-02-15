@@ -15,6 +15,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
+import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
@@ -24,12 +25,23 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
 )
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_dual_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_group,
     get_world_group,
+    get_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -38,19 +50,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-        FlashAttentionBackend,
-    )
-except ImportError:
-    FlashAttentionBackend = None
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -63,40 +70,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
-        SlidingTileAttentionBackend,
-    )
-
-    st_attn_available = True
-except ImportError:
-    st_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
-        VMOBAAttentionBackend,
-    )
-    from sglang.multimodal_gen.utils import is_vmoba_available
-
-    vmoba_attn_available = is_vmoba_available()
-except ImportError:
-    vmoba_attn_available = False
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
-        VideoSparseAttentionBackend,
-    )
-
-    vsa_available = True
-except ImportError:
-    vsa_available = False
 
 logger = init_logger(__name__)
 
@@ -123,10 +106,8 @@ class DenoisingStage(PipelineStage):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
-        if self.server_args.enable_torch_compile:
-            self.torch_compile_module(self.transformer)
-            if transformer_2 is not None:
-                self.torch_compile_module(self.transformer_2)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -146,16 +127,17 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._is_warmed_up = False
 
-    def torch_compile_module(self, module):
+    def _maybe_enable_torch_compile(self, module: object) -> None:
         """
-        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
-        No-op if torch compile is disabled or the object has no forward.
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if not self.server_args.enable_torch_compile or module is None:
-            return module
-        if not hasattr(module, "forward"):
-            return module
+        if not self.server_args.enable_torch_compile or not isinstance(
+            module, nn.Module
+        ):
+            return
         try:
             import torch._inductor.config as _inductor_cfg
 
@@ -164,11 +146,12 @@ class DenoisingStage(PipelineStage):
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info(f"Compiling transformer with mode: {mode}")
-        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
-        setattr(module, "forward", compiled_forward)
-        return module
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(mode=mode, fullgraph=False, dynamic=None)
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+    def _maybe_enable_cache_dit(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
 
         This method should be called after the transformer is fully loaded
@@ -178,31 +161,32 @@ class DenoisingStage(PipelineStage):
         transformers with (potentially) different configurations.
 
         """
+        if isinstance(num_inference_steps, tuple):
+            num_high_noise_steps, num_low_noise_steps = num_inference_steps
+
+        # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            if self._cached_num_steps != num_inference_steps:
-                logger.warning(
-                    "num_inference_steps changed from %d to %d after cache-dit was enabled. "
-                    "Continuing with initial configuration (steps=%d).",
-                    self._cached_num_steps,
+            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+            scm_preset = None if scm_preset == "none" else scm_preset
+            if isinstance(num_inference_steps, tuple):
+                refresh_context_on_dual_transformer(
+                    self.transformer,
+                    self.transformer_2,
+                    num_high_noise_steps,
+                    num_low_noise_steps,
+                    scm_preset=scm_preset,
+                )
+            else:
+                refresh_context_on_transformer(
+                    self.transformer,
                     num_inference_steps,
-                    self._cached_num_steps,
+                    scm_preset=scm_preset,
                 )
             return
-        # check if cache-dit is enabled in config
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            return
 
-        from sglang.multimodal_gen.runtime.distributed import (
-            get_sp_group,
-            get_tp_group,
-            get_world_size,
-        )
-        from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
-            CacheDitConfig,
-            enable_cache_on_dual_transformer,
-            enable_cache_on_transformer,
-            get_scm_mask,
-        )
+        # check if cache-dit is enabled in config
+        if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
+            return
 
         world_size = get_world_size()
         parallelized = world_size > 1
@@ -261,10 +245,22 @@ class DenoisingStage(PipelineStage):
         # cache-dit handles step count validation and scaling internally
         steps_computation_mask = get_scm_mask(
             preset=scm_preset,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             compute_bins=scm_compute_bins,
             cache_bins=scm_cache_bins,
         )
+
+        if isinstance(num_inference_steps, tuple):
+            steps_computation_mask_2 = get_scm_mask(
+                preset=scm_preset,
+                num_inference_steps=num_low_noise_steps,
+                compute_bins=scm_compute_bins,
+                cache_bins=scm_cache_bins,
+            )
 
         # build config for primary transformer (high-noise expert)
         primary_config = CacheDitConfig(
@@ -276,7 +272,11 @@ class DenoisingStage(PipelineStage):
             max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
             enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
             taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             # SCM fields
             steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_policy,
@@ -295,9 +295,9 @@ class DenoisingStage(PipelineStage):
                 max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
                 enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
                 taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=num_low_noise_steps,
                 # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask,
+                steps_computation_mask=steps_computation_mask_2,
                 steps_computation_policy=scm_policy,
             )
 
@@ -313,8 +313,9 @@ class DenoisingStage(PipelineStage):
                 tp_group=tp_group,
             )
             logger.info(
-                "cache-dit enabled on dual transformers (steps=%d)",
-                num_inference_steps,
+                "cache-dit enabled on dual transformers (steps=%d, %d)",
+                num_high_noise_steps,
+                num_low_noise_steps,
             )
         else:
             # single transformer
@@ -509,32 +510,40 @@ class DenoisingStage(PipelineStage):
         """
         Prepare all necessary invariant variables for the denoising loop.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
         Returns:
             A dictionary containing all the prepared variables for the denoising loop.
         """
+        assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+
+        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
+        # Get timesteps and calculate warmup steps
+        timesteps = batch.timesteps
+        num_inference_steps = batch.num_inference_steps
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        if self.transformer_2 is not None:
+            assert boundary_timestep is not None, "boundary_timestep must be provided"
+            num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
+            num_low_noise_steps = num_inference_steps - num_high_noise_steps
+            cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
+        else:
+            cache_dit_num_inference_steps = num_inference_steps
+
         if not server_args.model_loaded["transformer"]:
+            # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args
+                server_args.model_paths["transformer"], server_args, "transformer"
             )
-
             # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
-
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
+            self._maybe_enable_torch_compile(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
+            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -548,13 +557,6 @@ class DenoisingStage(PipelineStage):
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        # Get timesteps and calculate warmup steps
-        timesteps = batch.timesteps
-        if timesteps is None:
-            raise ValueError("Timesteps must be provided")
-        num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
         if len(image_embeds) > 0:
@@ -563,7 +565,7 @@ class DenoisingStage(PipelineStage):
             ]
 
         # Prepare STA parameters
-        if st_attn_available and self.attn_backend == SlidingTileAttentionBackend:
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
         # Get latents and embeddings
@@ -575,8 +577,6 @@ class DenoisingStage(PipelineStage):
             neg_prompt_embeds = batch.negative_prompt_embeds
             assert neg_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
-
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
 
         # specifically for Wan2_2_TI2V_5B_Config, not applicable for FastWan2_2_TI2V_5B_Config
         should_preprocess_for_wan_ti2v = (
@@ -696,6 +696,7 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list,
         trajectory_timesteps: list,
         server_args: ServerArgs,
+        is_warmup: bool = False,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -709,6 +710,23 @@ class DenoisingStage(PipelineStage):
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
         )
+
+        # Gather noise_pred if using sequence parallelism
+        # noise_pred has the same shape as latents (sharded along sequence dimension)
+        if (
+            get_sp_world_size() > 1
+            and getattr(batch, "did_sp_shard_latents", False)
+            and server_args.comfyui_mode
+            and hasattr(batch, "noise_pred")
+            and batch.noise_pred is not None
+        ):
+            batch.noise_pred = server_args.pipeline_config.gather_latents_for_sp(
+                batch.noise_pred
+            )
+            if hasattr(batch, "raw_latent_shape"):
+                orig_s = batch.raw_latent_shape[1]
+                if batch.noise_pred.shape[1] > orig_s:
+                    batch.noise_pred = batch.noise_pred[:, :orig_s, :]
 
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
@@ -732,15 +750,15 @@ class DenoisingStage(PipelineStage):
 
         # Save STA mask search results if needed
         if (
-            st_attn_available
-            and self.attn_backend == SlidingTileAttentionBackend
-            and server_args.STA_mode == STA_Mode.STA_SEARCHING
+            not is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            and server_args.attention_backend_config.STA_mode == "STA_SEARCHING"
         ):
             self.save_sta_search_results(batch)
 
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_available() and not is_warmup:
             logger.info(
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
@@ -753,6 +771,14 @@ class DenoisingStage(PipelineStage):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+
+        # reset offload managers with prefetching first layer for next forward
+        for dit in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(dit, OffloadableDiTMixin):
+                # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
+                # TODO: should be make this an option?
+                for manager in dit.layerwise_offload_managers:
+                    manager.release_all()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -810,14 +836,18 @@ class DenoisingStage(PipelineStage):
 
     def _manage_device_placement(
         self,
-        model_to_use: torch.nn.Module,
-        model_to_offload: torch.nn.Module | None,
+        model_to_use: nn.Module,
+        model_to_offload: nn.Module | None,
         server_args: ServerArgs,
     ):
         """
         Manages the offload / load behavior of dit
         """
         if not server_args.dit_cpu_offload:
+            return
+
+        # FSDP manages offloading internally
+        if server_args.use_fsdp_inference:
             return
 
         # Offload the unused model if it's on CUDA
@@ -945,13 +975,6 @@ class DenoisingStage(PipelineStage):
     ) -> Req:
         """
         Run the denoising loop.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with denoised latents.
         """
         # Prepare variables for the denoising loop
 
@@ -980,7 +1003,7 @@ class DenoisingStage(PipelineStage):
         denoising_start_time = time.time()
 
         # to avoid device-sync caused by timestep comparison
-
+        is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -992,7 +1015,10 @@ class DenoisingStage(PipelineStage):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
                     with StageProfiler(
-                        f"denoising_step_{i}", logger=logger, timings=batch.timings
+                        f"denoising_step_{i}",
+                        logger=logger,
+                        timings=batch.timings,
+                        perf_dump_path_provided=batch.perf_dump_path is not None,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
@@ -1030,7 +1056,13 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(i, batch, server_args)
+                        attn_metadata = self._build_attn_metadata(
+                            i,
+                            batch,
+                            server_args,
+                            timestep_value=t_int,
+                            timesteps=timesteps_cpu,
+                        )
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
@@ -1047,6 +1079,10 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
+
+                        # Save noise_pred to batch for external access (e.g., ComfyUI)
+                        if server_args.comfyui_mode:
+                            batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
@@ -1074,11 +1110,12 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
+                        if not is_warmup:
+                            self.step_profile()
 
         denoising_end_time = time.time()
 
-        if num_timesteps > 0:
+        if num_timesteps > 0 and not is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
@@ -1090,6 +1127,7 @@ class DenoisingStage(PipelineStage):
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
             server_args=server_args,
+            is_warmup=is_warmup,
         )
         return batch
 
@@ -1123,13 +1161,6 @@ class DenoisingStage(PipelineStage):
     ) -> tqdm:
         """
         Create a progress bar for the denoising process.
-
-        Args:
-            iterable: The iterable to iterate over.
-            total: The total number of items.
-
-        Returns:
-            A tqdm progress bar.
         """
         local_rank = get_world_group().local_rank
         disable = local_rank != 0
@@ -1165,18 +1196,19 @@ class DenoisingStage(PipelineStage):
         return noise_cfg
 
     def _build_attn_metadata(
-        self, i: int, batch: Req, server_args: ServerArgs
+        self,
+        i: int,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        timestep_value: int | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> Any | None:
         """
         Build attention metadata for custom attention backends.
 
         Args:
             i: The current timestep index.
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The attention metadata, or None if not applicable.
         """
         attn_metadata = None
         self.attn_metadata_builder = None
@@ -1186,19 +1218,106 @@ class DenoisingStage(PipelineStage):
             self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
-        if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (
-            vsa_available and self.attn_backend == VideoSparseAttentionBackend
+        if (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
+            or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.VSA_sparsity,
+                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
                 device=get_local_torch_device(),
             )
-        elif vmoba_attn_available and self.attn_backend == VMOBAAttentionBackend:
-            moba_params = server_args.moba_config.copy()
+        elif (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+        ):
+            if timestep_value is None or timesteps is None:
+                raise ValueError(
+                    "timestep_value and timesteps must be provided for SVG2 attention metadata"
+                )
+
+            svg2_cfg = server_args.attention_backend_config or {}
+            num_layers = server_args.pipeline_config.dit_config.num_layers
+            if (
+                server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan"
+                and hasattr(server_args.pipeline_config.dit_config, "num_single_layers")
+            ):
+                num_layers += server_args.pipeline_config.dit_config.num_single_layers
+            first_layers_fp = svg2_cfg.get("svg2_first_layers_fp", 0.03)
+            if first_layers_fp <= 1.0:
+                first_layers_fp = math.floor(first_layers_fp * num_layers)
+            first_layers_fp = max(0, min(int(first_layers_fp), num_layers))
+
+            first_times_fp = svg2_cfg.get("svg2_first_times_fp", 0.2)
+            if first_times_fp <= 1.0:
+                num_fp_steps = math.floor(first_times_fp * len(timesteps))
+                if num_fp_steps > 0:
+                    first_times_fp = float(timesteps[num_fp_steps - 1].item() - 1)
+                else:
+                    first_times_fp = float(timesteps.max().item() + 1)
+
+            current_timestep = int(timestep_value)
+
+            cache = batch.extra.get("svg2_cache")
+            if cache is None:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (
+                    Svg2Cache,
+                )
+
+                cache = Svg2Cache()
+                batch.extra["svg2_cache"] = cache
+
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            if isinstance(patch_size, list):
+                patch_size = tuple(patch_size)
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+
+            context_length = 0
+            prompt_length = None
+            if server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan":
+                prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+                if isinstance(prompt_embeds, list):
+                    text_embeds = prompt_embeds[0] if prompt_embeds else None
+                else:
+                    text_embeds = prompt_embeds
+                if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim >= 2:
+                    context_length = int(text_embeds.shape[1])
+                if context_length > 0 and batch.prompt_attention_mask:
+                    mask = batch.prompt_attention_mask[0]
+                    if isinstance(mask, torch.Tensor):
+                        if mask.shape[-1] > context_length:
+                            mask = mask[:, -context_length:]
+                        prompt_length = int(mask[0].sum().item())
+                if prompt_length is None:
+                    prompt_length = context_length
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                raw_latent_shape=batch.raw_latent_shape,
+                patch_size=patch_size,
+                num_q_centroids=svg2_cfg.get("svg2_num_q_centroids", 300),
+                num_k_centroids=svg2_cfg.get("svg2_num_k_centroids", 1000),
+                top_p_kmeans=svg2_cfg.get("svg2_top_p_kmeans", 0.9),
+                min_kc_ratio=svg2_cfg.get("svg2_min_kc_ratio", 0.1),
+                kmeans_iter_init=svg2_cfg.get("svg2_kmeans_iter_init", 50),
+                kmeans_iter_step=svg2_cfg.get("svg2_kmeans_iter_step", 2),
+                zero_step_kmeans_init=svg2_cfg.get("svg2_zero_step_kmeans_init", False),
+                first_layers_fp=first_layers_fp,
+                first_times_fp=first_times_fp,
+                context_length=context_length,
+                prompt_length=prompt_length,
+                cache=cache,
+                calculate_density=False,  # only need density when doing head load balancing
+            )
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
+            moba_params = server_args.attention_backend_config.moba_config.copy()
             moba_params.update(
                 {
                     "current_timestep": i,
@@ -1207,14 +1326,13 @@ class DenoisingStage(PipelineStage):
                     "device": get_local_torch_device(),
                 }
             )
-        elif self.attn_backend == FlashAttentionBackend:
+        elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 
@@ -1236,7 +1354,7 @@ class DenoisingStage(PipelineStage):
 
     def _predict_noise_with_cfg(
         self,
-        current_model: torch.nn.Module,
+        current_model: nn.Module,
         latent_model_input: torch.Tensor,
         timestep,
         batch: Req,
@@ -1332,6 +1450,21 @@ class DenoisingStage(PipelineStage):
 
             noise_pred = cfg_model_parallel_all_reduce(partial)
 
+            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+                factor = float(batch.cfg_normalization)
+                pred_f = noise_pred.float()
+                new_norm = torch.linalg.vector_norm(pred_f)
+                if cfg_rank == 0:
+                    cond_f = noise_pred_cond.float()
+                    ori_norm = torch.linalg.vector_norm(cond_f)
+                else:
+                    ori_norm = torch.empty_like(new_norm)
+                ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
+                max_norm = ori_norm * factor
+
+                if new_norm > max_norm:
+                    noise_pred = noise_pred * (max_norm / new_norm)
+
             # Guidance rescale: broadcast std(cond) from rank 0, compute std(cfg) locally
             if batch.guidance_rescale > 0.0:
                 std_cfg = noise_pred.std(
@@ -1359,6 +1492,17 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond - noise_pred_uncond
             )
 
+            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+                factor = float(batch.cfg_normalization)
+                cond_f = noise_pred_cond.float()
+                pred_f = noise_pred.float()
+                ori_norm = torch.linalg.vector_norm(cond_f)
+                new_norm = torch.linalg.vector_norm(pred_f)
+                max_norm = ori_norm * factor
+
+                if new_norm > max_norm:
+                    noise_pred = noise_pred * (max_norm / new_norm)
+
             if batch.guidance_rescale > 0.0:
                 noise_pred = self.rescale_noise_cfg(
                     noise_pred,
@@ -1370,14 +1514,14 @@ class DenoisingStage(PipelineStage):
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
         Prepare Sliding Tile Attention (STA) parameters and settings.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
-        STA_mode = server_args.STA_mode
-        skip_time_steps = server_args.skip_time_steps
+        try:
+            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+        except Exception as e:
+            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            raise e
+        skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
             raise ValueError("Timesteps must be provided")
         timesteps_num = batch.timesteps.shape[0]

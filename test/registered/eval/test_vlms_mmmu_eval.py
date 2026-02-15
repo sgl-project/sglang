@@ -34,24 +34,24 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.270, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
-        0.330, 22.3
+        0.330, 23.5
     ),
-    ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.3),
+    ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
     ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
-    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 17.0),
+    ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 18.0),
     ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
-    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
+    ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.330, 31.9),
     ModelLaunchSettings(
         "Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]
     ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.310, 16.7),
+    ): ModelEvalMetrics(0.30, 16.7),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.26, 32.0),
+    ): ModelEvalMetrics(0.26, 34.0),
 }
 
 

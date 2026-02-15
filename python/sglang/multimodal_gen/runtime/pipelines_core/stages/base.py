@@ -54,6 +54,8 @@ class PipelineStage(ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
+        if self.server_args.comfyui_mode:
+            return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
     def log_warning(self, msg, *args):
@@ -82,18 +84,23 @@ class PipelineStage(ABC):
                 result.add_check("image_latent", batch.image_latent, V.is_tensor)
                 return result
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            A VerificationResult containing the verification status.
-
         """
         # Default implementation - no verification
         return VerificationResult()
 
     def maybe_free_model_hooks(self):
+        pass
+
+    def load_model(self):
+        """
+        Load the model for the stage.
+        """
+        pass
+
+    def offload_model(self):
+        """
+        Offload the model for the stage.
+        """
         pass
 
     # execute on all ranks by default
@@ -107,9 +114,7 @@ class PipelineStage(ABC):
         """
         Verify the output for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             A VerificationResult containing the verification status.
@@ -170,40 +175,40 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.
         """
         stage_name = self.__class__.__name__
         # Check if verification is enabled (simple approach for prototype)
-        enable_verification = getattr(server_args, "enable_stage_verification", False)
 
-        if enable_verification:
-            # Pre-execution input verification
-            try:
-                input_result = self.verify_input(batch, server_args)
-                self._run_verification(input_result, stage_name, "input")
-            except Exception as e:
-                logger.error("Input verification failed for %s: %s", stage_name, str(e))
-                raise
+        # Pre-execution input verification
+        try:
+            input_result = self.verify_input(batch, server_args)
+            self._run_verification(input_result, stage_name, "input")
+        except Exception as e:
+            logger.error("Input verification failed for %s: %s", stage_name, str(e))
+            raise
 
         # Execute the actual stage logic with unified profiling
-        with StageProfiler(stage_name, logger=logger, timings=batch.timings):
+        with StageProfiler(
+            stage_name,
+            logger=logger,
+            timings=batch.timings,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
+            log_stage_start_end=not batch.is_warmup
+            and not (self.server_args and self.server_args.comfyui_mode),
+        ):
             result = self.forward(batch, server_args)
 
-        if enable_verification:
-            # Post-execution output verification
-            try:
-                output_result = self.verify_output(result, server_args)
-                self._run_verification(output_result, stage_name, "output")
-            except Exception as e:
-                logger.error(
-                    "Output verification failed for %s: %s", stage_name, str(e)
-                )
-                raise
+        # Post-execution output verification
+        try:
+            output_result = self.verify_output(result, server_args)
+            self._run_verification(output_result, stage_name, "output")
+        except Exception as e:
+            logger.error("Output verification failed for %s: %s", stage_name, str(e))
+            raise
 
         return result
 
@@ -219,9 +224,7 @@ class PipelineStage(ABC):
         This method should be implemented by subclasses to provide the forward
         processing logic for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.

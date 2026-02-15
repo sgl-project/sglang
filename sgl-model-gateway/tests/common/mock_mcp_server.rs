@@ -23,6 +23,12 @@ pub struct MockSearchServer {
     tool_router: ToolRouter<MockSearchServer>,
 }
 
+impl Default for MockSearchServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[tool_router]
 impl MockSearchServer {
     pub fn new() -> Self {
