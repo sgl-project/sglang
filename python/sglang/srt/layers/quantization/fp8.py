@@ -21,6 +21,7 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.cutlass_moe import CUTLASS_MOE_WORKSPACE_BYTES
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -1553,7 +1554,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.c_strides2 = torch.full(
             (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
-        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
+        self.workspace = torch.empty(
+            CUTLASS_MOE_WORKSPACE_BYTES, device=device, dtype=torch.uint8
+        )
         self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
         self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
         self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)

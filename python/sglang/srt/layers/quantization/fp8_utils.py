@@ -654,6 +654,31 @@ def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     return packed.view(1, scale_m, scale_k, 2, 256)
 
 
+def dequantize_mxfp8(
+    data: torch.Tensor, scale_u8: torch.Tensor, group_size: int = 32
+) -> torch.Tensor:
+    """Dequantize MXFP8 tensor with UE8M0 scales back to bf16.
+
+    Applies per-group scaling: fp8_val * 2^(scale - 127).
+
+    Args:
+        data: FP8 tensor of shape (M, K).
+        scale_u8: uint8 UE8M0 scales of shape (M, K // group_size).
+        group_size: Number of elements per scale group (default 32).
+
+    Returns:
+        bf16 tensor of shape (M, K).
+    """
+    m, k = data.shape
+    n_groups = k // group_size
+    scales_f32 = torch.pow(
+        2.0, scale_u8.to(dtype=torch.float32, device=data.device) - 127.0
+    )
+    data_f32 = data.to(torch.float32).view(m, n_groups, group_size)
+    scales_f32 = scales_f32.view(m, n_groups, 1)
+    return (data_f32 * scales_f32).view(m, k).to(torch.bfloat16)
+
+
 def triton_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

@@ -102,6 +102,7 @@ QUANTIZATION_CHOICES = [
     "bitsandbytes",
     "gguf",
     "modelopt",
+    "modelopt_mxfp8",
     "modelopt_fp8",
     "modelopt_fp4",
     "petit_nvfp4",
