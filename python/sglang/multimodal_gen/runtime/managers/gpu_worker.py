@@ -146,7 +146,7 @@ class GPUWorker:
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        peak_memory_bytes = torch.cuda.max_memory_reserved()
         output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
         peak_memory_gb = peak_memory_bytes / (1024**3)
         remaining_gpu_mem_gb = (
