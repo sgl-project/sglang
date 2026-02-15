@@ -137,18 +137,10 @@ class TestDumperDistributed:
         for enable in [True, False]:
             dist.barrier()
             if rank == 0:
-                for attempt in range(10):
-                    try:
-                        requests.post(
-                            "http://localhost:40000/dumper",
-                            json={"enable": enable},
-                            timeout=0.5,
-                        ).raise_for_status()
-                        break
-                    except requests.exceptions.ConnectionError:
-                        if attempt == 9:
-                            raise
-                        time.sleep(0.2)
+                time.sleep(0.1)
+                requests.post(
+                    "http://localhost:40000/dumper", json={"enable": enable}
+                ).raise_for_status()
             dist.barrier()
             assert dumper._enable == enable
 
