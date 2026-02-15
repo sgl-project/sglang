@@ -1635,6 +1635,19 @@ class ServerArgs:
                 sm100_default_attention_backend="triton",
             )
 
+        elif model_arch == "GraniteMoeHybridForCausalLM":
+            hf_config = self.get_model_config().hf_config
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(hf_config, "layer_types", [])
+            )
+            if has_mamba:
+                self._handle_mamba_radix_cache(
+                    model_arch=model_arch,
+                    support_mamba_cache_extra_buffer=False,
+                    sm100_default_attention_backend="triton",
+                )
+
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
