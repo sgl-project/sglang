@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 @dataclass
 class ToolCallTestParams:
     test_basic: bool = True
+    test_auto: bool = True
     test_streaming: bool = True
     test_required: bool = True
     test_none: bool = True
@@ -23,7 +24,9 @@ class ToolCallTestParams:
     test_strict: bool = True
     test_multiturn: bool = True
     test_thinking: bool = False  # model-specific, e.g. DeepSeek
+    test_reasoning_usage: bool = False  # verify usage.reasoning_tokens > 0
     test_parallel: bool = True
+    test_streaming_parallel: bool = True
 
 
 @dataclass
@@ -99,6 +102,15 @@ def _test_basic_format(client, model):
     tc = msg.tool_calls[0]
     assert tc.function.name == "add", f"expected 'add', got '{tc.function.name}'"
     assert isinstance(json.loads(tc.function.arguments), dict)
+    assert response.choices[0].finish_reason == "tool_calls"
+
+
+def _test_auto(client, model):
+    """tool_choice=auto should populate tool_calls, not content (#17942)."""
+    response = _call(client, model, "Compute 3 + 5", tool_choice="auto")
+    msg = response.choices[0].message
+    assert msg.tool_calls and len(msg.tool_calls) > 0
+    assert not msg.content, f"content should be empty, got: {msg.content}"
     assert response.choices[0].finish_reason == "tool_calls"
 
 
@@ -225,6 +237,29 @@ def _test_thinking(client, model):
     assert "8" in content, f"expected '8' in content, got: {content}"
 
 
+def _test_reasoning_usage(client, model):
+    """With thinking enabled, usage.reasoning_tokens should be reported as > 0."""
+    thinking_body = {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "What is 3 + 5?"}],
+        tools=[ADD_TOOL_STRICT],
+        tool_choice="required",
+        temperature=0.1,
+        extra_body=thinking_body,
+    )
+    usage = response.usage
+    assert usage is not None, "usage should not be None"
+    assert (
+        usage.reasoning_tokens and usage.reasoning_tokens > 0
+    ), f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
+    if usage.completion_tokens_details:
+        detail_reasoning = usage.completion_tokens_details.get("reasoning_tokens", 0)
+        assert (
+            detail_reasoning > 0
+        ), f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+
+
 def _test_parallel(client, model):
     """Single request should return multiple tool calls."""
     response = _call(
@@ -237,8 +272,39 @@ def _test_parallel(client, model):
     assert tc and len(tc) >= 2, f"expected >= 2 tool calls, got {len(tc) if tc else 0}"
 
 
+def _test_streaming_parallel(client, model):
+    """Streaming with tool_choice=auto should return multiple tool calls."""
+    response = _call(
+        client,
+        model,
+        "What is 3+5 and what is the weather in Tokyo?",
+        tools=[ADD_TOOL, WEATHER_TOOL],
+        tool_choice="auto",
+        stream=True,
+    )
+    # collect tool calls from streaming chunks
+    tool_calls = {}
+    for chunk in response:
+        if not chunk.choices[0].delta.tool_calls:
+            continue
+        for tc in chunk.choices[0].delta.tool_calls:
+            idx = tc.index
+            if idx not in tool_calls:
+                tool_calls[idx] = {"name": "", "arguments": ""}
+            if tc.function.name:
+                tool_calls[idx]["name"] = tc.function.name
+            if tc.function.arguments:
+                tool_calls[idx]["arguments"] += tc.function.arguments
+    assert len(tool_calls) >= 2, f"expected >= 2 tool calls, got {len(tool_calls)}"
+    for idx, tc in tool_calls.items():
+        assert tc["name"], f"tool call {idx} missing function name"
+        args = json.loads(tc["arguments"])
+        assert isinstance(args, dict), f"tool call {idx} arguments not a dict"
+
+
 _TESTS = [
     ("basic_format", _test_basic_format, "test_basic"),
+    ("auto", _test_auto, "test_auto"),
     ("streaming", _test_streaming, "test_streaming"),
     ("required", _test_required, "test_required"),
     ("none", _test_none, "test_none"),
@@ -246,7 +312,9 @@ _TESTS = [
     ("strict", _test_strict, "test_strict"),
     ("multiturn", _test_multiturn, "test_multiturn"),
     ("thinking", _test_thinking, "test_thinking"),
+    ("reasoning_usage", _test_reasoning_usage, "test_reasoning_usage"),
     ("parallel", _test_parallel, "test_parallel"),
+    ("streaming_parallel", _test_streaming_parallel, "test_streaming_parallel"),
 ]
 
 

@@ -45,6 +45,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sglang.srt.configs import (
     AfmoeConfig,
+    BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -62,7 +63,10 @@ from sglang.srt.configs import (
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Step3p5Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -74,6 +78,7 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
+    BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
@@ -92,9 +97,12 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     DeepseekVLV2Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
+    Step3p5Config,
 ]
 
 _CONFIG_REGISTRY = {

@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import List, Optional, Tuple
 
 import safetensors
@@ -1729,6 +1730,88 @@ def _validate_weights_after_download(
     return True
 
 
+def _get_lock_file_path(model_name_or_path: str) -> str:
+    """
+    Generate a unique lock file path for download coordination.
+
+    Uses file-based locking (fcntl.flock) to ensure only one process downloads
+    while others wait. This works regardless of how processes are spawned
+    (mp.Process, torchrun, etc.).
+
+    Args:
+        model_name_or_path: Model identifier
+
+    Returns:
+        Path to the lock file
+    """
+    # Create a unique hash based on model name only (not cache_dir)
+    # This ensures all processes coordinate on the same lock regardless of
+    # cache_dir configuration differences between processes
+    key_hash = hashlib.sha256(model_name_or_path.encode()).hexdigest()[:16]
+
+    # Use /dev/shm (shared memory filesystem) for lock files because:
+    # 1. It's always local to the machine (not NFS)
+    # 2. It properly supports file locking
+    # 3. It's shared across all processes on the same machine
+    # Fall back to /tmp if /dev/shm doesn't exist
+    if os.path.isdir("/dev/shm"):
+        return f"/dev/shm/sglang_download_lock_{key_hash}"
+    return f"/tmp/sglang_download_lock_{key_hash}"
+
+
+def _cleanup_incomplete_blobs(model_name_or_path: str, cache_dir: Optional[str]) -> int:
+    """
+    Remove stale .incomplete files from the model's blobs directory.
+
+    This is lighter than _cleanup_corrupted_model_cache (which deletes the
+    entire cache). We only remove .incomplete files so snapshot_download
+    starts fresh on retry, preserving any successfully downloaded blobs.
+
+    Args:
+        model_name_or_path: Model identifier (e.g., "meta-llama/Llama-2-7b-hf")
+        cache_dir: HF cache directory (None to use default)
+
+    Returns:
+        Number of .incomplete files removed
+    """
+    try:
+        import huggingface_hub.constants
+
+        effective_cache_dir = cache_dir or huggingface_hub.constants.HF_HUB_CACHE
+        repo_folder_name = huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+            ["models", *model_name_or_path.split("/")]
+        )
+        blobs_dir = os.path.join(effective_cache_dir, repo_folder_name, "blobs")
+
+        if not os.path.isdir(blobs_dir):
+            return 0
+
+        incomplete_files = glob_module.glob(os.path.join(blobs_dir, "*.incomplete"))
+        removed = 0
+        for f in incomplete_files:
+            try:
+                os.remove(f)
+                removed += 1
+                logger.debug("Removed incomplete blob: %s", os.path.basename(f))
+            except OSError as e:
+                logger.debug(
+                    "Failed to remove incomplete blob %s: %s", os.path.basename(f), e
+                )
+
+        if removed > 0:
+            logger.warning(
+                "Cleaned up %d .incomplete blob(s) for %s in %s",
+                removed,
+                model_name_or_path,
+                blobs_dir,
+            )
+        return removed
+
+    except Exception as e:
+        logger.debug("Failed to clean up incomplete blobs: %s", e)
+        return 0
+
+
 def ci_download_with_validation_and_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
@@ -1742,6 +1825,14 @@ def ci_download_with_validation_and_retry(
 
     This function handles the download of model weights in CI environments,
     with automatic validation and retry logic for handling corrupted downloads.
+
+    Uses file-based locking (fcntl.flock) to prevent HuggingFace hub race
+    conditions where multiple processes try to download simultaneously,
+    causing .incomplete file conflicts. Only one process downloads at a time;
+    others wait for the lock then use the cached result.
+
+    This approach works regardless of how processes are spawned (mp.Process,
+    torchrun, etc.) since it doesn't rely on environment variables.
 
     Args:
         model_name_or_path: The model name or path
@@ -1757,7 +1848,8 @@ def ci_download_with_validation_and_retry(
     Raises:
         RuntimeError: If download fails after max_retries attempts
     """
-    # Lazy imports to avoid circular dependencies
+    import fcntl
+
     import huggingface_hub.constants
     from huggingface_hub import snapshot_download
     from tqdm.auto import tqdm
@@ -1767,43 +1859,119 @@ def ci_download_with_validation_and_retry(
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    # Retry loop for handling corrupted downloads
-    for attempt in range(max_retries):
-        hf_folder = snapshot_download(
+    # Use file-based locking to serialize downloads across all processes
+    # This prevents HF hub race conditions with .incomplete files
+    lock_file_path = _get_lock_file_path(model_name_or_path)
+
+    # Log lock file path for debugging
+    logger.info(
+        "[CI Download] Process %d using lock file: %s",
+        os.getpid(),
+        lock_file_path,
+    )
+
+    # Create lock file if it doesn't exist
+    lock_file = open(lock_file_path, "w")
+
+    try:
+        # Acquire exclusive lock - blocks until lock is available
+        # This ensures only one process downloads at a time
+        logger.info(
+            "[CI Download] Process %d waiting to acquire lock for %s",
+            os.getpid(),
             model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        logger.info(
+            "[CI Download] Process %d ACQUIRED lock for %s",
+            os.getpid(),
+            model_name_or_path,
         )
 
-        # Validate downloaded files to catch corruption early
-        is_valid = _validate_weights_after_download(
-            hf_folder, allow_patterns, model_name_or_path
+        # Now we have exclusive access - perform download with retry logic
+        hf_folder = None
+        for attempt in range(max_retries):
+            try:
+                hf_folder = snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    tqdm_class=DisabledTqdm,
+                    revision=revision,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    # Force single-threaded downloads to prevent race conditions
+                    # on NFS. HF hub defaults to max_workers=8, which can cause
+                    # .incomplete file conflicts when multiple threads operate
+                    # on the same files
+                    max_workers=1,
+                )
+            except (FileNotFoundError, OSError) as e:
+                # Cross-container race condition: another container on the same
+                # host moved/deleted the .incomplete file while we were using it.
+                # This happens when multiple CI containers share an NFS-mounted
+                # HF cache but have separate /dev/shm lock namespaces.
+                logger.warning(
+                    "[CI Download] Process %d hit download race condition "
+                    "(attempt %d/%d) for %s: %s: %s",
+                    os.getpid(),
+                    attempt + 1,
+                    max_retries,
+                    model_name_or_path,
+                    type(e).__name__,
+                    e,
+                )
+                _cleanup_incomplete_blobs(model_name_or_path, cache_dir)
+                if attempt < max_retries - 1:
+                    backoff = 2**attempt
+                    logger.info(
+                        "[CI Download] Retrying in %ds...",
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(
+                    f"Download failed for {model_name_or_path} after "
+                    f"{max_retries} attempts due to cross-container race "
+                    f"condition (.incomplete file conflicts). "
+                    f"Last error: {type(e).__name__}: {e}"
+                ) from e
+
+            # Validate downloaded files to catch corruption early
+            is_valid = _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
+
+            if is_valid:
+                return hf_folder
+
+            # Validation failed, corrupted files were cleaned up
+            if attempt < max_retries - 1:
+                log_info_on_rank0(
+                    logger,
+                    f"Retrying download for {model_name_or_path} "
+                    f"(attempt {attempt + 2}/{max_retries})...",
+                )
+            else:
+                raise RuntimeError(
+                    f"Downloaded model files are still corrupted for "
+                    f"{model_name_or_path} after {max_retries} attempts. "
+                    "This may indicate a persistent issue with the model files "
+                    "on Hugging Face Hub or network problems."
+                )
+
+        # Should never reach here, but return hf_folder just in case
+        return hf_folder
+
+    finally:
+        # Always release the lock
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+        logger.info(
+            "[CI Download] Process %d RELEASED lock for %s",
+            os.getpid(),
+            model_name_or_path,
         )
-
-        if is_valid:
-            return hf_folder
-
-        # Validation failed, corrupted files were cleaned up
-        if attempt < max_retries - 1:
-            log_info_on_rank0(
-                logger,
-                f"Retrying download for {model_name_or_path} "
-                f"(attempt {attempt + 2}/{max_retries})...",
-            )
-        else:
-            raise RuntimeError(
-                f"Downloaded model files are still corrupted for "
-                f"{model_name_or_path} after {max_retries} attempts. "
-                "This may indicate a persistent issue with the model files "
-                "on Hugging Face Hub or network problems."
-            )
-
-    # This should never be reached, but just in case
-    return hf_folder
 
 
 def ci_validate_and_clean_hf_cache(model_path: str) -> None:

@@ -189,6 +189,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens_cpu
 
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        return self.attn_metadata.nsa_extend_seq_lens_list
+
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
 
@@ -297,6 +300,8 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        # Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT), controlled by env var.
+        self._force_attn_forward_mla: bool = envs.SGLANG_NSA_FORCE_MLA.get()
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -1834,6 +1839,8 @@ class NativeSparseAttnBackend(
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
+        if self._force_attn_forward_mla:
+            self.use_mha = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
