@@ -30,8 +30,6 @@ class TestGptOss4Gpu(BaseTestGptOss):
                 "4",
                 "--cuda-graph-max-bs",
                 "200",
-                "--mem-fraction-static",
-                "0.93",
             ],
         )
 
