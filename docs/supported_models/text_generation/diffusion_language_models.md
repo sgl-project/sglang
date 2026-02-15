@@ -1,7 +1,5 @@
 # Diffusion Language Models
 
-> This page covers **text generation** using diffusion-based LLMs. For **image and video generation**, see [Diffusion Models](../image_generation/diffusion_models.md).
-
 Diffusion language models have shown promise for non-autoregressive text generation with parallel decoding capabilities. Unlike auto-regressive language models, different diffusion language models require different decoding strategies.
 
 ## Example Launch Command
