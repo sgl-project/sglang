@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb_qk
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -76,25 +77,6 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
-def rope_apply_head_dim(x, freqs, head_dim):
-    x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    # print(f"{x_out.shape = }, {freqs.shape = }")
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
 class SelfAttention(nn.Module):
     """
     Self-Attention module for MOVA DiT with Sequence Parallelism support.
@@ -139,14 +121,11 @@ class SelfAttention(nn.Module):
 
         Args:
             x: Input tensor [B, S_local, D] - already sharded by SP when SP > 1
-            freqs: RoPE frequencies [S_local, 1, head_dim] - should match x's sequence length
+            freqs: RoPE frequencies [S_local, head_dim] - should match x's sequence length
 
         Returns:
             Output tensor [B, S_local, D]
         """
-        if isinstance(freqs, DTensor):
-            freqs = freqs.to_local()
-
         # Compute Q, K, V on local sequence
         q, _ = self.q(x)
         k, _ = self.k(x)
@@ -160,14 +139,14 @@ class SelfAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
 
-        # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
-
         # USPAttention expects [B, S_local, H, D] format
         q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+
+        # Apply RoPE
+        cos, sin = freqs
+        q, k = _apply_rotary_emb_qk(q, k, cos, sin, is_neox_style=False)
 
         # USPAttention handles SP communication internally
         out = self.attn(q, k, v)
@@ -515,9 +494,10 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
                 ],
                 dim=-1,
             )
-            .reshape(f * h * w, 1, -1)
+            .reshape(f * h * w, -1)
             .to(x.device)
         )
+        freqs = (freqs.real.contiguous().float(), freqs.imag.contiguous().float())
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)

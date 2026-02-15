@@ -23,9 +23,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    apply_flashinfer_rope_qk_inplace,
-)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -48,14 +46,14 @@ def compute_rope_cos_sin(
     making it compatible with FSDP meta device initialization.
 
     Args:
-        position_ids: Position IDs tensor [B, L] or [1, L]
+        position_ids: Position IDs tensor [L]
         head_dim: Dimension of each attention head
         base: RoPE base frequency (default: 10000.0)
         device: Target device
         dtype: Output dtype
 
     Returns:
-        (cos, sin): Each with shape [B, L, head_dim]
+        (cos, sin): Each with shape [L, head_dim]
     """
     device = device or position_ids.device
     dtype = dtype or torch.float32
@@ -66,18 +64,10 @@ def compute_rope_cos_sin(
         ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
     )
 
-    # Expand for batch computation: [B, L] -> [B, 1, L] @ [1, head_dim/2, 1] -> [B, head_dim/2, L]
-    inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-    position_ids_expanded = position_ids[:, None, :].float()
+    freqs = torch.outer(inv_freq.float(), position_ids.float()).transpose(0, 1)
 
-    # Compute frequencies: [B, head_dim/2, L] -> [B, L, head_dim/2]
-    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-
-    # Double the frequencies for full head_dim: [B, L, head_dim]
-    emb = torch.cat((freqs, freqs), dim=-1)
-
-    cos = emb.cos().to(dtype=dtype)
-    sin = emb.sin().to(dtype=dtype)
+    cos = freqs.cos().to(dtype=dtype)
+    sin = freqs.sin().to(dtype=dtype)
 
     return cos, sin
 
@@ -245,45 +235,13 @@ class ConditionalCrossAttention(nn.Module):
         if x_freqs is not None:
             x_cos, x_sin = x_freqs
             q_view = rearrange(q, "b l (h d) -> b l h d", d=self.head_dim)
-            x_cos = x_cos.to(q_view.dtype).to(q_view.device).squeeze(0)
-            x_sin = x_sin.to(q_view.dtype).to(q_view.device).squeeze(0)
-            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
-            # where the first half is cos and the second half is sin, each with
-            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
-            # frequencies (cat((freqs, freqs))), we only take the first half.
-            half_dim = self.head_dim // 2
-            cos_sin_cache = torch.cat(
-                [
-                    x_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                    x_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            q_view, _ = apply_flashinfer_rope_qk_inplace(
-                q_view, q_view.clone(), cos_sin_cache, is_neox=True
-            )
+            q_view = _apply_rotary_emb(q_view, x_cos, x_sin, is_neox_style=True)
             q = rearrange(q_view, "b l h d -> b l (h d)")
 
         if y_freqs is not None:
             y_cos, y_sin = y_freqs
             k_view = rearrange(k, "b l (h d) -> b l h d", d=self.head_dim)
-            y_cos = y_cos.to(k_view.dtype).to(k_view.device).squeeze(0)
-            y_sin = y_sin.to(k_view.dtype).to(k_view.device).squeeze(0)
-            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
-            # where the first half is cos and the second half is sin, each with
-            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
-            # frequencies (cat((freqs, freqs))), we only take the first half.
-            half_dim = self.head_dim // 2
-            cos_sin_cache = torch.cat(
-                [
-                    y_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                    y_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            k_view, _ = apply_flashinfer_rope_qk_inplace(
-                k_view, k_view.clone(), cos_sin_cache, is_neox=True
-            )
+            k_view = _apply_rotary_emb(k_view, y_cos, y_sin, is_neox_style=True)
             k = rearrange(k_view, "b l h d -> b l (h d)")
 
         q = rearrange(q, "b l (h d) -> b l h d", h=self.num_heads_per_rank)
@@ -538,7 +496,7 @@ class DualTowerConditionalBridge(
         dtype = dtype or torch.float32
 
         # Audio positions: 0, 1, 2, ..., L_a-1
-        audio_pos = torch.arange(L_a, device=device, dtype=torch.float32).unsqueeze(0)
+        audio_pos = torch.arange(L_a, device=device, dtype=torch.float32)
 
         # Video positions: Align video frames to audio step units
         if self.apply_first_frame_bias_in_rope:
@@ -558,7 +516,7 @@ class DualTowerConditionalBridge(
                 torch.arange(f_v, device=device, dtype=torch.float32) * scale
             )
 
-        video_pos = video_pos_per_frame.repeat_interleave(h * w).unsqueeze(0)
+        video_pos = video_pos_per_frame.repeat_interleave(h * w)
 
         # Use functional RoPE to compute cos/sin
         cos_v, sin_v = compute_rope_cos_sin(
