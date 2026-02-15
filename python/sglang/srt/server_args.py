@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_free_port,
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
@@ -52,7 +53,6 @@ from sglang.srt.utils.common import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
-    is_port_available,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
@@ -1135,9 +1135,9 @@ class ServerArgs:
         # suggest them to be explicit about kv_cache_dtype to avoid surprises
         if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
             logger.warning(
-                f"When specifying --nsa-prefill-backend or --nsa-decode-backend, "
-                f"you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
-                f"DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
+                "When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
+                "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
 
         if self.kv_cache_dtype == "auto":
@@ -1216,7 +1216,7 @@ class ServerArgs:
                 if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
-                            f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                            "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
                         if self.nsa_prefill_cp_mode == "in-seq-split":
                             # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
@@ -1226,7 +1226,7 @@ class ServerArgs:
                             self.ep_size = self.tp_size
                             self.kv_cache_dtype = "bf16"
                             logger.warning(
-                                f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
+                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
                             )
                         else:
                             self.enable_dp_attention = True
@@ -1663,7 +1663,7 @@ class ServerArgs:
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
             logger.warning(
-                f"Overlap scheduler is disabled when using sparse head for embedding model."
+                "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
@@ -5500,7 +5500,7 @@ class ServerArgs:
     def validate_transfer_engine(self):
         if importlib.util.find_spec("mooncake.engine") is None:
             logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+                "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
             return False
         elif self.enable_memory_saver:
@@ -5603,14 +5603,7 @@ class PortArgs:
         worker_ports: Optional[List[int]] = None,
     ) -> PortArgs:
         if server_args.nccl_port is None:
-            nccl_port = server_args.port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
+            nccl_port = get_free_port()
         else:
             nccl_port = server_args.nccl_port
 
@@ -5671,7 +5664,7 @@ class PortArgs:
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
-            except ValueError as e:
+            except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
                 )
