@@ -20,6 +20,7 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -362,6 +363,26 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_pipeline_config(self):
+        # enable parallel folding when SP is enabled
+        if self.tp_size != 1 or self.sp_degree <= 1:
+            return
+
+        enabled = False
+        for text_encoder_config in self.pipeline_config.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                enabled = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
+        if enabled:
+            logger.info(
+                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                self.__class__.__name__,
+                self.tp_size,
+                self.sp_degree,
+            )
+
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
             logger.info(
@@ -428,6 +449,8 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        self.check_server_args()
+
         self.adjust_offload()
 
         if self.attention_backend in ["fa3", "fa4"]:
@@ -458,8 +481,6 @@ class ServerArgs:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
-
-        self.check_server_args()
 
         # log clean server_args
         try:
@@ -976,7 +997,7 @@ class ServerArgs:
             raise ValueError("DP is not yet supported")
 
     def check_server_args(self) -> None:
-        """Validate inference arguments for consistency"""
+        """Check, Validate and Normalize inference arguments for consistency"""
         # layerwise offload
         if current_platform.is_mps():
             self.use_fsdp_inference = False
@@ -1071,6 +1092,7 @@ class ServerArgs:
         # allocate all remaining gpus for sp-size
         self.check_server_sp_args()
 
+        # after this point, all parallel settings are normalized
         if self.enable_cfg_parallel:
             if self.num_gpus == 1:
                 raise ValueError(
@@ -1085,6 +1107,8 @@ class ServerArgs:
                     "cache-dit is enabled with hybrid parallelism (SP + TP). "
                     "Proceeding anyway (SGLang integration may support this mode)."
                 )
+
+        self.adjust_pipeline_config()
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
