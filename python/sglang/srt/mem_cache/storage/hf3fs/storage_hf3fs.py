@@ -614,16 +614,25 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return keys, values
 
+    def _batch_set_postprocess(self, host_indices, results):
+        page_num = len(host_indices) // self.mem_pool_host.page_size
+
+        if self.is_zero_copy and not self.is_mla_model:
+            # Zero-copy MHA splits each page into K and V entries (N -> 2N),
+            # so we need to combine 2N results back to N by AND-ing each pair.
+            results = [(results[2 * i] and results[2 * i + 1]) for i in range(page_num)]
+
+        return results
+
     def batch_set_v1(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        len_keys = len(keys)
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)
-        return results
+        return self._batch_set_postprocess(host_indices, results)
 
     # Deprecated
     def get(
