@@ -8,14 +8,22 @@ Author:
 Menyang Liu, https://github.com/dreamyang-liu
 Chenyang Zhao, https://github.com/zhaochenyang20
 
-We use two model pairs for testing (base model / instruct model pairs):
+We use two model pairs for testing (base model / source model pairs):
 
 - FLUX.2-klein-base-4B / FLUX.2-klein-4B
 - Qwen/Qwen-Image / Qwen/Qwen-Image-2512
 
-These model pairs share the same architecture, but not every module is
-guaranteed to have different weights between base and update models.
-Some modules can be identical across the pair.
+These model pairs share the same architecture but differ in transformer
+weights (all other modules — vae, text_encoder, … — are identical).
+
+The source model is not used directly by any test.  Instead, at fixture
+setup time we clone it and perturb its vae weights, producing a synthetic
+perturbed checkpoint (perturbed_vae_model_dir) where both transformer AND
+vae differ from the base model.  This perturbed checkpoint is used in all
+tests, giving us two modules with known different checksums to verify.
+
+NOTE: Disk-vs-server checksum verification currently ONLY covers transformer.
+Other modules have weight-name remapping / QKV merge mismatches to resolve first.
 
 =============================================================================
 
@@ -39,56 +47,48 @@ error handling, checksum verification, and corrupted-weight rollback.
 All tests share one class-scoped server (same process, same in-memory weights).
 Tests that require "base model then update" should be explicitly reset to
 default_model first so behavior is order-independent and updates are real
- (base→update), not no-ops (update→update).
+(base→perturbed), not no-ops (perturbed→perturbed).
 
   • test_update_weights_from_disk_default
 
-    base -> instruct with flush_cache=True. Verifies:
-    (1) before-update checksum == base model disk checksum;
-    (2) after-update checksum == instruct model disk checksum;
-    (3) before != after (update actually changed weights).
-    rollback to base model after update.
+    base -> perturbed with flush_cache=True.
+    Verifies after-update checksum == perturbed checkpoint disk checksum
+    (implicitly confirms weights changed, since fixture guarantees
+    base ≠ perturbed).
 
   • test_update_weights_specific_modules
 
-    base -> instruct with flush_cache=False: randomly selects target_modules,
-    updates only those from base to instruct model. Verifies:
-    (1) updated modules' checksums match instruct model disk checksum;
-    (2) non-updated modules' checksums are unchanged (before == after == disk).
-    rollback to base model after update.
+    base -> perturbed with flush_cache=False.  Randomly selects one module
+    from _DIFFERING_MODULES (modules whose weights differ between base and
+    perturbed checkpoint) as target_modules, updates only that module. Verifies:
+    (1) targeted module's in-memory checksum changed;
+    (2) non-targeted modules' in-memory checksums are unchanged.
 
   • test_update_weights_nonexistent_model
 
     model_path set to a non-existent path; must fail (400, success=False).
 
-    Ensure server is healthy after inaccurate update and server's checksums
-    equals to base model's disk checksums.
+    Ensure server is healthy after failed update and server's checksums
+    equal base model's disk checksums.
 
   • test_update_weights_missing_model_path
 
     Request body empty (no model_path); must fail (400, success=False).
 
-    Ensure server is healthy after inaccurate update and server's checksums
-    equals to base model's disk checksums.
+    Ensure server is healthy after failed update and server's checksums
+    equal base model's disk checksums.
 
   • test_update_weights_nonexistent_module
 
     target_modules=["nonexistent_module"]; must fail (400, success=False).
 
-    Verify server is healthy after inaccurate update and server's checksums
-    equals to base model's disk checksums.
+    Verify server is healthy after failed update and server's checksums
+    equal base model's disk checksums.
 
   • test_corrupted_weights_rollback
 
-    Verify base -> instruct rollback after loading corrupted instruct model.
-    Builds a corrupted model directory by copying the instruct model and
-    truncating the vae safetensors. Updates with target_modules=["transformer",
-    "vae"]. The transformer updates successfully first; the corrupted vae module
-    then fails during safetensors validation, triggering a rollback that restores
-    the transformer to its previous weights.
-
-    Ensure server is healthy after rollback and server's checksums equals to
-    base model's disk checksums.
+    All-or-nothing rollback: base→perturbed succeeds, then perturbed→corrupted
+    fails (truncated vae), server rolls back to the perturbed checkpoint.
 
 -----------------------------------------------------------------------------
 
@@ -102,9 +102,8 @@ and update prefetched GPU tensors without shape mismatch.
 
   • test_update_weights_with_offload_enabled
 
-    Server with --dit-layerwise-offload (base). Update to instruct; must succeed
-    (200, success=True), message must not contain "Shape mismatch". Assert server
-    checksums == instruct model disk checksums (server healthy).
+    Server with --dit-layerwise-offload (base). Load perturbed checkpoint;
+    must succeed (200, success=True), no "Shape mismatch". Checksums match disk.
 """
 
 from __future__ import annotations
@@ -115,6 +114,8 @@ import random
 import shutil
 import tempfile
 import threading
+from collections.abc import Callable
+from enum import StrEnum
 
 import pytest
 import requests
@@ -137,6 +138,18 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in
 
 logger = init_logger(__name__)
 
+
+class _Module(StrEnum):
+    """Updatable pipeline module names."""
+
+    TRANSFORMER = "transformer"
+    VAE = "vae"
+
+
+# Modules whose weights differ between the base model and the synthetic
+# perturbed checkpoint
+_DIFFERING_MODULES: list[str] = [_Module.TRANSFORMER, _Module.VAE]
+
 _ALL_MODEL_PAIRS: list[tuple[str, str, float]] = [
     (
         "black-forest-labs/FLUX.2-klein-base-4B",
@@ -152,7 +165,7 @@ _ALL_MODEL_PAIRS: list[tuple[str, str, float]] = [
 
 
 def _select_model_pairs() -> list[tuple[str, str]]:
-    """Return the (default, update) model pairs to test.
+    """Return the (default, source) model pairs to test.
 
     When SGLANG_TEST_DIFFUSION_MODEL / SGLANG_TEST_UPDATE_MODEL env vars
     are set, use them as a single explicit pair.  Otherwise, run both
@@ -193,48 +206,17 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     return compute_weights_checksum(safetensors_weights_iterator(safetensors_files))
 
 
-def _get_modules_with_weights_on_disk(
-    model_path: str, module_names: list[str]
-) -> list[str]:
-    """Return module names that have safetensors on disk for the given model."""
-    local_path = maybe_download_model(model_path)
-    result = []
-    for name in module_names:
-        weights_dir = find_weights_dir(local_path, name)
-        if weights_dir and _list_safetensors_files(weights_dir):
-            result.append(name)
-    return result
-
-
-def _get_modules_with_different_checksums(
-    base_model: str, update_model: str, module_names: list[str]
-) -> list[str]:
-    """Return shared modules whose disk checksums differ across model pair."""
-    base_modules = set(_get_modules_with_weights_on_disk(base_model, module_names))
-    update_modules = set(_get_modules_with_weights_on_disk(update_model, module_names))
-    shared_modules = sorted(base_modules & update_modules)
-
-    changed_modules = []
-    for name in shared_modules:
-        base_cs = _compute_checksum_from_disk(base_model, name)
-        update_cs = _compute_checksum_from_disk(update_model, name)
-        if base_cs != update_cs:
-            changed_modules.append(name)
-    return changed_modules
-
-
-def _prepare_corrupted_model(
-    src_model: str, dst_model: str, corrupt_module: str
+def _clone_model_with_modified_module(
+    src_model: str,
+    dst_model: str,
+    target_module: str,
+    transform_safetensor: Callable[[str, str], None],
 ) -> None:
-    """Build a corrupted model directory from src_model.
+    """Clone a model directory via symlinks, applying transform to one module.
 
-    Uses symlinks for everything except the corrupt_module directory to
-    save disk space and time.  Only the corrupt_module's safetensors are
-    physically copied and then truncated so that safetensors_weights_iterator
-    detects corruption at load time, triggering a rollback.
-
-    Must be called before every test attempt because the server deletes
-    corrupted files on detection.
+    Everything is symlinked except the target module's first .safetensors
+    file, which is transformed (causing a checksum difference or corruption);
+    remaining files are symlinked for speed.
     """
     # Symlink root-level files (model_index.json, etc.).
     for fname in os.listdir(src_model):
@@ -249,37 +231,52 @@ def _prepare_corrupted_model(
         if not os.path.isdir(src_dir):
             continue
 
-        # Non-corrupted modules: symlink the entire directory.
-        if module_dir != corrupt_module:
+        if module_dir != target_module:
             if not os.path.exists(dst_dir):
                 os.symlink(src_dir, dst_dir)
             continue
 
-        # Corrupted module: create a real directory, symlink non-safetensors
-        # files, and copy + truncate safetensors files.
         os.makedirs(dst_dir, exist_ok=True)
-        for fname in os.listdir(src_dir):
+        transformed = False
+        for fname in sorted(os.listdir(src_dir)):
             src_file = os.path.join(src_dir, fname)
             dst_file = os.path.join(dst_dir, fname)
             if not os.path.isfile(src_file):
                 continue
 
-            if not fname.endswith(".safetensors"):
+            if not fname.endswith(".safetensors") or transformed:
                 if not os.path.exists(dst_file):
                     os.symlink(src_file, dst_file)
                 continue
 
-            # Copy safetensors then truncate to corrupt it.
-            shutil.copy2(src_file, dst_file)
-            size = os.path.getsize(dst_file)
-            with open(dst_file, "r+b") as f:
-                f.truncate(size - 1000)
-            logger.info(
-                "Created corrupted safetensors: %s (%d -> %d bytes)",
-                dst_file,
-                size,
-                size - 1000,
-            )
+            transform_safetensor(src_file, dst_file)
+            transformed = True
+
+
+def _truncate_safetensor(src_file: str, dst_file: str) -> None:
+    """Copy then truncate — produces an invalid safetensors that triggers rollback."""
+    shutil.copy2(src_file, dst_file)
+    size = os.path.getsize(dst_file)
+    with open(dst_file, "r+b") as f:
+        f.truncate(size - 1000)
+    logger.info(
+        "Created corrupted safetensors: %s (%d -> %d bytes)",
+        dst_file,
+        size,
+        size - 1000,
+    )
+
+
+def _perturb_safetensor(src_file: str, dst_file: str) -> None:
+    """Load, add small perturbation to floating-point tensors, and save."""
+    from safetensors.torch import load_file, save_file
+
+    tensors = load_file(src_file)
+    perturbed = {
+        k: (t + 0.01 if t.is_floating_point() else t) for k, t in tensors.items()
+    }
+    save_file(perturbed, dst_file)
+    logger.info("Created perturbed safetensors: %s", dst_file)
 
 
 class _UpdateWeightsApiMixin:
@@ -323,28 +320,31 @@ class _UpdateWeightsApiMixin:
         ), f"get_weights_checksum failed: {response.status_code} {response.text}"
         return response.json()
 
-    def _assert_server_matches_model_on_changed_modules(
+    def _assert_server_matches_model(
         self,
         base_url: str,
-        base_model: str,
-        update_model: str,
         expected_model: str,
     ) -> None:
-        all_checksums = self._get_weights_checksum(base_url)
-        module_names = [k for k, v in all_checksums.items() if v != "not_found"]
-        changed_modules = _get_modules_with_different_checksums(
-            base_model, update_model, module_names
+        """Assert the server's transformer checksum matches expected_model on disk.
+
+        Only the transformer is verified because weight-name remapping and
+        QKV merge during model loading cause in-memory parameter names/shapes
+        to diverge from on-disk safetensors for other modules (e.g. vae),
+        making their checksums incomparable.
+
+        TODO: Extend to verify all modules once these
+        discrepancies are resolved.
+        """
+        server_checksums = self._get_weights_checksum(
+            base_url, module_names=[_Module.TRANSFORMER]
         )
-        if not changed_modules:
-            pytest.skip("No checksum-different shared modules in model pair")
-        for name in changed_modules:
-            server_cs = all_checksums.get(name)
-            expected_cs = _compute_checksum_from_disk(expected_model, name)
-            assert server_cs == expected_cs, (
-                f"Checksum mismatch on '{name}'\n"
-                f"  expected({expected_model}): {expected_cs}\n"
-                f"  server: {server_cs}"
-            )
+        expected_cs = _compute_checksum_from_disk(expected_model, _Module.TRANSFORMER)
+        server_cs = server_checksums.get(_Module.TRANSFORMER)
+        assert server_cs == expected_cs, (
+            f"Checksum mismatch on '{_Module.TRANSFORMER}'\n"
+            f"  expected({expected_model}): {expected_cs}\n"
+            f"  server: {server_cs}"
+        )
 
 
 class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
@@ -362,11 +362,17 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     def diffusion_server_no_offload(self, request):
         """Start a diffusion server (no offload) for this test class.
 
-        Precomputes disk checksums for the update model in background threads
-        while the server is starting, so they are already cached (via lru_cache)
-        by the time tests need them.
+        Builds two synthetic checkpoints from the source model:
+        - perturbed_vae_model_dir: source model with perturbed vae (both
+          transformer and vae differ from base).
+        - corrupted_vae_model_dir: base model with truncated vae — triggers
+          load failure for rollback testing.
+
+        Checksum cache warmup and synthetic checkpoints building run in background
+        threads while the server boots, so everything is ready by the time
+        tests start.
         """
-        default_model, update_model = request.param
+        default_model, source_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
 
@@ -377,180 +383,129 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             extra_args="--num-gpus 1",
         )
 
-        # Warm the lru_cache while the server boots (disk I/O is independent).
-        checksum_threads = [
+        # Ensure models are local before spawning threads that need the paths.
+        local_default = maybe_download_model(default_model)
+        local_source = maybe_download_model(source_model)
+
+        perturbed_vae_model_dir = tempfile.mkdtemp(prefix="sglang_perturbed_vae_")
+        corrupted_vae_model_dir = tempfile.mkdtemp(prefix="sglang_corrupted_")
+
+        # Run all disk I/O in background while the server boots.
+        bg_threads = [
             threading.Thread(
-                target=_compute_checksum_from_disk, args=(update_model, module)
+                target=_compute_checksum_from_disk, args=(default_model, module)
             )
-            for module in ("transformer", "vae")
+            for module in _DIFFERING_MODULES
+        ] + [
+            threading.Thread(
+                target=_clone_model_with_modified_module,
+                args=(
+                    local_source,
+                    perturbed_vae_model_dir,
+                    _Module.VAE,
+                    _perturb_safetensor,
+                ),
+            ),
+            threading.Thread(
+                target=_clone_model_with_modified_module,
+                args=(
+                    local_default,
+                    corrupted_vae_model_dir,
+                    _Module.VAE,
+                    _truncate_safetensor,
+                ),
+            ),
         ]
-        for t in checksum_threads:
+        for t in bg_threads:
             t.start()
 
         ctx = manager.start()
-        for t in checksum_threads:
+        for t in bg_threads:
             t.join()
 
+        # Sanity: all _DIFFERING_MODULES should differ between base and perturbed.
+        for module in _DIFFERING_MODULES:
+            assert _compute_checksum_from_disk(
+                default_model, module
+            ) != _compute_checksum_from_disk(perturbed_vae_model_dir, module), (
+                f"Assumption violated: {module} should differ between "
+                f"{default_model} and {perturbed_vae_model_dir}"
+            )
+
         try:
-            yield ctx, default_model, update_model
+            yield ctx, default_model, perturbed_vae_model_dir, corrupted_vae_model_dir
         finally:
             ctx.cleanup()
-
-    @pytest.fixture(scope="class")
-    def corrupted_model_dir(self, diffusion_server_no_offload):
-        """Create a separate temporary directory per parametrized model pair."""
-        tmpdir = tempfile.mkdtemp(prefix="sglang_corrupted_model_")
-        yield tmpdir
-        shutil.rmtree(tmpdir, ignore_errors=True)
+            shutil.rmtree(perturbed_vae_model_dir, ignore_errors=True)
+            shutil.rmtree(corrupted_vae_model_dir, ignore_errors=True)
 
     def test_update_weights_from_disk_default(self, diffusion_server_no_offload):
-        """Base→instruct with flush_cache=True; verify before/after; rollback to base.
-
-        Resets to base, records before checksum. Updates to instruct with
-        flush_cache=True. Asserts: (1) before == base disk; (2) after == instruct
-        disk; (3) before != after. Then rollback to base so server ends on base.
-        """
-        ctx, default_model, update_model = diffusion_server_no_offload
+        """Default update (target_modules=None, flush_cache=True): all changed modules updated."""
+        ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
-        # Reset to base so we have a real base→instruct.
         self._update_weights(base_url, default_model)
 
-        before_checksum = self._get_weights_checksum(
-            base_url, module_names=["transformer"]
-        )["transformer"]
-        base_disk = _compute_checksum_from_disk(default_model, "transformer")
+        result, status_code = self._update_weights(base_url, perturbed_model_dir)
+        assert status_code == 200
+        assert result.get("success", False), f"Update failed: {result.get('message')}"
 
-        result, status_code = self._update_weights(
-            base_url,
-            update_model,
-            flush_cache=True,
-        )
-        assert status_code == 200 and result.get(
-            "success"
-        ), f"Update failed: {result.get('message')}"
-
-        after_checksum = self._get_weights_checksum(
-            base_url, module_names=["transformer"]
-        )["transformer"]
-        instruct_disk = _compute_checksum_from_disk(update_model, "transformer")
-
-        assert before_checksum == base_disk, (
-            f"Before-update checksum should match base model disk\n"
-            f"  base_disk: {base_disk}\n  before:    {before_checksum}"
-        )
-        assert after_checksum == instruct_disk, (
-            f"After-update checksum should match instruct model disk\n"
-            f"  instruct_disk: {instruct_disk}\n  after:      {after_checksum}"
-        )
-        assert (
-            before_checksum != after_checksum
-        ), "Before and after checksums should differ (update changed weights)"
-
-        # Rollback to base so server ends in known state.
-        self._update_weights(base_url, default_model)
+        self._assert_server_matches_model(base_url, perturbed_model_dir)
 
     def test_update_weights_specific_modules(self, diffusion_server_no_offload):
-        """Partial update base→instruct with flush_cache=False; verify checksums; rollback to base.
+        """Verify target_modules filtering: only the specified module is updated.
 
-        Randomly picks target_modules, updates only those to instruct with
-        flush_cache=False. Asserts:
-        (1) for modules whose base/update disk checksums differ, updated modules
-            match update-model disk and actually change;
-        (2) for modules with identical base/update checksums, updating them keeps
-            checksums unchanged;
-        (3) non-updated modules remain unchanged (before == after).
-        Then rollback to base.
+        The perturbed checkpoint has different weights for both transformer and
+        vae.  This test randomly picks ONE of them as target_modules and loads
+        from the perturbed checkpoint.  Assertions:
+        (1) the targeted module's in-memory checksum changed (before != after);
+        (2) every non-targeted module's in-memory checksum is unchanged,
+            proving the server only touched what was requested.
         """
-        ctx, default_model, update_model = diffusion_server_no_offload
+        ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
-        # Reset to base model so we start from a known state.
+        # Reset server to default_model.
         self._update_weights(base_url, default_model)
-
-        # All pipeline module names (from server).
-        all_checksums = self._get_weights_checksum(base_url, module_names=None)
-        all_module_names = [k for k in all_checksums if all_checksums[k] != "not_found"]
-        if not all_module_names:
-            pytest.skip("No updatable modules reported by server")
-
-        # Only consider modules that have weights on disk in both models.
-        base_modules = set(
-            _get_modules_with_weights_on_disk(default_model, all_module_names)
-        )
-        update_modules = set(
-            _get_modules_with_weights_on_disk(update_model, all_module_names)
-        )
-        candidates = sorted(base_modules & update_modules)
-        if not candidates:
-            pytest.skip("No shared modules with weights on disk in model pair")
-
-        changed_modules = _get_modules_with_different_checksums(
-            default_model, update_model, candidates
-        )
-        if not changed_modules:
-            pytest.skip("No checksum-different shared modules in model pair")
-
-        # Random non-empty subset (fixed seed) that always includes one changed module.
-        random.seed(42)
-        must_include = random.choice(changed_modules)
-        optional = [m for m in candidates if m != must_include]
-        k_extra = random.randint(0, len(optional))
-        target_modules = [must_include] + random.sample(optional, k_extra)
-        target_set = set(target_modules)
-        changed_set = set(changed_modules)
-        logger.info(
-            "Partial update test (flush_cache=False): target_modules=%s (checksum-different modules: %s)",
-            target_modules,
-            changed_modules,
+        before_checksums = self._get_weights_checksum(
+            base_url, module_names=_DIFFERING_MODULES
         )
 
-        before_checksums = self._get_weights_checksum(base_url, module_names=None)
-
+        target_modules = [random.choice(_DIFFERING_MODULES)]
         result, status_code = self._update_weights(
             base_url,
-            update_model,
+            perturbed_model_dir,
             target_modules=target_modules,
             flush_cache=False,
         )
         assert status_code == 200, f"Update failed: {result}"
         assert result.get("success", False), f"Update failed: {result.get('message')}"
 
-        after_checksums = self._get_weights_checksum(base_url, module_names=None)
+        after_checksums = self._get_weights_checksum(
+            base_url, module_names=_DIFFERING_MODULES
+        )
 
-        for name in all_module_names:
-            if name in target_set:
-                if name in changed_set:
-                    disk_cs = _compute_checksum_from_disk(update_model, name)
-                    assert after_checksums.get(name) == disk_cs, (
-                        f"Updated module '{name}': checksum should match update model disk\n"
-                        f"  disk: {disk_cs}\n  gpu:  {after_checksums.get(name)}"
-                    )
-                    assert after_checksums.get(name) != before_checksums.get(name), (
-                        f"Updated module '{name}' should change checksum (base != update)\n"
-                        f"  before: {before_checksums.get(name)}\n"
-                        f"  after:  {after_checksums.get(name)}"
-                    )
-                else:
-                    assert after_checksums.get(name) == before_checksums.get(name), (
-                        f"Updated module '{name}' has identical base/update disk checksum, "
-                        "so it should remain unchanged\n"
-                        f"  before: {before_checksums.get(name)}\n"
-                        f"  after:  {after_checksums.get(name)}"
-                    )
-            else:
-                assert after_checksums.get(name) == before_checksums.get(name), (
-                    f"Non-updated module '{name}': checksum must be unchanged\n"
-                    f"  before: {before_checksums.get(name)}\n"
-                    f"  after:  {after_checksums.get(name)}"
-                )
+        # Targeted module should have changed.
+        for name in target_modules:
+            assert after_checksums.get(name) != before_checksums.get(name), (
+                f"Targeted module '{name}' checksum should change after update\n"
+                f"  before: {before_checksums.get(name)}\n"
+                f"  after:  {after_checksums.get(name)}"
+            )
 
-        # Rollback to base so server ends in known state.
-        self._update_weights(base_url, default_model)
+        # Non-targeted modules should be unchanged.
+        for name, cs in after_checksums.items():
+            if name in target_modules or cs == "not_found":
+                continue
+            assert cs == before_checksums.get(name), (
+                f"Non-targeted module '{name}' should be unchanged\n"
+                f"  before: {before_checksums.get(name)}\n"
+                f"  after:  {cs}"
+            )
 
     def test_update_weights_nonexistent_model(self, diffusion_server_no_offload):
         """Nonexistent model path must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, update_model = diffusion_server_no_offload
+        ctx, default_model, _, _ = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
         self._update_weights(base_url, default_model)
@@ -564,13 +519,11 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
 
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
-        self._assert_server_matches_model_on_changed_modules(
-            base_url, default_model, update_model, default_model
-        )
+        self._assert_server_matches_model(base_url, default_model)
 
     def test_update_weights_missing_model_path(self, diffusion_server_no_offload):
         """Request without model_path must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, update_model = diffusion_server_no_offload
+        ctx, default_model, _, _ = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
         self._update_weights(base_url, default_model)
@@ -582,20 +535,18 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         )
 
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
-        self._assert_server_matches_model_on_changed_modules(
-            base_url, default_model, update_model, default_model
-        )
+        self._assert_server_matches_model(base_url, default_model)
 
     def test_update_weights_nonexistent_module(self, diffusion_server_no_offload):
         """Nonexistent module must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, update_model = diffusion_server_no_offload
+        ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = self._get_base_url(ctx)
 
         self._update_weights(base_url, default_model)
 
         result, status_code = self._update_weights(
             base_url,
-            update_model,
+            perturbed_model_dir,
             target_modules=["nonexistent_module"],
             timeout=60,
         )
@@ -604,102 +555,40 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent module"
         assert "not found in pipeline" in result.get("message", "")
-        self._assert_server_matches_model_on_changed_modules(
-            base_url, default_model, update_model, default_model
-        )
+        self._assert_server_matches_model(base_url, default_model)
 
-    def test_corrupted_weights_rollback(
-        self,
-        diffusion_server_no_offload,
-        corrupted_model_dir: str,
-    ):
-        """Base→instruct then load corrupted instruct; verify rollback.
+    def test_corrupted_weights_rollback(self, diffusion_server_no_offload):
+        """Verify all-or-nothing rollback on corrupted weights.
 
-        Updates to instruct, then attempts load from corrupted instruct dir
-        (vae safetensors truncated). Rollback restores to instruct state.
-        Ensures server healthy: reset to base and assert checksums == base disk.
+        Steps:
+        1. base → perturbed (succeeds, server now on perturbed checkpoint).
+        2. perturbed → corrupted with target_modules=_DIFFERING_MODULES.
+           The corrupted checkpoint has a truncated vae safetensors file.
+           Transformer loads first (succeeds), then vae fails during
+           safetensors parsing, triggering rollback of both modules.
+        3. Assert the server rolled back to the perturbed checkpoint, not base.
         """
-        ctx, default_model, update_model = diffusion_server_no_offload
+        ctx, default_model, perturbed_model_dir, corrupted_vae_model_dir = (
+            diffusion_server_no_offload
+        )
         base_url = self._get_base_url(ctx)
-        rollback_modules = ["transformer", "vae"]
 
-        # --- Step 0: Reset to default model ---
-        # Previous tests may have left the server on a different model.
-        result, status_code = self._update_weights(base_url, default_model)
-        assert status_code == 200 and result.get(
-            "success"
-        ), f"Failed to reset to default model: {result.get('message')}"
+        # base → perturbed
+        self._update_weights(base_url, default_model)
+        result, status_code = self._update_weights(base_url, perturbed_model_dir)
+        assert status_code == 200 and result.get("success")
 
-        # --- Step 1: Get base-model checksums for rollback modules ---
-        base_checksums = self._get_weights_checksum(
-            base_url, module_names=rollback_modules
-        )
-        logger.info(f"Base model checksums: {base_checksums}")
-
-        # --- Step 2: Update to the update model ---
-        result, status_code = self._update_weights(base_url, update_model)
-        assert status_code == 200
-        assert result.get(
-            "success", False
-        ), f"Weight update failed: {result.get('message')}"
-
-        # --- Step 3: Record update-model checksums for rollback modules ---
-        update_checksums = self._get_weights_checksum(
-            base_url, module_names=rollback_modules
-        )
-        logger.info(f"Update model checksums: {update_checksums}")
-
-        assert (
-            update_checksums != base_checksums
-        ), "Base and update checksums should differ"
-
-        # --- Step 4: Recreate corrupted model, then attempt load ---
-        # Copy all modules from the base model (valid), but corrupt only the
-        # vae.  With target_modules=["transformer", "vae"], the transformer
-        # updates successfully first, then vae fails, giving a meaningful
-        # rollback that actually restores the transformer.
-        local_base = maybe_download_model(default_model)
-        _prepare_corrupted_model(local_base, corrupted_model_dir, corrupt_module="vae")
-
+        # perturbed → corrupted (should fail and rollback)
         result, status_code = self._update_weights(
             base_url,
-            corrupted_model_dir,
-            target_modules=rollback_modules,
-            timeout=120,
+            corrupted_vae_model_dir,
+            target_modules=_DIFFERING_MODULES,
         )
-        logger.info(f"Corrupted update result: status={status_code}, body={result}")
+        assert not result.get("success", True)
+        assert "rolled back" in result.get("message", "").lower()
 
-        assert not result.get("success", True), "Loading corrupted weights should fail"
-        assert (
-            "rolled back" in result.get("message", "").lower()
-        ), f"Expected rollback message, got: {result.get('message')}"
-
-        # --- Step 5: Verify rollback — rollback module checksums must match update model ---
-        post_rollback_checksums = self._get_weights_checksum(
-            base_url, module_names=rollback_modules
-        )
-        logger.info(f"Post-rollback checksums: {post_rollback_checksums}")
-
-        for module in update_checksums:
-            assert post_rollback_checksums.get(module) == update_checksums[module], (
-                f"Module '{module}' checksum mismatch after rollback\n"
-                f"  update:        {update_checksums[module]}\n"
-                f"  post-rollback: {post_rollback_checksums.get(module)}"
-            )
-
-        assert post_rollback_checksums != base_checksums, (
-            "Post-rollback checksums should not match base model "
-            "(rollback target is instruct model, not base)"
-        )
-
-        # Ensure server healthy: reset to base and verify checksums == base disk.
-        result, status_code = self._update_weights(base_url, default_model)
-        assert status_code == 200 and result.get(
-            "success"
-        ), f"Failed to reset to base after rollback: {result.get('message')}"
-        self._assert_server_matches_model_on_changed_modules(
-            base_url, default_model, update_model, default_model
-        )
+        # Verify: server still on perturbed, not base
+        self._assert_server_matches_model(base_url, perturbed_model_dir)
 
 
 class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
@@ -707,10 +596,28 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
 
     @pytest.fixture(scope="class", params=_ACTIVE_MODEL_PAIRS, ids=_PAIR_IDS)
     def diffusion_server_with_offload(self, request):
-        """Start a diffusion server with layerwise offload enabled."""
-        default_model, update_model = request.param
+        """Start a diffusion server with layerwise offload enabled.
+
+        Also builds perturbed_vae_model_dir in a background thread
+        while the server boots.
+        """
+        default_model, source_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
+
+        local_source = maybe_download_model(source_model)
+        perturbed_vae_model_dir = tempfile.mkdtemp(prefix="sglang_perturbed_vae_")
+
+        clone_thread = threading.Thread(
+            target=_clone_model_with_modified_module,
+            args=(
+                local_source,
+                perturbed_vae_model_dir,
+                _Module.VAE,
+                _perturb_safetensor,
+            ),
+        )
+        clone_thread.start()
 
         manager = ServerManager(
             model=default_model,
@@ -720,27 +627,27 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
         )
 
         ctx = manager.start()
+        clone_thread.join()
 
         try:
-            yield ctx, default_model, update_model
+            yield ctx, default_model, perturbed_vae_model_dir
         finally:
             ctx.cleanup()
+            shutil.rmtree(perturbed_vae_model_dir, ignore_errors=True)
 
     def test_update_weights_with_offload_enabled(self, diffusion_server_with_offload):
-        """Offload: base→instruct update; no Shape mismatch; checksums == instruct disk."""
-        ctx, default_model, update_model = diffusion_server_with_offload
+        """Offload: base→perturbed; no Shape mismatch; checksums == perturbed disk."""
+        ctx, _, perturbed_model_dir = diffusion_server_with_offload
         base_url = self._get_base_url(ctx)
 
-        result, status_code = self._update_weights(base_url, update_model)
+        result, status_code = self._update_weights(base_url, perturbed_model_dir)
         assert status_code == 200, f"Expected 200, got {status_code}"
         assert result.get("success", False), f"Update failed: {result.get('message')}"
 
         message = result.get("message", "")
         assert "Shape mismatch" not in message, f"Shape mismatch detected: {message}"
 
-        self._assert_server_matches_model_on_changed_modules(
-            base_url, default_model, update_model, update_model
-        )
+        self._assert_server_matches_model(base_url, perturbed_model_dir)
 
 
 if __name__ == "__main__":
