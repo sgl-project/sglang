@@ -18,7 +18,11 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -34,6 +38,8 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
+        config["model_path"] = component_model_path
+        quant_config = get_quant_config(config)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -54,6 +60,7 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
+        dit_config.quant_config = quant_config
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -113,6 +120,20 @@ class TransformerLoader(ComponentLoader):
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                if _is_npu:
+                    torch.npu.config.allow_internal_format = True
+                quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
 
         assert (
             next(model.parameters()).dtype == default_dtype

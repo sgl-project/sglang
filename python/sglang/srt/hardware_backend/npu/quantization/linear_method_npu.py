@@ -105,7 +105,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             quant_out,
             layer.weight,
             layer.weight_scale,
-            pertoken_scale=dynamic_scale,
+            pertoken_scale=dynamic_scale.flatten(),
             bias=bias,
             output_dtype=original_dtype,
         )
