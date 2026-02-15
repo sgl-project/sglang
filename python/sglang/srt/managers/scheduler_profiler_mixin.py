@@ -222,7 +222,11 @@ class SchedulerProfilerMixin:
             return ""
         if getattr(self, "dp_size", 1) > 1 and getattr(self, "dp_rank", 0) != 0:
             return ""
-        if getattr(self, "pp_size", 1) > 1 and getattr(self, "pp_rank", 0) != 0:
+        # For PP > 1, the last PP rank merges (to make sure all files exist)
+        if (
+            getattr(self, "pp_size", 1) > 1
+            and getattr(self, "pp_rank", 0) != getattr(self, "pp_size", 1) - 1
+        ):
             return ""
         if getattr(self, "moe_ep_size", 1) > 1 and getattr(self, "moe_ep_rank", 0) != 0:
             return ""
