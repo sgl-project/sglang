@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     load_audio,
     load_image,
     load_video,
+    maybe_wrap_ipv6_address,
     random_uuid,
 )
 
@@ -385,11 +386,13 @@ class MMEncoder:
             mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
-        endpoint = (
-            f"tcp://{url}"
-            if url is not None
-            else f"tcp://{prefill_host}:{embedding_port}"
-        )
+        if url is not None:
+            # Assume URL must follow IPV6/IPV4 convention(aka, "[IPV6]:port" or "IPV4:port")
+            endpoint = f"tcp://{url}"
+        else:
+            prefill_host = maybe_wrap_ipv6_address(prefill_host)
+            endpoint = f"tcp://{prefill_host}:{embedding_port}"
+
         logger.info(f"{endpoint = }")
 
         # Serialize data
