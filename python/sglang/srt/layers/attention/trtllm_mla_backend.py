@@ -1198,7 +1198,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out=out,
             )
         else:
-            out = torch.empty(
+            out = torch.zeros(
                 q.shape[0],
                 q.shape[1],
                 v.shape[2],
