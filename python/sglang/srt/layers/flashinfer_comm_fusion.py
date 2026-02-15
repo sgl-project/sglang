@@ -2,9 +2,11 @@ import logging
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -145,7 +147,7 @@ def ensure_workspace_initialized(
     if world_size <= 1:
         return False
 
-    rank = dist.get_rank()
+    rank = get_tensor_model_parallel_rank()
     token_num = token_num or max_token_num
 
     if (
