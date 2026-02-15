@@ -9,6 +9,10 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.sparsity.factory import (
+    get_sparse_coordinator,
+    is_hierarchical_sparse_attention_enabled,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -427,6 +431,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
+    # Allocate hierarchical sparse mode
+    if is_hierarchical_sparse_attention_enabled():
+        alloc_tokens_func = (
+            alloc_paged_token_slots_decode
+            if batch.tree_cache.page_size > 1
+            else alloc_token_slots
+        )
+        return get_sparse_coordinator().alloc_for_hierarchical_sparse_decode(
+            batch, token_per_req, alloc_tokens_func
+        )
 
     batch.maybe_evict_swa()
 

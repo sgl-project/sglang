@@ -534,6 +534,7 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
+    enable_hierarchical_sparse_attention: bool = False
     hierarchical_sparse_attention_extra_config: Optional[str] = None
 
     # LMCache
@@ -4298,6 +4299,11 @@ class ServerArgs:
         )
 
         # Hierarchical sparse attention
+        parser.add_argument(
+            "--enable-hierarchical-sparse-attention",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
         parser.add_argument(
             "--hierarchical-sparse-attention-extra-config",
             type=str,
