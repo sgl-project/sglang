@@ -795,7 +795,6 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
             },
-            placeholder_tokens=None,  # using mm_item.pad_value
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
         )
