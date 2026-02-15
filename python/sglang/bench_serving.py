@@ -1525,12 +1525,12 @@ def sample_custom_requests(
     return filtered_dataset
 
 
-def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
+def compute_random_lens(full_len: int, range_ratio: float, num: int) -> np.ndarray:
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,
         size=num,
-    ).tolist()
+    )
 
 
 def sample_random_requests(
