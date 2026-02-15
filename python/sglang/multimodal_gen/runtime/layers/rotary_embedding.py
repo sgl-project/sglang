@@ -105,11 +105,12 @@ def _rope_impl_flashinfer(
     sin: torch.Tensor,
     is_neox_style: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
     q = q.contiguous()
     if k is not None:
-        k = k.contiguous()
+        _k = k.contiguous()
     else:
-        k = torch.empty_like(q)
+        _k = torch.empty_like(q)
 
     cos_sin_cache = torch.cat([cos, sin], dim=-1).float()
 
@@ -127,14 +128,14 @@ def _rope_impl_flashinfer(
     apply_rope_with_cos_sin_cache_inplace(
         positions=positions,
         query=q.view(-1, num_q_heads * head_dim),
-        key=k.view(-1, num_kv_heads * head_dim),
+        key=_k.view(-1, num_kv_heads * head_dim),
         head_size=head_dim,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox_style,
     )
 
     if k is not None:
-        return q, k
+        return q, _k
     return q
 
 
