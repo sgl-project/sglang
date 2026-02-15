@@ -1004,6 +1004,13 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+        # Deferred KV cache release list: requests whose pool slots should not
+        # be freed immediately because the next batch (already launched on the
+        # forward stream) may still be reading their req_to_token rows when overlap
+        # schedule is enabled. They are flushed at the start of the next
+        # process_batch_result_decode, after copy_done.synchronize().
+        self._deferred_kv_release_reqs = []
+
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
