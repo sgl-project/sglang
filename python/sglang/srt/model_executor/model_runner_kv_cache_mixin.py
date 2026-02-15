@@ -638,6 +638,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        layout=self.server_args.device_mem_layout,
                     )
 
         # Initialize token_to_kv_pool_allocator
