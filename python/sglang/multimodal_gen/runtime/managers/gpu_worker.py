@@ -352,6 +352,7 @@ OOM detected. Possible solutions:
     2. Enable SP and/or TP
     3. Opt for a sparse-attention backend
     4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    5. Enable quantization (e.g. nunchaku)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 

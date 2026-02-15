@@ -21,6 +21,10 @@ import yaml
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -309,6 +313,11 @@ class ServerArgs:
 
     disable_autocast: bool | None = None
 
+    # Quantization / Nunchaku SVDQuant configuration
+    nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
+        default_factory=NunchakuSVDQuantArgs, repr=False
+    )
+
     # Master port for distributed inference
     # TODO: do not hard code
     master_port: int | None = None
@@ -361,6 +370,23 @@ class ServerArgs:
         If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched
         """
         return self.host is None or self.port is None
+
+    def adjust_quant_config(self):
+        """validate and adjust"""
+
+        # nunchaku
+        ncfg = self.nunchaku_config
+        ncfg.validate()
+        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
+            # if nunchaku is not applied
+            self.nunchaku_config = None
+        else:
+            self.nunchaku_config = NunchakuConfig(
+                precision=self.nunchaku_config.quantization_precision,
+                rank=self.nunchaku_config.quantization_rank,
+                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
+                quantized_model_path=self.nunchaku_config.quantized_model_path,
+            )
 
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
@@ -429,6 +455,7 @@ class ServerArgs:
         configure_logger(server_args=self)
 
         self.adjust_offload()
+        self.adjust_quant_config()
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -684,6 +711,9 @@ class ServerArgs:
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # Nunchaku SVDQuant quantization parameters
+        NunchakuSVDQuantArgs.add_cli_args(parser)
+
         # Master port for distributed inference
         parser.add_argument(
             "--master-port",
@@ -846,6 +876,9 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
+            elif attr == "nunchaku_config":
+                nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
+                server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -977,6 +1010,7 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
+
         # layerwise offload
         if current_platform.is_mps():
             self.use_fsdp_inference = False

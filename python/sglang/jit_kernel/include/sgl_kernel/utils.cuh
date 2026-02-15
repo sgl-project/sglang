@@ -46,7 +46,7 @@ inline constexpr auto kFullMask = 0xffffffffu;
 
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -55,7 +55,7 @@ SGL_DEVICE void PDLWaitPrimary() {
 
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
