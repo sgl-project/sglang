@@ -4,6 +4,7 @@
 """
 Synchronous pipeline executor implementation.
 """
+
 from typing import List
 
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
