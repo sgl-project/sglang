@@ -198,7 +198,6 @@ class Scheduler:
                         prompt="",
                         negative_prompt="",
                         image_path=[input_path],
-                        is_warmup=True,
                     )
                 else:
                     req = Req(
@@ -206,8 +205,8 @@ class Scheduler:
                         width=width,
                         height=height,
                         prompt="",
-                        is_warmup=True,
                     )
+                req.set_as_warmup()
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
