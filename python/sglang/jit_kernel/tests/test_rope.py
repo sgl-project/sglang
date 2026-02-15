@@ -41,9 +41,9 @@ def sglang_jit_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.rope_v2 import fused_rope_inplace
+    from sglang.jit_kernel.rope import apply_rope_inplace
 
-    fused_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
+    apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
 
 
 def flashinfer_rope(
@@ -168,7 +168,7 @@ def test_fused_rope_store(
     is_neox: bool,
 ) -> None:
     """Test fused RoPE + KV cache store against separate RoPE + manual store."""
-    from sglang.jit_kernel.rope_v2 import fused_rope_inplace_with_kvcache
+    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
     num_qo_heads = num_kv_heads * gqa_ratio
     dtype = DTYPE
@@ -197,7 +197,7 @@ def test_fused_rope_store(
     # --- fused kernel ---
     q_fused, k_fused = q.clone(), k.clone()
     v_fused = v.clone()
-    fused_rope_inplace_with_kvcache(
+    apply_rope_inplace_with_kvcache(
         q_fused,
         k_fused,
         v_fused,
