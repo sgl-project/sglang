@@ -66,6 +66,7 @@ env:
 permissions:
   actions: write
   contents: read
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -122,20 +123,6 @@ jobs:
               - ".github/workflows/pr-test.yml"
             sgl_kernel:
               - "sgl-kernel/**"
-              # Exclude non-CUDA platform configs and code
-              - "!sgl-kernel/pyproject_cpu.toml"
-              - "!sgl-kernel/pyproject_rocm.toml"
-              - "!sgl-kernel/pyproject_musa.toml"
-              - "!sgl-kernel/setup_rocm.py"
-              - "!sgl-kernel/setup_musa.py"
-              - "!sgl-kernel/csrc/cpu/**"
-              # Exclude documentation and non-functional files
-              - "!sgl-kernel/README.md"
-              - "!sgl-kernel/LICENSE"
-              - "!sgl-kernel/THIRDPARTYNOTICES.txt"
-              - "!sgl-kernel/.clang-format"
-              - "!sgl-kernel/analyze_whl_kernel_sizes.py"
-              - "!sgl-kernel/rename_wheels.sh"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - "python/pyproject.toml"
@@ -212,6 +199,8 @@ jobs:
 
       - name: Set max-parallel based on run type
         id: set-parallel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Scheduled runs and high-priority PRs get full parallelism
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -220,6 +209,27 @@ jobs:
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             echo "max_parallel=14" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 14"
+          elif [[ -n "${{ inputs.target_stage }}" ]]; then
+            # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
+            # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
+            LABELS=""
+            PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
+            if [[ -n "$PR_HEAD_SHA" ]]; then
+              LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
+                --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            if [[ -z "$LABELS" ]]; then
+              LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            echo "PR labels: ${LABELS:-"(none)"}"
+            if echo "$LABELS" | grep -Fxq "high priority"; then
+              echo "max_parallel=14" >> $GITHUB_OUTPUT
+              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
+            else
+              echo "max_parallel=3" >> $GITHUB_OUTPUT
+              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+            fi
           else
             echo "max_parallel=3" >> $GITHUB_OUTPUT
             echo "Using default max_parallel of 3"
@@ -951,7 +961,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -1055,7 +1065,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -1119,92 +1129,6 @@ jobs:
         timeout-minutes: 10
         run: |
           IS_BLACKWELL=1 python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
-
-  stage-c-test-large-4-gpu:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-4-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-h100
-    timeout-minutes: 240
-    env:
-      RUNNER_LABELS: 4-gpu-h100
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu $CONTINUE_ON_ERROR_FLAG
-
-  stage-c-test-large-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 240
-    env:
-      RUNNER_LABELS: ${{ needs.check-changes.outputs.b200_runner }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-large-4-gpu-b200
 
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -1678,7 +1602,6 @@ jobs:
         stage-b-test-small-1-gpu,
         stage-b-test-large-1-gpu,
         stage-b-test-large-2-gpu,
-        stage-c-test-large-4-gpu,
         stage-b-test-4-gpu-b200,
         stage-c-test-4-gpu-h100,
         stage-c-test-8-gpu-h20,
