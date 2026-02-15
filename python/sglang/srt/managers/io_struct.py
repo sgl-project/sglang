@@ -786,6 +786,9 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
     def __iter__(self):
         return iter(self.batch)
 
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
 
 @dataclass
 class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
@@ -975,6 +978,9 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
     def __iter__(self):
         return iter(self.batch)
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
 
 @dataclass
