@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 @dataclass
 class ToolCallTestParams:
     test_basic: bool = True
+    test_auto: bool = True
     test_streaming: bool = True
     test_required: bool = True
     test_none: bool = True
@@ -101,6 +102,15 @@ def _test_basic_format(client, model):
     tc = msg.tool_calls[0]
     assert tc.function.name == "add", f"expected 'add', got '{tc.function.name}'"
     assert isinstance(json.loads(tc.function.arguments), dict)
+    assert response.choices[0].finish_reason == "tool_calls"
+
+
+def _test_auto(client, model):
+    """tool_choice=auto should populate tool_calls, not content (#17942)."""
+    response = _call(client, model, "Compute 3 + 5", tool_choice="auto")
+    msg = response.choices[0].message
+    assert msg.tool_calls and len(msg.tool_calls) > 0
+    assert not msg.content, f"content should be empty, got: {msg.content}"
     assert response.choices[0].finish_reason == "tool_calls"
 
 
@@ -294,6 +304,7 @@ def _test_streaming_parallel(client, model):
 
 _TESTS = [
     ("basic_format", _test_basic_format, "test_basic"),
+    ("auto", _test_auto, "test_auto"),
     ("streaming", _test_streaming, "test_streaming"),
     ("required", _test_required, "test_required"),
     ("none", _test_none, "test_none"),
