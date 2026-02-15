@@ -1,6 +1,7 @@
 from .chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
 from .chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
 from .embedding_lora_a import embedding_lora_a_fwd
+from .fused_moe_lora_kernel import fused_moe_lora
 from .gate_up_lora_b import gate_up_lora_b_fwd
 from .qkv_lora_b import qkv_lora_b_fwd
 from .sgemm_lora_a import sgemm_lora_a_fwd
@@ -13,5 +14,6 @@ __all__ = [
     "sgemm_lora_b_fwd",
     "chunked_sgmv_lora_shrink_forward",
     "chunked_sgmv_lora_expand_forward",
+    "fused_moe_lora",
     "embedding_lora_a_fwd",
 ]
