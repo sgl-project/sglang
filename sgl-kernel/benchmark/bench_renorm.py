@@ -60,7 +60,7 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
 def torch_top_k_mask_logits(logits, top_k):
     """Reference PyTorch implementation of top-k logits masking."""
     batch_size, vocab_size = logits.shape
-    masked_logits = torch.full_like(logits, float('-inf'))
+    masked_logits = torch.full_like(logits, float("-inf"))
 
     for i in range(batch_size):
         k_val = top_k[i].item() if top_k.dim() > 0 else top_k
@@ -69,10 +69,12 @@ def torch_top_k_mask_logits(logits, top_k):
         # Get top-k values
         sorted_logits, _ = torch.sort(logits[i], descending=True)
         pivot = sorted_logits[k_val - 1]
-        mask = (logits[i] >= pivot)
+        mask = logits[i] >= pivot
 
         # Mask logits
-        masked_logits[i] = torch.where(mask, logits[i], torch.tensor(float('-inf'), device=logits.device))
+        masked_logits[i] = torch.where(
+            mask, logits[i], torch.tensor(float("-inf"), device=logits.device)
+        )
 
     return masked_logits
 
@@ -155,7 +157,7 @@ configs_p = list(itertools.product(batch_size_range, vocab_size_range, p_range))
 def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
     # Skip invalid configurations
     if k >= vocab_size:
-        return float('nan'), float('nan'), float('nan')
+        return float("nan"), float("nan"), float("nan")
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -219,7 +221,7 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
 def benchmark_top_k_mask(batch_size, vocab_size, k, provider):
     # Skip invalid configurations
     if k >= vocab_size:
-        return float('nan'), float('nan'), float('nan')
+        return float("nan"), float("nan"), float("nan")
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -254,7 +256,9 @@ if __name__ == "__main__":
         batch_size, vocab_size, k = cfg
         if k < vocab_size:  # Skip invalid configs
             calculate_diff_top_k_renorm(batch_size, vocab_size, k)
-            print(f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, k={k}")
+            print(
+                f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, k={k}"
+            )
 
     print("\n2. Testing top_p_renorm_probs...")
     for cfg in test_configs_p:
@@ -267,7 +271,9 @@ if __name__ == "__main__":
         batch_size, vocab_size, k = cfg
         if k < vocab_size:  # Skip invalid configs
             calculate_diff_top_k_mask(batch_size, vocab_size, k)
-            print(f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, k={k}")
+            print(
+                f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, k={k}"
+            )
 
     print("\n" + "=" * 60)
     print("All correctness checks passed!")
