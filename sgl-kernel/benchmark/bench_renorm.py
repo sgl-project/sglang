@@ -14,67 +14,96 @@ IS_CI = (
 
 
 def torch_top_k_renorm_probs(probs, top_k):
-    """Reference PyTorch implementation of top-k renormalization."""
+    """Vectorized PyTorch implementation of top-k renormalization."""
     batch_size, vocab_size = probs.shape
-    renorm_probs = torch.zeros_like(probs)
 
-    for i in range(batch_size):
-        k_val = top_k[i].item() if top_k.dim() > 0 else top_k
-        k_val = min(k_val, vocab_size)  # Clamp k to vocab_size
+    # Handle scalar or tensor k
+    if isinstance(top_k, int):
+        k_val = min(max(top_k, 1), vocab_size)
+        # Get top-k indices for all batches at once
+        _, topk_indices = torch.topk(probs, k_val, dim=1, largest=True)
 
-        # Get top-k values
-        sorted_prob, _ = torch.sort(probs[i], descending=True)
-        pivot = sorted_prob[k_val - 1]
-        mask = (probs[i] >= pivot).float()
+        # Create mask: batch_size x vocab_size
+        mask = torch.zeros_like(probs)
+        mask.scatter_(1, topk_indices, 1.0)
+    else:
+        # Variable k per batch - need to handle separately
+        renorm_probs = torch.zeros_like(probs)
+        for i in range(batch_size):
+            k_val = min(max(top_k[i].item(), 1), vocab_size)
+            _, topk_indices = torch.topk(probs[i], k_val, largest=True)
+            mask = torch.zeros_like(probs[i])
+            mask[topk_indices] = 1.0
+            masked_probs = probs[i] * mask
+            renorm_probs[i] = masked_probs / (masked_probs.sum() + 1e-10)
+        return renorm_probs
 
-        # Renormalize
-        masked_probs = probs[i] * mask
-        renorm_probs[i] = masked_probs / masked_probs.sum()
-
+    # Vectorized renormalization
+    masked_probs = probs * mask
+    renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + 1e-10)
     return renorm_probs
 
 
 def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
-    """Reference PyTorch implementation of top-p renormalization."""
+    """Vectorized PyTorch implementation of top-p renormalization."""
     batch_size, vocab_size = probs.shape
-    renorm_probs = torch.zeros_like(probs)
 
-    for i in range(batch_size):
-        p_val = top_p[i].item() if top_p.dim() > 0 else top_p
+    # Handle scalar or tensor p
+    if isinstance(top_p, float):
+        p_val = top_p
+        # Vectorized implementation for uniform top_p
+        # Sort probs in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
+        cumsum_probs = torch.cumsum(sorted_probs, dim=1)
 
-        # Sort and compute cumulative sum
-        sorted_prob, indices = torch.sort(probs[i], descending=False)
-        cdf = torch.cumsum(sorted_prob, dim=-1)
+        # Find cutoff: where cumsum exceeds top_p
+        cutoff_mask = cumsum_probs <= p_val
+        # Keep at least one token (the highest prob)
+        cutoff_mask[:, 0] = True
 
-        # Create mask for top-p
-        mask = torch.zeros(vocab_size, dtype=torch.float32, device=probs.device)
-        mask.scatter_(0, indices, (cdf >= (1 - p_val) - eps).float())
+        # Create mask in original order
+        mask = torch.zeros_like(probs)
+        mask.scatter_(1, sorted_indices, cutoff_mask.float())
+    else:
+        # Variable p per batch - need to handle separately
+        renorm_probs = torch.zeros_like(probs)
+        for i in range(batch_size):
+            p_val = top_p[i].item()
+            sorted_prob, indices = torch.sort(probs[i], descending=False)
+            cdf = torch.cumsum(sorted_prob, dim=-1)
+            mask = torch.zeros(vocab_size, dtype=torch.float32, device=probs.device)
+            mask.scatter_(0, indices, (cdf >= (1 - p_val) - eps).float())
+            masked_probs = probs[i] * mask
+            renorm_probs[i] = masked_probs / (masked_probs.sum() + eps)
+        return renorm_probs
 
-        # Renormalize
-        masked_probs = probs[i] * mask
-        renorm_probs[i] = masked_probs / (masked_probs.sum() + eps)
-
+    # Vectorized renormalization
+    masked_probs = probs * mask
+    renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + eps)
     return renorm_probs
 
 
 def torch_top_k_mask_logits(logits, top_k):
-    """Reference PyTorch implementation of top-k logits masking."""
+    """Vectorized PyTorch implementation of top-k logits masking."""
     batch_size, vocab_size = logits.shape
-    masked_logits = torch.full_like(logits, float("-inf"))
 
-    for i in range(batch_size):
-        k_val = top_k[i].item() if top_k.dim() > 0 else top_k
-        k_val = min(k_val, vocab_size)  # Clamp k to vocab_size
+    # Handle scalar or tensor k
+    if isinstance(top_k, int):
+        k_val = min(max(top_k, 1), vocab_size)
+        # Get top-k indices for all batches at once
+        _, topk_indices = torch.topk(logits, k_val, dim=1, largest=True)
 
-        # Get top-k values
-        sorted_logits, _ = torch.sort(logits[i], descending=True)
-        pivot = sorted_logits[k_val - 1]
-        mask = logits[i] >= pivot
-
-        # Mask logits
-        masked_logits[i] = torch.where(
-            mask, logits[i], torch.tensor(float("-inf"), device=logits.device)
-        )
+        # Create masked logits: start with -inf everywhere
+        masked_logits = torch.full_like(logits, float("-inf"))
+        # Scatter the top-k values back
+        masked_logits.scatter_(1, topk_indices, logits.gather(1, topk_indices))
+    else:
+        # Variable k per batch - need to handle separately
+        masked_logits = torch.full_like(logits, float("-inf"))
+        for i in range(batch_size):
+            k_val = min(max(top_k[i].item(), 1), vocab_size)
+            _, topk_indices = torch.topk(logits[i], k_val, largest=True)
+            masked_logits[i, topk_indices] = logits[i, topk_indices]
 
     return masked_logits
 
