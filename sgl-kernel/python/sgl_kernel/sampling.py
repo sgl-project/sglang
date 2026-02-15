@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+from flashinfer.sampling import get_sampling_module
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
 
@@ -102,32 +103,6 @@ def top_p_renorm_probs(
 top_p_renorm_prob = top_p_renorm_probs
 
 
-def _top_p_sampling_from_probs_internal(
-    probs: torch.Tensor,
-    indices: Optional[torch.Tensor],
-    maybe_top_p_arr: Optional[torch.Tensor],
-    top_p_val: float,
-    deterministic: bool,
-    generator: Optional[torch.Generator],
-) -> torch.Tensor:
-    with probs.device as device:
-        probs = probs.float()
-        maybe_top_p_arr = (
-            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
-        )
-        samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.top_p_sampling_from_probs.default(
-            probs,
-            samples,
-            indices,
-            maybe_top_p_arr,
-            top_p_val,
-            deterministic,
-            generator,
-        )
-        return samples
-
-
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -180,40 +155,9 @@ def top_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _top_p_sampling_from_probs_internal(
+    return get_sampling_module().top_p_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator
     )
-
-
-def _top_k_top_p_sampling_from_probs_internal(
-    probs: torch.Tensor,
-    indices: Optional[torch.Tensor],
-    maybe_top_k_arr: Optional[torch.Tensor],
-    top_k_val: int,
-    maybe_top_p_arr: Optional[torch.Tensor],
-    top_p_val: float,
-    deterministic: bool,
-    generator: Optional[torch.Generator],
-) -> torch.Tensor:
-    with probs.device as device:
-        probs = probs.float()
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-        maybe_top_p_arr = (
-            maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
-        )
-        samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.top_k_top_p_sampling_from_probs.default(
-            probs,
-            samples,
-            indices,
-            maybe_top_k_arr,
-            top_k_val,
-            maybe_top_p_arr,
-            top_p_val,
-            deterministic,
-            generator,
-        )
-        return samples
 
 
 def top_k_top_p_sampling_from_probs(
@@ -290,7 +234,7 @@ def top_k_top_p_sampling_from_probs(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        return _top_k_top_p_sampling_from_probs_internal(
+        return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             indices,
             *_to_tensor_scalar_tuple(top_k),
@@ -300,32 +244,6 @@ def top_k_top_p_sampling_from_probs(
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
-
-
-def _min_p_sampling_from_probs_internal(
-    probs: torch.Tensor,
-    indices: Optional[torch.Tensor],
-    maybe_min_p_arr: Optional[torch.Tensor],
-    min_p_val: float,
-    deterministic: bool,
-    generator: Optional[torch.Generator],
-) -> torch.Tensor:
-    with probs.device as device:
-        probs = probs.float()
-        maybe_min_p_arr = (
-            maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
-        )
-        samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-        torch.ops.sgl_kernel.min_p_sampling_from_probs.default(
-            probs,
-            samples,
-            indices,
-            maybe_min_p_arr,
-            min_p_val,
-            deterministic,
-            generator,
-        )
-        return samples
 
 
 def min_p_sampling_from_probs(
@@ -380,7 +298,7 @@ def min_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _min_p_sampling_from_probs_internal(
+    return get_sampling_module().min_p_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
 
@@ -531,7 +449,7 @@ def top_k_top_p_sampling_from_logits(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        return _top_k_top_p_sampling_from_probs_internal(
+        return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             indices,
             *_to_tensor_scalar_tuple(top_k),
