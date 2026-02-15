@@ -12,6 +12,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sglang.srt.environ import envs
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -86,6 +87,27 @@ class GrammarManager:
                 elif req.sampling_params.structural_tag:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                    key, req.require_reasoning
+                )
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+                else:
+                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
+        elif self.server_args.reasoning_parser:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            if reasoning_parser.detector.strict_reasoning_format:
+                key = ("regex", ".*")
+                logger.debug(
+                    f"strict reasoning enabled: {self.server_args.reasoning_parser}, config reasoner grammar with fake grammar."
+                )
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning
                 )

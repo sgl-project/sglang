@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,10 @@ class BaseGrammarBackend:
 
     def _not_supported(self, key_type: str, key_string: str) -> None:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+
+    @property
+    def is_support_token_filter(self):
+        return False
 
     def dispatch_fallback(
         self, key_type: str, key_string: str
@@ -262,13 +267,17 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    if server_args.reasoning_parser:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
+        reasoning_parser = ReasoningParser(
+            model_type=server_args.reasoning_parser, stream_reasoning=False
+        )
+
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
+            grammar_backend, reasoning_parser, tokenizer
         )
 
     return grammar_backend
