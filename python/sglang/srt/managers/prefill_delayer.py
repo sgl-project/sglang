@@ -9,7 +9,7 @@ import torch
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
-    from sglang.srt.metrics.collector import SchedulerMetricsCollector
+    from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
