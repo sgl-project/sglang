@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import threading
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockStored
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -266,6 +268,32 @@ class LMCRadixCache(RadixCache):
 
         return super().evict(params)
 
+    def take_events(self):
+        """Retrieve KV events from LMCache and RadixCache.
+
+        Returns:
+            A list of KV events.
+        """
+        lmcache_blocks = []
+        if hasattr(self.lmcache_connector, "get_kv_events"):
+            events = self.lmcache_connector.get_kv_events()
+            if events:
+                lmcache_blocks = [
+                    BlockStored(
+                        block_hashes=e.block_hashes,
+                        parent_block_hash=e.parent_block_hash,
+                        token_ids=e.token_ids,
+                        lora_id=e.lora_id,
+                        block_size=e.block_size,
+                    )
+                    for e in events
+                ]
+        else:
+            warn_kv_events_once()
+
+        radix_events = super().take_events()
+        return radix_events + lmcache_blocks
+
     def pretty_print(self):  # type: ignore[override]
         super().pretty_print()
         try:
@@ -274,3 +302,11 @@ class LMCRadixCache(RadixCache):
             )
         except Exception:  # pragma: no cover
             pass
+
+
+@lru_cache(maxsize=None)
+def warn_kv_events_once():
+    logger.warning(
+        "LMCache engine does not support get_kv_events, "
+        "please check and use the latest version"
+    )
