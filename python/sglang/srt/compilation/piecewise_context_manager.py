@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
