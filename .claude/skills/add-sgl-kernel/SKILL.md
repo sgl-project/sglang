@@ -182,13 +182,15 @@ python sgl-kernel/benchmark/bench_<op>.py
 Build:
 
 ```bash
-make -C sgl-kernel build
+cd sgl-kernel
+make build -j16
 ```
 
 If you need to limit host resource usage:
 
 ```bash
-make -C sgl-kernel build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+cd sgl-kernel
+make build -j1 MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
 Validate:
