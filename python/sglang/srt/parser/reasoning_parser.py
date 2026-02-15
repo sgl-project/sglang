@@ -238,6 +238,100 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK2Detector(Qwen3Detector):
+    """
+    Detector for Kimi K2/K2.5 models.
+    Uses the same reasoning format as Qwen3: <think>...</think>
+
+    This detector extends Qwen3Detector with additional logic to handle
+    tool call markers appearing inside or after reasoning blocks.
+    When tool call markers (e.g., <|tool_calls_section_begin|>) are detected,
+    the reasoning mode is forcibly ended to prevent tool call content from
+    being incorrectly included in reasoning_content.
+    """
+
+    # Tool call markers used by Kimi K2 models
+    TOOL_CALL_MARKERS = (
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>",
+    )
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+    def _find_tool_call_marker(self, text: str) -> tuple[int, str]:
+        """
+        Find the first tool call marker in the text.
+
+        Returns:
+            tuple: (marker_idx, marker) where:
+                - marker_idx: Index of the marker in text (-1 if not found)
+                - marker: The marker string that was found ("" if not found)
+        """
+        first_idx = -1
+        first_marker = ""
+        for marker in self.TOOL_CALL_MARKERS:
+            idx = text.find(marker)
+            if idx != -1 and (first_idx == -1 or idx < first_idx):
+                first_idx = idx
+                first_marker = marker
+        return first_idx, first_marker
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        """
+        Streaming incremental parsing with tool call marker detection.
+
+        If a tool call marker is detected while in reasoning mode,
+        the reasoning mode is forcibly ended and the tool call content
+        is returned as normal_text.
+
+        Key design:
+        - Use a temporary combined_text variable to check for markers
+        - This decouples from parent's implementation details
+        - If marker found while in reasoning, handle it directly
+        - Otherwise, delegate to parent without any state modification
+        """
+        # Only check for tool call markers when in reasoning mode
+        if self._in_reasoning:
+            # Check in combined buffer without modifying self._buffer yet
+            combined_text = self._buffer + new_text
+            marker_idx, marker = self._find_tool_call_marker(combined_text)
+
+            if marker_idx != -1:
+                # Tool call marker found - force end reasoning mode
+                text_before_marker = combined_text[:marker_idx]
+                text_from_marker = combined_text[marker_idx:]
+
+                # Process reasoning text: remove think tokens
+                reasoning_text = text_before_marker.rstrip()
+                if self.think_start_token in reasoning_text:
+                    reasoning_text = reasoning_text.replace(self.think_start_token, "")
+
+                # Force end reasoning mode and reset state
+                self._in_reasoning = False
+                self._buffer = ""
+                self.stripped_think_start = True
+
+                return StreamingParseResult(
+                    normal_text=text_from_marker, reasoning_text=reasoning_text
+                )
+
+        # No tool call marker found (or not in reasoning mode)
+        # Delegate to parent directly without any buffer modification
+        return super().parse_streaming_increment(new_text)
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
@@ -378,7 +472,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": Qwen3Detector,
+        "kimi_k2": KimiK2Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
