@@ -174,7 +174,7 @@ jobs:
             "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
 
           TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
-            '.results[] | select(.name | startswith("nightly-${{ matrix.variant.base }}-")) | "\(.last_updated)|\(.name)"' \
+            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
             | sort -r | cut -d'|' -f2)
 
           TAG_COUNT=$(echo "$TAGS" | wc -l)
