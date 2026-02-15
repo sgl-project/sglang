@@ -47,11 +47,13 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
+    cublas_mxfp8_blockscaled_linear,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    prepare_mxfp8_weight_for_cublas,
     requant_weight_ue8m0_inplace,
     triton_mxfp8_blockscaled_linear,
 )
@@ -412,11 +414,13 @@ class Fp8LinearMethod(LinearMethodBase):
         elif self.use_mxfp8:
             if not self.is_checkpoint_fp8_serialized:
                 self._quantize_mxfp8_weights(layer)
-                return
-            # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
-            # Keep parameter object to preserve weight_loader attrs for hot reload.
-            layer.weight_scale_inv.requires_grad_(False)
-            layer.weight_scale_inv.format_ue8m0 = True
+            else:
+                # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
+                # Keep parameter object to preserve weight_loader attrs for hot reload.
+                layer.weight_scale_inv.requires_grad_(False)
+                layer.weight_scale_inv.format_ue8m0 = True
+            # Pre-compute weight transpose + interleaved scales for cuBLAS
+            self._prepare_mxfp8_cublas(layer)
             return
         else:
             # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
@@ -466,6 +470,20 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         layer.weight_scale_inv.format_ue8m0 = True
         layer.input_scale = None
+
+    @staticmethod
+    def _prepare_mxfp8_cublas(layer: Module) -> None:
+        """Pre-compute weight transpose and interleaved scales for cuBLAS MXFP8."""
+        weight_t, weight_scale_cublas = prepare_mxfp8_weight_for_cublas(
+            layer.weight.data, layer.weight_scale_inv.data
+        )
+        layer.weight_t = weight_t
+        layer.weight_scale_cublas = weight_scale_cublas
+        logger.debug(
+            "MXFP8 cuBLAS: pre-computed weight_t %s and scale %s",
+            tuple(weight_t.shape),
+            tuple(weight_scale_cublas.shape),
+        )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
@@ -598,17 +616,17 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_mxfp8:
             if isinstance(x, tuple):
-                return triton_mxfp8_blockscaled_linear(
+                return cublas_mxfp8_blockscaled_linear(
                     input=x[0],
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_t=layer.weight_t,
+                    weight_scale_cublas=layer.weight_scale_cublas,
                     input_scale=x[1],
                     bias=bias,
                 )
-            return triton_mxfp8_blockscaled_linear(
+            return cublas_mxfp8_blockscaled_linear(
                 input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
+                weight_t=layer.weight_t,
+                weight_scale_cublas=layer.weight_scale_cublas,
                 input_scale=None,
                 bias=bias,
             )

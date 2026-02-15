@@ -15,8 +15,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    cublas_mxfp8_blockscaled_linear,
     input_to_float8,
     mxfp8_group_quantize,
+    prepare_mxfp8_weight_for_cublas,
     triton_mxfp8_blockscaled_linear,
 )
 from sglang.srt.utils import is_sm100_supported
@@ -472,6 +474,7 @@ class TestMXFP8DenseLinear(CustomTestCase):
             b_dq = _mxfp8_group_dequant(weight_q, weight_scale_u8)
             ref_out = torch.matmul(a_dq, b_dq.t()).to(dtype)
 
+            # Triton path
             out = triton_mxfp8_blockscaled_linear(
                 input=input_fp16,
                 weight=weight_q,
@@ -485,18 +488,37 @@ class TestMXFP8DenseLinear(CustomTestCase):
                 output_dtype=dtype,
             )
 
-        self.assertTrue(
-            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
-            / torch.mean(torch.abs(ref_out.to(torch.float32)))
-            < 0.02
-        )
-        self.assertTrue(
-            torch.mean(
-                torch.abs(out_prequant.to(torch.float32) - ref_out.to(torch.float32))
+            # cuBLAS path
+            weight_t, weight_scale_cublas = prepare_mxfp8_weight_for_cublas(
+                weight_q, weight_scale_u8
             )
-            / torch.mean(torch.abs(ref_out.to(torch.float32)))
-            < 0.02
-        )
+            out_cublas = cublas_mxfp8_blockscaled_linear(
+                input=input_fp16,
+                weight_t=weight_t,
+                weight_scale_cublas=weight_scale_cublas,
+            )
+            out_cublas_prequant = cublas_mxfp8_blockscaled_linear(
+                input=q_input,
+                weight_t=weight_t,
+                weight_scale_cublas=weight_scale_cublas,
+                input_scale=input_scale_u8,
+                output_dtype=dtype,
+            )
+
+        for label, result in [
+            ("triton", out),
+            ("triton_prequant", out_prequant),
+            ("cublas", out_cublas),
+            ("cublas_prequant", out_cublas_prequant),
+        ]:
+            self.assertTrue(
+                torch.mean(
+                    torch.abs(result.to(torch.float32) - ref_out.to(torch.float32))
+                )
+                / torch.mean(torch.abs(ref_out.to(torch.float32)))
+                < 0.02,
+                f"{label} failed for M={M}, N={N}, K={K}",
+            )
 
     def test_mxfp8_dense_linear(self):
         for params in itertools.product(
