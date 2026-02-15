@@ -286,7 +286,7 @@ class LayerwiseOffloadManager:
         offload manager replaces GPU parameters with small torch.empty((1,))
         placeholders while real weights live in consolidated pinned CPU
         buffers.
-        
+
         The refit process writes new weights directly into the CPU buffers,
         bypassing the placeholders.  For any layer that happens to be resident
         on the GPU at update time, the live GPU tensor is also updated.
