@@ -43,6 +43,39 @@ class BaseLayerWithLoRA(nn.Module):
     def set_lora_info(self, *args):
         pass
 
+    def _should_apply_lora(self) -> bool:
+        """
+        Check if LoRA should be applied for the current batch.
+
+        Returns True if:
+        1. set_lora is True (LoRA is enabled for this layer)
+        2. batch_info exists (meaning prepare_lora_batch() was called)
+
+        The distinction between LoRA and non-LoRA paths:
+        - LoRA path: prepare_lora_batch() is called → batch_info exists → return True
+          (Even if ranks are zero during capture, kernels must be in the graph)
+        - Non-LoRA path: prepare_lora_batch() is NOT called → batch_info is None → return False
+          (Kernels should not be in the graph at all)
+
+        Note: We don't check ranks here because:
+        - During LoRA graph capture: ranks are zero but kernels must be captured
+        - During replay: kernels check ranks internally and return early if rank=0
+        """
+        if not self.set_lora:
+            return False
+
+        # If batch_info exists, we're in a LoRA-enabled path
+        # (prepare_lora_batch() was called, so LoRA kernels should be launched)
+        if (
+            hasattr(self.lora_backend, "batch_info")
+            and self.lora_backend.batch_info is not None
+        ):
+            return True
+
+        # If batch_info doesn't exist, we're in a non-LoRA path
+        # (prepare_lora_batch() was NOT called, so skip LoRA entirely)
+        return False
+
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         pass
 
@@ -161,8 +194,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Extra tokens (tokens >= vocab_size) are now handled efficiently
         in the backend's run_lora_a_embedding method.
         """
-        batch_info = self.lora_backend.batch_info
-
         # Get base embedding output
         # For tokens >= vocab_size, base_layer will clamp or handle them
         # We mask them to 0 to avoid out-of-bounds access
@@ -177,10 +208,11 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         ):
             base_output = self.extra_token_embedding(input_, base_output)
 
-        # Apply LoRA if configured
-        if self.set_lora:
+        # Apply LoRA if configured and batch has LoRA requests
+        if self._should_apply_lora():
             # The backend's run_lora_a_embedding now handles both regular
             # and extra tokens efficiently with CUDA graph support
+            batch_info = self.lora_backend.batch_info
             base_output = self.apply_lora(base_output, input_, batch_info)
 
         return base_output
@@ -271,8 +303,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
 
-        # Apply LoRA if set
-        if self.set_lora:
+        # Apply LoRA if set and batch has LoRA requests
+        if self._should_apply_lora():
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
@@ -341,7 +373,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_, bias
         )
 
-        if self.set_lora:
+        if self._should_apply_lora():
             output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
@@ -541,7 +573,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
-        if self.set_lora:
+        if self._should_apply_lora():
             output_parallel = self.apply_lora(output_parallel, input_parallel)
 
         if (
