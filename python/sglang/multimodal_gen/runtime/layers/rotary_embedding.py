@@ -120,7 +120,7 @@ def _rope_impl_flashinfer(
     else:
         bsz, seq_len, num_q_heads, head_dim = q.shape
 
-    num_kv_heads = k.size(-2)
+    num_kv_heads = _k.size(-2)
 
     pos_1d = torch.arange(seq_len, device=q.device, dtype=torch.long)
     positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
