@@ -395,6 +395,8 @@ class ServerArgs:
 
         # nunchaku
         ncfg = self.nunchaku_config
+        if ncfg is None or isinstance(ncfg, NunchakuConfig):
+            return
         ncfg.validate()
         if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
             # if nunchaku is not applied
@@ -471,9 +473,15 @@ class ServerArgs:
 
     def _adjust_network_ports(self):
         self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
+        initial_scheduler_port = self.scheduler_port + (
+            random.randint(0, 100) if self.scheduler_port == 5555 else 0
+        )
         self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
+        initial_master_port = (
+            self.master_port
+            if self.master_port is not None
+            else (30005 + random.randint(0, 100))
+        )
         self.master_port = self.settle_port(initial_master_port, 37)
 
     def _adjust_parallelism(self):
@@ -513,9 +521,6 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
-
-        if self.num_gpus < max(self.tp_size, self.sp_degree):
-            self.num_gpus = max(self.tp_size, self.sp_degree)
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
@@ -1123,8 +1128,6 @@ class ServerArgs:
 
         if self.dp_size < 1:
             raise ValueError("--dp-size must be a natural number")
-
-        logger.debug(f"Setting dp_degree to: {self.dp_degree}")
 
         if self.dp_size > 1:
             raise ValueError("DP is not yet supported")
