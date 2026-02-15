@@ -89,6 +89,10 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_teacache"] = request.enable_teacache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.rollout is not None:
+        sampling_kwargs["rollout"] = request.rollout
+    if request.rollout_sde_type is not None:
+        sampling_kwargs["rollout_sde_type"] = request.rollout_sde_type
     if request.output_compression is not None:
         sampling_kwargs["output_compression"] = request.output_compression
     sampling_params = SamplingParams.from_user_sampling_params_args(
@@ -176,6 +180,8 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    rollout: Optional[bool] = Form(False),
+    rollout_sde_type: Optional[str] = Form("sde"),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -237,6 +243,8 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            rollout=rollout,
+            rollout_sde_type=rollout_sde_type,
             output_compression=output_compression,
             output_quality=output_quality,
             **(
