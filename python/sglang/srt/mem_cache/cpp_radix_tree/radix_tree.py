@@ -7,6 +7,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
+
 radix_tree_cpp = load(
     name="radix_tree_cpp",
     sources=[

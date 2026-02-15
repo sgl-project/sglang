@@ -170,10 +170,23 @@ struct TreeNode {
 
   /// @return The first index in `m_tokens` that differs from `key`.
   std::size_t diff_key(token_slice key, std::size_t offset) const {
-    const auto a = token_slice{key}.subspan(offset);
-    const auto b = token_slice{m_tokens}.subspan(offset);
-    const auto [it_a, it_b] = std::ranges::mismatch(a, b);
-    return it_a - a.begin();  // return the index of the first differing token
+    // diff_key is candidate for lookup quite often. Here (raw ptr) and
+    // avoid std::ranges/iterator abstraction, easier on compiler.
+    // This way, we could have a simple memcmp-style compare for tokens (int).
+    // Logics: bound, then comparing
+    // from `offset` and returning the first mismatching index (relative to
+    // `offset`) or the full matched length if all tokens are equal.
+    if (offset >= key.size() || offset >= m_tokens.size()) {
+      return 0;
+    }
+    const token_t* a = key.data() + offset;
+    const token_t* b = m_tokens.data() + offset;
+    const std::size_t len = std::min(key.size(), m_tokens.size()) - offset;
+    std::size_t i = 0;
+    for (; i < len; ++i) {
+      if (a[i] != b[i]) break;
+    }
+    return i;  // return the index of the first differing token
   }
 
   at::Tensor device_indices() const {
