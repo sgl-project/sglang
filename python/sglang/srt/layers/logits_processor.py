@@ -448,6 +448,15 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
         else:
             # Prefill with input logprobs.
+            #
+            # WARNING: Pruning hidden states here changes the token count
+            # passed to lm_head. If lm_head has LoRA applied, the LoRA
+            # batch_info (seg_lens / seg_indptr) must reflect the pruned
+            # shape, not the original extend_seq_lens. This is handled by
+            # ParallelLMHeadWithLoRA.forward() which swaps to a pre-computed
+            # lm_head_batch_info. See also: prepare_for_logits_chunk() for
+            # the chunked logprobs path.
+            #
             # Find 4 different indices.
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
@@ -688,6 +697,12 @@ class LogitsProcessor(nn.Module):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
 
+            # Notify lm_head LoRA about the current chunk boundaries so it
+            # can recompute its batch_info to match the chunk's segmentation.
+            # This is a no-op for non-LoRA lm_head modules.
+            if hasattr(lm_head, "prepare_for_logits_chunk"):
+                lm_head.prepare_for_logits_chunk(start_idx, end_idx, token_to_seq_idx)
+
             # Get indices for this chunk
             chunk_mask = (input_logprob_indices >= start_idx) & (
                 input_logprob_indices < end_idx
@@ -791,6 +806,10 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+
+        # Restore the full-pruned lm_head batch_info after chunk iteration.
+        if hasattr(lm_head, "finish_logits_chunking"):
+            lm_head.finish_logits_chunking()
 
         # Concatenate the results
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)

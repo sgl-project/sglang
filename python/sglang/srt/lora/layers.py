@@ -1,4 +1,5 @@
-from typing import Optional
+from itertools import groupby
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -273,9 +274,65 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if set
         if self.set_lora:
+            # lm_head receives *pruned* hidden states whose segmentation
+            # differs from the original extend_seq_lens stored in the main
+            # batch_info.  Swap to the pre-computed lm_head_batch_info so
+            # that the LoRA kernels index correctly, then restore.
+            saved_batch_info = None
+            if self.lora_backend.lm_head_batch_info is not None:
+                saved_batch_info = self.lora_backend.batch_info
+                self.lora_backend.batch_info = self.lora_backend.lm_head_batch_info
+
             base_output = self.apply_lora(base_output, hidden_states)
 
+            if saved_batch_info is not None:
+                self.lora_backend.batch_info = saved_batch_info
+
         return base_output
+
+    # ------------------------------------------------------------------
+    # Chunked-logprobs support
+    # ------------------------------------------------------------------
+
+    def prepare_for_logits_chunk(
+        self,
+        start_idx: int,
+        end_idx: int,
+        token_to_seq_idx: List[int],
+    ):
+        """Update ``lm_head_batch_info`` for a single chunk of pruned states.
+
+        Called by ``LogitsProcessor.process_input_logprobs_by_chunk()`` before
+        each chunk's ``_get_logits`` call.
+        """
+        # If the backend does not support lm_head pruning (e.g. CSGMV), the
+        # full-pruned info was set to None by _compute_lm_head_batch_info.
+        if self.lora_backend._lm_head_batch_info_full is None:
+            raise NotImplementedError(
+                f"Chunked logprobs with lm_head LoRA is not supported by "
+                f"{type(self.lora_backend).__name__}. Disable "
+                f"SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK or remove lm_head "
+                f"from LoRA target modules."
+            )
+
+        chunk_seq_ids = token_to_seq_idx[start_idx:end_idx]
+        original_wi = self.lora_backend.batch_info.weight_indices
+
+        # Run-length encode: consecutive tokens from the same seq → one segment.
+        seg_lens_list, wi_list = [], []
+        for seq_id, group in groupby(chunk_seq_ids):
+            seg_lens_list.append(sum(1 for _ in group))
+            wi_list.append(original_wi[seq_id].item())
+
+        self.lora_backend.lm_head_batch_info = (
+            self.lora_backend._make_lm_head_batch_info(seg_lens_list, wi_list)
+        )
+
+    def finish_logits_chunking(self):
+        """Restore the full-pruned ``lm_head_batch_info`` after the chunk loop."""
+        self.lora_backend.lm_head_batch_info = (
+            self.lora_backend._lm_head_batch_info_full
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed

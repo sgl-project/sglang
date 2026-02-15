@@ -214,3 +214,6 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Pre-compute lm_head batch_info for pruned hidden states.
+        self._compute_lm_head_batch_info(forward_batch, weight_indices)
