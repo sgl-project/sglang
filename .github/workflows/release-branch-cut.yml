@@ -85,7 +85,7 @@ jobs:
 
           echo "Branch '$BRANCH_NAME' does not exist, proceeding with creation"
 
-      - name: Create and push release branch
+      - name: Create release branch
         id: set_output
         run: |
           COMMIT_SHA="${{ steps.validate.outputs.COMMIT_SHA }}"
@@ -97,11 +97,33 @@ jobs:
           # Create branch from the specified commit
           git checkout -b "$BRANCH_NAME" "$COMMIT_SHA"
 
-          # Push the new branch
-          git push origin "$BRANCH_NAME"
-
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          echo "Successfully created and pushed branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
+          echo "Successfully created branch '$BRANCH_NAME' from commit '$COMMIT_SHA'"
+
+      - name: Update version references in documentation
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          # Extract version from branch name (e.g., release/v0.5.8 -> v0.5.8)
+          VERSION=$(echo "$BRANCH_NAME" | sed 's/release\///')
+
+          # Update git clone version references in docs
+          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs/get_started/install.md
+          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs/platforms/amd_gpu.md
+
+          # Check if any changes were made
+          if git diff --quiet; then
+            echo "No version references needed updating"
+          else
+            git add docs/get_started/install.md docs/platforms/amd_gpu.md
+            git commit -m "docs: update version references to $VERSION"
+            echo "Updated version references to $VERSION"
+          fi
+
+      - name: Push release branch
+        run: |
+          BRANCH_NAME="${{ steps.set_output.outputs.branch_name }}"
+          git push origin "$BRANCH_NAME"
+          echo "Successfully pushed branch '$BRANCH_NAME'"
 
       - name: Summary
         run: |
