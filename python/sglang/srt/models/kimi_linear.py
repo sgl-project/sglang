@@ -16,10 +16,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated, fused_kda_gate
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -334,7 +331,7 @@ class KimiDeltaAttention(nn.Module):
         conv_weights = (self.q_conv_weights, self.k_conv_weights, self.v_conv_weights)
         bias = (self.q_conv1d.bias, self.k_conv1d.bias, self.v_conv1d.bias)
 
-        self.linear_attn = RadixLinearAttention(
+        self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
             num_k_heads=self.num_k_heads // self.attn_tp_size,
@@ -368,9 +365,7 @@ class KimiDeltaAttention(nn.Module):
 
         # Fused bfg projections
         fused_bfg_states = self.fused_bfg_a_proj(hidden_states)
-        beta, fg_a_states = torch.split(
-            fused_bfg_states, self.split_sizes_bfg, dim=-1
-        )
+        beta, fg_a_states = torch.split(fused_bfg_states, self.split_sizes_bfg, dim=-1)
         # use batch matmul to calculate forget_gate and g_proj_states
         forget_gate, g_proj_states = self.fused_fg_b_proj(
             fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
@@ -409,7 +404,7 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        core_attn_out = self.linear_attn(
+        core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=forget_gate,
@@ -653,6 +648,7 @@ class KimiLinearForCausalLM(nn.Module):
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
