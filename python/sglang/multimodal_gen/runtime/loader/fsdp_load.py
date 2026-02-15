@@ -328,7 +328,7 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # from nunchaku
+    # for nunchaku
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
