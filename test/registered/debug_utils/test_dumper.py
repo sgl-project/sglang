@@ -74,14 +74,16 @@ class TestDumperPureFunctions:
 
         assert torch.equal(torch.load(path, weights_only=True), param.data)
 
-    def test_torch_save_silent_skip(self, tmp_path):
+    def test_torch_save_silent_skip(self, tmp_path, capsys):
         from sglang.srt.debug_utils.dumper import _torch_save
 
         path = str(tmp_path / "c.pt")
 
         _torch_save({"fn": lambda: None}, path)
 
-        assert not Path(path).exists()
+        captured = capsys.readouterr()
+        assert "[Dumper] Observe error=" in captured.out
+        assert "skip the tensor" in captured.out
 
 
 class TestDumperDistributed:
@@ -205,7 +207,8 @@ class TestDumperDistributed:
         dumper.dump("content_check", tensor)
 
         dist.barrier()
-        loaded = _load_dump_file(tmpdir, rank=rank, name="content_check")
+        path = _find_dump_file(tmpdir, rank=rank, name="content_check")
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
         assert torch.equal(loaded, tensor.cpu())
 
 
@@ -222,7 +225,7 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
         ), f"{p} should not exist in {filenames}"
 
 
-def _load_dump_file(tmpdir, *, rank: int, name: str) -> torch.Tensor:
+def _find_dump_file(tmpdir, *, rank: int, name: str) -> Path:
     matches = [
         f
         for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
@@ -231,7 +234,7 @@ def _load_dump_file(tmpdir, *, rank: int, name: str) -> torch.Tensor:
     assert len(matches) == 1, (
         f"Expected 1 file matching rank={rank} name={name}, got {matches}"
     )
-    return torch.load(matches[0], map_location="cpu", weights_only=True)
+    return matches[0]
 
 
 if __name__ == "__main__":
