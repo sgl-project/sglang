@@ -14,13 +14,11 @@ DEFAULT_BLOCK_QUOTA = 2
 
 @cache_once
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
-    num_threads, occupancy = 1024, 1
     args = make_cpp_args(
         element_size,
         unroll,
         block_quota,
-        num_threads,
-        occupancy,
+        1024,  # num_threads, can be tuned for performance
     )
     return load_jit(
         "hicache",
@@ -39,6 +37,10 @@ def can_use_hicache_jit_kernel(
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
+    logger = logging.getLogger(__name__)
+    if element_size % 128 != 0:
+        logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
+        return False
     try:
         unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
@@ -49,7 +51,6 @@ def can_use_hicache_jit_kernel(
         )
         return True
     except Exception as e:
-        logger = logging.getLogger(__name__)
         logger.warning(f"Failed to load JIT HiCache kernel: {e}")
         return False
 
