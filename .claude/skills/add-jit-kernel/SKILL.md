@@ -57,6 +57,49 @@ You will typically touch these files/areas:
 
 ---
 
+## tvm-ffi primer (practical, as used in this repo)
+
+This repository uses tvm-ffi primarily as a **stable C++ ABI** and a set of **lightweight container types** to move data between Python and C++ with minimal overhead.
+
+### Core types you will see in JIT kernels
+
+- `tvm::ffi::TensorView`
+  - A **non-owning view** of a tensor (backed by DLPack) that enables zero-copy interop.
+  - Use it for most tensor arguments in kernel entrypoints.
+  - You typically inspect/validate:
+    - Shape/strides: `dim()`, `shape()`, `strides()`, `size(i)`, `stride(i)`, `is_contiguous()`
+    - Dtype/device: `dtype()`, `device()`
+    - Raw pointer: `data_ptr()` (then cast after dtype checks)
+
+- `tvm::ffi::Optional<T>`
+  - Used for optional tensor arguments, e.g. `tvm::ffi::Optional<tvm::ffi::TensorView>`.
+  - Always check `has_value()` before using it.
+
+### Containers you may want (even if not widely used here yet)
+
+- `tvm::ffi::Array<T>`, `tvm::ffi::Tuple<...>`
+  - Useful for passing small structured metadata without inventing ad-hoc pointer conventions.
+
+### STL support
+
+tvm-ffi has optional headers to interop with parts of the C++ standard library (review mentions `extra/stl.h`). This repo currently mostly relies on `TensorView` + `Optional` for kernel interfaces.
+
+### Source of truth in `sglang`
+
+The most reliable documentation for how tvm-ffi is used in `sglang` is the code under:
+
+- `python/sglang/jit_kernel/include/`
+
+In particular:
+
+- `python/sglang/jit_kernel/include/sgl_kernel/tensor.h`
+  - `host::TensorMatcher` for validating shapes/strides/dtypes/devices
+  - Symbolic helper types used across many kernels:
+    - `host::SymbolicSize` / `host::SymbolicDType` / `host::SymbolicDevice`
+    - Typical pattern: declare symbols, validate with `TensorMatcher(...).verify(...)`, then `unwrap()` the resolved values for launch configuration
+
+---
+
 ## Step 0 (optional): Generate a `.clangd` config for better IDE support
 
 Because JIT kernels compile at runtime, there is no static `compile_commands.json`.
@@ -77,7 +120,12 @@ This will generate a `.clangd` file (and will not overwrite an existing one).
 
 - `python/sglang/jit_kernel/csrc/<op>.cuh` (common pattern)
 
-2. Use the project’s recommended utilities (see `docs/developer_guide/development_jit_kernel_guide.md`):
+2. Use the project’s recommended utilities.
+
+Notes:
+
+- Prefer reading and reusing the actual helper code in `python/sglang/jit_kernel/include/`.
+- If you find a missing helper that would be reusable across kernels, add it under `python/sglang/jit_kernel/include/`.
 
 - Use `tvm::ffi::TensorView` for tensor arguments (PyTorch tensors are passed through tvm-ffi)
 - Validate inputs with `TensorMatcher` (shape/stride/dtype/device)
@@ -219,5 +267,10 @@ python python/sglang/jit_kernel/benchmark/bench_<op>.py
 
 - `docs/developer_guide/development_jit_kernel_guide.md`
 - `python/sglang/jit_kernel/utils.py` (`cache_once`, `load_jit`, wrappers, CUDA arch list)
+- `python/sglang/jit_kernel/include/sgl_kernel/tensor.h` (`TensorMatcher` and symbolic size/dtype/device helpers)
+- Existing kernels that are good references for utility usage:
+  - `python/sglang/jit_kernel/per_tensor_quant_fp8.py` + `python/sglang/jit_kernel/csrc/gemm/per_tensor_quant_fp8.cuh`
+  - `python/sglang/jit_kernel/norm.py` + `python/sglang/jit_kernel/csrc/elementwise/qknorm.cuh`
+  - `python/sglang/jit_kernel/csrc/elementwise/qknorm_across_heads.cuh`
 - `python/sglang/jit_kernel/tests/test_add_constant.py` (minimal runnable example)
 - `python/sglang/jit_kernel/benchmark/utils.py` (benchmark helpers)
