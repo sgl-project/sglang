@@ -50,6 +50,39 @@ class TestDumperPureFunctions:
         assert "value=42" in get_tensor_info(42)
         assert "min=None" in get_tensor_info(torch.tensor([]))
 
+    def test_torch_save_normal(self, tmp_path):
+        from sglang.srt.debug_utils.dumper import _torch_save
+
+        path = str(tmp_path / "a.pt")
+        tensor = torch.randn(3, 3)
+
+        _torch_save(tensor, path)
+
+        assert torch.equal(torch.load(path, weights_only=True), tensor)
+
+    def test_torch_save_parameter_fallback(self, tmp_path):
+        from sglang.srt.debug_utils.dumper import _torch_save
+
+        class BadParam(torch.nn.Parameter):
+            def __reduce_ex__(self, protocol):
+                raise RuntimeError("not pickleable")
+
+        path = str(tmp_path / "b.pt")
+        param = BadParam(torch.randn(4))
+
+        _torch_save(param, path)
+
+        assert torch.equal(torch.load(path, weights_only=True), param.data)
+
+    def test_torch_save_silent_skip(self, tmp_path):
+        from sglang.srt.debug_utils.dumper import _torch_save
+
+        path = str(tmp_path / "c.pt")
+
+        _torch_save({"fn": lambda: None}, path)
+
+        assert not Path(path).exists()
+
 
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
@@ -144,6 +177,37 @@ class TestDumperDistributed:
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
 
+    def test_save_false(self, tmp_path):
+        run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
+
+    @staticmethod
+    def _test_save_false_func(rank, tmpdir):
+        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
+        from sglang.srt.debug_utils.dumper import dumper
+
+        dumper.on_forward_pass_start()
+        dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
+
+        dist.barrier()
+        assert len(_get_filenames(tmpdir)) == 0
+
+    def test_file_content_correctness(self, tmp_path):
+        run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
+
+    @staticmethod
+    def _test_file_content_func(rank, tmpdir):
+        os.environ["SGLANG_DUMPER_DIR"] = tmpdir
+        from sglang.srt.debug_utils.dumper import dumper
+
+        tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
+
+        dumper.on_forward_pass_start()
+        dumper.dump("content_check", tensor)
+
+        dist.barrier()
+        loaded = _load_dump_file(tmpdir, rank=rank, name="content_check")
+        assert torch.equal(loaded, tensor.cpu())
+
 
 def _get_filenames(tmpdir):
     return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
@@ -156,6 +220,18 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
         assert not any(
             p in f for f in filenames
         ), f"{p} should not exist in {filenames}"
+
+
+def _load_dump_file(tmpdir, *, rank: int, name: str) -> torch.Tensor:
+    matches = [
+        f
+        for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
+        if f"rank={rank}" in f.name and name in f.name
+    ]
+    assert len(matches) == 1, (
+        f"Expected 1 file matching rank={rank} name={name}, got {matches}"
+    )
+    return torch.load(matches[0], map_location="cpu", weights_only=True)
 
 
 if __name__ == "__main__":
