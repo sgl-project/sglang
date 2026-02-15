@@ -65,12 +65,14 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
 )
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
+_is_sm120_supported = _is_cuda and is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
@@ -92,7 +94,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
+        (_is_sm90_supported or _is_sm100_supported or _is_sm120_supported)
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
