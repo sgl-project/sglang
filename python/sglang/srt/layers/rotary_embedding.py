@@ -360,10 +360,11 @@ class RotaryEmbedding(MultiPlatformOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
+            batch_size = positions.size(0)
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
-                q=query,
-                k=key,
+                q=query.view(batch_size, -1, self.head_size),
+                k=key.view(batch_size, -1, self.head_size),
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
                 fused_args=fused_set_kv_buffer_arg,
