@@ -48,7 +48,8 @@ inline void invoke_gemm(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size) {
   using GemmT = typename Config::Cutlass3xW4A8Gemm;
   cutlass_w4a8_group_gemm_caller<GemmT>(
@@ -62,7 +63,8 @@ inline void invoke_gemm(
       a_strides,
       b_strides,
       d_strides,
-      s_strides,
+      sa_strides,
+      sb_strides,
       chunk_size);
 }
 
@@ -81,7 +83,8 @@ inline void invoke_gemm(
       a_strides,                            \
       b_strides,                            \
       d_strides,                            \
-      s_strides,                            \
+      sa_strides,                           \
+      sb_strides,                           \
       chunk_size)
 #define INVOKE_GEMM_WITH_CONFIG(Config) INVOKE_GEMM_WITH_CONFIG_HELPER Config
 
@@ -96,12 +99,19 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
+  uint32_t m = a_tensors.size(-2);
+  if(a_tensors.dim() == 3){ // low-latency 3d input
+    m = 32;
+  }else{
+    m = m / a_tensors.size(0); // for 2d input, m is the per-expert m
+  }
+
   uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+  uint32_t const k = a_tensors.size(-1);
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
@@ -194,7 +204,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk) {
   dispatch_w4a8_moe_mm_sm90(
@@ -208,7 +219,8 @@ void cutlass_w4a8_moe_mm_sm90(
       a_strides,
       b_strides,
       d_strides,
-      s_strides,
+      sa_strides,
+      sb_strides,
       chunk_size,
       topk);
 }

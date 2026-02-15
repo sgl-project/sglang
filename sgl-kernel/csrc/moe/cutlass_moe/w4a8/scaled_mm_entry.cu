@@ -21,7 +21,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk);
 
@@ -47,7 +48,8 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk) {
   cutlass_w4a8_moe_mm_sm90(
@@ -61,7 +63,8 @@ void cutlass_w4a8_moe_mm(
       a_strides,
       b_strides,
       d_strides,
-      s_strides,
+      sa_strides,
+      sb_strides,
       chunk_size,
       topk);
   return;

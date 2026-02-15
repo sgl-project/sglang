@@ -43,6 +43,8 @@
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/trace.h"
 #include "cutlass_extensions/detail/collective/mixed_input_utils.hpp"
+#include "cutlass_extensions/gemm/collective/collective_mma_decl_.hpp"
+#include "cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_2scales.hpp"
 
 #define GROUP_SIZE 128
 
@@ -101,7 +103,7 @@ struct CollectiveMmaArrayMixedInput<
  private:
   template <class T>
   friend struct detail::MixedGroupedGemmInputUtils;
-  using CollectiveType = CollectiveMma<
+  using CollectiveType = CollectiveMma_<
       DispatchPolicy,
       TileShape_,
       ElementAOptionalTuple,
@@ -129,18 +131,18 @@ struct CollectiveMmaArrayMixedInput<
 
  public:
   static_assert(
-      cute::is_tuple<ElementAOptionalTuple>::value ^ cute::is_tuple<ElementBOptionalTuple>::value,
-      "Either A OR B must be a tuple. It must take the from {ElementOperand, [ElementScale], [ElementZero]}. Inputs in "
-      "[] are optional.");
+      cute::is_tuple<ElementAOptionalTuple>::value && cute::is_tuple<ElementBOptionalTuple>::value,
+      "ElementA and ElementB must be tuples.");
 
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementAOptionalTuple>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementBOptionalTuple>;
-  static constexpr bool IsATransformed = cute::is_tuple<ElementAOptionalTuple>::value;
-  using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
+  static constexpr bool IsATransformed = cutlass::sizeof_bits<ElementA>::value == 4;  // cutlass::int4b_t
+
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
   // For cases where we can't have a void type, we can use this to allow the code to compile when the scale / zero is
   // void.
-  using NonVoidElementScale = cute::conditional_t<cute::is_void_v<ElementScale>, float, ElementScale>;
+  using NonVoidElementScaleA = cute::conditional_t<cute::is_void_v<ScaleA>, float, ScaleA>;
+  using NonVoidElementScaleB = cute::conditional_t<cute::is_void_v<ScaleB>, float, ScaleB>;
   using NonVoidElementZero = cute::conditional_t<cute::is_void_v<ElementZero>, float, ElementZero>;
 
   using StrideA = StrideA_;
@@ -148,9 +150,12 @@ struct CollectiveMmaArrayMixedInput<
   using StrideB = StrideB_;
   using InternalStrideB = cute::remove_pointer_t<StrideB>;
 
-  using StrideScale = cute::Stride<cute::Int<1>, int64_t, int64_t>;
-  using NonVoidStrideScale =
-      cute::conditional_t<cute::is_void_v<StrideScale>, cute::Stride<_1, int64_t, int64_t>, StrideScale>;
+  using StrideScaleA = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+  using StrideScaleB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
+  using NonVoidStrideScaleA =
+      cute::conditional_t<cute::is_void_v<StrideScaleA>, cute::Stride<_1, int64_t, int64_t>, StrideScaleA>;
+  using NonVoidStrideScaleB =
+      cute::conditional_t<cute::is_void_v<StrideScaleB>, cute::Stride<int64_t, _1, int64_t>, StrideScaleB>;
 
   static_assert(
       (IsATransformed && (cutlass::gemm::detail::is_k_major<StrideA>() || is_layout<StrideA>::value ||
@@ -168,8 +173,9 @@ struct CollectiveMmaArrayMixedInput<
       "The unscaled element must be 2 bytes OR both inputs must be K-major");
 
   static_assert(
-      cutlass::gemm::detail::is_mn_major<NonVoidStrideScale>(),
-      "Scale must be MN major [Col Major if A is scaled, Row Major if B is scaled].");
+      cutlass::gemm::detail::is_mn_major<NonVoidStrideScaleA>() &&
+          cutlass::gemm::detail::is_k_major<NonVoidStrideScaleB>(),
+      "ScaleA must be MN major [Col Major if A is scaled]. ScaleB must be K major.");
 
   using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
   using TiledMma = TiledMma_;
@@ -181,10 +187,9 @@ struct CollectiveMmaArrayMixedInput<
   using SmemLayoutAtomB = SmemLayoutAtomB_;
   using SmemCopyAtomA = SmemCopyAtomA_;
   using SmemCopyAtomB = SmemCopyAtomB_;
-  using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   // We must ensure the type to be scaled goes to RF
-  static constexpr bool SwapAB = !IsATransformed;
+  static constexpr bool SwapAB = !IsATransformed;  // "false" for our case, since A is scaled
   using SwappedStrideA = cute::conditional_t<!SwapAB, StrideA, StrideB>;
   using SwappedStrideB = cute::conditional_t<!SwapAB, StrideB, StrideA>;
   using InternalSwappedStrideA = cute::conditional_t<!SwapAB, InternalStrideA, InternalStrideB>;
@@ -212,19 +217,33 @@ struct CollectiveMmaArrayMixedInput<
 
   static constexpr int IsSubbyteA = cute::sizeof_bits_v<SwappedElementA> < 8;
   using TmaElementA = cute::conditional_t<IsSubbyteA, uint8_t, SwappedElementA>;
-  using TmaElementScale = uint_bit_t<sizeof_bits_v<NonVoidElementScale>>;  // in case we have array. translating to uint
-                                                                           // to satisfy tma descriptor's specialization
+  using TmaElementScaleA =
+      uint_bit_t<sizeof_bits_v<NonVoidElementScaleA>>;  // in case we have array. translating to uint
+                                                        // to satisfy tma descriptor's specialization
 
   using MainloopPipeline = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
   using PipelineState = cutlass::PipelineState<DispatchPolicy::Stages>;
   using PipelineParams = typename MainloopPipeline::Params;
 
   static constexpr int NumProducerThreadEvents = 1;
+  static constexpr int GroupSize = 128;
+  using SmemLayoutAtomScaleA = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
 
-  using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
-  using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
+  static constexpr int TileK = cute::get<2>(TileShape{});
+
+  // static constexpr int TileKGroup = TileK / GroupSize;
+  static constexpr int TileKGroup = 4;  // K need padding to 4
+
+  using SmemLayoutAtomScaleB = Layout<
+      Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomB{})), cute::Int<TileKGroup>>,
+      cute::Stride<cute::Int<TileKGroup>, cute::Int<1>>>;
+
+  using ScaleATileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScaleA{})));
+  using ScaleBTileShape = decltype(make_shape(shape<1>(TileShape{}), cute::Int<TileKGroup>{}));
 
   static_assert(cute::rank(SwappedSmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+  static_assert(cute::rank(SwappedSmemLayoutAtomB{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
+
   static_assert(
       (size<0>(TileShape{}) % size<0>(SwappedSmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
   static_assert(
@@ -236,12 +255,20 @@ struct CollectiveMmaArrayMixedInput<
   static_assert(
       (size<2>(TileShape{}) % size<1>(SwappedSmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
 
-  static_assert(rank(SmemLayoutAtomScale{}) == 2, "SmemLayoutAtomScale must be rank 2");
+  static_assert(rank(SmemLayoutAtomScaleA{}) == 2, "SmemLayoutAtomScale must be rank 2");
+  static_assert(rank(SmemLayoutAtomScaleB{}) == 2, "SmemLayoutBtomScale must be rank 2");
+
   static_assert(
-      (size<0>(TileShape{}) % size<0>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must equal the tile shape.");
+      (size<0>(TileShape{}) % size<0>(SmemLayoutAtomScaleA{})) == 0, "SmemLayoutAtomScaleA must equal the tile shape.");
   static_assert(
-      (size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0,
-      "SmemLayoutAtomScale must evenly divide tile k shape.");
+      (size<2>(TileShape{}) % size<1>(SmemLayoutAtomScaleA{})) == 0,
+      "SmemLayoutAtomScaleA must evenly divide tile k shape.");
+
+  static_assert(
+      (size<1>(TileShape{}) % size<0>(SmemLayoutAtomScaleB{})) == 0, "SmemLayoutAtomScaleB must equal the tile shape.");
+  static_assert(
+      (size<2>(TileShape{}) % size<1>(SmemLayoutAtomScaleB{})) == 0,
+      "SmemLayoutAtomScaleB must evenly divide tile k shape.");
 
   /// Tile along modes in a way that maximizes the TMA box size.
   using SmemLayoutA = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(
@@ -250,11 +277,19 @@ struct CollectiveMmaArrayMixedInput<
       SwappedSmemLayoutAtomB{}, select<1, 2>(TileShape{}), InternalSwappedStrideB{}));
 
   // It is assumed that the scales and zero-points share the same smem layout
-  using SmemLayoutScale = decltype(tile_to_shape(
-      SmemLayoutAtomScale{},
-      make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
+  using SmemLayoutScaleA = decltype(tile_to_shape(
+      SmemLayoutAtomScaleA{},
+      make_shape(shape<0>(ScaleATileShape{}), shape<1>(ScaleATileShape{}), Int<Stages>{}),
       cute::conditional_t<
-          ::cutlass::gemm::detail::is_major<0, NonVoidStrideScale>(),
+          ::cutlass::gemm::detail::is_major<0, NonVoidStrideScaleA>(),
+          Step<_2, _1, _3>,
+          Step<_1, _2, _3>>{}));
+
+  using SmemLayoutScaleB = decltype(tile_to_shape(
+      SmemLayoutAtomScaleB{},
+      make_shape(shape<0>(ScaleBTileShape{}), shape<1>(ScaleBTileShape{}), Int<Stages>{}),
+      cute::conditional_t<
+          ::cutlass::gemm::detail::is_major<0, NonVoidStrideScaleB>(),
           Step<_2, _1, _3>,
           Step<_1, _2, _3>>{}));
 
@@ -272,11 +307,10 @@ struct CollectiveMmaArrayMixedInput<
 
   // To relax them, we need to handle loading more than 1 row of scales for every main loop iteration.
   // We must also handle updating the pipeline transaction bytes on the fly.
-  static_assert(size<1>(SmemLayoutAtomScale{}) == 1, "size<1>(SmemLayoutAtomScale) must be 1.");
 
  private:
   static constexpr ConversionMode get_conversion_mode() {
-    if constexpr (cute::is_void_v<ElementScale>) {
+    if constexpr (cute::is_void_v<ScaleA>) {
       return ConversionMode::DirectConvert;
     } else if constexpr (cute::is_void_v<ElementZero>) {
       return ConversionMode::ConvertAndScale;
@@ -290,7 +324,7 @@ struct CollectiveMmaArrayMixedInput<
   static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale ||
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
   static constexpr bool UseScaleLookupTable =
-      KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ElementScale>;
+      KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ScaleA>;
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
   static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
@@ -298,19 +332,22 @@ struct CollectiveMmaArrayMixedInput<
   static_assert(SmemAlignmentA >= 128 and SmemAlignmentB >= 128, "Require at least 128B alignment");
 
   struct SharedStorage {
-    static constexpr int scale_elements = Utils::elements_per_smem_scale();
+    static constexpr int scaleA_elements = Utils::elements_per_smem_scaleA();
+    static constexpr int scaleB_elements = Utils::elements_per_smem_scaleB();
     static constexpr int zero_elements = Utils::elements_per_smem_zero();
     struct TensorStorage {
       CUTE_ALIGNAS(SmemAlignmentA) cute::ArrayEngine<RealSwappedElementA, cute::cosize_v<SmemLayoutA>> smem_A;
       CUTE_ALIGNAS(SmemAlignmentB) cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      cute::ArrayEngine<NonVoidElementScale, scale_elements> smem_scale;
+      cute::ArrayEngine<NonVoidElementScaleA, scaleA_elements> smem_scaleA;
+      cute::ArrayEngine<NonVoidElementScaleB, scaleB_elements> smem_scaleB;
       cute::ArrayEngine<NonVoidElementZero, zero_elements> smem_zero;
     } tensors;
 
     struct TensorMapStorage {
       cute::TmaDescriptor smem_tensormap_A;
       cute::TmaDescriptor smem_tensormap_B;
-      cute::TmaDescriptor smem_tensormap_scale;
+      cute::TmaDescriptor smem_tensormap_scaleA;
+      cute::TmaDescriptor smem_tensormap_scaleB;
       cute::TmaDescriptor smem_tensormap_zero;
     };
 
@@ -330,8 +367,10 @@ struct CollectiveMmaArrayMixedInput<
     StrideA dA;
     ElementB const** ptr_B;
     StrideB dB;
-    ElementScale const** ptr_S = nullptr;
-    NonVoidStrideScale const* dS{};
+    ScaleA const** ptr_SA = nullptr;
+    NonVoidStrideScaleA const* dSA{};
+    ScaleB const** ptr_SB = nullptr;
+    NonVoidStrideScaleB const* dSB{};
     int chunk_size = 0;
     ElementZero const** ptr_Z = nullptr;
   };
@@ -350,6 +389,7 @@ struct CollectiveMmaArrayMixedInput<
         SmemLayoutA{}(_, _, cute::Int<0>{}),
         make_shape(shape<0>(TileShape{}), shape<2>(TileShape{})),
         size<1>(ClusterShape{})));  // mcast along N mode for this M load, if any
+
     // Assumption: StrideB is congruent with Problem_NK
     using TMA_B = decltype(make_tma_copy(
         GmemTiledCopyB{},
@@ -358,38 +398,53 @@ struct CollectiveMmaArrayMixedInput<
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{})));  // mcast along M mode for this N load, if any
 
-    using TMA_Scale = decltype(make_tma_copy<TmaElementScale>(
+    // using TMA_B = TMA_A;
+
+    using TMA_ScaleA = decltype(make_tma_copy<TmaElementScaleA>(
         GmemTiledCopyScale{},
         make_tensor(
-            detail::get_logical_ptr(static_cast<NonVoidElementScale const*>(nullptr)),
-            repeat_like(NonVoidStrideScale{}, int32_t(0)),
-            NonVoidStrideScale{}),
-        SmemLayoutScale{}(_, _, cute::Int<0>{}),
-        ScaleTileShape{},
+            detail::get_logical_ptr(static_cast<NonVoidElementScaleA const*>(nullptr)),
+            repeat_like(NonVoidStrideScaleA{}, int32_t(0)),
+            NonVoidStrideScaleA{}),
+        SmemLayoutScaleA{}(_, _, cute::Int<0>{}),
+        ScaleATileShape{},
         _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
+
+    using TMA_ScaleB = decltype(make_tma_copy(
+        GmemTiledCopyScale{},
+        make_tensor(
+            detail::get_logical_ptr(static_cast<NonVoidElementScaleB const*>(nullptr)),
+            repeat_like(NonVoidStrideScaleB{}, int32_t(0)),
+            NonVoidStrideScaleB{}),
+        SmemLayoutScaleB{}(_, _, cute::Int<0>{}),
+        ScaleBTileShape{},
+        _1{}));  // mcast along M mode for this N load, if any. Scale is ALWAYS loaded with B for RF kernel
 
     using TMA_Zero = decltype(make_tma_copy(
         GmemTiledCopyScale{},
         make_tensor(
             detail::get_logical_ptr(static_cast<NonVoidElementZero const*>(nullptr)),
-            repeat_like(NonVoidStrideScale{}, int32_t(0)),
-            NonVoidStrideScale{}),
-        SmemLayoutScale{}(_, _, cute::Int<0>{}),
-        ScaleTileShape{},
+            repeat_like(NonVoidStrideScaleA{}, int32_t(0)),
+            NonVoidStrideScaleA{}),
+        SmemLayoutScaleA{}(_, _, cute::Int<0>{}),
+        ScaleATileShape{},
         _1{}));  // mcast along N mode for this M load, if any. Scale is ALWAYS loaded with A for RF kernel
 
     TMA_A tma_load_a;
     TMA_B tma_load_b;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
-    TMA_Scale tma_load_scale;
+    TMA_ScaleA tma_load_scaleA;
+    TMA_ScaleB tma_load_scaleB;
     TMA_Zero tma_load_zero;
     void* tensormaps;
     SwappedElementA const** ptr_A;
     SwappedStrideA ptr_dA;
     SwappedElementB const** ptr_B;
     SwappedStrideB ptr_dB;
-    NonVoidElementScale const** ptr_S;
-    NonVoidStrideScale const* dS;
+    NonVoidElementScaleA const** ptr_SA;
+    NonVoidStrideScaleA const* dSA;
+    NonVoidElementScaleB const** ptr_SB;
+    NonVoidStrideScaleB const* dSB;
     NonVoidElementZero const** ptr_Z;
     int64_t scale_k;
     int chunk_size;
@@ -488,7 +543,9 @@ struct CollectiveMmaArrayMixedInput<
         SmemLayoutB{}(_, _, cute::Int<0>{}),
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         size<0>(ClusterShape{}));  // mcast along M mode for this N load, if any
-    typename Params::TMA_Scale tma_load_scale{};
+    typename Params::TMA_ScaleA tma_load_scaleA{};
+    typename Params::TMA_ScaleB tma_load_scaleB{};
+
     typename Params::TMA_Zero tma_load_zero{};
 
     void* tensormaps = workspace;
@@ -498,15 +555,18 @@ struct CollectiveMmaArrayMixedInput<
           tma_load_a,
           tma_load_b,
           TmaTransactionBytes,
-          tma_load_scale,
+          tma_load_scaleA,
+          tma_load_scaleB,
           tma_load_zero,
           tensormaps,
           reinterpret_cast<SwappedElementA const**>(ptr_A),
           ptr_dA,
           reinterpret_cast<SwappedElementB const**>(ptr_B),
           ptr_dB,
-          reinterpret_cast<NonVoidElementScale const**>(args.ptr_S),
-          args.dS,
+          reinterpret_cast<NonVoidElementScaleA const**>(args.ptr_SA),
+          args.dSA,
+          reinterpret_cast<NonVoidElementScaleB const**>(args.ptr_SB),
+          args.dSB,
           reinterpret_cast<NonVoidElementZero const**>(args.ptr_Z),
           scale_k,
           chunk_size,
@@ -519,17 +579,28 @@ struct CollectiveMmaArrayMixedInput<
       return SwapAB ? args_setup(args.ptr_B, args.ptr_A) : args_setup(args.ptr_A, args.ptr_B);
     } else if constexpr (ModeHasScales) {
       auto fake_scale_k = 1;
-      ElementScale const* ptr_S = reinterpret_cast<ElementScale const*>(args.ptr_S);
-      StrideScale dS{};
-      Tensor tensor_scale =
-          make_tensor(detail::get_logical_ptr(ptr_S), make_layout(make_shape(init_M, fake_scale_k, mock_L), dS));
-      tma_load_scale = make_tma_copy<TmaElementScale>(
+      ScaleA const* ptr_SA = reinterpret_cast<ScaleA const*>(args.ptr_SA);
+      ScaleB const* ptr_SB = reinterpret_cast<ScaleB const*>(args.ptr_SB);
+      StrideScaleA dSA{};
+      Tensor tensor_scaleA =
+          make_tensor(detail::get_logical_ptr(ptr_SA), make_layout(make_shape(init_M, fake_scale_k, mock_L), dSA));
+      StrideScaleB dSB{};
+      Tensor tensor_scaleB =
+          make_tensor(detail::get_logical_ptr(ptr_SB), make_layout(make_shape(init_N, fake_scale_k, mock_L), dSB));
+
+      tma_load_scaleA = make_tma_copy<TmaElementScaleA>(
           GmemTiledCopyScale{},
-          tensor_scale,
-          SmemLayoutScale{}(_, _, cute::Int<0>{}),
-          ScaleTileShape{},
+          tensor_scaleA,
+          SmemLayoutScaleA{}(_, _, cute::Int<0>{}),
+          ScaleATileShape{},
           _1{});  // mcast along N mode for this M load, if any
 
+      tma_load_scaleB = make_tma_copy(
+          GmemTiledCopyScale{},
+          tensor_scaleB,
+          SmemLayoutScaleB{}(_, _, cute::Int<0>{}),
+          ScaleBTileShape{},
+          _1{});  // mcast along M mode for this N load, if any
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return SwapAB ? args_setup(
                             args.ptr_B,
@@ -546,12 +617,12 @@ struct CollectiveMmaArrayMixedInput<
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         ElementZero const* ptr_Z = reinterpret_cast<ElementZero const*>(args.ptr_Z);
         Tensor tensor_zero =
-            make_tensor(detail::get_logical_ptr(ptr_Z), make_layout(make_shape(init_M, fake_scale_k, mock_L), dS));
+            make_tensor(detail::get_logical_ptr(ptr_Z), make_layout(make_shape(init_M, fake_scale_k, mock_L), dSA));
         tma_load_zero = make_tma_copy(
             GmemTiledCopyScale{},
             tensor_zero,
-            SmemLayoutScale{}(_, _, cute::Int<0>{}),
-            ScaleTileShape{},
+            SmemLayoutScaleA{}(_, _, cute::Int<0>{}),
+            ScaleATileShape{},
             _1{});  // mcast along N mode for this M load, if any
         return SwapAB ? args_setup(
                             args.ptr_B,
@@ -591,12 +662,12 @@ struct CollectiveMmaArrayMixedInput<
       return calculate_workspace_size(2);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies,
-      // followed by scale tensormap copies
-      return calculate_workspace_size(3);
+      // followed by scaleA and scaleB tensormap copies
+      return calculate_workspace_size(4);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B tensormap copies,
-      // followed by scale and zeros tensormap copies
-      return calculate_workspace_size(4);
+      // followed by scaleA and scaleB and zeros tensormap copies
+      return calculate_workspace_size(5);
     } else {
       static_assert(
           cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in get_workspace_size.");
@@ -639,23 +710,28 @@ struct CollectiveMmaArrayMixedInput<
         implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_B>(
                                              detail::get_gmem_layout(cute::make_shape(N, K, L), dB));
         if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-          implementable = implementable && (args.ptr_S == nullptr);
+          implementable = implementable && (args.ptr_SA == nullptr);
+          implementable = implementable && (args.ptr_SB == nullptr);
           implementable = implementable && (args.ptr_Z == nullptr);
         } else if constexpr (ModeHasScales) {
-          const int scale_mn = SwapAB ? N : M;
           const int scale_k = (K + args.chunk_size - 1) / args.chunk_size;
-          constexpr int min_tma_aligned_elements_scale = tma_alignment_bits / cutlass::sizeof_bits<ElementScale>::value;
-          implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scale>(
-                                               cute::make_shape(scale_mn, scale_k, L), StrideScale{});
+          constexpr int min_tma_aligned_elements_scaleA = tma_alignment_bits / cutlass::sizeof_bits<ScaleA>::value;
+          constexpr int min_tma_aligned_elements_scaleB = tma_alignment_bits / cutlass::sizeof_bits<ScaleB>::value;
+          implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scaleA>(
+                                               cute::make_shape(M, scale_k, L), StrideScaleA{});
+          implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_scaleB>(
+                                               cute::make_shape(N, scale_k % 4 == 0 ? scale_k : scale_k * 4, L),
+                                               StrideScaleB{});  // scale_k need padding to 4
           implementable = implementable && (args.chunk_size == K || ((args.chunk_size % size<2>(TileShape{})) == 0));
           implementable = implementable && args.chunk_size != 0;
-          implementable = implementable && (args.ptr_S != nullptr);
+          implementable = implementable && (args.ptr_SA != nullptr);
+          implementable = implementable && (args.ptr_SB != nullptr);
           if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
             implementable = implementable && (args.ptr_Z == nullptr);
           } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
             constexpr int min_tma_aligned_elements_zero = tma_alignment_bits / cutlass::sizeof_bits<ElementZero>::value;
             implementable = implementable && cutlass::detail::check_alignment<min_tma_aligned_elements_zero>(
-                                                 cute::make_shape(scale_mn, scale_k, L), StrideScale{});
+                                                 cute::make_shape(M, scale_k, L), StrideScaleA{});
             implementable = implementable && (args.ptr_Z != nullptr);
           } else {
             static_assert(
@@ -713,14 +789,21 @@ struct CollectiveMmaArrayMixedInput<
       // auto scale_k = K / mainloop_params.chunk_size;
       auto scale_k = K / GROUP_SIZE;
 
-      Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M, scale_k, L));  // (m,scale_k,l)
-      Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
+      Tensor mSA_mkl = mainloop_params.tma_load_scaleA.get_tma_tensor(make_shape(M, scale_k, L));  // (m,scale_k,l)
+      Tensor gSA_mkl = local_tile(mSA_mkl, ScaleATileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
+
+      // Tensor mSB_nkl = mainloop_params.tma_load_scaleB.get_tma_tensor(make_shape(N, scale_k, L));  // (n,scale_k,l)
+      Tensor mSB_nkl = mainloop_params.tma_load_scaleB.get_tma_tensor(shape(detail::get_gmem_layout(
+          make_shape(N, scale_k % 4 == 0 ? scale_k : scale_k * 4, L),
+          mainloop_params.dSB[0])));  // (m,k,l) scale_k need padding to 4 for B scale
+
+      Tensor gSB_nkl = local_tile(mSB_nkl, ScaleBTileShape{}, make_coord(_, _));  // (BLK_N,BLK_Scale_K,n,scale_k,l)
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl);
+        return cute::make_tuple(gA_mkl, gB_nkl, gSA_mkl, gSB_nkl);
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor mZ_mkl = mainloop_params.tma_load_zero.get_tma_tensor(make_shape(M, scale_k, L));  // (m,scale_k,l)
-        Tensor gZ_mkl = local_tile(mZ_mkl, ScaleTileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
-        return cute::make_tuple(gA_mkl, gB_nkl, gS_mkl, gZ_mkl);
+        Tensor gZ_mkl = local_tile(mZ_mkl, ScaleATileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
+        return cute::make_tuple(gA_mkl, gB_nkl, gSA_mkl, gSB_nkl, gZ_mkl);
       } else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in load_init.");
       }
@@ -749,11 +832,11 @@ struct CollectiveMmaArrayMixedInput<
       static_assert(sizeof...(Ts) == 2, "Direct convert needs two inputs");
       static_assert(sizeof...(TMs) == 2, "Direct convert needs two tensormaps");
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      static_assert(sizeof...(Ts) == 3, "Scaled convert needs three inputs");
-      static_assert(sizeof...(TMs) == 3, "Scaled convert needs three tensormaps");
+      static_assert(sizeof...(Ts) == 4, "Scaled convert needs four inputs");
+      static_assert(sizeof...(TMs) == 4, "Scaled convert needs four tensormaps");
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      static_assert(sizeof...(Ts) == 4, "Scaled and zero convert needs four inputs");
-      static_assert(sizeof...(TMs) == 4, "Scaled and zero convert needs four tensormaps");
+      static_assert(sizeof...(Ts) == 5, "Scaled and zero convert needs five inputs");
+      static_assert(sizeof...(TMs) == 5, "Scaled and zero convert needs five tensormaps");
     } else {
       static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in TMA load.");
     }
@@ -790,7 +873,8 @@ struct CollectiveMmaArrayMixedInput<
 
     uint16_t mcast_mask_a = 0;
     uint16_t mcast_mask_b = 0;
-    uint16_t mcast_mask_s = 0;
+    uint16_t mcast_mask_sA = 0;
+    uint16_t mcast_mask_sB = 0;
 
     // Issue TmaLoads
     // Maps the tile -> block, value
@@ -809,7 +893,7 @@ struct CollectiveMmaArrayMixedInput<
     }
 
     auto extra_input_partitions = Utils::partition_extra_tma_inputs(
-        mainloop_params, load_inputs, shared_tensors, cluster_local_block_id, m_coord, l_coord);
+        mainloop_params, load_inputs, shared_tensors, cluster_local_block_id, m_coord, n_coord, l_coord);
 
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
@@ -839,8 +923,11 @@ struct CollectiveMmaArrayMixedInput<
         // Nothing extra to do.
       } else if constexpr (ModeHasScales) {
         // scale copy
-        auto tSgS = get<0>(extra_input_partitions);
-        auto tSsS = get<1>(extra_input_partitions);
+        auto tSgSA = get<0>(extra_input_partitions);
+        auto tSsSA = get<1>(extra_input_partitions);
+
+        auto tSgSB = get<2>(extra_input_partitions);
+        auto tSsSB = get<3>(extra_input_partitions);
 
         // Temporary factor which will determine which k tile to reload from gmem. Needed so we don't modify tma
         // transaction bytes on the fly. We must do a ceiling divide here to correctly handle with chunk_size == K. In
@@ -850,20 +937,24 @@ struct CollectiveMmaArrayMixedInput<
         // chunk_size == K.
         if (cute::elect_one_sync()) {
           copy(
-              mainloop_params.tma_load_scale.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_s),
-              tSgS(_, _, _, scale_load_k),
-              tSsS(_, _, _, write_stage));
+              mainloop_params.tma_load_scaleA.with(get<2>(input_tensormaps), *tma_barrier, mcast_mask_sA),
+              tSgSA(_, _, _, scale_load_k),
+              tSsSA(_, _, _, write_stage));
+          copy(
+              mainloop_params.tma_load_scaleB.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_sB),
+              tSgSB(_, _, _, *k_tile_iter),
+              tSsSB(_, _, _, write_stage));
         }
 
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
           // zero copy
-          auto tZgZ = get<2>(extra_input_partitions);
-          auto tZsZ = get<3>(extra_input_partitions);
+          auto tZgZ = get<4>(extra_input_partitions);
+          auto tZsZ = get<5>(extra_input_partitions);
           if (cute::elect_one_sync()) {
             copy(
-                mainloop_params.tma_load_zero.with(get<3>(input_tensormaps), *tma_barrier, mcast_mask_s),
+                mainloop_params.tma_load_zero.with(get<4>(input_tensormaps), *tma_barrier, mcast_mask_sA),
                 tZgZ(_, _, _, scale_load_k),
                 tZsZ(_, _, _, write_stage));
           }
@@ -927,6 +1018,9 @@ struct CollectiveMmaArrayMixedInput<
     Tensor sA = as_position_independent_swizzle_tensor(sA_);                                // (BLK_M,BLK_K,PIPE)
 
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});  // (BLK_N,BLK_K,PIPE)
+
+    constexpr int BLK_N = size<0>(SmemLayoutScaleB{});
+    constexpr int BLK_scaleK = size<1>(SmemLayoutScaleB{});
 
     //
     // Define C accumulators and A/B partitioning
@@ -1058,6 +1152,31 @@ struct CollectiveMmaArrayMixedInput<
         }
       }
 
+      constexpr int n_mma = cute::size<0>(sB.shape())() / 8;
+      float4 scale_b_per_n_e0[n_mma];
+      float4 scale_b_per_n_e1[n_mma];
+      uint32_t lane_id;
+      asm("mov.u32 %0, %laneid;" : "=r"(lane_id));
+      int in_blk_c = (lane_id & 3) * 2;
+      auto smem_scaleB_stage = shared_tensors.smem_scaleB.begin() + read_stage * BLK_N * BLK_scaleK;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < size<0, 2>(accum); ++n) {
+        int col_base = (n << 3) + in_blk_c;
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e0[n].x),
+                       "=f"(scale_b_per_n_e0[n].y),
+                       "=f"(scale_b_per_n_e0[n].z),
+                       "=f"(scale_b_per_n_e0[n].w)
+                     : "l"(smem_scaleB_stage + 4 * col_base));
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e1[n].x),
+                       "=f"(scale_b_per_n_e1[n].y),
+                       "=f"(scale_b_per_n_e1[n].z),
+                       "=f"(scale_b_per_n_e1[n].w)
+                     : "l"(smem_scaleB_stage + 4 * (col_base + 1))  // +1
+        );
+      }
       warpgroup_wait<0>();
 
       CUTLASS_PRAGMA_UNROLL
@@ -1066,23 +1185,31 @@ struct CollectiveMmaArrayMixedInput<
 
         // Apply the group-wise scaling
         // tCrS  ((4, _2, _2), MMA_M, _1)
-        // accum ((2, _2, _2), MMA_M, _1)
+        // accum ((_2, _2, n), MMA_M, _1)
         auto tCrS = cute::get<1>(partitioned_extra_info);
         for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+          CUTLASS_PRAGMA_UNROLL
           for (int m = 0; m < size<0, 1>(accum); m++) {
-            for (int n = 0; n < size<0, 2>(accum); n++) {
-              for (int e = 0; e < size<0, 0>(accum); e++) {
-                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+            float sA = static_cast<float>(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[chunk_id_]);
 
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < size<0, 2>(accum); n++) {
+              float sb_e0 = ((float*)&(scale_b_per_n_e0[n]))[chunk_id_];
+              float sb_e1 = ((float*)&(scale_b_per_n_e1[n]))[chunk_id_];
+              {
+                auto accum_coord = make_coord(make_tuple(0, m, n), mma_m, 0);
                 if (chunk_id_ == 0) {
-                  accum(accum_coord) =
-                      intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
+                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * sA * sb_e0;
                 } else {
-                  accum(accum_coord) =
-                      fma(intermediate_array[chunk_id_](accum_coord),
-                          static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                          accum(accum_coord));
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), sA * sb_e0, accum(accum_coord));
+                }
+              }
+              {
+                auto accum_coord = make_coord(make_tuple(1, m, n), mma_m, 0);
+                if (chunk_id_ == 0) {
+                  accum(accum_coord) = intermediate_array[chunk_id_](accum_coord) * sA * sb_e1;
+                } else {
+                  accum(accum_coord) = fma(intermediate_array[chunk_id_](accum_coord), sA * sb_e1, accum(accum_coord));
                 }
               }
             }
@@ -1132,6 +1259,35 @@ struct CollectiveMmaArrayMixedInput<
       int read_stage = smem_pipe_read.index();
       ++smem_pipe_read;
 
+      constexpr int n_mma = cute::size<0>(sB.shape())() / 8;
+      float4 scale_b_per_n_e0[n_mma];
+      float4 scale_b_per_n_e1[n_mma];
+
+      uint32_t lane_id;
+      asm("mov.u32 %0, %laneid;" : "=r"(lane_id));
+      int in_blk_c = (lane_id & 3) * 2;
+      auto smem_scaleB_stage = shared_tensors.smem_scaleB.begin() + read_stage * BLK_N * BLK_scaleK;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < size<0, 2>(accum); ++n) {
+        int col_base = (n << 3) + in_blk_c;
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e0[n].x),
+                       "=f"(scale_b_per_n_e0[n].y),
+                       "=f"(scale_b_per_n_e0[n].z),
+                       "=f"(scale_b_per_n_e0[n].w)
+                     : "l"(smem_scaleB_stage + 4 * col_base)  // +0
+        );
+
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e1[n].x),
+                       "=f"(scale_b_per_n_e1[n].y),
+                       "=f"(scale_b_per_n_e1[n].z),
+                       "=f"(scale_b_per_n_e1[n].w)
+                     : "l"(smem_scaleB_stage + 4 * (col_base + 1))  // +1
+        );
+      }
+
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
@@ -1168,16 +1324,23 @@ struct CollectiveMmaArrayMixedInput<
               // Apply the group-wise scaling
               auto tCrS = cute::get<1>(partitioned_extra_info);
               for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+                CUTLASS_PRAGMA_UNROLL
                 for (int m = 0; m < size<0, 1>(accum); m++) {
-                  for (int n = 0; n < size<0, 2>(accum); n++) {
-                    for (int e = 0; e < size<0, 0>(accum); e++) {
-                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                  float sA = static_cast<float>(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[chunk_id_]);
 
+                  CUTLASS_PRAGMA_UNROLL
+                  for (int n = 0; n < size<0, 2>(accum); n++) {
+                    float sb_e0 = ((float*)&(scale_b_per_n_e0[n]))[chunk_id_];
+                    float sb_e1 = ((float*)&(scale_b_per_n_e1[n]))[chunk_id_];
+                    {
+                      auto accum_coord = make_coord(make_tuple(0, m, n), mma_m, 0);
                       accum(accum_coord) =
-                          fma(intermediate_array[chunk_id_](accum_coord),
-                              static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                              accum(accum_coord));
+                          fma(intermediate_array[chunk_id_](accum_coord), sA * sb_e0, accum(accum_coord));
+                    }
+                    {
+                      auto accum_coord = make_coord(make_tuple(1, m, n), mma_m, 0);
+                      accum(accum_coord) =
+                          fma(intermediate_array[chunk_id_](accum_coord), sA * sb_e1, accum(accum_coord));
                     }
                   }
                 }
@@ -1229,6 +1392,35 @@ struct CollectiveMmaArrayMixedInput<
 
       int read_stage = smem_pipe_read.index();
 
+      constexpr int n_mma = cute::size<0>(sB.shape())() / 8;
+      float4 scale_b_per_n_e0[n_mma];
+      float4 scale_b_per_n_e1[n_mma];
+
+      uint32_t lane_id;
+      asm("mov.u32 %0, %laneid;" : "=r"(lane_id));
+      int in_blk_c = (lane_id & 3) * 2;
+      auto smem_scaleB_stage = shared_tensors.smem_scaleB.begin() + read_stage * BLK_N * BLK_scaleK;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < size<0, 2>(accum); ++n) {
+        int col_base = (n << 3) + in_blk_c;
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e0[n].x),
+                       "=f"(scale_b_per_n_e0[n].y),
+                       "=f"(scale_b_per_n_e0[n].z),
+                       "=f"(scale_b_per_n_e0[n].w)
+                     : "l"(smem_scaleB_stage + 4 * col_base)  // +0
+        );
+
+        asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(scale_b_per_n_e1[n].x),
+                       "=f"(scale_b_per_n_e1[n].y),
+                       "=f"(scale_b_per_n_e1[n].z),
+                       "=f"(scale_b_per_n_e1[n].w)
+                     : "l"(smem_scaleB_stage + 4 * (col_base + 1))  // +1
+        );
+      }
+
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
       // Unroll the K mode manually to set scale D to 1
@@ -1269,15 +1461,22 @@ struct CollectiveMmaArrayMixedInput<
           // Apply the group-wise scaling
           auto tCrS = cute::get<1>(partitioned_extra_info);
           for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            CUTLASS_PRAGMA_UNROLL
             for (int m = 0; m < size<0, 1>(accum); m++) {
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                  int scale_idx = k_block / NumMMAsPerChunk;
+              int scale_idx = k_block / NumMMAsPerChunk;
+              float sA = static_cast<float>(tCrS(make_coord(make_tuple(0, m, 0), mma_m, 0))[scale_idx]);
 
-                  accum(accum_coord) = fma(
-                      intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                float sb_e0 = ((float*)&(scale_b_per_n_e0[n]))[scale_idx];
+                float sb_e1 = ((float*)&(scale_b_per_n_e1[n]))[scale_idx];
+                {
+                  auto accum_coord = make_coord(make_tuple(0, m, n), mma_m, 0);
+                  accum(accum_coord) = fma(intermediate(accum_coord), sA * sb_e0, accum(accum_coord));
+                }
+                {
+                  auto accum_coord = make_coord(make_tuple(1, m, n), mma_m, 0);
+                  accum(accum_coord) = fma(intermediate(accum_coord), sA * sb_e1, accum(accum_coord));
                 }
               }
             }
@@ -1313,8 +1512,9 @@ struct CollectiveMmaArrayMixedInput<
 
     cute::TmaDescriptor* tma_desc_a = &gmem_tensormap[sm_idx];
     cute::TmaDescriptor* tma_desc_b = &gmem_tensormap[sm_idx + sm_count];
-    cute::TmaDescriptor* tma_desc_scale = &gmem_tensormap[sm_idx + 2 * sm_count];
-    cute::TmaDescriptor* tma_desc_zero = &gmem_tensormap[sm_idx + 3 * sm_count];
+    cute::TmaDescriptor* tma_desc_scaleA = &gmem_tensormap[sm_idx + 2 * sm_count];
+    cute::TmaDescriptor* tma_desc_scaleB = &gmem_tensormap[sm_idx + 3 * sm_count];
+    cute::TmaDescriptor* tma_desc_zero = &gmem_tensormap[sm_idx + 4 * sm_count];
 
     // Bringing tensormaps from params to smem for modification later
     Tensor pA_tensormap = make_tensor(mainloop_params.tma_load_a.get_tma_descriptor(), Int<1>{}, Int<1>{});
@@ -1328,10 +1528,14 @@ struct CollectiveMmaArrayMixedInput<
     }
 
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      Tensor pS_tensormap = make_tensor(mainloop_params.tma_load_scale.get_tma_descriptor(), Int<1>{}, Int<1>{});
-      Tensor sS_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_scale), Int<1>{}, Int<1>{});
+      Tensor pSA_tensormap = make_tensor(mainloop_params.tma_load_scaleA.get_tma_descriptor(), Int<1>{}, Int<1>{});
+      Tensor sSA_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_scaleA), Int<1>{}, Int<1>{});
+
+      Tensor pSB_tensormap = make_tensor(mainloop_params.tma_load_scaleB.get_tma_descriptor(), Int<1>{}, Int<1>{});
+      Tensor sSB_tensormap = make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_scaleB), Int<1>{}, Int<1>{});
       if (cute::elect_one_sync()) {
-        copy(recast<uint128_t>(pS_tensormap), recast<uint128_t>(sS_tensormap));
+        copy(recast<uint128_t>(pSA_tensormap), recast<uint128_t>(sSA_tensormap));
+        copy(recast<uint128_t>(pSB_tensormap), recast<uint128_t>(sSB_tensormap));
       }
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       Tensor pZ_tensormap = make_tensor(mainloop_params.tma_load_zero.get_tma_descriptor(), Int<1>{}, Int<1>{});
@@ -1349,9 +1553,9 @@ struct CollectiveMmaArrayMixedInput<
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple(tma_desc_a, tma_desc_b);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale);
+      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scaleA, tma_desc_scaleB);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scale, tma_desc_zero);
+      return cute::make_tuple(tma_desc_a, tma_desc_b, tma_desc_scaleA, tma_desc_scaleB, tma_desc_zero);
     } else {
       static_assert(
           cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_init.");
@@ -1369,7 +1573,9 @@ struct CollectiveMmaArrayMixedInput<
         shared_tensormaps.smem_tensormap_B, mainloop_params.ptr_B[next_batch]);
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       cute::tma_descriptor_replace_addr_in_shared_mem(
-          shared_tensormaps.smem_tensormap_scale, mainloop_params.ptr_S[next_batch]);
+          shared_tensormaps.smem_tensormap_scaleA, mainloop_params.ptr_SA[next_batch]);
+      cute::tma_descriptor_replace_addr_in_shared_mem(
+          shared_tensormaps.smem_tensormap_scaleB, mainloop_params.ptr_SB[next_batch]);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       cute::tma_descriptor_replace_addr_in_shared_mem(
           shared_tensormaps.smem_tensormap_zero, mainloop_params.ptr_Z[next_batch]);
@@ -1397,8 +1603,10 @@ struct CollectiveMmaArrayMixedInput<
     cute::array<uint64_t, MaxTensorRank> prob_stride_A = {0, 0, 0, 0, 0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_B = {1, 1, 1, 1, 1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0, 0, 0, 0, 0};
-    cute::array<uint32_t, MaxTensorRank> prob_shape_scale = {1, 1, 1, 1, 1};
-    cute::array<uint64_t, MaxTensorRank> prob_stride_scale = {0, 0, 0, 0, 0};
+    cute::array<uint32_t, MaxTensorRank> prob_shape_scaleA = {1, 1, 1, 1, 1};
+    cute::array<uint64_t, MaxTensorRank> prob_stride_scaleA = {0, 0, 0, 0, 0};
+    cute::array<uint32_t, MaxTensorRank> prob_shape_scaleB = {1, 1, 1, 1, 1};
+    cute::array<uint64_t, MaxTensorRank> prob_stride_scaleB = {0, 0, 0, 0, 0};
     cute::array<uint32_t, MaxTensorRank> prob_shape_zero = {1, 1, 1, 1, 1};
     cute::array<uint64_t, MaxTensorRank> prob_stride_zero = {0, 0, 0, 0, 0};
 
@@ -1414,19 +1622,28 @@ struct CollectiveMmaArrayMixedInput<
     cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, prob_shape_B, prob_stride_B);
 
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      NonVoidElementScale const* ptr_S = nullptr;
+      NonVoidElementScaleA const* ptr_SA = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
       auto scale_k = K / GROUP_SIZE;
-      Tensor tensor_scale =
-          make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
+      Tensor tensor_scaleA = make_tensor(
+          detail::get_logical_ptr(ptr_SA), make_shape(M, scale_k, Int<1>{}), mainloop_params.dSA[next_group]);
+
+      NonVoidElementScaleB const* ptr_SB = nullptr;
+      Tensor tensor_scaleB = make_tensor(
+          detail::get_logical_ptr(ptr_SB),
+          make_shape(N, scale_k % 4 == 0 ? scale_k : scale_k * 4, Int<1>{}),
+          mainloop_params.dSB[next_group]);  // scale_k need padding to 4 for B scale
+
       cute::detail::fill_tma_gmem_shape_stride(
-          mainloop_params.tma_load_scale, tensor_scale, prob_shape_scale, prob_stride_scale);
+          mainloop_params.tma_load_scaleA, tensor_scaleA, prob_shape_scaleA, prob_stride_scaleA);
+      cute::detail::fill_tma_gmem_shape_stride(
+          mainloop_params.tma_load_scaleB, tensor_scaleB, prob_shape_scaleB, prob_stride_scaleB);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       ElementZero const* ptr_Z = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
       auto scale_k = K / GROUP_SIZE;
-      Tensor tensor_zero =
-          make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
+      Tensor tensor_zero = make_tensor(
+          detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}), mainloop_params.dSA[next_group]);
       cute::detail::fill_tma_gmem_shape_stride(
           mainloop_params.tma_load_zero, tensor_zero, prob_shape_zero, prob_stride_zero);
     } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
@@ -1442,11 +1659,14 @@ struct CollectiveMmaArrayMixedInput<
     for (uint64_t& stride : prob_stride_B) {
       stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
     }
-    for (uint64_t& stride : prob_stride_scale) {
-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+    for (uint64_t& stride : prob_stride_scaleA) {
+      stride = (stride * sizeof_bits_v<NonVoidElementScaleA>) / 8;
+    }
+    for (uint64_t& stride : prob_stride_scaleB) {
+      stride = (stride * sizeof_bits_v<NonVoidElementScaleB>) / 8;
     }
     for (uint64_t& stride : prob_stride_zero) {
-      stride = (stride * sizeof_bits_v<NonVoidElementScale>) / 8;
+      stride = (stride * sizeof_bits_v<NonVoidElementScaleA>) / 8;
     }
 
     cute::tma_descriptor_replace_dims_strides_in_shared_mem(
@@ -1456,7 +1676,9 @@ struct CollectiveMmaArrayMixedInput<
 
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       cute::tma_descriptor_replace_dims_strides_in_shared_mem(
-          shared_tensormaps.smem_tensormap_scale, prob_shape_scale, prob_stride_scale);
+          shared_tensormaps.smem_tensormap_scaleA, prob_shape_scaleA, prob_stride_scaleA);
+      cute::tma_descriptor_replace_dims_strides_in_shared_mem(
+          shared_tensormaps.smem_tensormap_scaleB, prob_shape_scaleB, prob_stride_scaleB);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       cute::tma_descriptor_replace_dims_strides_in_shared_mem(
           shared_tensormaps.smem_tensormap_zero, prob_shape_zero, prob_stride_zero);
@@ -1496,9 +1718,10 @@ struct CollectiveMmaArrayMixedInput<
     tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
     tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      tma_descriptor_cp_fence_release(get<2>(input_tensormaps), shared_tensormaps.smem_tensormap_scale);
+      tma_descriptor_cp_fence_release(get<2>(input_tensormaps), shared_tensormaps.smem_tensormap_scaleA);
+      tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_scaleB);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      tma_descriptor_cp_fence_release(get<3>(input_tensormaps), shared_tensormaps.smem_tensormap_zero);
+      tma_descriptor_cp_fence_release(get<4>(input_tensormaps), shared_tensormaps.smem_tensormap_zero);
     } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
       static_assert(
           cutlass::detail::dependent_false<KernelSchedule>,
@@ -1513,8 +1736,9 @@ struct CollectiveMmaArrayMixedInput<
     cute::tma_descriptor_fence_acquire(get<1>(input_tensormaps));
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       cute::tma_descriptor_fence_acquire(get<2>(input_tensormaps));
-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       cute::tma_descriptor_fence_acquire(get<3>(input_tensormaps));
+    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
+      cute::tma_descriptor_fence_acquire(get<4>(input_tensormaps));
     } else if constexpr (KernelConversionMode != ConversionMode::DirectConvert) {
       static_assert(
           cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in tensormaps_fence_acquire.");

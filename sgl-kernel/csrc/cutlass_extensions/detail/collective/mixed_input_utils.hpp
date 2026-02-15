@@ -32,26 +32,41 @@ struct MixedGroupedGemmInputUtils {
   using ConversionMode = typename Collective::ConversionMode;
   using SmemLayoutA = typename Collective::SmemLayoutA;
   using SmemLayoutB = typename Collective::SmemLayoutB;
-  using SmemLayoutScale = typename Collective::SmemLayoutScale;
+  using SmemLayoutScaleA = typename Collective::SmemLayoutScaleA;
+  using SmemLayoutScaleB = typename Collective::SmemLayoutScaleB;
   using SwappedElementA = typename Collective::SwappedElementA;
   using SwappedElementB = typename Collective::SwappedElementB;
   using RealSwappedElementA = typename Collective::RealSwappedElementA;
   using RealSwappedElementB = typename Collective::RealSwappedElementB;
-  using ElementScale = typename Collective::ElementScale;
+  using ScaleA = typename Collective::ScaleA;
+  using ScaleB = typename Collective::ScaleB;
+  using ElementScale = typename Collective::ScaleA;
+
   using ElementZero = typename Collective::ElementZero;
-  using SmemCopyAtomScale = typename Collective::SmemCopyAtomScale;
+  using SmemCopyAtomScaleA = typename Collective::SmemCopyAtomScaleA;
+  using SmemCopyAtomScaleB = typename Collective::SmemCopyAtomScaleB;
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
 
  public:
-  static constexpr auto elements_per_smem_scale() {
+  static constexpr auto elements_per_smem_scaleA() {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     } else if constexpr (ModeHasScales) {
-      return cute::cosize_v<SmemLayoutScale>;
+      return cute::cosize_v<SmemLayoutScaleA>;
     } else {
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scaleA smem allocation.");
+    }
+  }
+
+  static constexpr auto elements_per_smem_scaleB() {
+    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+      return 0;
+    } else if constexpr (ModeHasScales) {
+      return cute::cosize_v<SmemLayoutScaleB>;
+    } else {
+      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scaleB smem allocation.");
     }
   }
 
@@ -61,9 +76,10 @@ struct MixedGroupedGemmInputUtils {
         KernelConversionMode == ConversionMode::ConvertAndScale) {
       return 0;
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-      return cute::cosize_v<SmemLayoutScale>;
+      return cute::cosize_v<SmemLayoutScaleA>;
     } else {
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in scale smem allocation.");
+      static_assert(
+          cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in zero_point smem allocation.");
     }
   }
 
@@ -82,19 +98,25 @@ struct MixedGroupedGemmInputUtils {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     } else if constexpr (ModeHasScales) {
-      constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(
-          size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
-          static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
-      static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned.");  // required by TMA
+      constexpr uint32_t scaleA_tx_bytes = cutlass::bits_to_bytes(
+          size<0>(SmemLayoutScaleA{}) * size<1>(SmemLayoutScaleA{}) *
+          static_cast<uint32_t>(cute::sizeof_bits_v<ScaleA>));
+      static_assert(scaleA_tx_bytes % 128 == 0, "Each scaleA stage must be 128B aligned.");  // required by TMA
+
+      constexpr uint32_t scaleB_tx_bytes = cutlass::bits_to_bytes(
+          size<0>(SmemLayoutScaleB{}) * size<1>(SmemLayoutScaleB{}) *
+          static_cast<uint32_t>(cute::sizeof_bits_v<ScaleB>));
+      static_assert(scaleB_tx_bytes % 128 == 0, "Each scaleB stage must be 128B aligned.");  // required by TMA
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return scale_tx_bytes;
+        return scaleA_tx_bytes + scaleB_tx_bytes;
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
         constexpr uint32_t zero_tx_bytes = cutlass::bits_to_bytes(
-            size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
+            size<0>(SmemLayoutScaleA{}) * size<1>(SmemLayoutScaleA{}) *
             static_cast<uint32_t>(cute::sizeof_bits_v<ElementZero>));
         static_assert(zero_tx_bytes % 128 == 0, "Each zero stage must be 128B aligned.");  // required by TMA
-        return scale_tx_bytes + zero_tx_bytes;
+        return scaleA_tx_bytes + scaleB_tx_bytes + zero_tx_bytes;
       } else {
         static_assert(
             cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in tma transaction bytes computation.");
@@ -129,7 +151,7 @@ struct MixedGroupedGemmInputUtils {
         if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
           // Nothing extra to do
         } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-          auto tCsZ = cute::get<2>(partitioned_mma_extra_info);
+          auto tCsZ = cute::get<4>(partitioned_mma_extra_info);
           auto tCrZ_copy_view = cute::get<2>(tiled_copy_and_views);
           copy(smem_tiled_copy_S, tCsZ(_, _, k_block, read_stage), tCrZ_copy_view(_, _, k_block));
         } else {
@@ -383,30 +405,44 @@ struct MixedGroupedGemmInputUtils {
       TensorStorage& shared_tensors,
       uint2 const& cluster_local_block_id,
       int const m_coord,
+      int const n_coord,
       int const l_coord) {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple();
     } else if constexpr (ModeHasScales) {
-      Tensor sS =
-          make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_K,PIPE)
-      Tensor gS_mkl = get<2>(load_inputs);
-      auto block_tma_s = mainloop_params.tma_load_scale.get_slice(cluster_local_block_id.y);
-      Tensor gS = gS_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
+      Tensor sSA =
+          make_tensor(make_smem_ptr(shared_tensors.smem_scaleA.begin()), SmemLayoutScaleA{});  // (BLK_M,BLK_K,PIPE)
+      Tensor gSA_mkl = get<2>(load_inputs);
+      auto block_tma_sA = mainloop_params.tma_load_scaleA.get_slice(cluster_local_block_id.y);
+      Tensor gSA = gSA_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
 
-      Tensor tSgS = block_tma_s.partition_S(gS);  // (TMA,TMA_M,TMA_K,k)
-      Tensor tSsS = block_tma_s.partition_D(sS);  // (TMA,TMA_M,TMA_K,PIPE)
+      Tensor tSgSA = block_tma_sA.partition_S(gSA);  // (TMA,TMA_M,TMA_K,k)
+      Tensor tSsSA = block_tma_sA.partition_D(sSA);  // (TMA,TMA_M,TMA_K,PIPE)
+
+      Tensor sSB =
+          make_tensor(make_smem_ptr(shared_tensors.smem_scaleB.begin()), SmemLayoutScaleB{});  // (BLK_N,BLK_K,PIPE)
+      Tensor gSB_mkl = get<3>(load_inputs);
+      auto block_tma_sB = mainloop_params.tma_load_scaleB.get_slice(cluster_local_block_id.x);
+      Tensor gSB = gSB_mkl(_, _, n_coord, _, l_coord);  // (BLK_N,BLK_K,k)
+
+      Tensor tSgSB = block_tma_sB.partition_S(gSB);  // (TMA,TMA_N,TMA_K,k)
+      Tensor tSsSB = block_tma_sB.partition_D(sSB);  // (TMA,TMA_N,TMA_K,PIPE)
+
+      CUTE_STATIC_ASSERT_V(size<1>(tSgSA(_, _, 0, 0)) == size<1>(tSsSA(_, _, 0, 0)));
+      CUTE_STATIC_ASSERT_V(size<1>(tSgSB(_, _, 0, 0)) == size<1>(tSsSB(_, _, 0, 0)));
+
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return cute::make_tuple(tSgS, tSsS);
+        return cute::make_tuple(tSgSA, tSsSA, tSgSB, tSsSB);
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ =
-            make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});  // (BLK_M,BLK_K,PIPE)
-        Tensor gZ_mkl = get<3>(load_inputs);
+            make_tensor(make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScaleA{});  // (BLK_M,BLK_K,PIPE)
+        Tensor gZ_mkl = get<4>(load_inputs);
         auto block_tma_z = mainloop_params.tma_load_zero.get_slice(cluster_local_block_id.y);
         Tensor gZ = gZ_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
 
         Tensor tZgZ = block_tma_z.partition_S(gZ);  // (TMA,TMA_M,TMA_K,k)
         Tensor tZsZ = block_tma_z.partition_D(sZ);  // (TMA,TMA_M,TMA_K,PIPE)
-        return cute::make_tuple(tSgS, tSsS, tZgZ, tZsZ);
+        return cute::make_tuple(tSgSA, tSsSA, tSgSB, tSsSB, tZgZ, tZsZ);
       } else {
         static_assert(
             cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled for input partitioning.");
@@ -425,15 +461,15 @@ struct MixedGroupedGemmInputUtils {
       // nothing to do
       return cute::make_tuple();
     } else if constexpr (UseScaleLookupTable) {
-      Tensor sS =
-          make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
+      Tensor sS = make_tensor(
+          make_smem_ptr(shared_tensors.smem_scaleA.begin()), SmemLayoutScaleA{});  // (BLK_M,BLK_SCALE_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
       Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
 
       return cute::make_tuple(tCsS, tCrS);
     } else if constexpr (ModeHasScales) {
-      Tensor sS =
-          make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
+      Tensor sS = make_tensor(
+          make_smem_ptr(shared_tensors.smem_scaleA.begin()), SmemLayoutScaleA{});  // (BLK_M,BLK_SCALE_K,PIPE)
       Tensor tCsS = mma_thread_slice.partition_A(sS);
       Tensor tCrS = make_tensor<ElementScale>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
 
@@ -441,7 +477,7 @@ struct MixedGroupedGemmInputUtils {
         return cute::make_tuple(tCsS, tCrS);
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         Tensor sZ = make_tensor(
-            make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScale{});  // (BLK_M,BLK_SCALE_K,PIPE)
+            make_smem_ptr(shared_tensors.smem_zero.begin()), SmemLayoutScaleA{});  // (BLK_M,BLK_SCALE_K,PIPE)
         Tensor tCsZ = mma_thread_slice.partition_A(sZ);
         Tensor tCrZ = make_tensor<ElementZero>(mma_thread_slice.partition_fragment_A(sZ(_, _, Int<0>{})).layout());
         return cute::make_tuple(tCsS, tCrS, tCsZ, tCrZ);
@@ -461,14 +497,14 @@ struct MixedGroupedGemmInputUtils {
       // nothing to do
       return cute::make_tuple();
     } else if constexpr (ModeHasScales) {
-      auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScale{}, tiled_mma);
+      auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScaleA{}, tiled_mma);
       auto smem_thr_copy_S = smem_tiled_copy_S.get_thread_slice(warp_group_thread_idx);
       Tensor tCrS_copy_view = smem_thr_copy_S.retile_D(cute::get<1>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
 
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view);
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
-        Tensor tCrZ_copy_view = smem_thr_copy_S.retile_D(cute::get<3>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
+        Tensor tCrZ_copy_view = smem_thr_copy_S.retile_D(cute::get<5>(partitioned_extra_info));  // (CPY,CPY_M,CPY_K)
         return cute::make_tuple(smem_tiled_copy_S, tCrS_copy_view, tCrZ_copy_view);
       } else {
         static_assert(cutlass::detail::dependent_false<KernelSchedule>, "Conversion mode not handled in A -> RF path.");
