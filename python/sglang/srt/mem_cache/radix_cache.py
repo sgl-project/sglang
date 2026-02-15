@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
+    SLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 
@@ -298,9 +299,12 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
+        elif self.eviction_policy == "slru":
+            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
+
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
             )
 
         self.evictable_leaves = set()
@@ -655,6 +659,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            child.hit_count += 1
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -675,6 +680,7 @@ class RadixCache(BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        new_node.hit_count = child.hit_count
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -709,6 +715,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
+            node.hit_count += 1
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -729,6 +736,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            new_node.hit_count = 1
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
