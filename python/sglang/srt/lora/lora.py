@@ -102,13 +102,24 @@ class LoRAAdapter(nn.Module):
             self.config.target_modules
         )
 
+        # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
+        # recognized and loaded into the correct buffer.
+        if "unembed_tokens" in name:
+            name = name.replace("unembed_tokens", "lm_head")
+
         layer_id = get_layer_id(name)
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
-            # Check if this module is declared in target_modules before loading
+            # Check if this module is declared in target_modules before loading.
+            # When normalized_target_modules is {"all"} (e.g. target_modules was
+            # "all-linear"), we allow loading since the server-level
+            # --lora-target-modules will govern which modules are active.
             module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
-            if module_name in normalized_target_modules:
+            if (
+                "all" in normalized_target_modules
+                or module_name in normalized_target_modules
+            ):
                 self.embedding_layers[name] = loaded_weight.cpu()
             else:
                 logger.debug(

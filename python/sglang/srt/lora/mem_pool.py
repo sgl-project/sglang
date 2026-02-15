@@ -115,6 +115,8 @@ class LoRAMemoryPool:
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
             target_module_names = get_normalized_target_modules(config.target_modules)
+            if "all" in target_module_names:
+                return True
             return target_module_names.issubset(self.target_modules)
 
         if isinstance(config, LoRAConfig):
