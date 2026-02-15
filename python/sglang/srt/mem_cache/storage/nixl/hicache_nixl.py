@@ -142,7 +142,7 @@ class HiCacheNixl(HiCacheStorage):
             storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
             host_descs = self.agent.get_xfer_descs(buffers)
 
-            if direction == "READ" or direction == "WRITE":
+            if direction in ("READ", "WRITE"):
                 # register buffer to avoid calling initialize_xfer twice due to missing registration
                 self.register_buffers(buffers)
 
@@ -152,7 +152,7 @@ class HiCacheNixl(HiCacheStorage):
                 [(x[0], x[1], 0) for x in buffers], "DRAM"
             )
 
-            if direction == "READ" or direction == "WRITE":
+            if direction in ("READ", "WRITE"):
                 # register buffer to avoid calling initialize_xfer twice due to missing registration
                 self.register_buffers(buffers)
 
