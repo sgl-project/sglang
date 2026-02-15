@@ -81,5 +81,11 @@ class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+@unittest.skip("Needs nightly flashinfer (0.6.4)")
+class TestFP4GemmFlashinferCutedsl(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_cutedsl"
+
+
 if __name__ == "__main__":
     unittest.main()
