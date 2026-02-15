@@ -8,7 +8,9 @@ from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 # Compatible with KimiVLForConditionalGeneration
