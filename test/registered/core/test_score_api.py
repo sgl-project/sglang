@@ -85,7 +85,7 @@ class TestScoreAPI(CustomTestCase):
         try:
             label_token_ids = []
             for token in tokens:
-                encoding = tokenizer.encode_plus(token, add_special_tokens=False)
+                encoding = tokenizer(token, add_special_tokens=False)
                 token_ids = encoding["input_ids"]
                 label_token_ids.append(token_ids[0])
             return label_token_ids

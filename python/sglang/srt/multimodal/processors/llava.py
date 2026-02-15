@@ -2,6 +2,7 @@ import asyncio
 from typing import Dict, List, Optional, Union
 
 import numpy as np
+import torch
 from transformers.models.auto.processing_auto import (
     PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
 )
@@ -50,8 +51,11 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 # It is a video with multiple images
                 image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                for i in range(len(pixel_values)):
+                    v = pixel_values[i]
+                    if isinstance(v, torch.Tensor):
+                        v = v.numpy()
+                    pixel_values[i] = v.astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
                 return pixel_values, image_hash, image_size
             else:
@@ -75,6 +79,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 else:
                     pixel_values = image_processor(image)["pixel_values"][0]
 
+                if isinstance(pixel_values, torch.Tensor):
+                    pixel_values = pixel_values.numpy()
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 

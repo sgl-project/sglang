@@ -129,6 +129,52 @@ def download_from_hf(
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def get_rope_config(config):
+    """Get (rope_theta, rope_scaling) from config, supporting both v4 and v5.
+
+    In transformers v5, rope_theta/rope_scaling are accessed via the computed
+    property config.rope_parameters. Trust-remote-code configs or parent configs
+    passed to sub-models may not have this property or may return None.
+    Falls back to the v4-style config.rope_theta / config.rope_scaling attributes.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return config.rope_theta, getattr(config, "rope_scaling", None)
+
+
+def _patch_text_config(parent_config: PretrainedConfig, text_config):
+    """Synchronize standard attributes between parent config and text sub-config.
+
+    In transformers v5, the "untangle config" refactor removed automatic
+    inheritance of top-level PretrainedConfig attributes (pad_token_id,
+    tie_word_embeddings, etc.) from sub-configs. Downstream code expects
+    these attributes to be present on both configs (some models pass the
+    parent directly to the language model, others pass the text sub-config),
+    so we propagate in both directions when an attribute is missing.
+    (See https://github.com/huggingface/transformers/pull/41541)
+    """
+    # Some models store text_config as a plain dict rather than a
+    # PretrainedConfig object. Skip patching in that case.
+    if isinstance(text_config, dict):
+        return text_config
+
+    _ATTRS_TO_PROPAGATE = [
+        "pad_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "tie_word_embeddings",
+    ]
+    for attr in _ATTRS_TO_PROPAGATE:
+        parent_has = hasattr(parent_config, attr)
+        text_has = hasattr(text_config, attr)
+        if parent_has and not text_has:
+            setattr(text_config, attr, getattr(parent_config, attr))
+        elif text_has and not parent_has:
+            setattr(parent_config, attr, getattr(text_config, attr))
+    return text_config
+
+
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
@@ -143,20 +189,22 @@ def get_hf_text_config(config: PretrainedConfig):
             setattr(config, "dtype", torch.float16)
             return config
 
+    text_config = None
+
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
         # `num_attention_heads` (among others). Assert here to fail early
         # if transformers config doesn't align with this assumption.
         assert hasattr(config.text_config, "num_attention_heads")
-        return config.text_config
+        text_config = config.text_config
 
     if hasattr(config, "llm_config"):
         # PointsV1.5 Chat Model
         assert hasattr(config.llm_config, "num_attention_heads")
-        return config.llm_config
+        text_config = config.llm_config
 
     if hasattr(config, "language_config"):
-        return config.language_config
+        text_config = config.language_config
     if hasattr(config, "thinker_config"):
         # qwen2.5 omni
         thinker_config = config.thinker_config
@@ -166,12 +214,16 @@ def get_hf_text_config(config: PretrainedConfig):
                 "torch_dtype",
                 getattr(thinker_config, "torch_dtype", None),
             )
-            return thinker_config.text_config
-        return thinker_config
+            text_config = thinker_config.text_config
+        else:
+            text_config = thinker_config
+
     if hasattr(config, "llm_config"):
-        return config.llm_config
-    else:
-        return config
+        text_config = config.llm_config
+
+    if text_config is not None:
+        return _patch_text_config(config, text_config)
+    return config
 
 
 # Temporary hack for DeepSeek-V3.2 model
@@ -498,6 +550,12 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+    elif tokenizer_mode == "auto":
+        # In Transformers v5, the default for use_fast changed from True to False.
+        # Explicitly set use_fast=True for "auto" mode to maintain previous behavior
+        # and avoid issues with models that have incorrect tokenizer_class values.
+        if "use_fast" not in kwargs:
+            kwargs["use_fast"] = True
 
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     if tokenizer_name == "mistralai/Devstral-Small-2505":
@@ -560,9 +618,22 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
+    _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
+
+
+def _fix_special_tokens_pattern(tokenizer):
+    """Fix https://github.com/huggingface/transformers/pull/42563 which defaults
+    special_tokens_pattern to "cls_sep", inserting None into token IDs when
+    cls_token/sep_token are undefined (e.g. Kimi-VL's TikTokenTokenizer).
+    """
+    pattern = getattr(tokenizer, "special_tokens_pattern", None)
+    if pattern == "cls_sep" and (
+        tokenizer.cls_token_id is None or tokenizer.sep_token_id is None
+    ):
+        tokenizer.special_tokens_pattern = "none"
 
 
 # Some models doesn't have an available processor, e.g.: InternVL
@@ -660,6 +731,7 @@ def get_processor(
             raise e
     tokenizer = get_tokenizer_from_processor(processor)
 
+    _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     return processor
 

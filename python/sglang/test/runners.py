@@ -25,7 +25,7 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoProcessor,
     GenerationConfig,
 )
@@ -274,7 +274,7 @@ class HFRunner:
             ).to(get_device())
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
@@ -338,20 +338,18 @@ class HFRunner:
                                 images=image[0], return_tensors="pt"
                             )
                             logits = self.model.get_image_features(
-                                pixel_values=inputs.data["pixel_values"].to(
-                                    get_device()
-                                ),
-                            ).tolist()
+                                pixel_values=inputs.data["pixel_values"].cuda(),
+                                return_dict=True,
+                            ).pooler_output.tolist()
                         else:
                             inputs = self.tokenizer(
                                 prompts, padding=True, return_tensors="pt"
                             )
                             logits = self.model.get_text_features(
-                                input_ids=inputs.data["input_ids"].to(get_device()),
-                                attention_mask=inputs.data["attention_mask"].to(
-                                    get_device()
-                                ),
-                            ).tolist()
+                                input_ids=inputs.data["input_ids"].cuda(),
+                                attention_mask=inputs.data["attention_mask"].cuda(),
+                                return_dict=True,
+                            ).pooler_output.tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
