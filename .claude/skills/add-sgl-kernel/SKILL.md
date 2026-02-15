@@ -5,7 +5,7 @@ description: Step-by-step tutorial for adding a heavyweight AOT CUDA/C++ kernel 
 
 # Tutorial: Adding a New Kernel to `sgl-kernel` (AOT / Heavyweight)
 
-This SKILL is a step-by-step guide for adding a **heavyweight** CUDA/C++ kernel to `sglang/sgl-kernel/`.
+This SKILL is a step-by-step guide for adding a **heavyweight** CUDA/C++ kernel to `sgl-kernel/`.
 
 Typical characteristics:
 
@@ -15,7 +15,7 @@ Typical characteristics:
 
 ## Two rules of thumb (must follow)
 
-1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS/FlashInfer/DeepGEMM (or similarly heavy stacks), implement it in `sglang/sgl-kernel`.
+1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS/FlashInfer/DeepGEMM (or similarly heavy stacks), implement it in `sgl-kernel/`.
 2. **Lightweight kernels go to `python/sglang/jit_kernel`.** If it is small, has few dependencies, and benefits from rapid iteration, implement it as a JIT kernel instead.
 
 In addition, every new kernel must ship with:
@@ -41,13 +41,13 @@ Add a new kernel end-to-end, including:
 
 You will typically touch these files/areas:
 
-- Implementation: `sglang/sgl-kernel/csrc/...`
-- Public declarations: `sglang/sgl-kernel/include/sgl_kernel_ops.h`
-- Torch extension registration: `sglang/sgl-kernel/csrc/common_extension.cc`
-- Build: `sglang/sgl-kernel/CMakeLists.txt` (`set(SOURCES ...)`)
-- Python API: `sglang/sgl-kernel/python/sgl_kernel/...` and `python/sgl_kernel/__init__.py`
-- Tests: `sglang/sgl-kernel/tests/test_<op>.py`
-- Benchmarks: `sglang/sgl-kernel/benchmark/bench_<op>.py`
+- Implementation: `sgl-kernel/csrc/...`
+- Public declarations: `sgl-kernel/include/sgl_kernel_ops.h`
+- Torch extension registration: `sgl-kernel/csrc/common_extension.cc`
+- Build: `sgl-kernel/CMakeLists.txt` (`set(SOURCES ...)`)
+- Python API: `sgl-kernel/python/sgl_kernel/...` and `sgl-kernel/python/sgl_kernel/__init__.py`
+- Tests: `sgl-kernel/tests/test_<op>.py`
+- Benchmarks: `sgl-kernel/benchmark/bench_<op>.py`
 
 ---
 
@@ -77,7 +77,7 @@ You will typically touch these files/areas:
 
 Edit:
 
-- `sglang/sgl-kernel/include/sgl_kernel_ops.h`
+- `sgl-kernel/include/sgl_kernel_ops.h`
 
 Add your function declaration in the appropriate section.
 
@@ -87,7 +87,7 @@ Add your function declaration in the appropriate section.
 
 Edit:
 
-- `sglang/sgl-kernel/csrc/common_extension.cc`
+- `sgl-kernel/csrc/common_extension.cc`
 
 Inside `TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)`:
 
@@ -105,7 +105,7 @@ Inside `TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)`:
 
 Edit:
 
-- `sglang/sgl-kernel/CMakeLists.txt`
+- `sgl-kernel/CMakeLists.txt`
 
 Add your new `.cu` / `.cc` file to the `set(SOURCES ...)` list.
 
@@ -116,12 +116,12 @@ Add your new `.cu` / `.cc` file to the `set(SOURCES ...)` list.
 
 ---
 
-## Step 5: Expose a Python API under `python/sgl_kernel/`
+## Step 5: Expose a Python API under `sgl-kernel/python/sgl_kernel/`
 
 Goal: users can call `sgl_kernel.<op>(...)`.
 
-- Add/extend a Python wrapper under `sglang/sgl-kernel/python/sgl_kernel/` (follow existing module organization).
-- Export it from `sglang/sgl-kernel/python/sgl_kernel/__init__.py`.
+- Add/extend a Python wrapper under `sgl-kernel/python/sgl_kernel/` (follow existing module organization).
+- Export it from `sgl-kernel/python/sgl_kernel/__init__.py`.
 
 ---
 
@@ -129,7 +129,7 @@ Goal: users can call `sgl_kernel.<op>(...)`.
 
 Create:
 
-- `sglang/sgl-kernel/tests/test_<op>.py`
+- `sgl-kernel/tests/test_<op>.py`
 
 **Minimum coverage:**
 
@@ -154,7 +154,7 @@ pytest sgl-kernel/tests/test_<op>.py -q
 
 Create:
 
-- `sglang/sgl-kernel/benchmark/bench_<op>.py`
+- `sgl-kernel/benchmark/bench_<op>.py`
 
 Follow the repository convention:
 
@@ -211,7 +211,7 @@ Validate:
 
 ## References
 
-- `sglang/sgl-kernel/README.md`
-- `sglang/sgl-kernel/include/sgl_kernel_ops.h`
-- `sglang/sgl-kernel/csrc/common_extension.cc`
-- `sglang/sgl-kernel/CMakeLists.txt`
+- `sgl-kernel/README.md`
+- `sgl-kernel/include/sgl_kernel_ops.h`
+- `sgl-kernel/csrc/common_extension.cc`
+- `sgl-kernel/CMakeLists.txt`

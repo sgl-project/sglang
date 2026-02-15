@@ -1,11 +1,11 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a lightweight JIT CUDA/C++ kernel to sglang/python/sglang/jit_kernel (including tests & benchmarks)
+description: Step-by-step tutorial for adding a lightweight JIT CUDA/C++ kernel to python/sglang/jit_kernel (including tests & benchmarks)
 ---
 
 # Tutorial: Adding a New Kernel to `python/sglang/jit_kernel` (JIT / Lightweight)
 
-This SKILL is a step-by-step guide for adding a **lightweight** CUDA/C++ kernel to `sglang/python/sglang/jit_kernel/`.
+This SKILL is a step-by-step guide for adding a **lightweight** CUDA/C++ kernel to `python/sglang/jit_kernel/`.
 
 Typical characteristics:
 
@@ -15,7 +15,7 @@ Typical characteristics:
 
 ## Two rules of thumb (must follow)
 
-1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS / FlashInfer / DeepGEMM (or similarly heavy stacks), implement it in `sglang/sgl-kernel`.
+1. **Heavyweight kernels go to `sgl-kernel`.** If it depends on CUTLASS / FlashInfer / DeepGEMM (or similarly heavy stacks), implement it in `sgl-kernel/`.
 2. **Lightweight kernels go to `jit_kernel`.** If it is small and can be compiled independently, implement it here.
 
 ## Stop and use `sgl-kernel` instead (important)
