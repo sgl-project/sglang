@@ -708,6 +708,7 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
 def wait_port_available(
     port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
 ) -> bool:
+    error_message = ""
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -715,20 +716,28 @@ def wait_port_available(
         if i > 10 and i % 5 == 0:
             process = find_process_using_port(port)
             if process is None:
+                error_message = (
+                    f"{port_name} is used by a process already, but process details are "
+                    "not available."
+                )
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+            else:
+                pid = process.pid
+                error_message = (
+                    f"{port_name} is used by a process already. {process.name()=} "
+                    f"{process.cmdline()=} {process.status()=} {pid=}"
+                )
             logger.info(
                 f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
             )
         time.sleep(0.1)
 
     if raise_exception:
+        suffix = f" {error_message}" if error_message else ""
         raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
+            f"{port_name} at {port} is not available in {timeout_s} seconds.{suffix}"
         )
     return False
 
