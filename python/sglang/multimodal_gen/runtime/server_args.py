@@ -443,7 +443,10 @@ class ServerArgs:
             )
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in ("fa", "sage_attn"):
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
                 raise ValueError(
                     "Ring Attention is only supported for flash attention or sage attention backend for now"
                 )
@@ -491,7 +494,11 @@ class ServerArgs:
                 # Will be validated later
                 self.sp_degree = 1
 
-        if self.ulysses_degree is None and self.ring_degree is None and self.sp_degree != 1:
+        if (
+            self.ulysses_degree is None
+            and self.ring_degree is None
+            and self.sp_degree != 1
+        ):
             self.ulysses_degree = self.sp_degree
             logger.info(
                 f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
@@ -499,7 +506,9 @@ class ServerArgs:
 
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
-            logger.debug(f"Ulysses degree not set, using default value {self.ulysses_degree}")
+            logger.debug(
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
+            )
 
         if self.ring_degree is None:
             self.ring_degree = 1
@@ -712,7 +721,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
-                 "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+            "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
 
         # Prompt text file for batch processing
@@ -733,7 +742,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
-                 + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
 
         # warmup
@@ -742,8 +751,8 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.warmup,
             help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
-                 "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-                 "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
         )
         parser.add_argument(
             "--warmup-resolutions",
@@ -763,7 +772,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan, MOVA). "
-                 "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -795,7 +804,7 @@ class ServerArgs:
             "--pin-cpu-memory",
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-                 "Should be enabled in almost all cases",
+            "Should be enabled in almost all cases",
         )
         parser.add_argument(
             "--disable-autocast",
@@ -886,7 +895,7 @@ class ServerArgs:
             choices=Backend.choices(),
             default=ServerArgs.backend.value,
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
-                 "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
+            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
         return parser
 
@@ -1048,7 +1057,9 @@ class ServerArgs:
             isinstance(self.dit_offload_prefetch_size, float)
             and not self.dit_offload_prefetch_size.is_integer()
         ):
-            self.dit_offload_prefetch_size = int(math.floor(self.dit_offload_prefetch_size))
+            self.dit_offload_prefetch_size = int(
+                math.floor(self.dit_offload_prefetch_size)
+            )
             logger.info(
                 f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
             )
@@ -1089,18 +1100,26 @@ class ServerArgs:
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
             )
 
-        if self.hsdp_replicate_dim > self.num_gpus or self.num_gpus % self.hsdp_replicate_dim != 0:
+        if (
+            self.hsdp_replicate_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_replicate_dim != 0
+        ):
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_replicate_dim ({self.hsdp_replicate_dim})"
             )
 
-        if self.hsdp_shard_dim > self.num_gpus or self.num_gpus % self.hsdp_shard_dim != 0:
+        if (
+            self.hsdp_shard_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_shard_dim != 0
+        ):
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_shard_dim ({self.hsdp_shard_dim})"
             )
 
         if self.num_gpus % self.dp_size != 0:
-            raise ValueError(f"num_gpus ({self.num_gpus}) must be divisible by dp_size ({self.dp_size})")
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by dp_size ({self.dp_size})"
+            )
 
         if self.dp_size < 1:
             raise ValueError("--dp-size must be a natural number")
@@ -1139,7 +1158,6 @@ class ServerArgs:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
-
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
