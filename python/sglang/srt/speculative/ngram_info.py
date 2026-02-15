@@ -443,7 +443,12 @@ class NgramVerifyInput(SpecInput):
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
-        return logits_output, self.verified_id, num_accepted_tokens
+        return (
+            logits_output,
+            self.verified_id,
+            num_accepted_tokens,
+            accept_length_cpu.tolist(),
+        )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass
