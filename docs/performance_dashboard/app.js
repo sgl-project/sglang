@@ -22,13 +22,13 @@ const metricTypes = {
     accLength: { label: 'Accept Length', unit: 'tokens', field: 'accLength', filterInvalid: true }
 };
 
-// Chart.js default configuration for dark theme
-Chart.defaults.color = '#94a3b8';
-Chart.defaults.borderColor = '#1e293b';
+// Chart.js default configuration for light theme
+Chart.defaults.color = '#78716c';
+Chart.defaults.borderColor = '#e7e0d9';
 
 const chartColors = [
-    '#22d3ee', '#34d399', '#fbbf24', '#f87171', '#a78bfa',
-    '#67e8f9', '#6ee7b7', '#fcd34d', '#fca5a5', '#c4b5fd'
+    '#d55815', '#b45309', '#0d9488', '#7c3aed', '#2563eb',
+    '#e87332', '#d97706', '#14b8a6', '#8b5cf6', '#3b82f6'
 ];
 
 // Initialize the dashboard
@@ -726,10 +726,12 @@ function getChartOptions(yAxisLabel) {
                 }
             },
             tooltip: {
-                backgroundColor: '#1a2332',
-                borderColor: 'rgba(148, 163, 184, 0.1)',
+                backgroundColor: '#1c1917',
+                titleColor: '#fdf8f4',
+                bodyColor: '#e7e5e4',
+                borderColor: 'rgba(28, 25, 23, 0.15)',
                 borderWidth: 1,
-                titleFont: { size: 13, family: "'DM Sans', sans-serif" },
+                titleFont: { size: 13, family: "'Inter', sans-serif" },
                 bodyFont: { size: 12, family: "'JetBrains Mono', monospace" },
                 padding: 14,
                 cornerRadius: 8
@@ -745,7 +747,7 @@ function getChartOptions(yAxisLabel) {
                     }
                 },
                 grid: {
-                    color: 'rgba(148, 163, 184, 0.06)'
+                    color: 'rgba(28, 25, 23, 0.06)'
                 }
             },
             y: {
@@ -754,7 +756,7 @@ function getChartOptions(yAxisLabel) {
                     text: yAxisLabel
                 },
                 grid: {
-                    color: 'rgba(148, 163, 184, 0.06)'
+                    color: 'rgba(28, 25, 23, 0.06)'
                 }
             }
         }
