@@ -42,6 +42,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -50,6 +51,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -233,6 +235,7 @@ class Engine(EngineBase):
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -270,6 +273,7 @@ class Engine(EngineBase):
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -320,6 +324,7 @@ class Engine(EngineBase):
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -358,6 +363,7 @@ class Engine(EngineBase):
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -373,6 +379,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -386,6 +393,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -400,6 +408,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -415,6 +424,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -447,6 +457,37 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Open a session for multi-turn conversation with shared context.
+
+        Args:
+            capacity_of_str_len: Maximum string length capacity for the session.
+            session_id: Optional session ID. If not provided, a UUID will be generated.
+
+        Returns:
+            The session ID (either the provided one or a newly generated UUID).
+        """
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.open_session(obj, None)
+        )
+
+    def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID to close.
+        """
+        obj = CloseSessionReqInput(session_id=session_id)
+        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -800,7 +841,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.1",
+                "0.6.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -897,7 +938,29 @@ def _launch_scheduler_processes(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                attn_dp_size = (
+                    server_args.dp_size if server_args.enable_dp_attention else 1
+                )
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
+                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
@@ -907,6 +970,8 @@ def _launch_scheduler_processes(
                             port_args,
                             gpu_id,
                             tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
                             moe_ep_rank,
                             pp_rank,
                             None,

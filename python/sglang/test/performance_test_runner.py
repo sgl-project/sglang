@@ -77,6 +77,7 @@ def run_performance_test(
             input_lens=input_lens,
             output_lens=output_lens,
             other_args=model.extra_args,
+            variant=model.variant or "",
             extra_bench_args=extra_bench_args,
         )
 

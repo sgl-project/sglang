@@ -15,16 +15,16 @@ use kube::{
     Client,
 };
 use rustls;
+use smg_mesh::service::{
+    gossip::{NodeState, NodeStatus},
+    ClusterState,
+};
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
     core::Job,
-    mesh::service::{
-        gossip::{NodeState, NodeStatus},
-        ClusterState,
-    },
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -841,10 +841,10 @@ mod tests {
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,
-            response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(crate::data_connector::MemoryConversationStorage::new()),
+            response_storage: Arc::new(data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(data_connector::MemoryConversationStorage::new()),
             conversation_item_storage: Arc::new(
-                crate::data_connector::MemoryConversationItemStorage::new(),
+                data_connector::MemoryConversationItemStorage::new(),
             ),
             load_monitor: None,
             configured_reasoning_parser: None,

@@ -165,7 +165,7 @@ class MiMoV2ModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -229,6 +229,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)

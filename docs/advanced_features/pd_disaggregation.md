@@ -130,9 +130,11 @@ PD Disaggregation with Mooncake supports the following environment variables for
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 
 ```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
+
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
@@ -260,6 +262,26 @@ python -m sglang.launch_server \
   --moe-a2a-backend deepep \
   --mem-fraction-static 0.8 \
   --max-running-requests 128
+```
+
+### Advanced Configuration
+
+#### NIXL Backend Selection
+
+By default, NIXL uses the **UCX** backend for KV cache transfers. You can select a different NIXL plugin backend depending on your infrastructure using the environment variable `SGLANG_DISAGGREGATION_NIXL_BACKEND`.
+
+Example: `export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`
+
+**Available backends:** UCX (default), LIBFABRIC, or any installed NIXL plugin.
+
+Example usage:
+```bash
+export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl \
+  --port 30000
 ```
 
 ## ASCEND

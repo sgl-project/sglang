@@ -55,13 +55,13 @@ class LoRAManager:
         max_loras_per_batch: int,
         load_config: LoadConfig,
         dtype: torch.dtype,
+        server_args: ServerArgs,
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
-        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -154,6 +154,10 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+        if lora_config.lora_added_tokens_size > 0:
+            raise ValueError(
+                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
 
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
