@@ -53,7 +53,7 @@ repos:
       - id: codespell
         args: ['--config', '.codespellrc']
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v21.1.8
+    rev: v20.1.7
     hooks:
     - id: clang-format
       types_or: [c++, cuda]

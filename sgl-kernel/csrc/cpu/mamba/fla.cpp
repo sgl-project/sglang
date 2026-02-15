@@ -243,9 +243,9 @@ void chunk_gated_delta_rule_kernel_impl(
     THREAD_BUFFER_ALLOC(v_pack, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(k_beta_g, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
     THREAD_BUFFER_ALLOC(k_beta_g_pack, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
-    THREAD_BUFFER_ALLOC(curr_attn, thread_buff_ptr, offset, float, chunk_size * chunk_size * 2);
+    THREAD_BUFFER_ALLOC(curr_attn, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
     THREAD_BUFFER_ALLOC(curr_attn_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
-    THREAD_BUFFER_ALLOC(k_cumdecay, thread_buff_ptr, offset, float, chunk_size * qk_head_size * 2);
+    THREAD_BUFFER_ALLOC(k_cumdecay, thread_buff_ptr, offset, float, chunk_size* qk_head_size * 2);
     THREAD_BUFFER_ALLOC(row, thread_buff_ptr, offset, float, chunk_size * 2);
     THREAD_BUFFER_ALLOC(updated, thread_buff_ptr, offset, float, chunk_size * 2);
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
@@ -493,16 +493,16 @@ void chunk_gated_delta_rule_kernel_impl(
     THREAD_BUFFER_ALLOC(
         curr_last_recurrent_state_pack_reduced, thread_buff_ptr, offset, scalar_t, qk_head_size * v_head_size);
     THREAD_BUFFER_ALLOC(k_transpose_i, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
-    THREAD_BUFFER_ALLOC(attn_i, thread_buff_ptr, offset, float, chunk_size * chunk_size * 2);
+    THREAD_BUFFER_ALLOC(attn_i, thread_buff_ptr, offset, float, chunk_size* chunk_size * 2);
     THREAD_BUFFER_ALLOC(attn_i_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * chunk_size);
-    THREAD_BUFFER_ALLOC(v_prime, thread_buff_ptr, offset, float, chunk_size * v_head_size * 2);
+    THREAD_BUFFER_ALLOC(v_prime, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
     THREAD_BUFFER_ALLOC(v_prime_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(v_prime_pack_reduced, thread_buff_ptr, offset, scalar_t, chunk_size * v_head_size);
     THREAD_BUFFER_ALLOC(qg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
-    THREAD_BUFFER_ALLOC(attn_inter, thread_buff_ptr, offset, float, chunk_size * v_head_size * 2);
+    THREAD_BUFFER_ALLOC(attn_inter, thread_buff_ptr, offset, float, chunk_size* v_head_size * 2);
     THREAD_BUFFER_ALLOC(kg, thread_buff_ptr, offset, scalar_t, chunk_size * qk_head_size);
     THREAD_BUFFER_ALLOC(kg_transpose, thread_buff_ptr, offset, scalar_t, qk_head_size * chunk_size);
-    THREAD_BUFFER_ALLOC(kgv, thread_buff_ptr, offset, float, qk_head_size * v_head_size * 2);
+    THREAD_BUFFER_ALLOC(kgv, thread_buff_ptr, offset, float, qk_head_size* v_head_size * 2);
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t start_q = cu_seqlens_ptr[b];
