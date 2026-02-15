@@ -2174,7 +2174,7 @@ class NativeSparseAttnMultiStepBackend:
 
             # Use multi-backend fused copy when we have 3 or more backends
             # This is 3x faster than calling the single-backend copy 3 times
-            if self.speculative_num_steps >= 3:
+            if self.speculative_num_steps > 3:
                 try:
                     from sglang.jit_kernel.fused_metadata_copy import (
                         fused_metadata_copy_multi_cuda,
@@ -2293,7 +2293,7 @@ class NativeSparseAttnMultiStepBackend:
                         )
 
                     # Copy remaining backends one by one (if > 3 backends)
-                    for i in range(3, self.speculative_num_steps):
+                    for i in range(3, self.speculative_num_steps - 1):
                         self.attn_backends[
                             i
                         ].init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -2311,7 +2311,7 @@ class NativeSparseAttnMultiStepBackend:
                         print(
                             f"Warning: Multi-backend fused metadata copy kernel failed with error: {e}, falling back to loop."
                         )
-                    for i in range(self.speculative_num_steps):
+                    for i in range(self.speculative_num_steps - 1):
                         self.attn_backends[
                             i
                         ].init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -2321,7 +2321,7 @@ class NativeSparseAttnMultiStepBackend:
                         )
             else:
                 # Less than 3 backends: copy to each backend individually
-                for i in range(self.speculative_num_steps):
+                for i in range(self.speculative_num_steps - 1):
                     self.attn_backends[
                         i
                     ].init_forward_metadata_replay_cuda_graph_from_precomputed(
