@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
@@ -756,5 +758,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if language_weights:
             self.language_model.load_weights(language_weights)
 
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.n_routed_experts,
+            num_groups=text_config.n_group,
+        )
 
 EntryClass = [KimiK25ForConditionalGeneration]
