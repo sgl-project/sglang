@@ -167,3 +167,7 @@ class AttentionBackend(ABC):
     ) -> Optional[BaseIndexerMetadata]:
         """Get the indexer metadata. None means don't support indexer."""
         return None
+
+    def support_rope_fusion(self) -> bool:
+        """Check if the current backend supports RoPE fusion."""
+        return False
