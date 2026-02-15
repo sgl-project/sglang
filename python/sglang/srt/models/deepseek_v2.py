@@ -986,11 +986,22 @@ class DeepseekV2MoE(nn.Module):
                         layer_load.tolist(),
                     )
         except Exception as e:
+            self._static_wf_init_failures = (
+                getattr(self, "_static_wf_init_failures", 0) + 1
+            )
             logger.warning(
-                "Failed to init static waterfill weights for layer %s: %s",
+                "Failed to init static waterfill weights for layer %s (attempt %d): %s",
                 self.layer_id,
+                self._static_wf_init_failures,
                 e,
             )
+            if self._static_wf_init_failures >= 3:
+                logger.warning(
+                    "Giving up on static waterfill weights for layer %s after %d failures",
+                    self.layer_id,
+                    self._static_wf_init_failures,
+                )
+                self._static_wf_init_done = True
 
     def get_moe_weights(self):
         # EPLB only manages routed experts. In DeepEP Waterfill mode, we add one extra
