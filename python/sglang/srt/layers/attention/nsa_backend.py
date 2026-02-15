@@ -1468,7 +1468,9 @@ class NativeSparseAttnBackend(
                 seq_lens=metadata.nsa_cache_seqlens_int32,
             )
         else:
-            raise ValueError(f"Unsupported {nsa_impl = }")
+            raise ValueError(
+                f"Unsupported {nsa_impl = } for forward_extend. Consider using an other attention backend."
+            )
 
     def forward_decode(
         self,
