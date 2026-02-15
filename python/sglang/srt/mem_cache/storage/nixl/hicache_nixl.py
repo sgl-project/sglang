@@ -173,7 +173,7 @@ class HiCacheNixl(HiCacheStorage):
             xfer_req = self.agent.initialize_xfer(
                 direction, host_descs, storage_descs, self.agent_name
             )
-        except Exception as e_first:
+        except Exception:
             # Check if it was due to missing pre-registration
             if not self.register_buffers(buffers):
                 logger.error("Failed to register tensors/buffers")
