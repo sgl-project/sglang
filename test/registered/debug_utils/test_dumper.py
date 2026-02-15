@@ -235,9 +235,9 @@ def _find_dump_file(tmpdir, *, rank: int, name: str) -> Path:
         for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
         if f"rank={rank}" in f.name and name in f.name
     ]
-    assert len(matches) == 1, (
-        f"Expected 1 file matching rank={rank} name={name}, got {matches}"
-    )
+    assert (
+        len(matches) == 1
+    ), f"Expected 1 file matching rank={rank} name={name}, got {matches}"
     return matches[0]
 
 
