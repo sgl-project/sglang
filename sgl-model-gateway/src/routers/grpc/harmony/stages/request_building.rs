@@ -18,7 +18,7 @@ use crate::routers::{
 ///
 /// Takes the Harmony-encoded input_ids from preparation and builds a proto::GenerateRequest.
 /// Unlike regular request building, this uses token_ids directly (Harmony encoding handles messages).
-pub struct HarmonyRequestBuildingStage {
+pub(crate) struct HarmonyRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 
@@ -88,6 +88,16 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                 return Err(error::bad_request(
                     "harmony_embedding_not_supported",
                     "Embedding requests are not supported with Harmony models".to_string(),
+                ));
+            }
+            RequestType::Classify(_) => {
+                error!(
+                    function = "HarmonyRequestBuildingStage::execute",
+                    "Classify requests not supported for Harmony models"
+                );
+                return Err(error::bad_request(
+                    "harmony_classify_not_supported",
+                    "Classify requests are not supported with Harmony models".to_string(),
                 ));
             }
         };

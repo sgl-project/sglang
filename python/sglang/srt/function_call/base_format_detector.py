@@ -83,7 +83,7 @@ class BaseFormatDetector(ABC):
 
             results.append(
                 ToolCallItem(
-                    tool_index=-1,  # Caller should update this based on the actual tools array called
+                    tool_index=tool_indices.get(name, -1),
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),
@@ -166,15 +166,22 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                tool_call_pos = current_text.find(self.bot_token)
-                if tool_call_pos != -1:
-                    start_idx = tool_call_pos + len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
+                # Priority check: if we're processing a subsequent tool (current_tool_id > 0),
+                # first check if text starts with the tool separator. This is critical for
+                # parallel tool calls because the bot_token (e.g., '[') can also
+                # appear inside array parameters of the current tool, and we must not
+                # mistakenly identify that as the start of a new tool.
+                if self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)
                 else:
-                    start_idx = 0
+                    # Only search for bot_token if not processing subsequent tool
+                    tool_call_pos = current_text.find(self.bot_token)
+                    if tool_call_pos != -1:
+                        start_idx = tool_call_pos + len(self.bot_token)
+                    else:
+                        start_idx = 0
 
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
@@ -249,7 +256,7 @@ class BaseFormatDetector(ABC):
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments)
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
                         prev_arguments = self.prev_tool_call_arr[
@@ -270,7 +277,7 @@ class BaseFormatDetector(ABC):
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments)
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]

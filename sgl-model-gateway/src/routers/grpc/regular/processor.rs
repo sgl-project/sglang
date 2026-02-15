@@ -6,10 +6,10 @@
 use std::{sync::Arc, time::Instant};
 
 use serde_json::Value;
+use smg_grpc_client::sglang_proto::generate_complete::MatchedStop;
 use tracing::error;
 
 use crate::{
-    grpc_client::sglang_proto::generate_complete::MatchedStop,
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue},
@@ -34,7 +34,7 @@ use crate::{
 
 /// Unified response processor for both routers
 #[derive(Clone)]
-pub struct ResponseProcessor {
+pub(crate) struct ResponseProcessor {
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     pub configured_tool_parser: Option<String>,

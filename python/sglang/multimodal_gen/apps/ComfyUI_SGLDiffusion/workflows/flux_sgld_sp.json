@@ -1,0 +1,222 @@
+{
+    "8": {
+      "inputs": {
+        "samples": [
+          "40",
+          0
+        ],
+        "vae": [
+          "10",
+          0
+        ]
+      },
+      "class_type": "VAEDecode",
+      "_meta": {
+        "title": "VAE Decode"
+      }
+    },
+    "10": {
+      "inputs": {
+        "vae_name": "ae.safetensors"
+      },
+      "class_type": "VAELoader",
+      "_meta": {
+        "title": "Load VAE"
+      }
+    },
+    "11": {
+      "inputs": {
+        "clip_name1": "t5xxl_fp16.safetensors",
+        "clip_name2": "clip_l.safetensors",
+        "type": "flux",
+        "device": "default"
+      },
+      "class_type": "DualCLIPLoader",
+      "_meta": {
+        "title": "DualCLIPLoader"
+      }
+    },
+    "17": {
+      "inputs": {
+        "scheduler": "normal",
+        "steps": 25,
+        "denoise": 1,
+        "model": [
+          "46",
+          0
+        ]
+      },
+      "class_type": "BasicScheduler",
+      "_meta": {
+        "title": "BasicScheduler"
+      }
+    },
+    "38": {
+      "inputs": {
+        "model": [
+          "46",
+          0
+        ],
+        "conditioning": [
+          "42",
+          0
+        ]
+      },
+      "class_type": "BasicGuider",
+      "_meta": {
+        "title": "BasicGuider"
+      }
+    },
+    "39": {
+      "inputs": {
+        "filename_prefix": "ComfyUI",
+        "images": [
+          "8",
+          0
+        ]
+      },
+      "class_type": "SaveImage",
+      "_meta": {
+        "title": "Save Image"
+      }
+    },
+    "40": {
+      "inputs": {
+        "noise": [
+          "45",
+          0
+        ],
+        "guider": [
+          "38",
+          0
+        ],
+        "sampler": [
+          "47",
+          0
+        ],
+        "sigmas": [
+          "17",
+          0
+        ],
+        "latent_image": [
+          "44",
+          0
+        ]
+      },
+      "class_type": "SamplerCustomAdvanced",
+      "_meta": {
+        "title": "SamplerCustomAdvanced"
+      }
+    },
+    "42": {
+      "inputs": {
+        "guidance": 3.5,
+        "conditioning": [
+          "43",
+          0
+        ]
+      },
+      "class_type": "FluxGuidance",
+      "_meta": {
+        "title": "FluxGuidance"
+      }
+    },
+    "43": {
+      "inputs": {
+        "text": "beautiful photography of a gonger haired artist with Lots of Colorful coloursplashes in face and pn her hands, she is natural, having her hair in a casual bun, looking happily into camera, cinematic,",
+        "speak_and_recognation": {
+          "__value__": [
+            false,
+            true
+          ]
+        },
+        "clip": [
+          "11",
+          0
+        ]
+      },
+      "class_type": "CLIPTextEncode",
+      "_meta": {
+        "title": "CLIP Text Encode (Prompt)"
+      }
+    },
+    "44": {
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      },
+      "class_type": "EmptySD3LatentImage",
+      "_meta": {
+        "title": "EmptySD3LatentImage"
+      }
+    },
+    "45": {
+      "inputs": {
+        "noise_seed": 747172083610812
+      },
+      "class_type": "RandomNoise",
+      "_meta": {
+        "title": "RandomNoise"
+      }
+    },
+    "46": {
+      "inputs": {
+        "max_shift": 1.15,
+        "base_shift": 0.5,
+        "width": 1024,
+        "height": 1024,
+        "model": [
+          "51",
+          0
+        ]
+      },
+      "class_type": "ModelSamplingFlux",
+      "_meta": {
+        "title": "ModelSamplingFlux"
+      }
+    },
+    "47": {
+      "inputs": {
+        "sampler_name": "euler"
+      },
+      "class_type": "KSamplerSelect",
+      "_meta": {
+        "title": "KSamplerSelect"
+      }
+    },
+    "51": {
+      "inputs": {
+        "unet_name": "flux1-dev.safetensors",
+        "weight_dtype": "default",
+        "sgld_options": [
+          "52",
+          0
+        ]
+      },
+      "class_type": "SGLDUNETLoader",
+      "_meta": {
+        "title": "SGLDiffusion UNET Loader"
+      }
+    },
+    "52": {
+      "inputs": {
+        "model_type": "auto-detect",
+        "enable_torch_compile": false,
+        "num_gpus": 2,
+        "tp_size": -1,
+        "sp_degree": -1,
+        "ulysses_degree": -1,
+        "ring_degree": -1,
+        "dp_size": 1,
+        "dp_degree": 1,
+        "enable_cfg_parallel": false,
+        "attention_backend": "",
+        "cache_strategy": "none"
+      },
+      "class_type": "SGLDOptions",
+      "_meta": {
+        "title": "SGLDiffusion Options"
+      }
+    }
+  }

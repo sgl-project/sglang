@@ -24,6 +24,9 @@ class MockModelRunner:
     ):
         self.device = "cuda"
         self.dtype = torch.float16
+        self.kv_cache_dtype = torch.float16
+        self.is_hybrid_swa = False
+        self.attention_chunk_size = None
         attention_arch = AttentionArch.MHA
         # Max batch size for the test.
         max_batch_size = 160
@@ -36,10 +39,11 @@ class MockModelRunner:
                 "context_len": max_context_len,
                 "is_multimodal": False,
                 "attention_arch": attention_arch,
+                "is_encoder_decoder": False,
+                "is_local_attention_model": False,
             },
-        )
+        )()
         self.sliding_window_size = None
-        self.device = self.device
         # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",
@@ -55,7 +59,7 @@ class MockModelRunner:
                     device=self.device,
                 ),
             },
-        )
+        )()
         self.page_size = page_size
         max_total_num_tokens = max_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(

@@ -7,6 +7,17 @@ from typing import Tuple
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
+def is_zimage_layer(n: str, m) -> bool:
+    """Returns if the module should be sharded for Z-Image model."""
+    if "layers" in n and str.isdigit(n.split(".")[-1]):
+        return True
+    if ("noise_refiner" in n or "context_refiner" in n) and str.isdigit(
+        n.split(".")[-1]
+    ):
+        return True
+    return False
+
+
 @dataclass
 class ZImageArchConfig(DiTArchConfig):
     all_patch_size: Tuple[int, ...] = (2,)
@@ -26,12 +37,11 @@ class ZImageArchConfig(DiTArchConfig):
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
 
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_zimage_layer])
+
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             # (param_name, shard_name, shard_id)
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
             (".feed_forward.w13", ".feed_forward.w1", "gate"),
             (".feed_forward.w13", ".feed_forward.w3", "up"),
         ]
@@ -39,11 +49,18 @@ class ZImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            r"(.*)\.to_q\.weight$": (r"\1.to_qkv.weight", 0, 3),
-            r"(.*)\.to_k\.weight$": (r"\1.to_qkv.weight", 1, 3),
-            r"(.*)\.to_v\.weight$": (r"\1.to_qkv.weight", 2, 3),
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
+            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                0,
+                2,
+            ),
+            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B)$": (
+                r"\1.feed_forward.w13.\2",
+                1,
+                2,
+            ),
         }
     )
 

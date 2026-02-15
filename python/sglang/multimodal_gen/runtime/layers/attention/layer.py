@@ -20,10 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    backend_name_to_enum,
-    get_attn_backend,
-)
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -78,7 +75,7 @@ class UlyssesAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
-        self.backend = backend_name_to_enum(attn_backend.get_name())
+        self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
     @torch.compiler.disable
@@ -259,7 +256,7 @@ class LocalAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
-        self.backend = backend_name_to_enum(attn_backend.get_name())
+        self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
     def forward(
@@ -336,7 +333,7 @@ class USPAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
-        self.backend = backend_name_to_enum(attn_backend.get_name())
+        self.backend = attn_backend.get_enum()
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate

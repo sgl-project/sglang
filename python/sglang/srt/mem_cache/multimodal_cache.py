@@ -1,5 +1,6 @@
 import abc
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -67,6 +68,11 @@ def _get_tensor_size(embedding: torch.Tensor):
     return embedding.element_size() * embedding.numel()
 
 
+@dataclass(kw_only=True)
+class EmbeddingResult:
+    embedding: torch.Tensor
+
+
 class MultiModalStaticCache(MultimodalCache):
     """
     A server-level cache for multimodal embedding.
@@ -79,12 +85,12 @@ class MultiModalStaticCache(MultimodalCache):
     ):
         super().__init__()
         self.max_size = max_size
-        self.mm_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self.mm_cache: OrderedDict[int, EmbeddingResult] = OrderedDict()
         self.current_size = 0
 
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[EmbeddingResult]:
         combined_hash = self.combine_hashes(mm_hashes)
         # MultiModalStaticCache does not fallback to individual item lookup
 
@@ -94,17 +100,21 @@ class MultiModalStaticCache(MultimodalCache):
         return embedding
 
     def set(
-        self, mm_hash: int, embedding: torch.Tensor, loc: Optional[torch.Tensor] = None
+        self,
+        mm_hash: int,
+        embedding: EmbeddingResult,
+        loc: Optional[torch.Tensor] = None,
     ) -> bool:
+        assert isinstance(embedding, EmbeddingResult), embedding
         if mm_hash in self.mm_cache:
             self.mm_cache.move_to_end(mm_hash)
             return True
-        data_size = _get_tensor_size(embedding)
+        data_size = _get_tensor_size(embedding.embedding)
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
-            self.current_size -= _get_tensor_size(lru_embedding)
+            self.current_size -= _get_tensor_size(lru_embedding.embedding)
 
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
@@ -119,7 +129,7 @@ class MultiModalStaticCache(MultimodalCache):
         if mm_hash not in self.mm_cache:
             return False
         old_embedding = self.mm_cache.pop(mm_hash)
-        self.current_size -= _get_tensor_size(old_embedding)
+        self.current_size -= _get_tensor_size(old_embedding.embedding)
         return True
 
     def clear(self):
