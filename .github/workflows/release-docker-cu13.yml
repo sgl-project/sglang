@@ -3,6 +3,11 @@ name: Build and Push CUDA 13 Docker Images
 # release this manually via workflow_dispatch for now
 on:
     workflow_dispatch:
+      inputs:
+        pr_number:
+          description: "PR number to build from (leave empty to use current branch)"
+          required: false
+          default: ""
     schedule:
       - cron: "0 0 * * *"
 jobs:
@@ -30,6 +35,8 @@ jobs:
 
             - name: Checkout repository
               uses: actions/checkout@v4
+              with:
+                ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
 
             - name: Free disk space
               uses: jlumbroso/free-disk-space@main
