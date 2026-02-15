@@ -247,7 +247,6 @@ class ComposedPipelineBase(ABC):
         # all the component models used by the pipeline
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
-
         loaded_components = {}
         for module_name, (
             transformers_or_diffusers,
