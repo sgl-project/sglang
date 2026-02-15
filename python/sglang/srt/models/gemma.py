@@ -305,6 +305,9 @@ class GemmaForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
     @torch.no_grad()
     def forward(
         self,
