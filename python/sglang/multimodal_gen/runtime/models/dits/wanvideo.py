@@ -323,7 +323,7 @@ class WanTransformerBlock(nn.Module):
         ):
             cross_attn_backends = supported_attention_backends.copy()
             cross_attn_backends.remove(AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN)
-            logger.warning_once(
+            logger.debug(
                 "Sparse Video Gen 2 attention backend is not supported for cross-attention; "
                 "removing SPARSE_VIDEO_GEN_2_ATTN from cross-attention backends."
             )
