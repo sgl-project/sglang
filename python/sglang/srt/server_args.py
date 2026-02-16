@@ -11,6 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# NOTE: PyTorch 2.10.0 still requires cuDNN >= 9.15 for Conv3D operations.
+# The cuDNN version check was removed from runtime but CI enforces
+# nvidia-cudnn-cu12==9.16.0.29 installation to avoid performance regression.
 """The arguments of the server."""
 
 from __future__ import annotations
@@ -5138,6 +5141,9 @@ class ServerArgs:
             f"Invalid value: '{self.served_model_name}'"
         )
 
+        # Check cuDNN compatibility for PyTorch 2.10+
+        self.check_torch_cudnn_compatibility()
+
         # Check LoRA
         self.check_lora_server_args()
 
@@ -5233,6 +5239,62 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+    def check_torch_cudnn_compatibility(self):
+        """Check cuDNN compatibility for PyTorch 2.10+.
+
+        PyTorch 2.10.0 ships with cuDNN 9.10.2.21 which has Conv3D performance regression.
+        This check warns users to upgrade to cuDNN 9.15+ for multimodal models.
+        """
+        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
+            return
+
+        # Only check for multimodal models which use Conv3D
+        if (
+            not hasattr(self, "get_model_config")
+            or not self.get_model_config().is_multimodal
+        ):
+            return
+
+        import torch
+
+        torch_version = torch.__version__.split("+", 1)[0]
+        # Check for PyTorch 2.10.0+ (which has the cuDNN issue)
+        if torch_version.startswith("2.10"):
+            cudnn_version = None
+            try:
+                cudnn_version = torch.backends.cudnn.version()
+            except Exception:
+                cudnn_version = None
+            if cudnn_version is not None:
+                version_float = float(str(cudnn_version)[:3]) / 100
+                if version_float < 9.15:
+                    RED = "\033[91m"
+                    BOLD = "\033[1m"
+                    RESET = "\033[0m"
+                    msg = (
+                        f"{RED}{BOLD}"
+                        "CRITICAL WARNING: PyTorch 2.10.0 & CuDNN Compatibility Issue Detected\n"
+                        "--------------------------------------------------------------------------------\n"
+                        f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
+                        "Issue:     PyTorch 2.10.0 ships with cuDNN 9.10.2.21 which has a KNOWN BUG\n"
+                        "           in `nn.Conv3d` implementation causing SEVERE PERFORMANCE DEGRADATION\n"
+                        "           and EXCESSIVE MEMORY USAGE in multimodal models.\n\n"
+                        "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
+                        "Run the following command immediately to fix:\n"
+                        "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                        "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
+                        "--------------------------------------------------------------------------------\n"
+                        f"{RESET}"
+                    )
+                    raise RuntimeError(msg)
+            else:
+                RED = "\033[91m"
+                RESET = "\033[0m"
+                logger.warning(
+                    f"{RED}WARNING: Could not determine CuDNN version for torch==2.10.0. "
+                    f"Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
+                )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

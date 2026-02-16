@@ -221,6 +221,28 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 else
     $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
 fi
+
+# Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
+# On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
+if [ "$IS_BLACKWELL" = "1" ]; then
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
+        echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
+    else
+        $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
+fi
+
+# Set LD_LIBRARY_PATH to use pip-installed cuDNN instead of PyTorch's bundled cuDNN
+# This is critical for PyTorch 2.10+ which ships with cuDNN 9.10.2.21 that has Conv3D performance issues
+CUDNN_PATH=$(python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__file__)" 2>/dev/null | xargs dirname | xargs dirname 2>/dev/null || echo "")
+if [ -n "$CUDNN_PATH" ] && [ -d "$CUDNN_PATH/lib" ]; then
+    export LD_LIBRARY_PATH="$CUDNN_PATH/lib:$LD_LIBRARY_PATH"
+    echo "Set LD_LIBRARY_PATH to use pip-installed cuDNN: $CUDNN_PATH/lib"
+fi
+
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
