@@ -874,6 +874,12 @@ def _set_envs_and_config(server_args: ServerArgs):
                 f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
             )
             signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
+    else:
+        logger.warning(
+            "Signal handler is not added because the engine is not in the "
+            "main thread. This disables the SIGQUIT handler for cleaning up "
+            "the process tree when a child process fails."
+        )
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
