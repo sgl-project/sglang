@@ -72,19 +72,19 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
                 other_args = list(model_setup.extra_args)
-                error_message = None
+                process = None
 
                 if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
                     other_args.extend(["--mem-fraction-static", "0.9"])
 
-                process = popen_launch_server(
-                    model=model_setup.model_path,
-                    other_args=other_args,
-                    base_url=self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                )
-
                 try:
+                    process = popen_launch_server(
+                        model=model_setup.model_path,
+                        other_args=other_args,
+                        base_url=self.base_url,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    )
+
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_setup.model_path,
@@ -103,20 +103,18 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     )
                     is_first = False
 
-                    # 0.0 for empty latency, None for no error
                     all_results.append(
-                        (model_setup.model_path, metrics["score"], 0.0, error_message)
+                        (model_setup.model_path, metrics["score"], 0.0, None)
                     )
                 except Exception as e:
-                    # Capture error message for the summary table
                     error_message = str(e)
-                    # Still append result with error info (use None for N/A metrics to match else clause)
                     all_results.append(
                         (model_setup.model_path, None, None, error_message)
                     )
                     print(f"Error evaluating {model_setup.model_path}: {error_message}")
                 finally:
-                    kill_process_tree(process.pid)
+                    if process is not None:
+                        kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

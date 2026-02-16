@@ -70,15 +70,16 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
 
         for model in self.models:
             model_path = model.model_path
-            error_message = None
             with self.subTest(model=model_path):
-                process = popen_launch_server(
-                    model=model_path,
-                    base_url=self.base_url,
-                    other_args=model.extra_args,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                )
+                process = None
                 try:
+                    process = popen_launch_server(
+                        model=model_path,
+                        base_url=self.base_url,
+                        other_args=model.extra_args,
+                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    )
+
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_path,
@@ -106,17 +107,16 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                             model_path,
                             metrics["score"],
                             metrics["latency"],
-                            error_message,
+                            None,
                         )
                     )
                 except Exception as e:
-                    # Capture error message for the summary table
                     error_message = str(e)
-                    # Still append result with error info (use None for N/A metrics to match else clause)
                     all_results.append((model_path, None, None, error_message))
                     print(f"Error evaluating {model_path}: {error_message}")
                 finally:
-                    kill_process_tree(process.pid)
+                    if process is not None:
+                        kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:
