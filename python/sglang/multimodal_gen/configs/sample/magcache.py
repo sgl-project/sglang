@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
+import json
+import os
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import CacheParams
@@ -21,6 +23,8 @@ T2V_13B_MAG_RATIOS = torch.tensor([
     0.94013, 0.94019, 0.92402, 0.92414, 0.90241, 0.9026, 0.86821, 0.86868,
     0.81838, 0.81939
 ])
+
+NUM_STEPS = 50
 
 def nearest_interp(data:torch.Tensor, target_len:int):
     """Simple nearest neighbor interpolation for 1D arrays."""
@@ -44,6 +48,41 @@ def get_interpolated_mag_ratios(sample_steps:int, raw_ratios=T2V_13B_MAG_RATIOS)
     return raw_ratios
 
 
+def load_calibrated_mag_ratios(
+    model_name: str, num_steps: int, do_cfg: bool = True
+) -> torch.Tensor | None:
+    """
+    Load calibrated magnitude ratios from cache directory.
+
+    Args:
+        model_name: Model identifier (e.g., "wan", "flux").
+        num_steps: Number of inference steps.
+        do_cfg: Whether CFG is enabled.
+
+    Returns:
+        Tensor of magnitude ratios, or None if not found.
+    """
+    cache_root = os.path.expanduser("~/.cache/sgl_diffusion")
+    calibration_dir = os.path.join(cache_root, "magcache_calibrations")
+
+    cfg_suffix = "_cfg" if do_cfg else "_nocfg"
+    filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
+    filepath = os.path.join(calibration_dir, filename)
+
+    if not os.path.exists(filepath):
+        return None
+
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        mag_ratios = torch.tensor(data["mag_ratios"])
+        print(f"✓ Loaded calibrated MagCache ratios from: {filename}")
+        return mag_ratios
+    except Exception as e:
+        print(f"⚠ Failed to load calibration from {filepath}: {e}")
+        return None
+
+
 
 @dataclass
 class MagCacheParams(CacheParams):
@@ -63,32 +102,28 @@ class MagCacheParams(CacheParams):
     """
 
     cache_type: str = "magcache"
-    threshold: float = 0.06
-    max_skip_steps: int = 3
-    retention_ratio: float = 0.2
-    # Note: mag_ratios calibration data would be added here in future
-    # mag_ratios: dict[int, float] = field(default_factory=dict)
-
-
-@dataclass
-class WanMagCacheParams(CacheParams):
-    """
-    Wan-specific MagCache parameters aligned with command-line defaults.
-    """
-    cache_type: str = "magcache"
     threshold: float = 0.12
     max_skip_steps: int = 4
     retention_ratio: float = 0.2
+    num_steps: int = NUM_STEPS # Hardcoded for now
+    mag_ratios: torch.Tensor | None = None
     use_ret_steps: bool = True
-    num_steps: int = 50 # Hardcoded for now
-    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(num_steps, T2V_13B_MAG_RATIOS)
+
+
+@dataclass
+class WanMagCacheParams(MagCacheParams):
+    """
+    Wan-specific MagCache parameters aligned with command-line defaults.
+
+    This class will automatically try to load calibrated magnitude ratios from
+    the cache directory. If not found, it falls back to the default interpolated
+    ratios from T2V_13B_MAG_RATIOS.
+    """
+    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, T2V_13B_MAG_RATIOS) # hardcoded for now
 
     @property
     def ret_steps(self) -> int:
-        """
-        Calculation based on retention_ratio.
-        If ratio is 0.2 and steps are 50, it ensures the first 10 steps are never skipped.
-        """
+        """ Calculation based on retention_ratio."""
         return int(self.num_steps * self.retention_ratio) * 2 if self.use_ret_steps else 2
 
     def get_cutoff_steps(self, num_inference_steps: int) -> int:

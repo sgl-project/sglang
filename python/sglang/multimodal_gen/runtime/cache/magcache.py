@@ -15,7 +15,10 @@ References:
   https://openreview.net/forum?id=KZn7TDOL4J
 """
 
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import torch
@@ -204,25 +207,50 @@ class MagCacheMixin:
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
-    def _calibrate_magcache(self, residual: torch.Tensor) -> None:
-        """Calibration mode to collect magnitude ratios. save it json file"""
+    def _calibrate_magcache(self, residual: torch.Tensor, is_negative: bool = False) -> None:
+        """
+        Calibration mode to collect magnitude ratios and save them to a JSON file.
+
+        This method tracks the magnitude ratios between consecutive residuals during
+        diffusion inference. The ratios are collected for both positive and negative
+        CFG branches (interleaved) and saved to disk when generation completes.
+        """
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+
         current_norm = residual.norm(p=2).item()
 
-        if self.previous_residual is not None:
-            prev_norm = (
-                self.previous_residual_norm_negative
-                if self.is_cfg_negative
-                else self.previous_residual_norm
+        # Get previous norm based on branch
+        prev_norm = (
+            self.previous_residual_norm_negative if is_negative
+            else self.previous_residual_norm
+        )
+
+        # Calculate and collect ratio if we have a previous norm
+        if prev_norm > 0:
+            ratio = current_norm / prev_norm
+            self.calibration_ratios.append(ratio)
+
+        # Update norm for this branch
+        if is_negative:
+            self.previous_residual_norm_negative = current_norm
+        else:
+            self.previous_residual_norm = current_norm
+
+        # Save calibration data at the end of generation (last timestep, positive branch only)
+        if forward_batch is not None and forward_context is not None:
+            is_last_timestep = (
+                forward_context.current_timestep == forward_batch.num_inference_steps - 1
             )
-            ratio = current_norm / prev_norm if prev_norm > 0 else 1.0
-
-            # Store ratio in magcache_params for later use (e.g., interpolation)
-            # This is a simplified example; in practice, you might want to store
-            # these ratios externally or handle them differently.
-            if hasattr(self.magcache_params, "mag_ratios"):
-                self.magcache_params.mag_ratios.append(ratio)
-
-        self.previous_residual = residual.detach()
+            if is_last_timestep and not is_negative:
+                self._save_calibration_data(
+                    num_steps=forward_batch.num_inference_steps,
+                    do_cfg=forward_batch.do_classifier_free_guidance
+                )
 
     def _update_magcache_state(
         self, norm: float | None, error: float, skips: int
@@ -239,6 +267,90 @@ class MagCacheMixin:
                 self.previous_residual_norm_negative = norm
             self.accumulated_error_negative = error
             self.consecutive_skips_negative = skips
+
+    def _get_calibration_cache_dir(self) -> str:
+        """Get the directory for storing MagCache calibration files."""
+        from sglang.multimodal_gen import SGLANG_DIFFUSION_CACHE_ROOT
+        calibration_dir = os.path.join(SGLANG_DIFFUSION_CACHE_ROOT, "magcache_calibrations")
+        os.makedirs(calibration_dir, exist_ok=True)
+        return calibration_dir
+
+    def _save_calibration_data(self, num_steps: int, do_cfg: bool) -> None:
+        """
+        Save collected magnitude ratios to a JSON file.
+
+        Args:
+            num_steps: Number of inference steps used during calibration.
+            do_cfg: Whether classifier-free guidance was enabled.
+        """
+        if not self.calibration_ratios:
+            return
+
+        # Generate filename based on model and configuration
+        model_name = self.config.prefix.lower()  # e.g., "wan", "flux", etc.
+        cfg_suffix = "_cfg" if do_cfg else "_nocfg"
+        filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
+
+        calibration_dir = self._get_calibration_cache_dir()
+        filepath = os.path.join(calibration_dir, filename)
+
+        # Prepare calibration data
+        calibration_data = {
+            "model": model_name,
+            "num_steps": num_steps,
+            "do_cfg": do_cfg,
+            "mag_ratios": self.calibration_ratios,
+            "calibration_date": datetime.now().isoformat(),
+            "num_ratios": len(self.calibration_ratios),
+            "recommended_threshold": 0.12 if model_name == "wan" else 0.06,
+            "recommended_max_skip_steps": 4 if model_name == "wan" else 3,
+            "recommended_retention_ratio": 0.2,
+        }
+
+        # Save to JSON
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(calibration_data, f, indent=2)
+            print(f"✓ MagCache calibration saved to: {filepath}")
+            print(f"  - Model: {model_name}")
+            print(f"  - Steps: {num_steps}")
+            print(f"  - CFG: {do_cfg}")
+            print(f"  - Ratios collected: {len(self.calibration_ratios)}")
+        except Exception as e:
+            print(f"⚠ Failed to save MagCache calibration: {e}")
+
+    @staticmethod
+    def load_calibration_data(
+        model_name: str, num_steps: int, do_cfg: bool
+    ) -> dict | None:
+        """
+        Load calibration data from disk.
+
+        Args:
+            model_name: Model identifier (e.g., "wan", "flux").
+            num_steps: Number of inference steps.
+            do_cfg: Whether CFG is enabled.
+
+        Returns:
+            Dictionary containing calibration data, or None if not found.
+        """
+        cache_root = os.path.expanduser("~/.cache/sgl_diffusion")
+        calibration_dir = os.path.join(cache_root, "magcache_calibrations")
+
+        cfg_suffix = "_cfg" if do_cfg else "_nocfg"
+        filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
+        filepath = os.path.join(calibration_dir, filename)
+
+        if not os.path.exists(filepath):
+            return None
+
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            return data
+        except Exception as e:
+            print(f"⚠ Failed to load MagCache calibration from {filepath}: {e}")
+            return None
 
     def _get_magcache_context(self) -> MagCacheContext | None:
         """

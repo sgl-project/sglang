@@ -929,9 +929,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         else:
             self.previous_residual_negative = residual
 
+        if self.calibrate_magcache:
+            self._calibrate_magcache(residual, is_negative=self.is_cfg_negative)
+
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
-        # if self.calibrate_magcache: return False
+        if self.calibrate_magcache: return False
 
         # Try TeaCache first
         if self.enable_teacache:
@@ -981,7 +984,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             ic('checking magcache')
             ctx = self._get_magcache_context()
             if ctx is None:
-                ic('magcache ctx is None')
                 return False
 
             # Get Wan-specific params
