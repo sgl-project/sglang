@@ -1,8 +1,12 @@
 """CUDA coredump helpers.
 
-CUDA coredump env vars are auto-injected by environ.py at import time
-when SGLANG_CUDA_COREDUMP=1.  This module provides directory management
-(setup / cleanup) and coredump file reporting for the CI test runner.
+When SGLANG_CUDA_COREDUMP=1, this module injects CUDA coredump environment
+variables into the current process so that GPU exceptions (e.g. illegal
+memory access) produce lightweight coredump files for post-mortem analysis
+with cuda-gdb.
+
+The injection happens at module import time via _inject_env(), which must
+run before CUDA runtime initialization.
 """
 
 import glob
@@ -14,6 +18,11 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
+_CUDA_COREDUMP_FLAGS = (
+    "skip_nonrelocated_elf_images,skip_global_memory,"
+    "skip_shared_memory,skip_local_memory,skip_constbank_memory"
+)
+
 
 def is_enabled() -> bool:
     return envs.SGLANG_CUDA_COREDUMP.get()
@@ -21,6 +30,19 @@ def is_enabled() -> bool:
 
 def get_dump_dir() -> str:
     return envs.SGLANG_CUDA_COREDUMP_DIR.get()
+
+
+def _inject_env():
+    """Inject CUDA coredump env vars into os.environ.
+
+    Uses setdefault so user-provided CUDA_* overrides are preserved.
+    Must run before CUDA runtime initialization.
+    """
+    dump_dir = get_dump_dir()
+    os.environ.setdefault("CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "1")
+    os.environ.setdefault("CUDA_COREDUMP_SHOW_PROGRESS", "1")
+    os.environ.setdefault("CUDA_COREDUMP_GENERATION_FLAGS", _CUDA_COREDUMP_FLAGS)
+    os.environ.setdefault("CUDA_COREDUMP_FILE", f"{dump_dir}/cuda_coredump_%h.%p.%t")
 
 
 def setup_dir():
@@ -52,3 +74,8 @@ def report():
         logger.info(f"Download from CI: gh run download {run_id} --repo {repo}")
 
     logger.info(f"{'='*60}\n")
+
+
+# Auto-inject CUDA coredump env vars at import time.
+if is_enabled():
+    _inject_env()

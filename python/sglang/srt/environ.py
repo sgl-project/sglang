@@ -577,6 +577,10 @@ _warn_deprecated_env_to_cli_flag(
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
 
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when SGLANG_CUDA_COREDUMP=1. Must happen before CUDA runtime init.
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
+
 
 def example_with_exit_stack():
     # Use this style of context manager in unit test
