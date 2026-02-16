@@ -344,7 +344,7 @@ class DecodePreallocQueue:
             # Auto enable FAKE mode if configured
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
                 req.bootstrap_host is None
-                and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+                and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
             ):
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
@@ -759,7 +759,7 @@ class DecodeTransferQueue:
 
         if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
             decode_req.req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
         ):
             # Warm up or fake transfer mode
             pass
