@@ -339,7 +339,7 @@ class SamplingParams:
                     self.guidance_scale = pipeline_config.shape_guidance_scale
                 else:
                     self.guidance_scale = 1.0
-            except Exception:
+            except ImportError:
                 self.guidance_scale = 1.0
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
