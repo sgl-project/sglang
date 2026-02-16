@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
+    _collect_megatron_parallel_info,
+    _collect_sglang_parallel_info,
     _Dumper,
     _obj_to_dict,
     _torch_save,
@@ -311,6 +313,55 @@ def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
         len(matches) == 1
     ), f"Expected 1 file matching rank={rank} name={name}, got {matches}"
     return matches[0]
+
+
+class TestSaveValue:
+    def test_dump_output_format(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+
+        dumper.dump("dict_test", tensor)
+
+        path = _find_dump_file(tmp_path, rank=0, name="dict_test")
+        loaded = _load_dump(path)
+        assert torch.equal(loaded["value"], tensor)
+        assert loaded["meta"]["name"] == "dict_test"
+        assert loaded["meta"]["rank"] == 0
+
+
+class TestStaticMetadata:
+    def test_static_meta_contains_world_info(self):
+        dumper = _make_test_dumper(Path("/tmp"))
+        meta = dumper._static_meta
+        assert "world_rank" in meta
+        assert "world_size" in meta
+        assert meta["world_rank"] == 0
+        assert meta["world_size"] == 1
+
+    def test_static_meta_caching(self):
+        dumper = _make_test_dumper(Path("/tmp"))
+        meta1 = dumper._static_meta
+        meta2 = dumper._static_meta
+        assert meta1 is meta2
+
+    def test_parallel_info_graceful_fallback(self):
+        sglang_info = _collect_sglang_parallel_info()
+        assert isinstance(sglang_info, dict)
+
+        megatron_info = _collect_megatron_parallel_info()
+        assert isinstance(megatron_info, dict)
+
+    def test_dump_includes_static_meta(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        tensor = torch.randn(2, 2)
+
+        dumper.dump("meta_test", tensor)
+
+        path = _find_dump_file(tmp_path, rank=0, name="meta_test")
+        loaded = _load_dump(path)
+        meta = loaded["meta"]
+        assert "world_rank" in meta
+        assert "world_size" in meta
 
 
 if __name__ == "__main__":
