@@ -21,6 +21,7 @@ Design Goals:
 4. Testability - Property access validates imports at test time
 5. Performance - Use @lru_cache for frequently-called platform checks
 """
+
 from __future__ import annotations
 
 import enum

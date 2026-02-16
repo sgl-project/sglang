@@ -25,10 +25,12 @@ For IDE type hints, developers have several options:
 2. Platform-specific stubs: Symlink the appropriate .pyi file for your platform
 3. Type ignore: Use # type: ignore[attr-defined] for platform-specific ops
 """
+
 from __future__ import annotations
 
 import logging
 import traceback
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from sglang.platforms.interface import (
@@ -54,6 +56,30 @@ _current_platform: Platform | None = None
 _init_trace: str = ""
 
 
+def _try_import_pynvml():
+    """Import pynvml, preferring the bundled multimodal_gen copy.
+
+    Falls back to the pip-installed pynvml package if multimodal_gen is not
+    available.  Returns None when neither source provides pynvml.
+
+    Note: KeyError is caught because importlib can raise it when namespace
+    packages or __init__.py files have resolution issues.
+    """
+    try:
+        from sglang.multimodal_gen.utils import import_pynvml
+
+        return import_pynvml()
+    except (ImportError, KeyError):
+        pass
+
+    try:
+        import pynvml
+
+        return pynvml
+    except ImportError:
+        return None
+
+
 def _cuda_platform_plugin() -> str | None:
     """
     Detect if CUDA is available.
@@ -65,59 +91,48 @@ def _cuda_platform_plugin() -> str | None:
     """
     is_cuda = False
 
-    try:
-        from sglang.multimodal_gen.utils import import_pynvml
-
-        pynvml = import_pynvml()
-        pynvml.nvmlInit()
+    pynvml = _try_import_pynvml()
+    if pynvml is not None:
         try:
-            is_cuda = pynvml.nvmlDeviceGetCount() > 0
-        finally:
-            pynvml.nvmlShutdown()
-    except ImportError as e:
-        # pynvml not installed - check if this is expected or a broken installation
-        error_str = str(e).lower()
-        if "no module named" not in error_str:
-            # Partial/broken installation - log warning
+            pynvml.nvmlInit()
+            try:
+                is_cuda = pynvml.nvmlDeviceGetCount() > 0
+            finally:
+                pynvml.nvmlShutdown()
+        except Exception as e:
+            # Check if this is an NVML-specific error
+            is_nvml_error = (
+                "nvml" in str(type(e).__module__).lower()
+                or "nvml" in type(e).__name__.lower()
+                or "nvml" in str(e).lower()
+            )
+
+            if not is_nvml_error:
+                # Re-raise non-NVML errors
+                raise
+
+            # Log NVML errors with actionable guidance
             logger.warning(
-                "pynvml import failed with unexpected error: %s. "
-                "If you have NVIDIA hardware, check your pynvml installation.",
+                "NVML error during CUDA detection: %s (%s). "
+                "If you have NVIDIA hardware, check: (1) nvidia-smi works, "
+                "(2) your user has GPU access permissions, "
+                "(3) NVIDIA driver is properly installed. "
+                "Checking for Jetson platform as fallback.",
+                type(e).__name__,
                 e,
             )
-    except Exception as e:
-        # Check if this is an NVML-specific error
-        is_nvml_error = (
-            "nvml" in str(type(e).__module__).lower()
-            or "nvml" in type(e).__name__.lower()
-            or "nvml" in str(e).lower()
-        )
 
-        if not is_nvml_error:
-            # Re-raise non-NVML errors
-            raise
+            # NVML not available - check for Jetson (supports CUDA without NVML)
+            import os
 
-        # Log NVML errors with actionable guidance
-        logger.warning(
-            "NVML error during CUDA detection: %s (%s). "
-            "If you have NVIDIA hardware, check: (1) nvidia-smi works, "
-            "(2) your user has GPU access permissions, "
-            "(3) NVIDIA driver is properly installed. "
-            "Checking for Jetson platform as fallback.",
-            type(e).__name__,
-            e,
-        )
+            def cuda_is_jetson() -> bool:
+                return os.path.isfile("/etc/nv_tegra_release") or os.path.exists(
+                    "/sys/class/tegra-firmware"
+                )
 
-        # NVML not available - check for Jetson (supports CUDA without NVML)
-        import os
-
-        def cuda_is_jetson() -> bool:
-            return os.path.isfile("/etc/nv_tegra_release") or os.path.exists(
-                "/sys/class/tegra-firmware"
-            )
-
-        if cuda_is_jetson():
-            is_cuda = True
-            logger.info("Detected Jetson platform (CUDA without NVML)")
+            if cuda_is_jetson():
+                is_cuda = True
+                logger.info("Detected Jetson platform (CUDA without NVML)")
 
     if is_cuda:
         logger.info("CUDA platform detected")
@@ -261,8 +276,7 @@ def _mps_platform_plugin() -> str | None:
 
 def _cpu_platform_plugin() -> str | None:
     """CPU is always available as a fallback."""
-    # For now, CPU falls back to multimodal_gen implementation
-    return "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform"
+    return "sglang.platforms.cpu.CpuPlatform"
 
 
 def _detect_platform() -> Platform:
@@ -283,57 +297,32 @@ def _detect_platform() -> Platform:
     Raises:
         RuntimeError: If no platform can be detected (should not happen).
     """
-    # Try MPS first on macOS
-    platform_cls_qualname = _mps_platform_plugin()
-    if platform_cls_qualname is not None:
-        try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load MPS platform: %s", e)
+    # Ordered list of (platform name, detector function) pairs.
+    # Each detector returns a qualname string if the platform is available,
+    # or None if it is not.
+    _PLATFORM_DETECTORS: list[tuple[str, Callable[[], str | None]]] = [
+        ("MPS", _mps_platform_plugin),
+        ("ROCm", _rocm_platform_plugin),
+        ("CUDA", _cuda_platform_plugin),
+        ("MUSA", _musa_platform_plugin),
+        ("XPU", _xpu_platform_plugin),
+        ("CPU", _cpu_platform_plugin),
+    ]
 
-    # Fall back to ROCm
-    platform_cls_qualname = _rocm_platform_plugin()
-    if platform_cls_qualname is not None:
+    for name, detect_fn in _PLATFORM_DETECTORS:
+        qualname = detect_fn()
+        if qualname is None:
+            continue
         try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load ROCm platform: %s", e)
-
-    # Fall back to CUDA
-    platform_cls_qualname = _cuda_platform_plugin()
-    if platform_cls_qualname is not None:
-        try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load CUDA platform: %s", e)
-
-    # Fall back to MUSA
-    platform_cls_qualname = _musa_platform_plugin()
-    if platform_cls_qualname is not None:
-        try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load MUSA platform: %s", e)
-
-    # Fall back to XPU (Intel GPUs)
-    platform_cls_qualname = _xpu_platform_plugin()
-    if platform_cls_qualname is not None:
-        try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load XPU platform: %s", e)
-
-    # Fall back to CPU as last resort
-    platform_cls_qualname = _cpu_platform_plugin()
-    if platform_cls_qualname is not None:
-        try:
-            return resolve_obj_by_qualname(platform_cls_qualname)()
-        except (ImportError, AttributeError) as e:
-            logger.error("Failed to load CPU platform: %s", e)
-            raise RuntimeError(
-                f"Failed to load CPU platform (last resort): {e}. "
-                "Please check your SGLang installation."
-            ) from e
+            return resolve_obj_by_qualname(qualname)()
+        except (ImportError, AttributeError, KeyError) as e:
+            logger.error("Failed to load %s platform: %s", name, e, exc_info=True)
+            # CPU is the last-resort fallback; if it fails, nothing else to try.
+            if name == "CPU":
+                raise RuntimeError(
+                    f"Failed to load CPU platform (last resort): {e}. "
+                    "Please check your SGLang installation."
+                ) from e
 
     raise RuntimeError("No platform plugin found. Please check your installation.")
 

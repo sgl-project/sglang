@@ -11,6 +11,7 @@ Ops are registered as @cached_property with direct imports for:
 - IDE navigation (Ctrl+Click on import goes to implementation)
 - Testability (property access validates import)
 """
+
 from __future__ import annotations
 
 import logging
@@ -39,36 +40,30 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 # Attempt to import pynvml for NVML-based device queries
-_pynvml = None
 _nvml_available = False
 _nvml_init_error: str | None = None
 
-try:
-    from sglang.multimodal_gen.utils import import_pynvml
+# Reuse the shared pynvml import helper (prefers bundled multimodal_gen copy,
+# falls back to pip-installed pynvml, returns None if neither is available).
+from sglang.platforms import _try_import_pynvml
 
-    _pynvml = import_pynvml()
-    _pynvml.nvmlInit()
-    _nvml_available = True
-    _pynvml.nvmlShutdown()
-except ImportError as e:
-    # pynvml or dependencies not installed
-    _nvml_init_error = f"ImportError: {e}"
-    error_str = str(e).lower()
-    # Only log warning if this looks like a partial/broken installation
-    if "no module named" not in error_str:
-        logger.debug(
-            "pynvml import failed: %s. Using torch.cuda for device queries.", e
+_pynvml = _try_import_pynvml()
+
+if _pynvml is not None:
+    try:
+        _pynvml.nvmlInit()
+        _nvml_available = True
+        _pynvml.nvmlShutdown()
+    except Exception as e:
+        # Store error for debugging and log appropriately
+        _nvml_init_error = str(e)
+        # Log at INFO level so users know why NVML isn't being used
+        logger.info(
+            "NVML initialization failed: %s. "
+            "Falling back to torch.cuda for device queries. "
+            "This may initialize CUDA context earlier than intended.",
+            e,
         )
-except Exception as e:
-    # Store error for debugging and log appropriately
-    _nvml_init_error = str(e)
-    # Log at INFO level so users know why NVML isn't being used
-    logger.info(
-        "NVML initialization failed: %s. "
-        "Falling back to torch.cuda for device queries. "
-        "This may initialize CUDA context earlier than intended.",
-        e,
-    )
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:

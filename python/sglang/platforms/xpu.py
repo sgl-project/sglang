@@ -10,6 +10,7 @@ Ops are registered as @cached_property with direct imports for:
 - IDE navigation (Ctrl+Click on import goes to implementation)
 - Testability (property access validates import)
 """
+
 from __future__ import annotations
 
 import logging

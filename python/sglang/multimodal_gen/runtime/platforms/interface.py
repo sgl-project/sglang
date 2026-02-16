@@ -11,6 +11,7 @@ class extends the unified one with multimodal_gen-specific methods.
 
 New code should import directly from sglang.platforms.interface.
 """
+
 from __future__ import annotations
 
 import random
@@ -30,7 +31,10 @@ from sglang.platforms.interface import (
     DeviceCapability,
 )
 from sglang.platforms.interface import Platform as UnifiedPlatform
-from sglang.platforms.interface import PlatformEnum, UnspecifiedPlatform
+from sglang.platforms.interface import (
+    PlatformEnum,
+    UnspecifiedPlatform,
+)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (

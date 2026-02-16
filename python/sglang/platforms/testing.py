@@ -4,6 +4,7 @@ Testing utilities for platform abstraction.
 
 Provides MockPlatform and helpers for unit tests that don't require hardware.
 """
+
 from __future__ import annotations
 
 from typing import Any, Callable
