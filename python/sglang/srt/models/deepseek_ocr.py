@@ -16,6 +16,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only Apertus model compatible with HuggingFace weights."""
+
 import copy
 import logging
 import math

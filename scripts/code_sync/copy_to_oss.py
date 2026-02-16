@@ -29,44 +29,20 @@ python3 scripts/copy_to_oss.py --commit <commit_hash> --dry-run
 import argparse
 import datetime
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
-# --- Configuration Begin ---
-# List of folders and files to copy to the OSS repo.
-# Changes outside these paths will be ignored.
-folder_names = [
-    "3rdparty",
-    "assets",
-    "benchmark",
-    "docker",
-    "docs",
-    "examples",
-    "python/sglang/lang",
-    "python/sglang/jit_kernel",
-    "python/sglang/srt",
-    "python/sglang/test",
-    "python/sglang/utils.py",
-    "python/sglang/README.md",
-    "sgl-kernel",
-    "test/manual",
-    "test/registered",
-    "test/srt",
-    "test/README.md",
-    "test/run_suite.py",
-    "README.md",
-]
+# Allow sibling imports regardless of the working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# --- Configuration End ---
-
-
-def write_github_step_summary(content):
-    if not os.environ.get("GITHUB_STEP_SUMMARY"):
-        return
-
-    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-        f.write(content)
+from utils import (  # noqa: E402
+    FOLDER_NAMES,
+    find_latest_oss_sync_commit,
+    write_github_step_summary,
+)
 
 
 def get_commit_info(commit_ref):
@@ -131,7 +107,7 @@ def create_filtered_patch(commit_hash, dry_run):
 
         # Filter the list of files
         relevant_files = [
-            f for f in changed_files if any(f.startswith(path) for path in folder_names)
+            f for f in changed_files if any(f.startswith(path) for path in FOLDER_NAMES)
         ]
 
         if not relevant_files:
@@ -181,7 +157,9 @@ def get_oss_repo(dry_run):
     """
     gh_token = os.getenv("GH_TOKEN")
     if not gh_token:
-        print("⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation.")
+        print(
+            "⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation."
+        )
         if not dry_run:
             return
 
@@ -190,7 +168,7 @@ def get_oss_repo(dry_run):
     print(f"\nCreated temporary directory for OSS repo: {temp_dir}")
 
     repo_url = f"https://{gh_token}@github.com/sgl-project/sglang.git"
-    command = ["git", "clone", "--branch", "main", repo_url, oss_root]
+    command = ["git", "clone", repo_url, oss_root]
 
     print(f"Run: {' '.join(command)}")
     if not dry_run:
@@ -205,9 +183,105 @@ def get_oss_repo(dry_run):
     return oss_root, temp_dir
 
 
-def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_run):
+def _apply_patch(patch_file, dry_run):
     """
-    In the OSS repo, create a branch, apply the patch, commit, and push.
+    Try to apply a patch, falling back to --3way merge if a clean apply fails.
+
+    Returns True if the patch was applied cleanly.
+    Returns False if conflicts were encountered (changes are still staged
+    with conflict markers so a PR can be created for manual resolution).
+    """
+    # --- Attempt 1: clean git apply ---
+    apply_cmd = ["git", "apply", patch_file]
+    print(f"Run: {' '.join(apply_cmd)}")
+    if dry_run:
+        return True
+
+    result = subprocess.run(apply_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("✅ Patch applied cleanly.")
+        return True
+
+    print(f"⚠️  Clean apply failed:\n{result.stderr.strip()}")
+    print("Falling back to git apply --3way ...\n")
+
+    # --- Attempt 2: three-way merge ---
+    threeway_cmd = ["git", "apply", "--3way", patch_file]
+    print(f"Run: {' '.join(threeway_cmd)}")
+    result_3way = subprocess.run(threeway_cmd, capture_output=True, text=True)
+
+    if result_3way.returncode == 0:
+        print("✅ Patch applied via --3way merge (no conflicts).")
+        return True
+
+    # --- --3way left conflict markers in the working tree ---
+    print(f"⚠️  --3way merge had conflicts:\n{result_3way.stderr.strip()}\n")
+
+    # Show which hunks conflict
+    check_cmd = ["git", "apply", "--check", "--verbose", patch_file]
+    print(f"Run: {' '.join(check_cmd)}")
+    check_result = subprocess.run(check_cmd, capture_output=True, text=True)
+    conflict_details = (check_result.stdout + check_result.stderr).strip()
+    print(
+        f"\n--- Conflict details ---\n{conflict_details}\n--- End conflict details ---\n"
+    )
+
+    # Show git diff if --3way left conflict markers
+    diff_result = subprocess.run(["git", "diff"], capture_output=True, text=True)
+    if diff_result.stdout.strip():
+        print(
+            f"\n--- git diff (conflict markers) ---\n"
+            f"{diff_result.stdout.strip()}\n"
+            f"--- End git diff ---\n"
+        )
+
+    # Read the patch content for the summary
+    with open(patch_file, "r", encoding="utf-8") as pf:
+        patch_content = pf.read()
+
+    # Print the patch to stdout so it's visible in the CI logs
+    separator = "=" * 72
+    print(
+        f"\n{separator}\n"
+        f"PATCH CONTENT (apply this manually):\n"
+        f"{separator}\n"
+        f"{patch_content}\n"
+        f"{separator}\n"
+    )
+
+    # Write a rich summary to the GitHub Actions step summary
+    summary_lines = [
+        "\n## ⚠️ Patch had conflicts — PR created for manual resolution\n",
+        "### Conflict details\n",
+        f"```\n{conflict_details}\n```\n",
+    ]
+    if diff_result.stdout.strip():
+        summary_lines.append("### git diff (conflict markers)\n")
+        summary_lines.append(f"```diff\n{diff_result.stdout.strip()}\n```\n")
+    summary_lines.append("### Patch to apply manually\n")
+    summary_lines.append(
+        "<details><summary>Click to expand full patch</summary>\n\n"
+        f"```diff\n{patch_content}\n```\n"
+        "</details>\n"
+    )
+    write_github_step_summary("".join(summary_lines))
+
+    return False
+
+
+def apply_patch_and_push(
+    oss_root, patch_file, branch_name, commit_message, base_oss_commit, dry_run
+):
+    """
+    In the OSS repo, create a branch from base_oss_commit, apply the patch,
+    commit, and push.
+
+    Args:
+        base_oss_commit: The OSS commit hash to branch from (the last sync
+            point). If None, the current HEAD (main) is used.
+
+    Returns True if the patch applied cleanly, False if there were conflicts
+    (the conflicted state is still committed and pushed so a PR can be opened).
     """
     print("\nApplying patch and pushing to OSS repo...")
 
@@ -215,11 +289,22 @@ def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_
     if not dry_run:
         os.chdir(oss_root)
 
+    applied_cleanly = True
     try:
-        # Define commands as lists to avoid shell injection issues
-        commands_to_run = [
-            ["git", "checkout", "-b", branch_name],
-            ["git", "apply", patch_file],
+        # Check out a new branch from the base OSS commit
+        if base_oss_commit:
+            checkout_cmd = ["git", "checkout", "-b", branch_name, base_oss_commit]
+        else:
+            checkout_cmd = ["git", "checkout", "-b", branch_name]
+        print(f"Run: {' '.join(checkout_cmd)}")
+        if not dry_run:
+            subprocess.run(checkout_cmd, check=True, capture_output=True, text=True)
+
+        # Apply the patch (with --3way fallback and diagnostics)
+        applied_cleanly = _apply_patch(patch_file, dry_run)
+
+        # Configure git user and stage changes
+        post_apply_commands = [
             ["git", "config", "user.name", "github-actions[bot]"],
             [
                 "git",
@@ -230,7 +315,7 @@ def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_
             ["git", "add", "."],
         ]
 
-        for cmd_list in commands_to_run:
+        for cmd_list in post_apply_commands:
             print(f"Run: {' '.join(cmd_list)}")
             if not dry_run:
                 subprocess.run(cmd_list, check=True, capture_output=True, text=True)
@@ -261,14 +346,24 @@ def apply_patch_and_push(oss_root, patch_file, branch_name, commit_message, dry_
         if not dry_run:
             os.chdir(original_cwd)
 
-    print("✅ Branch created, patch applied, and pushed successfully.")
+    if applied_cleanly:
+        print("✅ Branch created, patch applied cleanly, and pushed successfully.")
+    else:
+        print(
+            "⚠️  Branch created and pushed with conflict markers. "
+            "A PR will be opened for manual resolution."
+        )
+
+    return applied_cleanly
 
 
 def create_pull_request(oss_root, branch_name, title, body, dry_run):
     """Create a pull request in the OSS repo using the GitHub CLI."""
     gh_token = os.getenv("GH_TOKEN")
     if not gh_token:
-        print("⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation.")
+        print(
+            "⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation."
+        )
         if not dry_run:
             return
 
@@ -335,6 +430,36 @@ def get_commit_author(commit_hash):
         raise
 
 
+def get_all_co_author_lines(commit_hash, commit_message):
+    """
+    Build a deduplicated list of Co-authored-by lines that includes both
+    the primary commit author and any Co-authored-by trailers already
+    present in the commit message.
+
+    Returns a list of unique "Co-authored-by: Name <email>" strings.
+    """
+    seen = set()
+    co_author_lines = []
+
+    def _add(name, email):
+        key = (name.strip(), email.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            co_author_lines.append(f"Co-authored-by: {name.strip()} <{email.strip()}>")
+
+    # 1. Primary author of the commit
+    author_name, author_email = get_commit_author(commit_hash)
+    _add(author_name, author_email)
+
+    # 2. Existing Co-authored-by trailers in the commit message
+    for line in commit_message.splitlines():
+        m = re.match(r"^\s*Co-authored-by:\s*(.+?)\s*<([^>]+)>", line, re.IGNORECASE)
+        if m:
+            _add(m.group(1), m.group(2))
+
+    return co_author_lines
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Copy a commit from the private repo to OSS and open a PR."
@@ -389,33 +514,67 @@ def main():
         # 2. Get the OSS repo
         oss_root, temp_dir = get_oss_repo(args.dry_run)
 
-        # 3. Get original commit author for the co-author line
-        author_name, author_email = get_commit_author(commit_hash)
+        # 3. Find the latest OSS commit that was synced into sglang-private.
+        #    This is the correct base for our patch, since the private repo's
+        #    code is based on this sync point.
+        base_oss_commit = find_latest_oss_sync_commit()
+        if base_oss_commit:
+            print(f"ℹ️  Will branch from OSS commit {base_oss_commit}")
+        else:
+            print(
+                "⚠️  Could not determine latest OSS sync commit. "
+                "Falling back to OSS main HEAD."
+            )
 
-        # 4. Prepare content for the commit and PR based on changed files
+        # 4. Get all co-author lines (primary author + trailers from commit message)
+        co_author_lines = get_all_co_author_lines(commit_hash, original_commit_message)
+        authors_display = "\n".join(co_author_lines)
+
+        # 5. Prepare content for the commit and PR based on changed files
         file_list_str = "\n".join([f"- {f}" for f in relevant_files])
         filename_list_str = ", ".join([f.split("/")[-1] for f in relevant_files])
         if len(filename_list_str) > 40:
             filename_list_str = filename_list_str[:40] + "..."
         current_date = datetime.datetime.now().strftime("%Y%m%d")
         pr_title = f"[Auto Sync] Update {filename_list_str} ({current_date})"
-        pr_body = (
-            f"Sync changes from commit `{short_hash}`.\n\n"
-            f"**Files Changed:**\n{file_list_str}\n\n"
-            f"Author: {author_name} <{author_email}>"
-            f"\n\n---\n\n"
-            f"*This is an automated PR created by scripts/copy_from_oss.py.*"
-        )
 
-        # 5. Create branch, apply patch, and push
+        # 6. Create branch from the last synced OSS commit, apply patch, and push
         branch_name = f"sync-{short_hash}-{current_date}"
-        co_author_line = f"Co-authored-by: {author_name} <{author_email}>"
-        commit_message = f"{pr_title}\n\n{co_author_line}"
-        apply_patch_and_push(
-            oss_root, patch_file, branch_name, commit_message, args.dry_run
+        co_authors_block = "\n".join(co_author_lines)
+        commit_message = f"{pr_title}\n\n{co_authors_block}"
+        applied_cleanly = apply_patch_and_push(
+            oss_root,
+            patch_file,
+            branch_name,
+            commit_message,
+            base_oss_commit,
+            args.dry_run,
         )
 
-        # 6. Create Pull Request
+        # 7. Adjust PR title and body when there are conflicts
+        if not applied_cleanly:
+            pr_title = (
+                f"[Auto Sync][⚠️ Conflicts] Update {filename_list_str} ({current_date})"
+            )
+
+        pr_body_parts = [
+            f"Sync changes from commit `{short_hash}`.\n",
+            f"**Files Changed:**\n{file_list_str}\n",
+            f"**Authors:**\n{authors_display}",
+        ]
+        if not applied_cleanly:
+            pr_body_parts.append(
+                "\n\n⚠️ **This patch had merge conflicts.** "
+                "The branch contains conflict markers that must be resolved manually. "
+                "Please check the CI logs for the full patch and conflict details."
+            )
+        pr_body_parts.append(
+            f"\n\n---\n\n"
+            f"*This is an automated PR created by scripts/copy_to_oss.py.*"
+        )
+        pr_body = "\n".join(pr_body_parts)
+
+        # 8. Create Pull Request
         create_pull_request(oss_root, branch_name, pr_title, pr_body, args.dry_run)
 
     finally:

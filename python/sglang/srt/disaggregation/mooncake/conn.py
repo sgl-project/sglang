@@ -643,6 +643,13 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
+            if len(prefill_state_indices) < len(req.dst_state_indices):
+                logger.warning(
+                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(req.dst_state_indices)}"
+                )
+                prefill_state_indices = prefill_state_indices[
+                    : len(req.dst_state_indices)
+                ]
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
@@ -963,7 +970,7 @@ class MooncakeKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
-                (bootstrap_room, status, prefill_rank) = msg
+                bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))

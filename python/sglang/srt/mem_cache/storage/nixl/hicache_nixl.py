@@ -1,11 +1,11 @@
 import logging
-import os
 import time
 import uuid
 from typing import Any, List, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 from .nixl_utils import (
@@ -44,7 +44,7 @@ class HiCacheNixl(HiCacheStorage):
         plugin = nixlconfig.get_specified_plugin()
 
         # Might be better to be unified across HiCache backends and moved to HiCacheController
-        file_path = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR", file_path)
+        file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
         self.file_manager = (
             NixlFileManager(file_path)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
