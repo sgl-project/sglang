@@ -72,10 +72,10 @@ def convert_transformer(model_type: str, model_dir: str, output_dir: str):
     RENAME_DICT = get_transformer_config(model_type)
 
     original_state_dict = load_sharded_safetensors(
-        pathlib.Path(model_dir, "quant_model_weight_w8a8_dynamic.safetensors")
+        pathlib.Path(model_dir, "*model*.safetensors")
     )
     with open(
-        pathlib.Path(model_dir, "quant_model_description_w8a8_dynamic.json")
+        pathlib.Path(model_dir, "*quant_model_description*.json")
     ) as f:
         original_quant_config = json.load(f)
 
@@ -115,3 +115,4 @@ if __name__ == "__main__":
         model_dir=pathlib.Path(args.input_path, "low_noise_model"),
         output_dir=pathlib.Path(args.output_path, "transformer_2"),
     )
+
