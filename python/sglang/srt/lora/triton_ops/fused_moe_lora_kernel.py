@@ -3,7 +3,6 @@
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.utils import is_arch_support_pdl
 
 from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,

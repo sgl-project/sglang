@@ -595,14 +595,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
     ):
-
-        # initialize triton_lora moe runner for batches with lora enabled
-        if lora_backend.name != "triton":
-            raise ValueError(
-                "FusedMoEWithLoRA only supports 'triton' backend. "
-                "Please set --lora-backend triton when using LoRA on MoE models."
-            )
-
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
         # LoRA tensors will be set by LoRAManager
