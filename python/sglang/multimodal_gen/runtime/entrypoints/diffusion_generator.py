@@ -277,6 +277,7 @@ class DiffGenerator:
                         samples_out=samples_out,
                         audios_out=audios_out,
                         frames_out=frames_out,
+                        output_compression=req.output_compression,
                     )
 
                     for output_idx in range(len(samples_out)):
