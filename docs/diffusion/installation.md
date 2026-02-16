@@ -84,7 +84,7 @@ pip install -e "python[all_musa]"
 
 ## Platform-Specific: Ascend NPU
 
-For Ascend NPU please follow this guide [installation on NPU](../platforms/ascend_npu.md)
+For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend_npu.md).
 
 Quick test:
 
