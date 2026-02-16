@@ -119,6 +119,7 @@ class DmdDenoisingStage(DenoisingStage):
                         )
                     else:
                         current_model = self.transformer
+                        self._manage_device_placement(current_model, None, server_args)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)

@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/olmo2.py
 """Inference-only OLMo2 model compatible with HuggingFace weights."""
+
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
