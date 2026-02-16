@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
 """The arguments of sglang-diffusion Inference."""
+
 import argparse
 import dataclasses
 import inspect
@@ -21,6 +22,10 @@ import yaml
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -251,8 +256,8 @@ class ServerArgs:
 
     # Parallelism
     num_gpus: int = 1
-    tp_size: int = -1
-    sp_degree: int = -1
+    tp_size: Optional[int] = None
+    sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
@@ -265,7 +270,7 @@ class ServerArgs:
     enable_cfg_parallel: bool = False
 
     hsdp_replicate_dim: int = 1
-    hsdp_shard_dim: int = -1
+    hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
@@ -308,6 +313,11 @@ class ServerArgs:
     warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
+
+    # Quantization / Nunchaku SVDQuant configuration
+    nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
+        default_factory=NunchakuSVDQuantArgs, repr=False
+    )
 
     # Master port for distributed inference
     # TODO: do not hard code
@@ -362,7 +372,45 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
-    def adjust_offload(self):
+    def _adjust_parameters(self):
+        """set defaults and normalize values."""
+        self._adjust_offload()
+        self._adjust_quant_config()
+        self._adjust_warmup()
+        self._adjust_network_ports()
+        # adjust parallelism before attention backend
+        self._adjust_parallelism()
+        self._adjust_attention_backend()
+        self._adjust_platform_specific()
+        self._adjust_autocast()
+
+    def _validate_parameters(self):
+        """check consistency and raise errors for invalid configs"""
+        self._validate_pipeline()
+        self._validate_offload()
+        self._validate_parallelism()
+        self._validate_cfg_parallel()
+
+    def _adjust_quant_config(self):
+        """validate and adjust"""
+
+        # nunchaku
+        ncfg = self.nunchaku_config
+        if ncfg is None or isinstance(ncfg, NunchakuConfig):
+            return
+        ncfg.validate()
+        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
+            # if nunchaku is not applied
+            self.nunchaku_config = None
+        else:
+            self.nunchaku_config = NunchakuConfig(
+                precision=self.nunchaku_config.quantization_precision,
+                rank=self.nunchaku_config.quantization_rank,
+                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
+                quantized_model_path=self.nunchaku_config.quantized_model_path,
+            )
+
+    def _adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
@@ -384,6 +432,119 @@ class ServerArgs:
                 self.image_encoder_cpu_offload = True
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = True
+
+    def _adjust_attention_backend(self):
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
+
+        # attention_backend_config
+        if self.attention_backend_config is None:
+            self.attention_backend_config = addict.Dict()
+        elif isinstance(self.attention_backend_config, str):
+            self.attention_backend_config = addict.Dict(
+                self._parse_attention_backend_config(self.attention_backend_config)
+            )
+
+        if self.ring_degree > 1:
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
+                raise ValueError(
+                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                )
+            if self.attention_backend is None:
+                self.attention_backend = "fa"
+                logger.info(
+                    "Ring Attention is currently only supported for flash attention or sage attention; "
+                    "attention_backend has been automatically set to flash attention"
+                )
+
+        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            self._set_default_attention_backend()
+
+    def _adjust_warmup(self):
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
+
+    def _adjust_network_ports(self):
+        self.port = self.settle_port(self.port)
+        initial_scheduler_port = self.scheduler_port + (
+            random.randint(0, 100) if self.scheduler_port == 5555 else 0
+        )
+        self.scheduler_port = self.settle_port(initial_scheduler_port)
+        initial_master_port = (
+            self.master_port
+            if self.master_port is not None
+            else (30005 + random.randint(0, 100))
+        )
+        self.master_port = self.settle_port(initial_master_port, 37)
+
+    def _adjust_parallelism(self):
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        if self.hsdp_shard_dim is None:
+            self.hsdp_shard_dim = self.num_gpus
+
+        # adjust sp_degree: allocate all remaining GPUs after TP and DP
+        if self.sp_degree is None:
+            num_gpus_per_group = self.dp_size * self.tp_size
+            if self.enable_cfg_parallel:
+                num_gpus_per_group *= 2
+            if self.num_gpus % num_gpus_per_group == 0:
+                self.sp_degree = self.num_gpus // num_gpus_per_group
+            else:
+                # Will be validated later
+                self.sp_degree = 1
+
+        if (
+            self.ulysses_degree is None
+            and self.ring_degree is None
+            and self.sp_degree != 1
+        ):
+            self.ulysses_degree = self.sp_degree
+            logger.info(
+                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
+            )
+
+        if self.ulysses_degree is None:
+            self.ulysses_degree = 1
+            logger.debug(
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
+            )
+
+        if self.ring_degree is None:
+            self.ring_degree = 1
+            logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _adjust_platform_specific(self):
+        if current_platform.is_mps():
+            self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+
+        # automatically enable dit_layerwise_offload for Wan/MOVA models if appropriate
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
+            if (
+                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
+                and self.dit_layerwise_offload is None
+                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            ):
+                logger.info(
+                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
+                    "for low memory and performance balance"
+                )
+                self.dit_layerwise_offload = True
+
+    def _adjust_autocast(self):
+        if self.disable_autocast is None:
+            self.disable_autocast = not self.pipeline_config.enable_autocast
 
     def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
         """parse attention backend config from string."""
@@ -428,38 +589,11 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
-        self.adjust_offload()
+        # 1. adjust parameters
+        self._adjust_parameters()
 
-        if self.attention_backend in ["fa3", "fa4"]:
-            self.attention_backend = "fa"
-
-        # normalize attention_backend_config
-        if self.attention_backend_config is None:
-            self.attention_backend_config = addict.Dict()
-        elif isinstance(self.attention_backend_config, str):
-            self.attention_backend_config = addict.Dict(
-                self._parse_attention_backend_config(self.attention_backend_config)
-            )
-
-        # handle warmup
-        if self.warmup_resolutions is not None:
-            self.warmup = True
-
-        if self.warmup:
-            logger.info(
-                "Warmup enabled, the launch time is expected to be longer than usual"
-            )
-
-        # network initialization: port and host
-        self.port = self.settle_port(self.port)
-        # Add randomization to avoid race condition when multiple servers start simultaneously
-        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
-
-        self.check_server_args()
+        # 2. Validate parameters
+        self._validate_parameters()
 
         # log clean server_args
         try:
@@ -540,14 +674,14 @@ class ServerArgs:
         parser.add_argument(
             "--tp-size",
             type=int,
-            default=ServerArgs.tp_size,
-            help="The tensor parallelism size.",
+            default=None,
+            help="The tensor parallelism size. Defaults to 1 if not specified.",
         )
         parser.add_argument(
             "--sp-degree",
             type=int,
-            default=ServerArgs.sp_degree,
-            help="The sequence parallelism size.",
+            default=None,
+            help="The sequence parallelism size. If not specified, will use all remaining GPUs after accounting for TP and DP.",
         )
         parser.add_argument(
             "--ulysses-degree",
@@ -585,8 +719,8 @@ class ServerArgs:
         parser.add_argument(
             "--hsdp-shard-dim",
             type=int,
-            default=ServerArgs.hsdp_shard_dim,
-            help="The data parallelism shards.",
+            default=None,
+            help="The data parallelism shards. Defaults to num_gpus if not specified.",
         )
         parser.add_argument(
             "--dist-timeout",
@@ -683,6 +817,9 @@ class ServerArgs:
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
+
+        # Nunchaku SVDQuant quantization parameters
+        NunchakuSVDQuantArgs.add_cli_args(parser)
 
         # Master port for distributed inference
         parser.add_argument(
@@ -846,6 +983,9 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
+            elif attr == "nunchaku_config":
+                nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
+                server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -911,77 +1051,14 @@ class ServerArgs:
 
         return provided_args
 
-    def check_server_sp_args(self):
-        if self.sp_degree == -1:
-            # assume we leave all remaining gpus to sp
-            num_gpus_per_group = self.dp_size * self.tp_size
-            if self.enable_cfg_parallel:
-                num_gpus_per_group *= 2
-            if self.num_gpus % num_gpus_per_group != 0:
-                raise ValueError(f"{self.num_gpus=} % {num_gpus_per_group} != 0")
-            self.sp_degree = self.num_gpus // num_gpus_per_group
+    def _validate_pipeline(self):
+        if self.pipeline_config is None:
+            raise ValueError("pipeline_config is not set in ServerArgs")
 
-        if (
-            self.ulysses_degree is None
-            and self.ring_degree is None
-            and self.sp_degree != 1
-        ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
-            )
+        self.pipeline_config.check_pipeline_config()
 
-        if self.ulysses_degree is None:
-            self.ulysses_degree = 1
-            logger.debug(
-                f"Ulysses degree not set, using default value {self.ulysses_degree}"
-            )
-
-        if self.ring_degree is None:
-            self.ring_degree = 1
-            logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
-
-        if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
-            ):
-                raise ValueError(
-                    "Ring Attention is only supported for flash attention or sage attention backend for now"
-                )
-            if self.attention_backend is None:
-                self.attention_backend = "fa"
-                logger.info(
-                    "Ring Attention is currently only supported for flash attention or sage attention; attention_backend has been automatically set to flash attention"
-                )
-
-        if self.sp_degree == -1:
-            self.sp_degree = self.ring_degree * self.ulysses_degree
-            logger.info(
-                f"sequence_parallel_degree is not provided, using ring_degree * ulysses_degree = {self.sp_degree}"
-            )
-
-        if self.sp_degree != self.ring_degree * self.ulysses_degree:
-            raise ValueError(
-                f"sequence_parallel_degree is not equal to ring_degree * ulysses_degree, {self.sp_degree} != {self.ring_degree} * {self.ulysses_degree}"
-            )
-
-    def check_server_dp_args(self):
-        assert self.num_gpus % self.dp_size == 0, f"{self.num_gpus=}, {self.dp_size=}"
-        assert self.dp_size >= 1, "--dp-size must be natural number"
-        # NOTE: disable temporarily
-        # self.dp_degree = self.num_gpus // self.dp_size
-        logger.debug(f"Setting dp_degree to: {self.dp_degree}")
-        if self.dp_size > 1:
-            raise ValueError("DP is not yet supported")
-
-    def check_server_args(self) -> None:
-        """Validate inference arguments for consistency"""
-        # layerwise offload
-        if current_platform.is_mps():
-            self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-
+    def _validate_offload(self):
+        # validate dit_offload_prefetch_size
         if self.dit_offload_prefetch_size > 1 and (
             isinstance(self.dit_offload_prefetch_size, float)
             and not self.dit_offload_prefetch_size.is_integer()
@@ -992,38 +1069,29 @@ class ServerArgs:
             logger.info(
                 f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
             )
+
         if 0.5 <= self.dit_offload_prefetch_size < 1.0:
             logger.info(
-                f"We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+                "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
             )
 
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            # TODO: need a better way to tell this
-            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
-            if (
-                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
-                and self.dit_layerwise_offload is None
-                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-            ):
-                logger.info(
-                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} for low memory and performance balance"
-                )
-                self.dit_layerwise_offload = True
-
+        # validate dit_layerwise_offload conflicts
         if self.dit_layerwise_offload:
-            assert (
-                self.dit_offload_prefetch_size >= 0.0
-            ), "dit_offload_prefetch_size must be non-negative"
+            if self.dit_offload_prefetch_size < 0.0:
+                raise ValueError("dit_offload_prefetch_size must be non-negative")
+
             if self.use_fsdp_inference:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
+
             if self.dit_cpu_offload:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
                 self.dit_cpu_offload = False
+
             if envs.SGLANG_CACHE_DIT_ENABLED:
                 raise ValueError(
                     "dit_layerwise_offload cannot be enabled together with cache-dit. "
@@ -1032,50 +1100,53 @@ class ServerArgs:
                     "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
                 )
 
-        # autocast
-        if self.disable_autocast is None:
-            self.disable_autocast = not self.pipeline_config.enable_autocast
-        else:
-            self.disable_autocast = False
+    def _validate_parallelism(self):
+        if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
+            )
 
-        if self.tp_size == -1:
-            self.tp_size = 1
+        if (
+            self.hsdp_replicate_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_replicate_dim != 0
+        ):
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_replicate_dim ({self.hsdp_replicate_dim})"
+            )
 
-        if self.hsdp_shard_dim == -1:
-            self.hsdp_shard_dim = self.num_gpus
+        if (
+            self.hsdp_shard_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_shard_dim != 0
+        ):
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_shard_dim ({self.hsdp_shard_dim})"
+            )
 
-        assert (
-            self.sp_degree <= self.num_gpus and self.num_gpus % self.sp_degree == 0
-        ), "num_gpus must >= and be divisible by sp_size"
-        assert (
-            self.hsdp_replicate_dim <= self.num_gpus
-            and self.num_gpus % self.hsdp_replicate_dim == 0
-        ), "num_gpus must >= and be divisible by hsdp_replicate_dim"
-        assert (
-            self.hsdp_shard_dim <= self.num_gpus
-            and self.num_gpus % self.hsdp_shard_dim == 0
-        ), "num_gpus must >= and be divisible by hsdp_shard_dim"
+        if self.num_gpus % self.dp_size != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by dp_size ({self.dp_size})"
+            )
 
-        if self.num_gpus < max(self.tp_size, self.sp_degree):
-            self.num_gpus = max(self.tp_size, self.sp_degree)
+        if self.dp_size < 1:
+            raise ValueError("--dp-size must be a natural number")
 
-        if self.pipeline_config is None:
-            raise ValueError("pipeline_config is not set in ServerArgs")
+        if self.dp_size > 1:
+            raise ValueError("DP is not yet supported")
 
-        self.pipeline_config.check_pipeline_config()
-        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
-            self._set_default_attention_backend()
-
-        # parallelism
-        self.check_server_dp_args()
-        # allocate all remaining gpus for sp-size
-        self.check_server_sp_args()
-
+        num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
-            if self.num_gpus == 1:
-                raise ValueError(
-                    "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
-                )
+            num_gpus_per_group *= 2
+
+        if self.num_gpus % num_gpus_per_group != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size{' * 2' if self.enable_cfg_parallel else ''}) = {num_gpus_per_group}"
+            )
+
+        if self.sp_degree != self.ring_degree * self.ulysses_degree:
+            raise ValueError(
+                f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
+                f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
+            )
 
         if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
             has_sp = self.sp_degree > 1
@@ -1085,6 +1156,12 @@ class ServerArgs:
                     "cache-dit is enabled with hybrid parallelism (SP + TP). "
                     "Proceeding anyway (SGLang integration may support this mode)."
                 )
+
+    def _validate_cfg_parallel(self):
+        if self.enable_cfg_parallel and self.num_gpus == 1:
+            raise ValueError(
+                "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
+            )
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
