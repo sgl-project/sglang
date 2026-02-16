@@ -19,7 +19,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
 
@@ -285,9 +284,7 @@ class TestAnthropicVision(CustomTestCase):
 
         # Verify we got content
         content_deltas = [e for e in events if e["type"] == "content_block_delta"]
-        self.assertTrue(
-            len(content_deltas) > 0, "Expected content_block_delta events"
-        )
+        self.assertTrue(len(content_deltas) > 0, "Expected content_block_delta events")
 
         # Reconstruct text
         full_text = "".join(
