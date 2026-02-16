@@ -266,5 +266,38 @@ class TestPortArgs(unittest.TestCase):
         self.assertIn("expected ':' after ']'", str(context.exception))
 
 
+class TestServerArgsFP8(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_sm120_supported")
+    def test_fp8_gemm_backend_auto_detection_sm120(self, mock_is_sm120):
+
+        mock_is_sm120.return_value = True
+
+        args = ServerArgs(model_path="dummy", fp8_gemm_runner_backend="auto")
+
+        args._handle_fp8_gemm_backend()
+
+        self.assertEqual(args.fp8_gemm_runner_backend, "cutlass")
+
+    @patch("sglang.srt.server_args.is_sm120_supported")
+    def test_fp8_gemm_backend_auto_detection_non_sm120(self, mock_is_sm120):
+
+        mock_is_sm120.return_value = False
+
+        args = ServerArgs(model_path="dummy", fp8_gemm_runner_backend="auto")
+        args._handle_fp8_gemm_backend()
+
+        self.assertEqual(args.fp8_gemm_runner_backend, "auto")
+
+    @patch("sglang.srt.server_args.is_sm120_supported")
+    def test_fp8_gemm_backend_manual_override(self, mock_is_sm120):
+
+        mock_is_sm120.return_value = True
+
+        args = ServerArgs(model_path="dummy", fp8_gemm_runner_backend="triton")
+        args._handle_fp8_gemm_backend()
+
+        self.assertEqual(args.fp8_gemm_runner_backend, "triton")
+
+
 if __name__ == "__main__":
     unittest.main()
