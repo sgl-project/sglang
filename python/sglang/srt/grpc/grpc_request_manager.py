@@ -983,8 +983,8 @@ class GrpcRequestManager:
 
         self.event_loop = loop
 
-        # We cannot add signal handler when the grpc manager is not in
-        # the main thread due to the CPython limitation.
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = GrpcSignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
@@ -992,12 +992,7 @@ class GrpcRequestManager:
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
-        else:
-            logger.warning(
-                "Signal handler is not added because the grpc request manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "grpc request manager when SIGTERM is received."
-            )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )

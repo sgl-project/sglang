@@ -125,7 +125,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
-        from sgl_kernel import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
