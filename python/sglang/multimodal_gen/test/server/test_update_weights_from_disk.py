@@ -568,10 +568,12 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
 
         Steps:
         1. base → perturbed (succeeds, server now on perturbed checkpoint).
-        2. perturbed → corrupted with target_modules=_DIFFERING_MODULES.
+        2. perturbed → corrupted with target_modules=[transformer, vae].
            The corrupted checkpoint has a truncated vae safetensors file.
-           Transformer loads first (succeeds), then vae fails during
-           safetensors parsing, triggering rollback of both modules.
+           We explicitly assert the first failed module is vae from the API
+           error message (which reports the failing module name), proving
+           transformer was attempted before the vae parse failure and that
+           rollback then covered both modules.
         3. Assert the server rolled back to the perturbed checkpoint, not base.
         """
         ctx, default_model, perturbed_model_dir, corrupted_vae_model_dir = (
@@ -599,16 +601,24 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         ), "Expected at least one text encoder module checksum"
 
         # perturbed → corrupted (should fail and rollback)
+        rollback_targets = [_TRANSFORMER_MODULE, _VAE_MODULE]
         result, status_code = self._update_weights(
             base_url,
             corrupted_vae_model_dir,
-            target_modules=_DIFFERING_MODULES,
+            target_modules=rollback_targets,
         )
         assert (
             status_code == 400
         ), f"Expected 400 on corrupted weights, got {status_code}"
         assert not result.get("success", True)
-        assert "rolled back" in result.get("message", "").lower()
+        message = result.get("message", "")
+        assert "rolled back" in message.lower()
+        # The updater reports the first failing module in the error message.
+        # With ordered target_modules=[transformer, vae], this makes the
+        # failure point explicit: transformer is processed first, then vae fails.
+        assert (
+            "Failed to update module 'vae'" in message
+        ), f"Expected vae to be the explicit failure point, got: {message}"
         rolled_back_checksums = self._get_weights_checksum(base_url)
 
         # 1) transformer: server == perturbed != base
