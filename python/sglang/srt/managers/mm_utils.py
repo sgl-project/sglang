@@ -380,6 +380,15 @@ def init_mm_embedding_cache(max_size: int = 0):
     embedding_cache = MultiModalStaticCache(max_size)
 
 
+def flush_mm_embedding_cache() -> bool:
+    """Clear the global multimodal embedding cache."""
+    global embedding_cache
+    if embedding_cache is not None:
+        embedding_cache.clear()
+        return True
+    return False
+
+
 def get_embedding_chunk(
     embedding: torch.Tensor,
     extend_prefix_len: int,

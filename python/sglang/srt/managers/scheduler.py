@@ -129,7 +129,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    flush_mm_embedding_cache,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -2634,7 +2638,7 @@ class Scheduler(
         return no_request
 
     def flush_cache(self):
-        """Flush the memory pool and cache."""
+        """Flush the memory pool, cache, and multimodal embedding cache."""
         if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
@@ -2642,6 +2646,7 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
+            flush_mm_embedding_cache()
             self.reset_metrics()
 
             if self.draft_worker:
