@@ -74,10 +74,11 @@ class ImageEncodingStage(PipelineStage):
             self.move_to_device("cpu")
 
     def move_to_device(self, device):
+        if self.server_args.use_fsdp_inference:
+            return
         fields = [
             "image_processor",
             "image_encoder",
-            "text_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)
