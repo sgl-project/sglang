@@ -126,7 +126,7 @@ LORA_MODELS_QWEN3 = [
                 prefill_tolerance=3e-1,
             ),
             LoRAAdaptor(
-                name="y9760210/Qwen3-4B-lora_model",
+                name="TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0",
                 prefill_tolerance=3e-1,
             ),
         ],
