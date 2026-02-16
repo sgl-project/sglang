@@ -5381,15 +5381,8 @@ class ServerArgs:
                         self.lora_target_modules.discard("embed_tokens")
                         self.lora_target_modules.discard("lm_head")
 
-                    # TODO: find creative solution to differentiate between MoE gate_proj, up_proj, and down_proj and non-MoE gate_proj, up_proj, and down_proj so we do not have to drop all.
-                    if self.lora_backend != "triton":
-                        logger.warning("Current LoRA backend does not support LoRA on MoE layers; "
-                        "dropping 'gate_proj', 'up_proj', and 'down_proj from --lora-target-modules=all.",
-                        "To apply LoRA to these, use --lora-backend triton."
-                        )
-                        self.lora_target_modules.discard("gate_proj")
-                        self.lora_target_modules.discard("up_proj")
-                        self.lora_target_modules.discard("down_proj")
+                    # TODO: find creative solution to differentiate between MoE gate_proj, up_proj, and down_proj and non-MoE gate_proj, up_proj, and down_proj here so we do not have to do
+                    # it later in LoRA Manager
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (

@@ -52,15 +52,7 @@ if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
     if _is_hip:
-        if _use_aiter:
-            try:
-                from aiter import moe_sum
-            except ImportError:
-                raise ImportError(
-                    "aiter is required when SGLANG_USE_AITER is set to True"
-                )
-        else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+        from vllm import _custom_ops as vllm_ops  # moe_sum
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
@@ -71,6 +63,7 @@ if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import (  # noqa: F401
         moe_align_block_size as sgl_moe_align_block_size,
     )
+
     from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 
 

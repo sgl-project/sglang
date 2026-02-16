@@ -386,7 +386,6 @@ class LoRAManager:
             target_modules=target_modules,
         )
 
-
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -621,6 +620,14 @@ class LoRAManager:
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
+
+                if self.lora_backend.name != "triton":
+                    logger.warning(
+                        "Current LoRA backend does not support LoRA on MoE layers; "
+                        "skipping MoE layer."
+                    )
+                    continue
+
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module

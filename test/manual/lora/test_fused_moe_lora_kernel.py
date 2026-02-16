@@ -8,7 +8,6 @@ import torch
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
-
 from sglang.srt.lora.triton_ops import fused_moe_lora
 from sglang.srt.utils import set_random_seed
 
