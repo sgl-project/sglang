@@ -37,6 +37,7 @@ def setup_dir():
     if os.path.exists(CUDA_COREDUMP_DIR):
         shutil.rmtree(CUDA_COREDUMP_DIR, ignore_errors=True)
     os.makedirs(CUDA_COREDUMP_DIR, exist_ok=True)
+    logger.info(f"[CUDA Coredump] Enabled. Dump dir: {CUDA_COREDUMP_DIR}")
 
 
 def get_env() -> dict:

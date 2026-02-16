@@ -134,10 +134,6 @@ def run_unittest_files(
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
         cuda_coredump.setup_dir()
-        logger.info(
-            f"CUDA coredump enabled. "
-            f"Dump files will be saved to {cuda_coredump.CUDA_COREDUMP_DIR}"
-        )
 
     tic = time.perf_counter()
     success = True
