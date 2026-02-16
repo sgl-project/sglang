@@ -28,9 +28,9 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.main_package || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests}}
-      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true'}}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
