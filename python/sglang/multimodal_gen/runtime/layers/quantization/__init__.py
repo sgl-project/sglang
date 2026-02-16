@@ -2,7 +2,7 @@
 
 from typing import Literal, get_args
 
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
@@ -26,17 +26,7 @@ def register_quantization_config(quantization: str):
     Args:
         quantization (str): The quantization method name.
 
-    Examples:
-        >>> from sglang.multimodal_gen.runtime.layers.quantization import register_quantization_config
-        >>> from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
-        >>> from sglang.multimodal_gen.runtime.layers.quantization.base_config import QuantizationConfig
-        >>>
-        >>> @register_quantization_config("my_quant")
-        ... class MyQuantConfig(QuantizationConfig):
-        ...     pass
-        >>>
-        >>> get_quantization_config("my_quant")
-        <class 'MyQuantConfig'>
+
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):
@@ -66,7 +56,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-all = [
+__all__ = [
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",
