@@ -24,11 +24,10 @@
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cstdlib>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 namespace {
 
@@ -94,18 +93,14 @@ __device__ int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_) {
   return *reinterpret_cast<int*>(&col_idx);
 }
 
-__device__ void initialize_barrier(
-    uint64_t* smem_barrier,
-    int thread_count = 1) {
+__device__ void initialize_barrier(uint64_t* smem_barrier, int thread_count = 1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_int_ptr), "r"(thread_count));
 #endif
 }
 
-__device__ void wait_barrier(
-    uint64_t* smem_barrier,
-    int phase_bit) {
+__device__ void wait_barrier(uint64_t* smem_barrier, int phase_bit) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile(
@@ -578,39 +573,29 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   constexpr auto kernel = fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt, kUsePDL>;
 
   if (smem_bytes >= (48 * 1024)) {
-    cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
   }
 
-  host::LaunchKernel(grid, block_size, stream, smem_bytes)
-      .enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
+  host::LaunchKernel(grid, block_size, stream, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
 
-template<bool kUsePDL>
-struct dsv3_fused_a_gemm_kernel{
-  static void run(
-    const tvm::ffi::TensorView output,
-    const tvm::ffi::TensorView mat_a,
-    const tvm::ffi::TensorView mat_b
-  ){
+template <bool kUsePDL>
+struct dsv3_fused_a_gemm_kernel {
+  static void
+  run(const tvm::ffi::TensorView output, const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b) {
     using namespace host;
-    
+
     auto num_tokens_sym = SymbolicSize{"num_tokens"};
     auto hd_in_sym = SymbolicSize{"hd_in"};
     auto hd_out_sym = SymbolicSize{"hd_out"};
 
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    
-    // mat_a: [num_tokens, hd_in], row-major
-    TensorMatcher({num_tokens_sym, hd_in_sym})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(mat_a);
 
-     // mat_b: [hd_in, hd_out], column-major
+    // mat_a: [num_tokens, hd_in], row-major
+    TensorMatcher({num_tokens_sym, hd_in_sym}).with_dtype<bf16_t>().with_device(device).verify(mat_a);
+
+    // mat_b: [hd_in, hd_out], column-major
     TensorMatcher({hd_in_sym, hd_out_sym})
         .with_strides({1, hd_in_sym})
         .with_dtype<bf16_t>()
@@ -618,11 +603,8 @@ struct dsv3_fused_a_gemm_kernel{
         .verify(mat_b);
 
     // output: [num_tokens, hd_out], row-major
-    TensorMatcher({num_tokens_sym, hd_out_sym})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(output);
-    
+    TensorMatcher({num_tokens_sym, hd_out_sym}).with_dtype<bf16_t>().with_device(device).verify(output);
+
     const auto num_tokens = static_cast<int>(num_tokens_sym.unwrap());
     const auto hd_in = static_cast<int>(hd_in_sym.unwrap());
     const auto hd_out = static_cast<int>(hd_out_sym.unwrap());
@@ -635,7 +617,7 @@ struct dsv3_fused_a_gemm_kernel{
 
     auto cc_major = runtime::get_cc_major(device.unwrap().device_id);
     RuntimeCheck(cc_major >= 9, "required CUDA ARCH >= SM_90");
-    
+
     DLDevice dl_device = device.unwrap();
     cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
 
@@ -644,12 +626,10 @@ struct dsv3_fused_a_gemm_kernel{
     auto* mat_b_ptr = static_cast<bf16_t const*>(mat_b.data_ptr());
 
     if (num_tokens <= 8) {
-      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 8, kUsePDL>(
-          output_ptr, mat_a_ptr, mat_b_ptr, num_tokens, stream);
+      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 8, kUsePDL>(output_ptr, mat_a_ptr, mat_b_ptr, num_tokens, stream);
     } else {
-      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 16, kUsePDL>(
-          output_ptr, mat_a_ptr, mat_b_ptr, num_tokens, stream);
+      invokeFusedAGemm<bf16_t, kHdIn, kHdOut, 16, kUsePDL>(output_ptr, mat_a_ptr, mat_b_ptr, num_tokens, stream);
     }
-  } 
+  }
 };
 }  // namespace

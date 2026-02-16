@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -13,12 +19,16 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_dsv3_fused_a_gemm_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+    # Keep JIT PDL gating consistent with AOT behavior:
+    # enable PDL only when the architecture supports it and TRTLLM_ENABLE_PDL=1.
+    # This avoids mismatched benchmark/runtime paths between JIT and AOT.
+    enable_pdl = is_arch_support_pdl() and os.getenv("TRTLLM_ENABLE_PDL") == "1"
+    args = make_cpp_args(enable_pdl)
     return load_jit(
         "dsv3_fused_a_gemm",
         *args,
         cuda_files=["gemm/dsv3_fused_a_gemm.cuh"],
-        cuda_wrappers=[("dsv3_fused_a_gemm", "dsv3_fused_a_gemm")],
+        cuda_wrappers=[("dsv3_fused_a_gemm", f"dsv3_fused_a_gemm_kernel<{args}>::run")],
     )
 
 
