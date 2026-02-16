@@ -289,6 +289,11 @@ if [ "$FLASHINFER_INSTALLED" = false ]; then
     exit 1
 fi
 
+# Download precompiled CUDA binaries for the current GPU architecture
+# Without this, flashinfer.fused_moe (trtllm_fp4_block_scale_moe) may not be available
+# on architectures like B200/sm_100 where PyPI cubins are missing
+FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
