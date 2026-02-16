@@ -142,10 +142,10 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Callable
-from enum import StrEnum
 
 import pytest
 import requests
+from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -158,7 +158,6 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_utils import (
-    ServerContext,
     ServerManager,
 )
 from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in_ci
@@ -166,50 +165,30 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in
 logger = init_logger(__name__)
 
 
-class _Module(StrEnum):
-    """Updatable pipeline module names."""
-
-    TRANSFORMER = "transformer"
-    VAE = "vae"
+_TRANSFORMER_MODULE = "transformer"
+_VAE_MODULE = "vae"
+_TEXT_ENCODER_MODULE_PREFIX = "text_encoder"
 
 
 # Modules whose weights differ between the base model and the perturbed
 # perturbed checkpoint
-_DIFFERING_MODULES: list[str] = [_Module.TRANSFORMER, _Module.VAE]
+_DIFFERING_MODULES: list[str] = [_TRANSFORMER_MODULE, _VAE_MODULE]
 
-_ALL_MODEL_PAIRS: list[tuple[str, str, float]] = [
+_ALL_MODEL_PAIRS: list[tuple[str, str]] = [
     (
         "black-forest-labs/FLUX.2-klein-base-4B",
         "black-forest-labs/FLUX.2-klein-4B",
-        5.0,
     ),
     (
         "Qwen/Qwen-Image",
         "Qwen/Qwen-Image-2512",
-        1.0,  # Qwen Image is large; run it less often in CI.
     ),
 ]
 
 
-def _select_model_pairs() -> list[tuple[str, str]]:
-    """Return the (default, source) model pairs to test.
-
-    When SGLANG_TEST_DIFFUSION_MODEL / SGLANG_TEST_UPDATE_MODEL env vars
-    are set, use them as a single explicit pair.  Otherwise, run both
-    pairs locally, or randomly pick one in CI (weighted) to save resources.
-    """
-    default_env = os.environ.get("SGLANG_TEST_DIFFUSION_MODEL")
-    update_env = os.environ.get("SGLANG_TEST_UPDATE_MODEL")
-    if default_env and update_env:
-        return [(default_env, update_env)]
-    pairs = [(d, u) for d, u, _ in _ALL_MODEL_PAIRS]
-    if is_in_ci():
-        weights = [w for _, _, w in _ALL_MODEL_PAIRS]
-        return random.choices(pairs, weights=weights, k=1)
-    return pairs
-
-
-_ACTIVE_MODEL_PAIRS = _select_model_pairs()
+_ACTIVE_MODEL_PAIRS = (
+    _ALL_MODEL_PAIRS if not is_in_ci() else [random.choice(_ALL_MODEL_PAIRS)]
+)
 _PAIR_IDS = [p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS]
 
 
@@ -285,18 +264,17 @@ def _truncate_safetensor(src_file: str, dst_file: str) -> None:
     shutil.copy2(src_file, dst_file)
     size = os.path.getsize(dst_file)
     with open(dst_file, "r+b") as f:
-        f.truncate(size - 1000)
+        f.truncate(size - 2)
     logger.info(
         "Created corrupted safetensors: %s (%d -> %d bytes)",
         dst_file,
         size,
-        size - 1000,
+        size - 2,
     )
 
 
 def _perturb_safetensor(src_file: str, dst_file: str) -> None:
     """Load, add small perturbation to floating-point tensors, and save."""
-    from safetensors.torch import load_file, save_file
 
     tensors = load_file(src_file)
     perturbed = {
@@ -307,9 +285,6 @@ def _perturb_safetensor(src_file: str, dst_file: str) -> None:
 
 
 class _UpdateWeightsApiMixin:
-    def _get_base_url(self, ctx: ServerContext) -> str:
-        return f"http://localhost:{ctx.port}"
-
     def _update_weights(
         self,
         base_url: str,
@@ -363,12 +338,12 @@ class _UpdateWeightsApiMixin:
         discrepancies are resolved.
         """
         server_checksums = self._get_weights_checksum(
-            base_url, module_names=[_Module.TRANSFORMER]
+            base_url, module_names=[_TRANSFORMER_MODULE]
         )
-        expected_cs = _compute_checksum_from_disk(expected_model, _Module.TRANSFORMER)
-        server_cs = server_checksums.get(_Module.TRANSFORMER)
+        expected_cs = _compute_checksum_from_disk(expected_model, _TRANSFORMER_MODULE)
+        server_cs = server_checksums.get(_TRANSFORMER_MODULE)
         assert server_cs == expected_cs, (
-            f"Checksum mismatch on '{_Module.TRANSFORMER}'\n"
+            f"Checksum mismatch on '{_TRANSFORMER_MODULE}'\n"
             f"  expected({expected_model}): {expected_cs}\n"
             f"  server: {server_cs}"
         )
@@ -429,7 +404,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
                 args=(
                     local_source,
                     perturbed_vae_model_dir,
-                    _Module.VAE,
+                    _VAE_MODULE,
                     _perturb_safetensor,
                 ),
             ),
@@ -438,7 +413,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
                 args=(
                     local_default,
                     corrupted_vae_model_dir,
-                    _Module.VAE,
+                    _VAE_MODULE,
                     _truncate_safetensor,
                 ),
             ),
@@ -469,11 +444,13 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     def test_update_weights_from_disk_default(self, diffusion_server_no_offload):
         """Default update (target_modules=None, flush_cache=True): all changed modules updated."""
         ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
-        self._update_weights(base_url, default_model)
+        self._update_weights(base_url, default_model, flush_cache=True)
 
-        result, status_code = self._update_weights(base_url, perturbed_model_dir)
+        result, status_code = self._update_weights(
+            base_url, perturbed_model_dir, flush_cache=True
+        )
         assert status_code == 200
         assert result.get("success", False), f"Update failed: {result.get('message')}"
 
@@ -490,7 +467,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             proving the server only touched what was requested.
         """
         ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         # Reset server to default_model.
         self._update_weights(base_url, default_model)
@@ -533,7 +510,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     def test_update_weights_nonexistent_model(self, diffusion_server_no_offload):
         """Nonexistent model path must fail (400). Server healthy, checksums == base disk."""
         ctx, default_model, _, _ = diffusion_server_no_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         self._update_weights(base_url, default_model)
 
@@ -551,7 +528,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     def test_update_weights_missing_model_path(self, diffusion_server_no_offload):
         """Request without model_path must fail (400). Server healthy, checksums == base disk."""
         ctx, default_model, _, _ = diffusion_server_no_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         self._update_weights(base_url, default_model)
 
@@ -562,12 +539,14 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         )
 
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
+        result = response.json()
+        assert not result.get("success", True), "Should fail when model_path is missing"
         self._assert_server_matches_model(base_url, default_model)
 
     def test_update_weights_nonexistent_module(self, diffusion_server_no_offload):
         """Nonexistent module must fail (400). Server healthy, checksums == base disk."""
         ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         self._update_weights(base_url, default_model)
 
@@ -598,12 +577,26 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         ctx, default_model, perturbed_model_dir, corrupted_vae_model_dir = (
             diffusion_server_no_offload
         )
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         # base → perturbed
         self._update_weights(base_url, default_model)
+        base_checksums = self._get_weights_checksum(base_url)
+
         result, status_code = self._update_weights(base_url, perturbed_model_dir)
         assert status_code == 200 and result.get("success")
+        perturbed_checksums = self._get_weights_checksum(base_url)
+
+        text_encoder_modules = sorted(
+            name
+            for name in perturbed_checksums
+            if _TEXT_ENCODER_MODULE_PREFIX in name
+            and perturbed_checksums.get(name) != "not_found"
+            and base_checksums.get(name) != "not_found"
+        )
+        assert (
+            text_encoder_modules
+        ), "Expected at least one text encoder module checksum"
 
         # perturbed → corrupted (should fail and rollback)
         result, status_code = self._update_weights(
@@ -611,11 +604,35 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             corrupted_vae_model_dir,
             target_modules=_DIFFERING_MODULES,
         )
+        assert (
+            status_code == 400
+        ), f"Expected 400 on corrupted weights, got {status_code}"
         assert not result.get("success", True)
         assert "rolled back" in result.get("message", "").lower()
+        rolled_back_checksums = self._get_weights_checksum(base_url)
 
-        # Verify: server still on perturbed, not base
-        self._assert_server_matches_model(base_url, perturbed_model_dir)
+        # 1) transformer: server == perturbed != base
+        transformer_base = base_checksums.get(_TRANSFORMER_MODULE)
+        transformer_perturbed = perturbed_checksums.get(_TRANSFORMER_MODULE)
+        transformer_rolled_back = rolled_back_checksums.get(_TRANSFORMER_MODULE)
+        assert transformer_rolled_back == transformer_perturbed
+        assert transformer_rolled_back != transformer_base
+
+        # 2) vae: server == perturbed != base
+        vae_base = base_checksums.get(_VAE_MODULE)
+        vae_perturbed = perturbed_checksums.get(_VAE_MODULE)
+        vae_rolled_back = rolled_back_checksums.get(_VAE_MODULE)
+        assert vae_rolled_back == vae_perturbed
+        assert vae_rolled_back != vae_base
+
+        # 3) text encoder(s): server == base == perturbed
+        for name in text_encoder_modules:
+            assert rolled_back_checksums.get(name) == perturbed_checksums.get(
+                name
+            ), f"Text encoder module '{name}' should stay equal to perturbed"
+            assert rolled_back_checksums.get(name) == base_checksums.get(
+                name
+            ), f"Text encoder module '{name}' should stay equal to base"
 
 
 class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
@@ -640,7 +657,7 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
             args=(
                 local_source,
                 perturbed_vae_model_dir,
-                _Module.VAE,
+                _VAE_MODULE,
                 _perturb_safetensor,
             ),
         )
@@ -665,7 +682,7 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
     def test_update_weights_with_offload_enabled(self, diffusion_server_with_offload):
         """Offload: base→perturbed; no Shape mismatch; checksums == perturbed disk."""
         ctx, _, perturbed_model_dir = diffusion_server_with_offload
-        base_url = self._get_base_url(ctx)
+        base_url = f"http://localhost:{ctx.port}"
 
         result, status_code = self._update_weights(base_url, perturbed_model_dir)
         assert status_code == 200, f"Expected 200, got {status_code}"
