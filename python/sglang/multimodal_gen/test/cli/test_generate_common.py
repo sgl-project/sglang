@@ -1,8 +1,9 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 """
-    Common generate cli test, one test for image and video each
+Common generate cli test, one test for image and video each
 """
+
 import dataclasses
 import os
 import shlex
