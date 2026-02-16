@@ -597,11 +597,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
-        # LoRA tensors will be set by LoRAManager
-        self.gate_up_lora_a_weights = None
-        self.gate_up_lora_b_weights = None
-        self.down_lora_a_weights = None
-        self.down_lora_b_weights = None
 
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
@@ -727,7 +722,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
-
     supported_layer_types = {
         # the order matters
         FusedMoE: FusedMoEWithLoRA,
