@@ -11,6 +11,7 @@ from sglang.srt.debug_utils.dumper import (
     _collect_megatron_parallel_info,
     _collect_sglang_parallel_info,
     _Dumper,
+    _materialize_value,
     _obj_to_dict,
     _torch_save,
     get_tensor_info,
@@ -315,6 +316,28 @@ def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
     return matches[0]
 
 
+class TestMaterializeValue:
+    def test_materialize_value_callable(self):
+        tensor = torch.randn(3, 3)
+        result = _materialize_value(lambda: tensor)
+        assert torch.equal(result, tensor)
+
+    def test_materialize_value_passthrough(self):
+        tensor = torch.randn(3, 3)
+        result = _materialize_value(tensor)
+        assert result is tensor
+
+    def test_dump_with_callable_value(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+        d.dump("lazy_tensor", lambda: tensor)
+
+        _assert_files(_get_filenames(tmp_path), exist=["name=lazy_tensor"])
+
+        path = _find_dump_file(tmp_path, rank=0, name="lazy_tensor")
+        assert torch.equal(_load_dump(path)["value"], tensor)
+
+
 class TestSaveValue:
     def test_dump_output_format(self, tmp_path):
         dumper = _make_test_dumper(tmp_path)
@@ -362,6 +385,177 @@ class TestStaticMetadata:
         meta = loaded["meta"]
         assert "world_rank" in meta
         assert "world_size" in meta
+
+
+class TestDumpGrad:
+    def test_dump_grad_basic(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        x = torch.randn(3, 3, requires_grad=True)
+        y = (x * 2).sum()
+
+        d.dump("test_tensor", x)
+        y.backward()
+
+        filenames = _get_filenames(tmp_path)
+        assert any("name=test_tensor" in f and "grad__" not in f for f in filenames)
+        _assert_files(filenames, exist=["grad__test_tensor"])
+
+    def test_dump_grad_non_tensor_skipped(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        d.dump("not_tensor", 42)
+
+        _assert_files(_get_filenames(tmp_path), not_exist=["grad__"])
+
+    def test_dump_grad_no_requires_grad_skipped(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        x = torch.randn(3, 3, requires_grad=False)
+        d.dump("no_grad_tensor", x)
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["name=no_grad_tensor"],
+            not_exist=["grad__"],
+        )
+
+    def test_dump_grad_captures_forward_pass_id(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        d._forward_pass_id = 42
+        x = torch.randn(3, 3, requires_grad=True)
+        y = (x * 2).sum()
+
+        d.dump("id_test", x)
+        d._forward_pass_id = 999
+        y.backward()
+
+        grad_file = _find_dump_file(tmp_path, name="grad__id_test")
+        assert "forward_pass_id=42" in grad_file.name
+
+    def test_dump_grad_file_content(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        y = (x * 3).sum()
+
+        d.dump("content_check", x)
+        y.backward()
+
+        grad_path = _find_dump_file(tmp_path, name="grad__content_check")
+        expected_grad = torch.full((2, 2), 3.0)
+        assert torch.equal(_load_dump(grad_path)["value"], expected_grad)
+
+    def test_disable_value(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_value=False, enable_grad=True)
+        x = torch.randn(3, 3, requires_grad=True)
+        y = (x * 2).sum()
+
+        d.dump("fwd_disabled", x)
+        y.backward()
+
+        filenames = _get_filenames(tmp_path)
+        assert not any(
+            "name=fwd_disabled" in f and "grad__" not in f for f in filenames
+        )
+        _assert_files(filenames, exist=["grad__fwd_disabled"])
+
+    def test_disable_grad(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_grad=False)
+        x = torch.randn(3, 3, requires_grad=True)
+        y = (x * 2).sum()
+
+        d.dump("grad_disabled", x)
+        y.backward()
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["name=grad_disabled"],
+            not_exist=["grad__"],
+        )
+
+
+class TestDumpModel:
+    def test_grad_basic(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_value=False)
+        model = torch.nn.Linear(4, 2)
+        x = torch.randn(3, 4)
+        y = model(x).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="model")
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["grad__model__weight", "grad__model__bias"],
+        )
+
+    def test_value_basic(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+
+        d.dump_model(model, name_prefix="model")
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["model__weight"],
+        )
+
+    def test_no_grad_skipped(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_value=False)
+        model = torch.nn.Linear(4, 2)
+
+        d.dump_model(model, name_prefix="model")
+
+        filenames = _get_filenames(tmp_path)
+        assert len(filenames) == 0
+
+    def test_filter(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="weight")
+        model = torch.nn.Linear(4, 2)
+        x = torch.randn(3, 4)
+        y = model(x).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="model")
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["model__weight", "grad__model__weight"],
+            not_exist=["model__bias", "grad__model__bias"],
+        )
+
+    def test_grad_file_content(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_value=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+        x = torch.ones(1, 4)
+        y = model(x).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="p")
+
+        path = _find_dump_file(tmp_path, name="grad__p__weight")
+        assert torch.equal(_load_dump(path)["value"], model.weight.grad)
+
+    def test_disable_model_grad(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2)
+        x = torch.randn(3, 4)
+        y = model(x).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="model")
+
+        filenames = _get_filenames(tmp_path)
+        assert all("grad" not in f for f in filenames)
+
+    def test_disable_model_value(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_value=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+        x = torch.ones(1, 4)
+        y = model(x).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="model")
+
+        filenames = _get_filenames(tmp_path)
+        assert all("grad" in f for f in filenames)
 
 
 if __name__ == "__main__":

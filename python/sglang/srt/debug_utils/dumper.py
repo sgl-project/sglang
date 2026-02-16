@@ -4,6 +4,7 @@ import re
 import socket
 import threading
 import time
+from copy import deepcopy
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -46,6 +47,10 @@ class _Dumper:
         base_dir: Path,
         filter: Optional[str] = None,
         enable_write_file: bool = True,
+        enable_value: bool = True,
+        enable_grad: bool = False,
+        enable_model_value: bool = True,
+        enable_model_grad: bool = True,
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
     ):
@@ -55,6 +60,10 @@ class _Dumper:
         self._filter = filter
         self._base_dir = base_dir
         self._enable_write_file = enable_write_file
+        self._enable_value = enable_value
+        self._enable_grad = enable_grad
+        self._enable_model_value = enable_model_value
+        self._enable_model_grad = enable_model_grad
 
         # States
         self._partial_name = partial_name
@@ -71,6 +80,12 @@ class _Dumper:
             base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
             filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
             enable_write_file=get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1"),
+            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
+            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
+            enable_model_value=get_bool_env_var(
+                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
+            ),
+            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
             partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
             enable_http_server=get_bool_env_var(
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
@@ -126,41 +141,156 @@ class _Dumper:
         for name, value in data.items():
             self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
 
-    def dump(self, name, value, save: bool = True, **kwargs):
+    def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
+        self._dump_inner(
+            name=name,
+            value=value,
+            extra_kwargs=kwargs,
+            save=save,
+            enable_value=self._enable_value,
+            enable_curr_grad=False,
+            enable_future_grad=self._enable_grad,
+            value_tag="Dumper.Value",
+            grad_tag="Dumper.Grad",
+        )
+
+    def dump_model(
+        self,
+        model: "torch.nn.Module",
+        name_prefix: str = "param",
+        save: bool = True,
+        **kwargs,
+    ) -> None:
+        for param_name, param in model.named_parameters():
+            self._dump_inner(
+                name=f"{name_prefix}__{param_name}",
+                value=param,
+                extra_kwargs=kwargs,
+                save=save,
+                enable_value=self._enable_model_value,
+                enable_curr_grad=self._enable_model_grad,
+                enable_future_grad=False,
+                value_tag="Dumper.ParamValue",
+                grad_tag="Dumper.ParamGrad",
+            )
+
+    def _dump_inner(
+        self,
+        *,
+        name: str,
+        value,
+        extra_kwargs: dict,
+        save: bool,
+        enable_value: bool,
+        enable_curr_grad: bool,
+        enable_future_grad: bool,
+        value_tag: str,
+        grad_tag: str,
+    ) -> None:
         self._ensure_http_server()
 
         if not (self._enable and (self._override_enable is not False)):
             return
         if (f := self._filter) is not None and re.search(f, name) is None:
             return
+        if not (enable_value or enable_curr_grad or enable_future_grad):
+            return
 
         if self._forward_pass_id < 1:
             print("Dump without on_forward_pass_start()")
+
+        value = _materialize_value(value)
+
+        if enable_value:
+            self._dump_single(
+                tag=value_tag,
+                name=name,
+                value=value,
+                extra_kwargs=extra_kwargs,
+                save=save,
+            )
+
+        if (
+            enable_curr_grad
+            and isinstance(value, torch.Tensor)
+            and (g := value.grad) is not None
+        ):
+            self._dump_single(
+                tag=grad_tag,
+                name=f"grad__{name}",
+                value=g,
+                extra_kwargs=extra_kwargs,
+                save=save,
+            )
+
+        if enable_future_grad:
+            self._register_dump_grad_hook(
+                name=name,
+                tensor=value,
+                save=save,
+                **extra_kwargs,
+            )
+
+    def _register_dump_grad_hook(
+        self, *, name: str, tensor, save: bool, **kwargs
+    ) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        if not tensor.requires_grad:
+            return
+
+        captured_forward_pass_id = self._forward_pass_id
+        captured_extra = deepcopy(dict(**kwargs))
+
+        def grad_hook(grad: torch.Tensor) -> None:
+            self._dump_single(
+                tag="Dumper.Grad",
+                name=f"grad__{name}",
+                value=grad,
+                extra_kwargs=captured_extra,
+                save=save,
+                forward_pass_id=captured_forward_pass_id,
+            )
+
+        tensor.register_hook(grad_hook)
+
+    def _dump_single(
+        self,
+        *,
+        tag: str,
+        name: str,
+        value,
+        extra_kwargs: dict,
+        save: bool,
+        forward_pass_id: Optional[int] = None,
+    ) -> None:
         self._ensure_partial_name()
         self._dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            forward_pass_id=self._forward_pass_id,
+            forward_pass_id=(
+                forward_pass_id
+                if forward_pass_id is not None
+                else self._forward_pass_id
+            ),
             rank=rank,
             name=name,
             dump_index=self._dump_index,
-            **kwargs,
+            **extra_kwargs,
             **self._global_ctx,
         )
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
-        sample_value = get_truncated_value(value)
-
         print(
-            f"[Dumper] [{rank}, {time.time()}] {path} "
+            f"[{tag}] [{rank}, {time.time()}] {path} "
             f"type={type(value)} "
             f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
             f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
             f"device={value.device if isinstance(value, torch.Tensor) else None} "
             f"id={id(value)} "
-            f"sample_value={sample_value}"
+            f"sample_value={get_truncated_value(value)}"
         )
 
         if self._enable_write_file and save:
@@ -230,7 +360,13 @@ def _obj_to_dict(obj):
     return ret
 
 
-# -------------------------------------- static metadata ------------------------------------------
+def _materialize_value(value):
+    if callable(value):
+        value = value()
+    return value
+
+
+# -------------------------------------- static meta ------------------------------------------
 
 
 def _compute_static_meta():
