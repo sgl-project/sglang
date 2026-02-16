@@ -170,20 +170,21 @@ class ModelRunnerKVCacheMixin:
                 mamba_state_intermediate_size / (1 << 30)
             )
 
-        if (
-            server_args.disable_radix_cache
-            or server_args.max_mamba_cache_size is not None
-        ):
-            # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
-            if server_args.max_mamba_cache_size is None:
-                if server_args.max_running_requests is not None:
-                    server_args.max_mamba_cache_size = server_args.max_running_requests
-                else:
-                    server_args.max_mamba_cache_size = 512
+        if server_args.max_mamba_cache_size is not None:
+            # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+        elif (
+            server_args.disable_radix_cache
+            and server_args.max_running_requests is not None
+        ):
+            # Use explicitly set max_running_requests when radix cache is disabled
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
         else:
+            # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
@@ -207,6 +208,45 @@ class ModelRunnerKVCacheMixin:
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
+        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        kv_cache_dtype = self.kv_cache_dtype
+        kv_lora_rank = self.model_config.kv_lora_rank
+        qk_rope_head_dim = self.model_config.qk_rope_head_dim
+        kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
+
+        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+        if not is_nsa_model:
+            return kv_cache_dim
+
+        # TRTLLM backend does not override kv_cache_dim for MLA kv cache
+        # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
+        # since it is not compatible for trtllm and other mla attn backend due to the different
+        # kv cache layout.
+        if (
+            self.server_args.nsa_prefill_backend == "trtllm"
+            or self.server_args.nsa_decode_backend == "trtllm"
+        ):
+            return kv_cache_dim
+
+        quant_block_size = NSATokenToKVPool.quant_block_size
+        rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
+        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
+        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
+        if kv_cache_dtype == torch.float8_e4m3fn:
+            assert (
+                kv_lora_rank % quant_block_size == 0
+            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+
+            return (
+                kv_lora_rank
+                + kv_lora_rank // quant_block_size * 4
+                + qk_rope_head_dim * rope_storage_dtype.itemsize
+            )
+
+        return kv_cache_dim
 
     def set_num_tokens_hybrid_swa(self: ModelRunner):
         page_size = self.server_args.page_size
@@ -491,6 +531,7 @@ class ModelRunnerKVCacheMixin:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
+                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
@@ -584,7 +625,13 @@ class ModelRunnerKVCacheMixin:
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
-                        [0] if self.is_draft_worker else config.full_attention_layer_ids
+                        [0]
+                        if self.is_draft_worker
+                        else [
+                            i
+                            for i in config.full_attention_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ]
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
