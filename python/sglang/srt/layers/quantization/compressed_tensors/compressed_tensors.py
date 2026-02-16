@@ -85,6 +85,14 @@ __all__ = ["CompressedTensorsLinearMethod"]
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
+# VLM models need to adapt to VisionAttention (attn.qkv -> attn.qkv_proj)
+_VLM_NEEDS_QKV_PROJ_ADAPTATION: List[str] = [
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "internvl_chat",
+    "glm4v",
+]
+
 
 class DeviceCapability(NamedTuple):
     major: int
@@ -114,10 +122,23 @@ class CompressedTensorsConfig(QuantizationConfig):
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        model_type: Optional[str] = None,
         linear_fp8_config: Optional[Any] = None,
     ):
         super().__init__()
-        self.ignore = ignore
+
+        # Adapt to VisionAttention
+        if model_type in _VLM_NEEDS_QKV_PROJ_ADAPTATION:
+            self.ignore = [
+                (
+                    name.replace(r"attn.qkv", r"attn.qkv_proj")
+                    if "visual" in name
+                    else name
+                )
+                for name in ignore
+            ]
+        else:
+            self.ignore = ignore
         self.quant_format = quant_format
         # Map from [target -> scheme]
         self.target_scheme_map = target_scheme_map
@@ -220,6 +241,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
+        model_type = config.get("model_type", None)
 
         # Parse linear_fp8_config if present (for mixed quantization scenarios)
         # Format: {"activation_scheme": "dynamic", "fmt": "e4m3",
@@ -246,6 +268,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            model_type=model_type,
             linear_fp8_config=linear_fp8_config,
         )
 
