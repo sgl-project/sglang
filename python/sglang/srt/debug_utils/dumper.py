@@ -28,28 +28,53 @@ class _Dumper:
     from dumper import dumper
     ```
 
-    Disable at startup and enable via HTTP:
-    1. `SGLANG_DUMPER_ENABLE=0 python ...`
+    Then run the program:
+    `SGLANG_DUMPER_ENABLE=1 python ...`
+
+    Alternatively, disable at startup and enable via HTTP:
+    1. `python ...`
     2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(self):
-        # Do not import `sglang` to make this file standalone
-        self._enable = bool(int(os.environ.get("SGLANG_DUMPER_ENABLE", "1")))
+    def __init__(
+        self,
+        *,
+        enable: bool,
+        base_dir: Path,
+        filter: Optional[str] = None,
+        enable_write_file: bool = True,
+        partial_name: Optional[str] = None,
+        enable_http_server: bool = True,
+    ):
+        # Config
+        self._enable = enable
         # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
-        self._filter = os.environ.get("SGLANG_DUMPER_FILTER")
-        self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
-        self._enable_write_file = bool(
-            int(os.environ.get("SGLANG_DUMPER_WRITE_FILE", "1"))
-        )
-        self._partial_name: Optional[str] = None
+        self._filter = filter
+        self._base_dir = base_dir
+        self._enable_write_file = enable_write_file
+
+        # States
+        self._partial_name = partial_name
         self._dump_index = 0
         self._forward_pass_id = 0
         self._global_ctx = {}
         self._override_enable = None
-        self._http_server_handled = False
+        self._http_server_handled = not enable_http_server
+
+    @classmethod
+    def from_env(cls) -> "_Dumper":
+        return cls(
+            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
+            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
+            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
+            enable_write_file=get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1"),
+            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
+            enable_http_server=get_bool_env_var(
+                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
+            ),
+        )
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -193,8 +218,8 @@ def _obj_to_dict(obj):
 
 
 def _start_maybe_http_server(dumper):
-    http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
-    zmq_base_port = int(os.environ.get("SGLANG_DUMPER_ZMQ_BASE_PORT", "16800"))
+    http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
+    zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
     if http_port <= 0:
         return
 
@@ -321,6 +346,30 @@ class _ZmqRpcHandle:
 # --------------------------------- copied code (avoid dependency) --------------------------------------
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+    truthy_values = ("true", "1")
+    return value in truthy_values
+
+
+def _get_str_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def _get_local_ip_by_remote() -> Optional[str]:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -353,7 +402,7 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper()
+dumper = _Dumper.from_env()
 
 
 # -------------------------------------- other utility functions ------------------------------------------
