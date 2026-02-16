@@ -7,7 +7,9 @@ from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):

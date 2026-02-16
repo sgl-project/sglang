@@ -1,5 +1,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 """Rotary Positional Embeddings."""
+
 from __future__ import annotations
 
 import itertools
@@ -2896,7 +2897,7 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
         self.local_size = local_size
         self.dtype = dtype
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        (q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache) = (
+        q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache = (
             self._compute_cos_sin_cache()
         )
 
