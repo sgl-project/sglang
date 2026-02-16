@@ -4,6 +4,8 @@ import re
 import socket
 import threading
 import time
+from copy import deepcopy
+from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import List, Optional
@@ -28,28 +30,67 @@ class _Dumper:
     from dumper import dumper
     ```
 
-    Disable at startup and enable via HTTP:
-    1. `SGLANG_DUMPER_ENABLE=0 python ...`
+    Then run the program:
+    `SGLANG_DUMPER_ENABLE=1 python ...`
+
+    Alternatively, disable at startup and enable via HTTP:
+    1. `python ...`
     2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(self):
-        # Do not import `sglang` to make this file standalone
-        self._enable = bool(int(os.environ.get("SGLANG_DUMPER_ENABLE", "1")))
+    def __init__(
+        self,
+        *,
+        enable: bool,
+        base_dir: Path,
+        filter: Optional[str] = None,
+        enable_write_file: bool = True,
+        enable_value: bool = True,
+        enable_grad: bool = False,
+        enable_model_value: bool = True,
+        enable_model_grad: bool = True,
+        partial_name: Optional[str] = None,
+        enable_http_server: bool = True,
+    ):
+        # Config
+        self._enable = enable
         # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
-        self._filter = os.environ.get("SGLANG_DUMPER_FILTER")
-        self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
-        self._enable_write_file = bool(
-            int(os.environ.get("SGLANG_DUMPER_WRITE_FILE", "1"))
-        )
-        self._partial_name: Optional[str] = None
+        self._filter = filter
+        self._base_dir = base_dir
+        self._enable_write_file = enable_write_file
+        self._enable_value = enable_value
+        self._enable_grad = enable_grad
+        self._enable_model_value = enable_model_value
+        self._enable_model_grad = enable_model_grad
+
+        # States
+        self._partial_name = partial_name
         self._dump_index = 0
         self._forward_pass_id = 0
         self._global_ctx = {}
         self._override_enable = None
-        self._http_server_handled = False
+        self._http_server_handled = not enable_http_server
+
+    @classmethod
+    def from_env(cls) -> "_Dumper":
+        return cls(
+            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
+            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
+            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
+            enable_write_file=get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1"),
+            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
+            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
+            enable_model_value=get_bool_env_var(
+                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
+            ),
+            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
+            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
+            enable_http_server=get_bool_env_var(
+                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
+            ),
+        )
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -100,46 +141,169 @@ class _Dumper:
         for name, value in data.items():
             self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
 
-    def dump(self, name, value, save: bool = True, **kwargs):
+    def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
+        self._dump_inner(
+            name=name,
+            value=value,
+            extra_kwargs=kwargs,
+            save=save,
+            enable_value=self._enable_value,
+            enable_curr_grad=False,
+            enable_future_grad=self._enable_grad,
+            value_tag="Dumper.Value",
+            grad_tag="Dumper.Grad",
+        )
+
+    def dump_model(
+        self,
+        model: "torch.nn.Module",
+        name_prefix: str = "param",
+        save: bool = True,
+        **kwargs,
+    ) -> None:
+        for param_name, param in model.named_parameters():
+            self._dump_inner(
+                name=f"{name_prefix}__{param_name}",
+                value=param,
+                extra_kwargs=kwargs,
+                save=save,
+                enable_value=self._enable_model_value,
+                enable_curr_grad=self._enable_model_grad,
+                enable_future_grad=False,
+                value_tag="Dumper.ParamValue",
+                grad_tag="Dumper.ParamGrad",
+            )
+
+    def _dump_inner(
+        self,
+        *,
+        name: str,
+        value,
+        extra_kwargs: dict,
+        save: bool,
+        enable_value: bool,
+        enable_curr_grad: bool,
+        enable_future_grad: bool,
+        value_tag: str,
+        grad_tag: str,
+    ) -> None:
         self._ensure_http_server()
 
         if not (self._enable and (self._override_enable is not False)):
             return
         if (f := self._filter) is not None and re.search(f, name) is None:
             return
+        if not (enable_value or enable_curr_grad or enable_future_grad):
+            return
 
         if self._forward_pass_id < 1:
             print("Dump without on_forward_pass_start()")
+
+        value = _materialize_value(value)
+
+        if enable_value:
+            self._dump_single(
+                tag=value_tag,
+                name=name,
+                value=value,
+                extra_kwargs=extra_kwargs,
+                save=save,
+            )
+
+        if (
+            enable_curr_grad
+            and isinstance(value, torch.Tensor)
+            and (g := value.grad) is not None
+        ):
+            self._dump_single(
+                tag=grad_tag,
+                name=f"grad__{name}",
+                value=g,
+                extra_kwargs=extra_kwargs,
+                save=save,
+            )
+
+        if enable_future_grad:
+            self._register_dump_grad_hook(
+                name=name,
+                tensor=value,
+                save=save,
+                **extra_kwargs,
+            )
+
+    def _register_dump_grad_hook(
+        self, *, name: str, tensor, save: bool, **kwargs
+    ) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        if not tensor.requires_grad:
+            return
+
+        captured_forward_pass_id = self._forward_pass_id
+        captured_extra = deepcopy(dict(**kwargs))
+
+        def grad_hook(grad: torch.Tensor) -> None:
+            self._dump_single(
+                tag="Dumper.Grad",
+                name=f"grad__{name}",
+                value=grad,
+                extra_kwargs=captured_extra,
+                save=save,
+                forward_pass_id=captured_forward_pass_id,
+            )
+
+        tensor.register_hook(grad_hook)
+
+    def _dump_single(
+        self,
+        *,
+        tag: str,
+        name: str,
+        value,
+        extra_kwargs: dict,
+        save: bool,
+        forward_pass_id: Optional[int] = None,
+    ) -> None:
         self._ensure_partial_name()
         self._dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            forward_pass_id=self._forward_pass_id,
+            forward_pass_id=(
+                forward_pass_id
+                if forward_pass_id is not None
+                else self._forward_pass_id
+            ),
             rank=rank,
             name=name,
             dump_index=self._dump_index,
-            **kwargs,
+            **extra_kwargs,
             **self._global_ctx,
         )
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
-        sample_value = get_truncated_value(value)
-
         print(
-            f"[Dumper] [{rank}, {time.time()}] {path} "
+            f"[{tag}] [{rank}, {time.time()}] {path} "
             f"type={type(value)} "
             f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
             f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
             f"device={value.device if isinstance(value, torch.Tensor) else None} "
             f"id={id(value)} "
-            f"sample_value={sample_value}"
+            f"sample_value={get_truncated_value(value)}"
         )
 
         if self._enable_write_file and save:
             path.parent.mkdir(parents=True, exist_ok=True)
-            _torch_save(value, str(path))
+            output_data = {
+                "value": value.data if isinstance(value, torch.nn.Parameter) else value,
+                "meta": dict(**full_kwargs, **self._static_meta),
+            }
+            _torch_save(output_data, str(path))
+
+    @cached_property
+    def _static_meta(self) -> dict:
+        return _compute_static_meta()
 
 
 def _torch_save(value, path: str):
@@ -172,6 +336,13 @@ def _get_rank():
         return 0
 
 
+def _get_world_size():
+    if dist.is_initialized():
+        return dist.get_world_size()
+    else:
+        return 1
+
+
 def _obj_to_dict(obj):
     if isinstance(obj, dict):
         return obj
@@ -189,12 +360,120 @@ def _obj_to_dict(obj):
     return ret
 
 
+def _materialize_value(value):
+    if callable(value):
+        value = value()
+    return value
+
+
+# -------------------------------------- static meta ------------------------------------------
+
+
+def _compute_static_meta():
+    result = {
+        "world_rank": _get_rank(),
+        "world_size": _get_world_size(),
+    }
+
+    if x := _collect_sglang_parallel_info():
+        result["sglang_parallel_info"] = x
+    if x := _collect_megatron_parallel_info():
+        result["megatron_parallel_info"] = x
+
+    return result
+
+
+def _collect_sglang_parallel_info():
+    info = {}
+
+    try:
+        from sglang.srt.distributed import (
+            get_moe_expert_parallel_rank,
+            get_moe_expert_parallel_world_size,
+            get_moe_tensor_parallel_rank,
+            get_moe_tensor_parallel_world_size,
+            get_pipeline_model_parallel_rank,
+            get_pipeline_model_parallel_world_size,
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        info["tp_rank"] = get_tensor_model_parallel_rank()
+        info["tp_size"] = get_tensor_model_parallel_world_size()
+        info["pp_rank"] = get_pipeline_model_parallel_rank()
+        info["pp_size"] = get_pipeline_model_parallel_world_size()
+        info["moe_ep_rank"] = get_moe_expert_parallel_rank()
+        info["moe_ep_size"] = get_moe_expert_parallel_world_size()
+        info["moe_tp_rank"] = get_moe_tensor_parallel_rank()
+        info["moe_tp_size"] = get_moe_tensor_parallel_world_size()
+    except (ImportError, AttributeError, AssertionError):
+        info["distributed_error"] = True
+
+    try:
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            get_attention_dp_size,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+            get_local_attention_dp_rank,
+            get_local_attention_dp_size,
+            is_dp_attention_enabled,
+        )
+
+        info["enable_dp_attention"] = is_dp_attention_enabled()
+        info["attn_tp_rank"] = get_attention_tp_rank()
+        info["attn_tp_size"] = get_attention_tp_size()
+        info["attn_dp_rank"] = get_attention_dp_rank()
+        info["attn_dp_size"] = get_attention_dp_size()
+        info["local_attn_dp_rank"] = get_local_attention_dp_rank()
+        info["local_attn_dp_size"] = get_local_attention_dp_size()
+    except (ImportError, AttributeError, AssertionError):
+        info["dp_attention_error"] = True
+
+    return info
+
+
+def _collect_megatron_parallel_info():
+    info = {}
+
+    try:
+        from megatron.core import parallel_state as mpu
+
+        info["tp_rank"] = mpu.get_tensor_model_parallel_rank()
+        info["tp_size"] = mpu.get_tensor_model_parallel_world_size()
+        info["pp_rank"] = mpu.get_pipeline_model_parallel_rank()
+        info["pp_size"] = mpu.get_pipeline_model_parallel_world_size()
+        info["dp_rank"] = mpu.get_data_parallel_rank()
+        info["dp_size"] = mpu.get_data_parallel_world_size()
+        info["cp_rank"] = mpu.get_context_parallel_rank()
+        info["cp_size"] = mpu.get_context_parallel_world_size()
+        info["vpp_rank"] = mpu.get_virtual_pipeline_model_parallel_rank()
+        info["vpp_size"] = mpu.get_virtual_pipeline_model_parallel_world_size()
+        info["ep_rank"] = mpu.get_expert_model_parallel_rank()
+        info["ep_size"] = mpu.get_expert_model_parallel_world_size()
+        info["etp_rank"] = mpu.get_expert_tensor_parallel_rank()
+        info["etp_size"] = mpu.get_expert_tensor_parallel_world_size()
+        info["edp_rank"] = mpu.get_expert_data_parallel_rank()
+        info["edp_size"] = mpu.get_expert_data_parallel_world_size()
+        info["tcp_rank"] = mpu.get_tensor_and_context_parallel_rank()
+        info["tcp_size"] = mpu.get_tensor_and_context_parallel_world_size()
+        info["etmp_rank"] = mpu.get_expert_tensor_and_model_parallel_rank()
+        info["etmp_size"] = mpu.get_expert_tensor_and_model_parallel_world_size()
+        info["tp_src_rank"] = mpu.get_tensor_model_parallel_src_rank()
+        info["mp_src_rank"] = mpu.get_model_parallel_src_rank()
+        info["dp_src_rank"] = mpu.get_data_parallel_src_rank()
+    except (ImportError, AttributeError, AssertionError):
+        info["megatron_error"] = True
+
+    return info
+
+
 # -------------------------------------- http control server ------------------------------------------
 
 
 def _start_maybe_http_server(dumper):
-    http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
-    zmq_base_port = int(os.environ.get("SGLANG_DUMPER_ZMQ_BASE_PORT", "16800"))
+    http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
+    zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
     if http_port <= 0:
         return
 
@@ -321,6 +600,30 @@ class _ZmqRpcHandle:
 # --------------------------------- copied code (avoid dependency) --------------------------------------
 
 
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+    truthy_values = ("true", "1")
+    return value in truthy_values
+
+
+def _get_str_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def _get_local_ip_by_remote() -> Optional[str]:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -353,7 +656,7 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper()
+dumper = _Dumper.from_env()
 
 
 # -------------------------------------- other utility functions ------------------------------------------
