@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -20,8 +21,7 @@ from sglang.srt.managers.io_struct import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder
-from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import (
     SchedulerMetricsCollector,
@@ -40,6 +40,17 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+
+
+@dataclasses.dataclass
+class PrefillStats:
+    """Stats for logging prefill batch metrics."""
+
+    log_input_tokens: int
+    log_hit_tokens: int
+    new_token_ratio: float
+    running_bs: int
+    num_new_seqs: int  # len(can_run_list)
 
 
 class KvMetrics:
@@ -93,9 +104,11 @@ class SchedulerMetricsMixin:
         )
 
         if self.enable_metrics:
-            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
                 engine_type = "prefill"
-            elif self.server_args.disaggregation_mode == DisaggregationMode.DECODE:
+            elif (
+                self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
+            ):
                 engine_type = "decode"
             else:
                 engine_type = "unified"
@@ -148,21 +161,18 @@ class SchedulerMetricsMixin:
 
     def log_prefill_stats(
         self: Scheduler,
-        adder: PrefillAdder,
-        can_run_list: List[Req],
-        running_bs: int,
-        running_bs_offline_batch: int,
+        prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
-        self.last_prefill_tokens = adder.log_input_tokens
+        self.last_prefill_tokens = prefill_stats.log_input_tokens
 
         assert self.temp_prefill_info is None
         self.temp_prefill_info = dict(
-            adder_log_input_tokens=adder.log_input_tokens,
-            adder_log_hit_tokens=adder.log_hit_tokens,
+            adder_log_input_tokens=prefill_stats.log_input_tokens,
+            adder_log_hit_tokens=prefill_stats.log_hit_tokens,
         )
 
         # TODO: generalize this for various memory pools
@@ -204,16 +214,16 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
-        self.stats.new_token_ratio = adder.new_token_ratio
+        self.stats.new_token_ratio = prefill_stats.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
-            f"#new-seq: {len(can_run_list)}, "
-            f"#new-token: {adder.log_input_tokens}, "
-            f"#cached-token: {adder.log_hit_tokens}, "
+            f"#new-seq: {prefill_stats.num_new_seqs}, "
+            f"#new-token: {prefill_stats.log_input_tokens}, "
+            f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
-            f"#running-req: {running_bs}, "
+            f"#running-req: {prefill_stats.running_bs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
@@ -224,6 +234,8 @@ class SchedulerMetricsMixin:
         else:
             msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
+        if self.server_args.language_only:
+            msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
         graph_backend = defaultdict(
             lambda: "cuda graph",
             {
@@ -238,13 +250,13 @@ class SchedulerMetricsMixin:
 
         if self.enable_metrics:
             # Basics
-            total_tokens = adder.log_input_tokens + adder.log_hit_tokens
+            total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
             cache_hit_rate = (
-                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
+                prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
-            self.stats.num_running_reqs = running_bs
-            self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
+            self.stats.num_running_reqs = prefill_stats.running_bs
+            self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
             if self.is_hybrid_swa:
@@ -397,6 +409,9 @@ class SchedulerMetricsMixin:
             msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+
+        if self.server_args.language_only:
+            msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 
         graph_backend = defaultdict(
             lambda: "cuda graph",

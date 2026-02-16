@@ -198,17 +198,17 @@ def test_edge_case():
     assert result1 == result2
     print("Pass for normal test")
 
-    class UnkownType:
+    class UnknownType:
         pass
 
     try:
-        list_dispatcher(UnkownType())
+        list_dispatcher(UnknownType())
         print("exception was thrown from list version as expected")
     except ValueError:
         print("exception thrown from list version was processed...")
 
     try:
-        dict_dispatcher(UnkownType())
+        dict_dispatcher(UnknownType())
         print("exception was thrown from dict version as expected")
     except ValueError:
         print("exception thrown from dict version was processed...")
