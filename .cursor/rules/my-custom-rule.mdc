@@ -1,4 +1,0 @@
----
-alwaysApply: true
----
-Always edit files directly without CLI tools unless specified
