@@ -1,5 +1,5 @@
-from typing import Optional, Tuple
 from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 import torch
 
@@ -39,8 +39,10 @@ class FlashMLASchedMeta:
     have_initialized: bool = False
     config: Optional[Config] = None
 
-    tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
-    num_splits: Optional[torch.Tensor] = None                # (batch_size + 1), dtype torch.int32.
+    tile_scheduler_metadata: Optional[torch.Tensor] = (
+        None  # (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
+    )
+    num_splits: Optional[torch.Tensor] = None  # (batch_size + 1), dtype torch.int32.
 
 
 def get_mla_metadata(
@@ -52,7 +54,7 @@ def get_mla_metadata(
     topk: Optional[int] = None,
 ) -> Tuple[FlashMLASchedMeta, None]:
     """
-    Returns an empty FlashMLASchedMeta object. The actual scheduling metadata 
+    Returns an empty FlashMLASchedMeta object. The actual scheduling metadata
     will be generated during the first invocation of flash_mla_with_kvcache.
 
     Arguments:
@@ -76,7 +78,7 @@ def get_mla_decoding_metadata_dense_fp8(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Get metadata for dense FP8 decoding.
-    
+
     Returns:
         tile_scheduler_metadata: (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
@@ -131,12 +133,13 @@ def flash_mla_with_kvcache(
         raise _IMPORT_ERROR from _flashmla_import_error
 
     sched_meta = tile_scheduler_metadata
-    assert isinstance(sched_meta, FlashMLASchedMeta), \
-        "tile_scheduler_metadata must be of type FlashMLASchedMeta"
+    assert isinstance(
+        sched_meta, FlashMLASchedMeta
+    ), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
     assert num_splits is None, "num_splits must be None, use FlashMLASchedMeta instead"
 
     topk = indices.shape[-1] if indices is not None else None
-    
+
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -162,10 +165,16 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.b == q.shape[0], "batch_size mismatch." + helper_msg
         assert sched_meta.config.s_q == q.shape[1], "seq_len_q mismatch." + helper_msg
         assert sched_meta.config.h_q == q.shape[2], "num_heads_q mismatch." + helper_msg
-        assert sched_meta.config.page_block_size == k_cache.shape[1], "page_block_size mismatch." + helper_msg
-        assert sched_meta.config.h_k == k_cache.shape[2], "num_heads_k mismatch." + helper_msg
+        assert sched_meta.config.page_block_size == k_cache.shape[1], (
+            "page_block_size mismatch." + helper_msg
+        )
+        assert sched_meta.config.h_k == k_cache.shape[2], (
+            "num_heads_k mismatch." + helper_msg
+        )
         assert sched_meta.config.causal == causal, "causal mismatch." + helper_msg
-        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "is_fp8_kvcache mismatch." + helper_msg
+        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, (
+            "is_fp8_kvcache mismatch." + helper_msg
+        )
         assert sched_meta.config.topk == topk, "topk mismatch." + helper_msg
 
     # Call the underlying kernel
@@ -199,7 +208,7 @@ def flash_mla_with_kvcache(
             is_fp8_kvcache,
             indices,
         )
-    
+
     return out, softmax_lse
 
 
