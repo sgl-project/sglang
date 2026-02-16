@@ -1858,8 +1858,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
-            self._dummy_run(batch_size=self.req_to_token_pool.size)
+        # Temporarily disable symmetric memory during autotune to avoid deadlock.
+        # MoE forward passes use use_symmetric_memory() which triggers NCCL collective
+        # operations. During autotune profiling, these collectives can deadlock because
+        # different ranks may execute different kernel configurations.
+        # is_symmetric_memory_enabled() reads server_args.enable_symm_mem directly,
+        # so we temporarily flip the flag.
+        saved_symm_mem = self.server_args.enable_symm_mem
+        self.server_args.enable_symm_mem = False
+        try:
+            with torch.inference_mode(), autotune():
+                self._dummy_run(batch_size=self.req_to_token_pool.size)
+        finally:
+            self.server_args.enable_symm_mem = saved_symm_mem
 
         logger.info("FlashInfer autotune completed.")
 
