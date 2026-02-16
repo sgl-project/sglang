@@ -642,8 +642,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         batch_info = self.lora_backend.batch_info
         lora_ranks = batch_info.lora_ranks  # [num_loras]
 
-        # max_lora_rank
-        max_lora_rank = self.gate_up_lora_a_weights.shape[2]
+        # Compute max LoRA rank from current batch ranks
+        max_lora_rank = self.lora_backend.max_lora_rank
 
         # Create adapter_enabled tensor for the current batch
         # Only enable LoRA adapters that are actually used in this batch
