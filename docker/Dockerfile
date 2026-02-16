@@ -213,7 +213,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /tmp/sgl-kernel-src \
     && git checkout bec7fe9e65239f4118c1633e27650b1fdc47b3f8 \
     && cd sgl-kernel \
-    && pip install "scikit-build-core>=0.10" "cmake>=3.31" ninja \
+    && pip install "scikit-build-core>=0.10" "cmake>=3.31,<4" ninja \
     && pip install --no-build-isolation --force-reinstall --no-deps . \
     && rm -rf /tmp/sgl-kernel-src
 
