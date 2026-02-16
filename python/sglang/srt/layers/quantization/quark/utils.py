@@ -128,10 +128,10 @@ def b_dynamic_mxfp4_quant(x):
     return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
 
 
-def mxfp4_to_f32(x, is_threed):
+def mxfp4_to_f32(x, is_3d):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
-    if is_threed:
+    if is_3d:
         x[..., ::2] = x[..., ::2] & 0xF
         x[..., 1::2] = x[..., 1::2] >> 4
     else:
