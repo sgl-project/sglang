@@ -218,12 +218,6 @@ def _clone_model_with_modified_module(
     target_module: str,
     transform_safetensor: Callable[[str, str], None],
 ) -> None:
-    """Clone a model directory via symlinks, applying transform to one module.
-
-    Everything is symlinked except the target module's first .safetensors
-    file, which is transformed (causing a checksum difference or corruption);
-    remaining files are symlinked for speed.
-    """
     # Symlink root-level files (model_index.json, etc.).
     for fname in os.listdir(src_model):
         src_path = os.path.join(src_model, fname)
@@ -260,7 +254,6 @@ def _clone_model_with_modified_module(
 
 
 def _truncate_safetensor(src_file: str, dst_file: str) -> None:
-    """Copy then truncate — produces an invalid safetensors that triggers rollback."""
     shutil.copy2(src_file, dst_file)
     size = os.path.getsize(dst_file)
     with open(dst_file, "r+b") as f:
@@ -274,7 +267,6 @@ def _truncate_safetensor(src_file: str, dst_file: str) -> None:
 
 
 def _perturb_safetensor(src_file: str, dst_file: str) -> None:
-    """Load, add small perturbation to floating-point tensors, and save."""
 
     tensors = load_file(src_file)
     perturbed = {
@@ -327,16 +319,6 @@ class _UpdateWeightsApiMixin:
         base_url: str,
         expected_model: str,
     ) -> None:
-        """Assert the server's transformer checksum matches expected_model on disk.
-
-        Only the transformer is verified because weight-name remapping and
-        QKV merge during model loading cause in-memory parameter names/shapes
-        to diverge from on-disk safetensors for other modules (e.g. vae),
-        making their checksums incomparable.
-
-        TODO: Extend to verify all modules once these
-        discrepancies are resolved.
-        """
         server_checksums = self._get_weights_checksum(
             base_url, module_names=[_TRANSFORMER_MODULE]
         )
@@ -350,11 +332,6 @@ class _UpdateWeightsApiMixin:
 
 
 class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
-    """Test suite for update_weights_from_disk API and corrupted-weight rollback.
-
-    Uses a class-scoped server fixture so the server is torn down at class end,
-    freeing the port and GPU memory before the offload class starts.
-    """
 
     @pytest.fixture(
         scope="class",
@@ -362,18 +339,6 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         ids=_PAIR_IDS,
     )
     def diffusion_server_no_offload(self, request):
-        """Start a diffusion server (no offload) for this test class.
-
-        Builds two perturbed checkpoints from the source model:
-        - perturbed_vae_model_dir: source model with perturbed vae (both
-          transformer and vae differ from base).
-        - corrupted_vae_model_dir: base model with truncated vae — triggers
-          load failure for rollback testing.
-
-        Checksum cache warmup and perturbed checkpoints building run in background
-        threads while the server boots, so everything is ready by the time
-        tests start.
-        """
         default_model, source_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
@@ -457,15 +422,6 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         self._assert_server_matches_model(base_url, perturbed_model_dir)
 
     def test_update_weights_specific_modules(self, diffusion_server_no_offload):
-        """Verify target_modules filtering: only the specified module is updated.
-
-        The perturbed checkpoint has different weights for both transformer and
-        vae.  This test randomly picks ONE of them as target_modules and loads
-        from the perturbed checkpoint.  Assertions:
-        (1) the targeted module's in-memory checksum changed (before != after);
-        (2) every non-targeted module's in-memory checksum is unchanged,
-            proving the server only touched what was requested.
-        """
         ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = f"http://localhost:{ctx.port}"
 
@@ -564,18 +520,6 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         self._assert_server_matches_model(base_url, default_model)
 
     def test_corrupted_weights_rollback(self, diffusion_server_no_offload):
-        """Verify all-or-nothing rollback on corrupted weights.
-
-        Steps:
-        1. base → perturbed (succeeds, server now on perturbed checkpoint).
-        2. perturbed → corrupted with target_modules=[transformer, vae].
-           The corrupted checkpoint has a truncated vae safetensors file.
-           We explicitly assert the first failed module is vae from the API
-           error message (which reports the failing module name), proving
-           transformer was attempted before the vae parse failure and that
-           rollback then covered both modules.
-        3. Assert the server rolled back to the perturbed checkpoint, not base.
-        """
         ctx, default_model, perturbed_model_dir, corrupted_vae_model_dir = (
             diffusion_server_no_offload
         )
@@ -650,11 +594,6 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
 
     @pytest.fixture(scope="class", params=_ACTIVE_MODEL_PAIRS, ids=_PAIR_IDS)
     def diffusion_server_with_offload(self, request):
-        """Start a diffusion server with layerwise offload enabled.
-
-        Also builds perturbed_vae_model_dir in a background thread
-        while the server boots.
-        """
         default_model, source_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
@@ -690,7 +629,6 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
             shutil.rmtree(perturbed_vae_model_dir, ignore_errors=True)
 
     def test_update_weights_with_offload_enabled(self, diffusion_server_with_offload):
-        """Offload: base→perturbed; no Shape mismatch; checksums == perturbed disk."""
         ctx, _, perturbed_model_dir = diffusion_server_with_offload
         base_url = f"http://localhost:{ctx.port}"
 
