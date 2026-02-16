@@ -386,8 +386,6 @@ class LoRAManager:
             target_modules=target_modules,
         )
 
-        # Inject max_lora_rank into backend
-        self.lora_backend.max_lora_rank = self.max_lora_rank
 
         self.init_lora_modules()
         self.init_memory_pool()
