@@ -1451,20 +1451,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.event_loop = loop
 
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
-            )
-        else:
-            # We cannot add signal handler when the tokenizer manager is not in
-            # the main thread due to the CPython limitation.
-            logger.warning(
-                "Signal handler is not added because the tokenizer manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "tokenizer manager when SIGTERM is received."
             )
 
         self.asyncio_tasks.add(

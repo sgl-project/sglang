@@ -33,6 +33,7 @@ from torch import nn
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -1601,6 +1602,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
+
+        if isinstance(config, GraniteMoeHybridConfig):
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(config, "layer_types", [])
+            )
+            if not has_mamba:
+                return None
+            else:
+                return config
+
         return None
 
     @property

@@ -1588,13 +1588,16 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
-        assert not (
-            self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
-        ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
+        self.nsa_kv_cache_store_fp8 = (
+            use_nsa
+            and dtype == torch.float8_e4m3fn
+            and override_kv_cache_dim is not None
+        )
+        # When override_kv_cache_dim is provided with nsa model, we assume the
+        # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.use_nsa and self.nsa_kv_cache_store_fp8
+            if self.nsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1676,7 +1679,7 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1696,7 +1699,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1845,7 +1848,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
-        assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        assert not self.nsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1870,7 +1873,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
@@ -1924,20 +1927,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
         device: str,
         index_head_dim: int,
         enable_memory_saver: bool,
+        kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        assert (
-            kv_lora_rank % self.quant_block_size == 0
-        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {self.quant_block_size}"
 
-        # Calculate override_kv_cache_dim for FP8 storage:
-        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         override_dim = (
-            kv_lora_rank
-            + kv_lora_rank // self.quant_block_size * 4
-            + qk_rope_head_dim * self.rope_storage_dtype.itemsize
+            kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
 
         super().__init__(

@@ -454,7 +454,7 @@ def scaled_fp4_experts_quant(
         input_tensor.ndim == 2
     ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
     if expert_map is not None:
-        (m, k) = input_tensor.shape
+        m, k = input_tensor.shape
         output_tensor_shape = (m * topk, k)
         input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
     m_numtopk, k = input_tensor.shape
