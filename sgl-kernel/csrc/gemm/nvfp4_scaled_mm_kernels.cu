@@ -663,7 +663,7 @@ void cutlass_scaled_fp4_mm_sm100a_sm120a(
   // Check SM version and dispatch accordingly
   auto sm_version = getSMVersion();
 
-  if (sm_version == 120) {
+  if (sm_version >= 120) {
     // Use SM120 specific dispatch
     if (out_dtype == at::ScalarType::Half) {
       cutlass_fp4_f16_gemm_dispatch_sm120(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);

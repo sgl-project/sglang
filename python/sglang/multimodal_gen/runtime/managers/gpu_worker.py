@@ -218,7 +218,7 @@ class GPUWorker:
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
+            if req.save_output and req.return_file_paths_only and self.rank == 0:
                 output_paths = save_outputs(
                     output_batch.output,
                     req.data_type,
@@ -227,6 +227,7 @@ class GPUWorker:
                     lambda idx: req.output_file_path(len(output_batch.output), idx),
                     audio=output_batch.audio,
                     audio_sample_rate=output_batch.audio_sample_rate,
+                    output_compression=req.output_compression,
                 )
                 output_batch.output_file_paths = output_paths
                 output_batch.output = None
@@ -351,6 +352,7 @@ OOM detected. Possible solutions:
     2. Enable SP and/or TP
     3. Opt for a sparse-attention backend
     4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    5. Enable quantization (e.g. nunchaku)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
