@@ -60,7 +60,6 @@ class ModelTaskType(Enum):
             self == ModelTaskType.T2I
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
-            or self == ModelTaskType.I2M
         )
 
     def requires_image_input(self) -> bool:
