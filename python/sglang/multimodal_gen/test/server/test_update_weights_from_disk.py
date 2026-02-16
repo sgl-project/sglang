@@ -193,7 +193,7 @@ def _resolve_active_model_pairs() -> list[tuple[str, str]]:
     if not is_in_ci():
         return _ALL_MODEL_PAIRS
 
-    pair_by_id = {base.split("/")[-1]: pair for base, pair in _ALL_MODEL_PAIRS}
+    pair_by_id = {pair[0].split("/")[-1]: pair for pair in _ALL_MODEL_PAIRS}
     selected_pair_id = os.environ.get(_CI_MODEL_PAIR_ENV)
     if selected_pair_id is None:
         return [random.choice(_ALL_MODEL_PAIRS)]
