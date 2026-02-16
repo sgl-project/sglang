@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
+    _Dumper,
     _obj_to_dict,
     _torch_save,
     get_tensor_info,
@@ -161,8 +162,12 @@ class TestDumperDistributed:
 
         dist.barrier()
         path = _find_dump_file(tmpdir, rank=rank, name="content_check")
-        loaded = torch.load(path, map_location="cpu", weights_only=True)
-        assert torch.equal(loaded, tensor.cpu())
+        raw = _load_dump(path)
+        assert isinstance(raw, dict), f"Expected dict, got {type(raw)}"
+        assert "value" in raw and "meta" in raw
+        assert torch.equal(raw["value"], tensor.cpu())
+        assert raw["meta"]["name"] == "content_check"
+        assert raw["meta"]["rank"] == rank
 
 
 class TestDumperFileWriteControl:
@@ -230,6 +235,54 @@ class TestDumperFileWriteControl:
         assert len(_get_filenames(tmpdir)) == 0
 
 
+class TestDumpDictFormat:
+    """Verify that dump files use the dict output format: {"value": ..., "meta": {...}}."""
+
+    def test_dict_format_structure(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+        dumper.dump("fmt_test", tensor, custom_key="hello")
+
+        path = _find_dump_file(str(tmp_path), rank=0, name="fmt_test")
+        raw = _load_dump(path)
+
+        assert isinstance(raw, dict)
+        assert set(raw.keys()) == {"value", "meta"}
+        assert torch.equal(raw["value"], tensor)
+
+        meta = raw["meta"]
+        assert meta["name"] == "fmt_test"
+        assert meta["custom_key"] == "hello"
+        assert "forward_pass_id" in meta
+        assert "rank" in meta
+        assert "dump_index" in meta
+
+    def test_dict_format_with_context(self, tmp_path):
+        dumper = _make_test_dumper(tmp_path)
+        dumper.set_ctx(ctx_val=42)
+        tensor = torch.randn(2, 2)
+        dumper.dump("ctx_fmt", tensor)
+
+        path = _find_dump_file(str(tmp_path), rank=0, name="ctx_fmt")
+        raw = _load_dump(path)
+
+        assert raw["meta"]["ctx_val"] == 42
+        assert torch.equal(raw["value"], tensor)
+
+
+def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
+    """Create a _Dumper for CPU testing without HTTP server or distributed."""
+    defaults: dict = dict(
+        enable=True,
+        base_dir=tmp_path,
+        partial_name="test",
+        enable_http_server=False,
+    )
+    d = _Dumper(**{**defaults, **overrides})
+    d.on_forward_pass_start()
+    return d
+
+
 def _get_filenames(tmpdir):
     return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
 
@@ -241,6 +294,11 @@ def _assert_files(filenames, *, exist=(), not_exist=()):
         assert not any(
             p in f for f in filenames
         ), f"{p} should not exist in {filenames}"
+
+
+def _load_dump(path: Path) -> dict:
+    """Load a dump file and return the raw dict (with 'value' and 'meta' keys)."""
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
