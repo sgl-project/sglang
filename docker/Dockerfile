@@ -214,7 +214,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && git checkout bec7fe9e65239f4118c1633e27650b1fdc47b3f8 \
     && cd sgl-kernel \
     && pip install "scikit-build-core>=0.10" "cmake>=3.31,<4" ninja \
-    && pip install --no-build-isolation --force-reinstall --no-deps . \
+    && TORCH_CUDA_ARCH_LIST="9.0;10.0;10.3" MAX_JOBS=4 pip install --no-build-isolation --force-reinstall --no-deps . \
     && rm -rf /tmp/sgl-kernel-src
 
 # Install transformers from source (GLM-4.1V support)
