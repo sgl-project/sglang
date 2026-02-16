@@ -7,7 +7,9 @@ from torch import Tensor
 
 from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
+    fused_dual_norm_scale_shift,
     fused_scale_residual_norm_scale_shift,
+    fused_dual_scale_residual_norm_scale_shift
 )
 
 DEVICE = "cuda"
@@ -28,7 +30,7 @@ SHAPES = [
     (1, 32760, 1, 1536),  # Wan
     (1, 6, 1, 3072),  # Qwen
     (1, 1024, 8, 3072),
-    (4, 512, 16, 3072),
+    (4, 512, 16, 136), # irregular case
 ]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 NORM_TYPES = ["layer", "rms"]
@@ -60,6 +62,7 @@ def _apply_scale_shift(y: Tensor, scale: Tensor, shift: Tensor) -> Tensor:
         return y * (1 + scale) + shift
 
 
+@torch.compile()
 def fused_norm_scale_shift_ref(
     x: Tensor,
     weight: Optional[Tensor],
@@ -144,6 +147,44 @@ def run_norm_scale_shift(
 
 
 @torch.no_grad()
+def run_dual_norm_scale_shift(
+    shape=SHAPES[0],
+    dtype=DTYPES[0],
+    affine_dtype=DTYPES[0],
+    scale_dtype=DTYPES[0],
+    shift_dtype=DTYPES[0],
+    norm_type=NORM_TYPES[0],
+    affine_mode=AFFINE_MODES[0],
+    scale_mode="BSD",
+    shift_mode="BSD",
+    eps=1e-5,
+):
+    x = _make_tensor("BSD", shape, dtype)
+    weight = _make_tensor(affine_mode, shape, affine_dtype)
+    bias = _make_tensor(affine_mode, shape, affine_dtype)
+    scale = _make_tensor(scale_mode, shape, scale_dtype)
+    shift = _make_tensor(shift_mode, shape, shift_dtype)
+    x_2 = _make_tensor("BSD", shape, dtype)
+    weight_2 = _make_tensor(affine_mode, shape, affine_dtype)
+    bias_2 = _make_tensor(affine_mode, shape, affine_dtype)
+    scale_2 = _make_tensor(scale_mode, shape, scale_dtype)
+    shift_2 = _make_tensor(shift_mode, shape, shift_dtype)
+    y_dev_1, y_dev_2 = fused_dual_norm_scale_shift(
+        x, weight, bias, scale, shift,
+        x_2, weight_2, bias_2, scale_2, shift_2,
+        norm_type, eps,
+    )
+    y_ref_1 = fused_norm_scale_shift_ref(
+        x, weight, bias, scale, shift, norm_type, eps
+    )
+    y_ref_2 = fused_norm_scale_shift_ref(
+        x_2, weight_2, bias_2, scale_2, shift_2, norm_type, eps
+    )
+    torch.testing.assert_close(y_dev_1, y_ref_1, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(y_dev_2, y_ref_2, atol=_tol(dtype), rtol=_tol(dtype))
+
+
+@torch.no_grad()
 def run_scale_resi_norm_scale_shift(
     shape=SHAPES[0],
     dtype=DTYPES[0],
@@ -173,6 +214,93 @@ def run_scale_resi_norm_scale_shift(
     torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
     torch.testing.assert_close(res_dev, res_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
+
+@torch.no_grad()
+def run_dual_scale_resi_norm_scale_shift(
+    shape=SHAPES[0],
+    dtype=DTYPES[0],
+    affine_dtype=DTYPES[0],
+    scale_dtype=DTYPES[0],
+    shift_dtype=DTYPES[0],
+    norm_type=NORM_TYPES[0],
+    affine_mode=AFFINE_MODES[0],
+    gate_mode="B1D",
+    scale_mode="BSD",
+    shift_mode="BSD",
+    eps=1e-5,
+):
+    residual = _make_tensor("BSD", shape, dtype)
+    x = _make_tensor("BSD", shape, dtype)
+    gate = _make_tensor(gate_mode, shape, dtype)
+    weight = _make_tensor(affine_mode, shape, affine_dtype)
+    bias = _make_tensor(affine_mode, shape, affine_dtype)
+    scale = _make_tensor(scale_mode, shape, scale_dtype)
+    shift = _make_tensor(shift_mode, shape, shift_dtype)
+    residual_2 = _make_tensor("BSD", shape, dtype)
+    x_2 = _make_tensor("BSD", shape, dtype)
+    gate_2 = _make_tensor(gate_mode, shape, dtype)
+    weight_2 = _make_tensor(affine_mode, shape, affine_dtype)
+    bias_2 = _make_tensor(affine_mode, shape, affine_dtype)
+    scale_2 = _make_tensor(scale_mode, shape, scale_dtype)
+    shift_2 = _make_tensor(shift_mode, shape, shift_dtype)
+    y_dev_1, res_dev_1, y_dev_2, res_dev_2 = fused_dual_scale_residual_norm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift,
+        residual_2, x_2, gate_2, weight_2, bias_2, scale_2, shift_2,
+        norm_type, eps
+    )
+    y_ref_1, res_ref_1 = fused_scale_residual_norm_scale_shift_ref(
+        residual, x, gate, weight, bias, scale, shift, norm_type, eps
+    )
+    y_ref_2, res_ref_2 = fused_scale_residual_norm_scale_shift_ref(
+        residual_2, x_2, gate_2, weight_2, bias_2, scale_2, shift_2, norm_type, eps
+    )
+    torch.testing.assert_close(y_dev_1, y_ref_1, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(res_dev_1, res_ref_1, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(y_dev_2, y_ref_2, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(res_dev_2, res_ref_2, atol=_tol(dtype), rtol=_tol(dtype))
+
+
+# @pytest.mark.parametrize("shape", [(1, 4096, 1, 3072)])
+# def test_special(shape):
+#     run_norm_scale_shift(
+#         shape=shape,
+#         # affine_mode="NAT",
+#         scale_mode="B1D",
+#         shift_mode="B1D",
+#         norm_type="layer",
+#     )
+
+# @pytest.mark.parametrize("shape", [(1, 4096, 1, 3072)])
+# def test_special(shape):
+#     run_dual_norm_scale_shift(
+#         shape=shape,
+#         # affine_mode="NAT",
+#         scale_mode="B1D",
+#         shift_mode="B1D",
+#         norm_type="layer",
+#     )
+
+
+# @pytest.mark.parametrize("shape", [(1, 4096, 1, 3072)])
+# def test_special(shape):
+#     run_scale_resi_norm_scale_shift(
+#         shape=shape,
+#         # affine_mode="NAT",
+#         gate_mode="B1D",
+#         scale_mode="B1D",
+#         shift_mode="B1D",
+#         norm_type="layer",
+#     )
+
+@pytest.mark.parametrize("shape", [(1, 4096, 1, 3072)])
+def test_special(shape):
+    run_dual_scale_resi_norm_scale_shift(
+        shape=shape,
+        # affine_mode="NAT",
+        scale_mode="B1D",
+        shift_mode="B1D",
+        norm_type="layer",
+    )
 
 @pytest.mark.parametrize("norm_type", NORM_TYPES)
 class TestFusedNormScaleShift:

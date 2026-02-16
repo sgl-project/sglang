@@ -47,6 +47,10 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+    fused_dual_scale_residual_norm_scale_shift
+)
+
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -366,6 +370,11 @@ class FluxTransformerBlock(nn.Module):
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
+        # norm_hidden_states, hidden_states, norm_encoder_hidden_states, encoder_hidden_states= fused_dual_scale_residual_norm_scale_shift(
+        #     hidden_states, attn_output, gate_msa.unsqueeze(1), None, None, scale_mlp[:, None], shift_mlp[:, None],
+        #     encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1), None, None, c_scale_mlp[:, None], c_shift_mlp[:, None],
+        #     "layer", 1e-6,
+        # )
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
         norm_hidden_states = self.norm2(hidden_states)
