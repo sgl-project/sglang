@@ -1118,6 +1118,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
                         self.work_indptr,
@@ -1190,6 +1191,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.make_mla_meta_data(
                     qo_indptr,
                     kv_indptr,
+                    kv_last_page_len,
                     self.work_metadata,
                     self.work_info_set,
                     self.work_indptr,
@@ -1256,6 +1258,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.make_mla_meta_data(
                     qo_indptr,
                     kv_indptr,
+                    kv_last_page_len,
                     self.work_metadata,
                     self.work_info_set,
                     self.work_indptr,
