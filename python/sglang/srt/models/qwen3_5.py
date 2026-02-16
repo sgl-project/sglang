@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union

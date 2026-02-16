@@ -15,6 +15,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
+
 from __future__ import annotations
 
 import logging
@@ -1492,6 +1493,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+        if self.current_attention_backend == "nsa":
+            return (
+                get_global_server_args().nsa_decode_backend == "trtllm"
+                or get_global_server_args().nsa_prefill_backend == "trtllm"
+            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+
         return (
             self.current_attention_backend == "trtllm_mla"
             and (
