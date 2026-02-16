@@ -10,7 +10,7 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
     from sglang.srt.speculative.eagle_info import EagleVerifyOutput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
@@ -402,6 +402,84 @@ def add_output_logprobs_for_spec_v1(
                     assert (
                         should_top_logprobs
                     ), "Inconsistent state: should_top_logprobs is False"
+                    req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
+                    req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
+            pt += 1
+
+
+def add_output_logprobs_for_spec_v2(
+    batch: Union["ScheduleBatch", "ModelWorkerBatch"],
+    logits_output: "LogitsProcessorOutput",
+    predict: torch.Tensor,
+    accept_length: torch.Tensor,
+    accept_index: torch.Tensor,
+    stride: int,
+) -> None:
+    """Compute and attach output logprobs for overlap spec v2 verify.
+
+    Called from the worker after verify_input.sample(). Uses full verify logits
+    and accept_index to slice accepted positions, then appends logprobs to each
+    req in the same order as accepted tokens (req 0, then req 1, ...).
+
+    Args:
+        batch: ScheduleBatch or ModelWorkerBatch with reqs, top_logprobs_nums,
+            token_ids_logprobs, sampling_info.
+        logits_output: Full verify logits; next_token_logits shape [bs*stride, V].
+        predict: Token ids from sample(), shape [bs*stride].
+        accept_length: Per-req accept lengths, shape [bs].
+        accept_index: Per-req accepted indices into flattened logits, shape
+            [bs, stride]; -1 for invalid. Row-major order.
+        stride: speculative_num_draft_tokens (number of positions per req).
+    """
+    assert batch.reqs is not None, "spec v2 logprob requires batch.reqs"
+    num_accepted = (accept_index != -1).sum().item()
+    if num_accepted == 0:
+        return
+    flat_accepted = accept_index[accept_index != -1]
+    # Batch index for each accepted position (row index in accept_index).
+    batch_indices = (accept_index != -1).nonzero(as_tuple=True)[0]
+    accepted_logits = logits_output.next_token_logits[flat_accepted]
+    temperatures = batch.sampling_info.temperatures[batch_indices]
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        logprobs = torch.nn.functional.log_softmax(accepted_logits, dim=-1)
+    else:
+        logprobs = torch.nn.functional.log_softmax(
+            accepted_logits / temperatures.unsqueeze(-1), dim=-1
+        )
+    verified_ids = predict[flat_accepted].long()
+    device = logprobs.device
+    next_token_logprobs_t = logprobs[
+        torch.arange(num_accepted, device=device),
+        verified_ids,
+    ]
+    num_tokens_per_req = accept_length.tolist()
+    bs = len(batch.reqs)
+    top_logprobs_nums = (
+        batch.top_logprobs_nums if batch.top_logprobs_nums is not None else [0] * bs
+    )
+    top_logprobs_nums_repeat_interleaved = [
+        num
+        for num, ntok in zip(top_logprobs_nums, num_tokens_per_req)
+        for _ in range(ntok)
+    ]
+    should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+    token_top_logprobs_val: Optional[List] = None
+    token_top_logprobs_idx: Optional[List] = None
+    if should_top_logprobs:
+        token_top_logprobs_val, token_top_logprobs_idx = get_top_logprobs(
+            logprobs,
+            top_logprobs_nums_repeat_interleaved,
+        )
+    next_token_logprobs = next_token_logprobs_t.tolist()
+    verified_ids_list = verified_ids.tolist()
+    pt = 0
+    for req, ntok in zip(batch.reqs, num_tokens_per_req, strict=True):
+        for _ in range(ntok):
+            if req.return_logprob:
+                req.output_token_logprobs_val.append(next_token_logprobs[pt])
+                req.output_token_logprobs_idx.append(verified_ids_list[pt])
+                if req.top_logprobs_num > 0 and token_top_logprobs_val is not None:
+                    assert token_top_logprobs_idx is not None
                     req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
                     req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
             pt += 1

@@ -37,6 +37,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids_triton,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v2
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
@@ -693,6 +694,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
+
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            add_output_logprobs_for_spec_v2(
+                batch,
+                logits_output,
+                predict,
+                accept_length,
+                accept_index,
+                self.speculative_num_draft_tokens,
+            )
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]

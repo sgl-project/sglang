@@ -35,6 +35,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v2
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -787,6 +788,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
+
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            add_output_logprobs_for_spec_v2(
+                batch,
+                logits_output,
+                predict,
+                accept_length,
+                accept_index,
+                self.speculative_num_draft_tokens,
+            )
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]

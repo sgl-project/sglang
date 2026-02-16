@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -90,6 +92,71 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         self.assertGreater(
             metrics["accuracy"], 0.23
         )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        assert self.process.poll() is None
+
+    def test_logprob_spec_v2(self):
+        """Integration test: overlap spec v2 + EAGLE returns output_token_logprobs."""
+        output_len = 8
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Hello, say one word:",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": output_len,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        res = response.json()
+        self.assertIn("meta_info", res)
+        meta = res["meta_info"]
+        self.assertIn("output_token_logprobs", meta)
+        self.assertEqual(
+            len(meta["output_token_logprobs"]),
+            meta["completion_tokens"],
+            "output_token_logprobs length must equal completion_tokens",
+        )
+        self.assertEqual(meta["completion_tokens"], output_len)
+        # Each entry is [token_id, logprob]
+        for i, entry in enumerate(meta["output_token_logprobs"]):
+            self.assertIsInstance(entry, list, f"entry {i}")
+            self.assertEqual(len(entry), 2, f"entry {i}: [token_id, logprob]")
+            self.assertIsInstance(entry[0], int)
+            self.assertIsInstance(entry[1], (int, float))
+        assert self.process.poll() is None
+
+    def test_logprob_spec_v2_top_logprobs(self):
+        """Integration test: spec v2 + return_logprob + top_logprobs_num."""
+        output_len = 4
+        top_logprobs_num = 3
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Count: one two",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": output_len,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": top_logprobs_num,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        res = response.json()
+        meta = res["meta_info"]
+        self.assertEqual(len(meta["output_token_logprobs"]), output_len)
+        self.assertIn("output_top_logprobs", meta)
+        self.assertEqual(len(meta["output_top_logprobs"]), output_len)
+        for i in range(output_len):
+            self.assertEqual(
+                len(meta["output_top_logprobs"][i]),
+                top_logprobs_num,
+                f"position {i}",
+            )
         assert self.process.poll() is None
 
 
