@@ -14,6 +14,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA.
 - **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
+- **NPU**: always uses PyTorch SDPA.
 
 ## Backend options
 
@@ -83,17 +84,17 @@ Some backends require additional configuration. You can pass these parameters vi
 
 ## Platform support matrix
 
-| Backend | CUDA | ROCm | MPS | Notes |
-|---|---:|---:|---:|---|
-| `fa` | ✅ | ✅ | ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
-| `torch_sdpa` | ✅ | ✅ | ✅ | Most compatible option across platforms. |
-| `sliding_tile_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `st_attn`. Configure via `--attention-backend-config`. |
-| `sage_attn` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `sage_attn_3` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `video_sparse_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `vsa`. Configure `sparsity` via `--attention-backend-config`. |
-| `vmoba_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
-| `aiter` | ✅ | ❌ | ❌ | Requires `aiter`. |
-| `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `svg`. |
+| Backend | CUDA | ROCm | MPS | NPU | Notes |
+|---|---:|---:|---:|---:|---|
+| `fa` | ✅ | ✅ | ❌ | ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
+| `torch_sdpa` | ✅ | ✅ | ✅ | ✅ | Most compatible option across platforms. |
+| `sliding_tile_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `st_attn`. Configure via `--attention-backend-config`. |
+| `sage_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
+| `sage_attn_3` | ✅ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
+| `video_sparse_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `vsa`. Configure `sparsity` via `--attention-backend-config`. |
+| `vmoba_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
+| `aiter` | ✅ | ❌ | ❌ | ❌ | Requires `aiter`. |
+| `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `svg`. |
 
 ## Usage
 
