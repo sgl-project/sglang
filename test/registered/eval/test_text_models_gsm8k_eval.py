@@ -11,7 +11,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     check_evaluation_test_results,
@@ -19,6 +18,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+# Nightly eval tests run large models (up to 70B+ params) that may need
+# downloading on cache miss. Use a longer timeout than the default 600s.
+NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
@@ -82,7 +85,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         model=model_setup.model_path,
                         other_args=other_args,
                         base_url=self.base_url,
-                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
                     )
 
                     args = SimpleNamespace(

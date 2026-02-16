@@ -7,7 +7,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelEvalMetrics,
     ModelLaunchSettings,
@@ -15,6 +14,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+# Nightly eval tests run large models that may need downloading on cache miss.
+# Use a longer timeout than the default 600s.
+NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
 
@@ -77,7 +80,7 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                         model=model_path,
                         base_url=self.base_url,
                         other_args=model.extra_args,
-                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
                     )
 
                     args = SimpleNamespace(

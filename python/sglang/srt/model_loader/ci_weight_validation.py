@@ -1889,6 +1889,18 @@ def ci_download_with_validation_and_retry(
         )
 
         # Now we have exclusive access - perform download with retry logic
+        # Clean up stale .incomplete files from previous failed downloads
+        # before starting (they can cause FileNotFoundError if another
+        # container cleaned them up mid-download)
+        cleaned = _cleanup_incomplete_blobs(model_name_or_path, cache_dir)
+        if cleaned > 0:
+            logger.info(
+                "[CI Download] Pre-download cleanup: removed %d stale "
+                ".incomplete file(s) for %s",
+                cleaned,
+                model_name_or_path,
+            )
+
         hf_folder = None
         for attempt in range(max_retries):
             try:
@@ -1923,7 +1935,9 @@ def ci_download_with_validation_and_retry(
                 )
                 _cleanup_incomplete_blobs(model_name_or_path, cache_dir)
                 if attempt < max_retries - 1:
-                    backoff = 2**attempt
+                    # Use longer backoff (30s/60s/120s) to give NFS time to
+                    # stabilize after cross-container interference
+                    backoff = 30 * (2**attempt)
                     logger.info(
                         "[CI Download] Retrying in %ds...",
                         backoff,
