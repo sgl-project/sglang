@@ -48,7 +48,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        
         # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
         # Use `clone()` so merge updates cannot mutate this backup tensor.
         self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
