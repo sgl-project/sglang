@@ -20,6 +20,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v2
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -37,7 +38,6 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids_triton,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v2
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,

@@ -46,7 +46,13 @@ def _make_mock_batch(
     top_logprobs_nums: list = None,
     device: str = "cpu",
 ):
-    reqs = [_make_mock_req(return_logprob=True, top_logprobs_num=top_logprobs_nums[i] if top_logprobs_nums else 0) for i in range(bs)]
+    reqs = [
+        _make_mock_req(
+            return_logprob=True,
+            top_logprobs_num=top_logprobs_nums[i] if top_logprobs_nums else 0,
+        )
+        for i in range(bs)
+    ]
     temperatures = torch.ones(bs, device=device)
     sampling_info = SimpleNamespace(temperatures=temperatures)
     batch = SimpleNamespace()
