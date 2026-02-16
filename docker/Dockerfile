@@ -190,14 +190,6 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     fi \
     && rm -rf /tmp/local_src
 
-# Build sgl-kernel from source (deepgemm upgrade commit bec7fe9e)
-RUN git clone https://github.com/sgl-project/sglang.git /tmp/sgl-kernel-src \
-    && cd /tmp/sgl-kernel-src \
-    && git checkout bec7fe9e65239f4118c1633e27650b1fdc47b3f8 \
-    && cd sgl-kernel \
-    && pip install --no-build-isolation . \
-    && rm -rf /tmp/sgl-kernel-src
-
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
@@ -213,6 +205,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
+# Build sgl-kernel from source (deepgemm upgrade commit bec7fe9e)
+# Runs after sglang install so torch is available as a build dependency
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone https://github.com/sgl-project/sglang.git /tmp/sgl-kernel-src \
+    && cd /tmp/sgl-kernel-src \
+    && git checkout bec7fe9e65239f4118c1633e27650b1fdc47b3f8 \
+    && cd sgl-kernel \
+    && pip install scikit-build-core>=0.10 ninja \
+    && pip install --no-build-isolation --force-reinstall --no-deps . \
+    && rm -rf /tmp/sgl-kernel-src
 
 # Install transformers from source (GLM-4.1V support)
 RUN --mount=type=cache,target=/root/.cache/pip \
