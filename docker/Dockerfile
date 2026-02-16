@@ -190,6 +190,14 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     fi \
     && rm -rf /tmp/local_src
 
+# Build sgl-kernel from source (deepgemm upgrade commit bec7fe9e)
+RUN git clone https://github.com/sgl-project/sglang.git /tmp/sgl-kernel-src \
+    && cd /tmp/sgl-kernel-src \
+    && git checkout bec7fe9e65239f4118c1633e27650b1fdc47b3f8 \
+    && cd sgl-kernel \
+    && pip install --no-build-isolation . \
+    && rm -rf /tmp/sgl-kernel-src
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
@@ -200,19 +208,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-    ; \
-    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
-    ; \
-    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-    ; \
-    else \
-        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-    ; \
-    fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
