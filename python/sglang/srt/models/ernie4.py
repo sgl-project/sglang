@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-""" Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights. """
+"""Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights."""
 
 from typing import Iterable, List, Optional, Tuple, Union
 
