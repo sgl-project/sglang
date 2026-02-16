@@ -48,10 +48,9 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        # Keep an immutable snapshot of the original base weight.
-        # Using clone() is critical: when the base parameter already resides on CPU,
-        # Tensor.to("cpu") may return a view of the same storage, which would let
-        # subsequent merge operations silently mutate this "backup" tensor.
+        
+        # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
+        # Use `clone()` so merge updates cannot mutate this backup tensor.
         self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
