@@ -100,7 +100,6 @@ class Req:
     raw_audio_latent_shape: tuple[int, ...] | None = None
 
     # Audio Parameters
-    fps: float = 24.0
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
@@ -253,6 +252,8 @@ class Req:
 
     def set_as_warmup(self):
         self.is_warmup = True
+        self.save_output = False
+        self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = 1
 
@@ -295,6 +296,7 @@ class Req:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
+                         fps: {self.fps}
                       prompt: {self.prompt}
                   neg_prompt: {self.negative_prompt}
                         seed: {self.seed}
@@ -309,7 +311,7 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         if not self.suppress_logs:
-            logger.info(debug_str)
+            logger.debug(debug_str)
 
 
 @dataclass
@@ -325,6 +327,7 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    output_file_paths: list[str] | None = None
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None

@@ -23,7 +23,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
-SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
+SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NVLINK"]
 
 
 def init_mooncake_custom_mem_pool(
@@ -55,6 +55,8 @@ def init_mooncake_custom_mem_pool(
                 from mooncake.allocator import BarexAllocator
 
                 allocator = BarexAllocator.get_allocator(device)
+            elif custom_mem_pool_type == "INTRA_NODE_NVLINK":
+                return False, None, None
             else:
                 # This should not happen due to the enable_custom_mem_pool check above
                 raise ValueError(

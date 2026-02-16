@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import functools
 import os
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -21,7 +23,6 @@ from sglang.srt.layers.quantization.int8_kernel import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_device_name,
     is_cpu,
     is_cuda,
     is_hip,
@@ -55,28 +56,16 @@ def support_tensor_descriptor():
     return _support_tensor_descriptor
 
 
-# In theory, swap_ab should benefit all SM90 GPUs.
-# However, since it has only been verified on H20 (not H100/H200),
-# it is currently enabled only on H20.
+# swap_ab benefits SM90 GPUs (H20, H100, H200, etc.) for certain block shapes.
 @functools.lru_cache(maxsize=8)
 def should_enable_swap_ab(
     BLOCK_SIZE_M: int,
     BLOCK_SIZE_N: int,
 ) -> bool:
-    if not _is_cuda:
+    if not _is_cuda or is_batch_invariant_mode_enabled():
         return False
 
-    @functools.lru_cache(maxsize=1)
-    def is_h20_device_and_sm90_supported():
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
-        return is_h20_device and is_sm90_supported()
-
-    return (
-        is_h20_device_and_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
-    )
+    return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
 
 
 @triton.jit
@@ -622,6 +611,67 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+# -----------------------------------------------------------------------------
+# TMA allocator: set once per process (avoid per-call triton.set_allocator)
+# -----------------------------------------------------------------------------
+_TMA_ALLOCATOR_SET = False
+
+
+def _set_triton_tma_allocator():
+    """TMA descriptors require a global allocator; set it once to avoid per-call overhead."""
+    global _TMA_ALLOCATOR_SET
+    if _TMA_ALLOCATOR_SET:
+        return
+
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        # NOTE: keep this allocation on CUDA device
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+    _TMA_ALLOCATOR_SET = True
+
+
+# --- B TensorDescriptor cache (LRU) ---
+_B_DESC_CACHE_MAX = 64
+_B_DESC_CACHE: "OrderedDict[tuple, TensorDescriptor]" = OrderedDict()
+
+
+def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
+    """
+    Cache TensorDescriptor for constant weight B.
+    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    """
+    key = (
+        int(B.data_ptr()),
+        tuple(B.shape),
+        tuple(B.stride()),
+        str(B.dtype),
+        int(block_n),
+        int(block_k),
+    )
+
+    desc = _B_DESC_CACHE.get(key, None)
+    if desc is not None:
+        _B_DESC_CACHE.move_to_end(key)
+        return desc
+
+    # Create outside lock to reduce lock hold time (ok if duplicated rarely)
+    desc = TensorDescriptor(
+        B,
+        B.shape,
+        B.stride(),
+        [1, block_n, block_k],
+    )
+
+    _B_DESC_CACHE[key] = desc
+    _B_DESC_CACHE.move_to_end(key)
+    if len(_B_DESC_CACHE) > _B_DESC_CACHE_MAX:
+        _B_DESC_CACHE.popitem(last=False)
+
+    return desc
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -766,11 +816,8 @@ def invoke_fused_moe_kernel(
 
     else:
         if a_use_tma or b_use_tma:
-            # TMA descriptors require a global memory allocation
-            def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-                return torch.empty(size, device="cuda", dtype=torch.int8)
+            _set_triton_tma_allocator()
 
-            triton.set_allocator(alloc_fn)
         if a_use_tma:
             a_desc = TensorDescriptor(
                 A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
@@ -778,11 +825,11 @@ def invoke_fused_moe_kernel(
         else:
             a_desc = None
         if b_use_tma:
-            b_desc = TensorDescriptor(
+            # B is constant weights -> cache descriptor
+            b_desc = _get_b_tma_desc_cached(
                 B,
-                B.shape,
-                B.stride(),
-                [1, config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
             )
         else:
             b_desc = None

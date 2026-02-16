@@ -14,9 +14,21 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.utils import cdiv, device_context, is_npu, next_power_of_2
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    device_context,
+    is_cpu,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_npu = is_npu()
+_use_cpu = is_cpu() and cpu_has_amx_support()
+
+# Maximum rows per Triton block for layernorm gated kernel
+MAX_ROWS_PER_BLOCK = 4
 
 
 def rms_norm_ref(
@@ -73,6 +85,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    ACTIVATION: tl.constexpr,
 ):
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -101,7 +114,10 @@ def _layer_norm_fwd_1pass_kernel(
     if HAS_Z and not NORM_BEFORE_GATE:
         Z_base = Z + rows[:, None] * stride_z_row + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            x *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            x *= tl.sigmoid(z)
 
     # Compute mean and variance per row (reduce along axis 1)
     if not IS_RMS_NORM:
@@ -144,7 +160,10 @@ def _layer_norm_fwd_1pass_kernel(
     if HAS_Z and NORM_BEFORE_GATE:
         Z_base = Z + rows[:, None] * stride_z_row + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
 
     # Write output
     tl.store(Y_base, y, mask=mask)
@@ -158,9 +177,17 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    # When piecewise cuda graph is enabled, use a constant value to avoid
+    # torch.compile creating guards on the dynamic batch dimension.
+    try:
+        if get_global_server_args().enable_piecewise_cuda_graph:
+            return MAX_ROWS_PER_BLOCK
+    except ValueError:
+        # Global server args not initialized (e.g., in unit tests)
+        pass
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
-    rows_per_block = min(rows_per_block, 4)
+    rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
     return rows_per_block
 
 
@@ -174,6 +201,7 @@ def _layer_norm_fwd(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     M, N = x.shape
     if group_size is None:
@@ -234,6 +262,7 @@ def _layer_norm_fwd(
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
+            ACTIVATION=activation,
         )
     return out, mean, rstd
 
@@ -252,6 +281,7 @@ def rms_norm_gated(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
 
@@ -268,6 +298,8 @@ def rms_norm_gated(
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
+    if _is_npu:
+        assert activation == "swish", "NPU only supports swish activation"
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
@@ -277,6 +309,7 @@ def rms_norm_gated(
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
+        activation=activation,
     )
     return y.reshape(x_shape_og)
 
@@ -294,6 +327,7 @@ class LayerNormFn(torch.autograd.Function):
         group_size=None,
         norm_before_gate=True,
         is_rms_norm=False,
+        activation: str = "swish",
     ):
         return rms_norm_gated(
             x=x,
@@ -304,6 +338,7 @@ class LayerNormFn(torch.autograd.Function):
             group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
+            activation=activation,
         )
 
 
@@ -316,9 +351,10 @@ def layernorm_fn(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    activation: str = "swish",
 ):
     return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm, activation
     )
 
 
@@ -374,6 +410,7 @@ class RMSNorm(torch.nn.Module):
         norm_before_gate=True,
         device=None,
         dtype=None,
+        activation: str = "swish",
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -381,6 +418,7 @@ class RMSNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
+        self.activation = activation
         self.weight = torch.nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
         self.group_size = group_size
@@ -392,13 +430,24 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        return layernorm_fn(
-            x,
-            self.weight,
-            self.bias,
-            z=z,
-            eps=self.eps,
-            group_size=self.group_size,
-            norm_before_gate=self.norm_before_gate,
-            is_rms_norm=True,
-        )
+        if _use_cpu:
+            assert (
+                self.norm_before_gate
+                and self.group_size is None
+                and self.activation == "swish"
+            ), "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
+                x, self.weight, z, self.eps
+            )
+        else:
+            return layernorm_fn(
+                x,
+                self.weight,
+                self.bias,
+                z=z,
+                eps=self.eps,
+                group_size=self.group_size,
+                norm_before_gate=self.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.activation,
+            )

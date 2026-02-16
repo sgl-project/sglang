@@ -242,6 +242,7 @@ class Llama4Attention(nn.Module):
             RMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
+                has_weight=False,
             )
             if self.use_qk_norm
             else None

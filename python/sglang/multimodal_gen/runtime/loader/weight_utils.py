@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
 """Utilities for downloading and initializing model weights."""
+
 import hashlib
 import json
 import os
@@ -21,11 +22,6 @@ try:
 
     HAS_RUNAI_MODEL_STREAMER = True
 except ImportError:
-    HAS_RUNAI_MODEL_STREAMER = False
-
-# Disable runai_model_streamer on AMD/ROCm due to global state issues
-# that cause "Streamer is handling previous request" errors
-if torch.version.hip is not None:
     HAS_RUNAI_MODEL_STREAMER = False
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
