@@ -164,9 +164,6 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
-        assert (
-            next(model.parameters()).dtype == default_dtype
-        ), "Model dtype does not match default dtype"
         # considering the existent of mixed-precision models (e.g., nunchaku)
         if next(model.parameters()).dtype != param_dtype:
             logger.warning(
