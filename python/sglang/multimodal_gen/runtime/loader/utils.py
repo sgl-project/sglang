@@ -2,12 +2,14 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """Utilities for selecting and loading models."""
+
 import contextlib
 import glob
 import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any, Dict, Type
 
 import torch
@@ -30,7 +32,7 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def get_param_names_mapping(
-    mapping_dict: dict[str, str]
+    mapping_dict: dict[str, str],
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
@@ -86,6 +88,8 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
+            continue
         reverse_param_names_mapping[target_param_name] = (
             source_param_name,
             merge_index,
@@ -145,14 +149,14 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
-def find_weights_dir(local_path: str, module_name: str) -> str | None:
+def find_weights_dir(local_path: str, module_name: str) -> Path | None:
     """Locate the safetensors directory for module_name under local_path.
 
     Diffusion models store weights in per-module subdirectories (e.g.
     transformer/, vae/, text_encoder/).
     """
-    dir_path = os.path.join(local_path, module_name)
-    if os.path.exists(dir_path):
+    dir_path = Path(local_path) / module_name
+    if dir_path.exists():
         return dir_path
     return None
 

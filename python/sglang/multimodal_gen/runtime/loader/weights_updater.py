@@ -87,6 +87,77 @@ def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
     return {n: m for n, m in raw.items() if isinstance(m, torch.nn.Module)}
 
 
+def _get_weights_iter(weights_dir: str):
+    """Return a (name, tensor) iterator over safetensors in weights_dir."""
+    safetensors_files = _list_safetensors_files(weights_dir)
+    if not safetensors_files:
+        raise FileNotFoundError(f"No safetensors files found in {weights_dir}")
+    return safetensors_weights_iterator(safetensors_files)
+
+
+def _validate_weight_files(
+    local_model_path: str,
+    modules_to_update: list[tuple[str, torch.nn.Module]],
+) -> tuple[dict[str, str], list[str]]:
+    """Check that every module has a weights directory with safetensors files.
+
+    Returns:
+        (weights_map, missing) where weights_map maps module name to its
+        weights directory and missing lists modules without weight files.
+    """
+    weights_map: dict[str, str] = {}
+    missing: list[str] = []
+    for module_name, _ in modules_to_update:
+        weights_dir = find_weights_dir(local_model_path, module_name)
+        if weights_dir and _list_safetensors_files(weights_dir):
+            weights_map[module_name] = weights_dir
+        else:
+            missing.append(module_name)
+    return weights_map, missing
+
+
+def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
+    """Load weights into a module, handling offload-managed parameters.
+
+    For offloaded modules, updates CPU buffers directly via
+    update_cpu_weights(); non-offloaded parameters use in-place copy.
+    """
+    offload_managers: list = []
+    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+
+    if offload_managers:
+        weight_dict = dict(weights_iter)
+        offloaded_names: set[str] = set()
+        for manager in offload_managers:
+            offloaded_names.update(manager.update_cpu_weights(weight_dict))
+        remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
+        load_weights_into_model(remaining, dict(module.named_parameters()))
+    else:
+        load_weights_into_model(weights_iter, dict(module.named_parameters()))
+
+
+def load_weights_into_model(weights_iter, model_params: dict) -> None:
+    """Copy weights from weights_iter into model_params in-place."""
+    for name, loaded_weight in weights_iter:
+        if name not in model_params:
+            continue
+        param = model_params[name]
+        if param.shape != loaded_weight.shape:
+            raise ValueError(
+                f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
+            )
+        if isinstance(param, DTensor):
+            distributed_weight = distribute_tensor(
+                loaded_weight.to(param.dtype),
+                param.device_mesh,
+                param.placements,
+            )
+            param._local_tensor.copy_(distributed_weight._local_tensor)
+        else:
+            param.data.copy_(loaded_weight.to(param.dtype))
+
+
 class WeightsUpdater:
     """In-place weight updates for diffusion pipeline modules.
 
@@ -168,10 +239,6 @@ class WeightsUpdater:
         logger.info(message)
         return success, message
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
     def _collect_modules(
         self, target_modules: list[str] | None
     ) -> list[tuple[str, torch.nn.Module]]:
@@ -244,79 +311,3 @@ class WeightsUpdater:
                 continue
             weights_iter = _get_weights_iter(weights_dir)
             _load_weights_into_module(module, weights_iter)
-
-
-# ---------------------------------------------------------------------------
-# Module-level utility functions
-# ---------------------------------------------------------------------------
-
-
-def _get_weights_iter(weights_dir: str):
-    """Return a (name, tensor) iterator over safetensors in weights_dir."""
-    safetensors_files = _list_safetensors_files(weights_dir)
-    if not safetensors_files:
-        raise FileNotFoundError(f"No safetensors files found in {weights_dir}")
-    return safetensors_weights_iterator(safetensors_files)
-
-
-def _validate_weight_files(
-    local_model_path: str,
-    modules_to_update: list[tuple[str, torch.nn.Module]],
-) -> tuple[dict[str, str], list[str]]:
-    """Check that every module has a weights directory with safetensors files.
-
-    Returns:
-        (weights_map, missing) where weights_map maps module name to its
-        weights directory and missing lists modules without weight files.
-    """
-    weights_map: dict[str, str] = {}
-    missing: list[str] = []
-    for module_name, _ in modules_to_update:
-        weights_dir = find_weights_dir(local_model_path, module_name)
-        if weights_dir and _list_safetensors_files(weights_dir):
-            weights_map[module_name] = weights_dir
-        else:
-            missing.append(module_name)
-    return weights_map, missing
-
-
-def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
-    """Load weights into a module, handling offload-managed parameters.
-
-    For offloaded modules, updates CPU buffers directly via
-    update_cpu_weights(); non-offloaded parameters use in-place copy.
-    """
-    offload_managers: list = []
-    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
-        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
-
-    if offload_managers:
-        weight_dict = dict(weights_iter)
-        offloaded_names: set[str] = set()
-        for manager in offload_managers:
-            offloaded_names.update(manager.update_cpu_weights(weight_dict))
-        remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(remaining, dict(module.named_parameters()))
-    else:
-        load_weights_into_model(weights_iter, dict(module.named_parameters()))
-
-
-def load_weights_into_model(weights_iter, model_params: dict) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
-    for name, loaded_weight in weights_iter:
-        if name not in model_params:
-            continue
-        param = model_params[name]
-        if param.shape != loaded_weight.shape:
-            raise ValueError(
-                f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
-            )
-        if isinstance(param, DTensor):
-            distributed_weight = distribute_tensor(
-                loaded_weight.to(param.dtype),
-                param.device_mesh,
-                param.placements,
-            )
-            param._local_tensor.copy_(distributed_weight._local_tensor)
-        else:
-            param.data.copy_(loaded_weight.to(param.dtype))
