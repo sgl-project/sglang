@@ -1157,7 +1157,7 @@ class HiRadixCache(RadixCache):
                 )
             if timeout_terminated:
                 status = "timeout"
-            elif min_completed_tokens == expected_tokens and expected_tokens > 0:
+            elif min_completed_tokens == expected_tokens:
                 status = "ok"
             else:
                 status = "failed"
