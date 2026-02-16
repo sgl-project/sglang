@@ -689,22 +689,20 @@ class KimiLinearForCausalLM(nn.Module):
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
-            # Fused path: qkv+b+f_a+g_a (when do_fuse_qkvbfg=True)
+            # Fused path
             (".fused_qkvbfg_a_proj", ".q_proj", 0),
             (".fused_qkvbfg_a_proj", ".k_proj", 1),
             (".fused_qkvbfg_a_proj", ".v_proj", 2),
             (".fused_qkvbfg_a_proj", ".b_proj", 3),
             (".fused_qkvbfg_a_proj", ".f_a_proj", 4),
             (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
+            (".fused_fg_b_proj", ".f_b_proj", 0),
+            (".fused_fg_b_proj", ".g_b_proj", 1),
             # Unfused path: separate qkv_proj (when do_fuse_qkvbfg=False)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # f_b and g_b projections (both paths)
-            (".fused_fg_b_proj", ".f_b_proj", 0),
-            (".fused_fg_b_proj", ".g_b_proj", 1),
         ]
-        fuse_qkvbfg_keys = {x[1] for x in stacked_params_mapping[2:8]}
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -739,15 +737,18 @@ class KimiLinearForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                # Check if this is a qkvbfg fusion weight
-                if weight_name in fuse_qkvbfg_keys:
+                # Check if this mapping targets a fused projection (only apply fusion check to fused params)
+                if param_name in {".fused_qkvbfg_a_proj", ".fused_fg_b_proj"}:
                     layer_id = int(name.split(".")[2])
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
                     # Only load to fused projection if fusion is enabled
                     if not getattr(layer, "do_fuse_qkvbfg", False):
-                        # Fusion disabled, skip and load to separate projections
+                        continue
+                if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
+                    layer_id = int(name.split(".")[2])
+                    if not self.config.is_kda_layer(layer_id):
                         continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
