@@ -186,9 +186,29 @@ _ALL_MODEL_PAIRS: list[tuple[str, str]] = [
 ]
 
 
-_ACTIVE_MODEL_PAIRS = (
-    _ALL_MODEL_PAIRS if not is_in_ci() else [random.choice(_ALL_MODEL_PAIRS)]
-)
+_CI_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+
+
+def _resolve_active_model_pairs() -> list[tuple[str, str]]:
+    if not is_in_ci():
+        return _ALL_MODEL_PAIRS
+
+    pair_by_id = {base.split("/")[-1]: pair for base, pair in _ALL_MODEL_PAIRS}
+    selected_pair_id = os.environ.get(_CI_MODEL_PAIR_ENV)
+    if selected_pair_id is None:
+        return [random.choice(_ALL_MODEL_PAIRS)]
+
+    selected_pair = pair_by_id.get(selected_pair_id)
+    if selected_pair is None:
+        valid_ids = ", ".join(sorted(pair_by_id))
+        raise ValueError(
+            f"Invalid {_CI_MODEL_PAIR_ENV}={selected_pair_id!r}. "
+            f"Expected one of: {valid_ids}."
+        )
+    return [selected_pair]
+
+
+_ACTIVE_MODEL_PAIRS = _resolve_active_model_pairs()
 _PAIR_IDS = [p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS]
 
 
