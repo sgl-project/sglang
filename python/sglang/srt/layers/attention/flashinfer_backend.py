@@ -145,6 +145,13 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        # Only use KV scales for quantized dtypes.
+        self.use_kv_scale = self.kv_cache_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -795,8 +802,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                k_scale=layer.k_scale_float if self.use_kv_scale else None,
+                v_scale=layer.v_scale_float if self.use_kv_scale else None,
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -848,6 +855,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float if self.use_kv_scale else None,
+                    v_scale=layer.v_scale_float if self.use_kv_scale else None,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
@@ -891,8 +900,8 @@ class FlashInferAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            k_scale=layer.k_scale_float if self.use_kv_scale else None,
+            v_scale=layer.v_scale_float if self.use_kv_scale else None,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
