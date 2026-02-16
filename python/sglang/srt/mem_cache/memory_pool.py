@@ -334,6 +334,10 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
+    def mamba1_layer_cache(self, layer_id: int):
+        """Alias for mamba2_layer_cache - works for Mamba1 models too."""
+        return self.mamba_cache.at_layer_idx(layer_id)
+
     def available_size(self):
         return len(self.free_slots)
 
@@ -570,6 +574,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
+
+    def mamba1_layer_cache(self, layer_id: int):
+        """Alias for mamba2_layer_cache - works for Mamba1 models too."""
+        assert layer_id in self.mamba_map
+        return self.mamba_pool.mamba1_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()

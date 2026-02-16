@@ -128,7 +128,7 @@ class BaseLinearStateParams(ABC):
 @dataclass(kw_only=True, frozen=True)
 class Mamba1StateShape:
     conv: list[tuple[int, int]]
-    temporal: tuple[int, int, int]
+    temporal: tuple[int, int]  # (intermediate_size/tp, state_size) - 2D for Mamba1
 
     intermediate_size: int
     ssm_state_size: int

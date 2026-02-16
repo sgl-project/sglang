@@ -718,6 +718,85 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+class Mamba1AttnBackend(MambaAttnBackendBase):
+    """Attention backend wrapper for Mamba1 (Jamba) mixer kernels.
+
+    Mamba1 differs from Mamba2 in:
+    - 2D temporal state (intermediate_size/tp, state_size) vs 3D for Mamba2
+    - No chunk-based processing
+    - Uses selective_scan_fn for prefill, selective_state_update for decode
+    """
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__(model_runner)
+        config = model_runner.mamba1_config
+        assert config is not None, "Mamba1AttnBackend requires mamba1_config"
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Initialize forward metadata for Mamba1."""
+        self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def forward(
+        self,
+        mixer,  # JambaMambaMixer1
+        hidden_states: torch.Tensor,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ):
+        """Forward pass through Mamba1 mixer.
+
+        Args:
+            mixer: JambaMambaMixer1 instance
+            hidden_states: Input tensor (num_tokens, hidden_size)
+            layer_id: Layer index
+            forward_batch: ForwardBatch with batch info
+
+        Returns:
+            Output tensor (num_tokens, hidden_size)
+        """
+        layer_cache = self.req_to_token_pool.mamba1_layer_cache(layer_id)
+        metadata = self.forward_metadata
+
+        # Get conv and ssm states for this layer
+        # layer_cache.conv is a list (for Mamba1, single element)
+        # layer_cache.temporal is the SSM state
+        conv_state = layer_cache.conv[0]
+        ssm_state = layer_cache.temporal
+
+        # Determine prefill vs decode counts
+        if forward_batch.forward_mode.is_decode_or_idle():
+            num_prefills = 0
+            num_decodes = forward_batch.batch_size
+        elif forward_batch.forward_mode.is_extend():
+            # For mixed batches, extend_num_batches gives prefill count
+            num_prefills = forward_batch.batch_size
+            num_decodes = 0
+        else:
+            num_prefills = forward_batch.batch_size
+            num_decodes = 0
+
+        return mixer.forward(
+            hidden_states=hidden_states,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            state_indices=metadata.mamba_cache_indices,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            query_start_loc=metadata.query_start_loc,
+        )
+
+    def forward_decode(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Mamba1AttnBackend.forward is called directly instead of forward_decode"
+        )
+
+    def forward_extend(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Mamba1AttnBackend.forward is called directly instead of forward_extend"
+        )
+
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
