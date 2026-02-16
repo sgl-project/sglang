@@ -45,7 +45,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    capture_memory_snapshot,
+)
 
 logger = init_logger(__name__)
 
@@ -146,11 +149,20 @@ class GPUWorker:
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-        peak_memory_gb = peak_memory_bytes / (1024**3)
+        final_snapshot = capture_memory_snapshot()
+        if output_batch.timings:
+            output_batch.timings.record_memory_snapshot("mem_analysis", final_snapshot)
+
+        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
+        peak_reserved_bytes = torch.cuda.max_memory_reserved()
+        peak_allocated_bytes = torch.cuda.max_memory_allocated()
+
+        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_gb = peak_reserved_bytes / (1024**3)
+        peak_allocated_gb = peak_allocated_bytes / (1024**3)
+
         remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
+            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
         suggested_args = set()
@@ -173,8 +185,13 @@ class GPUWorker:
         suggested_args_str = (
             ", ".join(sorted(suggested_args)) if suggested_args else "None"
         )
+
+        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
+
         logger.info(
-            f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
+            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
+            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb/peak_reserved_gb*100:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
@@ -193,6 +210,11 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            # capture memory baseline before forward
+            if self.rank == 0 and req.timings:
+                baseline_snapshot = capture_memory_snapshot()
+                req.timings.record_memory_snapshot("before_forward", baseline_snapshot)
+
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
@@ -209,6 +231,13 @@ class GPUWorker:
                 )
             else:
                 output_batch = result
+
+            # capture memory after forward (peak)
+            if self.rank == 0 and output_batch.timings:
+                peak_snapshot = capture_memory_snapshot()
+                output_batch.timings.record_memory_snapshot(
+                    "after_forward", peak_snapshot
+                )
 
             if self.rank == 0 and not req.suppress_logs:
                 self.do_mem_analysis(output_batch)
