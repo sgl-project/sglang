@@ -512,6 +512,19 @@ class Platform:
             return torch.device("cpu")
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        """Get the local torch.device for the current process.
+
+        This is similar to get_device() but:
+        - It's a classmethod (doesn't need instance)
+        - Uses LOCAL_RANK from environment for device index
+        - Returns device("cuda") instead of device("cuda", 0) for CUDA/ROCm
+
+        Used by multimodal_gen for device placement in distributed contexts.
+        """
+        raise NotImplementedError
+
+    @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         """
         Set random seeds for reproducibility.

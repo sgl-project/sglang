@@ -52,6 +52,11 @@ class CpuPlatform(Platform):
         return True
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        """Get the local torch.device for CPU platform."""
+        return torch.device("cpu")
+
+    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:

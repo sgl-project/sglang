@@ -47,6 +47,14 @@ class XpuPlatform(Platform):
         """Initialize XPU platform."""
         self.log_warnings()
 
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        """Get the local torch.device for the current process."""
+        import os
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        return torch.device(f"xpu:{local_rank}")
+
     # =========================================================================
     # Device Capabilities
     # =========================================================================

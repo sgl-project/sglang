@@ -139,6 +139,17 @@ class CudaPlatformBase(Platform):
         # Log warnings about device configuration (e.g., mixed GPU types)
         self.log_warnings()
 
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        """Get the local torch.device for the current process.
+
+        Uses LOCAL_RANK environment variable (default 0) for device index.
+        """
+        import os
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        return torch.device(f"cuda:{local_rank}")
+
     # =========================================================================
     # CUDA-specific capability checks (moved from base Platform class)
     # =========================================================================

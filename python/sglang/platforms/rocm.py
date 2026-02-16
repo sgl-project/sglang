@@ -58,6 +58,17 @@ class RocmPlatform(Platform):
         """Initialize ROCm platform."""
         self.log_warnings()
 
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        """Get the local torch.device for the current process.
+
+        ROCm uses CUDA APIs, so we use cuda device type with LOCAL_RANK.
+        """
+        import os
+
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        return torch.device(f"cuda:{local_rank}")
+
     # =========================================================================
     # Device Capabilities
     # =========================================================================
