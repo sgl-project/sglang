@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    dequantize_mxfp8,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -48,6 +49,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.utils import set_weight_attrs
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -1850,3 +1852,501 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ),
         )
         return out
+
+
+class ModelOptMxfp8Config(ModelOptQuantConfig):
+    """Config class for ModelOpt MXFP8 quantization.
+
+    Handles checkpoints with:
+    - weight: float8_e4m3fn
+    - weight_scale: uint8 (UE8M0 block scales, group_size=32)
+    - k_scale/v_scale: float32 (KV cache FP8 scales)
+    """
+
+    def __init__(
+        self,
+        kv_cache_quant_algo: Optional[str] = None,
+        exclude_modules: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_mxfp8"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 100  # Blackwell required
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "ModelOptMxfp8Config":
+        kv_cache_quant_method = None
+        exclude_modules = None
+
+        quant_method = config.get("quant_algo")
+        if quant_method is not None:
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if (
+                kv_cache_scheme
+                and kv_cache_scheme.get("type") == "float"
+                and kv_cache_scheme.get("num_bits") == 8
+            ):
+                kv_cache_quant_method = "FP8"
+            exclude_modules = config.get("ignore")
+        else:
+            try:
+                quantization_section = cls.get_from_keys(config, ["quantization"])
+                quant_method = quantization_section.get("quant_algo")
+                kv_cache_quant_method = quantization_section.get("kv_cache_quant_algo")
+                exclude_modules = quantization_section.get("exclude_modules")
+            except ValueError:
+                raise ValueError(
+                    "Cannot find 'quant_algo' in the model's quantization config."
+                )
+
+        if quant_method is None or "MXFP8" not in quant_method:
+            raise ValueError(
+                "ModelOptMxfp8Config only supports MXFP8 quantization. "
+                f"Got quant_algo={quant_method}."
+            )
+
+        return cls(
+            kv_cache_quant_algo=kv_cache_quant_method,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+        )
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        if not self.exclude_modules:
+            return False
+        return any(
+            module in prefix
+            or (
+                prefix.startswith("language_model.")
+                and module in prefix.removeprefix("language_model.")
+            )
+            for module in self.exclude_modules
+        )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        return self._get_quant_method(
+            layer,
+            prefix,
+            Linear=ModelOptMxfp8LinearMethod,
+            Moe=ModelOptMxfp8MoEMethod,
+        )
+
+
+class ModelOptMxfp8LinearMethod(LinearMethodBase):
+    """Linear method for ModelOpt MXFP8 quantization.
+
+    Loads FP8 weights with uint8 UE8M0 block scales (group_size=32).
+    Uses flashinfer's mm_mxfp8 for inference.
+
+    During process_weights_after_loading, checkpoint MXFP8 weights are
+    dequantized to bf16 and re-quantized with flashinfer's swizzled scale
+    layout required by mm_mxfp8.
+    """
+
+    BLOCK_K = 32  # MXFP8 group size
+
+    def __init__(self, quant_config: ModelOptMxfp8Config):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.parameter import BlockQuantScaleParameter
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        # Weight: fp8
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+        # Block scales: uint8 UE8M0, named "weight_scale" to match ModelOpt checkpoint
+        scale = BlockQuantScaleParameter(
+            data=torch.zeros(
+                output_size_per_partition,
+                input_size_per_partition // self.BLOCK_K,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        scale.format_ue8m0 = True
+        layer.register_parameter("weight_scale", scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from flashinfer.fp8_quantization import mxfp8_quantize
+
+        # Checkpoint MXFP8 stores raw FP8 data and per-block UE8M0 scales.
+        # Reconstruct bf16 values first, then requantize to flashinfer swizzled
+        # scales so mm_mxfp8 can consume them directly.
+        weight_bf16 = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
+        weight_q, weight_scale = mxfp8_quantize(
+            weight_bf16, is_sf_swizzled_layout=True, backend="cuda"
+        )
+
+        # mm_mxfp8 expects B as [K, N] column-major.
+        layer.weight = Parameter(weight_q.t(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(
+            weight_scale.view(torch.uint8), requires_grad=False
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from flashinfer import mm_mxfp8
+        from flashinfer.fp8_quantization import mxfp8_quantize
+
+        input_tensor = x[0] if isinstance(x, tuple) else x
+        input_2d = input_tensor.view(-1, input_tensor.shape[-1])  # [M, K]
+        output_shape = [*input_tensor.shape[:-1], layer.weight.shape[1]]  # [..., N]
+        m_actual = input_2d.shape[0]
+        k_dim = input_2d.shape[1]
+
+        # Quantize activations to MXFP8 using swizzled scales for mm_mxfp8.
+        # If input is already pre-quantized, dequantize first when a 2D UE8M0
+        # scale tensor is provided.
+        if isinstance(x, tuple):
+            input_scale = x[1]
+            if input_scale.dim() == 2:
+                input_2d = dequantize_mxfp8(
+                    input_2d,
+                    input_scale.view(-1, input_scale.shape[-1]),
+                )
+
+        # CUTLASS MXFP8 requires M >= 32. Pad decode/capture micro-batches
+        # and slice the output back to original M.
+        if m_actual < 32:
+            input_padded = torch.zeros(
+                (32, k_dim),
+                dtype=input_2d.dtype,
+                device=input_2d.device,
+            )
+            input_padded[:m_actual, :] = input_2d
+            input_2d = input_padded
+
+        input_q, input_scale = mxfp8_quantize(
+            input_2d, is_sf_swizzled_layout=True, backend="cuda"
+        )
+
+        out = mm_mxfp8(
+            input_q,
+            layer.weight,
+            input_scale.view(torch.uint8),
+            layer.weight_scale_inv,
+            out_dtype=torch.bfloat16,
+        )
+        out = out[:m_actual, :]
+
+        if bias is not None:
+            out = out + bias
+        return out.view(*output_shape)
+
+
+class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
+    """MoE method for ModelOpt MXFP8 quantization.
+
+    Loads FP8 expert weights with uint8 UE8M0 block scales (group_size=32).
+    Supports CUTLASS (native MXFP8) and Triton (block-FP8 with float scales)
+    MoE runner backends.
+    """
+
+    BLOCK_K = 32  # MXFP8 group size
+
+    def __init__(self, quant_config: ModelOptMxfp8Config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        intermediate_size = num_shards * intermediate_size_per_partition
+
+        # Weights: fp8
+        w13_weight = ModelWeightParameter(
+            data=torch.empty(
+                num_experts,
+                intermediate_size,
+                hidden_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            input_dim=2,
+            output_dim=1,
+            weight_loader=weight_loader,
+        )
+        w2_weight = ModelWeightParameter(
+            data=torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=torch.float8_e4m3fn,
+            ),
+            input_dim=2,
+            output_dim=1,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        layer.register_parameter("w2_weight", w2_weight)
+
+        # Block scales: uint8 UE8M0, named "weight_scale" to match ModelOpt checkpoint
+        # Shape: [num_experts, N, K // 32]
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                intermediate_size,
+                hidden_size // self.BLOCK_K,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = True
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.BLOCK_K,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale.format_ue8m0 = True
+
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # Set weight_loader and quant_method on scale params for proper loading
+        extra_weight_attrs_block = dict(extra_weight_attrs)
+        extra_weight_attrs_block["quant_method"] = (
+            FusedMoeWeightScaleSupported.BLOCK.value
+        )
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs_block)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs_block)
+
+    @staticmethod
+    def _swizzle_mxfp8_scales(weight_shape: tuple, scale: torch.Tensor) -> torch.Tensor:
+        """Swizzle uint8 UE8M0 scales for CUTLASS MXFP8 MoE kernel."""
+        from triton_kernels.tensor import convert_layout, wrap_torch_tensor
+        from triton_kernels.tensor_details import layout
+
+        num_experts, m, k = weight_shape
+        aligned_m = ((m + 127) // 128) * 128
+        scale = scale.view(num_experts, aligned_m, k // 32)
+        num_warps = 8
+        scale_layout, scale_layout_opts = (
+            layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=1, num_warps=num_warps
+            )
+        )
+        scale = scale.transpose(-2, -1)
+        scale = convert_layout(
+            wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
+        )
+        scale = scale.data.view(num_experts, aligned_m, k // 32)
+        return scale
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+
+        if get_moe_runner_backend().is_cutlass():
+            # CUTLASS MXFP8: keep uint8 scales, swizzle for kernel layout
+            layer.w13_weight_scale_inv = Parameter(
+                self._swizzle_mxfp8_scales(
+                    layer.w13_weight.data.shape, layer.w13_weight_scale.data
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                self._swizzle_mxfp8_scales(
+                    layer.w2_weight.data.shape, layer.w2_weight_scale.data
+                ),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale_inv.format_ue8m0 = True
+            layer.w2_weight_scale_inv.format_ue8m0 = True
+        else:
+            # Triton block-FP8: convert UE8M0 uint8 → float32 scales
+            layer.w13_weight_scale_inv = Parameter(
+                torch.pow(
+                    2.0,
+                    layer.w13_weight_scale.data.to(torch.float32) - 127.0,
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                torch.pow(
+                    2.0,
+                    layer.w2_weight_scale.data.to(torch.float32) - 127.0,
+                ),
+                requires_grad=False,
+            )
+
+    def _ensure_cutlass_buffers(self, layer: torch.nn.Module) -> None:
+        if getattr(self, "_cutlass_buffers_ready", False):
+            return
+        device = layer.w13_weight.device
+        num_experts = layer.w13_weight.shape[0]
+        hidden_size = layer.w2_weight.shape[1]
+        intermediate_size_per_partition = layer.w2_weight.shape[2]
+
+        self.ab_strides1 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        )
+        self.c_strides1 = torch.full(
+            (num_experts,),
+            2 * intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.ab_strides2 = torch.full(
+            (num_experts,),
+            intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides2 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        )
+        from sglang.srt.layers.moe.cutlass_moe import CUTLASS_MOE_WORKSPACE_BYTES
+
+        self.workspace = torch.empty(
+            CUTLASS_MOE_WORKSPACE_BYTES, device=device, dtype=torch.uint8
+        )
+        self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.a_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.expert_offsets = torch.empty(
+            num_experts + 1, device=device, dtype=torch.int32
+        )
+        self.problem_sizes1 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self.problem_sizes2 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self._cutlass_buffers_ready = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        if get_moe_runner_backend().is_cutlass():
+            # CUTLASS path is called directly in apply(), no MoeRunner needed.
+            self._ensure_cutlass_buffers(layer)
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        if get_moe_runner_backend().is_cutlass():
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                use_symmetric_memory,
+            )
+            from sglang.srt.layers.dp_attention import is_allocation_symmetric
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            x = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty_like(x)
+
+            output = cutlass_fused_experts_fp8(
+                x,
+                layer.w13_weight.transpose(1, 2),
+                layer.w2_weight.transpose(1, 2),
+                layer.w13_weight_scale_inv.transpose(1, 2),
+                layer.w2_weight_scale_inv.transpose(1, 2),
+                topk_weights,
+                topk_ids,
+                self.ab_strides1,
+                self.c_strides1,
+                self.ab_strides2,
+                self.c_strides2,
+                self.workspace,
+                self.a_ptr,
+                self.b_ptr,
+                self.out_ptr,
+                self.a_scales_ptr,
+                self.b_scales_ptr,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                use_fp8_blockscale=True,
+                use_mxfp8=True,
+                output=symm_output,
+                enable_es=(True, True),
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        # Fallback: Triton block-FP8 with float scales
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=False,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            block_shape=[1, 32],
+        )
+        return self.runner.run(dispatch_output, quant_info)

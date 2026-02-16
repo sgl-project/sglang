@@ -7,6 +7,10 @@ import torch
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
+# Workspace size required by CUTLASS grouped GEMM kernels (bytes).
+# Used by both FP8 and MXFP8 MoE paths.
+CUTLASS_MOE_WORKSPACE_BYTES = 90000
+
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import (
