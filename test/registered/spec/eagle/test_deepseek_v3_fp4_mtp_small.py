@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.srt.utils import is_flashinfer_available, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 
 # Check if modelopt is available
 try:
@@ -24,14 +24,23 @@ try:
 except ImportError:
     MODELOPT_AVAILABLE = False
 
+# Check if flashinfer_trtllm is available
+try:
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe  # noqa: F401
+
+    FLASHINFER_TRTLLM_AVAILABLE = True
+except ImportError:
+    FLASHINFER_TRTLLM_AVAILABLE = False
+
 register_cuda_ci(est_time=900, suite="stage-b-test-4-gpu-b200")
 
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
-@unittest.skipIf(not is_flashinfer_available() or not MODELOPT_AVAILABLE,
-    "flashinfer + modelopt required",
+@unittest.skipIf(
+    not FLASHINFER_TRTLLM_AVAILABLE or not MODELOPT_AVAILABLE,
+    "flashinfer_trtllm + modelopt required",
 )
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
