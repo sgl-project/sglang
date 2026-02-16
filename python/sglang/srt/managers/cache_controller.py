@@ -226,6 +226,11 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        # Per-batch latency samples as (per_page_latency_seconds, delivered_pages).
+        self.page_latency_samples: List[tuple[float, int]] = []
+        self.prefetch_io_enqueue_time: Optional[float] = None
+        self.prefetch_io_start_time: Optional[float] = None
+        self.prefetch_queue_wait_seconds: Optional[float] = None
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -242,6 +247,39 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         return self._terminated_flag
+
+    def mark_prefetch_io_enqueued(self, enqueue_time: Optional[float] = None):
+        t = time.monotonic() if enqueue_time is None else enqueue_time
+        with self._lock:
+            self.prefetch_io_enqueue_time = t
+
+    def mark_prefetch_io_start(self, start_time: Optional[float] = None):
+        t = time.monotonic() if start_time is None else start_time
+        with self._lock:
+            if self.prefetch_io_start_time is None:
+                self.prefetch_io_start_time = t
+                if self.prefetch_io_enqueue_time is not None:
+                    self.prefetch_queue_wait_seconds = max(
+                        0.0, t - self.prefetch_io_enqueue_time
+                    )
+
+    def record_page_latency(
+        self, per_page_latency_seconds: float, delivered_pages: int
+    ):
+        if delivered_pages <= 0:
+            return
+        with self._lock:
+            self.page_latency_samples.append(
+                (per_page_latency_seconds, delivered_pages)
+            )
+
+    def get_page_latency_samples(self) -> List[tuple[float, int]]:
+        with self._lock:
+            return list(self.page_latency_samples)
+
+    def get_prefetch_queue_wait_seconds(self) -> Optional[float]:
+        with self._lock:
+            return self.prefetch_queue_wait_seconds
 
 
 class HiCacheController:
@@ -284,6 +322,8 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self._prefetch_inflight_lock = threading.Lock()
+        self._prefetch_inflight = 0
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -836,7 +876,16 @@ class HiCacheController:
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            start = time.monotonic()
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            elapsed = time.monotonic() - start
+            completed_in_batch = operation.completed_tokens - prev_completed_tokens
+            if completed_in_batch > 0:
+                delivered_pages = completed_in_batch // self.page_size
+                # Batch API returns aggregate time; distribute to per-page average.
+                operation.record_page_latency(
+                    elapsed / max(delivered_pages, 1), delivered_pages
+                )
             # Check termination
             if (
                 operation.completed_tokens
@@ -857,11 +906,16 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                operation.mark_prefetch_io_start()
+                self._update_prefetch_inflight(1)
+                try:
+                    self._page_transfer(operation)
+                    # operation terminated by controller, release pre-allocated memory
+                    self.append_host_mem_release(
+                        operation.host_indices[operation.completed_tokens :]
+                    )
+                finally:
+                    self._update_prefetch_inflight(-1)
             except Empty:
                 continue
 
@@ -874,6 +928,24 @@ class HiCacheController:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def get_prefetch_io_queue_size(self) -> int:
+        """Best-effort size of the prefetch I/O queue."""
+        q = getattr(self, "prefetch_buffer", None)
+        if q is None:
+            return 0
+        try:
+            return q.qsize()
+        except Exception:
+            return 0
+
+    def _update_prefetch_inflight(self, delta: int) -> None:
+        with self._prefetch_inflight_lock:
+            self._prefetch_inflight = max(0, self._prefetch_inflight + delta)
+
+    def get_prefetch_inflight(self) -> int:
+        with self._prefetch_inflight_lock:
+            return self._prefetch_inflight
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -952,6 +1024,7 @@ class HiCacheController:
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
+                    operation.mark_prefetch_io_enqueued()
                     self.prefetch_buffer.put(operation)
 
             except Empty:
