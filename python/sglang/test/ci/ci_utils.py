@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
 
 from sglang.srt.utils.common import kill_process_tree
+from sglang.test.ci import cuda_coredump
 from sglang.test.ci.ci_register import CIRegistry
 
 # Configure logger to output to stdout
@@ -130,6 +131,14 @@ def run_unittest_files(
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
     """
+    coredump_enabled = cuda_coredump.is_enabled()
+    if coredump_enabled:
+        cuda_coredump.setup_dir()
+        logger.info(
+            f"CUDA coredump enabled. "
+            f"Dump files will be saved to {cuda_coredump.CUDA_COREDUMP_DIR}"
+        )
+
     tic = time.perf_counter()
     success = True
     passed_tests = []
@@ -154,6 +163,7 @@ def run_unittest_files(
                 f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
             )
             file_tic = time.perf_counter()
+            popen_env = cuda_coredump.get_env() if coredump_enabled else os.environ
 
             if capture_output:
                 # Capture output for retry decision
@@ -161,7 +171,7 @@ def run_unittest_files(
                     ["python3", full_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    env=os.environ,
+                    env=popen_env,
                     text=True,
                     errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
                 )
@@ -172,7 +182,7 @@ def run_unittest_files(
                 process.wait()
             else:
                 process = subprocess.Popen(
-                    ["python3", full_path], stdout=None, stderr=None, env=os.environ
+                    ["python3", full_path], stdout=None, stderr=None, env=popen_env
                 )
                 process.wait()
 
@@ -257,6 +267,9 @@ def run_unittest_files(
                 break
 
     elapsed_total = time.perf_counter() - tic
+
+    if coredump_enabled and not success:
+        cuda_coredump.report()
 
     if success:
         logger.info(f"Success. Time elapsed: {elapsed_total:.2f}s")
