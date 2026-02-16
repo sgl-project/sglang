@@ -467,12 +467,17 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def _print_deprecated_env(new_name: str, old_name: str):
+def _print_deprecated_env(
+    new_name: str, old_name: str, *, invert: bool = False
+):
     if old_name in os.environ:
         warnings.warn(
             f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
         )
-        os.environ[new_name] = os.environ[old_name]
+        value = os.environ[old_name]
+        if invert:
+            value = str(not EnvBool(False).parse(value))
+        os.environ[new_name] = value
 
 
 def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
@@ -495,10 +500,12 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env(
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        invert=True,
     )
     _print_deprecated_env(
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        invert=True,
     )
 
     for key, value in os.environ.items():
