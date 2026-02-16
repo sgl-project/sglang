@@ -970,7 +970,7 @@ class MooncakeKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
-                (bootstrap_room, status, prefill_rank) = msg
+                bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
