@@ -95,6 +95,7 @@ def cpu_platform_plugin() -> str | None:
 
 
 def rocm_platform_plugin() -> str | None:
+    """Detect if ROCm is available - now uses unified platform."""
     is_rocm = False
 
     try:
@@ -110,9 +111,8 @@ def rocm_platform_plugin() -> str | None:
     except Exception as e:
         logger.info("ROCm platform is unavailable: %s", e)
 
-    return (
-        "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
-    )
+    # Use the unified ROCm platform
+    return "sglang.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
 def npu_platform_plugin() -> str | None:
