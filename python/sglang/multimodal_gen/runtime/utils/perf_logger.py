@@ -25,14 +25,32 @@ logger = init_logger(__name__)
 
 
 @dataclasses.dataclass
-class RequestTimings:
-    """A lightweight data class to store performance timings for a single request."""
+class MemorySnapshot:
+    allocated_mb: float  # current allocated memory
+    reserved_mb: float  # current reserved memory (actual VRAM)
+    peak_allocated_mb: float  # peak allocated since last reset
+    peak_reserved_mb: float  # peak reserved since last reset
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "allocated_mb": round(self.allocated_mb, 2),
+            "reserved_mb": round(self.reserved_mb, 2),
+            "peak_allocated_mb": round(self.peak_allocated_mb, 2),
+            "peak_reserved_mb": round(self.peak_reserved_mb, 2),
+        }
+
+
+@dataclasses.dataclass
+class RequestMetrics:
+    """Performance metrics for a single request, including timings and memory snapshots."""
 
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        # memory tracking: {checkpoint_name: MemorySnapshot}
+        self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
     @property
     def total_duration_s(self) -> float:
@@ -47,13 +65,20 @@ class RequestTimings:
         assert index == len(self.steps)
         self.steps.append(duration_s * 1000)
 
+    def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
+        self.memory_snapshots[checkpoint_name] = snapshot
+
     def to_dict(self) -> Dict[str, Any]:
-        """Serializes the timing data to a dictionary."""
+        """Serializes the metrics data to a dictionary."""
         return {
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "memory_snapshots": {
+                name: snapshot.to_dict()
+                for name, snapshot in self.memory_snapshots.items()
+            },
         }
 
 
@@ -90,6 +115,28 @@ def get_git_commit_hash() -> str:
         return "N/A"
 
 
+def capture_memory_snapshot() -> MemorySnapshot:
+    if not torch.cuda.is_available():
+        return MemorySnapshot(
+            allocated_mb=0.0,
+            reserved_mb=0.0,
+            peak_allocated_mb=0.0,
+            peak_reserved_mb=0.0,
+        )
+
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+
+    return MemorySnapshot(
+        allocated_mb=allocated / (1024**2),
+        reserved_mb=reserved / (1024**2),
+        peak_allocated_mb=peak_allocated / (1024**2),
+        peak_reserved_mb=peak_reserved / (1024**2),
+    )
+
+
 @dataclasses.dataclass
 class RequestPerfRecord:
     request_id: str
@@ -101,6 +148,7 @@ class RequestPerfRecord:
     stages: list[dict]
     steps: list[float]
     total_duration_ms: float
+    memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
 
     def __init__(
         self,
@@ -110,6 +158,7 @@ class RequestPerfRecord:
         stages,
         steps,
         total_duration_ms,
+        memory_snapshots=None,
         timestamp=None,
     ):
         self.request_id = request_id
@@ -123,20 +172,22 @@ class RequestPerfRecord:
         self.stages = stages
         self.steps = steps
         self.total_duration_ms = total_duration_ms
+        self.memory_snapshots = memory_snapshots or {}
 
 
 class StageProfiler:
     """
-    A unified context manager, records timing information (usually of a single Stage or a step) into a provided RequestTimings object (usually from a Req).
+    A unified context manager, records performance metrics (usually of a single Stage or a step) into a provided RequestMetrics object (usually from a Req).
     """
 
     def __init__(
         self,
         stage_name: str,
         logger: _SGLDiffusionLogger,
-        timings: Optional["RequestTimings"],
+        timings: Optional["RequestMetrics"],
         log_stage_start_end: bool = False,
         perf_dump_path_provided: bool = False,
+        capture_memory: bool = False,
     ):
         self.stage_name = stage_name
         self.timings = timings
@@ -144,6 +195,7 @@ class StageProfiler:
         self.start_time = 0.0
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
         self.log_stage_start_end = log_stage_start_end
+        self.capture_memory = capture_memory
 
     def __enter__(self):
         if self.log_stage_start_end:
@@ -194,6 +246,13 @@ class StageProfiler:
             else:
                 self.timings.record_stage(self.stage_name, execution_time_s)
 
+            # capture memory snapshot after stage if requested
+            if self.capture_memory and torch.cuda.is_available():
+                snapshot = capture_memory_snapshot()
+                self.timings.record_memory_snapshot(
+                    f"after_{self.stage_name}", snapshot
+                )
+
         return False
 
 
@@ -203,14 +262,14 @@ class PerformanceLogger:
 
     Serves both as a runtime logger (stream to file) and a dump utility.
 
-    Notice that ""RequestTimings"" stores the performance metrics of a single request
+    Notice that RequestMetrics stores the performance metrics of a single request
     """
 
     @classmethod
     def dump_benchmark_report(
         cls,
         file_path: str,
-        timings: "RequestTimings",
+        timings: "RequestMetrics",
         meta: Optional[Dict[str, Any]] = None,
         tag: str = "benchmark_dump",
     ):
@@ -228,6 +287,11 @@ class PerformanceLogger:
             for idx, duration_ms in enumerate(timings.steps)
         ]
 
+        memory_checkpoints = {
+            name: snapshot.to_dict()
+            for name, snapshot in timings.memory_snapshots.items()
+        }
+
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": timings.request_id,
@@ -236,6 +300,7 @@ class PerformanceLogger:
             "total_duration_ms": timings.total_duration_ms,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
+            "memory_checkpoints": memory_checkpoints,
             "meta": meta or {},
         }
 
@@ -251,7 +316,7 @@ class PerformanceLogger:
     @classmethod
     def log_request_summary(
         cls,
-        timings: "RequestTimings",
+        timings: "RequestMetrics",
         tag: str = "total_inference_time",
     ):
         """logs the stage metrics and total duration for a completed request
@@ -264,6 +329,11 @@ class PerformanceLogger:
             for name, duration_ms in timings.stages.items()
         ]
 
+        memory_checkpoints = {
+            name: snapshot.to_dict()
+            for name, snapshot in timings.memory_snapshots.items()
+        }
+
         record = RequestPerfRecord(
             timings.request_id,
             commit_hash=get_git_commit_hash(),
@@ -271,6 +341,7 @@ class PerformanceLogger:
             stages=formatted_stages,
             steps=timings.steps,
             total_duration_ms=timings.total_duration_ms,
+            memory_snapshots=memory_checkpoints,
         )
 
         try:
