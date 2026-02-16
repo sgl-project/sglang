@@ -257,11 +257,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
 
     def _send_json(self, data, status=200):
         """Send a JSON response."""
+        body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(body)
 
     def _check_auth(self):
         """Check if request is authenticated. Returns True if OK, sends 401 and returns False otherwise."""
