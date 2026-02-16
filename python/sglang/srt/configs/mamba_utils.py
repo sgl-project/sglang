@@ -39,12 +39,12 @@ def extra_groups_for_head_shards(ngroups: int, tp_size: int):
 
 
 @dataclass(kw_only=True, frozen=True)
-class Mamba2StateDType:
+class MambaStateDType:
     conv: torch.dtype
     temporal: torch.dtype
 
 
-def mamba2_state_dtype(config=None) -> Mamba2StateDType:
+def mamba_state_dtype(config=None) -> MambaStateDType:
     """
     Get mamba2 state dtype from config or environment variable.
 
@@ -104,12 +104,12 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 
     logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
-    return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
+    return MambaStateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
-    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
+    dtype: MambaStateDType = field(default_factory=lambda: mamba_state_dtype(None))
     layers: list[int]
 
     @property
@@ -123,6 +123,42 @@ class BaseLinearStateParams(ABC):
             conv_numel * self.dtype.conv.itemsize
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba1StateShape:
+    conv: list[tuple[int, int]]
+    temporal: tuple[int, int, int]
+
+    intermediate_size: int
+    ssm_state_size: int
+    state_size: int
+    conv_kernel: int
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "Mamba1StateShape":
+        conv_state_shape = divide(intermediate_size, tp_world_size), conv_kernel - 1
+
+        temporal_state_shape = (divide(intermediate_size, tp_world_size), state_size)
+        return Mamba1StateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            ssm_state_size=state_size,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba1CacheParams(BaseLinearStateParams):
+    shape: Mamba1StateShape
 
 
 @dataclass(kw_only=True, frozen=True)

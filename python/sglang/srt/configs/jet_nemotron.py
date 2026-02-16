@@ -6,7 +6,7 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
-    mamba2_state_dtype,
+    mamba_state_dtype,
 )
 
 
@@ -76,5 +76,5 @@ class JetNemotronConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(
-            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba_state_dtype(self)
         )

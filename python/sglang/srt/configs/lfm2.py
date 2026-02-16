@@ -23,7 +23,7 @@ from transformers.utils import logging
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
-    mamba2_state_dtype,
+    mamba_state_dtype,
 )
 
 logger = logging.get_logger(__name__)
@@ -94,7 +94,7 @@ class Lfm2Config(HFLfm2Config):
         return Mamba2CacheParams(
             shape=shape,
             layers=conv_layer_ids,
-            dtype=mamba2_state_dtype(self),
+            dtype=mamba_state_dtype(self),
         )
 
 
