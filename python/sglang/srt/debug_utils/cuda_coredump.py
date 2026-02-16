@@ -12,7 +12,6 @@ run before CUDA runtime initialization.
 import glob
 import logging
 import os
-import shutil
 
 from sglang.srt.environ import envs
 
@@ -39,6 +38,7 @@ def _inject_env():
     Must run before CUDA runtime initialization.
     """
     dump_dir = get_dump_dir()
+    os.makedirs(dump_dir, exist_ok=True)
     os.environ.setdefault("CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "1")
     os.environ.setdefault("CUDA_COREDUMP_SHOW_PROGRESS", "1")
     os.environ.setdefault("CUDA_COREDUMP_GENERATION_FLAGS", _CUDA_COREDUMP_FLAGS)
@@ -46,12 +46,10 @@ def _inject_env():
 
 
 def setup_dir():
-    """Clean and recreate the coredump directory for a fresh test run."""
+    """Remove stale coredump files from previous runs."""
     dump_dir = get_dump_dir()
-    if os.path.exists(dump_dir):
-        shutil.rmtree(dump_dir, ignore_errors=True)
-    os.makedirs(dump_dir, exist_ok=True)
-    logger.info(f"[CUDA Coredump] Enabled. Dump dir: {dump_dir}")
+    for f in glob.glob(os.path.join(dump_dir, "cuda_coredump_*")):
+        os.remove(f)
 
 
 def report():
