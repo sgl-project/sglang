@@ -389,6 +389,23 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         return query, key
 
+    def forward_hip(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """HIP/ROCm implementation.
+
+        Bypass forward_cuda to avoid JIT kernel (tvm-ffi) which requires
+        nvidia-smi/CUDA_HOME unavailable on AMD GPUs.
+        """
+        return self.forward_native(
+            positions, query, key, offsets, fused_set_kv_buffer_arg
+        )
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"

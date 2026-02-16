@@ -128,6 +128,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
+$PIP_CMD uninstall torch || true
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Fix CUDA version mismatch between torch and torchaudio.
