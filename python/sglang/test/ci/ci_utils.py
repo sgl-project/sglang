@@ -159,7 +159,6 @@ def run_unittest_files(
                 f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
             )
             file_tic = time.perf_counter()
-            popen_env = cuda_coredump.get_env() if coredump_enabled else os.environ
 
             if capture_output:
                 # Capture output for retry decision
@@ -167,7 +166,6 @@ def run_unittest_files(
                     ["python3", full_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    env=popen_env,
                     text=True,
                     errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
                 )
@@ -178,7 +176,7 @@ def run_unittest_files(
                 process.wait()
             else:
                 process = subprocess.Popen(
-                    ["python3", full_path], stdout=None, stderr=None, env=popen_env
+                    ["python3", full_path], stdout=None, stderr=None
                 )
                 process.wait()
 

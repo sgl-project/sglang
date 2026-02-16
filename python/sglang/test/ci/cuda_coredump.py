@@ -1,9 +1,11 @@
-"""CUDA coredump support for CI test runs.
+"""CUDA coredump support for sglang.
 
-When enabled via SGLANG_CI_CUDA_COREDUMP=1, injects CUDA coredump
-environment variables into test subprocesses so that GPU exceptions
-(e.g. illegal memory access) produce lightweight coredump files for
-post-mortem analysis with cuda-gdb.
+When enabled via SGLANG_CUDA_COREDUMP=1, injects CUDA coredump environment
+variables into the current process so that GPU exceptions (e.g. illegal memory
+access) produce lightweight coredump files for post-mortem analysis with
+cuda-gdb.
+
+Works in any environment: CI test runner, local debugging, server deployment.
 """
 
 import glob
@@ -15,41 +17,48 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-CUDA_COREDUMP_DIR = "/tmp/sglang_cuda_coredumps"
+_DEFAULT_DUMP_DIR = "/tmp/sglang_cuda_coredumps"
 
-CUDA_COREDUMP_ENV = {
-    "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
-    "CUDA_COREDUMP_SHOW_PROGRESS": "1",
-    "CUDA_COREDUMP_GENERATION_FLAGS": (
-        "skip_nonrelocated_elf_images,skip_global_memory,"
-        "skip_shared_memory,skip_local_memory,skip_constbank_memory"
-    ),
-    "CUDA_COREDUMP_FILE": f"{CUDA_COREDUMP_DIR}/cuda_coredump_%h.%p.%t",
-}
+_CUDA_COREDUMP_FLAGS = (
+    "skip_nonrelocated_elf_images,skip_global_memory,"
+    "skip_shared_memory,skip_local_memory,skip_constbank_memory"
+)
 
 
 def is_enabled() -> bool:
-    return envs.SGLANG_CI_CUDA_COREDUMP.get()
+    return envs.SGLANG_CUDA_COREDUMP.get()
+
+
+def get_dump_dir() -> str:
+    return envs.SGLANG_CUDA_COREDUMP_DIR.get()
+
+
+def inject_env():
+    """Inject CUDA coredump env vars into the current process.
+
+    Uses setdefault so user-provided CUDA_* overrides are preserved.
+    """
+    dump_dir = get_dump_dir()
+    os.environ.setdefault("CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "1")
+    os.environ.setdefault("CUDA_COREDUMP_SHOW_PROGRESS", "1")
+    os.environ.setdefault("CUDA_COREDUMP_GENERATION_FLAGS", _CUDA_COREDUMP_FLAGS)
+    os.environ.setdefault("CUDA_COREDUMP_FILE", f"{dump_dir}/cuda_coredump_%h.%p.%t")
 
 
 def setup_dir():
-    """Clean and recreate the CUDA coredump directory."""
-    if os.path.exists(CUDA_COREDUMP_DIR):
-        shutil.rmtree(CUDA_COREDUMP_DIR, ignore_errors=True)
-    os.makedirs(CUDA_COREDUMP_DIR, exist_ok=True)
-    logger.info(f"[CUDA Coredump] Enabled. Dump dir: {CUDA_COREDUMP_DIR}")
-
-
-def get_env() -> dict:
-    """Return env dict with CUDA coredump variables injected."""
-    env = os.environ.copy()
-    env.update(CUDA_COREDUMP_ENV)
-    return env
+    """Clean and recreate the coredump directory, then inject env vars."""
+    dump_dir = get_dump_dir()
+    if os.path.exists(dump_dir):
+        shutil.rmtree(dump_dir, ignore_errors=True)
+    os.makedirs(dump_dir, exist_ok=True)
+    inject_env()
+    logger.info(f"[CUDA Coredump] Enabled. Dump dir: {dump_dir}")
 
 
 def report():
     """Log any CUDA coredump files found after a test failure."""
-    coredump_files = glob.glob(os.path.join(CUDA_COREDUMP_DIR, "cuda_coredump_*"))
+    dump_dir = get_dump_dir()
+    coredump_files = glob.glob(os.path.join(dump_dir, "cuda_coredump_*"))
     if not coredump_files:
         return
 

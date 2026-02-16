@@ -63,7 +63,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
-  SGLANG_CI_CUDA_COREDUMP: "1"
+  SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
 
 permissions:
