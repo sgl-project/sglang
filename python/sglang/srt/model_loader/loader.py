@@ -88,6 +88,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -99,7 +100,6 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
-    multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -508,7 +508,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                 )
             elif use_multithread:
-                weights_iterator = multi_thread_safetensors_weights_iterator(
+                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
