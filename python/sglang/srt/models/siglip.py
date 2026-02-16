@@ -50,7 +50,7 @@ class SiglipVisionEmbeddings(nn.Module):
         patch_embeds = self.patch_embedding(
             pixel_values.to(dtype=target_dtype)
         )  # shape = [*, width, grid, grid]
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2).contiguous()
         # interpolate_pos_encoding is never used in sglang
         embeddings = embeddings + self.position_embedding(self.position_ids)
 
