@@ -8,22 +8,36 @@ Author:
 Menyang Liu, https://github.com/dreamyang-liu
 Chenyang Zhao, https://github.com/zhaochenyang20
 
-We use two model pairs for testing (base model / source model pairs):
+We use two model pairs for testing (base model / instruct model pairs):
 
 - FLUX.2-klein-base-4B / FLUX.2-klein-4B
 - Qwen/Qwen-Image / Qwen/Qwen-Image-2512
 
 These model pairs share the same architecture but differ in transformer
-weights (all other modules — vae, text_encoder, … — are identical).
+weights. The basic testing logic is to refit the instruct model into the
+base model and verify the checksum of the transformer weights are the same,
+which simulates the real-world RL scenario. However, since these two model
+pairs only differ in transformer weights, and we want to verify update a
+specific module with update_weights_from_disk API, we need to create a perturbed
+instruct model that adds noise to the vae weights. In this sense, the instruct
+model differs from the base model in vae and transformer weights, the text
+encoder are still the same.
 
-The source model is not used directly by any test.  Instead, at fixture
-setup time we clone it and perturb its vae weights, producing a synthetic
-perturbed checkpoint (perturbed_vae_model_dir) where both transformer AND
-vae differ from the base model.  This perturbed checkpoint is used in all
-tests, giving us two modules with known different checksums to verify.
+To strictly verify the correctness of the refit API, we compare the checksum in
+SHA-256 on the disk and the server.
 
-NOTE: Disk-vs-server checksum verification currently ONLY covers transformer.
-Other modules have weight-name remapping / QKV merge mismatches to resolve first.
+NOTE and TODO: In the refit a specific module test, we randomly select one module
+from the transformer and vae to refit the server and keep other modules the same.
+As described above, the vae's weights are perturbed. If we select the vae to be the
+target module, ideally speaking, we should assert that the refitted vae's checksum
+is the same as directly computed from the perturbed vae weights in the disk. However,
+since the there is complex weight-name remapping and QKV merge during model loading,
+it is not easy to compare the server-disk checksum for vae and text encoder directly.
+Therefore, if the target module is vae, we only verify that the refitted vae's checksum
+is different from the base model's vae's checksum.
+
+It should be good issue to solve for the community to adds comparison the server-disk
+checksum for vae and text encoder in this test.
 
 =============================================================================
 
@@ -46,21 +60,21 @@ error handling, checksum verification, and corrupted-weight rollback.
 
 All tests share one class-scoped server (same process, same in-memory weights).
 Tests that require "base model then update" should be explicitly reset to
-default_model first so behavior is order-independent and updates are real
-(base→perturbed), not no-ops (perturbed→perturbed).
+base model first so behavior is order-independent and updates are real
+(base -> perturbed), not no-ops (perturbed -> perturbed).
 
   • test_update_weights_from_disk_default
 
-    base -> perturbed with flush_cache=True.
-    Verifies after-update checksum == perturbed checkpoint disk checksum
-    (implicitly confirms weights changed, since fixture guarantees
-    base ≠ perturbed).
+    base model -> perturbed model with flush_cache=True.
+    Verifies after-update transformer checksum == perturbed model's
+    transformer disk checksum
+
 
   • test_update_weights_specific_modules
 
     base -> perturbed with flush_cache=False.  Randomly selects one module
-    from _DIFFERING_MODULES (modules whose weights differ between base and
-    perturbed checkpoint) as target_modules, updates only that module. Verifies:
+    from _DIFFERING_MODULES (transformer and vae) as target_modules, updates
+    only that module. Verifies that:
     (1) targeted module's in-memory checksum changed;
     (2) non-targeted modules' in-memory checksums are unchanged.
 
@@ -68,27 +82,39 @@ default_model first so behavior is order-independent and updates are real
 
     model_path set to a non-existent path; must fail (400, success=False).
 
-    Ensure server is healthy after failed update and server's checksums
-    equal base model's disk checksums.
+    Ensure server is healthy after failed update and server's transformer
+    checksums equal base model's transformer disk checksum.
 
   • test_update_weights_missing_model_path
 
     Request body empty (no model_path); must fail (400, success=False).
 
-    Ensure server is healthy after failed update and server's checksums
-    equal base model's disk checksums.
+    Ensure server is healthy after failed update and server's transformer
+    checksums equal base model's transformer disk checksum.
 
   • test_update_weights_nonexistent_module
 
     target_modules=["nonexistent_module"]; must fail (400, success=False).
 
     Verify server is healthy after failed update and server's checksums
-    equal base model's disk checksums.
+    equal base model's transformer disk checksum.
 
   • test_corrupted_weights_rollback
 
-    All-or-nothing rollback: base→perturbed succeeds, then perturbed→corrupted
-    fails (truncated vae), server rolls back to the perturbed checkpoint.
+    All-or-nothing rollback: We first refit the server from base model ->
+    perturbed model. We manually truncate the vae weights of the base
+    model to get a corrupted model. We then call the refit to update
+    the server from the perturbed model -> corrupted model. Verify that:
+
+    1. The update fails due to truncated vae, server should roll back to the
+    perturbed model, i.e., server's transformer weights == perturbed model's
+    transformer weights != base model's transformer weights.
+
+    2. After the rollback, server's vae weights == perturbed model's vae
+    weights != base model's vae weights.
+
+    3. After the rollback, server's text encoder weights == base model's
+    text encoder weights == perturbed model's text encoder weights.
 
 -----------------------------------------------------------------------------
 
@@ -103,7 +129,8 @@ and update prefetched GPU tensors without shape mismatch.
   • test_update_weights_with_offload_enabled
 
     Server with --dit-layerwise-offload (base). Load perturbed checkpoint;
-    must succeed (200, success=True), no "Shape mismatch". Checksums match disk.
+    must succeed (200, success=True), no "Shape mismatch". server's transformer checksum
+    matches perturbed model's transformer disk checksum.
 """
 
 from __future__ import annotations
@@ -146,7 +173,7 @@ class _Module(StrEnum):
     VAE = "vae"
 
 
-# Modules whose weights differ between the base model and the synthetic
+# Modules whose weights differ between the base model and the perturbed
 # perturbed checkpoint
 _DIFFERING_MODULES: list[str] = [_Module.TRANSFORMER, _Module.VAE]
 
@@ -362,13 +389,13 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
     def diffusion_server_no_offload(self, request):
         """Start a diffusion server (no offload) for this test class.
 
-        Builds two synthetic checkpoints from the source model:
+        Builds two perturbed checkpoints from the source model:
         - perturbed_vae_model_dir: source model with perturbed vae (both
           transformer and vae differ from base).
         - corrupted_vae_model_dir: base model with truncated vae — triggers
           load failure for rollback testing.
 
-        Checksum cache warmup and synthetic checkpoints building run in background
+        Checksum cache warmup and perturbed checkpoints building run in background
         threads while the server boots, so everything is ready by the time
         tests start.
         """
