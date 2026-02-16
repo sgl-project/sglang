@@ -208,10 +208,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install sgl-kernel from pre-built wheel (deepgemm upgrade, built from PR 18362)
 # wget bypasses pip cache entirely to ensure we get the correct wheel
-RUN wget -q -O /tmp/sgl_kernel.whl \
-        https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl \
-    && pip install --force-reinstall --no-deps /tmp/sgl_kernel.whl \
-    && rm /tmp/sgl_kernel.whl
+RUN WHL_NAME="sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl" \
+    && wget -q -O /tmp/${WHL_NAME} \
+        https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/${WHL_NAME} \
+    && pip install --force-reinstall --no-deps /tmp/${WHL_NAME} \
+    && rm /tmp/${WHL_NAME}
 
 # Install transformers from source (GLM-4.1V support)
 RUN --mount=type=cache,target=/root/.cache/pip \
