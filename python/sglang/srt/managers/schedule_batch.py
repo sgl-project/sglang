@@ -360,6 +360,8 @@ class MultimodalInputs:
     # QWen2-VL related
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    # Runtime cache for device-side mRoPE delta used in speculative verify.
+    mrope_position_delta_device: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -471,6 +473,7 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+        self.mrope_position_delta_device = None
 
         for key, val in other.__dict__.items():
             if "_id" in key:
