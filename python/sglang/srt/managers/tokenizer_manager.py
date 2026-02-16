@@ -39,7 +39,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -422,7 +422,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Encoder Disaggregation
         if self.server_args.language_only:
-            self.mm_receiver = MMReceiver(
+            self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
                 dtype=self.model_config.dtype,
             )
@@ -437,6 +437,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.server_args.tokenizer_metrics_allowed_custom_labels:
                 for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
+            if self.server_args.extra_metric_labels:
+                labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = TokenizerMetricsCollector(
                 server_args=self.server_args,
                 labels=labels,
@@ -956,6 +958,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
@@ -1448,20 +1451,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.event_loop = loop
 
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
-            )
-        else:
-            # We cannot add signal handler when the tokenizer manager is not in
-            # the main thread due to the CPython limitation.
-            logger.warning(
-                "Signal handler is not added because the tokenizer manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "tokenizer manager when SIGTERM is received."
             )
 
         self.asyncio_tasks.add(
@@ -1534,6 +1531,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                # Add detailed cache breakdown if available
+                if (
+                    hasattr(recv_obj, "cached_tokens_details")
+                    and recv_obj.cached_tokens_details
+                ):
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
+                        i
+                    ]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
@@ -1852,6 +1857,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
+            if (
+                recv_obj.spec_acceptance_histogram
+                and len(recv_obj.spec_acceptance_histogram) > i
+                and recv_obj.spec_acceptance_histogram[i]
+            ):
+                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
+                    i
+                ]
+
     def _calculate_timing_metrics(
         self,
         meta_info: Dict[str, Any],
@@ -1972,6 +1987,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Get detailed cache breakdown if available
+            cached_tokens_details = None
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                cached_tokens_details = recv_obj.cached_tokens_details[i]
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1980,6 +2003,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                cached_tokens_details,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -2078,6 +2102,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         data_to_dump_with_server_args = {
             "server_args": self.server_args,  # Include server_args in the dump
             "requests": data_to_dump,
+            "launch_command": " ".join(sys.argv),
         }
         with open(filename, "wb") as f:
             pickle.dump(data_to_dump_with_server_args, f)
@@ -2133,6 +2158,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
+        state.finished_time = time.time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -2141,7 +2167,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
-        meta_info = {"id": recv_obj.rid, "finish_reason": finish_reason}
+        meta_info = {
+            "id": recv_obj.rid,
+            "finish_reason": finish_reason,
+            "weight_version": self.server_args.weight_version,
+            "e2e_latency": state.finished_time - state.created_time,
+        }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(

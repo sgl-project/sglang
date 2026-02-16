@@ -68,6 +68,7 @@ class TestDeepseekV32(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
@@ -82,6 +83,7 @@ class TestDeepseekV32(unittest.TestCase):
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]
@@ -96,7 +98,9 @@ class TestDeepseekV32(unittest.TestCase):
                 batch_sizes=[1, 8, 16, 64],
                 profile_dir="performance_profiles_deepseek_v32",
             ),
-            tool_call_params=ToolCallTestParams(test_thinking=True),
+            tool_call_params=ToolCallTestParams(
+                test_thinking=True, test_reasoning_usage=True
+            ),
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")

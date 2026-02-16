@@ -24,11 +24,12 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
+    get_mooncake_transfer_engine,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -40,6 +41,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    config_socket,
     get_local_ip_auto,
     get_zmq_socket,
     load_audio,
@@ -54,6 +56,8 @@ rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
+cond_dict_lock = asyncio.Lock()
+rid_to_cond: Dict[str, asyncio.Condition] = {}
 
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
@@ -186,6 +190,8 @@ class MMEncoder:
         )
 
         self.context = zmq.asyncio.Context(2)
+        self.sync_context = zmq.Context()  # Reuse sync context for thread pool
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -194,6 +200,7 @@ class MMEncoder:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
+        self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -207,12 +214,7 @@ class MMEncoder:
 
             if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
-
-                self.engine = MooncakeTransferEngine(
-                    hostname=self.local_ip,
-                    gpu_id=None,
-                    ib_device=server_args.disaggregation_ib_device,
-                )
+                self.engine = get_mooncake_transfer_engine()
 
             self.embedding_to_send = dict()
             self.background_tasks: Set[asyncio.Task] = set()
@@ -389,25 +391,35 @@ class MMEncoder:
             else f"tcp://{prefill_host}:{embedding_port}"
         )
         logger.info(f"{endpoint = }")
-        socket = get_zmq_socket(
-            self.context,
-            zmq.PUSH,
-            endpoint,
-            False,
-        )
 
+        # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
-            socket.send_multipart([pickle.dumps(mm_data)])
+            serialized_data = pickle.dumps(mm_data)
+            buffer = None
         else:
             new_mm_data = mm_data.copy_without_embedding()
             if new_mm_data.error_msg is not None:
-                socket.send_multipart([pickle.dumps(new_mm_data)])
-                return
+                buffer = None
+                serialized_data = pickle.dumps(new_mm_data)
+            else:
+                embedding_tensor = TensorWrapper(mm_data.embedding)
+                serialized_data = pickle.dumps(new_mm_data)
+                buffer = embedding_tensor.__buffer__()
 
-            embedding_tensor = TensorWrapper(mm_data.embedding)
-            socket.send_multipart(
-                [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
-            )
+        # Use thread pool executor for parallel ZMQ send operations
+        def send_with_socket():
+            sock = self.sync_context.socket(zmq.PUSH)
+            config_socket(sock, zmq.PUSH)
+            try:
+                sock.connect(endpoint)
+                if buffer is not None:
+                    sock.send_multipart([serialized_data, buffer], copy=False)
+                else:
+                    sock.send_multipart([serialized_data], copy=False)
+            finally:
+                sock.close()
+
+        await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         try:
@@ -467,7 +479,8 @@ class MMEncoder:
         sent_urls: Set[str] = set()
         all_tasks: List[Tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
-        timeout = 60.0
+        timeout = self.send_timeout
+        cond = await get_condition(req_id)
 
         try:
             while True:
@@ -496,14 +509,18 @@ class MMEncoder:
                         f"All {expected_count} endpoints initiated for {req_id}. Breaking loop."
                     )
                     break
-
-                if asyncio.get_running_loop().time() - start_time > timeout:
+                remaining = timeout - (asyncio.get_running_loop().time() - start_time)
+                if remaining <= 0:
                     logger.error(
-                        f"Timeout waiting for all endpoints for {req_id}. Initiated {len(sent_urls)}/{expected_count}"
+                        f"[{req_id}] Timeout! Sent {len(sent_urls)}/{expected_count}"
                     )
                     break
 
-                await asyncio.sleep(0.001)
+                async with cond:
+                    try:
+                        await asyncio.wait_for(cond.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        continue
 
             if all_tasks:
                 logger.info(
@@ -527,6 +544,8 @@ class MMEncoder:
             async with rid_lock:
                 rid_to_receive_endpoint.pop(req_id, None)
                 rid_to_receive_count.pop(req_id, None)
+            async with cond_dict_lock:
+                rid_to_cond.pop(req_id, None)
             self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
@@ -666,6 +685,13 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
+async def get_condition(rid):
+    async with cond_dict_lock:
+        if rid not in rid_to_cond:
+            rid_to_cond[rid] = asyncio.Condition()
+        return rid_to_cond[rid]
+
+
 @app.post("/encode")
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
@@ -781,6 +807,9 @@ async def handle_scheduler_receive_url_request(request: dict):
             rid_to_receive_count[rid] = request["receive_count"]
         assert rid_to_receive_count[rid] == request["receive_count"]
         rid_to_receive_endpoint[rid].add(request["receive_url"])
+    cond = await get_condition(rid)
+    async with cond:
+        cond.notify_all()
 
 
 @app.get("/health")

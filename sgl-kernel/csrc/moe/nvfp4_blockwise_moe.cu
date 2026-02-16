@@ -665,7 +665,7 @@ void cutlass_fp4_group_mm(
           N,
           K);
     }
-  } else if (sm_version == 120) {
+  } else if (sm_version >= 120) {
     if (output.scalar_type() == torch::kBFloat16) {
       run_fp4_blockwise_scaled_group_mm_sm120(
           output,
