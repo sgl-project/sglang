@@ -232,6 +232,7 @@ class MockModelRunner:
             device=self.device,
             index_head_dim=self.config["index_head_dim"],
             enable_memory_saver=False,
+            kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
         )
 
         # Required by backend with NSA-specific attributes
