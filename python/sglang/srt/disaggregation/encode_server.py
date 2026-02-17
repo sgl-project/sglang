@@ -24,11 +24,12 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
+    get_mooncake_transfer_engine,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -55,6 +56,8 @@ rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
+cond_dict_lock = asyncio.Lock()
+rid_to_cond: Dict[str, asyncio.Condition] = {}
 
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
@@ -197,6 +200,7 @@ class MMEncoder:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
+        self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -210,12 +214,7 @@ class MMEncoder:
 
             if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
-
-                self.engine = MooncakeTransferEngine(
-                    hostname=self.local_ip,
-                    gpu_id=None,
-                    ib_device=server_args.disaggregation_ib_device,
-                )
+                self.engine = get_mooncake_transfer_engine()
 
             self.embedding_to_send = dict()
             self.background_tasks: Set[asyncio.Task] = set()
@@ -480,7 +479,8 @@ class MMEncoder:
         sent_urls: Set[str] = set()
         all_tasks: List[Tuple[asyncio.Task, str]] = []
         start_time = asyncio.get_running_loop().time()
-        timeout = 60.0
+        timeout = self.send_timeout
+        cond = await get_condition(req_id)
 
         try:
             while True:
@@ -509,14 +509,18 @@ class MMEncoder:
                         f"All {expected_count} endpoints initiated for {req_id}. Breaking loop."
                     )
                     break
-
-                if asyncio.get_running_loop().time() - start_time > timeout:
+                remaining = timeout - (asyncio.get_running_loop().time() - start_time)
+                if remaining <= 0:
                     logger.error(
-                        f"Timeout waiting for all endpoints for {req_id}. Initiated {len(sent_urls)}/{expected_count}"
+                        f"[{req_id}] Timeout! Sent {len(sent_urls)}/{expected_count}"
                     )
                     break
 
-                await asyncio.sleep(0.001)
+                async with cond:
+                    try:
+                        await asyncio.wait_for(cond.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        continue
 
             if all_tasks:
                 logger.info(
@@ -540,6 +544,8 @@ class MMEncoder:
             async with rid_lock:
                 rid_to_receive_endpoint.pop(req_id, None)
                 rid_to_receive_count.pop(req_id, None)
+            async with cond_dict_lock:
+                rid_to_cond.pop(req_id, None)
             self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
@@ -679,6 +685,13 @@ def launch_server(server_args: ServerArgs):
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
+async def get_condition(rid):
+    async with cond_dict_lock:
+        if rid not in rid_to_cond:
+            rid_to_cond[rid] = asyncio.Condition()
+        return rid_to_cond[rid]
+
+
 @app.post("/encode")
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
@@ -794,6 +807,9 @@ async def handle_scheduler_receive_url_request(request: dict):
             rid_to_receive_count[rid] = request["receive_count"]
         assert rid_to_receive_count[rid] == request["receive_count"]
         rid_to_receive_endpoint[rid].add(request["receive_url"])
+    cond = await get_condition(rid)
+    async with cond:
+        cond.notify_all()
 
 
 @app.get("/health")
