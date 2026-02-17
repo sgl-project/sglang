@@ -5,18 +5,9 @@ This module provides WeightsUpdater, which swaps model weights at runtime
 without restarting the server.  It is the diffusion-engine counterpart of the
 LLM engine's ModelRunner.update_weights_from_disk.
 
-Typical usage (from GPUWorker.update_weights_from_disk):
+Detailed usage of higher level API can be found in
 
-    updater = WeightsUpdater(self.pipeline)
-    success, message = updater.update_weights_from_disk(
-        model_path,
-        flush_cache=flush_cache,
-        target_modules=target_modules,
-    )
-    if success:
-        self.server_args.model_path = model_path
-        self.pipeline.model_path = model_path
-    return success, message
+/python/sglang/multimodal_gen/test/server/test_update_weights_from_disk.py
 
 Key design decisions:
 
@@ -176,18 +167,7 @@ class WeightsUpdater:
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
-        """Update model weights from disk without restarting the server.
-
-        Args:
-            model_path: HF repo id or local path to the new weights.
-            flush_cache: If True, reset TeaCache state after a successful
-                update so that stale cached residuals are not reused.
-            target_modules: Explicit list of module names to update.  None
-                updates every nn.Module in the pipeline.
-
-        Returns:
-            (success, message) tuple where success is True on success.
-        """
+        """Update model weights from disk without restarting the server."""
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
