@@ -198,7 +198,6 @@ class Scheduler:
                         prompt="",
                         negative_prompt="",
                         image_path=[input_path],
-                        is_warmup=True,
                     )
                 else:
                     req = Req(
@@ -206,8 +205,8 @@ class Scheduler:
                         width=width,
                         height=height,
                         prompt="",
-                        is_warmup=True,
                     )
+                req.set_as_warmup()
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -242,9 +241,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue

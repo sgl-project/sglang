@@ -63,11 +63,9 @@ class ModelSlimMoEMethod(FusedMoEMethodBase):
             logger.info_once("Using ModelSlimW8A8Int8MoE")
             return ModelSlimW8A8Int8MoE(quant_config)
         else:
-            logger.warning(
-                f"Unsupported FusedMoe modelslim scheme: \
+            logger.warning(f"Unsupported FusedMoe modelslim scheme: \
                     {quant_config.quant_description.get(prefix_in_quant_config.strip())} \
-                    in layer: {prefix}"
-            )
+                    in layer: {prefix}")
             return None
 
 
