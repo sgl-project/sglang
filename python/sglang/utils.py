@@ -464,37 +464,80 @@ def terminate_process(process):
         release_port(lock_socket)
 
 
-def wait_for_server(base_url: str, timeout: int = None) -> None:
+def _raise_if_process_exited(process: Optional[Any]) -> None:
+    if process is None:
+        return
+
+    if hasattr(process, "poll"):
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"Server process exited with code {return_code}")
+        return
+
+    if hasattr(process, "is_alive") and not process.is_alive():
+        return_code = getattr(process, "exitcode", None)
+        if return_code is None:
+            raise RuntimeError("Server process exited")
+        raise RuntimeError(f"Server process exited with code {return_code}")
+
+
+def _is_wait_timeout(start_time: float, timeout: Optional[int]) -> bool:
+    if timeout is None:
+        return False
+    return time.perf_counter() - start_time > timeout
+
+
+def wait_for_http_ready(
+    url: str,
+    timeout: Optional[int] = None,
+    process: Optional[Any] = None,
+    headers: Optional[dict] = None,
+    request_timeout: int = 5,
+) -> None:
+    """Wait for an HTTP endpoint to return status 200."""
+    start_time = time.perf_counter()
+    while True:
+        _raise_if_process_exited(process)
+        try:
+            response = requests.get(url, headers=headers, timeout=request_timeout)
+            if response.status_code == 200:
+                return
+        except requests.exceptions.RequestException:
+            _raise_if_process_exited(process)
+
+        if _is_wait_timeout(start_time, timeout):
+            raise TimeoutError(
+                f"Endpoint {url} did not become ready within timeout period"
+            )
+        time.sleep(1)
+
+
+def wait_for_server(
+    base_url: str,
+    timeout: int = None,
+    process: Optional[subprocess.Popen] = None,
+) -> None:
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
-        base_url: The base URL of the server
+        base_url: The base URL of the server.
         timeout: Maximum time to wait in seconds. None means wait forever.
+        process: Optional server process used for early-exit checks.
     """
-    start_time = time.perf_counter()
-    while True:
-        try:
-            response = requests.get(
-                f"{base_url}/v1/models",
-                headers={"Authorization": "Bearer None"},
-            )
-            if response.status_code == 200:
-                time.sleep(5)
-                print_highlight(
-                    """\n
-                    NOTE: Typically, the server runs in a separate terminal.
-                    In this notebook, we run the server and notebook code together, so their outputs are combined.
-                    To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
-                    To reduce the log length, we set the log level to warning for the server, the default log level is info.
-                    We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-                    """
-                )
-                break
-
-            if timeout and time.perf_counter() - start_time > timeout:
-                raise TimeoutError("Server did not become ready within timeout period")
-        except requests.exceptions.RequestException:
-            time.sleep(1)
+    wait_for_http_ready(
+        url=f"{base_url}/v1/models",
+        timeout=timeout,
+        process=process,
+        headers={"Authorization": "Bearer None"},
+    )
+    time.sleep(5)
+    print_highlight("""\n
+        NOTE: Typically, the server runs in a separate terminal.
+        In this notebook, we run the server and notebook code together, so their outputs are combined.
+        To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+        To reduce the log length, we set the log level to warning for the server, the default log level is info.
+        We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
+        """)
 
 
 class TypeBasedDispatcher:

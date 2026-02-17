@@ -36,7 +36,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
+    _apply_rotary_emb_qk,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
@@ -116,8 +116,9 @@ class CausalWanSelfAttention(nn.Module):
             cache_start = current_start
 
         cos, sin = freqs_cis
-        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        roped_query, roped_key = _apply_rotary_emb_qk(
+            q, k, cos, sin, is_neox_style=False
+        )
 
         if kv_cache is None:
             # Padding for flex attention
@@ -301,7 +302,16 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
+        self.attn2 = WanT2VCrossAttention(
+            dim,
+            num_heads,
+            qk_norm=qk_norm,
+            eps=eps,
+            supported_attention_backends=cross_attn_backends,
+        )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )

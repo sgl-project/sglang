@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only Qwen3_5 MTP model."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 

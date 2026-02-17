@@ -7,11 +7,17 @@ from typing import Any
 
 
 @contextmanager
-def temp_set_env(**env_vars: dict[str, Any]):
-    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
-    for key in env_vars:
-        if key.startswith("SGLANG_") or key.startswith("SGL_"):
-            raise ValueError("temp_set_env should not be used for sglang env vars")
+def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
+    """Temporarily set environment variables, restoring originals on exit.
+
+    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
+    for those.  Pass ``allow_sglang=True`` only for special env vars that
+    intentionally bypass ``environ.py`` (e.g. ``SGLANG_DUMPER_*``).
+    """
+    if not allow_sglang:
+        for key in env_vars:
+            if key.startswith("SGLANG_") or key.startswith("SGL_"):
+                raise ValueError("temp_set_env should not be used for sglang env vars")
 
     backup = {key: os.environ.get(key) for key in env_vars}
     try:
@@ -259,12 +265,17 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Override the distributed init method used by torch.distributed.init_process_group.
+    # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
+    SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
@@ -357,6 +368,8 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
 
     # sgl-kernel
