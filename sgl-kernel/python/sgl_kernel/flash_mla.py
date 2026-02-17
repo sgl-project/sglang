@@ -15,36 +15,6 @@ _IMPORT_ERROR = ImportError(
 )
 
 
-@dataclass
-class FlashMLASchedMeta:
-    """
-    A class that stores the tile scheduler metadata of FlashMLA
-    """
-
-    @dataclass
-    class Config:
-        b: int
-        s_q: int
-        h_q: int
-        page_block_size: int
-        h_k: int
-
-        causal: bool
-        is_fp8_kvcache: bool
-        topk: Optional[int]
-
-        extra_page_block_size: Optional[int] = None
-        extra_topk: Optional[int] = None
-
-    have_initialized: bool = False
-    config: Optional[Config] = None
-
-    tile_scheduler_metadata: Optional[torch.Tensor] = (
-        None  # (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
-    )
-    num_splits: Optional[torch.Tensor] = None  # (batch_size + 1), dtype torch.int32.
-
-
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_q_tokens_per_head_k: int,
@@ -52,10 +22,9 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
-) -> Tuple[FlashMLASchedMeta, None]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Returns an empty FlashMLASchedMeta object. The actual scheduling metadata
-    will be generated during the first invocation of flash_mla_with_kvcache.
+    Get tile scheduler metadata for FlashMLA decode.
 
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
@@ -66,9 +35,19 @@ def get_mla_metadata(
         topk: If not None, sparse attention will be enabled.
 
     Returns:
-        A tuple of (FlashMLASchedMeta, None). Only the first element is useful.
+        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
+        num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return FlashMLASchedMeta(), None
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
+        cache_seqlens,
+        num_q_tokens_per_head_k,
+        num_heads_k,
+        num_heads_q,
+        is_fp8_kvcache,
+        topk,
+    )
 
 
 def get_mla_decoding_metadata_dense_fp8(
@@ -98,8 +77,8 @@ def flash_mla_with_kvcache(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata: FlashMLASchedMeta,
-    num_splits: None = None,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     descale_q: torch.Tensor | None = None,
@@ -116,8 +95,8 @@ def flash_mla_with_kvcache(
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
         cache_seqlens: (batch_size), torch.int32.
         head_dim_v: Head dimension of v.
-        tile_scheduler_metadata: FlashMLASchedMeta object returned by get_mla_metadata.
-        num_splits: Must be None (for API compatibility).
+        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32.
+        num_splits: (batch_size + 1), torch.int32.
         softmax_scale: float. The scale of QK^T before applying softmax.
         causal: bool. Whether to apply causal attention mask.
         descale_q: (batch_size), torch.float32. Descaling factors for Q.
@@ -132,72 +111,10 @@ def flash_mla_with_kvcache(
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
 
-    sched_meta = tile_scheduler_metadata
-    assert isinstance(
-        sched_meta, FlashMLASchedMeta
-    ), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
-    assert num_splits is None, "num_splits must be None, use FlashMLASchedMeta instead"
-
-    topk = indices.shape[-1] if indices is not None else None
-
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    if not sched_meta.have_initialized:
-        # Initialize the tile scheduler metadata during the first invocation
-        sched_meta.have_initialized = True
-        sched_meta.config = FlashMLASchedMeta.Config(
-            b=q.shape[0],
-            s_q=q.shape[1],
-            h_q=q.shape[2],
-            page_block_size=k_cache.shape[1],
-            h_k=k_cache.shape[2],
-            causal=causal,
-            is_fp8_kvcache=is_fp8_kvcache,
-            topk=topk,
-            extra_page_block_size=None,
-            extra_topk=None,
-        )
-
-        # Compute num_q_tokens_per_head_k for get_mla_decoding_metadata
-        # num_q_tokens_per_head_k = seq_len_q * num_heads_q // num_heads_k
-        num_q_tokens_per_head_k = q.shape[1] * q.shape[2] // k_cache.shape[2]
-        h_k = k_cache.shape[2]
-        h_q = q.shape[2]
-
-        # Get tile scheduler metadata from kernel
-        # For non-FP8 dense path, use get_mla_decoding_metadata
-        # Note: FP8 dense path should use get_mla_decoding_metadata_dense_fp8 externally
-        if not is_fp8_kvcache:
-            (
-                sched_meta.tile_scheduler_metadata,
-                sched_meta.num_splits,
-            ) = torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
-                cache_seqlens,
-                num_q_tokens_per_head_k,
-                h_k,
-                h_q,
-                is_fp8_kvcache,
-                topk if topk is not None else None,
-            )
-    else:
-        # Check consistency with sched_meta
-        assert sched_meta.config is not None
-        helper_msg = " Input arguments are inconsistent with sched_meta."
-        assert sched_meta.config.b == q.shape[0], "batch_size mismatch." + helper_msg
-        assert sched_meta.config.s_q == q.shape[1], "seq_len_q mismatch." + helper_msg
-        assert sched_meta.config.h_q == q.shape[2], "num_heads_q mismatch." + helper_msg
-        assert sched_meta.config.page_block_size == k_cache.shape[1], (
-            "page_block_size mismatch." + helper_msg
-        )
-        assert sched_meta.config.h_k == k_cache.shape[2], (
-            "num_heads_k mismatch." + helper_msg
-        )
-        assert sched_meta.config.causal == causal, "causal mismatch." + helper_msg
-        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, (
-            "is_fp8_kvcache mismatch." + helper_msg
-        )
-        assert sched_meta.config.topk == topk, "topk mismatch." + helper_msg
+    topk = indices.shape[-1] if indices is not None else None
 
     # Call the underlying kernel
     if indices is None and q.element_size() == 1:
@@ -210,8 +127,8 @@ def flash_mla_with_kvcache(
             block_table,
             softmax_scale,
             causal,
-            sched_meta.tile_scheduler_metadata,
-            sched_meta.num_splits,
+            tile_scheduler_metadata,
+            num_splits,
             descale_q,
             descale_k,
         )
@@ -225,8 +142,8 @@ def flash_mla_with_kvcache(
             block_table,
             softmax_scale,
             causal,
-            sched_meta.tile_scheduler_metadata,
-            sched_meta.num_splits,
+            tile_scheduler_metadata,
+            num_splits,
             is_fp8_kvcache,
             indices,
         )
@@ -258,6 +175,8 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )
