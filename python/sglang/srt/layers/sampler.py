@@ -121,7 +121,7 @@ class Sampler(nn.Module):
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
-            if get_global_server_args().rl_on_policy_target is not None:
+            if self.rl_on_policy_target is not None:
                 # TODO: use more inplace ops to save memory
                 logits_div_temperature = (
                     logits.bfloat16().div(sampling_info.temperatures).bfloat16()
