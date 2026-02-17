@@ -341,6 +341,16 @@ class Platform:
         return False
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        """Check if automatic mixed precision (AMP) is supported.
+
+        Returns True for most platforms. Override in subclasses where
+        AMP is not supported (e.g., MPS).
+        """
+        return True
+
+    @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
@@ -594,6 +604,7 @@ class AttentionBackendEnum(enum.Enum):
 
     @property
     def is_sparse(self) -> bool:
+        """Check if this is a sparse attention backend."""
         return self in {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,

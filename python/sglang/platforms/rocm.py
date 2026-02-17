@@ -336,12 +336,15 @@ class RocmPlatform(Platform):
     # =========================================================================
 
     def postprocess_server_args(self, args: "ServerArgs") -> None:
-        """Apply ROCm-specific defaults to server arguments."""
-        # ROCm defaults to triton attention backend
-        if args.attention_backend is None:
-            args.attention_backend = "triton"
-        if args.sampling_backend is None:
-            args.sampling_backend = "pytorch"
+        """Apply ROCm-specific defaults to server arguments.
+
+        Note: attention_backend and sampling_backend defaults are handled by
+        _handle_attention_backend_compatibility() and _handle_sampling_backend()
+        in ServerArgs, which have complex logic accounting for MLA, aiter
+        backend selection based on head count, etc.
+        Do NOT set them here to avoid bypassing that logic.
+        """
+        pass
 
     # =========================================================================
     # Utilities

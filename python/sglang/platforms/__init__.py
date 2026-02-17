@@ -101,11 +101,20 @@ def _cuda_platform_plugin() -> str | None:
                 pynvml.nvmlShutdown()
         except Exception as e:
             # Check if this is an NVML-specific error
-            is_nvml_error = (
-                "nvml" in str(type(e).__module__).lower()
-                or "nvml" in type(e).__name__.lower()
-                or "nvml" in str(e).lower()
-            )
+            is_nvml_error = False
+            if (
+                pynvml
+                and hasattr(pynvml, "NVMLError")
+                and isinstance(e, pynvml.NVMLError)
+            ):
+                is_nvml_error = True
+            else:
+                # Fallback to string matching if type check is not possible
+                is_nvml_error = (
+                    "nvml" in str(type(e).__module__).lower()
+                    or "nvml" in type(e).__name__.lower()
+                    or "nvml" in str(e).lower()
+                )
 
             if not is_nvml_error:
                 # Re-raise non-NVML errors

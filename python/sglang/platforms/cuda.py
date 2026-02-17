@@ -446,11 +446,15 @@ class CudaPlatformBase(Platform):
     # =========================================================================
 
     def postprocess_server_args(self, args: "ServerArgs") -> None:
-        """Apply CUDA-specific defaults to server arguments."""
-        if args.attention_backend is None:
-            args.attention_backend = "flashinfer"
-        if args.sampling_backend is None:
-            args.sampling_backend = "flashinfer"
+        """Apply CUDA-specific defaults to server arguments.
+
+        Note: attention_backend and sampling_backend defaults are handled by
+        _handle_attention_backend_compatibility() and _handle_sampling_backend()
+        in ServerArgs, which have complex logic accounting for MLA, speculative
+        decoding topk, GPU architecture (Hopper/Blackwell), etc.
+        Do NOT set them here to avoid bypassing that logic.
+        """
+        pass
 
     # =========================================================================
     # Activation Ops - Lazy loaded via @cached_property
