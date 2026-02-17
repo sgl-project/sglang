@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.2
+ARG FLASHINFER_VERSION=0.6.3
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -206,13 +206,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Install sgl-kernel from pre-built wheel (deepgemm upgrade, built from PR 18362)
-# wget bypasses pip cache entirely to ensure we get the correct wheel
-RUN WHL_NAME="sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl" \
-    && wget -q -O /tmp/${WHL_NAME} \
-        https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/${WHL_NAME} \
-    && pip install --force-reinstall --no-deps /tmp/${WHL_NAME} \
-    && rm /tmp/${WHL_NAME}
+# Install sgl-kernel (separate layer, no pip cache mount or --no-cache-dir to
+# ensure fresh wheel downloads — the BuildKit pip cache mount on other layers
+# can serve stale packages even when docker build --no-cache is used)
+RUN if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+        python3 -m pip install --no-cache-dir https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    ; \
+    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+        python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
+    ; \
+    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+        python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    ; \
+    else \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+    ; \
+    fi
 
 # Install transformers from source (GLM-4.1V support)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -305,7 +314,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cubloaty \
     google-cloud-storage
 
-# SKIPPED: sgl-model-gateway Rust build (OOMs on ARM runner, not needed for inference)
+# Build and install sgl-model-gateway (install Rust, build, then remove to save space)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && rustc --version && cargo --version \
+    && python3 -m pip install maturin \
+    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --force-reinstall dist/*.whl \
+    && cd /sgl-workspace/sglang/sgl-model-gateway \
+    && cargo build --release --bin sglang-router --features vendored-openssl \
+    && cp target/release/sglang-router /usr/local/bin/sglang-router \
+    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
+    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
