@@ -1281,7 +1281,8 @@ class Glm4MoeForCausalLM(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    pass
+    def determine_num_fused_shared_experts(self):
+        super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 
 
 EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]

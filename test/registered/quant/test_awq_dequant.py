@@ -7,6 +7,7 @@ unittest version of the AWQ Triton kernel tests.
 Run with:
     python -m unittest test_awq_dequant.py
 """
+
 import unittest
 
 import torch
