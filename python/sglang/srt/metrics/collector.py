@@ -279,9 +279,7 @@ class DPCooperationInfo:
             # Count ranks that are doing any extend-like work.
             # With overlap scheduling, prefill can appear as MIXED rather than EXTEND.
             num_prefill_ranks=sum(
-                1
-                for mode in forward_modes
-                if ForwardMode(mode).is_extend(include_draft_extend_v2=True)
+                1 for mode in forward_modes if ForwardMode(mode).is_extend()
             ),
         )
 
