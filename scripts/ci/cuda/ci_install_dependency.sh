@@ -146,16 +146,27 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_UNINSTALL_CMD="pip uninstall -y"
     PIP_UNINSTALL_SUFFIX="--break-system-packages"
 else
-    # In normal cases, we use uv, which is much faster than pip.
-    pip install uv
-    # On non-root runners, pip may install console scripts under ~/.local/bin.
-    export PATH="${HOME}/.local/bin:${PATH}"
-    export UV_SYSTEM_PYTHON=true
+    PYTHON_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ -w "${PYTHON_SITE_PACKAGES}" ]; then
+        # In normal writable environments, use uv for faster installs.
+        pip install uv
+        # On some runners, pip may install console scripts under ~/.local/bin.
+        export PATH="${HOME}/.local/bin:${PATH}"
+        export UV_SYSTEM_PYTHON=true
 
-    PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
-    PIP_UNINSTALL_CMD="uv pip uninstall"
-    PIP_UNINSTALL_SUFFIX=""
+        PIP_CMD="uv pip"
+        PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
+        PIP_UNINSTALL_CMD="uv pip uninstall"
+        PIP_UNINSTALL_SUFFIX=""
+    else
+        # Non-root runners may not be able to write system site-packages.
+        # Fall back to pip, which defaults to user install mode in this case.
+        echo "Python site-packages not writable (${PYTHON_SITE_PACKAGES}); falling back to pip."
+        PIP_CMD="pip"
+        PIP_INSTALL_SUFFIX="--pre"
+        PIP_UNINSTALL_CMD="pip uninstall -y"
+        PIP_UNINSTALL_SUFFIX=""
+    fi
 fi
 
 # Clean up existing installations
@@ -197,7 +208,9 @@ FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
     echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
+    if ! run_with_sudo_ci rm -rf "$FLASH_ATTN_PATH"; then
+        echo "Warning: Failed to remove $FLASH_ATTN_PATH"
+    fi
 else
     echo "Directory $FLASH_ATTN_PATH does not exist."
 fi
@@ -275,7 +288,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 else
     $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 fi
-$PIP_CMD uninstall xformers || true
+$PIP_UNINSTALL_CMD xformers $PIP_UNINSTALL_SUFFIX || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
 # Cache directory for flashinfer wheels (persists across CI runs on self-hosted runners)
