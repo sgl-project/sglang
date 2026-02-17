@@ -24,34 +24,34 @@ POST /v1/chat/completions
 Supported TTL formats: `"30s"`, `"5m"`, `"30m"`, `"1h"`. Default: `"5m"` (300s).
 Refresh-on-hit: each cache hit resets the TTL, so active conversations stay pinned.
 
-## Results
+## Results (2x L40S 48GB, Qwen3-14B-FP8, TP=1, depth=10, 5x eviction flood)
 
-### V9: cache_control + TTL (L40S 48GB, Qwen3-14B-FP8, 5x eviction flood)
+| Metric | Baseline | Pinned (TTL=5m) |
+|--------|----------|-----------------|
+| **TTFT** | **1606 ms** | **315 ms** |
+| Cached tokens | 0/10830 | 9664/10830 |
+| Cache hit | 0% | 89% |
+| **Speedup** | -- | **5.1x** |
 
-| Mode | TTFT | Cached tokens | Cache hit | Speedup |
-|------|------|---------------|-----------|---------|
-| **Pinned** (TTL=5m) | 289 ms | 5952/7351 | 81% | **3.5x** |
-| Baseline | 1012 ms | 0/7351 | 0% | -- |
+5,770 flood requests (5x full cache eviction cycles, concurrency=128).
+Pinned blocks survive on host memory via HiCache while baseline blocks
+are fully evicted.
 
-5,770 flood requests (5x full cache eviction cycles). Pinned blocks survive
-on host memory via HiCache L2 tier while baseline blocks are fully evicted.
+```
+NO PIN:                                    WITH PIN (cache_control + TTL):
 
-### V8: nvext.pin binary (L40S 48GB, Qwen3-14B-FP8, 3x eviction flood)
+Client -> warmup 10 turns                  Client -> warmup 10 turns
+  Cache stores prefix (~10.8K tokens)        Cache stores prefix + PIN nodes (ttl=300s)
 
-| Mode | TTFT | Cached tokens | Cache hit | Speedup |
-|------|------|---------------|-----------|---------|
-| **Pinned** | 334 ms | 9664/10830 | 89% | **5.9x** |
-| Baseline | 1976 ms | 0/10830 | 0% | -- |
+Flood traffic arrives (5770 reqs)          Flood traffic arrives (5770 reqs)
+  LRU evicts ALL cached blocks               LRU evicts unpinned blocks
+  Prefix gone from GPU + CPU                 Pinned blocks: GPU evict -> backed up to CPU
+                                             Pinned blocks SURVIVE on host memory (L2)
 
-### V7: Standalone SGLang (no Dynamo, depth=10, 3x flood)
-
-| Mode | TTFT | Cached tokens | Cache hit | Speedup |
-|------|------|---------------|-----------|---------|
-| **Pinned** | ~240 ms | ~10700/10830 | ~99% | **~8.5x** |
-| Baseline | ~2035 ms | 0/10830 | 0% | -- |
-
-> V9 uses shallower depth (6 vs 10) and heavier flood (5x vs 3x). Lower speedup
-> ratio is due to shorter prefix (lower baseline ceiling) and heavier eviction.
+Next request (turn 11):                    Next request (turn 11):
+  0 cached tokens                            9664/10830 cached (89%)
+  Full prefill: 1606ms TTFT                  Load-back CPU->GPU + partial prefill: 315ms
+```
 
 ## Branches
 
