@@ -808,7 +808,7 @@ async def hicache_storage_backend_status():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pin_prefix(obj: PinPrefixReqInput):
     """Pin a prefix by token_ids to resist eviction."""
-    ret = await _global_state.tokenizer_manager.pin_prefix(obj.token_ids)
+    ret = await _global_state.tokenizer_manager.pin_prefix(obj.token_ids, obj.ttl_seconds)
     return ORJSONResponse(
         content={
             "status": "ok" if ret.success else "error",
