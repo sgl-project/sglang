@@ -270,7 +270,7 @@ class TestPrefillAdder(CustomTestCase):
         # Second call needs more tokens than currently free, so it would need to
         # preempt req_prio_0 again if already-preempted requests were not filtered out.
         second_req = self.create_mock_req(
-            "new_req_prio_1", priority=1, max_new_tokens=76
+            "second_new_req_prio_1", priority=1, max_new_tokens=76
         )
         second_success = adder.preempt_to_schedule(second_req, mock_server_args)
 
