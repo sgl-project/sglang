@@ -724,8 +724,6 @@ def calculate_metrics(
             if req.slo_ms is None:
                 continue
             slo_defined_total += 1
-            if out.slo_achieved is None:
-                continue
             if out.slo_achieved:
                 slo_met_success += 1
 
