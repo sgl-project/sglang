@@ -163,7 +163,7 @@ class Sampler(nn.Module):
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs, dim=-1)
+                        else torch.log(probs)
                     )
 
         # Attach logprobs to logits_output (in-place modification)
