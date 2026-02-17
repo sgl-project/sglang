@@ -1132,7 +1132,7 @@ def general_mm_embed_routine(
         input_embeds = None
 
     hidden_states = language_model(
-        input_ids=None,
+        input_ids=input_ids,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
