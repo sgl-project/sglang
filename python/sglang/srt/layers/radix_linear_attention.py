@@ -71,7 +71,7 @@ class RadixLinearAttention(nn.Module):
     def forward(
         self,
         forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
