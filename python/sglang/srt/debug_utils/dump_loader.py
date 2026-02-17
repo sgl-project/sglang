@@ -34,6 +34,8 @@ class DumpLoader:
 
         path = self._directory / row["filename"]
         output = torch.load(path, weights_only=False)
+        if isinstance(output, dict) and "value" in output:
+            output = output["value"]
 
         print(
             f"[DumpLoader] load from {path=} (query: {name=} {kwargs=}, output: {type(output)})"
