@@ -23,12 +23,34 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
+# Run apt-get directly as root, otherwise try passwordless sudo first.
+apt_get_ci() {
+    # Fast path: privileged runners can execute apt-get directly.
+    if [ "$(id -u)" -eq 0 ]; then
+        apt-get "$@"
+        return $?
+    fi
+
+    # On non-root runners, only use sudo when it is non-interactive.
+    # CI jobs cannot answer password prompts.
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true >/dev/null 2>&1; then
+            sudo -n apt-get "$@"
+            return $?
+        fi
+        echo "Warning: sudo exists but requires a password; trying apt-get without sudo..."
+    fi
+
+    # Final fallback keeps prior behavior for environments without sudo/root.
+    apt-get "$@"
+}
+
 # Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
 # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
-apt-get update || true
-apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+apt_get_ci update || true
+apt_get_ci install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
     for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
@@ -61,8 +83,8 @@ if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
-        apt-get update || true  # May fail due to unrelated broken packages
-        apt-get install -y --no-install-recommends wget unzip gcc g++ perl make || {
+        apt_get_ci update || true  # May fail due to unrelated broken packages
+        apt_get_ci install -y --no-install-recommends wget unzip gcc g++ perl make || {
             echo "Warning: apt-get install failed, checking if required packages are available..."
             for pkg in wget unzip gcc g++ perl make; do
                 if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
