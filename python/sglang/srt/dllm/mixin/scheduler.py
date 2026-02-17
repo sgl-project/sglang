@@ -8,12 +8,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, RequestStage, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 
 
 class SchedulerDllmMixin:
@@ -57,6 +58,48 @@ class SchedulerDllmMixin:
         # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
         return new_batch
+
+    def process_batch_result_dllm(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        # No new tokens will be generated while all requests are in the prefill stage.
+        if not result.next_token_ids:
+            return
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        for idx in range(batch.batch_size()):
+            req = batch.reqs[idx]
+
+            next_token_ids = result.next_token_ids[idx].tolist()
+            new_tokens = len(next_token_ids)
+            if new_tokens == 0:
+                continue
+
+            req.fill_ids[-new_tokens:] = next_token_ids[:]
+            self.num_generated_tokens += new_tokens
+
+            req.output_ids.extend(next_token_ids)
+            req.check_finished(new_accepted_len=new_tokens)
+
+            if req.finished():
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.completion_time = time.perf_counter()
+
+        self.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
+
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
