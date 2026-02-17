@@ -956,9 +956,7 @@ async def benchmark(args):
                 "SLO Attainment Rate:", metrics["slo_attainment_rate"]
             )
         )
-        print(
-            "{:<40} {:<15}".format("SLO Met (Success):", metrics["slo_met_success"])
-        )
+        print("{:<40} {:<15}".format("SLO Met (Success):", metrics["slo_met_success"]))
         print("{:<40} {:<15.2f}".format("SLO Scale:", metrics["slo_scale"]))
 
     print("=" * 60)
