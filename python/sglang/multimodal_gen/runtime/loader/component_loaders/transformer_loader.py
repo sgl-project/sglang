@@ -169,7 +169,7 @@ class TransformerLoader(ComponentLoader):
             logger.warning(
                 f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
             )
-            
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
