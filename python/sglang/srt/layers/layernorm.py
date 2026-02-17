@@ -51,6 +51,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_cuda or _is_hip or _is_xpu:
     _rmsnorm = current_platform.rmsnorm
     _fused_add_rmsnorm = current_platform.fused_add_rmsnorm
+# Gemma ops are not available on ROCm (raises NotImplementedError),
+# so only resolve eagerly on platforms that support them.
+if _is_cuda or _is_xpu:
     _gemma_rmsnorm = current_platform.gemma_rmsnorm
     _gemma_fused_add_rmsnorm = current_platform.gemma_fused_add_rmsnorm
 _flashinfer_layernorm_available = False
