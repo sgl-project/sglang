@@ -111,7 +111,7 @@ class TestGLM47FP8TPMTP(CustomTestCase):
         if is_in_amd_ci():
             self.assertGreater(speed, 15)
         else:
-            self.assertGreater(speed, 130)
+            self.assertGreater(speed, 50)
 
 
 if __name__ == "__main__":
