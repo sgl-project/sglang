@@ -25,7 +25,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb_qk
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -387,15 +390,28 @@ class GlmImageAttention(torch.nn.Module):
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
-            query[:, text_seq_length:, :, :], key[:, text_seq_length:, :, :] = (
-                _apply_rotary_emb_qk(
-                    query[:, text_seq_length:, :, :],
-                    key[:, text_seq_length:, :, :],
-                    cos,
-                    sin,
-                    is_neox_style=True,
+
+            if _is_cuda and cos.dim() == 2:
+                q_img = query[:, text_seq_length:, :, :]
+                k_img = key[:, text_seq_length:, :, :]
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
                 )
-            )
+                # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
+                q_out, k_out = apply_flashinfer_rope_qk_inplace(
+                    q_img, k_img, cos_sin_cache, is_neox=True
+                )
+            else:
+                query[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    query[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
+                key[:, text_seq_length:, :, :] = _apply_rotary_emb(
+                    key[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
+                )
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
