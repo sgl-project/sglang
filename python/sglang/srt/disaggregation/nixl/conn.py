@@ -735,10 +735,7 @@ class NixlKVManager(CommonKVManager):
                 notif,
             )
         elif state_type in ["swa", "nsa"]:
-            if (
-                not self.is_mla_backend
-                and self.attn_tp_size != decode_tp_size
-            ):
+            if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                 raise RuntimeError(
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
@@ -759,7 +756,9 @@ class NixlKVManager(CommonKVManager):
             )
         else:
             if state_type != "none":
-                raise RuntimeError(f"PD Disaggregation via NIXL does NOT support {state_type} hybrid models yet.")
+                raise RuntimeError(
+                    f"PD Disaggregation via NIXL does NOT support {state_type} hybrid models yet."
+                )
             return None
 
     def add_transfer_request(
