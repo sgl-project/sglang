@@ -3,16 +3,7 @@ from typing import Optional, Tuple
 
 import torch
 
-try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
-except Exception as _e:
-    _flashmla_import_error = _e
-else:
-    _flashmla_import_error = None
-
-_IMPORT_ERROR = ImportError(
-    "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
-)
+from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 
 
 @dataclass
@@ -83,8 +74,6 @@ def get_mla_decoding_metadata_dense_fp8(
         tile_scheduler_metadata: (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    if _flashmla_import_error is not None:
-        raise _IMPORT_ERROR from _flashmla_import_error
     return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -129,9 +118,6 @@ def flash_mla_with_kvcache(
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
-    if _flashmla_import_error is not None:
-        raise _IMPORT_ERROR from _flashmla_import_error
-
     sched_meta = tile_scheduler_metadata
     assert isinstance(
         sched_meta, FlashMLASchedMeta
@@ -212,7 +198,7 @@ def flash_mla_with_kvcache(
     return out, softmax_lse
 
 
-def flash_mla_sparse_prefill(
+def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -232,8 +218,6 @@ def flash_mla_sparse_prefill(
     Returns:
         (output, max_logits, lse)
     """
-    if _flashmla_import_error is not None:
-        raise _IMPORT_ERROR from _flashmla_import_error
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )
