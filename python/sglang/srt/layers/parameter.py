@@ -168,7 +168,13 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     loaded_weight = loaded_weight.narrow(
                         self.output_dim, start_idx, shard_size
                     )
-
+        # Per-channel scale: checkpoint may be 1D (out,) while param is (out, 1)
+        if (
+            len(loaded_weight.shape) == 1
+            and param_data.dim() == 2
+            and param_data.shape[1] == 1
+        ):
+            loaded_weight = loaded_weight.reshape(-1, 1)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -217,6 +223,13 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
+        # Per-channel scale: checkpoint may be 1D (out,) while param is (out, 1)
+        if (
+            len(loaded_weight.shape) == 1
+            and param_data.dim() == 2
+            and param_data.shape[1] == 1
+        ):
+            loaded_weight = loaded_weight.reshape(-1, 1)
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"

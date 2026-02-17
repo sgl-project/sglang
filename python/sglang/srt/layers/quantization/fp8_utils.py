@@ -696,6 +696,7 @@ def apply_fp8_linear(
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
         if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+            print("yyyyyy" * 100)
             # Fall back to vllm cutlass w8a8 fp8 kernel
             output = ops.cutlass_scaled_mm(
                 qinput,
@@ -706,6 +707,7 @@ def apply_fp8_linear(
                 bias=bias,
             )
         else:
+            print("zzzzzz" * 100)
             cutlass_compatible_b = (
                 weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
             )
@@ -765,6 +767,7 @@ def apply_fp8_linear(
             # For CUDA platform please validate if the
             # torch._scaled_mm support rowwise scaled GEMM
             # Fused GEMM_DQ Rowwise GEMM
+            print("yes: rowwise!!!")
             output = torch._scaled_mm(
                 qinput,
                 weight,

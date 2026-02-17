@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
@@ -1346,6 +1347,27 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
+
+        # Per-channel scale (e.g. CT bridge / ModelOpt FP8 per-channel): checkpoint
+        # may have (out_features,) or (out_features, 1); param is (out_partition, 1).
+        if isinstance(param, ChannelQuantScaleParameter):
+            shard_size = param.data.shape[0]
+            if loaded_weight.shape[0] > shard_size:
+                start = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(0, start, shard_size)
+            if len(loaded_weight.shape) == 1:
+                loaded_weight = loaded_weight.reshape(-1, 1)
+            param.load_row_parallel_weight(loaded_weight)
+            return
+
+        # Weight matrix: checkpoint may be (in, out) while param is (out, in) or (out, in_partition).
+        if isinstance(param, RowvLLMParameter) and loaded_weight.dim() == 2:
+            # Swap matches (tp=1) or full-layer (in, out) vs sharded (out, in_partition).
+            if loaded_weight.shape[1] == param.data.shape[0] and (
+                loaded_weight.shape[0] == param.data.shape[1]
+                or loaded_weight.shape[0] > param.data.shape[1]
+            ):
+                loaded_weight = loaded_weight.t().contiguous()
 
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,

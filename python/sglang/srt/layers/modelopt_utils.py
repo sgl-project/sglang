@@ -4,6 +4,7 @@ ModelOpt related constants
 
 QUANT_CFG_CHOICES = {
     "fp8": "FP8_DEFAULT_CFG",
+    "fp8_per_channel_per_token": "FP8_PER_CHANNEL_PER_TOKEN_CFG",  # CT bridge
     "int4_awq": "INT4_AWQ_CFG",  # TODO: add support for int4_awq
     "w4a8_awq": "W4A8_AWQ_BETA_CFG",  # TODO: add support for w4a8_awq
     "nvfp4": "NVFP4_DEFAULT_CFG",

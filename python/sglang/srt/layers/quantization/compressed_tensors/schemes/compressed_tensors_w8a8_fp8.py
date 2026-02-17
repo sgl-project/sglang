@@ -1,5 +1,14 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+"""
+FP8 W8A8 compressed-tensors scheme (per-tensor or per-channel weights, static or dynamic activations).
+
+This is the primary scheme for the ModelOpt->CompressedTensors bridge:
+- ModelOpt recipe FP8_PER_CHANNEL_PER_TOKEN_CFG maps to this class with strategy=channel
+  and is_static_input_scheme=False (dynamic per-token activations).
+- strategy: "tensor" -> per-tensor weight scales; "channel" -> per-channel (output dimension).
+- is_static_input_scheme: True -> static activation scales; False -> dynamic per-token (typical for bridge).
+"""
 
 from typing import Callable, List, Optional
 
@@ -32,6 +41,7 @@ if _use_aiter:
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
+    """FP8 W8A8 scheme; supports per-tensor or per-channel weight scales and static or dynamic input scales."""
 
     def __init__(self, strategy: str, is_static_input_scheme: bool):
         self.strategy = strategy
@@ -130,6 +140,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # TODO: update create_xxx_parameter functions to return
         # the newly added parameters
         if self.strategy == QuantizationStrategy.CHANNEL:
+            print(f"yes: channel!!!{self.strategy == QuantizationStrategy.CHANNEL}")
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
                 output_dim=0,
@@ -161,6 +172,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # print(f"layer.weight.shape: {layer.weight.shape}, layer.weight_scale.shape: {layer.weight_scale.shape}, layer.input_scale.shape: {x.shape}")
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,

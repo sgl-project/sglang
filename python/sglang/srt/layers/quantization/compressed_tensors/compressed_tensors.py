@@ -140,6 +140,11 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            return BaseKVCacheMethod(self)
         return None
 
     @classmethod

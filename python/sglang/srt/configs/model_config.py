@@ -561,18 +561,30 @@ class ModelConfig:
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
-        """Parse ModelOpt quantization config and return the appropriate quant_method."""
-        json_quant_configs = quant_config_dict["quantization"]
-        quant_algo = json_quant_configs.get("quant_algo", None)
+        """Parse ModelOpt quantization config and return the appropriate quant_method.
 
+        Uses ModelOptQuantizationScheme detection when possible so that
+        quant_cfg/recipe (e.g. FP8_PER_CHANNEL_PER_TOKEN_CFG, INT4_AWQ_CFG) drives
+        the returned quant_method for bridge and native config routing.
+        """
+        from sglang.srt.layers.quantization.modelopt_scheme import (
+            detect_modelopt_quantization_scheme,
+        )
+
+        scheme = detect_modelopt_quantization_scheme(quant_config_dict)
+        if scheme is not None:
+            return {"quant_method": scheme.quant_method()}
+
+        # Fallback: legacy quant_algo-only parsing (e.g. configs without quant_cfg)
+        json_quant_configs = quant_config_dict.get("quantization") or quant_config_dict
+        quant_algo = (json_quant_configs.get("quant_algo") or "").upper()
         if quant_algo == "MIXED_PRECISION":
             return {"quant_method": "w4afp8"}
-        elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
+        if quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4"}
-        elif quant_algo and "FP8" in quant_algo:
+        if quant_algo and "FP8" in quant_algo:
             return {"quant_method": "modelopt_fp8"}
-        else:
-            return None
+        return None
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
