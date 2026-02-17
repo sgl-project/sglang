@@ -27,12 +27,17 @@ class SGLDiffusionProfiler:
         full_profile: bool = False,
         num_steps: int | None = None,
         num_inference_steps: int | None = None,
-        log_dir: str = "./logs",
+        log_dir: str | None = None,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
-        self.log_dir = log_dir
+
+        self.log_dir = (
+            log_dir
+            if log_dir is not None
+            else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        )
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)

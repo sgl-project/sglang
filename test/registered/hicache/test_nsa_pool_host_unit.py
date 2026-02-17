@@ -50,6 +50,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
             layer_num=layer_num,
             device="cuda",
             enable_memory_saver=False,
+            kv_cache_dim=576,
             index_head_dim=128,
         )
         pin_memory = io_backend == "kernel"

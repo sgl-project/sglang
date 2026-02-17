@@ -8,7 +8,9 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
+from sglang.jit_kernel.hicache import (
+    can_use_hicache_jit_kernel,
+)
 from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
