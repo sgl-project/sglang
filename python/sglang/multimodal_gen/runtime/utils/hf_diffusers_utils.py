@@ -38,6 +38,7 @@ from huggingface_hub.errors import (
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
+from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -836,3 +837,12 @@ def snapshot_download(
         }
         hf_kwargs.update(kwargs)
         return _hf_snapshot_download(**hf_kwargs)
+
+
+def get_metadata_from_safetensors_file(file_path: str):
+    try:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata()
+            return metadata
+    except Exception as e:
+        logger.warning(e)

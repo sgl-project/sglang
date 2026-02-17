@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
+
 from typing import Optional, Tuple, Union
 
 import torch
@@ -81,6 +82,10 @@ class RMSNorm(CustomOp):
         if x.dtype == torch.float:
             # fp32
             out = self.forward_triton(x, residual)
+            if residual is not None:
+                return out[0].view(shape), out[1].view(residual_shape)
+            out = out.view(shape)
+            return out
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
@@ -94,6 +99,7 @@ class RMSNorm(CustomOp):
             else:
                 out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
+
         return out
 
     def forward_native(
