@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -24,19 +23,13 @@ def get_mla_metadata(
     topk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Get tile scheduler metadata for FlashMLA decode.
-
-    Automatically selects the appropriate backend:
-    - Dense FP8: uses optimized get_mla_decoding_metadata_dense_fp8
-    - Other cases: uses generic get_mla_decoding_metadata
-
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
         num_q_tokens_per_head_k: Equals to num_q_tokens_per_q_seq * num_heads_q // num_heads_k.
         num_heads_k: The number of k heads.
         num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
         is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
-        topk: If not None, sparse attention will be enabled.
+        topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
@@ -45,15 +38,12 @@ def get_mla_metadata(
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
 
-    # Dense FP8 uses a specialized optimized path
     if is_fp8_kvcache and topk is None:
         return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
             cache_seqlens,
             num_q_tokens_per_head_k,
             num_heads_k,
         )
-
-    # Generic path for BF16/FP16 and sparse FP8
     return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -80,22 +70,20 @@ def flash_mla_with_kvcache(
     indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    FlashMLA attention with KV cache.
-
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim).
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
         cache_seqlens: (batch_size), torch.int32.
         head_dim_v: Head dimension of v.
-        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32.
-        num_splits: (batch_size + 1), torch.int32.
-        softmax_scale: float. The scale of QK^T before applying softmax.
+        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
+        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
+        softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
-        descale_q: (batch_size), torch.float32. Descaling factors for Q.
-        descale_k: (batch_size), torch.float32. Descaling factors for K.
-        is_fp8_kvcache: bool. Whether the k_cache is in fp8 format.
-        indices: (batch_size, seq_len_q, topk), torch.int32. For sparse attention.
+        descale_q: (batch_size), torch.float32. Descaling factors for Q, used for fp8 quantization.
+        descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
+        is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
+        indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -106,12 +94,13 @@ def flash_mla_with_kvcache(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if indices is not None:
+        assert causal == False, "causal must be `false` if sparse attention is enabled."
+    assert (descale_q is None) == (
+        descale_k is None
+    ), "descale_q and descale_k should be both None or both not None"
 
-    topk = indices.shape[-1] if indices is not None else None
-
-    # Call the underlying kernel
     if indices is None and q.element_size() == 1:
-        # FP8 dense decode path
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
             q,
             k_cache,
@@ -126,7 +115,6 @@ def flash_mla_with_kvcache(
             descale_k,
         )
     else:
-        # BF16/FP16 dense or sparse decode path
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
             q,
             k_cache,
@@ -140,7 +128,6 @@ def flash_mla_with_kvcache(
             is_fp8_kvcache,
             indices,
         )
-
     return out, softmax_lse
 
 
@@ -170,6 +157,7 @@ def flash_mla_sparse_fwd(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )
