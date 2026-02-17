@@ -336,7 +336,7 @@ class SamplingParams:
                 )
 
                 if isinstance(pipeline_config, Hunyuan3D2PipelineConfig):
-                    self.guidance_scale = pipeline_config.shape_guidance_scale
+                    self.guidance_scale = pipeline_config.guidance_scale
                 else:
                     self.guidance_scale = 1.0
             except ImportError:

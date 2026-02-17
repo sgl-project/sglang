@@ -35,7 +35,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     shape_use_safetensors: bool = True
     shape_variant: Optional[str] = "fp16"
     shape_num_inference_steps: int = 50
-    shape_guidance_scale: float = 5.0
+    guidance_scale: float = 5.0
     shape_box_v: float = 1.01
     shape_octree_resolution: int = 384
     shape_mc_level: float = 0.0
