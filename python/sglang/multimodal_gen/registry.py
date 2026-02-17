@@ -367,7 +367,7 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
-    # Detect quantized models and warn the user
+    # Detect quantized models and raise error
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
     if is_quantized and backend != Backend.DIFFUSERS:
         raise RuntimeError(
