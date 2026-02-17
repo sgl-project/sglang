@@ -236,10 +236,7 @@ def register_configs(
 
 def get_model_short_name(model_id: str) -> str:
     if "/" in model_id:
-        if model_id[-1] == "/":
-            return model_id.split("/")[-2]
-        else:
-            return model_id.split("/")[-1]
+        return model_id.rstrip("/").split("/")[-1]
     else:
         return model_id
 
