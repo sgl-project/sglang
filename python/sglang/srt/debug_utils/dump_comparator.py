@@ -280,6 +280,9 @@ def _load_object(path):
         print(f"Skip load {path} since error {e}")
         return None
 
+    if isinstance(x, dict) and "value" in x:
+        x = x["value"]
+
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
