@@ -131,8 +131,10 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
-            if _is_cuda or _is_hip:
+            if _is_cuda:
                 from sglang.jit_kernel.pos_enc import rotary_embedding
+            elif _is_hip:
+                from sgl_kernel import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 

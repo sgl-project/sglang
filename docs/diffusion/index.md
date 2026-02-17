@@ -7,7 +7,7 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
 - **Broad Model Support**: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image, and more
 - **Fast Inference**: Optimized kernels, efficient scheduler loop, and Cache-DiT acceleration
 - **Ease of Use**: OpenAI-compatible API, CLI, and Python SDK
-- **Multi-Platform**: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
+- **Multi-Platform**: NVIDIA GPUs (H100, H200, A100, B200, 4090), AMD GPUs (MI300X, MI325X) and Ascend NPU (A2, A3)
 
 ---
 
