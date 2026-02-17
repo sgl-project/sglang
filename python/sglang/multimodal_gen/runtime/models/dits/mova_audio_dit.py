@@ -233,10 +233,9 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
                 ],
                 dim=-1,
             )
-            .reshape(f, -1)
+            .reshape(f, 1, -1)
             .to(x.device)
         )
-        freqs = (freqs.real.contiguous().float(), freqs.imag.contiguous().float())
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)
