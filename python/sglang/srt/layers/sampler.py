@@ -192,7 +192,7 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Sample from probability distribution (after softmax).
 
-        Used for standard sampling on CUDA with flashinfer/pytorch backends.
+        Used for standard sampling with flashinfer/pytorch backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
         if simple_sampling_case:
