@@ -327,5 +327,3 @@ class TorchAOLinearMethod(LinearMethodBase):
 
         _restore_weight_attrs(weight, recorded_weight_attr)
         layer.register_parameter("weight", weight)
-
-        
