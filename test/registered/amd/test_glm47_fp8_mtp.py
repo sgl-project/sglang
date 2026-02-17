@@ -76,11 +76,11 @@ class TestGLM47FP8TPMTP(CustomTestCase):
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
-        print(f"{avg_spec_accept_length=}")
+        print(f"{avg_spec_accept_length=:.2f}")
 
         loads_info = requests.get(self.base_url + "/v1/loads?include=spec")
         spec_accept_rate = loads_info.json()["loads"][0]["speculative"]["accept_rate"]
-        print(f"{spec_accept_rate=}")
+        print(f"{spec_accept_rate=:.3f}")
 
         if is_in_ci():
             write_github_step_summary(
