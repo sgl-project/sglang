@@ -18,7 +18,12 @@ from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import TopK, TopKConfig, select_experts
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKConfig,
+    TopKOutputFormat,
+    select_experts,
+)
 
 
 def fused_moe_triton_api(
@@ -32,8 +37,8 @@ def fused_moe_triton_api(
         top_k=topk,
         renormalize=False,
         use_grouped_topk=False,
+        output_format=TopKOutputFormat.TRITON_KERNEL,
     )
-    topk_op.use_triton_kernels = True
     triton_topk_output = topk_op.forward_cuda(
         hidden_states=x,
         router_logits=input_gating,
@@ -199,6 +204,12 @@ def main():
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
 
+    # Initialize global server args (required by SGLang MoE kernels)
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    server_args = ServerArgs(model_path=args.model)
+    set_global_server_args_for_scheduler(server_args)
+
     try:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
@@ -217,8 +228,8 @@ def main():
         )
 
         initialize_model_parallel(
-            tensor_model_parallel_size=args.ep_size,
-            pipeline_model_parallel_size=args.tp_size,
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
         )
 
         model_config = get_model_config(args.model, args.tp_size, args.ep_size)
