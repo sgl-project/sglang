@@ -2663,14 +2663,10 @@ class Scheduler(
                 f"tp_rank={self.tp_rank}"
             )
 
-            if active_pins > 0:
-                # Selective flush: preserve pinned blocks
+            if hasattr(self.tree_cache, "flush"):
+                # HiCache with PIN support: selective flush preserves pinned blocks
                 self.tree_cache.flush()
             else:
-                # Nuclear flush: no pins, reset everything
-                logger.info(
-                    f"[PIN] flush_cache: nuclear reset (no pins), tp_rank={self.tp_rank}"
-                )
                 self.tree_cache.reset()
                 self.req_to_token_pool.clear()
                 self.token_to_kv_pool_allocator.clear()

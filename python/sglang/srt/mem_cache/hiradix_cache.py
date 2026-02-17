@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import heapq
+import sys
 import json
 import logging
 import os
@@ -741,7 +742,7 @@ class HiRadixCache(RadixCache):
 
         # Evict everything evictable from host (pinned blocks are skipped)
         host_before = len(self.evictable_host_leaves)
-        self.evict_host(2**31)
+        self.evict_host(sys.maxsize)
         host_after = len(self.evictable_host_leaves)
 
         logger.debug(
