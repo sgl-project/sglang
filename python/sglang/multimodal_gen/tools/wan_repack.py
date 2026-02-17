@@ -74,9 +74,7 @@ def convert_transformer(model_type: str, model_dir: str, output_dir: str):
     original_state_dict = load_sharded_safetensors(
         pathlib.Path(model_dir, "*model*.safetensors")
     )
-    with open(
-        pathlib.Path(model_dir, "*quant_model_description*.json")
-    ) as f:
+    with open(pathlib.Path(model_dir, "*quant_model_description*.json")) as f:
         original_quant_config = json.load(f)
 
     for key in list(original_state_dict.keys()):
@@ -115,4 +113,3 @@ if __name__ == "__main__":
         model_dir=pathlib.Path(args.input_path, "low_noise_model"),
         output_dir=pathlib.Path(args.output_path, "transformer_2"),
     )
-
