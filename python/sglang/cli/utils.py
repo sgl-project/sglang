@@ -10,6 +10,8 @@ from typing import Optional
 import filelock
 from huggingface_hub import hf_hub_download
 
+from sglang.multimodal_gen.registry import is_known_non_diffusers_multimodal_model
+
 logger = logging.getLogger(__name__)
 
 temp_dir = tempfile.gettempdir()
@@ -126,8 +128,6 @@ def get_is_diffusion_model(model_path: str):
     except ValueError:
         # model_index.json/config.json not found, continue to check other formats
         pass
-
-    from sglang.multimodal_gen.registry import is_known_non_diffusers_multimodal_model
 
     if is_known_non_diffusers_multimodal_model(model_path):
         logger.info("Diffusion model detected (non-diffusers format: %s)", model_path)
