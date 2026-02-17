@@ -26,16 +26,16 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 template <bool kScaleUE8M0>
-using scale_packed_t = std::conditional_t<kScaleUE8M0, uint32_t, float>;
+using scale_packed_t_t = std::conditional_t<kScaleUE8M0, uint32_t, float>;
 
 template <bool kScaleUE8M0>
-using scale_element_t = std::conditional_t<kScaleUE8M0, uint8_t, float>;
+using scale_element_t_t = std::conditional_t<kScaleUE8M0, uint8_t, float>;
 
 template <typename T, typename DST_DTYPE, bool kIsColumnMajor, bool kScaleUE8M0>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
-    scale_packed_t<kScaleUE8M0>* __restrict__ output_s,
+    scale_packed_t_t<kScaleUE8M0>* __restrict__ output_s,
     const int group_size,
     const int num_groups,
     const int groups_per_block,
@@ -58,7 +58,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   float local_absmax = eps;
 
-  using scale_element_t = std::conditional_t<kScaleUE8M0, uint8_t, float>;
+  using scale_packed_t = scale_packed_t_t<kScaleUE8M0>;
+  using scale_element_t = scale_element_t_t<kScaleUE8M0>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   const T* group_input = input + block_group_offset;
@@ -66,7 +67,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   scale_element_t* scale_output = nullptr;
 
   if constexpr (kIsColumnMajor) {
-    constexpr kElemsPerPack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+    constexpr int kElemsPerPack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int row_idx = global_group_id / num_groups_per_row;
     const int col_idx_unpacked = global_group_id % num_groups_per_row;
     const int col_idx = col_idx_unpacked / kElemsPerPack;
@@ -124,6 +125,15 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 }
 
+inline int compute_groups_per_block(int64_t num_groups) {
+  if (num_groups % 16 == 0) return 16;
+  if (num_groups % 8 == 0) return 8;
+  if (num_groups % 4 == 0) return 4;
+  if (num_groups % 2 == 0) return 2;
+  return 1;
+}
+
+template <typename DType, typename OutType>
 void per_token_group_quant_8bit(
     tvm::ffi::TensorView input,
     tvm::ffi::TensorView output_q,
@@ -135,28 +145,33 @@ void per_token_group_quant_8bit(
     bool scale_ue8m0) {
   using namespace host;
 
-  const int64_t num_elements = 1;
-  // Compute total number of elements from the input tensor
-  int64_t total_elements = 1;
-  for (int i = 0; i < input.ndim(); ++i) {
-    total_elements *= input.shape()[i];
-  }
+  auto device = SymbolicDevice{};
+  auto M = SymbolicSize{"num_tokens"};
+  auto K = SymbolicSize{"hidden_dim"};
+  device.set_options<kDLCUDA>();
 
-  const int num_groups = total_elements / group_size;
+  TensorMatcher({M, K}).with_dtype<DType>().with_device(device).verify(input);
+  TensorMatcher({M, K}).with_dtype<OutType>().with_device(device).verify(output_q);
+
+  const auto num_tokens = M.unwrap();
+  const auto hidden_dim = K.unwrap();
+
+  const int64_t num_groups_per_row = hidden_dim / group_size;
+  const int64_t num_groups = num_tokens * num_groups_per_row;
+
   const int groups_per_block = compute_groups_per_block(num_groups);
   const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * kThreadsPerGroup;
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int num_groups_per_row = hidden_dim / group_size;
   const int scale_stride = output_s.stride(1);
 
-  auto device = input.device();
-
-  using scale_packed_t = std::conditional_t<kScaleUE8M0, uint32_t, float>;
+  const float feps = static_cast<float>(eps);
+  const float fmin8 = static_cast<float>(min_8bit);
+  const float fmax8 = static_cast<float>(max_8bit);
 
   if (is_column_major) {
     if (scale_ue8m0) {
-      LaunchKernel(num_blocks, num_threads, device.unwrap())(
+      LaunchKernel(num_blocks, num_threads, input.device())(
           per_token_group_quant_8bit_kernel<DType, OutType, true, true>,
           static_cast<const DType*>(input.data_ptr()),
           static_cast<OutType*>(output_q.data_ptr()),
@@ -164,13 +179,13 @@ void per_token_group_quant_8bit(
           static_cast<int>(group_size),
           static_cast<int>(num_groups),
           static_cast<int>(groups_per_block),
-          eps,
-          min_8bit,
-          max_8bit,
+          feps,
+          fmin8,
+          fmax8,
           static_cast<int>(num_groups_per_row),
           scale_stride);
     } else {
-      LaunchKernel(num_blocks, num_threads, device.unwrap())(
+      LaunchKernel(num_blocks, num_threads, input.device())(
           per_token_group_quant_8bit_kernel<DType, OutType, true, false>,
           static_cast<const DType*>(input.data_ptr()),
           static_cast<OutType*>(output_q.data_ptr()),
@@ -178,14 +193,14 @@ void per_token_group_quant_8bit(
           static_cast<int>(group_size),
           static_cast<int>(num_groups),
           static_cast<int>(groups_per_block),
-          eps,
-          min_8bit,
-          max_8bit,
+          feps,
+          fmin8,
+          fmax8,
           static_cast<int>(num_groups_per_row),
           scale_stride);
     }
   } else {
-    LaunchKernel(num_blocks, num_threads, device.unwrap())(
+    LaunchKernel(num_blocks, num_threads, input.device())(
         per_token_group_quant_8bit_kernel<DType, OutType, false, false>,
         static_cast<const DType*>(input.data_ptr()),
         static_cast<OutType*>(output_q.data_ptr()),
@@ -193,9 +208,9 @@ void per_token_group_quant_8bit(
         static_cast<int>(group_size),
         static_cast<int>(num_groups),
         static_cast<int>(groups_per_block),
-        eps,
-        min_8bit,
-        max_8bit,
+        feps,
+        fmin8,
+        fmax8,
         0,
         0);
   }

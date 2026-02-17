@@ -4,18 +4,32 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+_OUTPUT_DTYPE_MAP = {
+    torch.float8_e4m3fn: "fp8_e4m3_t",
+    torch.int8: "int8_t",
+}
+
 
 @cache_once
-def _jit_per_token_group_quant_8bit_module() -> Module:
+def _jit_per_token_group_quant_8bit_module(
+    dtype: torch.dtype, output_type: torch.dtype
+) -> Module:
+    input_args = make_cpp_args(dtype)
+    out_cpp = _OUTPUT_DTYPE_MAP[output_type]
     return load_jit(
-        "per_tensor_quant_fp8",
+        "per_token_group_quant_8bit",
         cuda_files=["gemm/per_token_group_quant_8bit.cuh"],
-        cuda_wrappers=[("per_token_group_quant_8bit", f"per_token_group_quant_8bit")],
+        cuda_wrappers=[
+            (
+                "per_token_group_quant_8bit",
+                f"per_token_group_quant_8bit<{input_args}, {out_cpp}>",
+            )
+        ],
     )
 
 
@@ -28,23 +42,29 @@ def per_token_group_quant_8bit(
     fp8_min: float,
     fp8_max: float,
     scale_ue8m0: bool = False,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Per-tensor quantization to FP8 format.
+    Per-token-group quantization to 8-bit format.
 
     Args:
-        input: Input tensor to quantize (float, half, or bfloat16)
-        output_q: Output quantized tensor (fp8_e4m3)
-        output_s: Output scale tensor (float scalar or 1D tensor with 1 element)
+        input: Input tensor to quantize (float, half, or bfloat16).
+        output_q: Output quantized tensor (e.g., fp8_e4m3 or int8).
+        output_s: Output scale tensor.
+        group_size: The size of the group for quantization.
+        eps: A small value to avoid division by zero.
+        fp8_min: The minimum value of the 8-bit data type.
+        fp8_max: The maximum value of the 8-bit data type.
+        scale_ue8m0: Whether to use UE8M0 format for scales.
     """
-    module = _jit_per_token_group_quant_8bit_module()
+    module = _jit_per_token_group_quant_8bit_module(input.dtype, output_q.dtype)
     module.per_token_group_quant_8bit(
-        input.view(-1),
-        output_q.view(-1),
-        output_s.view(-1),
+        input,
+        output_q,
+        output_s,
         group_size,
         eps,
         fp8_min,
         fp8_max,
         scale_ue8m0,
     )
+    return output_q, output_s
