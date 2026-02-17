@@ -11,6 +11,11 @@ on:
         description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-x86-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
+      pin:
+        description: "Pin this image to prevent nightly cleanup from deleting it. Appends '-pin' to the tag."
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: "0 0 * * *"
 
@@ -149,10 +154,15 @@ jobs:
           ARM64_TAG="dev-${{ matrix.variant.arm64 }}${SUFFIX}"
 
           # For nightly (no suffix), also stamp a dated tag
+          # If pin is set, append -pin so the dated tag survives cleanup
           EXTRA_TAG=""
           if [ -z "${SUFFIX}" ]; then
             SHORT_SHA="${{ github.sha }}"
-            EXTRA_TAG="-t lmsysorg/sglang:nightly-${TAG}-$(date +%Y%m%d)-${SHORT_SHA:0:8}"
+            PIN_SUFFIX=""
+            if [ "${{ inputs.pin }}" = "true" ]; then
+              PIN_SUFFIX="-pin"
+            fi
+            EXTRA_TAG="-t lmsysorg/sglang:nightly-${TAG}-$(date +%Y%m%d)-${SHORT_SHA:0:8}${PIN_SUFFIX}"
           fi
 
           docker buildx imagetools create \
@@ -174,7 +184,7 @@ jobs:
             "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
 
           TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
-            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
+            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | select(.name | test("pin") | not) | "\(.last_updated)|\(.name)"' \
             | sort -r | cut -d'|' -f2)
 
           TAG_COUNT=$(echo "$TAGS" | wc -l)
