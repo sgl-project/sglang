@@ -74,8 +74,6 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UnpinPrefixReqInput,
-    UnpinPrefixReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -219,9 +217,6 @@ class TokenizerCommunicatorMixin:
         self.pin_prefix_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.unpin_prefix_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -312,10 +307,6 @@ class TokenizerCommunicatorMixin:
                 (
                     PinPrefixReqOutput,
                     self.pin_prefix_communicator.handle_recv,
-                ),
-                (
-                    UnpinPrefixReqOutput,
-                    self.unpin_prefix_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -424,19 +415,6 @@ class TokenizerCommunicatorMixin:
         total = sum(r.pinned_count for r in results)
         return PinPrefixReqOutput(
             success=all_success, pinned_count=total, message=all_message
-        )
-
-    async def unpin_prefix(
-        self: TokenizerManager, token_ids: List[int]
-    ) -> UnpinPrefixReqOutput:
-        """Unpin a prefix by token_ids to allow normal eviction."""
-        results = await self.unpin_prefix_communicator(
-            UnpinPrefixReqInput(token_ids=token_ids)
-        )
-        all_success, all_message = _Communicator.merge_results(results)
-        total = sum(r.unpinned_count for r in results)
-        return UnpinPrefixReqOutput(
-            success=all_success, unpinned_count=total, message=all_message
         )
 
     async def start_profile(

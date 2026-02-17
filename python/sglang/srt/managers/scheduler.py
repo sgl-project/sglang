@@ -126,8 +126,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UnpinPrefixReqInput,
-    UnpinPrefixReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1037,7 +1035,6 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (PinPrefixReqInput, self.pin_prefix_wrapped),
-                (UnpinPrefixReqInput, self.unpin_prefix_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2629,20 +2626,6 @@ class Scheduler(
             message=f"Pinned {pinned} nodes (ttl={recv_req.ttl_seconds}s)",
         )
 
-    def unpin_prefix_wrapped(self, recv_req: UnpinPrefixReqInput):
-        if not hasattr(self.tree_cache, "unpin_prefix"):
-            return UnpinPrefixReqOutput(
-                success=False,
-                unpinned_count=0,
-                message="PIN requires --enable-hierarchical-cache",
-            )
-        unpinned = self.tree_cache.unpin_prefix(recv_req.token_ids)
-        return UnpinPrefixReqOutput(
-            success=True,
-            unpinned_count=unpinned,
-            message=f"Unpinned {unpinned} nodes from {len(recv_req.token_ids)} token_ids",
-        )
-
     def _is_no_request(self):
         no_request = (
             self.running_batch.is_empty()
@@ -2673,11 +2656,9 @@ class Scheduler(
             self.cur_batch = None
             self.last_batch = None
 
-            active_pins = getattr(self.tree_cache, "_active_pin_count", 0)
             evictable = getattr(self.tree_cache, "evictable_size_", "N/A")
             logger.info(
-                f"[PIN] flush_cache: active_pin_count={active_pins}, "
-                f"evictable_size={evictable}, "
+                f"[PIN] flush_cache: evictable_size={evictable}, "
                 f"req_to_token_pool.size={self.req_to_token_pool.size}, "
                 f"tp_rank={self.tp_rank}"
             )

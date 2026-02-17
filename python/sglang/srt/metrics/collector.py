@@ -1631,16 +1631,6 @@ class HiCacheMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
-        self.active_pin_count = Gauge(
-            name="sglang:hicache_active_pin_count",
-            documentation="Number of active PIN holds on HiRadixCache prefixes.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-
-    def update(
-        self, host_used: int, host_total: int, active_pins: int
-    ) -> None:
+    def update(self, host_used: int, host_total: int) -> None:
         self.host_used_tokens.labels(**self.labels).set(host_used)
         self.host_total_tokens.labels(**self.labels).set(host_total)
-        self.active_pin_count.labels(**self.labels).set(active_pins)

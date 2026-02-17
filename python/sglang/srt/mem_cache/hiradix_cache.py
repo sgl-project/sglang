@@ -165,8 +165,7 @@ class HiRadixCache(RadixCache):
 
         self.evictable_host_leaves = set()
 
-        # PIN infrastructure: simple counter for active pins
-        self._active_pin_count: int = 0
+        # PIN infrastructure
 
         super().__init__(params=params)
 
@@ -584,7 +583,6 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
-        self._active_pin_count = 0
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -732,8 +730,7 @@ class HiRadixCache(RadixCache):
             f"[PIN] flush: ENTER evictable_size={self.evictable_size_}, "
             f"protected_size={self.protected_size_}, "
             f"evictable_leaves={len(self.evictable_leaves)}, "
-            f"evictable_host_leaves={len(self.evictable_host_leaves)}, "
-            f"active_pin_count={self._active_pin_count}"
+            f"evictable_host_leaves={len(self.evictable_host_leaves)}"
         )
 
         # Evict everything evictable from GPU
@@ -742,27 +739,29 @@ class HiRadixCache(RadixCache):
             self.evict(EvictParams(num_tokens=gpu_before))
         gpu_evicted = gpu_before - self.evictable_size_
 
-        logger.debug(
-            f"[PIN] flush: after GPU evict: evictable_size={self.evictable_size_}, "
-            f"evictable_leaves={len(self.evictable_leaves)}"
-        )
-
-        # Evict everything evictable from host (pin_count blocks are skipped)
+        # Evict everything evictable from host (pinned blocks are skipped)
         host_before = len(self.evictable_host_leaves)
         self.evict_host(2**31)
         host_after = len(self.evictable_host_leaves)
 
         logger.debug(
             f"[PIN] flush: GPU evicted {gpu_evicted} tokens, "
-            f"host leaves {host_before}->{host_after}, "
-            f"active_pin_count={self._active_pin_count}"
+            f"host leaves {host_before}->{host_after}"
         )
         return {
             "gpu_evicted": gpu_evicted,
             "host_leaves_before": host_before,
             "host_leaves_after": host_after,
-            "active_pin_count": self._active_pin_count,
         }
+
+    def _is_pinned(self, node: TreeNode) -> bool:
+        """Check if a node has an active (non-expired) pin."""
+        return node.pin_expiry > 0 and time.monotonic() <= node.pin_expiry
+
+    def _clear_pin(self, node: TreeNode):
+        """Clear expired pin state from a node."""
+        node.pin_expiry = 0.0
+        node.pin_ttl = 0
 
     def pin_prefix(self, token_ids: List[int], ttl_seconds: int = 300) -> int:
         """Pin nodes along a prefix path by walking the tree via token_ids."""
@@ -785,9 +784,7 @@ class HiRadixCache(RadixCache):
             child = node.children[child_key]
             prefix_len = self.key_match_fn(child.key, key)
 
-            child.pin_count += 1
-            self._active_pin_count += 1
-            # TTL: extend expiry (never shorten), store original TTL for refresh
+            # Extend expiry (never shorten), store TTL for refresh-on-hit
             child.pin_expiry = max(child.pin_expiry, expiry)
             child.pin_ttl = max(child.pin_ttl, ttl_seconds)
             self._update_host_leaf_status(child)
@@ -805,45 +802,6 @@ class HiRadixCache(RadixCache):
             f"[PIN] pin_prefix: pinned {pinned} nodes, ttl={ttl_seconds}s"
         )
         return pinned
-
-    def unpin_prefix(self, token_ids: List[int]) -> int:
-        """Unpin nodes along a prefix path by walking the tree via token_ids."""
-        if self.disable or not token_ids:
-            return 0
-
-        key, _ = self.maybe_bigram_convert(self._to_radix_key(token_ids))
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
-        if len(key) == 0:
-            return 0
-
-        unpinned = 0
-        node = self.root_node
-        child_key = self.get_child_key_fn(key)
-
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-            prefix_len = self.key_match_fn(child.key, key)
-
-            if child.pin_count > 0:
-                child.pin_count -= 1
-                self._active_pin_count -= 1
-                self._update_host_leaf_status(child)
-                unpinned += 1
-
-            if prefix_len < len(child.key):
-                break
-
-            node = child
-            key = key[prefix_len:]
-            if len(key):
-                child_key = self.get_child_key_fn(key)
-
-        logger.debug(
-            f"[PIN] unpin_prefix: unpinned {unpinned} nodes from {len(token_ids)} token_ids"
-        )
-        return unpinned
 
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
         """Convert raw token_ids to a RadixKey for tree walking.
@@ -891,19 +849,12 @@ class HiRadixCache(RadixCache):
 
     def _update_host_leaf_status(self, node: TreeNode):
         # Lazy expiry check
-        if node.pin_count > 0 and node.pin_expiry > 0 and time.monotonic() > node.pin_expiry:
-            self._active_pin_count -= node.pin_count
-            node.pin_count = 0
-            node.pin_expiry = 0.0
-            node.pin_ttl = 0
+        if not self._is_pinned(node) and node.pin_expiry > 0:
+            self._clear_pin(node)
 
-        if not node.evicted or node.lock_ref > 0 or node.pin_count > 0:
+        pinned = self._is_pinned(node)
+        if not node.evicted or node.lock_ref > 0 or pinned:
             if node in self.evictable_host_leaves:
-                if node.pin_count > 0:
-                    logger.debug(
-                        f"[PIN] _update_host_leaf_status: node {node.id} removed from "
-                        f"evictable_host_leaves (pin_count={node.pin_count})"
-                    )
                 self.evictable_host_leaves.remove(node)
             return
 
@@ -933,26 +884,20 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-            if x.pin_count > 0:
-                # Check TTL expiry
-                if x.pin_expiry > 0 and time.monotonic() > x.pin_expiry:
-                    # Expired: clear pin, allow normal eviction
-                    self._active_pin_count -= x.pin_count
-                    x.pin_count = 0
-                    x.pin_expiry = 0.0
-                    x.pin_ttl = 0
-                    logger.info(
-                        f"[PIN] evict: pin expired on node {x.id}, allowing eviction"
-                    )
-                    # Fall through to normal eviction logic below
+            if self._is_pinned(x):
+                # Still active: backup to host, don't evict from tree
+                if not x.backuped:
+                    num_evicted += self.write_backup(x, write_back=True)
+                    write_back_nodes.append(x)
                 else:
-                    # Still active: backup to host, don't evict from tree
-                    if not x.backuped:
-                        num_evicted += self.write_backup(x, write_back=True)
-                        write_back_nodes.append(x)
-                    else:
-                        num_evicted += self._evict_backuped(x)
-                    continue  # skip tree removal
+                    num_evicted += self._evict_backuped(x)
+                continue  # skip tree removal
+            elif x.pin_expiry > 0:
+                # Expired pin: clear and fall through to normal eviction
+                self._clear_pin(x)
+                logger.info(
+                    f"[PIN] evict: pin expired on node {x.id}, allowing eviction"
+                )
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
@@ -1026,24 +971,18 @@ class HiRadixCache(RadixCache):
             # node is protected from eviction as it has ongoing prefetch or backup to storage
             if x.host_ref_counter > 0:
                 continue
-            if x.pin_count > 0:
-                if x.pin_expiry > 0 and time.monotonic() > x.pin_expiry:
-                    # Expired: clear pin, allow host eviction
-                    self._active_pin_count -= x.pin_count
-                    x.pin_count = 0
-                    x.pin_expiry = 0.0
-                    x.pin_ttl = 0
-                    logger.info(
-                        f"[PIN] evict_host: pin expired on node {x.id}, allowing eviction"
-                    )
-                    # Fall through to normal host eviction
-                else:
-                    logger.info(
-                        f"[PIN] evict_host: skipping pinned node {x.id} "
-                        f"(pin_count={x.pin_count}, expires in "
-                        f"{x.pin_expiry - time.monotonic():.1f}s)"
-                    )
-                    continue
+            if self._is_pinned(x):
+                logger.info(
+                    f"[PIN] evict_host: skipping pinned node {x.id} "
+                    f"(expires in {x.pin_expiry - time.monotonic():.1f}s)"
+                )
+                continue
+            elif x.pin_expiry > 0:
+                # Expired pin: clear and fall through to normal host eviction
+                self._clear_pin(x)
+                logger.info(
+                    f"[PIN] evict_host: pin expired on node {x.id}, allowing eviction"
+                )
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
@@ -1133,7 +1072,7 @@ class HiRadixCache(RadixCache):
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
-            if node.pin_count > 0:
+            if self._is_pinned(node):
                 pinned_count += 1
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
@@ -1448,8 +1387,8 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            # Refresh pin TTL on host insert hit (skip if expired)
-            if node.pin_count > 0 and node.pin_ttl > 0 and time.monotonic() <= node.pin_expiry:
+            # Refresh pin TTL on host insert hit
+            if self._is_pinned(node):
                 node.pin_expiry = time.monotonic() + node.pin_ttl
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
@@ -1486,8 +1425,8 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            # Refresh pin TTL on cache hit (skip if expired)
-            if child.pin_count > 0 and child.pin_ttl > 0 and time.monotonic() <= child.pin_expiry:
+            # Refresh pin TTL on cache hit
+            if self._is_pinned(child):
                 child.pin_expiry = time.monotonic() + child.pin_ttl
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
@@ -1513,18 +1452,10 @@ class HiRadixCache(RadixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.pin_count = child.pin_count
         new_node.pin_expiry = child.pin_expiry
         new_node.pin_ttl = child.pin_ttl
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
-
-        if child.pin_count > 0:
-            logger.debug(
-                f"[PIN] _split_node: splitting pinned node {child.id} "
-                f"(pin_count={child.pin_count}, key_len={len(child.key)}, "
-                f"split_len={split_len}, new_node_id={new_node.id})"
-            )
 
         # split value and host value if exists
         if child.evicted:

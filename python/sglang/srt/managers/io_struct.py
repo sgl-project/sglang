@@ -1268,20 +1268,6 @@ class PinPrefixReqOutput(BaseReq):
 
 
 @dataclass
-class UnpinPrefixReqInput(BaseReq):
-    """Unpin a prefix by token_ids to allow normal eviction."""
-
-    token_ids: List[int] = field(default_factory=list)
-
-
-@dataclass
-class UnpinPrefixReqOutput(BaseReq):
-    success: bool
-    unpinned_count: int = 0
-    message: str = ""
-
-
-@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.

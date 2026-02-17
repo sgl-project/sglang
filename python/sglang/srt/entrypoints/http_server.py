@@ -118,7 +118,6 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
-    UnpinPrefixReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -813,21 +812,6 @@ async def pin_prefix(obj: PinPrefixReqInput):
         content={
             "status": "ok" if ret.success else "error",
             "pinned_count": ret.pinned_count,
-            "message": ret.message,
-        },
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
-
-
-@app.api_route("/hicache/unpin_prefix", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def unpin_prefix(obj: UnpinPrefixReqInput):
-    """Unpin a prefix by token_ids to allow normal eviction."""
-    ret = await _global_state.tokenizer_manager.unpin_prefix(obj.token_ids)
-    return ORJSONResponse(
-        content={
-            "status": "ok" if ret.success else "error",
-            "unpinned_count": ret.unpinned_count,
             "message": ret.message,
         },
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,

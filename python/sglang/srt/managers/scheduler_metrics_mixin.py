@@ -559,8 +559,7 @@ class SchedulerMetricsMixin:
         host_pool = self.tree_cache.token_to_kv_pool_host
         host_used = host_pool.size - host_pool.available_size()
         host_total = host_pool.size
-        active_pins = self.tree_cache._active_pin_count
-        collector.update(host_used, host_total, active_pins)
+        collector.update(host_used, host_total)
 
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""
