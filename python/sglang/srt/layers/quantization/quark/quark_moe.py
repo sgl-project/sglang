@@ -118,11 +118,31 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         params_dtype = torch.uint8
 
+        # Padding for Aiter MFMA
+        padded_for_mfma = False
+        if _use_aiter:
+            ALIGN_K = 128
+            align_k = lambda n: (n + ALIGN_K - 1) // ALIGN_K * ALIGN_K
+            w13_inter_dim_padded = 2 * intermediate_size_per_partition
+            w2_inter_dim_padded = intermediate_size_per_partition // 2
+            if w2_inter_dim_padded % ALIGN_K:
+                w2_inter_dim_padded = align_k(w2_inter_dim_padded)
+                # up proj + gate fusion : 2x
+                w13_inter_dim_padded = w2_inter_dim_padded * 2
+                if hasattr(torch, "float4_e2m1fn_x2"):
+                    # pack fp4: 2x
+                    w13_inter_dim_padded *= 2
+                padded_for_mfma = True
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                (
+                    2 * intermediate_size_per_partition
+                    if not padded_for_mfma
+                    else w13_inter_dim_padded
+                ),
                 hidden_size // 2,
                 dtype=params_dtype,
             ),
@@ -136,7 +156,11 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // 2,
+                (
+                    intermediate_size_per_partition // 2
+                    if not padded_for_mfma
+                    else w2_inter_dim_padded
+                ),
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -149,7 +173,11 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                (
+                    2 * intermediate_size_per_partition
+                    if not padded_for_mfma
+                    else w13_inter_dim_padded
+                ),
                 hidden_size // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
