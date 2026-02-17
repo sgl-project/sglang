@@ -38,8 +38,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    _apply_rotary_emb_qk,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -314,18 +313,7 @@ class WanTransformerBlock(nn.Module):
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
-        cross_attn_backends = supported_attention_backends
-        if (
-            supported_attention_backends is not None
-            and AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
-            in supported_attention_backends
-        ):
-            cross_attn_backends = supported_attention_backends.copy()
-            cross_attn_backends.remove(AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN)
-            logger.debug(
-                "Sparse Video Gen 2 attention backend is not supported for cross-attention; "
-                "removing SPARSE_VIDEO_GEN_2_ATTN from cross-attention backends."
-            )
+
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=self.local_num_heads,
@@ -458,21 +446,8 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk(query, key, cos, sin, is_neox_style=False)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -640,21 +615,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk(query, key, cos, sin, is_neox_style=False)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
