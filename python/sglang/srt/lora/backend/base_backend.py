@@ -1,7 +1,9 @@
-from typing import Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.lora.utils import build_lm_head_pass_segments
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -18,6 +20,14 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        self.lm_head_batch_info = None
+        # Precomputed per-pass lm_head batch_infos.  When the logits processor
+        # calls lm_head in multiple passes (chunked logprobs), each pass gets
+        # its own batch_info from this list.
+        self.lm_head_pass_batch_infos = None
+        # Current pass index.  When set, apply_lora uses
+        # lm_head_pass_batch_infos[idx] instead of lm_head_batch_info.
+        self._lm_head_pass_idx = None
 
     def run_lora_a_embedding(
         self,
@@ -178,3 +188,30 @@ class BaseLoRABackend:
             use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass
+
+    def _get_lm_head_pass_segments(
+        self,
+        weight_indices: list[int],
+        pruned_lens: List[int],
+    ) -> Optional[List[Tuple[List[int], List[int]]]]:
+        """Compute per-pass segment info for lm_head LoRA logprobs chunking.
+
+        When LogitsProcessor splits pruned states into fixed-size passes,
+        each pass needs its own segmentation so that lm_head LoRA operates
+        on the correct adapter assignments.  This method returns the generic
+        per-pass (seg_weight_indices, seg_lens) tuples; each backend is
+        responsible for converting them into backend-specific LoRABatchInfo.
+
+        Returns None if logprobs chunking is disabled or the pruned token
+        count does not exceed the logprobs chunk size.
+        """
+        logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+        pruned_total = sum(pruned_lens)
+
+        if not enable_logprobs_chunk or pruned_total <= logprobs_chunk_size:
+            return None
+
+        return build_lm_head_pass_segments(
+            weight_indices, pruned_lens, logprobs_chunk_size
+        )

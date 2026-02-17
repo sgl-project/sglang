@@ -531,6 +531,22 @@ class LoRAMemoryPool:
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+        else:
+            # Zero out embedding/lm_head buffers for adapters without embedding LoRA
+            # to avoid using garbage values from uninitialized memory
+            for k in self.embedding_A_buffer.keys():
+                self.embedding_A_buffer[k][buffer_id].zero_()
+            for k in self.embedding_B_buffer.keys():
+                self.embedding_B_buffer[k][buffer_id].zero_()
+            for k in self.lm_head_A_buffer.keys():
+                self.lm_head_A_buffer[k][buffer_id].zero_()
+            for k in self.lm_head_B_buffer.keys():
+                self.lm_head_B_buffer[k][buffer_id].zero_()
+            if (
+                self.lora_added_tokens_size > 0
+                and "input_embeddings" in self.new_embeddings_buffer
+            ):
+                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
