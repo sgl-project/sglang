@@ -94,9 +94,6 @@ def format_lora_message(
     return nickname_str, target_str, strength_str
 
 
-# ---- Generation result ----
-
-
 @dataclass
 class GenerationResult:
     """Result of a single generation request from DiffGenerator."""

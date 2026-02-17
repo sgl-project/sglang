@@ -58,7 +58,9 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return None, None
 
 
-def choose_image_ext(output_format: Optional[str], background: Optional[str]) -> str:
+def choose_output_image_ext(
+    output_format: Optional[str], background: Optional[str]
+) -> str:
     fmt = (output_format or "").lower()
     if fmt in {"png", "webp", "jpeg", "jpg"}:
         return "jpg" if fmt == "jpeg" else fmt
@@ -70,12 +72,17 @@ def choose_image_ext(output_format: Optional[str], background: Optional[str]) ->
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
-    Handles size parsing and None filtering before delegating to
-    SamplingParams.from_user_sampling_params_args. Callers pass only the
-    parameters they have; None values are stripped automatically so that
-    SamplingParams defaults apply.
+    Handles size parsing, output_quality resolution, and None filtering before
+    delegating to SamplingParams.from_user_sampling_params_args. Callers pass
+    only the parameters they have; None values are stripped automatically so
+    that SamplingParams defaults apply.
     """
     server_args = get_global_server_args()
+
+    # pop HTTP-layer params that aren't SamplingParams fields
+    output_quality = kwargs.pop("output_quality", None)
+
+    has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
@@ -89,12 +96,22 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
     kwargs.setdefault("save_output", True)
 
-    return SamplingParams.from_user_sampling_params_args(
+    sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
         request_id=request_id,
         **kwargs,
     )
+
+    # resolve output_quality → output_compression with the correct data_type.
+    # SamplingParams.__post_init__ may have resolved with the wrong data_type
+    # (default VIDEO) before _adjust() set the correct one.
+    if not has_explicit_compression and output_quality is not None:
+        resolved = adjust_output_quality(output_quality, sampling_params.data_type)
+        if resolved is not None:
+            sampling_params.output_compression = resolved
+
+    return sampling_params
 
 
 async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:

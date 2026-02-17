@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     DEFAULT_FPS,
     DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
-    adjust_output_quality,
     build_sampling_params,
     merge_image_input_list,
     process_generation_batch,
@@ -72,6 +71,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         enable_teacache=request.enable_teacache,
         output_path=request.output_path,
         output_compression=request.output_compression,
+        output_quality=request.output_quality,
     )
 
 
@@ -101,8 +101,10 @@ async def _save_first_input_image(image_sources, request_id: str) -> str | None:
     if not image_list:
         return None
     image = image_list[0]
-    uploads_dir = os.path.join("outputs", "uploads")
+
+    uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
+
     filename = image.filename if hasattr(image, "filename") else "url_image"
     target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
     return await save_image_to_path(image, target_path)
@@ -268,10 +270,6 @@ async def create_video(
         server_args=server_args,
         sampling_params=sampling_params,
     )
-    if batch.output_compression is None:
-        batch.output_compression = adjust_output_quality(
-            req.output_quality, batch.data_type
-        )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs

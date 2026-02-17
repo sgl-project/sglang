@@ -18,14 +18,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_stora
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
-    adjust_output_quality,
     build_sampling_params,
-    choose_image_ext,
+    choose_output_image_ext,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -47,6 +47,8 @@ def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
     prompt: str,
+    request_id: str,
+    result: OutputBatch,
     *,
     b64_list: list[str] | None = None,
     cloud_url: str | None = None,
@@ -57,6 +59,7 @@ def _build_image_response_kwargs(
     For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
     For url: uses cloud_url or fallback_url.
     """
+    ret = None
     if resp_format == "b64_json":
         if not b64_list:
             raise ValueError("b64_list required for b64_json response_format")
@@ -68,7 +71,7 @@ def _build_image_response_kwargs(
             )
             for b64, path in zip(b64_list, save_file_path_list)
         ]
-        return {"data": data}
+        ret = {"data": data}
     elif resp_format == "url":
         url = cloud_url or fallback_url
         if not url:
@@ -76,7 +79,7 @@ def _build_image_response_kwargs(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        return {
+        ret = {
             "data": [
                 ImageResponseData(
                     url=url,
@@ -90,14 +93,17 @@ def _build_image_response_kwargs(
             status_code=400, detail=f"response_format={resp_format} is not supported"
         )
 
+    ret = add_common_data_to_response(ret, request_id=request_id, result=result)
+
+    return ret
+
 
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
 ):
-
     request_id = generate_request_id()
-    ext = choose_image_ext(request.output_format, request.background)
+    ext = choose_output_image_ext(request.output_format, request.background)
     sampling = build_sampling_params(
         request_id,
         prompt=request.prompt,
@@ -112,15 +118,12 @@ async def generations(
         negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
         output_compression=request.output_compression,
+        output_quality=request.output_quality,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    if batch.output_compression is None:
-        batch.output_compression = adjust_output_quality(
-            request.output_quality, batch.data_type
-        )
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -152,12 +155,12 @@ async def generations(
         save_file_path_list,
         resp_format,
         request.prompt,
+        request_id,
+        result,
         b64_list=b64_list,
         cloud_url=cloud_url,
     )
-    response_kwargs = add_common_data_to_response(
-        response_kwargs, request_id=request_id, result=result
-    )
+
     return ImageResponse(**response_kwargs)
 
 
@@ -198,8 +201,9 @@ async def edits(
         )
 
     # Save all input images; additional images beyond the first are saved for potential future use
-    uploads_dir = os.path.join("outputs", "uploads")
+    uploads_dir = os.path.join("inputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
+
     image_list = merge_image_input_list(images, urls)
 
     input_paths = []
@@ -215,7 +219,7 @@ async def edits(
             status_code=400, detail=f"Failed to process image source: {str(e)}"
         )
 
-    ext = choose_image_ext(output_format, background)
+    ext = choose_output_image_ext(output_format, background)
     sampling = build_sampling_params(
         request_id,
         prompt=prompt,
@@ -232,15 +236,12 @@ async def edits(
         enable_teacache=enable_teacache,
         num_frames=num_frames,
         output_compression=output_compression,
+        output_quality=output_quality,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    if batch.output_compression is None:
-        batch.output_compression = adjust_output_quality(
-            output_quality, batch.data_type
-        )
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
@@ -270,13 +271,13 @@ async def edits(
         save_file_path_list,
         resp_format,
         prompt,
+        request_id,
+        result,
         b64_list=b64_list,
         cloud_url=cloud_url,
         fallback_url=f"/v1/images/{request_id}/content",
     )
-    response_kwargs = add_common_data_to_response(
-        response_kwargs, request_id=request_id, result=result
-    )
+
     return ImageResponse(**response_kwargs)
 
 
