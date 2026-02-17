@@ -38,8 +38,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    _apply_rotary_emb_qk,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -220,7 +219,6 @@ class WanI2VCrossAttention(WanSelfAttention):
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
-        # VSA should not be in supported_attention_backends
         super().__init__(
             dim,
             num_heads,
@@ -371,6 +369,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -456,21 +457,8 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk(query, key, cos, sin, is_neox_style=False)
+
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -564,9 +552,10 @@ class WanTransformerBlock_VSA(nn.Module):
             dtype=torch.float32,
         )
 
-        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
-            supported_attention_backends.remove(AttentionBackendEnum.VIDEO_SPARSE_ATTN)
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -574,7 +563,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -583,7 +572,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -637,21 +626,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk(query, key, cos, sin, is_neox_style=False)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)

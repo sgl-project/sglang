@@ -241,9 +241,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
