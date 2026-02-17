@@ -90,9 +90,9 @@ class TestGLM47FP8TPMTP(CustomTestCase):
                 f"{spec_accept_rate=:.2f}\n"
             )
 
-        self.assertGreater(metrics["accuracy"], 0.80)
-        self.assertGreater(avg_spec_accept_length, 2.0)
-        self.assertGreater(spec_accept_rate, 0.5)
+            self.assertGreater(metrics["accuracy"], 0.80)
+            self.assertGreater(spec_accept_rate, 0.5)
+            self.assertGreater(avg_spec_accept_length, 2.0)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -107,7 +107,7 @@ class TestGLM47FP8TPMTP(CustomTestCase):
                 f"{speed=:.2f} token/s\n"
             )
 
-        self.assertGreater(acc_length, 2.0)
+            self.assertGreater(acc_length, 2.0)
         if is_in_amd_ci():
             self.assertGreater(speed, 15)
         else:
