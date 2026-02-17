@@ -221,8 +221,8 @@ void awq_marlin_repack(
   auto stream = LaunchKernel::resolve_device(device);
 
   // Get pointers
-  auto* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(b_q_weight->data);
-  auto* out_ptr = reinterpret_cast<uint32_t*>(out->data);
+  auto* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr());
+  auto* out_ptr = reinterpret_cast<uint32_t*>(out.data_ptr());
 
   // Get device attributes
   int blocks = 0;
