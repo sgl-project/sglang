@@ -4,15 +4,16 @@
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
-/python/sglang/multimodal_gen @mickqian @yhyang201
-/python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian
-/python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian
+/python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
+/python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
+/python/sglang/multimodal_gen/runtime/models/dits @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
 /python/sglang/srt/compilation @hebiao064
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
+/python/sglang/srt/dllm @ClawSeven @btw616
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
 /python/sglang/srt/eplb @fzyzcjy @ch-wan
