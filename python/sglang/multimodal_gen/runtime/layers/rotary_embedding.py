@@ -52,7 +52,6 @@ class RotaryEmbedding(CustomOp):
         is_neox_style: bool,
         dtype: torch.dtype,
     ) -> None:
-        self.function_name = "rotary_embedding"
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
