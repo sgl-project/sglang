@@ -1467,6 +1467,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
+                intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(
                     getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
                 ),
