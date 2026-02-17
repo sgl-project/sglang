@@ -50,13 +50,13 @@ class Sampler(nn.Module):
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
 
+        self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
+        # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_global_server_args().enable_deterministic_inference
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-        self.use_log_softmax_logprob = (
-            get_global_server_args().rl_on_policy_target is not None
-        )
+        self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
@@ -95,14 +95,11 @@ class Sampler(nn.Module):
             return_logprob: If set, store the output logprob information to
                 logits_output
             top_logprobs_nums: Number of top lobprobs per sequence in a batch
-            batch_next_token_ids: next token IDs. If set, skip sampling and only
-                compute output logprobs It is used for speculative decoding which
-                performs sampling in draft workers.
+            token_ids_logprobs:
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
-        logits_dtype = torch.float32
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
@@ -121,9 +118,7 @@ class Sampler(nn.Module):
 
             # If requested, cache original logprobs before temperature scaling.
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
-                original_logprobs = torch.log(torch.softmax(logits, dim=-1)).clamp(
-                    min=torch.finfo(logits_dtype).min
-                )
+                original_logprobs = torch.log_softmax(logits, dim=-1)
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
@@ -135,45 +130,43 @@ class Sampler(nn.Module):
                     logits_div_temperature, dim=-1
                 )
                 del logits_div_temperature
-                # TODO: we should always sample from logprobs_via_logsoftmax_kernel
 
             if self.use_ascend_backend:
-                # Ascend backend path: sample directly from temperature-scaled logits (no softmax)
-                # Apply temperature scaling
+                # Ascend backend path:
+                # Ascend backend has some fused kernels that handle softmax internally,
+                # so we can sample directly from temperature-scaled logits.
                 logits.div_(sampling_info.temperatures)
                 batch_next_token_ids = self._sample_from_logits(
                     logits, sampling_info, simple_sampling_case
                 )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    probs = torch.softmax(logits, dim=-1)
+                    logprobs = torch.log_softmax(logits, dim=-1)
             elif (
                 self.use_log_softmax_logprob
                 and self.enable_deterministic
                 and simple_sampling_case
             ):
-                # RL onpolicy path: Sample from logprobs via gumbel trick
+                # RL on-policy path: Sample from logprobs to match the trainer better.
                 batch_next_token_ids = self._sample_from_logprobs(
                     logprobs_via_logsoftmax_kernel,
                     sampling_info,
                     positions,
                 )
+                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                    logprobs = logprobs_via_logsoftmax_kernel
             else:
-                # Standard path: sample from probs (softmax applied)
+                # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
                 probs = torch.softmax(logits, dim=-1)
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
+                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                    logprobs = torch.log(probs, dim=-1)
 
             # Compute logprobs for return if requested
-            if return_logprob:
-                if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = original_logprobs
-                elif get_global_server_args().rl_on_policy_target is not None:
-                    logprobs = logprobs_via_logsoftmax_kernel
-                else:
-                    # clamp to avoid -inf
-                    logprobs = torch.log(probs).clamp(min=torch.finfo(logits_dtype).min)
+            if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                logprobs = original_logprobs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -211,6 +204,9 @@ class Sampler(nn.Module):
         else:
             backend = get_global_server_args().sampling_backend
             if backend == "flashinfer":
+                assert (
+                    sampling_info.sampling_seed is None
+                ), "Sampling seed is not supported for flashinfer backend"
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -274,6 +270,9 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
+            assert (
+                self.use_ascend_backend
+            ), "Only ascend backend supports sampling from logits"
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_ascend(
                 logits,
                 sampling_info.top_ks,
@@ -281,7 +280,7 @@ class Sampler(nn.Module):
                 sampling_info.min_ps,
                 sampling_info.need_min_p_sampling,
             )
-        return batch_next_token_ids
+            return batch_next_token_ids.to(torch.int32)
 
     def _attach_logprobs_to_output(
         self,
@@ -292,6 +291,9 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
     ):
+        # clamp to avoid -inf values
+        logprobs = logprobs.clamp(min=torch.finfo(logprobs.dtype).min)
+
         # Attach logprobs to logits_output (in-place modification)
         if any(x > 0 for x in top_logprobs_nums):
             (
@@ -442,17 +444,19 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         ), "With sampling seed, multinomial_with_seed will provide wrong results"
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    if sampling_seed is not None:
+
+    if sampling_seed is None:
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    else:
         # NOTE: when using top-k/top-p/min-p sampling, we need to modify probs before we
         # apply log to get logprobs. Therefore, we cannot use log_softmax directly.
         # For now, we use log to the modified probs to get logprobs, but for numerical
         # stability, we'd better come up with a solution to use log_softmax.
         logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
         del probs_sort
-        torch.log_(logprobs)
+        logprobs.log_()
         sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
-    else:
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
@@ -561,13 +565,13 @@ def sampling_from_probs_torch(
 
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
-    if sampling_seed is not None:
-        # Deterministic sampling: convert probs to logprobs and use gumbel trick
-        logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
-        sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
-        del logprobs
-    else:
+    if sampling_seed is None:
         sampled_index = torch.multinomial(probs, num_samples=1)
+    else:
+        # Deterministic sampling: convert probs to logprobs and use gumbel trick
+        sampled_index = multinomial_with_seed(
+            torch.log(probs), sampling_seed, positions
+        )
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids
 
