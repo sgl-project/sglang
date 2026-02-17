@@ -1257,6 +1257,7 @@ class PinPrefixReqInput(BaseReq):
     """Pin a prefix by token_ids to resist eviction."""
 
     token_ids: List[int] = field(default_factory=list)
+    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
 
 
 @dataclass

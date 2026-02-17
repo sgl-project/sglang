@@ -106,6 +106,8 @@ class TreeNode:
         self.lock_ref = 0
         # pin_count: protects from CPU/host eviction only (external PIN API via HiRadixCache).
         self.pin_count = 0
+        self.pin_expiry: float = 0.0    # absolute expiry time (time.monotonic())
+        self.pin_ttl: int = 0           # original TTL in seconds, for refresh-on-hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 

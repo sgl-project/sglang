@@ -2565,11 +2565,11 @@ class Scheduler(
                 pinned_count=0,
                 message="PIN requires --enable-hierarchical-cache",
             )
-        pinned = self.tree_cache.pin_prefix(recv_req.token_ids)
+        pinned = self.tree_cache.pin_prefix(recv_req.token_ids, recv_req.ttl_seconds)
         return PinPrefixReqOutput(
             success=True,
             pinned_count=pinned,
-            message=f"Pinned {pinned} nodes from {len(recv_req.token_ids)} token_ids",
+            message=f"Pinned {pinned} nodes (ttl={recv_req.ttl_seconds}s)",
         )
 
     def unpin_prefix_wrapped(self, recv_req: UnpinPrefixReqInput):

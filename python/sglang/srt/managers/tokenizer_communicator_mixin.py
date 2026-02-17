@@ -414,11 +414,11 @@ class TokenizerCommunicatorMixin:
         return out
 
     async def pin_prefix(
-        self: TokenizerManager, token_ids: List[int]
+        self: TokenizerManager, token_ids: List[int], ttl_seconds: int = 300
     ) -> PinPrefixReqOutput:
         """Pin a prefix by token_ids to resist eviction."""
         results = await self.pin_prefix_communicator(
-            PinPrefixReqInput(token_ids=token_ids)
+            PinPrefixReqInput(token_ids=token_ids, ttl_seconds=ttl_seconds)
         )
         all_success, all_message = _Communicator.merge_results(results)
         total = sum(r.pinned_count for r in results)
