@@ -59,8 +59,8 @@ def _inject_env():
             os.environ[key] = value
 
 
-def setup_dir():
-    """Remove stale coredump files from previous runs."""
+def cleanup_dump_dir():
+    """Remove stale coredump files from the dump directory."""
     dump_dir = get_dump_dir()
     for f in glob.glob(os.path.join(dump_dir, "cuda_coredump_*")):
         os.remove(f)

@@ -133,7 +133,7 @@ def run_unittest_files(
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
-        cuda_coredump.setup_dir()
+        cuda_coredump.cleanup_dump_dir()
 
     tic = time.perf_counter()
     success = True
