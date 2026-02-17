@@ -78,15 +78,21 @@ class TestGLM47FP8TPMTP(CustomTestCase):
         ]
         print(f"{avg_spec_accept_length=}")
 
+        loads_info = requests.get(self.base_url + "/v1/loads?include=spec")
+        spec_accept_rate = loads_info.json()["loads"][0]["speculative"]["accept_rate"]
+        print(f"{spec_accept_rate=}")
+
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (glm-4.7-fp8 tp mtp)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
+                f"{spec_accept_rate=:.2f}\n"
             )
 
         self.assertGreater(metrics["accuracy"], 0.80)
         self.assertGreater(avg_spec_accept_length, 2.0)
+        self.assertGreater(spec_accept_rate, 0.5)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
