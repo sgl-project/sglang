@@ -131,10 +131,8 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
-            if _is_cuda:
+            if _is_cuda or _is_hip:
                 from sglang.jit_kernel.pos_enc import rotary_embedding
-            elif _is_hip:
-                from sgl_kernel import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -390,19 +388,6 @@ class RotaryEmbedding(MultiPlatformOp):
                 self.is_neox_style,
             )
         return query, key
-
-    def forward_hip(self, *args, **kwargs):
-        """HIP/ROCm implementation.
-
-        The JIT kernels (sglang.jit_kernel.pos_enc) used in forward_cuda's
-        fallback path depend on tvm_ffi which invokes nvidia-smi to detect
-        CUDA compute capability. This fails on AMD GPUs, so we use the
-        pure-PyTorch native implementation instead.
-
-        Uses *args/**kwargs because subclasses (MRotaryEmbedding, etc.)
-        have different forward_native() signatures.
-        """
-        return self.forward_native(*args, **kwargs)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
