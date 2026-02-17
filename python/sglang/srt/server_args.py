@@ -749,9 +749,6 @@ class ServerArgs:
         # Handle context parallelism.
         self._handle_context_parallelism()
 
-        # Handle FP8 GEMM backend
-        self._handle_fp8_gemm_backend()
-
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
@@ -2087,12 +2084,6 @@ class ServerArgs:
                 assert (
                     self.ep_size * self.moe_dp_size == self.tp_size
                 ), "ep_size * moe_dp_size must be equal to tp_size"
-
-    def _handle_fp8_gemm_backend(self):
-        if self.fp8_gemm_runner_backend == "auto":
-            if is_sm120_supported():
-                self.fp8_gemm_runner_backend = "cutlass"
-                logger.info("Using cutlass FP8 GEMM backend for SM120.")
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

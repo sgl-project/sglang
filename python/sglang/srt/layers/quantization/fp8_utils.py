@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     offloader,
 )
 
@@ -168,7 +169,7 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
     """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm90_supported() or is_blackwell_supported()
+    return is_sm90_supported() or is_blackwell_supported() or is_sm120_supported()
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -254,13 +255,16 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
-    # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 1. CUTLASS (if SM120) - Prioritized for SM120
+    # 2. DeepGEMM (if enabled and available)
+    # 3. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 4. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 5. AITER (if AMD GPU with AITER enabled)
+    # 6. Triton (fallback)
 
-    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+    if is_sm120_supported() and _check_cutlass_block_fp8_hardware_support():
+        return cutlass_w8a8_block_fp8_linear_with_fallback
+    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
