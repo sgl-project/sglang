@@ -9,7 +9,6 @@ import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from pathlib import Path
 from typing import Any, Dict, Type
 
 import torch
@@ -147,18 +146,6 @@ def _clean_hf_config_inplace(model_config: dict) -> None:
 def _list_safetensors_files(model_path: str) -> list[str]:
     """List all .safetensors files under a directory."""
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
-
-
-def find_weights_dir(local_path: str, module_name: str) -> Path | None:
-    """Locate the safetensors directory for module_name under local_path.
-
-    Diffusion models store weights in per-module subdirectories (e.g.
-    transformer/, vae/, text_encoder/).
-    """
-    dir_path = Path(local_path) / module_name
-    if dir_path.exists():
-        return dir_path
-    return None
 
 
 def get_memory_usage_of_component(module) -> float | None:

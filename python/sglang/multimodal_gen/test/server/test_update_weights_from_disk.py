@@ -149,7 +149,6 @@ from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
-    find_weights_dir,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     compute_weights_checksum,
@@ -223,8 +222,10 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     same disk checksum is requested multiple times across tests.
     """
     local_path = maybe_download_model(model_path)
-    weights_dir = find_weights_dir(local_path, module_name)
-    assert weights_dir is not None, f"No weights dir for {module_name} in {local_path}"
+    weights_dir = os.path.join(local_path, module_name)
+    assert os.path.exists(
+        weights_dir
+    ), f"No weights dir for {module_name} in {local_path}"
 
     safetensors_files = _list_safetensors_files(weights_dir)
     assert safetensors_files, f"No safetensors files in {weights_dir}"

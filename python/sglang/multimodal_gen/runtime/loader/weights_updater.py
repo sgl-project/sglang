@@ -50,6 +50,7 @@ Key design decisions:
 from __future__ import annotations
 
 import gc
+from pathlib import Path
 
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
@@ -57,7 +58,6 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
-    find_weights_dir,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -108,9 +108,9 @@ def _validate_weight_files(
     weights_map: dict[str, str] = {}
     missing: list[str] = []
     for module_name, _ in modules_to_update:
-        weights_dir = find_weights_dir(local_model_path, module_name)
-        if weights_dir and _list_safetensors_files(weights_dir):
-            weights_map[module_name] = weights_dir
+        weights_dir = Path(local_model_path) / module_name
+        if weights_dir.exists() and _list_safetensors_files(str(weights_dir)):
+            weights_map[module_name] = str(weights_dir)
         else:
             missing.append(module_name)
     return weights_map, missing
@@ -306,8 +306,8 @@ class WeightsUpdater:
             module = self.pipeline.get_module(name)
             if module is None:
                 continue
-            weights_dir = find_weights_dir(original_path, name)
-            if weights_dir is None:
+            weights_dir = Path(original_path) / name
+            if not weights_dir.exists():
                 continue
-            weights_iter = _get_weights_iter(weights_dir)
+            weights_iter = _get_weights_iter(str(weights_dir))
             _load_weights_into_module(module, weights_iter)
