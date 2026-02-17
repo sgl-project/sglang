@@ -60,11 +60,11 @@ class CustomOp(nn.Module):
         except:
             self.raise_error()
 
-    def two_step_choose(self, v1: str, v2: Callable) -> Callable:
+    def two_step_choose(self, base_backend: str, second_option: Callable) -> Callable:
         try:
-            return self.get_function(v1)
+            return self.get_function(base_backend)
         except:
-            return v2()
+            return second_option()
 
     def use_forward_hip(self, *args, **kwargs) -> Callable:
         # ROCm kernels follow the CUDA path by default.
