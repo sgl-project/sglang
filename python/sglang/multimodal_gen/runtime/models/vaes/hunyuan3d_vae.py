@@ -1,16 +1,6 @@
 # Copied and adapted from: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
 
 
-# SPDX-License-Identifier: Apache-2.0
-# Adapted from Hunyuan3D under TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-# Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
-"""
-Hunyuan3D Shape VAE for 3D mesh generation.
-
-This module implements the ShapeVAE and all its dependencies for encoding/decoding
-3D latent representations to meshes.
-"""
-
 from __future__ import annotations
 
 from typing import Callable, List, Optional, Tuple, Union
@@ -28,10 +18,6 @@ logger = init_logger(__name__)
 
 # Attention backend selection
 scaled_dot_product_attention = F.scaled_dot_product_attention
-
-# =============================================================================
-# Attention Processors
-# =============================================================================
 
 
 class CrossAttentionProcessor:
@@ -109,48 +95,7 @@ class FlashVDMTopMCrossAttentionProcessor(FlashVDMCrossAttentionProcessor):
         return k0, v0
 
 
-# =============================================================================
-# attention blocks
-# =============================================================================
-
-
 class FourierEmbedder(nn.Module):
-    """The sin/cosine positional embedding. Given an input tensor `x` of shape [n_batch, ..., c_dim], it converts
-    each feature dimension of `x[..., i]` into:
-        [
-            sin(x[..., i]),
-            sin(f_1*x[..., i]),
-            sin(f_2*x[..., i]),
-            ...
-            sin(f_N * x[..., i]),
-            cos(x[..., i]),
-            cos(f_1*x[..., i]),
-            cos(f_2*x[..., i]),
-            ...
-            cos(f_N * x[..., i]),
-            x[..., i]     # only present if include_input is True.
-        ], here f_i is the frequency.
-
-    Denote the space is [0 / num_freqs, 1 / num_freqs, 2 / num_freqs, 3 / num_freqs, ..., (num_freqs - 1) / num_freqs].
-    If logspace is True, then the frequency f_i is [2^(0 / num_freqs), ..., 2^(i / num_freqs), ...];
-    Otherwise, the frequencies are linearly spaced between [1.0, 2^(num_freqs - 1)].
-
-    Args:
-        num_freqs (int): the number of frequencies, default is 6;
-        logspace (bool): If logspace is True, then the frequency f_i is [..., 2^(i / num_freqs), ...],
-            otherwise, the frequencies are linearly spaced between [1.0, 2^(num_freqs - 1)];
-        input_dim (int): the input dimension, default is 3;
-        include_input (bool): include the input tensor or not, default is True.
-
-    Attributes:
-        frequencies (torch.Tensor): If logspace is True, then the frequency f_i is [..., 2^(i / num_freqs), ...],
-                otherwise, the frequencies are linearly spaced between [1.0, 2^(num_freqs - 1);
-
-        out_dim (int): the embedding size, if include_input is True, it is input_dim * (num_freqs * 2 + 1),
-            otherwise, it is input_dim * num_freqs * 2.
-
-    """
-
     def __init__(
         self,
         num_freqs: int = 6,
@@ -186,15 +131,7 @@ class FourierEmbedder(nn.Module):
         return out_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward process.
-
-        Args:
-            x: tensor of shape [..., dim]
-
-        Returns:
-            embedding: an embedding of `x` of shape [..., dim * (num_freqs * 2 + temp)]
-                where temp is 1 if include_input is True and 0 otherwise.
-        """
+        """Forward process."""
 
         if self.num_freqs > 0:
             embed = (x[..., None].contiguous() * self.frequencies).view(
@@ -217,15 +154,7 @@ class DropPath(nn.Module):
         self.scale_by_keep = scale_by_keep
 
     def forward(self, x):
-        """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-
-        This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
-        the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-        See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
-        changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
-        'survival rate' as the argument.
-
-        """
+        """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
         if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1 - self.drop_prob
@@ -604,11 +533,6 @@ class CrossAttentionDecoder(nn.Module):
 
         occ = self.output_proj(x)
         return occ
-
-
-# =============================================================================
-# Volume Decoders
-# =============================================================================
 
 
 def generate_dense_grid_points(
@@ -1080,11 +1004,6 @@ class FlashVDMVolumeDecoding:
         return grid_logits
 
 
-# =============================================================================
-# Surface Extractors
-# =============================================================================
-
-
 class Latent2MeshOutput:
     """Container for mesh output from VAE decoder."""
 
@@ -1181,11 +1100,6 @@ SurfaceExtractors = {
     "mc": MCSurfaceExtractor,
     "dmc": DMCSurfaceExtractor,
 }
-
-
-# =============================================================================
-# models
-# =============================================================================
 
 
 class VectsetVAE(nn.Module):

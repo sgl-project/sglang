@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Hunyuan3D image-to-mesh pipeline implementation.
 

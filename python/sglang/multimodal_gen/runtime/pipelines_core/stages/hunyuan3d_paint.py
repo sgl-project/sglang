@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Hunyuan3D paint/texture generation stages.
 
@@ -473,11 +472,6 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         return result
 
     # Stage 2: TexGen (model loading + input prep + denoising + decode)class Hunyuan3DPaintTexGenStage(PipelineStage):
-    """Multi-view texture generation via UNet2.5D diffusion.
-
-    Loads paint models lazily, prepares denoising inputs, runs the
-    denoising loop, and decodes latents to multi-view texture images.
-    """
 
     def __init__(
         self,

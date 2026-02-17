@@ -1,13 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-# Based on diffusers Hunyuan3DFlowMatchEulerDiscreteScheduler
-# Copyright 2024 Stability AI, Katherine Crowson and The HuggingFace Team.
-"""
-Flow Matching Scheduler for Hunyuan3D shape generation.
-
-This implements the Euler discrete scheduler with flow matching for
-the denoising process in 3D generation.
-"""
-
+# Copied and adapted from: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
 from __future__ import annotations
 
 import math
@@ -16,49 +7,20 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-
-try:
-    from diffusers.configuration_utils import ConfigMixin, register_to_config
-    from diffusers.schedulers.scheduling_utils import SchedulerMixin
-    from diffusers.utils import BaseOutput
-
-    HAS_DIFFUSERS = True
-except ImportError:
-    # Provide fallbacks if diffusers is not installed
-    HAS_DIFFUSERS = False
-    ConfigMixin = object
-    SchedulerMixin = object
-
-    class BaseOutput:
-        pass
-
-    def register_to_config(fn):
-        return fn
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.utils import BaseOutput
 
 
 @dataclass
 class Hunyuan3DFlowMatchSchedulerOutput(BaseOutput):
-    """Output class for the scheduler's step function.
-
-    Attributes:
-        prev_sample: Computed sample (x_{t-1}) of previous timestep.
-    """
+    """Output class for the scheduler's step function."""
 
     prev_sample: torch.FloatTensor
 
 
 class Hunyuan3DFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
-    """Euler discrete scheduler for flow matching.
-
-    This scheduler implements the Euler method for solving the ODE
-    in flow matching models. Timesteps are in the range [0, 1] scaled
-    to [0, num_train_timesteps].
-
-    Args:
-        num_train_timesteps: Number of diffusion steps used in training.
-        shift: Shift value for the timestep schedule (controls noise schedule).
-        use_dynamic_shifting: Whether to apply dynamic shifting based on input.
-    """
+    """Euler discrete scheduler for flow matching."""
 
     # External module path aliases for compatibility with Hunyuan3D configs
     _aliases = [
@@ -125,16 +87,7 @@ class Hunyuan3DFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         timestep: Union[float, torch.FloatTensor],
         noise: Optional[torch.FloatTensor] = None,
     ) -> torch.FloatTensor:
-        """Forward process in flow-matching (add noise to sample).
-
-        Args:
-            sample: The input sample.
-            timestep: The current timestep in the diffusion chain.
-            noise: Optional noise tensor. If None, noise is sampled.
-
-        Returns:
-            Noised sample.
-        """
+        """Forward process in flow-matching (add noise to sample)."""
         sigmas = self.sigmas.to(device=sample.device, dtype=sample.dtype)
 
         if sample.device.type == "mps" and torch.is_floating_point(timestep):
@@ -175,14 +128,7 @@ class Hunyuan3DFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         sigmas: Optional[List[float]] = None,
         mu: Optional[float] = None,
     ):
-        """Set the discrete timesteps for the diffusion chain.
-
-        Args:
-            num_inference_steps: Number of diffusion steps for inference.
-            device: Device for the timesteps tensor.
-            sigmas: Optional custom sigmas.
-            mu: Required if use_dynamic_shifting is True.
-        """
+        """Set the discrete timesteps for the diffusion chain."""
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError(
                 "Must pass a value for `mu` when `use_dynamic_shifting` is True"
@@ -243,25 +189,7 @@ class Hunyuan3DFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[Hunyuan3DFlowMatchSchedulerOutput, Tuple]:
-        """Predict the sample from the previous timestep.
-
-        This function propagates the diffusion process from the learned
-        model outputs using the Euler method.
-
-        Args:
-            model_output: Direct output from learned diffusion model.
-            timestep: Current discrete timestep in the diffusion chain.
-            sample: Current instance of sample created by diffusion process.
-            s_churn: Churn parameter (unused, for API compatibility).
-            s_tmin: Minimum timestep for churn (unused).
-            s_tmax: Maximum timestep for churn (unused).
-            s_noise: Noise scaling factor (unused).
-            generator: Random number generator (unused).
-            return_dict: Whether to return Hunyuan3DFlowMatchSchedulerOutput.
-
-        Returns:
-            Hunyuan3DFlowMatchSchedulerOutput or tuple with prev_sample.
-        """
+        """Predict the sample from the previous timestep."""
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
                 "Passing integer indices as timesteps is not supported. "
@@ -300,15 +228,7 @@ class Hunyuan3DConsistencyFlowMatchSchedulerOutput(BaseOutput):
 
 
 class Hunyuan3DConsistencyFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
-    """Consistency Flow Matching Euler Discrete Scheduler.
-
-    This scheduler implements PCM (Progressive Consistency Model) style
-    sampling for faster inference.
-
-    Args:
-        num_train_timesteps: Number of training timesteps.
-        pcm_timesteps: Number of PCM timesteps.
-    """
+    """Consistency Flow Matching Euler Discrete Scheduler."""
 
     # External module path aliases for compatibility with Hunyuan3D configs
     _aliases = [

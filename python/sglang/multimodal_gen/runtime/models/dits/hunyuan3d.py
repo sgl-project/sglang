@@ -1,28 +1,4 @@
 # Copied and adapted from: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
-
-
-# SPDX-License-Identifier: Apache-2.0
-# Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-# except for the third-party components listed below.
-# Hunyuan 3D does not impose any additional limitations beyond what is outlined
-# in the respective licenses of these third-party components.
-# Users must comply with all terms and conditions of original licenses of these third-party
-# components and must ensure that the usage of the third party components adheres to
-# all relevant laws and regulations.
-
-# For avoidance of doubts, Hunyuan 3D means the large language models and
-# their software and algorithms, including trained model weights, parameters (including
-# optimizer states), machine-learning model code, inference-enabling code, training-enabling code,
-# fine-tuning enabling code and other elements of the foregoing made publicly available
-# by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
-
-"""
-Hunyuan3D DiT (Diffusion Transformer) model for 3D shape generation.
-
-This module implements the core DiT architecture used in Hunyuan3D for
-generating 3D latent representations from image conditions.
-"""
-
 from __future__ import annotations
 
 import math
@@ -80,13 +56,7 @@ class MixedRowParallelLinear(RowParallelLinear):
 def _flux_timestep_embedding(
     t: torch.Tensor, dim, max_period=10000, time_factor: float = 1000.0
 ):
-    """
-    Create sinusoidal timestep embeddings for Flux-style model.
-    :param t: a 1-D Tensor of N indices, one per batch element.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an (N, D) Tensor of positional embeddings.
-    """
+    """Create sinusoidal timestep embeddings for Flux-style model."""
     t = time_factor * t
     half = dim // 2
     freqs = torch.exp(
@@ -594,11 +564,6 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
         return latent
 
 
-# =============================================================================
-# Hunyuan3D Paint UNet model for texture generation
-# Copied from: https://github.com/Tencent-Hunyuan/Hunyuan3D-2
-# =============================================================================
-
 import copy
 import json
 import os as _os
@@ -611,10 +576,7 @@ from diffusers.models.transformers.transformer_2d import BasicTransformerBlock
 def _chunked_feed_forward(
     ff: nn.Module, hidden_states: torch.Tensor, chunk_dim: int, chunk_size: int
 ):
-    """Feed forward with chunking to save memory.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-    """
+    """Feed forward with chunking to save memory."""
     if hidden_states.shape[chunk_dim] % chunk_size != 0:
         raise ValueError(
             f"`hidden_states` dimension to be chunked: {hidden_states.shape[chunk_dim]}"
@@ -1001,10 +963,7 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
 
 @torch.no_grad()
 def compute_voxel_grid_mask(position: torch.Tensor, grid_resolution: int = 8):
-    """Compute voxel grid mask for position-aware attention.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-    """
+    """Compute voxel grid mask for position-aware attention."""
     position = position.half()
     B, N, _, H, W = position.shape
     assert H % grid_resolution == 0 and W % grid_resolution == 0
@@ -1051,10 +1010,7 @@ def compute_voxel_grid_mask(position: torch.Tensor, grid_resolution: int = 8):
 def compute_multi_resolution_mask(
     position_maps: torch.Tensor, grid_resolutions: List[int] = [32, 16, 8]
 ) -> dict:
-    """Compute multi-resolution position attention masks.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-    """
+    """Compute multi-resolution position attention masks."""
     position_attn_mask = {}
     with torch.no_grad():
         for grid_resolution in grid_resolutions:
@@ -1070,10 +1026,7 @@ def compute_multi_resolution_mask(
 def compute_discrete_voxel_indice(
     position: torch.Tensor, grid_resolution: int = 8, voxel_resolution: int = 128
 ):
-    """Compute discrete voxel indices for position encoding.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-    """
+    """Compute discrete voxel indices for position encoding."""
     position = position.half()
     B, N, _, H, W = position.shape
     assert H % grid_resolution == 0 and W % grid_resolution == 0
@@ -1112,10 +1065,7 @@ def compute_multi_resolution_discrete_voxel_indice(
     grid_resolutions: List[int] = [64, 32, 16, 8],
     voxel_resolutions: List[int] = [512, 256, 128, 64],
 ) -> dict:
-    """Compute multi-resolution discrete voxel indices.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-    """
+    """Compute multi-resolution discrete voxel indices."""
     voxel_indices = {}
     with torch.no_grad():
         for grid_resolution, voxel_resolution in zip(
@@ -1133,16 +1083,7 @@ def compute_multi_resolution_discrete_voxel_indice(
 
 
 class UNet2p5DConditionModel(torch.nn.Module):
-    """2.5D UNet for multi-view texture generation.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-
-    This model wraps a standard UNet2DConditionModel and adds:
-    - Multiview Attention (MVA) for cross-view consistency
-    - Reference View Attention (RVA) for conditioning
-    - Camera embeddings for view-aware generation
-    - Dual-stream architecture for reference encoding
-    """
+    """2.5D UNet for multi-view texture generation."""
 
     def __init__(self, unet: UNet2DConditionModel) -> None:
         super().__init__()
@@ -1165,15 +1106,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
 
     @staticmethod
     def from_pretrained(pretrained_model_name_or_path: str, **kwargs):
-        """Load a pretrained UNet2p5DConditionModel.
-
-        Args:
-            pretrained_model_name_or_path: Path to the pretrained model directory.
-            **kwargs: Additional arguments (e.g., dtype).
-
-        Returns:
-            Loaded UNet2p5DConditionModel instance.
-        """
+        """Load a pretrained UNet2p5DConditionModel."""
         torch_dtype = kwargs.pop("dtype", kwargs.pop("torch_dtype", torch.float32))
         config_path = _os.path.join(pretrained_model_name_or_path, "config.json")
         unet_ckpt_path = _os.path.join(
@@ -1332,19 +1265,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
         mid_block_res_sample=None,
         **cached_condition,
     ):
-        """Forward pass for multi-view texture generation.
-
-        Args:
-            sample: Input latents [B, N_gen, C, H, W]
-            timestep: Diffusion timestep
-            encoder_hidden_states: Text encoder hidden states
-            cached_condition: Cached conditions including:
-                - normal_imgs: Normal map latents [B, N_gen, C, H, W]
-                - position_imgs: Position map latents [B, N_gen, C, H, W]
-                - ref_latents: Reference image latents [B, N_ref, C, H, W]
-                - camera_info_gen: Camera indices for generated views
-                - camera_info_ref: Camera indices for reference views
-        """
+        """Forward pass for multi-view texture generation."""
         B, N_gen, _, H, W = sample.shape
         assert H == W
 

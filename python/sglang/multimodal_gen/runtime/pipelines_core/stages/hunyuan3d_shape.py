@@ -36,11 +36,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-
 def retrieve_timesteps(
     scheduler,
     num_inference_steps=None,
@@ -117,11 +112,6 @@ def _move_to_device(payload, device, dtype):
     if isinstance(payload, list):
         return [_move_to_device(v, device, dtype) for v in payload]
     return payload
-
-
-# ---------------------------------------------------------------------------
-# Stage 1: BeforeDenoising (monolithic pre-processing)
-# ---------------------------------------------------------------------------
 
 
 class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
@@ -252,19 +242,8 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         return result
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: Denoising (kept unchanged)
-# ---------------------------------------------------------------------------
-
-
 class Hunyuan3DShapeDenoisingStage(DenoisingStage):
-    """Denoising stage for Hunyuan3D shape generation.
-
-    Inherits from DenoisingStage and adapts methods for Hunyuan3D-specific:
-    - Conditioning structure (dict-based)
-    - Timestep normalization
-    - CFG handling (concat latents pattern)
-    """
+    """Denoising stage for Hunyuan3D shape generation."""
 
     def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
         super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
@@ -420,11 +399,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         return result
 
 
-# ---------------------------------------------------------------------------
-# Stage 3: Export (VAE decode + mesh extraction)
-# ---------------------------------------------------------------------------
-
-
 class Hunyuan3DShapeExportStage(PipelineStage):
     """VAE decoding and mesh extraction stage."""
 
@@ -483,16 +457,8 @@ class Hunyuan3DShapeExportStage(PipelineStage):
         return result
 
 
-# ---------------------------------------------------------------------------
-# Stage 4: Save (mesh file export + output decision)
-# ---------------------------------------------------------------------------
-
-
 class Hunyuan3DShapeSaveStage(PipelineStage):
-    """Mesh file export and output decision stage.
-
-    Returns Req when paint is enabled, OutputBatch when paint is disabled.
-    """
+    """Mesh file export and output decision stage."""
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()

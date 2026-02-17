@@ -669,15 +669,7 @@ class MeshValidator:
         return np.array(points)
 
     def _compute_chamfer_distance(self, points1, points2):
-        """Compute bidirectional Chamfer Distance using KD-Tree.
-
-        Args:
-            points1: First point cloud (N, 3)
-            points2: Second point cloud (M, 3)
-
-        Returns:
-            Tuple of (forward_cd, backward_cd, total_cd)
-        """
+        """Compute bidirectional Chamfer Distance using KD-Tree."""
         import numpy as np
         from scipy.spatial import cKDTree
 
@@ -694,15 +686,7 @@ class MeshValidator:
         return forward_cd, backward_cd, total_cd
 
     def validate(self, mesh_path: str) -> dict:
-        """
-        Validate generated mesh against reference mesh.
-
-        Args:
-            mesh_path: Path to the generated mesh file
-
-        Returns:
-            Dictionary with validation results
-        """
+        """Validate generated mesh against reference mesh."""
         try:
             import trimesh
         except ImportError:

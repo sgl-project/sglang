@@ -46,24 +46,7 @@ def meshVerticeInpaint(
     uv_idx: np.ndarray,
     method: str = "smooth",
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Inpaint texture using mesh vertex connectivity.
-
-    This function propagates colors from painted vertices to unpainted vertices
-    using the mesh connectivity graph, weighted by inverse distance.
-
-    Args:
-        texture: Input texture [H, W, C], float32 in [0, 1]
-        mask: Valid region mask [H, W], uint8 (255 = valid)
-        vtx_pos: Vertex positions [V, 3], float32
-        vtx_uv: UV coordinates [V, 2], float32
-        pos_idx: Face vertex indices [F, 3], int32
-        uv_idx: Face UV indices [F, 3], int32
-        method: Inpainting method ("smooth")
-
-    Returns:
-        new_texture: Inpainted texture [H, W, C]
-        new_mask: Updated mask [H, W]
-    """
+    """Inpaint texture using mesh vertex connectivity."""
     kernel = _load_mesh_processor()
 
     texture = np.ascontiguousarray(texture, dtype=np.float32)

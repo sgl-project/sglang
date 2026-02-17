@@ -46,19 +46,7 @@ def rasterize(
     clamp_depth: torch.Tensor = None,
     use_depth_prior: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Rasterize mesh to get face indices and barycentric coordinates.
-
-    Args:
-        pos: Vertex positions [1, N, 4] in clip space (x, y, z, w)
-        tri: Triangle indices [F, 3]
-        resolution: (height, width) of output image
-        clamp_depth: Optional depth buffer for occlusion
-        use_depth_prior: Whether to use depth prior
-
-    Returns:
-        findices: Face indices for each pixel [H, W]
-        barycentric: Barycentric coordinates [H, W, 3]
-    """
+    """Rasterize mesh to get face indices and barycentric coordinates."""
     kernel = _load_custom_rasterizer()
 
     if clamp_depth is None:
@@ -80,17 +68,7 @@ def interpolate(
     barycentric: torch.Tensor,
     tri: torch.Tensor,
 ) -> torch.Tensor:
-    """Interpolate vertex attributes using barycentric coordinates.
-
-    Args:
-        col: Vertex colors/attributes [1, N, C]
-        findices: Face indices from rasterize [H, W]
-        barycentric: Barycentric coordinates [H, W, 3]
-        tri: Triangle indices [F, 3]
-
-    Returns:
-        Interpolated attributes [1, H, W, C]
-    """
+    """Interpolate vertex attributes using barycentric coordinates."""
     # Handle zero indices (background)
     f = findices - 1 + (findices == 0)
     vcol = col[0, tri.long()[f.long()]]

@@ -1,15 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-"""
-3D mesh utilities for Hunyuan3D texture generation.
-
-This module provides:
-- Mesh I/O and conversion utilities
-- Camera projection utilities
-- Mesh rendering with CUDA rasterization
-- Texture baking and inpainting
-
-Adapted from Hunyuan3D-2: https://github.com/Tencent/Hunyuan3D-2
-"""
+"""Adapted from Hunyuan3D-2: https://github.com/Tencent/Hunyuan3D-2"""
 
 from __future__ import annotations
 
@@ -30,10 +19,6 @@ logger = init_logger(__name__)
 
 # Import C++ mesh processor extension
 from sglang.multimodal_gen.csrc.render.mesh_processor import meshVerticeInpaint
-
-# =============================================================================
-# Camera Utilities
-# =============================================================================
 
 
 def transform_pos(
@@ -139,20 +124,8 @@ def get_perspective_projection_matrix(
     ).astype(np.float32)
 
 
-# =============================================================================
-# Mesh I/O Utilities
-# =============================================================================
-
-
 def export_to_trimesh(mesh_output: Any) -> Any:
-    """Convert mesh output to trimesh format.
-
-    Args:
-        mesh_output: Mesh output from VAE decoder, can be single mesh or list.
-
-    Returns:
-        trimesh.Trimesh object(s).
-    """
+    """Convert mesh output to trimesh format."""
     if isinstance(mesh_output, list):
         outputs = []
         for mesh in mesh_output:
@@ -197,11 +170,6 @@ def mesh_uv_wrap(mesh: Any) -> Any:
         mesh.visual.uv = uvs
 
     return mesh
-
-
-# =============================================================================
-# Mesh Rendering Utilities
-# =============================================================================
 
 
 def stride_from_shape(shape: Tuple[int, ...]) -> List[int]:
@@ -319,16 +287,7 @@ def linear_grid_put_2d(
 
 
 class MeshRender:
-    """Mesh renderer using CUDA rasterization for texture generation.
-
-    This class provides rendering utilities for multi-view texture generation:
-    - Normal map rendering
-    - Position map rendering
-    - Texture back-projection
-    - Texture baking from multiple views
-
-    Uses custom CUDA rasterizer for fast GPU-based rendering.
-    """
+    """Mesh renderer using CUDA rasterization for texture generation."""
 
     def __init__(
         self,
@@ -339,16 +298,7 @@ class MeshRender:
         bake_mode: str = "linear",
         device: str = "cuda",
     ):
-        """Initialize the mesh renderer.
-
-        Args:
-            camera_distance: Distance from camera to object center
-            camera_type: "orth" for orthographic, "perspective" for perspective
-            default_resolution: Default rendering resolution
-            texture_size: Texture map resolution
-            bake_mode: Texture baking mode ("linear")
-            device: Device to use for tensor operations
-        """
+        """Initialize the mesh renderer."""
         self.device = device
 
         self.set_default_render_resolution(default_resolution)
@@ -412,16 +362,7 @@ class MeshRender:
         tri: torch.Tensor,
         resolution: Tuple[int, int],
     ) -> torch.Tensor:
-        """Rasterize using CUDA rasterizer.
-
-        Args:
-            pos_clip: Clip-space positions [N, 4]
-            tri: Triangle indices [F, 3]
-            resolution: (height, width)
-
-        Returns:
-            rast_out: Rasterization output [1, H, W, 4] (barycentric + face_idx)
-        """
+        """Rasterize using CUDA rasterizer."""
         from sglang.multimodal_gen.csrc.render.hunyuan3d_rasterizer import rasterize
 
         if pos_clip.dim() == 2:
@@ -438,16 +379,7 @@ class MeshRender:
         rast_out: torch.Tensor,
         tri: torch.Tensor,
     ) -> torch.Tensor:
-        """Interpolate vertex attributes.
-
-        Args:
-            attr: Vertex attributes [1, N, C]
-            rast_out: Rasterization output [1, H, W, 4]
-            tri: Triangle indices [F, 3]
-
-        Returns:
-            Interpolated attributes [1, H, W, C]
-        """
+        """Interpolate vertex attributes."""
         from sglang.multimodal_gen.csrc.render.hunyuan3d_rasterizer import interpolate
 
         barycentric = rast_out[0, ..., :-1]
@@ -465,13 +397,7 @@ class MeshRender:
         scale_factor: float = 1.15,
         auto_center: bool = True,
     ):
-        """Load a mesh for rendering.
-
-        Args:
-            mesh: Input trimesh object
-            scale_factor: Scale factor for normalization
-            auto_center: Whether to auto-center the mesh
-        """
+        """Load a mesh for rendering."""
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
 
@@ -601,22 +527,7 @@ class MeshRender:
         normalize_rgb: bool = True,
         return_type: str = "th",
     ) -> Union[torch.Tensor, np.ndarray, Image.Image]:
-        """Render normal map from a viewpoint.
-
-        Args:
-            elev: Elevation angle in degrees
-            azim: Azimuth angle in degrees
-            camera_distance: Camera distance (optional)
-            center: Look-at center (optional)
-            resolution: Render resolution (optional)
-            bg_color: Background color
-            use_abs_coor: Use absolute coordinates for normals
-            normalize_rgb: Normalize normals to RGB range [0, 1]
-            return_type: "th" for tensor, "np" for numpy, "pl" for PIL
-
-        Returns:
-            Normal map in specified format
-        """
+        """Render normal map from a viewpoint."""
         pos_camera, pos_clip = self._get_pos_from_mvp(
             elev, azim, camera_distance, center
         )
@@ -685,20 +596,7 @@ class MeshRender:
         bg_color: List[float] = [1, 1, 1],
         return_type: str = "th",
     ) -> Union[torch.Tensor, np.ndarray, Image.Image]:
-        """Render position map from a viewpoint.
-
-        Args:
-            elev: Elevation angle in degrees
-            azim: Azimuth angle in degrees
-            camera_distance: Camera distance (optional)
-            center: Look-at center (optional)
-            resolution: Render resolution (optional)
-            bg_color: Background color
-            return_type: "th" for tensor, "np" for numpy, "pl" for PIL
-
-        Returns:
-            Position map in specified format
-        """
+        """Render position map from a viewpoint."""
         pos_camera, pos_clip = self._get_pos_from_mvp(
             elev, azim, camera_distance, center
         )
@@ -953,15 +851,7 @@ class MeshRender:
         texture: torch.Tensor,
         mask: Union[torch.Tensor, np.ndarray],
     ) -> torch.Tensor:
-        """Inpaint missing regions in UV texture using mesh-aware method.
-
-        Args:
-            texture: Texture tensor [H, W, C]
-            mask: Mask of valid regions
-
-        Returns:
-            Inpainted texture
-        """
+        """Inpaint missing regions in UV texture using mesh-aware method."""
         if isinstance(texture, torch.Tensor):
             texture_np = texture.cpu().numpy()
         else:
@@ -1004,13 +894,6 @@ class MeshRender:
     uv_inpaint = texture_inpaint
 
 
-# =============================================================================
-# Hunyuan3D Image Processors
-# =============================================================================
-# Adapted from https://github.com/Tencent-Hunyuan/Hunyuan3D-2
-# Licensed under TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
-
-
 def array_to_tensor(np_array):
     """Convert numpy array to normalized tensor."""
     image_pt = torch.tensor(np_array).float()
@@ -1021,11 +904,7 @@ def array_to_tensor(np_array):
 
 
 def recenter_image(image, border_ratio=0.2):
-    """Recenter a PIL image, cropping to non-transparent content with a border.
-
-    For RGB/L images, returns the image as-is (converted to RGB for L).
-    For RGBA images, crops to non-transparent region and re-centers with border.
-    """
+    """Recenter a PIL image, cropping to non-transparent content with a border."""
     from PIL import Image as PILImage
 
     if image.mode == "RGB":
@@ -1074,16 +953,7 @@ class ImageProcessorV2:
 
     @staticmethod
     def recenter(image, border_ratio: float = 0.2):
-        """recenter an image to leave some empty space at the image border.
-
-        Args:
-            image (ndarray): input image, float/uint8 [H, W, 3/4]
-            mask (ndarray): alpha mask, bool [H, W]
-            border_ratio (float, optional): border ratio, image will be resized to (1 - border_ratio). Defaults to 0.2.
-
-        Returns:
-            ndarray: output image, float/uint8 [H, W, 3/4]
-        """
+        """recenter an image to leave some empty space at the image border."""
 
         if image.shape[-1] == 4:
             mask = image[..., 3]
@@ -1160,10 +1030,7 @@ class ImageProcessorV2:
 
 
 class MVImageProcessorV2(ImageProcessorV2):
-    """Multi-view image processor for Hunyuan3D.
-
-    View order: front, front clockwise 90, back, front clockwise 270.
-    """
+    """Multi-view image processor for Hunyuan3D."""
 
     # External module path aliases for compatibility with Hunyuan3D configs
     _aliases = [
@@ -1225,22 +1092,17 @@ def resolve_hunyuan3d_tool(target: str):
 
 
 __all__ = [
-    # Camera utilities
     "transform_pos",
     "get_mv_matrix",
     "get_orthographic_projection_matrix",
     "get_perspective_projection_matrix",
-    # Mesh I/O utilities
     "export_to_trimesh",
     "mesh_uv_wrap",
-    # Mesh inpainting (C++ extension)
     "meshVerticeInpaint",
-    # Rendering utilities
     "stride_from_shape",
     "scatter_add_nd_with_count",
     "linear_grid_put_2d",
     "MeshRender",
-    # Hunyuan3D image processors
     "recenter_image",
     "array_to_tensor",
     "ImageProcessorV2",
