@@ -399,7 +399,7 @@ class DiffusersPipeline(ComposedPipelineBase):
 
         # Build common kwargs for from_pretrained
         load_kwargs = {
-            "dtype": dtype,
+            "torch_dtype": dtype,
             "trust_remote_code": server_args.trust_remote_code,
             "revision": server_args.revision,
         }
@@ -447,7 +447,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                 logger.warning(
                     "Failed with dtype=%s, falling back to float32: %s", dtype, e
                 )
-                load_kwargs["dtype"] = torch.float32
+                load_kwargs["torch_dtype"] = torch.float32
                 pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
             else:
                 raise
