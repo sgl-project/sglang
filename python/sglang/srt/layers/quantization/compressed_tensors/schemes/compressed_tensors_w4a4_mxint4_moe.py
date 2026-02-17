@@ -89,9 +89,8 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         **extra_weight_attrs,
     ):
         assert (
-            params_dtype == torch.bfloat16,
-            f"Params dtype should be torch.bfloat16, but got: {params_dtype}",
-        )
+            params_dtype == torch.bfloat16
+        ), f"Params dtype should be torch.bfloat16, but got: {params_dtype}"
 
         extra_weight_attrs.update({"quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(

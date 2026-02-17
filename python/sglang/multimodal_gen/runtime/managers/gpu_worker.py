@@ -154,8 +154,8 @@ class GPUWorker:
             output_batch.timings.record_memory_snapshot("mem_analysis", final_snapshot)
 
         # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.cuda.max_memory_reserved()
-        peak_allocated_bytes = torch.cuda.max_memory_allocated()
+        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
+        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
 
         output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
