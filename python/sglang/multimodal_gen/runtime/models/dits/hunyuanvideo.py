@@ -10,9 +10,6 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
-from sglang.multimodal_gen.runtime.backend.native.rotary_embedding import (
-    _apply_rotary_emb,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
@@ -26,7 +23,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rotary_pos_embed
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb_qk,
+    get_rotary_pos_embed,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
@@ -76,10 +76,10 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Fused operations for image stream
         self.img_attn_norm = LayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.img_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.img_mlp_residual = MulAdd()
 
@@ -122,10 +122,10 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Fused operations for text stream
         self.txt_attn_norm = LayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.txt_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
-            hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
+            hidden_size, elementwise_affine=False, dtype=dtype
         )
         self.txt_mlp_residual = MulAdd()
 
@@ -194,14 +194,13 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-
         img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
         img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
+
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        img_q, img_k = _apply_rotary_emb_qk(img_q, img_k, cos, sin, is_neox_style=False)
+
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -299,7 +298,6 @@ class MMSingleStreamBlock(nn.Module):
         # Fused operations with better naming
         self.input_norm_scale_shift = LayerNormScaleShift(
             hidden_size,
-            norm_type="layer",
             eps=1e-6,
             elementwise_affine=False,
             dtype=dtype,
@@ -361,11 +359,10 @@ class MMSingleStreamBlock(nn.Module):
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
+
         # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        img_q, img_k = _apply_rotary_emb_qk(img_q, img_k, cos, sin, is_neox_style=False)
 
         # Run distributed attention
         img_attn_output, txt_attn_output = self.attn(

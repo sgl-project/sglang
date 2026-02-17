@@ -21,7 +21,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT="v0.1.10.post3"
 
 # ===============================
 # Base image 950 and args
@@ -29,9 +29,9 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="0"
+ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT="v0.1.10.post3"
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -70,7 +70,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="20920706a9004018dbd87c7387f207d08d0e05af"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -278,8 +278,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
   chmod +x /usr/local/bin/llvm-config-16; \
   \
-  # TVM Python bits need Cython + z3 before configure
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver>=4.13.0"; \
+  # TVM Python bits need Cython + z3 before configure.
+  # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \

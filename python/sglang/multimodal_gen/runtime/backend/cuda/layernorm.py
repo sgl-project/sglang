@@ -16,6 +16,7 @@ def rms_norm(
     residual: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     shape = x.shape
+    device = x.device
     x = x.reshape(-1, shape[-1])
     if residual is not None:
         residual_shape = residual.shape
@@ -26,6 +27,10 @@ def rms_norm(
         out = rms_norm_fn(
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
         )
+        if residual is not None:
+            return out[0].view(shape), out[1].view(residual_shape)
+        out = out.view(shape)
+        return out
     elif residual is not None:
         fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
         return x.view(shape), residual.view(residual_shape)

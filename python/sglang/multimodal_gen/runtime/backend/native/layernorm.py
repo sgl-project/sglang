@@ -2,6 +2,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 def rms_norm(
     self,
@@ -43,7 +45,7 @@ def rms_norm(
         return x, residual
 
 
-@torch.compile(backend="inductor")
+@torch.compile(backend="inductor", disable=current_platform.is_npu())
 def layer_norm(
     self,
     x: torch.Tensor,

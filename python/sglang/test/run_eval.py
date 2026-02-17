@@ -34,6 +34,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     # Get thinking kwargs based on user's choice
     thinking_kwargs = get_thinking_kwargs(args)
 
+    # Build extra_body with thinking kwargs and top_k if specified
+    extra_body = thinking_kwargs.copy() if thinking_kwargs else {}
+    top_k = getattr(args, "top_k", None)
+    if top_k is not None:
+        extra_body["top_k"] = top_k
+
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
@@ -41,7 +47,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
         reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=thinking_kwargs if thinking_kwargs else None,
+        extra_body=extra_body if extra_body else None,
     )
 
     # Run eval
@@ -245,6 +251,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",

@@ -5,9 +5,6 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.runtime.backend.native.rotary_embedding import (
-    _apply_rotary_emb,
-)
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -18,9 +15,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    apply_flashinfer_rope_qk_inplace,
-)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb_qk
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -183,20 +178,7 @@ class ZImageAttention(nn.Module):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if _is_cuda and q.shape == k.shape:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q, k, cos_sin_cache, is_neox=False
-                )
-            else:
-                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            q, k = _apply_rotary_emb_qk(q, k, cos, sin, is_neox_style=False)
 
         hidden_states = self.attn(q, k, v)
         hidden_states = hidden_states.flatten(2)
@@ -383,6 +365,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
+    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
