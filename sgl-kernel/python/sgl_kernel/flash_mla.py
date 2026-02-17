@@ -26,6 +26,10 @@ def get_mla_metadata(
     """
     Get tile scheduler metadata for FlashMLA decode.
 
+    Automatically selects the appropriate backend:
+    - Dense FP8: uses optimized get_mla_decoding_metadata_dense_fp8
+    - Other cases: uses generic get_mla_decoding_metadata
+
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
         num_q_tokens_per_head_k: Equals to num_q_tokens_per_q_seq * num_heads_q // num_heads_k.
@@ -40,6 +44,16 @@ def get_mla_metadata(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    # Dense FP8 uses a specialized optimized path
+    if is_fp8_kvcache and topk is None:
+        return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+        )
+
+    # Generic path for BF16/FP16 and sparse FP8
     return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -47,27 +61,6 @@ def get_mla_metadata(
         num_heads_q,
         is_fp8_kvcache,
         topk,
-    )
-
-
-def get_mla_decoding_metadata_dense_fp8(
-    cache_seqlens: torch.Tensor,
-    num_q_tokens_per_head_k: int,
-    num_heads_k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Get metadata for dense FP8 decoding.
-
-    Returns:
-        tile_scheduler_metadata: (num_sm_parts, DecodingSchedMetaSize/sizeof(int)), dtype torch.int32.
-        num_splits: (batch_size + 1), dtype torch.int32.
-    """
-    if _flashmla_import_error is not None:
-        raise _IMPORT_ERROR from _flashmla_import_error
-    return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
-        cache_seqlens,
-        num_q_tokens_per_head_k,
-        num_heads_k,
     )
 
 
