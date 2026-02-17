@@ -158,6 +158,28 @@ def flash_mla_with_kvcache(
             extra_page_block_size=None,
             extra_topk=None,
         )
+
+        # Compute num_q_tokens_per_head_k for get_mla_decoding_metadata
+        # num_q_tokens_per_head_k = seq_len_q * num_heads_q // num_heads_k
+        num_q_tokens_per_head_k = q.shape[1] * q.shape[2] // k_cache.shape[2]
+        h_k = k_cache.shape[2]
+        h_q = q.shape[2]
+
+        # Get tile scheduler metadata from kernel
+        # For non-FP8 dense path, use get_mla_decoding_metadata
+        # Note: FP8 dense path should use get_mla_decoding_metadata_dense_fp8 externally
+        if not is_fp8_kvcache:
+            (
+                sched_meta.tile_scheduler_metadata,
+                sched_meta.num_splits,
+            ) = torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
+                cache_seqlens,
+                num_q_tokens_per_head_k,
+                h_k,
+                h_q,
+                is_fp8_kvcache,
+                topk if topk is not None else None,
+            )
     else:
         # Check consistency with sched_meta
         assert sched_meta.config is not None
