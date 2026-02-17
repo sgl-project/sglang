@@ -1,4 +1,4 @@
-"""Inference-only Sarvam MoE 100B model with MLA (Multi-head Latent Attention) for SGLang."""
+"""Inference-only Sarvam MoE 105B model with MLA (Multi-head Latent Attention) for SGLang."""
 
 import logging
 import math
