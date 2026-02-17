@@ -45,6 +45,24 @@ apt_get_ci() {
     apt-get "$@"
 }
 
+# Run command directly as root, otherwise try passwordless sudo first.
+run_with_sudo_ci() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true >/dev/null 2>&1; then
+            sudo -n "$@"
+            return $?
+        fi
+        echo "Warning: sudo exists but requires a password; trying command without sudo..."
+    fi
+
+    "$@"
+}
+
 # Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
@@ -109,7 +127,7 @@ if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
     fi
     PROTOC_ZIP="protoc-32.0-linux-${PROTOC_ARCH}.zip"
     wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}
-    unzip -o ${PROTOC_ZIP} -d /usr/local
+    run_with_sudo_ci unzip -o ${PROTOC_ZIP} -d /usr/local
     rm ${PROTOC_ZIP}
     protoc --version
     cd -
