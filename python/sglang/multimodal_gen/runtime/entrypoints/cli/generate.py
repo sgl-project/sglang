@@ -21,8 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    PerformanceLogger,
-    RequestTimings,
+    PerformanceLogger, RequestMetrics,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -74,7 +73,7 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
     if not (args.perf_dump_path and timings_dict):
         return
 
-    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings = RequestMetrics(request_id=timings_dict.get("request_id"))
     timings.stages = timings_dict.get("stages", {})
     timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
