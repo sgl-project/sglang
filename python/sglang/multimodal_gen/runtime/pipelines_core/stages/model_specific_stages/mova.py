@@ -201,7 +201,7 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def _maybe_enable_torch_compile(self, module: object, server_args: ServerArgs):
+    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
