@@ -1463,9 +1463,6 @@ class SarvamMLAForCausalLM(nn.Module):
                 loaded_counts["skipped"] += 1
                 continue
 
-            if ".mlp.gate.weight" in name and ".mlp.gate.gate.weight" not in name:
-                name = name.replace(".mlp.gate.weight", ".mlp.gate.weight")
-
             if ".mlp.gate.e_score_correction_bias" in name:
                 name = name.replace(
                     ".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias"
