@@ -13,6 +13,7 @@ from sgl_kernel.flash_mla import (
     FlashMLASchedMeta,
     flash_mla_with_kvcache,
     get_mla_metadata,
+    get_mla_decoding_metadata_dense_fp8,
 )
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
@@ -379,6 +380,19 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
             reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
             reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
+
+            # For FP8, we need to pre-fill tile_scheduler_metadata and num_splits
+            # since flash_mla_with_kvcache doesn't auto-initialize for FP8
+            if self.forward_metadata.sched_meta.tile_scheduler_metadata is None:
+                num_q_tokens_per_head_k = reshape_q_fp8.shape[1] * reshape_q_fp8.shape[2]
+                tile_scheduler_metadata, num_splits = get_mla_decoding_metadata_dense_fp8(
+                    forward_batch.seq_lens.to(torch.int32),
+                    num_q_tokens_per_head_k,
+                    1,  # h_k for MQA
+                )
+                self.forward_metadata.sched_meta.tile_scheduler_metadata = tile_scheduler_metadata
+                self.forward_metadata.sched_meta.num_splits = num_splits
+
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
@@ -463,6 +477,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
                 reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
                 reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
+
+                # For FP8, we need to pre-fill tile_scheduler_metadata and num_splits
+                if self.forward_metadata.sched_meta.tile_scheduler_metadata is None:
+                    num_q_tokens_per_head_k = reshape_q_fp8.shape[1] * reshape_q_fp8.shape[2]
+                    tile_scheduler_metadata, num_splits = get_mla_decoding_metadata_dense_fp8(
+                        forward_batch.seq_lens.to(torch.int32) + self.num_draft_tokens,
+                        num_q_tokens_per_head_k,
+                        1,  # h_k for MQA
+                    )
+                    self.forward_metadata.sched_meta.tile_scheduler_metadata = tile_scheduler_metadata
+                    self.forward_metadata.sched_meta.num_splits = num_splits
+
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
