@@ -35,11 +35,8 @@ def get_dump_dir() -> str:
 
 
 def _inject_env():
-    """Inject CUDA coredump env vars into os.environ.
-
-    If a CUDA_* variable is already present (e.g. set by the user in the
-    shell), injection is skipped for that variable and a warning is logged.
-    """
+    """Inject CUDA coredump environment variables into the current process.
+    If a CUDA_* variable is already present, skip it and log a warning."""
     dump_dir = get_dump_dir()
     os.makedirs(dump_dir, exist_ok=True)
 
