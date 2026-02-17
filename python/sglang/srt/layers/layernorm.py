@@ -45,6 +45,14 @@ _is_cpu = current_platform.is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_flashinfer_available = is_flashinfer_available()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Eagerly resolve platform ops to avoid @cached_property RLock issues
+# with torch.compile/torch._dynamo (which can't trace through RLock).
+if _is_cuda or _is_hip or _is_xpu:
+    _rmsnorm = current_platform.rmsnorm
+    _fused_add_rmsnorm = current_platform.fused_add_rmsnorm
+    _gemma_rmsnorm = current_platform.gemma_rmsnorm
+    _gemma_fused_add_rmsnorm = current_platform.gemma_fused_add_rmsnorm
 _flashinfer_layernorm_available = False
 
 # Flashinfer layernorm (CUDA/XPU only)
@@ -119,11 +127,9 @@ class RMSNorm(MultiPlatformOp):
             # we probably need to add another parameter to fused_add_rmsnorm
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            current_platform.fused_add_rmsnorm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
+            _fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
-        out = current_platform.rmsnorm(x, self.weight.data, self.variance_epsilon)
+        out = _rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
     def forward_npu(
@@ -153,7 +159,7 @@ class RMSNorm(MultiPlatformOp):
             output = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            current_platform.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 output,
                 x,
                 residual,
@@ -162,7 +168,7 @@ class RMSNorm(MultiPlatformOp):
                 self.variance_epsilon,
             )
             return output, residual_out
-        return current_platform.rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return _rmsnorm(x, self.weight.data, self.variance_epsilon)
 
     def forward_hip(
         self,
@@ -179,12 +185,12 @@ class RMSNorm(MultiPlatformOp):
             residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            current_platform.fused_add_rmsnorm(
+            _fused_add_rmsnorm(
                 out, x, residual_out, residual, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
         out = torch.empty_like(x)
-        current_platform.rmsnorm(out, x, self.weight.data, self.variance_epsilon)
+        _rmsnorm(out, x, self.weight.data, self.variance_epsilon)
         return out
 
     def forward_native(
@@ -268,11 +274,9 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            current_platform.fused_add_rmsnorm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
+            _fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
-        out = current_platform.rmsnorm(x, self.weight.data, self.variance_epsilon)
+        out = _rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
     def forward_with_allreduce_fusion(
@@ -400,11 +404,11 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            current_platform.gemma_fused_add_rmsnorm(
+            _gemma_fused_add_rmsnorm(
                 x, residual, self.weight.data, self.variance_epsilon
             )
             return x, residual
-        out = current_platform.gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        out = _gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 
     def forward_native(

@@ -45,6 +45,15 @@ _is_xpu = current_platform.is_xpu()
 _is_cpu = current_platform.is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+# Eagerly resolve platform ops to avoid @cached_property RLock issues
+# with torch.compile/torch._dynamo (which can't trace through RLock).
+if _is_cuda or _is_hip or _is_xpu:
+    _silu_and_mul = current_platform.silu_and_mul
+    _gelu_and_mul = current_platform.gelu_and_mul
+    _gelu_tanh_and_mul = current_platform.gelu_tanh_and_mul
+if _is_hip:
+    _gelu_quick = current_platform.gelu_quick
+
 # Lazy import for NPU
 if _is_npu:
     import torch_npu
@@ -64,7 +73,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        current_platform.silu_and_mul(x, out)
+        _silu_and_mul(x, out)
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,7 +91,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        current_platform.silu_and_mul(x, out)
+        _silu_and_mul(x, out)
         return out
 
 
@@ -96,9 +105,9 @@ class GeluAndMul(MultiPlatformOp):
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if self.approximate == "tanh":
-            current_platform.gelu_tanh_and_mul(x, out)
+            _gelu_tanh_and_mul(x, out)
         elif self.approximate == "none":
-            current_platform.gelu_and_mul(x, out)
+            _gelu_and_mul(x, out)
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
@@ -163,7 +172,7 @@ class QuickGELU(MultiPlatformOp):
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        current_platform.gelu_quick(x, out)
+        _gelu_quick(x, out)
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
