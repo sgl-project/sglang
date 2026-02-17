@@ -70,10 +70,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             "hy3dshape_image_processor": ["diffusers", "Hunyuan3DShapeImageProcessor"],
         }
 
-    # ------------------------------------------------------------------
     # Class resolution
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _resolve_class(target: str) -> Any:
         """Resolve a YAML target string to a Python class."""
@@ -102,10 +99,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         module, cls_name = target.rsplit(".", 1)
         return getattr(importlib.import_module(module, package=None), cls_name)
 
-    # ------------------------------------------------------------------
     # Path / checkpoint resolution
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _resolve_shape_dir(
         model_path: str,
@@ -175,10 +169,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         else:
             return torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
-    # ------------------------------------------------------------------
     # Component loading helpers
-    # ------------------------------------------------------------------
-
     @classmethod
     def _load_dit_model(
         cls,
@@ -254,10 +245,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         params = cfg.get("params", {})
         return target_cls(**params)
 
-    # ------------------------------------------------------------------
     # Module loading override
-    # ------------------------------------------------------------------
-
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -317,10 +305,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         logger.info("All Hunyuan3D shape components loaded successfully")
         return components
 
-    # ------------------------------------------------------------------
     # Pipeline lifecycle
-    # ------------------------------------------------------------------
-
     def initialize_pipeline(self, server_args: ServerArgs):
         config = server_args.pipeline_config
         if not isinstance(config, Hunyuan3D2PipelineConfig):

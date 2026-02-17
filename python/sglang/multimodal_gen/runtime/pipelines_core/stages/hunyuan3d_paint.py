@@ -38,11 +38,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Utility functions
-# ---------------------------------------------------------------------------
-
-
 def guidance_scale_embedding(
     w: torch.Tensor, embedding_dim: int = 512, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
@@ -230,11 +226,7 @@ def _recorrect_rgb(
     return corrected_bgr
 
 
-# ---------------------------------------------------------------------------
 # Stage 1: Preprocess (UV unwrap + delight + multi-view rendering)
-# ---------------------------------------------------------------------------
-
-
 class Hunyuan3DPaintPreprocessStage(PipelineStage):
     """Preprocessing: UV unwrap + delight in parallel, then multi-view rendering."""
 
@@ -480,13 +472,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         result.add_check("renderer", batch.extra.get("renderer"), V.not_none)
         return result
 
-
-# ---------------------------------------------------------------------------
-# Stage 2: TexGen (model loading + input prep + denoising + decode)
-# ---------------------------------------------------------------------------
-
-
-class Hunyuan3DPaintTexGenStage(PipelineStage):
+    # Stage 2: TexGen (model loading + input prep + denoising + decode)class Hunyuan3DPaintTexGenStage(PipelineStage):
     """Multi-view texture generation via UNet2.5D diffusion.
 
     Loads paint models lazily, prepares denoising inputs, runs the
@@ -985,11 +971,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         return result
 
 
-# ---------------------------------------------------------------------------
 # Stage 3: Postprocess (texture baking + mesh export)
-# ---------------------------------------------------------------------------
-
-
 class Hunyuan3DPaintPostprocessStage(PipelineStage):
     """Texture baking from multi-view images and final mesh export."""
 
