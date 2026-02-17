@@ -578,7 +578,8 @@ _warn_deprecated_env_to_cli_flag(
 )
 
 # Import cuda_coredump to trigger auto-injection of CUDA env vars
-# when SGLANG_CUDA_COREDUMP=1. Must happen before CUDA runtime init.
+# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
 import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
 
 

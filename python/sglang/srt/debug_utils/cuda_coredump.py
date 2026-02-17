@@ -5,8 +5,11 @@ variables into the current process so that GPU exceptions (e.g. illegal
 memory access) produce lightweight coredump files for post-mortem analysis
 with cuda-gdb.
 
-The injection happens at module import time via _inject_env(), which must
-run before CUDA runtime initialization.
+The injection happens at module import time via _inject_env() on a
+best-effort basis.  If any CUDA_* variable is already present in the
+environment (e.g. set by the user in the shell), injection is skipped for
+that variable and a warning is logged.  For strict guarantees, set the
+CUDA_* env vars in the shell before launching Python.
 """
 
 import glob
@@ -34,15 +37,29 @@ def get_dump_dir() -> str:
 def _inject_env():
     """Inject CUDA coredump env vars into os.environ.
 
-    Uses setdefault so user-provided CUDA_* overrides are preserved.
-    Must run before CUDA runtime initialization.
+    If a CUDA_* variable is already present (e.g. set by the user in the
+    shell), injection is skipped for that variable and a warning is logged.
     """
     dump_dir = get_dump_dir()
     os.makedirs(dump_dir, exist_ok=True)
-    os.environ.setdefault("CUDA_ENABLE_COREDUMP_ON_EXCEPTION", "1")
-    os.environ.setdefault("CUDA_COREDUMP_SHOW_PROGRESS", "1")
-    os.environ.setdefault("CUDA_COREDUMP_GENERATION_FLAGS", _CUDA_COREDUMP_FLAGS)
-    os.environ.setdefault("CUDA_COREDUMP_FILE", f"{dump_dir}/cuda_coredump_%h.%p.%t")
+
+    env_vars = {
+        "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
+        "CUDA_COREDUMP_SHOW_PROGRESS": "1",
+        "CUDA_COREDUMP_GENERATION_FLAGS": _CUDA_COREDUMP_FLAGS,
+        "CUDA_COREDUMP_FILE": f"{dump_dir}/cuda_coredump_%h.%p.%t",
+    }
+    for key, value in env_vars.items():
+        if key in os.environ:
+            logger.warning(
+                "CUDA coredump env var %s is already set to '%s', "
+                "skipping injection of '%s'.",
+                key,
+                os.environ[key],
+                value,
+            )
+        else:
+            os.environ[key] = value
 
 
 def setup_dir():
