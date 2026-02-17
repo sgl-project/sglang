@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -108,7 +109,13 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
+            logprobs_via_logsoftmax_kernel = None
             if get_global_server_args().rl_on_policy_target is not None:
+                # rl_on_policy_target auto enables deterministic inference,
+                # which will set sampling_seed to a non-None value.
+                assert (
+                    sampling_info.sampling_seed is not None
+                ), "sampling_seed is required for rl_on_policy_target mode"
                 logits_div_temperature = (
                     logits.bfloat16().div(sampling_info.temperatures).bfloat16()
                 )
@@ -122,12 +129,17 @@ class Sampler(nn.Module):
             if not get_global_server_args().sampling_backend == "ascend" or (
                 return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
             ):
-                logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
+                probs = torch.softmax(logits, dim=-1)
+            else:
+                probs = logits
             del logits
 
             batch_next_token_ids = self._sample_from_probs(
-                probs, sampling_info, positions, can_sample_directly_from_probs
+                probs,
+                sampling_info,
+                positions,
+                can_sample_directly_from_probs,
+                logprobs=logprobs_via_logsoftmax_kernel,  # only for deterministic sampling
             )
 
             if return_logprob:
@@ -164,6 +176,7 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         positions: torch.Tensor,
         can_sample_directly_from_probs: bool,
+        logprobs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if can_sample_directly_from_probs:
             # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
@@ -171,6 +184,7 @@ class Sampler(nn.Module):
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
+                logprobs=logprobs,  # only for deterministic sampling
             )
         else:
             if get_global_server_args().sampling_backend == "flashinfer":
@@ -366,10 +380,21 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
+        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
+        assert (
+            sampling_seed is None
+        ), "With sampling seed, multinomial_with_seed will provide wrong results"
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
     if sampling_seed is not None:
-        sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
+        # NOTE: when using top-k/top-p/min-p sampling, we need to modify probs before we
+        # apply log to get logprobs. Therefore, we cannot use log_softmax directly.
+        # For now, we use log to the modified probs to get logprobs, but for numerical
+        # stability, we'd better come up with a solution to use log_softmax.
+        logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
+        del probs_sort
+        torch.log_(logprobs)
+        sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
     else:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
     # int32 range is enough to represent the token ids
@@ -427,8 +452,9 @@ def top_k_top_p_min_p_sampling_from_probs_ascend(
     return batch_next_token_ids.view(-1)
 
 
+@torch.compile(dynamic=True)
 def multinomial_with_seed(
-    inputs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
+    logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
     """
     Samples n elements from an input tensor `inputs` of shape (n, m) using
@@ -448,29 +474,38 @@ def multinomial_with_seed(
         A tensor of shape (n,) where the i-th element is an index sampled
         from the distribution in `inputs[i]` using `seed[i]`.
     """
-    n, m = inputs.shape
-    col_indices = torch.arange(m, device=inputs.device).unsqueeze(0)
-    step_seed = (seed * 19349663) ^ (positions * 73856093)
-    seed_expanded = step_seed.unsqueeze(-1)
-    hashed = (seed_expanded * 8589934591) ^ (col_indices * 479001599)
-    uniform_samples = (hashed % (2**24)).float() / (2**24)
-    epsilon = 1e-10
-    uniform_samples = uniform_samples.clamp(epsilon, 1.0 - epsilon)
-    gumbel_noise = -torch.log(-torch.log(uniform_samples))
-    log_probs = torch.log(inputs + epsilon)
-    perturbed_log_probs = log_probs + gumbel_noise
-    return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
+    n, m = logprobs.shape
+    seed = seed.to(torch.uint64)
+    col_indices = torch.arange(m, device=logprobs.device)
+    hashed = murmur_hash32(seed, positions, col_indices)
+
+    # NOTE (sehoon): it is critical to keep gumbel noise calculation in float64 to avoid numerical instability.
+    # keeping logprobs in float64 is less critical, but we found it's still safer to keep it in float64.
+    x = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+
+    # x is a uniform sample in [0, 1]. get gumbel noise from it.
+    # which is equivalent to -log(-log(x))
+    # keep everything in in-place operations to avoid unnecessary memory allocations.
+    x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()  # -log(x)
+    x.log_().neg_()  # -log(-log(x)) == gumbel noise
+
+    # add gumbel noise to logprobs
+    x.add_(logprobs.to(torch.float64))
+
+    return torch.argmax(x, dim=1, keepdim=True)
 
 
 def sampling_from_probs_torch(
     probs: torch.Tensor,
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
+    logprobs: Optional[torch.Tensor] = None,
 ):
     """A sampling implementation with native pytorch operations, without
     top-k, top-p, or min-p filtering."""
     if sampling_seed is not None:
-        sampled_index = multinomial_with_seed(probs, sampling_seed, positions)
+        assert logprobs is not None, "logprobs is required for deterministic sampling"
+        sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
     else:
         sampled_index = torch.multinomial(probs, num_samples=1)
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
