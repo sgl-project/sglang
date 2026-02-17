@@ -65,6 +65,9 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
+    quantized_model_path: str | None = None
+
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize
