@@ -5,7 +5,7 @@ Support attention backend for FlashMLA.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
