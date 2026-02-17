@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    GetWeightsChecksumReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -173,6 +174,9 @@ class BaseTpWorker(ABC):
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def get_weights_checksum(self, recv_req: GetWeightsChecksumReqInput):
+        return self.model_runner.get_weights_checksum()
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
         result = self.model_runner.load_lora_adapter(recv_req.to_ref())

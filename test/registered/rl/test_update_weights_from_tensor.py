@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=195, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=195, suite="stage-b-test-small-1-gpu-amd")
 
+import functools
 import gc
 import json
 import random
@@ -15,6 +16,7 @@ import torch
 
 import sglang as sgl
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
+from sglang.srt.utils.weight_checksum import compute_weights_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -24,75 +26,119 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+# Llama stacked params: HF splits -> SGLang merged (concat along dim=0)
+_STACKED_PARAMS = [
+    (".qkv_proj", [".q_proj", ".k_proj", ".v_proj"]),
+    (".gate_up_proj", [".gate_proj", ".up_proj"]),
+]
 
-def test_update_weights_from_tensor(tp_size):
-    assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
-    torch.cuda.empty_cache()
+_PERTURB_PARAM_NAME = "model.layers.0.mlp.down_proj.weight"
+_PERTURB_NUMEL = 128
 
-    engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, tp_size=tp_size)
 
-    param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 16)]
+def _merge_hf_to_sglang(hf_named_params):
+    """Merge HF-format params to SGLang internal format (TP=1, concat along dim=0)."""
+    merged = {}
+    pending = {}
 
-    _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
+    for name, tensor in hf_named_params:
+        matched = False
+        for merged_suffix, shard_suffixes in _STACKED_PARAMS:
+            for shard_suffix in shard_suffixes:
+                if shard_suffix in name:
+                    merged_name = name.replace(shard_suffix, merged_suffix)
+                    pending.setdefault(merged_name, {})[shard_suffix] = tensor
+                    matched = True
+                    break
+            if matched:
+                break
+        if not matched:
+            merged[name] = tensor
 
-    memory_before = torch.cuda.memory_allocated()
-    new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
+    for name, parts in pending.items():
+        for merged_suffix, shard_suffixes in _STACKED_PARAMS:
+            if merged_suffix in name:
+                merged[name] = torch.cat([parts[s] for s in shard_suffixes], dim=0)
+                break
 
-    time_start = time.perf_counter()
-    engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
-    print(f"Time delta: {time.perf_counter() - time_start:.03f}")
+    return merged
 
-    for param_name in param_names[:3]:
-        _check_param(engine, param_name, [1.5] * 5)
 
-    engine.shutdown()
+@functools.lru_cache(maxsize=1)
+def _load_hf_params():
+    """Load and cache HF model params for cross-verification."""
+    from transformers import AutoModelForCausalLM
 
-    del new_tensor
-    gc.collect()
-    torch.cuda.ipc_collect()
-    torch.cuda.empty_cache()
-    memory_after = torch.cuda.memory_allocated()
-    assert (
-        memory_after <= memory_before + 1024
-    ), f"Memory leak detected: {memory_after - memory_before} bytes"
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        DEFAULT_SMALL_MODEL_NAME_FOR_TEST, torch_dtype=torch.bfloat16
+    )
+    params = [(n, p.detach().clone()) for n, p in hf_model.named_parameters()]
+    del hf_model
+    return params
+
+
+@functools.lru_cache(maxsize=1)
+def _load_perturbed_hf_params():
+    """Return HF params with a deterministic perturbation on one tensor."""
+    perturbed = []
+    found = False
+    for name, tensor in _load_hf_params():
+        cloned = tensor.clone()
+        if name == _PERTURB_PARAM_NAME:
+            numel = min(_PERTURB_NUMEL, cloned.numel())
+            delta = torch.linspace(0.01, 0.02, steps=numel, dtype=torch.float32).to(
+                cloned.dtype
+            )
+            cloned.view(-1)[:numel].add_(delta)
+            found = True
+        perturbed.append((name, cloned))
+
+    assert found, f"Cannot find parameter to perturb: {_PERTURB_PARAM_NAME}"
+    return perturbed
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_checksum_after_perturbation():
+    """Compute expected checksum from perturbed HF params merged to SGLang format."""
+    merged = _merge_hf_to_sglang(_load_perturbed_hf_params())
+    return compute_weights_checksum(merged.items())
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
     def test_update_weights_from_tensor(self):
-        tp_sizes = [1, 2]
-        for tp_size in tp_sizes:
-            if torch.cuda.device_count() < tp_size:
-                continue
+        torch.cuda.empty_cache()
+        memory_before = torch.cuda.memory_allocated()
 
-            with self.subTest(tp_size=tp_size):
-                test_update_weights_from_tensor(tp_size)
+        engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+        checksum_before = engine.get_weights_checksum()
+        hf_params = _load_perturbed_hf_params()
+        engine.update_weights_from_tensor(list(hf_params))
+
+        checksum_after = engine.get_weights_checksum()
+        assert checksum_after == _expected_checksum_after_perturbation()
+        assert checksum_after != checksum_before
+        engine.shutdown()
+
+        gc.collect()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        memory_after = torch.cuda.memory_allocated()
+        assert (
+            memory_after <= memory_before + 1024
+        ), f"Memory leak detected: {memory_after - memory_before} bytes"
 
     def test_update_weights_from_tensor_load_format_direct(self):
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
-        write_param_names = [
-            f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
-        ]
-        read_param_names = [
-            f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
-        ]
+        checksum_before = engine.get_weights_checksum()
+        # Direct format bypasses merge; send already-merged params
+        merged = _merge_hf_to_sglang(_load_perturbed_hf_params())
+        engine.update_weights_from_tensor(list(merged.items()), load_format="direct")
 
-        _check_param(
-            engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
-        )
-
-        new_tensor = torch.full((3072, 2048), 1.5)
-        engine.update_weights_from_tensor(
-            [
-                (write_param_name, new_tensor.clone())
-                for write_param_name in write_param_names
-            ],
-            load_format="direct",
-        )
-
-        for read_param_name in read_param_names[:3]:
-            _check_param(engine, read_param_name, [1.5] * 5)
-
+        checksum_after = engine.get_weights_checksum()
+        assert checksum_after == _expected_checksum_after_perturbation()
+        assert checksum_after != checksum_before
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_custom(self):
@@ -104,82 +150,39 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             custom_weight_loader=[custom_loader_name],
         )
 
-        write_param_names = [
-            f"model.layers.{i}.self_attn.qkv_proj.weight" for i in range(6, 16)
-        ]
-        read_param_names = [
-            f"model.layers.{i}.self_attn.k_proj.weight" for i in range(6, 16)
-        ]
-
-        _check_param(
-            engine, read_param_names[0], [-0.0198, 0.0227, 0.0168, 0.0232, -0.0178]
-        )
-
-        new_tensor = torch.full((3072, 2048), 1.5)
+        checksum_before = engine.get_weights_checksum()
+        merged = _merge_hf_to_sglang(_load_perturbed_hf_params())
         engine.update_weights_from_tensor(
-            [
-                (write_param_name, new_tensor.clone())
-                for write_param_name in write_param_names
-            ],
-            load_format=custom_loader_name,
+            list(merged.items()), load_format=custom_loader_name
         )
 
-        for read_param_name in read_param_names[:3]:
-            _check_param(engine, read_param_name, [1.5] * 5)
-
+        checksum_after = engine.get_weights_checksum()
+        assert checksum_after == _expected_checksum_after_perturbation()
+        assert checksum_after != checksum_before
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_flattened_bucket(self):
-        """Test updating weights using flattened_bucket format"""
         engine = sgl.Engine(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
-        # Create a small set of parameters for testing
-        param_names = [f"model.layers.{i}.mlp.up_proj.weight" for i in range(6, 10)]
+        checksum_before = engine.get_weights_checksum()
+        # Flattened bucket calls model.load_weights() internally, so use HF-format names
+        hf_params = _load_perturbed_hf_params()
+        named_tensors = [(n, t.cuda()) for n, t in hf_params]
 
-        # Check original values
-        _check_param(engine, param_names[0], [0.0087, -0.0214, -0.0004, 0.0039, 0.0110])
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket_dict = {
+            "flattened_tensor": bucket.get_flattened_tensor(),
+            "metadata": bucket.get_metadata(),
+        }
+        serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
 
-        # Create new tensors with different values
-        new_tensors = []
-        for _, name in enumerate(param_names):
-            # Create tensors with different values for each parameter
-            value = 2.0  # Different value for each parameter
-            new_tensor = torch.full((16384, 2048), value, device="cuda")
-            new_tensors.append((name, new_tensor))
-
-        # Create a flattened bucket
-        flattened_bucket = FlattenedTensorBucket(named_tensors=new_tensors)
-
-        # Extract the flattened tensor and metadata in the format expected by model_runner
-        flattened_tensor = flattened_bucket.get_flattened_tensor()
-        metadata = flattened_bucket.get_metadata()
-
-        # Create the dict format expected by _update_weights_from_flattened_bucket
-        bucket_dict = {"flattened_tensor": flattened_tensor, "metadata": metadata}
-
-        # Serialize the bucket data
-        from sglang.srt.utils import MultiprocessingSerializer
-
-        serialized_bucket = MultiprocessingSerializer.serialize(
-            bucket_dict, output_str=True
-        )
-
-        # Create a list where each rank contains the same serialized data
-        # This simulates the distributed environment where each rank has the same data
-        serialized_bucket_list = [serialized_bucket]
-
-        # Update weights using flattened_bucket format
-        time_start = time.perf_counter()
         engine.update_weights_from_tensor(
-            named_tensors=serialized_bucket_list, load_format="flattened_bucket"
+            named_tensors=[serialized], load_format="flattened_bucket"
         )
-        update_time = time.perf_counter() - time_start
-        print(f"Flattened bucket update time: {update_time:.03f}")
 
-        # Verify the weights were updated correctly
-        for i, param_name in enumerate(param_names):
-            _check_param(engine, param_name, [2.0] * 5)
-
+        checksum_after = engine.get_weights_checksum()
+        assert checksum_after == _expected_checksum_after_perturbation()
+        assert checksum_after != checksum_before
         engine.shutdown()
 
 
@@ -287,13 +290,6 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                     assert torch.allclose(
                         actual_values, torch.tensor([1.5] * 5), atol=0.002
                     ), f"{actual_values=}"
-
-
-def _check_param(engine, param_name, expect_values):
-    actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-    assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.002
-    ), f"{actual_values=}"
 
 
 if __name__ == "__main__":

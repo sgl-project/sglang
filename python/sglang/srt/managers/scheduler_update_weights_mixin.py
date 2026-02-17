@@ -19,6 +19,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    GetWeightsChecksumReqInput,
+    GetWeightsChecksumReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -117,6 +119,10 @@ class SchedulerUpdateWeightsMixin:
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
+
+    def get_weights_checksum(self: Scheduler, recv_req: GetWeightsChecksumReqInput):
+        checksum = self.tp_worker.get_weights_checksum(recv_req)
+        return GetWeightsChecksumReqOutput(checksum)
 
     def release_memory_occupation(
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput

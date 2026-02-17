@@ -47,6 +47,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
+    GetWeightsChecksumReqInput,
+    GetWeightsChecksumReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -188,6 +190,9 @@ class TokenizerCommunicatorMixin:
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_weights_checksum_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.release_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -270,6 +275,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
+                ),
+                (
+                    GetWeightsChecksumReqOutput,
+                    self.get_weights_checksum_communicator.handle_recv,
                 ),
                 (
                     ReleaseMemoryOccupationReqOutput,
@@ -811,6 +820,19 @@ class TokenizerCommunicatorMixin:
             return all_parameters[0]
         else:
             return all_parameters
+
+    async def get_weights_checksum(
+        self: TokenizerManager,
+        obj: GetWeightsChecksumReqInput,
+        request: Optional[fastapi.Request] = None,
+    ):
+        self.auto_create_handle_loop()
+        results = await self.get_weights_checksum_communicator(obj)
+        all_checksums = [r.checksum for r in results]
+        if self.server_args.dp_size == 1:
+            return all_checksums[0]
+        else:
+            return all_checksums
 
     async def release_memory_occupation(
         self: TokenizerManager,

@@ -1476,6 +1476,16 @@ class GetWeightsByNameReqOutput(BaseReq):
 
 
 @dataclass
+class GetWeightsChecksumReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class GetWeightsChecksumReqOutput(BaseReq):
+    checksum: str
+
+
+@dataclass
 class ReleaseMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
