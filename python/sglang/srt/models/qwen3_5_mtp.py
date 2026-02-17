@@ -63,7 +63,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.model = Qwen3_5ForCausalLM(
             config,
             quant_config,
-            prefix=add_prefix("model", prefix),
+            prefix=add_prefix("mtp", prefix),
         )
 
         if get_pp_group().is_last_rank:
