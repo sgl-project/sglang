@@ -738,7 +738,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         weight_block_size = self.quant_method.quant_config.weight_block_size
         block_n, _ = weight_block_size[0], weight_block_size[1]
         block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
-        
+
         # Calculate block sizes for each shard
         shard_block_sizes = []
         shard_block_offsets = []
@@ -748,7 +748,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_block_sizes.append(shard_block_size)
             shard_block_offsets.append(current_block_offset)
             current_block_offset += shard_block_size
-        
+
         # Load each shard
         for shard_id, (shard_block_offset, shard_block_size) in enumerate(
             zip(shard_block_offsets, shard_block_sizes)
@@ -757,11 +757,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_block_offset, shard_block_size
             )
-            
+
             # Calculate per-rank offset and size (considering TP)
             rank_shard_offset = shard_block_offset // self.tp_size
             rank_shard_size = shard_block_size // self.tp_size
-            
+
             # Load into the parameter
             param.load_merged_column_weight(
                 loaded_weight=loaded_weight_shard,
