@@ -1,3 +1,11 @@
+"""
+Usage:
+cd test/registered/core
+python3 -m unittest test_flush_mm_cache.TestFlushMMEmbeddingCache
+python3 -m unittest test_flush_mm_cache.TestSchedulerFlushCache
+python3 -m unittest test_flush_mm_cache.TestFlushCacheEndpoint
+"""
+
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -13,13 +21,13 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    kill_process_tree,
     popen_launch_server,
 )
 
@@ -27,20 +35,17 @@ register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
 
 
-# --------------------------------------------------------------------------- #
-# Case 1: flush_mm_embedding_cache() unit tests
-# --------------------------------------------------------------------------- #
 class TestFlushMMEmbeddingCache(unittest.TestCase):
-    """Direct unit tests for the flush_mm_embedding_cache() helper."""
-
     def tearDown(self):
         mm_mod.embedding_cache = None
 
     def test_returns_false_when_uninitialized(self):
+        """Verify flush returns False when the cache has not been initialized."""
         mm_mod.embedding_cache = None
         self.assertFalse(flush_mm_embedding_cache())
 
     def test_returns_true_and_clears_cache(self):
+        """Verify flush returns True and empties the cache."""
         init_mm_embedding_cache(max_size=1024)
         dummy = EmbeddingResult(embedding=torch.zeros(4))
         mm_mod.embedding_cache.set(12345, dummy)
@@ -54,6 +59,7 @@ class TestFlushMMEmbeddingCache(unittest.TestCase):
         self.assertEqual(mm_mod.embedding_cache.current_size, 0)
 
     def test_idempotent(self):
+        """Verify consecutive flushes succeed without error."""
         init_mm_embedding_cache(max_size=1024)
         dummy = EmbeddingResult(embedding=torch.zeros(4))
         mm_mod.embedding_cache.set(12345, dummy)
@@ -63,17 +69,11 @@ class TestFlushMMEmbeddingCache(unittest.TestCase):
         self.assertEqual(len(mm_mod.embedding_cache), 0)
 
 
-# --------------------------------------------------------------------------- #
-# Cases 2 & 3: Scheduler.flush_cache() with mocked internals
-# --------------------------------------------------------------------------- #
 class TestSchedulerFlushCache(unittest.TestCase):
-    """Verify flush_cache() calls flush_mm_embedding_cache() correctly."""
-
     @patch("sglang.srt.managers.scheduler.torch")
     @patch("sglang.srt.managers.scheduler.flush_mm_embedding_cache")
     def test_happy_path_calls_flush_mm(self, mock_flush_mm, mock_torch):
-        """When _is_no_request() is True, flush_mm_embedding_cache() is called
-        and flush_cache() returns True."""
+        """Verify flush_cache() calls flush_mm_embedding_cache() when idle."""
         scheduler = MagicMock()
         scheduler._is_no_request.return_value = True
         scheduler.draft_worker = None
@@ -91,8 +91,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
     @patch("sglang.srt.managers.scheduler.torch")
     @patch("sglang.srt.managers.scheduler.flush_mm_embedding_cache")
     def test_blocked_path_skips_flush_mm(self, mock_flush_mm, mock_torch):
-        """When _is_no_request() is False, flush_mm_embedding_cache() is NOT
-        called and flush_cache() returns False."""
+        """Verify flush_cache() skips flush when requests are pending."""
         scheduler = MagicMock()
         scheduler._is_no_request.return_value = False
         scheduler.waiting_queue = ["fake_req"]
@@ -105,12 +104,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.tree_cache.reset.assert_not_called()
 
 
-# --------------------------------------------------------------------------- #
-# Case 4: /flush_cache endpoint integration test
-# --------------------------------------------------------------------------- #
 class TestFlushCacheEndpoint(CustomTestCase):
-    """Integration test for the /flush_cache HTTP endpoint."""
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -126,7 +120,7 @@ class TestFlushCacheEndpoint(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_flush_cache_success(self):
-        """Verify 200 status and updated response text."""
+        """Verify 200 status and MM embedding cache mentioned in response."""
         time.sleep(1)
         response = requests.post(self.base_url + "/flush_cache")
 
@@ -134,14 +128,14 @@ class TestFlushCacheEndpoint(CustomTestCase):
         self.assertIn("MM embedding cache", response.text)
 
     def test_flush_cache_response_via_get(self):
-        """Endpoint accepts both GET and POST."""
+        """Verify endpoint accepts GET as well as POST."""
         response = requests.get(self.base_url + "/flush_cache")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("MM embedding cache", response.text)
 
     def test_flush_cache_blocked_by_running_request(self):
-        """Returns 400 when requests are in flight."""
+        """Verify 400 when requests are in flight."""
 
         def long_generate():
             return requests.post(
@@ -153,13 +147,9 @@ class TestFlushCacheEndpoint(CustomTestCase):
             )
 
         with ThreadPoolExecutor(max_workers=1) as executor:
-            # Fire a long-running request
             future = executor.submit(long_generate)
-            # Give it time to start processing
             time.sleep(1)
-            # Flush while request is in flight
             response = requests.post(self.base_url + "/flush_cache")
-            # Wait for the generation to finish
             future.result()
 
         self.assertEqual(response.status_code, 400)

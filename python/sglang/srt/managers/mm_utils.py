@@ -381,7 +381,9 @@ def init_mm_embedding_cache(max_size: int = 0):
 
 
 def flush_mm_embedding_cache() -> bool:
-    """Clear the global multimodal embedding cache."""
+    """
+    Clear the global multimodal embedding cache.
+    """
     global embedding_cache
     if embedding_cache is not None:
         embedding_cache.clear()
