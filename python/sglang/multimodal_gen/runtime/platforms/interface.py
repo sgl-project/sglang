@@ -46,6 +46,7 @@ class AttentionBackendEnum(enum.Enum):
         return self in {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
