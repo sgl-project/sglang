@@ -352,6 +352,9 @@ class PipelineConfig:
 
         # Pad to next multiple of SP degree if needed
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            logger.debug(
+                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            )
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
                 (*latents.shape[:2], pad_len, *latents.shape[3:]),

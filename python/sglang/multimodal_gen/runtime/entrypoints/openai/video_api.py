@@ -30,9 +30,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
+    DEFAULT_FPS,
+    DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
     adjust_output_quality,
+    build_sampling_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -46,65 +48,31 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
-# NOTE(mick): the sampling params needs to be further adjusted
-# FIXME: duplicated with the one in `image_api.py`
-def _build_sampling_params_from_request(
-    request_id: str, request: VideoGenerationsRequest
-) -> SamplingParams:
-    if request.size is None:
-        width, height = None, None
-    else:
-        width, height = _parse_size(request.size)
-    seconds = request.seconds if request.seconds is not None else 4
-    fps_default = 24
-    fps = request.fps if request.fps is not None else fps_default
-    derived_num_frames = fps * seconds
-    num_frames = (
-        request.num_frames if request.num_frames is not None else derived_num_frames
+def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
+    """Resolve video-specific defaults (fps, seconds → num_frames) then
+    delegate to the shared build_sampling_params."""
+    seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+    fps = request.fps if request.fps is not None else DEFAULT_FPS
+    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+
+    return build_sampling_params(
+        request_id,
+        prompt=request.prompt,
+        size=request.size,
+        num_frames=num_frames,
+        fps=fps,
+        image_path=request.input_reference,
+        output_file_name=request_id,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        guidance_scale_2=request.guidance_scale_2,
+        negative_prompt=request.negative_prompt,
+        enable_teacache=request.enable_teacache,
+        output_path=request.output_path,
+        output_compression=request.output_compression,
     )
-
-    server_args = get_global_server_args()
-    sampling_kwargs = {
-        "request_id": request_id,
-        "prompt": request.prompt,
-        "num_frames": num_frames,
-        "fps": fps,
-        "width": width,
-        "height": height,
-        "image_path": request.input_reference,
-        "save_output": True,
-        "output_file_name": request_id,
-        "seed": request.seed,
-        "generator_device": request.generator_device,
-    }
-    if request.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = request.guidance_scale
-    if request.guidance_scale_2 is not None:
-        sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
-    if request.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = request.negative_prompt
-    if request.enable_teacache is not None:
-        sampling_kwargs["enable_teacache"] = request.enable_teacache
-    if request.output_path is not None:
-        sampling_kwargs["output_path"] = request.output_path
-    if request.output_compression is not None:
-        sampling_kwargs["output_compression"] = request.output_compression
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        **sampling_kwargs,
-    )
-
-    if request.num_inference_steps is not None:
-        sampling_params.num_inference_steps = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_params.guidance_scale = request.guidance_scale
-    if request.seed is not None:
-        sampling_params.seed = request.seed
-
-    return sampling_params
 
 
 # extract metadata which http_server needs to know
@@ -291,7 +259,7 @@ async def create_video(
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
-    sampling_params = _build_sampling_params_from_request(request_id, req)
+    sampling_params = _build_video_sampling_params(request_id, req)
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 

@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
 import imageio
@@ -37,6 +38,25 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class GenerationResult:
+    """Result of a single generation request from DiffGenerator."""
+
+    samples: Any = None
+    frames: Any = None
+    audio: Any = None
+    prompt: str | None = None
+    size: tuple | None = None  # (height, width, num_frames)
+    generation_time: float = 0.0
+    peak_memory_mb: float = 0.0
+    timings: dict = field(default_factory=dict)
+    trajectory_latents: Any = None
+    trajectory_timesteps: Any = None
+    trajectory_decoded: Any = None
+    prompt_index: int = 0
+    output_file_path: str | None = None
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:

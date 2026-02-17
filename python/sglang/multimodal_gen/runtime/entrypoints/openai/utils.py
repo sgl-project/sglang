@@ -9,10 +9,14 @@ from typing import Any, List, Optional, Union
 import httpx
 from fastapi import UploadFile
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -22,6 +26,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+DEFAULT_FPS = 24
+DEFAULT_VIDEO_SECONDS = 4
 
 
 @dataclasses.dataclass
@@ -88,6 +94,45 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return w, h
     except Exception:
         return None, None
+
+
+def choose_image_ext(output_format: Optional[str], background: Optional[str]) -> str:
+    fmt = (output_format or "").lower()
+    if fmt in {"png", "webp", "jpeg", "jpg"}:
+        return "jpg" if fmt == "jpeg" else fmt
+    if (background or "auto").lower() == "transparent":
+        return "png"
+    return "jpg"
+
+
+def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
+    """Build SamplingParams from request parameters.
+
+    Handles size parsing and None filtering before delegating to
+    SamplingParams.from_user_sampling_params_args. Callers pass only the
+    parameters they have; None values are stripped automatically so that
+    SamplingParams defaults apply.
+    """
+    server_args = get_global_server_args()
+
+    # parse "WxH" size string if provided
+    size = kwargs.pop("size", None)
+    if size:
+        w, h = _parse_size(size)
+        if w is not None:
+            kwargs.setdefault("width", w)
+            kwargs.setdefault("height", h)
+
+    # filter out None values to let SamplingParams defaults apply
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    kwargs.setdefault("save_output", True)
+
+    return SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
+        server_args=server_args,
+        request_id=request_id,
+        **kwargs,
+    )
 
 
 async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
@@ -212,7 +257,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
-) -> tuple[str, OutputBatch]:
+) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
@@ -222,40 +267,21 @@ async def process_generation_batch(
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
-        save_file_path_list = []
-        # If output_file_paths is provided, use it instead of output.
+
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
         else:
-            audio_sample_rate = result.audio_sample_rate
-            if batch.data_type == DataType.VIDEO:
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda _idx: str(
-                        os.path.join(batch.output_path, batch.output_file_name)
-                    ),
-                    audio=result.audio,
-                    audio_sample_rate=audio_sample_rate,
-                    output_compression=batch.output_compression,
-                )
-            else:
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda idx: str(
-                        os.path.join(
-                            batch.output_path,
-                            f"sample_{idx}_" + batch.output_file_name,
-                        )
-                    ),
-                    audio_sample_rate=audio_sample_rate,
-                    output_compression=batch.output_compression,
-                )
+            num_outputs = len(result.output)
+            save_file_path_list = save_outputs(
+                result.output,
+                batch.data_type,
+                batch.fps,
+                batch.save_output,
+                lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                audio=result.audio,
+                audio_sample_rate=result.audio_sample_rate,
+                output_compression=batch.output_compression,
+            )
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)

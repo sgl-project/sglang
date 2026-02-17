@@ -65,11 +65,13 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
         return
 
     if isinstance(results, list):
-        result = results[0] if results else {}
+        result = results[0] if results else None
     else:
         result = results
 
-    timings_dict = result.get("timings")
+    timings_dict = getattr(result, "timings", None) or (
+        result.get("timings") if isinstance(result, dict) else None
+    )
     if not (args.perf_dump_path and timings_dict):
         return
 

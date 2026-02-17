@@ -8,10 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-    generate_request_id,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -20,9 +17,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
     add_common_data_to_response,
     adjust_output_quality,
+    build_sampling_params,
+    choose_image_ext,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -36,92 +34,19 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
 
 
-def _choose_ext(output_format: Optional[str], background: Optional[str]) -> str:
-    # Normalize and choose extension
-    fmt = (output_format or "").lower()
-    if fmt in {"png", "webp", "jpeg", "jpg"}:
-        return "jpg" if fmt == "jpeg" else fmt
-    # If transparency requested, prefer png
-    if (background or "auto").lower() == "transparent":
-        return "png"
-    # Default
-    return "jpg"
-
-
-def _build_sampling_params_from_request(
-    request_id: str,
-    prompt: str,
-    n: int,
-    size: Optional[str],
-    output_format: Optional[str],
-    background: Optional[str],
-    image_path: Optional[list[str]] = None,
-    seed: Optional[int] = None,
-    generator_device: Optional[str] = None,
-    num_inference_steps: Optional[int] = None,
-    guidance_scale: Optional[float] = None,
-    true_cfg_scale: Optional[float] = None,
-    negative_prompt: Optional[str] = None,
-    enable_teacache: Optional[bool] = None,
-    num_frames: int = 1,
-    output_compression: Optional[int] = None,
-) -> SamplingParams:
-    if size is None:
-        width, height = None, None
-    else:
-        width, height = _parse_size(size)
-    ext = _choose_ext(output_format, background)
-
-    server_args = get_global_server_args()
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        request_id=request_id,
-        prompt=prompt,
-        image_path=image_path,
-        num_frames=num_frames,
-        width=width,
-        height=height,
-        num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
-        save_output=True,
-        server_args=server_args,
-        output_file_name=f"{request_id}.{ext}",
-        seed=seed,
-        generator_device=generator_device,
-        num_inference_steps=num_inference_steps,
-        enable_teacache=enable_teacache,
-        **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
-        **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
-        **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
-        **(
-            {"output_compression": output_compression}
-            if output_compression is not None
-            else {}
-        ),
-    )
-
-    if num_inference_steps is not None:
-        sampling_params.num_inference_steps = num_inference_steps
-    if guidance_scale is not None:
-        sampling_params.guidance_scale = guidance_scale
-    if seed is not None:
-        sampling_params.seed = seed
-
-    return sampling_params
-
-
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
 ):
 
     request_id = generate_request_id()
-    sampling = _build_sampling_params_from_request(
-        request_id=request_id,
+    ext = choose_image_ext(request.output_format, request.background)
+    sampling = build_sampling_params(
+        request_id,
         prompt=request.prompt,
-        n=request.n or 1,
         size=request.size,
-        output_format=request.output_format,
-        background=request.background,
+        num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
+        output_file_name=f"{request_id}.{ext}",
         seed=request.seed,
         generator_device=request.generator_device,
         num_inference_steps=request.num_inference_steps,
@@ -262,13 +187,13 @@ async def edits(
             status_code=400, detail=f"Failed to process image source: {str(e)}"
         )
 
-    sampling = _build_sampling_params_from_request(
-        request_id=request_id,
+    ext = choose_image_ext(output_format, background)
+    sampling = build_sampling_params(
+        request_id,
         prompt=prompt,
-        n=n or 1,
         size=size,
-        output_format=output_format,
-        background=background,
+        num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
+        output_file_name=f"{request_id}.{ext}",
         image_path=input_paths,
         seed=seed,
         generator_device=generator_device,
