@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputFormat,
     select_experts,
 )
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 def fused_moe_triton_api(
@@ -205,8 +206,6 @@ def main():
     args = parser.parse_args()
 
     # Initialize global server args (required by SGLang MoE kernels)
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
     server_args = ServerArgs(model_path=args.model)
     set_global_server_args_for_scheduler(server_args)
 
