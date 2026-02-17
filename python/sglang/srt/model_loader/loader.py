@@ -2785,33 +2785,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 extra_config.get("distributed"), bool
             ):
                 self._is_distributed = extra_config.get("distributed")
-
-    def _maybe_download_from_modelscope(
-        self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
-        """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
-
-        Returns the path to the downloaded model, or None if the model is not
-        downloaded from ModelScope."""
-        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-            # download model from ModelScope hub,
-            # lazy import so that modelscope is not required for normal use.
-            # pylint: disable=C.
-            from modelscope.hub.snapshot_download import snapshot_download
-
-            if not os.path.exists(model):
-                model_path = snapshot_download(
-                    model_id=model,
-                    cache_dir=self.load_config.download_dir,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                    revision=revision,
-                    ignore_file_pattern=self.load_config.ignore_patterns,
-                )
-            else:
-                model_path = model
-            return model_path
-        return None
-
+ 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str]
     ) -> Tuple[str, List[str]]:
@@ -2819,11 +2793,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
         If the model is not local, it will be downloaded."""
         from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
-
-        model_name_or_path = (
-            self._maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
-        )
 
         is_object_storage_path = is_runai_obj_uri(model_name_or_path)
         if self._is_distributed is None:
