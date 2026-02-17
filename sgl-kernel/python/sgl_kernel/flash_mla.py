@@ -247,15 +247,17 @@ def flash_mla_sparse_fwd(
     Args:
         q: [s_q, h_q, d_qk], bfloat16
         kv: [s_kv, h_kv, d_qk], bfloat16
-        indices: [s_q, h_kv, topk], int32.
+        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float
         d_v: The dimension of value vectors. Can only be 512
 
     Returns:
         (output, max_logits, lse)
+        About the definition of output, max_logits and lse, please refer to README.md
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
-    if _flashmla_import_error is not None:
-        raise _IMPORT_ERROR from _flashmla_import_error
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )
