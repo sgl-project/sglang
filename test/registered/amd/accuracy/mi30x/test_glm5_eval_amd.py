@@ -11,7 +11,7 @@ import os
 import re
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -44,16 +44,10 @@ class ModelConfig:
     model_path: str
     tp_size: int = 8
     accuracy_threshold: float = 0.50
-    other_args: Optional[List[str]] = None
-    env_vars: Optional[dict] = None
+    other_args: List[str] = field(default_factory=list)
+    env_vars: dict = field(default_factory=dict)
     timeout: Optional[int] = None
     variant: Optional[str] = None
-
-    def __post_init__(self):
-        if self.other_args is None:
-            self.other_args = []
-        if self.env_vars is None:
-            self.env_vars = {}
 
     def get_display_name(self) -> str:
         if self.variant:

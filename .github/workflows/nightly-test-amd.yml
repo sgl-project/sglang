@@ -516,7 +516,10 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          # GLM-5 requires latest transformers for glm_moe_dsa architecture
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
 
       - name: Accuracy Test (8-GPU GLM-5 NSA)
         timeout-minutes: 120
@@ -882,6 +885,8 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          # GLM-5 requires latest transformers for glm_moe_dsa architecture
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
 
       - name: Accuracy Test MI35x (8-GPU GLM-5 NSA)
         timeout-minutes: 180

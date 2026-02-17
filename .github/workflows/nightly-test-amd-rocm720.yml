@@ -517,7 +517,10 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
+          # GLM-5 requires latest transformers for glm_moe_dsa architecture
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
 
       - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5 NSA)
         timeout-minutes: 120
@@ -881,6 +884,8 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          # GLM-5 requires latest transformers for glm_moe_dsa architecture
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5 NSA)
         timeout-minutes: 180
