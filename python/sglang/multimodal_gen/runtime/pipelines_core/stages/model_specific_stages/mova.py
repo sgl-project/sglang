@@ -701,7 +701,7 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_visual_seq_len, -1)
+            .reshape(full_visual_seq_len, 1, -1)
             .to(visual_x.device)
         )
 
@@ -720,7 +720,7 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_audio_seq_len, -1)
+            .reshape(full_audio_seq_len, 1, -1)
             .to(audio_x.device)
         )
 
@@ -731,15 +731,6 @@ class MOVADenoisingStage(PipelineStage):
         # Shard freqs to match local sequence length
         visual_freqs, _ = self._shard_sequence_for_sp(visual_freqs, dim=0)
         audio_freqs, _ = self._shard_sequence_for_sp(audio_freqs, dim=0)
-
-        visual_freqs = (
-            visual_freqs.real.contiguous().float(),
-            visual_freqs.imag.contiguous().float(),
-        )
-        audio_freqs = (
-            audio_freqs.real.contiguous().float(),
-            audio_freqs.imag.contiguous().float(),
-        )
 
         # Forward through dual-tower DiT
         visual_x, audio_x = self.forward_dual_tower_dit(
@@ -779,8 +770,8 @@ class MOVADenoisingStage(PipelineStage):
         audio_context: torch.Tensor,
         visual_t_mod: torch.Tensor,
         audio_t_mod: torch.Tensor,
-        visual_freqs: tuple[torch.Tensor, torch.Tensor],
-        audio_freqs: tuple[torch.Tensor, torch.Tensor],
+        visual_freqs: torch.Tensor,
+        audio_freqs: torch.Tensor,
         grid_size: tuple[int, int, int],
         video_fps: float,
         full_visual_seq_len: int,

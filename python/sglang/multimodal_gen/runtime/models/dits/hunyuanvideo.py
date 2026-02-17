@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb_qk,
+    _apply_rotary_emb,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -194,13 +194,14 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
+
         img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
         img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
-
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb_qk(img_q, img_k, cos, sin, is_neox_style=False)
-
+        img_q, img_k = _apply_rotary_emb(
+            img_q, cos, sin, is_neox_style=False
+        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -359,10 +360,11 @@ class MMSingleStreamBlock(nn.Module):
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
-
         # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb_qk(img_q, img_k, cos, sin, is_neox_style=False)
+        img_q, img_k = _apply_rotary_emb(
+            img_q, cos, sin, is_neox_style=False
+        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
 
         # Run distributed attention
         img_attn_output, txt_attn_output = self.attn(
