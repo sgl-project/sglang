@@ -16,12 +16,7 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import (
-    crash_on_warnings,
-    get_bool_env_var,
-    is_cuda,
-    is_npu,
-)
+from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
     from sgl_kernel import (
@@ -127,6 +122,7 @@ class Sampler(nn.Module):
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if get_global_server_args().rl_on_policy_target is not None:
+                # TODO: use more inplace ops to save memory
                 logits_div_temperature = (
                     logits.bfloat16().div(sampling_info.temperatures).bfloat16()
                 )
@@ -136,6 +132,7 @@ class Sampler(nn.Module):
                 del logits_div_temperature
 
             if self.use_ascend_backend:
+                # Ascend backend: sample from logits directly.
                 batch_next_token_ids, logprobs = self._forward_ascend_backend(
                     logits, sampling_info, simple_sampling_case, return_logprob
                 )
@@ -144,7 +141,7 @@ class Sampler(nn.Module):
                 and self.enable_deterministic
                 and simple_sampling_case
             ):
-                # RL on-policy path: Sample from logprobs to match the trainer better.
+                # RL on-policy path: sample from logprobs to match the trainer.
                 batch_next_token_ids = self._sample_from_logprobs(
                     logprobs_via_logsoftmax_kernel,
                     sampling_info,
@@ -155,7 +152,11 @@ class Sampler(nn.Module):
             else:
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
-                probs = torch.softmax(logits, dim=-1)
+
+                # In-place op to save memory
+                logits[:] = torch.softmax(logits, dim=-1)
+                probs = logits
+
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
@@ -165,6 +166,7 @@ class Sampler(nn.Module):
                         if logprobs_via_logsoftmax_kernel is not None
                         else torch.log(probs)
                     )
+                del probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
