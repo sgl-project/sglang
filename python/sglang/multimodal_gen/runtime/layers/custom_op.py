@@ -60,49 +60,46 @@ class CustomOp(nn.Module):
         except:
             self.raise_error()
 
-    def two_step_choose(self, v1: str, v2: str) -> Callable:
+    def two_step_choose(self, v1: str, v2: Callable) -> Callable:
         try:
             return self.get_function(v1)
         except:
-            try:
-                return self.get_function(v2)
-            except:
-                self.raise_error()
+            return v2()
 
     def use_forward_hip(self, *args, **kwargs) -> Callable:
         # ROCm kernels follow the CUDA path by default.
-        return self.two_step_choose("hip", "cuda")
+        return self.two_step_choose("hip", self.use_forward_cuda)
 
     def use_forward_cpu(self, *args, **kwargs) -> Callable:
         # By default, we assume that CPU ops are compatible with CUDA ops.
-        return self.two_step_choose("cpu", "cuda")
+        return self.two_step_choose("cpu", self.use_forward_cuda)
 
     def use_forward_tpu(self, *args, **kwargs) -> Callable:
         # By default, we assume that TPU ops are compatible with the
         # PyTorch-native implementation.
         # NOTE(woosuk): This is a placeholder for future extensions.
-        return self.two_step_choose("tpu", "native")
+        return self.two_step_choose("tpu", self.use_forward_native)
 
     def use_forward_musa(self, *args, **kwargs) -> Callable:
         # XXX (MUSA): MUSA kernels follow the CUDA path by default.
         # At this stage, sgl-kernel support for MUSA is still under active
         # development, so we fall back to the PyTorch-native implementation.
-        return self.two_step_choose("musa", "native")
+        return self.two_step_choose("musa", self.use_forward_native)
 
     def use_forward_oot(self, *args, **kwargs) -> Callable:
         # By default, we assume that OOT ops are compatible with the
         # PyTorch-native implementation.
-        return self.two_step_choose("oot", "native")
+        return self.two_step_choose("oot", self.use_forward_native)
 
     def use_forward_npu(self, *args, **kwargs) -> Callable:
         # By default, we assume that NPU ops are compatible with the
         # PyTorch-native implementation.
-        return self.two_step_choose("npu", "native")
+        return self.two_step_choose("npu", self.use_forward_native)
 
     def use_forward_xpu(self, *args, **kwargs) -> Callable:
         # By default, we assume that XPU ops are compatible with the
         # PyTorch-native implementation.
-        return self.two_step_choose("xpu", "native")
+        return self.two_step_choose("xpu", self.use_forward_native)
 
     def dispatch_forward(self) -> Callable:
         if _is_cuda:
