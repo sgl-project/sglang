@@ -678,7 +678,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         render_size = self.config.paint_resolution
         num_in_batch = len(normal_maps)
 
-        seed = batch.seed if batch.seed is not None else 0
+        seed = 0
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)

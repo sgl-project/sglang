@@ -10,7 +10,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 class Hunyuan3DSamplingParams(SamplingParams):
     """Sampling parameters for Hunyuan3D image-to-mesh generation."""
 
-    seed: int = 0
     negative_prompt: str = ""
 
     shape_num_inference_steps: int = 50
