@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2-Audio model compatible with HuggingFace weights."""
+
 import logging
 from typing import Any, Iterable, List, Optional, Tuple
 
