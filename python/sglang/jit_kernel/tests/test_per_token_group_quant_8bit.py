@@ -29,7 +29,7 @@ configs = list(
         [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
         [16, 32, 64, 128],  # group_size
         [None],  # num_ranks
-        [fp8_type_, torch.int8],  # dtype
+        [fp8_type_],  # dtype
         [
             dict(
                 column_major_scales=False,
@@ -64,7 +64,6 @@ configs = list(
 ) + list(
     itertools.product(
         [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-        # TODO support more
         [2048],
         [128],
         [8, 16, 32, 48],
