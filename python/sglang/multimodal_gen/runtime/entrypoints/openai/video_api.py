@@ -95,6 +95,19 @@ def _video_job_from_sampling(
     }
 
 
+async def _save_first_input_image(image_sources, request_id: str) -> str | None:
+    """Save the first input image from a list of sources and return its path."""
+    image_list = merge_image_input_list(image_sources)
+    if not image_list:
+        return None
+    image = image_list[0]
+    uploads_dir = os.path.join("outputs", "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    filename = image.filename if hasattr(image, "filename") else "url_image"
+    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    return await save_image_to_path(image, target_path)
+
+
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
@@ -158,26 +171,18 @@ async def create_video(
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
         # Validate image input based on model task type
-        image_list = merge_image_input_list(input_reference, reference_url)
-        if task_type.requires_image_input() and not image_list:
+        image_sources = merge_image_input_list(input_reference, reference_url)
+        if task_type.requires_image_input() and not image_sources:
             raise HTTPException(
                 status_code=400,
                 detail="input_reference or reference_url is required for image-to-video generation",
             )
-        input_path = None
-        if image_list:
-            # Save first input image for image-to-video generation
-            image = image_list[0]
-            uploads_dir = os.path.join("outputs", "uploads")
-            os.makedirs(uploads_dir, exist_ok=True)
-            filename = image.filename if hasattr(image, "filename") else "url_image"
-            input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
-            try:
-                input_path = await save_image_to_path(image, input_path)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400, detail=f"Failed to process image source: {str(e)}"
-                )
+        try:
+            input_path = await _save_first_input_image(image_sources, request_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
+            )
 
         # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
         extra_from_form: Dict[str, Any] = {}
@@ -236,17 +241,12 @@ async def create_video(
                     status_code=400,
                     detail="input_reference or reference_url is required for image-to-video generation",
                 )
-            # for not multipart/form-data type
+            # for non-multipart/form-data type
             if payload.get("reference_url"):
-                image_list = merge_image_input_list(payload.get("reference_url"))
-                # Save first input image
-                image = image_list[0]
-                uploads_dir = os.path.join("outputs", "uploads")
-                os.makedirs(uploads_dir, exist_ok=True)
-                filename = image.filename if hasattr(image, "filename") else "url_image"
-                input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
                 try:
-                    input_path = await save_image_to_path(image, input_path)
+                    input_path = await _save_first_input_image(
+                        payload.get("reference_url"), request_id
+                    )
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,

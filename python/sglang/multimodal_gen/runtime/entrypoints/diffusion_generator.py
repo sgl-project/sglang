@@ -14,16 +14,14 @@ import time
 from typing import Any, List, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    GenerationResult,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
     format_lora_message,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    GenerationResult,
     prepare_request,
     save_outputs,
 )
@@ -258,7 +256,14 @@ class DiffGenerator:
                                 output_file_path=req.output_file_path(num_outputs, idx),
                             )
                         )
-            except Exception:
+            except Exception as e:
+                logger.error(
+                    "Generation failed for prompt %d/%d: %s",
+                    request_idx + 1,
+                    len(requests),
+                    e,
+                    exc_info=True,
+                )
                 continue
 
         total_gen_time = time.perf_counter() - total_start_time
@@ -388,20 +393,15 @@ class DiffGenerator:
             "Failed to merge LoRA weights",
         )
 
-    def list_loras(self) -> OutputBatch:
-        """
-        List loaded LoRA adapters and current application status per module.
-        """
-
+    def list_loras(self) -> dict:
+        """List loaded LoRA adapters and current application status per module."""
         output = self._send_lora_request(
             req=ListLorasReq(),
             success_msg="Successfully listed LoRA adapters",
             failure_msg="Failed to list LoRA adapters",
         )
-        if output.error is None:
-            return output.output or {}
-        else:
-            raise RuntimeError(f"Failed to list LoRA adapters: {output.error}")
+        # _send_lora_request already raises on error, so output.error is always None here
+        return output.output or {}
 
     def _ensure_lora_state(
         self,
@@ -477,6 +477,9 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def __enter__(self):
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()

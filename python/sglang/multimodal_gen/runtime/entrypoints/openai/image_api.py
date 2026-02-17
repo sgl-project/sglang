@@ -34,6 +34,63 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
 
 
+def _read_b64_for_paths(paths: list[str]) -> list[str]:
+    """Read and base64-encode each file. Must be called before cloud upload deletes them."""
+    result = []
+    for path in paths:
+        with open(path, "rb") as f:
+            result.append(base64.b64encode(f.read()).decode("utf-8"))
+    return result
+
+
+def _build_image_response_kwargs(
+    save_file_path_list: list[str],
+    resp_format: str,
+    prompt: str,
+    *,
+    b64_list: list[str] | None = None,
+    cloud_url: str | None = None,
+    fallback_url: str | None = None,
+) -> dict:
+    """Build ImageResponse data list.
+
+    For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
+    For url: uses cloud_url or fallback_url.
+    """
+    if resp_format == "b64_json":
+        if not b64_list:
+            raise ValueError("b64_list required for b64_json response_format")
+        data = [
+            ImageResponseData(
+                b64_json=b64,
+                revised_prompt=prompt,
+                file_path=os.path.abspath(path),
+            )
+            for b64, path in zip(b64_list, save_file_path_list)
+        ]
+        return {"data": data}
+    elif resp_format == "url":
+        url = cloud_url or fallback_url
+        if not url:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format='url' requires cloud storage to be configured.",
+            )
+        return {
+            "data": [
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(save_file_path_list[0]),
+                )
+            ],
+        }
+    else:
+        raise HTTPException(
+            status_code=400, detail=f"response_format={resp_format} is not supported"
+        )
+
+
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -68,24 +125,19 @@ async def generations(
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
 
-    # Run synchronously for images and save to disk
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
     save_file_path = save_file_path_list[0]
-
     resp_format = (request.response_format or "b64_json").lower()
-    b64_data = None
 
-    # 1. Read content first if needed (while file exists)
-    if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("utf-8")
+    # read b64 before cloud upload may delete the local file
+    b64_list = (
+        _read_b64_for_paths(save_file_path_list) if resp_format == "b64_json" else None
+    )
 
-    # 2. Upload and Delete local file
     cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
@@ -96,37 +148,13 @@ async def generations(
         },
     )
 
-    # 4. Return Response
-    if resp_format == "b64_json":
-        response_kwargs = {
-            "data": [
-                ImageResponseData(
-                    b64_json=b64_data,
-                    revised_prompt=request.prompt,
-                )
-            ]
-        }
-    elif resp_format == "url":
-        if not cloud_url:
-            raise HTTPException(
-                status_code=400,
-                detail="response_format='url' requires cloud storage to be configured.",
-            )
-        response_kwargs = {
-            "data": [
-                ImageResponseData(
-                    url=cloud_url,
-                    revised_prompt=request.prompt,
-                    file_path=os.path.abspath(save_file_path),
-                )
-            ],
-        }
-    else:
-        # Return error, not supported
-        raise HTTPException(
-            status_code=400, detail=f"response_format={resp_format} is not supported"
-        )
-
+    response_kwargs = _build_image_response_kwargs(
+        save_file_path_list,
+        resp_format,
+        request.prompt,
+        b64_list=b64_list,
+        cloud_url=cloud_url,
+    )
     response_kwargs = add_common_data_to_response(
         response_kwargs, request_id=request_id, result=result
     )
@@ -217,19 +245,15 @@ async def edits(
         async_scheduler_client, batch
     )
     save_file_path = save_file_path_list[0]
-
     resp_format = (response_format or "b64_json").lower()
-    b64_data = None
 
-    # 1. Read content first if needed (while file exists)
-    if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("utf-8")
+    # read b64 before cloud upload may delete the local file
+    b64_list = (
+        _read_b64_for_paths(save_file_path_list) if resp_format == "b64_json" else None
+    )
 
-    # 2. Upload and Delete local file
     cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
@@ -237,40 +261,19 @@ async def edits(
             "created_at": int(time.time()),
             "file_path": None if cloud_url else save_file_path,
             "url": cloud_url,
-            "input_image_paths": input_paths,  # Store all input image paths
+            "input_image_paths": input_paths,
             "num_input_images": len(input_paths),
         },
     )
 
-    # 4. Return Response
-    if (response_format or "b64_json").lower() == "b64_json":
-        response_kwargs = {"data": []}
-        for path in save_file_path_list:
-            if path == save_file_path and b64_data is not None:
-                b64 = b64_data
-            else:
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-            response_kwargs["data"].append(
-                ImageResponseData(
-                    b64_json=b64,
-                    revised_prompt=prompt,
-                    file_path=os.path.abspath(path),
-                )
-            )
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            response_kwargs["peak_memory_mb"] = result.peak_memory_mb
-    else:
-        response_kwargs = {
-            "data": [
-                ImageResponseData(
-                    url=cloud_url if cloud_url else f"/v1/images/{request_id}/content",
-                    revised_prompt=prompt,
-                    file_path=os.path.abspath(save_file_path),
-                )
-            ],
-        }
-
+    response_kwargs = _build_image_response_kwargs(
+        save_file_path_list,
+        resp_format,
+        prompt,
+        b64_list=b64_list,
+        cloud_url=cloud_url,
+        fallback_url=f"/v1/images/{request_id}/content",
+    )
     response_kwargs = add_common_data_to_response(
         response_kwargs, request_id=request_id, result=result
     )

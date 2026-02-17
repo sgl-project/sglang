@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
-import dataclasses
 import os
 import re
 import time
@@ -13,7 +12,15 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
+    format_lora_message,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -23,66 +30,21 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 
+# re-export LoRA protocol types for backward compatibility
+__all__ = [
+    "SetLoraReq",
+    "MergeLoraWeightsReq",
+    "UnmergeLoraWeightsReq",
+    "ListLorasReq",
+    "ShutdownReq",
+    "format_lora_message",
+]
+
 logger = init_logger(__name__)
 
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
-
-
-@dataclasses.dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
-
-
-@dataclasses.dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
-
-
-@dataclasses.dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-
-
-@dataclasses.dataclass
-class ListLorasReq:
-    # Empty payload; used only as a type marker for listing LoRA status
-    pass
-
-
-@dataclasses.dataclass
-class ShutdownReq:
-    pass
-
-
-def format_lora_message(
-    lora_nickname: Union[str, List[str]],
-    target: Union[str, List[str]],
-    strength: Union[float, List[float]],
-) -> tuple[str, str, str]:
-    """Format success message for single or multiple LoRAs"""
-    if isinstance(lora_nickname, list):
-        nickname_str = ", ".join(lora_nickname)
-        target_str = ", ".join(target) if isinstance(target, list) else target
-        strength_str = (
-            ", ".join(f"{s:.2f}" for s in strength)
-            if isinstance(strength, list)
-            else f"{strength:.2f}"
-        )
-    else:
-        nickname_str = lora_nickname
-        target_str = target if isinstance(target, str) else ", ".join(target)
-        strength_str = (
-            f"{strength:.2f}"
-            if isinstance(strength, (int, float))
-            else ", ".join(f"{s:.2f}" for s in strength)
-        )
-    return nickname_str, target_str, strength_str
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -216,24 +178,23 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     """Decode base64 image data and save to target path."""
 
+    _B64_FMT_HINT = (
+        "Failed to decode base64 image. "
+        "Expected format: `data:[<media-type>];base64,<data>`"
+    )
+
     # split `data:[<media-type>][;base64],<data>` to media-type base64 data
     pattern = r"data:(.*?)(;base64)?,(.*)"
     match = re.match(pattern, base64_data)
     if not match:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(_B64_FMT_HINT)
     media_type = match.group(1)
     is_base64 = match.group(2)
     if not is_base64:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
     data = match.group(3)
     if not data:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
     # get ext from url
     if media_type.startswith("image/"):
         ext = media_type.split("/")[-1].lower()
