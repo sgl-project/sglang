@@ -71,6 +71,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "QuarkLinearMethod",  # TODO: validate it for TP=1, TP>1 for all schemes. This is required to handle weight_block_size.
 ]
 
 _is_cpu = is_cpu()

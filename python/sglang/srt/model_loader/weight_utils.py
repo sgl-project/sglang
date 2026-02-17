@@ -201,6 +201,10 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+
+        # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+        hf_quant_config["requantization_method"] = model_config.quantization
+
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -234,9 +238,12 @@ def get_quant_config(
     possible_config_filenames = quant_cls.get_config_filenames()
 
     # If the quantization config is not found, use the default config.
+    # TODO: standardize the handling of online quantization with custom handlenames (mxfp8, quark_mxfp4, etc.)
     if not possible_config_filenames:
         if model_config.quantization == "mxfp8":
             return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
+        if model_config.quantization == "quark_mxfp4":
+            return quant_cls(online_scheme=model_config.quantization)
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
