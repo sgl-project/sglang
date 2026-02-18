@@ -2788,7 +2788,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 extra_config.get("distributed"), bool
             ):
                 self._is_distributed = extra_config.get("distributed")
- 
+
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str]
     ) -> Tuple[str, List[str]]:
