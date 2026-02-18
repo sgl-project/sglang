@@ -31,6 +31,15 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+def _debug_tensor_str(name: str, val) -> str:
+    """Return a debug string for a tensor, handling None gracefully."""
+    if val is None:
+        return f"{name}: None\n"
+    if hasattr(val, "shape") and hasattr(val, "dtype"):
+        return f"{name}: shape={val.shape}, dtype={val.dtype}, tensor={val}\n"
+    return f"{name}: {val}\n"
+
+
 if is_cuda():
     from sgl_kernel import (
         apply_shuffle_mul_sum,
@@ -100,8 +109,8 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w2_blockscale: Optional[torch.Tensor] = None
     w1_alpha: Optional[torch.Tensor] = None
     w2_alpha: Optional[torch.Tensor] = None
-    a1_gscale: Optional[torch.Tensor] = None
-    a2_gscale: Optional[torch.Tensor] = None
+
+
     # W4A8 specific fields
     a_strides1: Optional[torch.Tensor] = None
     b_strides1: Optional[torch.Tensor] = None
@@ -380,11 +389,26 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
         c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
-        gateup_input = torch.empty(
-            (m * topk, k),
-            device=device,
-            dtype=torch.float8_e4m3fn,
-        )
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: first cutlass_w4a8_moe_mm inputs:\n")
+        #         f.write(_debug_tensor_str("c1", c1))
+        #         f.write(_debug_tensor_str("gateup_input", gateup_input))
+        #         f.write(_debug_tensor_str("w1_q", w1_q))
+        #         a1_scale_val = a1_scale.float() if a1_scale is not None else None
+        #         f.write(_debug_tensor_str("a1_scale", a1_scale_val))
+        #         f.write(_debug_tensor_str("w1_scale", w1_scale))
+        #         f.write(_debug_tensor_str("expert_offsets[:-1]", expert_offsets[:-1]))
+        #         f.write(_debug_tensor_str("problem_sizes1", problem_sizes1))
+        #         f.write(_debug_tensor_str("a_strides1", a_strides1))
+        #         f.write(_debug_tensor_str("b_strides1", b_strides1))
+        #         f.write(_debug_tensor_str("c_strides1", c_strides1))
+        #         f.write(_debug_tensor_str("s_strides13", s_strides13))
+        #         f.write(f"128: {128}\n")
+        #         f.write(f"topk: {topk}\n")
+        #         f.write("\n")
 
         cutlass_w4a8_moe_mm(
             c1,
@@ -405,9 +429,41 @@ class CutlassRunnerCore(MoeRunnerCore):
         intermediate_q = torch.empty(
             (m * topk, n), dtype=torch.float8_e4m3fn, device=device
         )
+
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: silu_mul_static_tensorwise_quant_for_cutlass_moe inputs:\n")
+        #         f.write(_debug_tensor_str("c1", c1))
+        #         f.write(_debug_tensor_str("intermediate_q", intermediate_q))
+        #         a2_scale_val = a2_scale.float() if a2_scale is not None else None
+        #         f.write(_debug_tensor_str("a2_scale", a2_scale_val))
+        #         f.write(_debug_tensor_str("expert_offsets[-1:]", expert_offsets[-1:]))
+        #         f.write(f"m * topk: {m * topk}\n")
+        #         f.write(f"n: {n}\n")
+        #         f.write("\n")
+
         silu_mul_static_tensorwise_quant_for_cutlass_moe(
             c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
         )
+
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: second cutlass_w4a8_moe_mm inputs:\n")
+        #         f.write(_debug_tensor_str("c2", c2))
+        #         f.write(_debug_tensor_str("intermediate_q", intermediate_q))
+        #         f.write(_debug_tensor_str("w2_q", w2_q))
+        #         a2_scale_val = a2_scale.float() if a2_scale is not None else None
+        #         f.write(_debug_tensor_str("a2_scale", a2_scale_val))
+        #         f.write(_debug_tensor_str("w2_scale", w2_scale))
+        #         f.write(_debug_tensor_str("expert_offsets[:-1]", expert_offsets[:-1]))
+        #         f.write(_debug_tensor_str("problem_sizes2", problem_sizes2))
+        #         f.write(_debug_tensor_str("a_strides2", a_strides2))
+        #         f.write(_debug_tensor_str("b_strides2", b_strides2))
+        #         f.write(_debug_tensor_str("c_strides2", c_strides2))
+        #         f.write(_debug_tensor_str("s_strides2", s_strides2))
+        #         f.write(f"128: {128}\n")
+        #         f.write(f"topk: {topk}\n")
+        #         f.write("\n")
 
         cutlass_w4a8_moe_mm(
             c2,
@@ -492,11 +548,34 @@ class CutlassRunnerCore(MoeRunnerCore):
         k = w1_q.size(2) * 2  # w1_q is transposed and packed
 
         topk = topk_ids_.size(1)
-        m = gateup_input.shape[0] // topk  # number of tokens
+        m = topk_ids_.size(0)  # number of tokens
 
         device = a.device
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
         c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: cutlass_w4a8_moe_deepep_normal first cutlass_w4a8_moe_mm inputs:\n")
+        #         f.write(_debug_tensor_str("c1", c1))
+        #         f.write(_debug_tensor_str("gateup_input", gateup_input))
+        #         f.write(_debug_tensor_str("w1_q", w1_q))
+        #         a1_scale_val = a1_scale.float() if a1_scale is not None else None
+        #         f.write(_debug_tensor_str("a1_scale", a1_scale_val))
+        #         f.write(_debug_tensor_str("w1_scale", w1_scale))
+        #         f.write(_debug_tensor_str("expert_offsets[:-1]", expert_offsets[:-1]))
+        #         f.write(_debug_tensor_str("problem_sizes1", problem_sizes1))
+        #         f.write(_debug_tensor_str("a_strides1", a_strides1))
+        #         f.write(_debug_tensor_str("b_strides1", b_strides1))
+        #         f.write(_debug_tensor_str("c_strides1", c_strides1))
+        #         f.write(_debug_tensor_str("s_strides13", s_strides13))
+        #         f.write(f"128: {128}\n")
+        #         f.write(f"topk: {topk}\n")
+        #         f.write(f"m: {m}\n")
+        #         f.write(f"n: {n}\n")
+        #         f.write(f"k: {k}\n")
+        #         f.write("\n")
 
         cutlass_w4a8_moe_mm(
             c1,
@@ -520,6 +599,25 @@ class CutlassRunnerCore(MoeRunnerCore):
             intermediate.shape, dtype=torch.float8_e4m3fn, device=device
         )
         sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: cutlass_w4a8_moe_deepep_normal second cutlass_w4a8_moe_mm inputs:\n")
+        #         f.write(_debug_tensor_str("c2", c2))
+        #         f.write(_debug_tensor_str("intermediate_q", intermediate_q))
+        #         f.write(_debug_tensor_str("w2_q", w2_q))
+        #         a2_scale_val = a2_scale.float() if a2_scale is not None else None
+        #         f.write(_debug_tensor_str("a2_scale", a2_scale_val))
+        #         f.write(_debug_tensor_str("w2_scale", w2_scale))
+        #         f.write(_debug_tensor_str("expert_offsets[:-1]", expert_offsets[:-1]))
+        #         f.write(_debug_tensor_str("problem_sizes2", problem_sizes2))
+        #         f.write(_debug_tensor_str("a_strides2", a_strides2))
+        #         f.write(_debug_tensor_str("b_strides2", b_strides2))
+        #         f.write(_debug_tensor_str("c_strides2", c_strides2))
+        #         f.write(_debug_tensor_str("s_strides2", s_strides2))
+        #         f.write(f"128: {128}\n")
+        #         f.write(f"topk: {topk}\n")
+        #         f.write("\n")
 
         cutlass_w4a8_moe_mm(
             c2,
@@ -961,6 +1059,9 @@ def pre_permute_standard_to_cutlass(
 
     device = hidden_states.device
 
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+
     if quant_info.moe_type == CutlassMoEType.BlockscaledFP8:
         # Extract variables from quant_info
         a = hidden_states
@@ -1002,8 +1103,6 @@ def pre_permute_standard_to_cutlass(
         topk = topk_ids.size(1)
         device = a.device
 
-        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
 
         if use_mxfp8:
             assert (
@@ -1077,11 +1176,6 @@ def pre_permute_standard_to_cutlass(
             rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
             rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-        # c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
-        # c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
-
-        # a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
-        # w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
         # ----------------------------------------------------------
         # Return the prepared input data
@@ -1218,6 +1312,13 @@ def pre_permute_standard_to_cutlass(
         if get_moe_expert_parallel_world_size() > 1:
             topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: cutlass_w4_run_moe_ep_preproess inputs:\n")
+        #         f.write(_debug_tensor_str("topk_ids", topk_ids))
+        #         f.write("\n")
+
         src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
         running_state["src2dst"] = src2dst
         running_state["topk_ids"] = topk_ids
@@ -1229,12 +1330,26 @@ def pre_permute_standard_to_cutlass(
             dtype=torch.float8_e4m3fn,
         )
 
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: pre_reorder_for_cutlass_moe inputs:\n")
+        #         f.write(_debug_tensor_str("hidden_states", hidden_states))
+        #         f.write(_debug_tensor_str("gateup_input", gateup_input))
+        #         f.write(_debug_tensor_str("src2dst", src2dst))
+        #         f.write(_debug_tensor_str("topk_ids", topk_ids))
+        #         f.write(_debug_tensor_str("quant_info.w13_input_scale", quant_info.w13_input_scale))
+        #         f.write(f"num_local_experts: {num_local_experts}\n")
+        #         f.write(f"topk: {topk}\n")
+        #         f.write(f"m: {m}\n")
+        #         f.write(f"k: {k}\n")
+        #         f.write("\n")
+
         pre_reorder_for_cutlass_moe(
             hidden_states,
             gateup_input,
             src2dst,
             topk_ids,
-            quant_info.a1_gscale,
+            quant_info.w13_input_scale,
             num_local_experts,
             topk,
             m,
@@ -1244,6 +1359,20 @@ def pre_permute_standard_to_cutlass(
         # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
         # they are kept to allow for a quick switch of the permutation logic
         # from the current triton kernel implementation to the cutlass-based one if needed.
+
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: get_cutlass_w4a8_moe_mm_data inputs:\n")
+        #         f.write(_debug_tensor_str("topk_ids", topk_ids))
+        #         f.write(_debug_tensor_str("quant_info.expert_offsets", quant_info.expert_offsets))
+        #         f.write(_debug_tensor_str("quant_info.problem_sizes1", quant_info.problem_sizes1))
+        #         f.write(_debug_tensor_str("quant_info.problem_sizes2", quant_info.problem_sizes2))
+        #         f.write(_debug_tensor_str("a_map", a_map))
+        #         f.write(_debug_tensor_str("c_map", c_map))
+        #         f.write(f"num_local_experts: {num_local_experts}\n")
+        #         f.write(f"n: {n}\n")
+        #         f.write(f"k: {k}\n")
+        #         f.write("\n")
 
         get_cutlass_w4a8_moe_mm_data(
             topk_ids,
@@ -1297,6 +1426,9 @@ def post_permute_cutlass_to_standard(
             running_state["topk_weights"].to(result.dtype),
         )
         hidden_states = result
+
+        if runner_config.routed_scaling_factor is not None:
+            hidden_states.mul_(runner_config.routed_scaling_factor)
     elif moe_type == CutlassMoEType.BlockscaledFP4:
         num_tokens = running_state["original_hidden_states_shape"][0]
         topk = running_state["c_map"].shape[0] // num_tokens
@@ -1315,6 +1447,9 @@ def post_permute_cutlass_to_standard(
                 .to(reordered.dtype)
             )
         hidden_states = reordered.sum(dim=1).to(down_output.dtype)
+
+        if runner_config.routed_scaling_factor is not None:
+            hidden_states.mul_(runner_config.routed_scaling_factor)
     elif moe_type == CutlassMoEType.W4A8:
         from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_for_cutlass_moe
 
@@ -1327,6 +1462,22 @@ def post_permute_cutlass_to_standard(
             device=down_output.device,
             dtype=down_output.dtype,
         )
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # if get_tensor_model_parallel_rank() == 1:
+        #     with open("debug_refactor.log", "a") as f:
+        #         f.write("DEBUG: post_reorder_for_cutlass_moe inputs:\n")
+        #         f.write(_debug_tensor_str("down_output", down_output))
+        #         f.write(_debug_tensor_str("result", result))
+        #         f.write(_debug_tensor_str("running_state['src2dst']", running_state.get("src2dst")))
+        #         f.write(_debug_tensor_str("running_state['topk_ids']", running_state.get("topk_ids")))
+        #         f.write(_debug_tensor_str("running_state['topk_weights']", running_state.get("topk_weights")))
+        #         f.write(_debug_tensor_str("running_state['num_local_experts']", running_state.get("num_local_experts")))
+        #         f.write(f"topk: {topk}\n")
+        #         f.write(f"num_tokens: {num_tokens}\n")
+        #         f.write(f"hidden_size: {hidden_size}\n")
+        #         f.write(f"runner_config.routed_scaling_factor or 1.0: {runner_config.routed_scaling_factor or 1.0}\n")
+        #         f.write("\n")
 
         post_reorder_for_cutlass_moe(
             down_output,
@@ -1344,9 +1495,6 @@ def post_permute_cutlass_to_standard(
         hidden_states = result
     else:
         raise NotImplementedError(f"Unsupported CUTLASS MoE type: {moe_type}")
-
-    if runner_config.routed_scaling_factor is not None:
-        hidden_states.mul_(runner_config.routed_scaling_factor)
 
     return StandardCombineInput(hidden_states=hidden_states)
 
@@ -1507,6 +1655,14 @@ def pre_permute_deepep_normal_to_cutlass(
     topk = topk_ids_.size(1)
     device = hidden_states.device
 
+    # from sglang.srt.distributed import get_tensor_model_parallel_rank
+    # if get_tensor_model_parallel_rank() == 1:
+    #     with open("debug_refactor.log", "a") as f:
+    #         f.write("DEBUG: pre_permute_deepep_normal_to_cutlass deepep_run_moe_deep_preprocess inputs:\n")
+    #         f.write(_debug_tensor_str("topk_ids_", topk_ids_))
+    #         f.write(f"num_experts: {num_experts}\n")
+    #         f.write("\n")
+
     reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
         topk_ids_, num_experts
     )
@@ -1516,6 +1672,18 @@ def pre_permute_deepep_normal_to_cutlass(
         device=device,
         dtype=hidden_states.dtype,
     )
+
+    # if get_tensor_model_parallel_rank() == 1:
+    #     with open("debug_refactor.log", "a") as f:
+    #         f.write("DEBUG: pre_permute_deepep_normal_to_cutlass deepep_permute_triton_kernel inputs:\n")
+    #         f.write(_debug_tensor_str("hidden_states", hidden_states))
+    #         f.write(_debug_tensor_str("gateup_input_pre_reorder", gateup_input_pre_reorder))
+    #         f.write(_debug_tensor_str("src2dst", src2dst))
+    #         f.write(_debug_tensor_str("topk_ids_", topk_ids_))
+    #         f.write(f"topk: {topk}\n")
+    #         f.write(f"hidden_states.shape[1]: {hidden_states.shape[1]}\n")
+    #         f.write("\n")
+
     deepep_permute_triton_kernel[(hidden_states.shape[0],)](
         hidden_states,
         gateup_input_pre_reorder,
@@ -1540,6 +1708,20 @@ def pre_permute_deepep_normal_to_cutlass(
 
     a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+
+    # if get_tensor_model_parallel_rank() == 1:
+    #     with open("debug_refactor.log", "a") as f:
+    #         f.write("DEBUG: pre_permute_deepep_normal_to_cutlass get_cutlass_w4a8_moe_mm_data inputs:\n")
+    #         f.write(_debug_tensor_str("local_topk_ids", local_topk_ids))
+    #         f.write(_debug_tensor_str("expert_offsets", quant_info.expert_offsets))
+    #         f.write(_debug_tensor_str("problem_sizes1", quant_info.problem_sizes1))
+    #         f.write(_debug_tensor_str("problem_sizes2", quant_info.problem_sizes2))
+    #         f.write(_debug_tensor_str("a_map", a_map))
+    #         f.write(_debug_tensor_str("c_map", c_map))
+    #         f.write(f"num_experts: {num_experts}\n")
+    #         f.write(f"n: {n}\n")
+    #         f.write(f"k: {k}\n")
+    #         f.write("\n")
 
     quant_info.problem_sizes1.zero_()
     quant_info.problem_sizes2.zero_()
@@ -1596,6 +1778,20 @@ def post_permute_cutlass_to_deepep_normal(
         device=c2.device,
         dtype=torch.bfloat16,
     )
+
+    # from sglang.srt.distributed import get_tensor_model_parallel_rank
+    # if get_tensor_model_parallel_rank() == 1:
+    #     with open("debug_refactor.log", "a") as f:
+    #         f.write("DEBUG: post_permute_cutlass_to_deepep_normal deepep_post_reorder_triton_kernel inputs:\n")
+    #         f.write(_debug_tensor_str("c2", c2))
+    #         f.write(_debug_tensor_str("output", output))
+    #         f.write(_debug_tensor_str("src2dst", src2dst))
+    #         f.write(_debug_tensor_str("topk_ids_", topk_ids_))
+    #         f.write(_debug_tensor_str("topk_weights", topk_weights))
+    #         f.write(f"topk: {topk}\n")
+    #         f.write(f"hidden_size: {hidden_size}\n")
+    #         f.write("\n")
+
     deepep_post_reorder_triton_kernel[(num_tokens,)](
         c2,
         output,
