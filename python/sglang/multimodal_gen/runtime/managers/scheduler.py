@@ -12,13 +12,15 @@ import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
-    _parse_size,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -241,9 +243,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue

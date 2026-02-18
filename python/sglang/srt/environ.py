@@ -7,11 +7,17 @@ from typing import Any
 
 
 @contextmanager
-def temp_set_env(**env_vars: dict[str, Any]):
-    """Temporarily set non-sglang environment variables, e.g. OPENAI_API_KEY"""
-    for key in env_vars:
-        if key.startswith("SGLANG_") or key.startswith("SGL_"):
-            raise ValueError("temp_set_env should not be used for sglang env vars")
+def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
+    """Temporarily set environment variables, restoring originals on exit.
+
+    By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
+    for those.  Pass ``allow_sglang=True`` only for special env vars that
+    intentionally bypass ``environ.py`` (e.g. ``SGLANG_DUMPER_*``).
+    """
+    if not allow_sglang:
+        for key in env_vars:
+            if key.startswith("SGLANG_") or key.startswith("SGL_"):
+                raise ValueError("temp_set_env should not be used for sglang env vars")
 
     backup = {key: os.environ.get(key) for key in env_vars}
     try:
@@ -170,6 +176,8 @@ class Envs:
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_CUDA_COREDUMP = EnvBool(False)
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -568,6 +576,11 @@ _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
+
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
 
 
 def example_with_exit_stack():
