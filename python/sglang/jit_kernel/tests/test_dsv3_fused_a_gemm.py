@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.jit_kernel.dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as jit_dsv3_fused_a_gemm,
@@ -16,8 +17,36 @@ HdIn = 7168
 HdOut = 2112
 
 
-def _make_inputs(num_tokens):
-    """Create test inputs: mat_a (row-major bf16), mat_b (column-major bf16)."""
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="requires CUDA SM90+",
+)
+@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
+def test_jit_vs_torch_matmul(num_tokens):
+    torch.manual_seed(42)
+    mat_a = torch.randn(num_tokens, HdIn, dtype=torch.bfloat16, device="cuda")
+    mat_b = (
+        torch.randn(HdIn, HdOut, dtype=torch.bfloat16, device="cuda")
+        .t()
+        .contiguous()
+        .t()
+    )
+
+    jit_output = jit_dsv3_fused_a_gemm(mat_a, mat_b)
+
+    ref_output = F.linear(mat_a, mat_b.T)
+
+    torch.testing.assert_close(jit_output, ref_output, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not AOT_AVAILABLE
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9,
+    reason="requires sgl_kernel AOT + CUDA SM90+",
+)
+@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
+def test_jit_vs_aot(num_tokens):
     torch.manual_seed(42)
     mat_a = torch.randn(num_tokens, HdIn, dtype=torch.bfloat16, device="cuda")
     # mat_b must be column-major: shape [HdIn, HdOut] with stride(0)==1
@@ -27,29 +56,6 @@ def _make_inputs(num_tokens):
         .contiguous()
         .t()
     )
-    return mat_a, mat_b
-
-
-@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
-def test_jit_vs_torch_matmul(num_tokens):
-    """JIT kernel should produce approximately correct results vs torch.matmul."""
-    mat_a, mat_b = _make_inputs(num_tokens)
-
-    jit_output = jit_dsv3_fused_a_gemm(mat_a, mat_b)
-
-    ref_output = (mat_a.float() @ mat_b.float()).bfloat16()
-
-    cos_sim = torch.nn.functional.cosine_similarity(
-        jit_output.float().flatten(), ref_output.float().flatten(), dim=0
-    )
-    assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim:.6f}"
-
-
-@pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel AOT not available")
-@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
-def test_jit_vs_aot(num_tokens):
-    """JIT kernel should produce bitwise identical results to AOT kernel."""
-    mat_a, mat_b = _make_inputs(num_tokens)
 
     jit_output = jit_dsv3_fused_a_gemm(mat_a, mat_b)
     aot_output = aot_dsv3_fused_a_gemm(mat_a, mat_b)

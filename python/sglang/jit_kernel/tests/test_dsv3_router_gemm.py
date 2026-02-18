@@ -32,7 +32,7 @@ def test_jit_vs_torch_matmul(num_tokens, num_experts, out_dtype):
     if out_dtype == torch.float32:
         ref_output = ref_output.float()
 
-    torch.testing.assert_close(jit_output, ref_output, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(jit_output, ref_output, rtol=1e-2, atol=1e-3)
 
 
 @pytest.mark.skipif(
