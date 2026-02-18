@@ -1222,12 +1222,24 @@ class NixlKVManager(CommonKVManager):
                     num_kv_heads = self.kv_args.kv_head_num
                     total_prefill_heads = num_kv_heads * prefill_tp_size
                     heads_per_decode_rank = total_prefill_heads // decode_tp_size
+                    # Decode ranks that connect to this prefill rank are grouped in
+                    # a contiguous block. Use the relative rank within that block so
+                    # head_start stays in [0, num_kv_heads).
+                    decode_per_prefill = decode_tp_size // prefill_tp_size
 
                     batch_requests = []
                     for req in active_reqs:
                         decode_info = self.decode_kv_args_table[req.agent_name]
                         decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
-                        head_start = decode_tp_rank * heads_per_decode_rank
+                        relative_decode_rank = decode_tp_rank % decode_per_prefill
+                        head_start = relative_decode_rank * heads_per_decode_rank
+                        logger.debug(
+                            f"[MIXED-TP-BATCHED] prefill_tp={prefill_tp_size}, "
+                            f"decode_tp={decode_tp_size}, decode_tp_rank={decode_tp_rank}, "
+                            f"decode_per_prefill={decode_per_prefill}, "
+                            f"relative_decode_rank={relative_decode_rank}, "
+                            f"head_start={head_start}, heads_per_decode={heads_per_decode_rank}"
+                        )
                         notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
                         batch_requests.append((
                             req.agent_name,
@@ -1294,7 +1306,16 @@ class NixlKVManager(CommonKVManager):
                 if prefill_tp_size > decode_tp_size:
                     head_start = 0
                     num_heads_to_send = num_kv_heads
-                    dst_head_offset = local_tp_rank * num_kv_heads
+                    # Use the rank relative to the decode bucket so dst_head_offset
+                    # stays within [0, num_kv_heads * prefill_ranks_per_decode).
+                    prefill_ranks_per_decode = prefill_tp_size // decode_tp_size
+                    dst_head_offset = (local_tp_rank % prefill_ranks_per_decode) * num_kv_heads
+                    logger.debug(
+                        f"[MIXED-TP] prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}, "
+                        f"local_tp_rank={local_tp_rank}, num_kv_heads={num_kv_heads}, "
+                        f"prefill_ranks_per_decode={prefill_ranks_per_decode}, "
+                        f"dst_head_offset={dst_head_offset}"
+                    )
                 else:
                     head_start = 0
                     num_heads_to_send = num_kv_heads

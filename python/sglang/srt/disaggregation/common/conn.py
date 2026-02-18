@@ -324,9 +324,16 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_tp_ranks = [self.target_tp_rank]
         elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
             if not self.kv_mgr.is_mla_backend:
-                logger.warning_once(
-                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
-                )
+                if getattr(self.kv_mgr, "nixl_use_cpu_buffer", False):
+                    logger.info_once(
+                        "Mixed TP sizes detected (decode_tp > prefill_tp). "
+                        "CPU buffer transfer (--nixl-use-cpu-buffer) is enabled for correct head redistribution."
+                    )
+                else:
+                    logger.warning_once(
+                        "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                        "Consider running with --nixl-use-cpu-buffer for correct mixed-TP KV transfer."
+                    )
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             ) // (self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size)
@@ -339,9 +346,16 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             if not self.kv_mgr.is_mla_backend:
-                logger.warning_once(
-                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
-                )
+                if getattr(self.kv_mgr, "nixl_use_cpu_buffer", False):
+                    logger.info_once(
+                        "Mixed TP sizes detected (prefill_tp > decode_tp). "
+                        "CPU buffer transfer (--nixl-use-cpu-buffer) is enabled for correct head redistribution."
+                    )
+                else:
+                    logger.warning_once(
+                        "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                        "Consider running with --nixl-use-cpu-buffer for correct mixed-TP KV transfer."
+                    )
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
                 rank
