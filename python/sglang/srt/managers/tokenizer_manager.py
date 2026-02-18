@@ -512,10 +512,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         async with self.model_update_lock.reader_lock:
             # Validate LoRA configuration
-            self._validate_lora_enabled(obj)
-
-            if self.server_args.enable_lora and obj.lora_path:
-                await self._resolve_lora_path(obj)
+            await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -876,27 +873,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             raise ValueError(
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
-
-    def _validate_lora_enabled(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-    ) -> None:
-        """Validate that LoRA is enabled when a LoRA adapter is requested."""
-        if not obj.lora_path or self.server_args.enable_lora:
-            return
-
-        # Extract adapter name for error message
-        if isinstance(obj.lora_path, str):
-            adapter_name = obj.lora_path
-        elif isinstance(obj.lora_path, list):
-            adapter_name = next((a for a in obj.lora_path if a), "unknown")
-        else:
-            adapter_name = str(obj.lora_path)
-
-        raise ValueError(
-            f"LoRA adapter '{adapter_name}' was requested, but LoRA is not enabled. "
-            "Please launch the server with --enable-lora flag and preload adapters "
-            "using --lora-paths or /load_lora_adapter endpoint."
-        )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
@@ -2236,6 +2212,28 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    async def _validate_and_resolve_lora(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate that LoRA is enabled when a LoRA adapter is requested."""
+        if not obj.lora_path:
+            return
+
+        if not self.server_args.enable_lora:
+            first_adapter = (
+                obj.lora_path
+                if isinstance(obj.lora_path, str)
+                else next((a for a in obj.lora_path if a), None)
+            )
+
+            raise ValueError(
+                f"LoRA adapter '{first_adapter}' was requested, but LoRA is not enabled. "
+                "Please launch the server with --enable-lora flag and preload adapters "
+                "using --lora-paths or /load_lora_adapter endpoint."
+            )
+
+        await self._resolve_lora_path(obj)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
