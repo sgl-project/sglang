@@ -7,7 +7,7 @@ import shutil
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SCHEMES = ["s3://", "gs://"]
+SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
 
 # Design Pattern: Single Metadata Download Before Process Launch
 

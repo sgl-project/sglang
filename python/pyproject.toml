@@ -99,7 +99,7 @@ torch = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
-runai = ["runai-model-streamer[s3,gcs]>=0.15.5"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.6"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
@@ -111,7 +111,7 @@ diffusion = [
   "remote-pdb==2.1.0",
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
-  "runai_model_streamer>=0.15.5",
+  "runai_model_streamer>=0.15.6",
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
@@ -144,7 +144,7 @@ test = [
   "pytest",
   "pytest-cov",
   "diff-cover",
-  "runai-model-streamer[gcs]>=0.15.5",
+  "runai-model-streamer[gcs]>=0.15.6",
   "sentence_transformers",
   "tabulate",
 ]
