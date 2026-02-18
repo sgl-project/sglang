@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
+    SGLANG_ENABLE_UAA: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -247,6 +248,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),
+    # Enable UAA (Ulysses Anything Attention) for arbitrary head/sequence sizes
+    "SGLANG_ENABLE_UAA": _lazy_bool("SGLANG_ENABLE_UAA", "false"),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),

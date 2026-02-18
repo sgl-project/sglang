@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 
@@ -303,6 +304,7 @@ class USPAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
+        enable_uaa: bool | None = None,
         **extra_impl_args,
     ) -> None:
         super().__init__()
@@ -313,6 +315,15 @@ class USPAttention(nn.Module):
 
         if num_kv_heads is None:
             num_kv_heads = num_heads
+
+        # If enable_uaa is not explicitly set, try to get it from server_args
+        if enable_uaa is None:
+            try:
+                server_args = get_global_server_args()
+                enable_uaa = server_args.enable_uaa
+            except (ValueError, AttributeError):
+                # If server_args is not set or doesn't have enable_uaa, default to False
+                enable_uaa = False
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
@@ -335,6 +346,17 @@ class USPAttention(nn.Module):
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
+        self.enable_uaa = enable_uaa
+
+        # Validate UAA restrictions (based on diffusers PR)
+        if self.enable_uaa and get_ring_parallel_world_size() > 1:
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "UAA with ring_degree > 1 is not yet supported. "
+                "Consider using only ulysses_degree or disabling UAA."
+            )
 
     def forward(
         self,
@@ -365,12 +387,18 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            q = _usp_input_all_to_all(q, head_dim=2, enable_uaa=self.enable_uaa)
+            k = _usp_input_all_to_all(k, head_dim=2, enable_uaa=self.enable_uaa)
+            v = _usp_input_all_to_all(v, head_dim=2, enable_uaa=self.enable_uaa)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
+            if self.enable_uaa:
+                # UAA with ring attention not fully supported yet
+                import logging
+
+                logger = logging.getLogger(__name__)
+                logger.warning("Using ring attention with UAA - this is experimental")
             out = ring_attn(
                 q,
                 k,
@@ -386,6 +414,6 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            out = _usp_output_all_to_all(out, head_dim=2, enable_uaa=self.enable_uaa)
 
         return out
