@@ -297,7 +297,7 @@ jobs:
         timeout-minutes: 120
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 4500
+          python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 5400
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()

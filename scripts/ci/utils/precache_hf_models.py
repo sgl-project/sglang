@@ -5,7 +5,7 @@ Pre-download missing HuggingFace models before CI tests start.
 This script runs once during CI initialization (in prepare_runner.sh) to:
 1. Extract model names from DEFAULT_*MODEL* constants in test_utils.py
 2. Scan test/registered/ for hardcoded model references (model = "org/repo")
-3. Check which models are NOT yet cached (no snapshot with config.json)
+3. Check which models are NOT yet cached (no snapshot with config + weight files)
 4. Download missing models via snapshot_download(max_workers=1)
 5. Use fcntl-based locking (same lock paths as ci_download_with_validation_and_retry)
    with LOCK_NB (non-blocking — skip if locked by another process)
@@ -92,30 +92,60 @@ def get_models_from_test_files():
     return models
 
 
+def _get_hf_cache_dir():
+    """Get the HuggingFace hub cache directory."""
+    try:
+        from huggingface_hub import constants
+
+        return constants.HF_HUB_CACHE
+    except ImportError:
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        return os.path.join(hf_home, "hub")
+
+
 def is_model_cached(model_name):
     """
-    Check if a model is already cached (has a snapshot with config.json).
+    Check if a model is already cached with both config AND weight files.
+
+    A model snapshot can have config.json and tokenizer files but be missing
+    the actual weight files (.safetensors/.bin) if a previous download was
+    incomplete or weights were evicted. This function checks for weight files
+    to avoid false positives.
 
     Args:
         model_name: HuggingFace model name (e.g., "meta-llama/Llama-3.1-8B-Instruct")
 
     Returns:
-        True if model appears to be cached, False otherwise
+        True if model appears to be fully cached, False otherwise
     """
-    try:
-        from huggingface_hub import constants
-
-        cache_dir = constants.HF_HUB_CACHE
-    except ImportError:
-        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-        cache_dir = os.path.join(hf_home, "hub")
+    cache_dir = _get_hf_cache_dir()
 
     # models--org--repo format
     repo_folder_name = "models--" + model_name.replace("/", "--")
-    snapshots_pattern = os.path.join(
-        cache_dir, repo_folder_name, "snapshots", "*", "config.json"
-    )
-    return len(glob.glob(snapshots_pattern)) > 0
+    snapshots_dir = os.path.join(cache_dir, repo_folder_name, "snapshots")
+
+    if not os.path.isdir(snapshots_dir):
+        return False
+
+    # Check each snapshot for both config.json and weight files
+    for snapshot_hash in os.listdir(snapshots_dir):
+        snapshot_path = os.path.join(snapshots_dir, snapshot_hash)
+        if not os.path.isdir(snapshot_path):
+            continue
+
+        has_config = os.path.exists(os.path.join(snapshot_path, "config.json"))
+        if not has_config:
+            continue
+
+        # Check for weight files (.safetensors or .bin)
+        has_weights = any(
+            glob.glob(os.path.join(snapshot_path, pattern))
+            for pattern in ("*.safetensors", "*.bin")
+        )
+        if has_weights:
+            return True
+
+    return False
 
 
 def _get_lock_file_path(model_name):
