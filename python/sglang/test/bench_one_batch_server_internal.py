@@ -16,6 +16,7 @@ from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
+    gen_prompt,
     get_processor,
     get_tokenizer,
     sample_mmmu_requests,
@@ -103,6 +104,10 @@ class BenchArgs:
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
     dataset_name: str = "random"
+    gsp_num_groups: int = 1
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_output_len: int = 256
     parallel_batch: bool = False
     result_filename: str = "result.jsonl"
     pydantic_result_filename: Optional[str] = None
@@ -164,8 +169,32 @@ class BenchArgs:
             "--dataset-name",
             type=str,
             default=BenchArgs.dataset_name,
-            choices=["mmmu", "random"],
+            choices=["mmmu", "random", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
+        )
+        parser.add_argument(
+            "--gsp-num-groups",
+            type=int,
+            default=BenchArgs.gsp_num_groups,
+            help="Number of shared prefix groups. batch_size requests are distributed across groups.",
+        )
+        parser.add_argument(
+            "--gsp-system-prompt-len",
+            type=int,
+            default=BenchArgs.gsp_system_prompt_len,
+            help="Length of the shared system prompt in tokens per group.",
+        )
+        parser.add_argument(
+            "--gsp-question-len",
+            type=int,
+            default=BenchArgs.gsp_question_len,
+            help="Length of the unique question suffix in tokens per request.",
+        )
+        parser.add_argument(
+            "--gsp-output-len",
+            type=int,
+            default=BenchArgs.gsp_output_len,
+            help="Output length in tokens for generated-shared-prefix requests.",
         )
         parser.add_argument("--parallel-batch", action="store_true")
         parser.add_argument(
@@ -356,6 +385,47 @@ def _warmup_cache(
     print("Cache warmup completed")
 
 
+def sample_generated_shared_prefix_requests(
+    batch_size: int,
+    num_groups: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    tokenizer,
+):
+    """Generate batch inputs where requests share system prompt prefixes.
+
+    Each group gets a unique system prompt. Requests in the batch are distributed
+    across groups round-robin. Each request = shared system prompt + unique question.
+    Returns (input_ids_list, effective_input_len, output_len).
+    """
+    actual_num_groups = min(num_groups, batch_size)
+
+    system_prompts_text = [
+        gen_prompt(tokenizer, system_prompt_len) for _ in range(actual_num_groups)
+    ]
+    system_prompts_ids = [tokenizer.encode(sp) for sp in system_prompts_text]
+
+    input_ids_list = []
+    for i in range(batch_size):
+        group_idx = i % actual_num_groups
+        question_text = gen_prompt(tokenizer, question_len)
+        question_ids = tokenizer.encode(question_text)
+        full_ids = system_prompts_ids[group_idx] + question_ids
+        input_ids_list.append(full_ids)
+
+    avg_input_len = sum(len(ids) for ids in input_ids_list) // len(input_ids_list)
+    avg_sys_len = sum(len(ids) for ids in system_prompts_ids) // len(system_prompts_ids)
+    avg_q_len = avg_input_len - avg_sys_len
+
+    print(f"Generated shared prefix inputs:")
+    print(f"  num_groups={actual_num_groups}, batch_size={batch_size}")
+    print(f"  avg system prompt len={avg_sys_len}, avg question len={avg_q_len}")
+    print(f"  avg total input len={avg_input_len}, output_len={output_len}")
+
+    return input_ids_list, avg_input_len, output_len
+
+
 def run_one_case(
     url: str,
     batch_size: int,
@@ -379,24 +449,47 @@ def run_one_case(
     cache_hit_rate: float = BenchArgs.cache_hit_rate,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    gsp_num_groups: int = BenchArgs.gsp_num_groups,
+    gsp_system_prompt_len: int = BenchArgs.gsp_system_prompt_len,
+    gsp_question_len: int = BenchArgs.gsp_question_len,
+    gsp_output_len: int = BenchArgs.gsp_output_len,
 ):
-    if backend == "vllm":
-        # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
-        response = requests.post(url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
-    else:
-        response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
+    # For shared-prefix, skip cache flush so the prefix stays cached across calls.
+    # For other datasets, flush the cache as usual.
+    if dataset_name != "generated-shared-prefix":
+        if backend == "vllm":
+            response = requests.post(
+                url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT
+            )
+            response.raise_for_status()
+        else:
+            response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
 
     # Load input token ids
     # TODO: reuse bench_serving.get_dataset ?
-    if dataset_name == "mmmu":
+    if dataset_name == "generated-shared-prefix":
+        input_ids, input_len, output_len = sample_generated_shared_prefix_requests(
+            batch_size=batch_size,
+            num_groups=gsp_num_groups,
+            system_prompt_len=gsp_system_prompt_len,
+            question_len=gsp_question_len,
+            output_len=gsp_output_len,
+            tokenizer=tokenizer,
+        )
+        image_data = None
+    elif dataset_name == "mmmu":
         input_requests = sample_mmmu_requests(
             num_requests=batch_size,
             processor=tokenizer,
             fixed_output_len=output_len,
             random_sample=False,
         )
+        input_ids = []
+        tokenizer = tokenizer.tokenizer
+        for input_req in input_requests:
+            input_ids += [tokenizer.encode(input_req.prompt)]
+        image_data = [req.image_data for req in input_requests]
     elif dataset_name == "random":
         input_requests = sample_random_requests(
             input_len=input_len,
@@ -408,16 +501,6 @@ def run_one_case(
             random_sample=True,
             return_text=False,
         )
-
-    # Extract input_ids from requests
-    if dataset_name == "mmmu":
-        input_ids = []
-        # for vlms, tokenizer is an instance of AutoProcessor
-        tokenizer = tokenizer.tokenizer
-        for input_req in input_requests:
-            input_ids += [tokenizer.encode(input_req.prompt)]
-        image_data = [req.image_data for req in input_requests]
-    else:
         input_ids = [req.prompt for req in input_requests]
         image_data = None
 
@@ -765,6 +848,14 @@ def run_benchmark_internal(
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
         skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
+    # Common GSP kwargs to pass through to run_one_case
+    gsp_kwargs = dict(
+        gsp_num_groups=bench_args.gsp_num_groups,
+        gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
+        gsp_question_len=bench_args.gsp_question_len,
+        gsp_output_len=bench_args.gsp_output_len,
+    )
+
     # Warmup
     if not bench_args.skip_warmup:
         print("=" * 8 + " Warmup Begin " + "=" * 8)
@@ -787,6 +878,7 @@ def run_benchmark_internal(
                 parallel_batch=bench_args.parallel_batch,
                 backend=bench_args.backend,
                 model_name=model_name,
+                **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -822,6 +914,7 @@ def run_benchmark_internal(
                     cache_hit_rate=bench_args.cache_hit_rate,
                     backend=bench_args.backend,
                     model_name=model_name,
+                    **gsp_kwargs,
                 )
             )
 
@@ -864,6 +957,7 @@ def run_benchmark_internal(
                             profile_output_dir=bench_args.profile_output_dir,
                             backend=bench_args.backend,
                             model_name=model_name,
+                            **gsp_kwargs,
                         )
                     )
             except Exception as e:
