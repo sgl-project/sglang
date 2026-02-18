@@ -1435,10 +1435,7 @@ class NativeSparseAttnBackend(
                     )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged(
-                        kv_cache,
-                        page_table_1_flattened,
-                        dim_nope=self.kv_lora_rank,
-                        dim_rope=self.qk_rope_head_dim,
+                        kv_cache, page_table_1_flattened
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)

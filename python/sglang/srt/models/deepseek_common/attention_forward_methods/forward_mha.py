@@ -215,20 +215,18 @@ class DeepseekMHAForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            use_paged_fp8_dequant = False
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                backend = forward_batch.attn_backend
-                if isinstance(backend, TboAttnBackend):
-                    backend = backend.primary
-                use_paged_fp8_dequant = bool(
-                    getattr(backend, "nsa_kv_cache_store_fp8", False)
+            if (
+                self.use_nsa
+                and self.kv_cache_dtype == "fp8_e4m3"
+                and (
+                    not get_global_server_args().nsa_decode_backend == "trtllm"
+                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
                 )
-
-            if use_paged_fp8_dequant:
-                # Scaled FP8 KV-cache layout path: dequantize to BF16.
+            ):
+                # FP8 path: dequantize NSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
-                # BF16/FP16 or compact FP8 KV-cache path: directly fetch from cache.
+                # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
                     forward_batch.fetch_mha_one_shot_kv_indices(),
                     q.dtype,
@@ -458,12 +456,7 @@ class DeepseekMHAForwardMixin:
             self.attn_mha.layer_id
         )
 
-        kv_latent_bf16 = dequantize_k_cache_paged(
-            kv_cache_fp8,
-            kv_indices,
-            dim_nope=self.kv_lora_rank,
-            dim_rope=self.qk_rope_head_dim,
-        )
+        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
 
         kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
         k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]

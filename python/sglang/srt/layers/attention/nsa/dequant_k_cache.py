@@ -169,48 +169,28 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
-    dim_nope: int = 512,
-    dim_rope: int = 64,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
     Args:
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
-        group_size: per-group quantization size for packed FP8+scale layout
-        dim_nope: no-PE latent dimension
-        dim_rope: RoPE latent dimension
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
+    assert (
+        dim_quant == 656
+    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in nsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
-    num_tiles = dim_nope // group_size
-
-    packed_dim_quant = dim_nope + num_tiles * 4 + dim_rope * torch.bfloat16.itemsize
-    compact_dim_quant = dim_nope + dim_rope
-
-    # Compact layout (e.g. TRTLLM MLA path): [nope_fp8 | rope_fp8].
-    # No per-group scales are stored in cache; dequantization is a plain fp8->bf16 cast.
-    if dim_quant == compact_dim_quant:
-        gather_indices = (
-            page_table_1_flattened
-            if page_table_1_flattened.dtype == torch.int64
-            else page_table_1_flattened.to(torch.int64)
-        )
-        gathered = quant_k_cache.index_select(0, gather_indices)
-        return gathered.to(torch.bfloat16).unsqueeze(1)
-
-    assert dim_quant == packed_dim_quant, (
-        f"Unsupported dim_quant={dim_quant} in dequantize_k_cache_paged; "
-        f"expected compact={compact_dim_quant} or packed={packed_dim_quant} "
-        f"for dim_nope={dim_nope}, dim_rope={dim_rope}, group_size={group_size}."
-    )
+    dim_nope = 512
+    dim_rope = 64
+    num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),
@@ -218,14 +198,18 @@ def dequantize_k_cache_paged(
         device=quant_k_cache.device,
     )
 
+    # cdiv(512 + 64, 128) = 5
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
+    assert num_blocks_per_token == 5
 
     assert dim_nope % group_size == 0
 
     input_nope_q = quant_k_cache[:, :dim_nope]
+    # [:, 512:512+4*4] = [:, 512:528]
     input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
         torch.float32
     )
+    # [:, 528:]
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
