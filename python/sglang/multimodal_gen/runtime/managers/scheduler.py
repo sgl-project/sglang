@@ -12,13 +12,15 @@ import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
-    _parse_size,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
