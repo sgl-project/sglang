@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -18,16 +19,16 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_npu
 
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
     from nixl_ep import Buffer
@@ -43,11 +44,11 @@ class NixlEPDispatchOutput(NamedTuple):
     """NixlEP dispatch output.
 
     Note: Uses same format as DeepEPLLOutput for compatibility with downstream code.
-    hidden_states_fp8 is a tuple of (hidden_states, scale) or just hidden_states if no scale.
     """
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
@@ -189,13 +190,21 @@ class _NixlEPDispatcherImplBase:
         self._mask_buffer = torch.zeros_like(self.active_ranks) if self.active_ranks is not None else None
 
         self.handle = None
+        self.quant_config = None
+        self.overlap_args = None
+        self.meta_overlap_args = None
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+
+    def set_overlap_args(self, combine_overlap_args, meta_overlap_args) -> None:
+        self.overlap_args = combine_overlap_args
+        self.meta_overlap_args = meta_overlap_args
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         raise NotImplementedError
 
@@ -205,9 +214,8 @@ class _NixlEPDispatcherImplBase:
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         raise NotImplementedError
 
@@ -232,24 +240,22 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         buffer = self._get_buffer()
-        topk_idx = topk_idx.to(torch.int64)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            input_global_scale,
-            topk_idx,
+            topk_ids,
         )
         return (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -260,7 +266,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def dispatch_b(
         self,
         hidden_states,
-        topk_idx,
+        topk_ids,
         topk_weights,
         masked_m,
         expected_m,
@@ -273,9 +279,15 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             masked_m
         )
 
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         nixl_output = NixlEPDispatchOutput(
             hidden_states,
-            topk_idx,
+            hidden_states_scale,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -285,10 +297,10 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
         topk_idx: torch.Tensor,
     ):
         use_nvfp4 = use_fp8 = False
+        input_global_scale = self.quant_config.get("input_global_scale", None) if self.quant_config else None
         if input_global_scale is not None:
             use_nvfp4 = True
         elif not get_bool_env_var("SGLANG_NIXL_EP_BF16_DISPATCH"):
@@ -321,19 +333,18 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
-            overlap_args=overlap_args,
         )
-        return hidden_states, event, hook, overlap_args
+        return hidden_states, event, hook
 
-    def combine_b(self, hidden_states, event, hook, overlap_args):
+    def combine_b(self, hidden_states, event, hook):
+        overlap_args = self.overlap_args
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
@@ -347,11 +358,11 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         buffer = self._get_buffer()
+        overlap_args = self.overlap_args
 
         ctx = nullcontext()
         if overlap_args is not None:
@@ -361,7 +372,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         with ctx:
             combined_hidden_states, event, hook = buffer.combine(
                 x=hidden_states,
-                topk_idx=topk_idx,
+                topk_idx=topk_ids,
                 topk_weights=topk_weights,
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
@@ -440,72 +451,81 @@ class NixlEPDispatcher(BaseDispatcher):
 
         self._stage = _Stage.INITIAL
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states=hidden_states, topk_output=topk_output)
         ret = self.dispatch_b()
         return ret
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
+        topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl(forward_batch).dispatch_a(
+        inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
-            input_global_scale=input_global_scale,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
         )
-        self._dispatch_intermediate_state = forward_batch, inner_state
+        self._dispatch_intermediate_state = inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        forward_batch, inner_state = self._dispatch_intermediate_state
+        inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl(forward_batch).dispatch_b(*inner_state)
+        return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(
+        self,
+        combine_input: CombineInput,
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        overlap_args: Optional["CombineOverlapArgs"] = None,
+        combine_input: CombineInput,
     ):
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl(forward_batch).combine_a(
+        inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
-            overlap_args=overlap_args,
         )
-        self._combine_intermediate_state = forward_batch, inner_state
+        self._combine_intermediate_state = inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        forward_batch, inner_state = self._combine_intermediate_state
+        inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl(forward_batch).combine_b(*inner_state)
+        return self._get_impl().combine_b(*inner_state)
 
-    def _get_impl(self, forward_batch: ForwardBatch) -> _NixlEPDispatcherImplBase:
-        resolved_deepep_mode = self.deepep_mode.resolve(
-            forward_batch.is_extend_in_batch
-        )
+    def _get_impl(self) -> _NixlEPDispatcherImplBase:
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
 
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
