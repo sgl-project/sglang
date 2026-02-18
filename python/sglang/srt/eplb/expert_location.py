@@ -25,6 +25,10 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_pipeline_model_parallel_world_size,
+)
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
 
@@ -67,8 +71,7 @@ class ExpertLocationMetadata:
 
     @property
     def ep_size(self):
-        # TODO change when EP size != world size
-        return torch.distributed.get_world_size()
+        return get_moe_expert_parallel_world_size()
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
@@ -161,7 +164,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = server_args.nnodes
+        num_nodes = server_args.nnodes if get_pipeline_model_parallel_world_size() == 1 else 1
 
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (
             eplb_algorithms.rebalance_experts(
