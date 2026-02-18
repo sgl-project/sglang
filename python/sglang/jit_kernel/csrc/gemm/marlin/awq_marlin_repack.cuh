@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include "marlin.cuh"
@@ -187,11 +188,7 @@ __global__ void awq_marlin_repack_kernel(
 
 // Host wrapper
 void awq_marlin_repack(
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView b_q_weight,
-    int64_t size_k,
-    int64_t size_n,
-    int64_t num_bits) {
+    tvm::ffi::TensorView out, tvm::ffi::TensorView b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits) {
   using namespace host;
   using namespace device::marlin;
 
@@ -206,10 +203,7 @@ void awq_marlin_repack(
   SymbolicDevice cuda_device;
   cuda_device.set_options<kDLCUDA>();
 
-  TensorMatcher({size_k, size_n / pack_factor})
-      .with_dtype<int32_t>()
-      .with_device(cuda_device)
-      .verify(b_q_weight);
+  TensorMatcher({size_k, size_n / pack_factor}).with_dtype<int32_t>().with_device(cuda_device).verify(b_q_weight);
 
   TensorMatcher({size_k / tile_size, size_n * tile_size / pack_factor})
       .with_dtype<int32_t>()
@@ -235,20 +229,22 @@ void awq_marlin_repack(
   // Dispatch based on num_bits
   if (num_bits == 4) {
     cudaFuncSetAttribute(
-        awq_marlin_repack_kernel<repack_threads, 4>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        max_shared_mem);
+        awq_marlin_repack_kernel<repack_threads, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
     LaunchKernel(blocks, repack_threads, stream, max_shared_mem)(
         awq_marlin_repack_kernel<repack_threads, 4>,
-        b_q_weight_ptr, out_ptr, static_cast<int>(size_k), static_cast<int>(size_n));
+        b_q_weight_ptr,
+        out_ptr,
+        static_cast<int>(size_k),
+        static_cast<int>(size_n));
   } else if (num_bits == 8) {
     cudaFuncSetAttribute(
-        awq_marlin_repack_kernel<repack_threads, 8>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        max_shared_mem);
+        awq_marlin_repack_kernel<repack_threads, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
     LaunchKernel(blocks, repack_threads, stream, max_shared_mem)(
         awq_marlin_repack_kernel<repack_threads, 8>,
-        b_q_weight_ptr, out_ptr, static_cast<int>(size_k), static_cast<int>(size_n));
+        b_q_weight_ptr,
+        out_ptr,
+        static_cast<int>(size_k),
+        static_cast<int>(size_n));
   } else {
     RuntimeCheck(false, "Unsupported repack config: num_bits = ", num_bits);
   }

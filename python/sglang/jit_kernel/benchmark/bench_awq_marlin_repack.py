@@ -6,11 +6,10 @@ import triton
 import triton.testing
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.jit_kernel.awq_marlin_repack import awq_marlin_repack as jit_awq_marlin_repack
-from sglang.srt.layers.quantization.utils import (
-    pack_cols,
-    quantize_weights,
+from sglang.jit_kernel.awq_marlin_repack import (
+    awq_marlin_repack as jit_awq_marlin_repack,
 )
+from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
 
 try:
     from sgl_kernel import awq_marlin_repack as aot_awq_marlin_repack
