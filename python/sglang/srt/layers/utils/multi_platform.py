@@ -45,7 +45,7 @@ class MultiPlatformOp(nn.Module):
         # so we decide to only use torch.compile when bs=1
         if "FusedMoE" in self.__class__.__name__:
             if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
+                from sglang.srt.layers.moe.moe_runner.torch_native import (
                     fused_moe_forward_native,
                 )
 

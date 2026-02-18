@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
+from sglang.srt.layers.moe.moe_runner.torch_native import TorchNativeRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
@@ -41,6 +42,8 @@ class MoeRunner:
             self.runner_core = None  # Marlin only supports fused path
         elif runner_backend.is_flashinfer_trtllm():
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_torch_native():
+            self.runner_core = TorchNativeRunnerCore(config)
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -74,8 +77,8 @@ class MoeRunner:
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
     ) -> CombineInput:
 
-        if self.fused_func is not None:
-            return self.fused_func(dispatch_output, quant_info, self.config)
+        # if self.fused_func is not None:
+        #     return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
         dispatch_format = dispatch_output.format.value

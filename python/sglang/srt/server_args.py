@@ -65,6 +65,8 @@ from sglang.srt.utils.common import (
     torch_release,
     wait_port_available,
     xpu_has_xmx_support,
+    is_cpu,
+    cpu_has_amx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.utils import is_in_ci
@@ -183,6 +185,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "torch_native",
+    "amx",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2104,6 +2108,21 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.moe_runner_backend == "amx" and not is_cpu():
+            raise ValueError("AMX MoE backend is only supported on CPU, set SGLANG_USE_CPU_ENGINE=1 to use CPU-only execution.")
+
+        if is_cpu():
+            if cpu_has_amx_support() and self.moe_runner_backend != "amx" and self.moe_runner_backend != "torch_native":
+                self.moe_runner_backend = "amx"
+                logger.warning(
+                    "CPU-only execution is enabled and amx is supported, setting moe_runner_backend to amx"
+                )
+            elif self.moe_runner_backend != "torch_native":
+                self.moe_runner_backend = "torch_native"
+                logger.warning(
+                    "CPU-only execution is enabled and amx is not supported, setting moe_runner_backend to torch_native"
+                )
+
         if self.quantization == "mxfp8":
             if self.moe_runner_backend not in ["auto", "cutlass"]:
                 logger.warning(
