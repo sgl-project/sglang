@@ -38,7 +38,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb_qk
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
 )
@@ -761,14 +763,12 @@ class QwenImageCrossAttention(nn.Module):
                 raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
 
             img_cache, txt_cache = image_rotary_emb
-            img_cos, img_sin = img_cache.chunk(2, dim=-1)
-            txt_cos, txt_sin = txt_cache.chunk(2, dim=-1)
 
-            img_query, img_key = _apply_rotary_emb_qk(
-                img_query, img_key, img_cos, img_sin, is_neox_style=False
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                img_query, img_key, img_cache, is_neox=False
             )
-            txt_query, txt_key = _apply_rotary_emb_qk(
-                txt_query, txt_key, txt_cos, txt_sin, is_neox_style=False
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                txt_query, txt_key, txt_cache, is_neox=False
             )
 
         # Concatenate for joint attention

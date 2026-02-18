@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
@@ -65,11 +64,13 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
         return
 
     if isinstance(results, list):
-        result = results[0] if results else {}
+        result = results[0] if results else None
     else:
         result = results
 
-    timings_dict = result.get("timings")
+    timings_dict = getattr(result, "timings", None) or (
+        result.get("timings") if isinstance(result, dict) else None
+    )
     if not (args.perf_dump_path and timings_dict):
         return
 
@@ -77,17 +78,6 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
     timings.stages = timings_dict.get("stages", {})
     timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
-
-    # restore memory snapshots from serialized dict
-    memory_snapshots_dict = timings_dict.get("memory_snapshots", {})
-    for checkpoint_name, snapshot_dict in memory_snapshots_dict.items():
-        snapshot = MemorySnapshot(
-            allocated_mb=snapshot_dict.get("allocated_mb", 0.0),
-            reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
-            peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
-            peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
-        )
-        timings.memory_snapshots[checkpoint_name] = snapshot
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
