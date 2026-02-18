@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -16,11 +17,9 @@ from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
-    gen_prompt,
+    get_dataset,
     get_processor,
     get_tokenizer,
-    sample_mmmu_requests,
-    sample_random_requests,
 )
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
@@ -385,47 +384,6 @@ def _warmup_cache(
     print("Cache warmup completed")
 
 
-def sample_generated_shared_prefix_requests(
-    batch_size: int,
-    num_groups: int,
-    system_prompt_len: int,
-    question_len: int,
-    output_len: int,
-    tokenizer,
-):
-    """Generate batch inputs where requests share system prompt prefixes.
-
-    Each group gets a unique system prompt. Requests in the batch are distributed
-    across groups round-robin. Each request = shared system prompt + unique question.
-    Returns (input_ids_list, effective_input_len, output_len).
-    """
-    actual_num_groups = min(num_groups, batch_size)
-
-    system_prompts_text = [
-        gen_prompt(tokenizer, system_prompt_len) for _ in range(actual_num_groups)
-    ]
-    system_prompts_ids = [tokenizer.encode(sp) for sp in system_prompts_text]
-
-    input_ids_list = []
-    for i in range(batch_size):
-        group_idx = i % actual_num_groups
-        question_text = gen_prompt(tokenizer, question_len)
-        question_ids = tokenizer.encode(question_text)
-        full_ids = system_prompts_ids[group_idx] + question_ids
-        input_ids_list.append(full_ids)
-
-    avg_input_len = sum(len(ids) for ids in input_ids_list) // len(input_ids_list)
-    avg_sys_len = sum(len(ids) for ids in system_prompts_ids) // len(system_prompts_ids)
-    avg_q_len = avg_input_len - avg_sys_len
-
-    print(f"Generated shared prefix inputs:")
-    print(f"  num_groups={actual_num_groups}, batch_size={batch_size}")
-    print(f"  avg system prompt len={avg_sys_len}, avg question len={avg_q_len}")
-    print(f"  avg total input len={avg_input_len}, output_len={output_len}")
-
-    return input_ids_list, avg_input_len, output_len
-
-
 def run_one_case(
     url: str,
     batch_size: int,
@@ -464,41 +422,45 @@ def run_one_case(
         response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
 
-    # Load input token ids
-    # TODO: reuse bench_serving.get_dataset ?
-    if dataset_name == "generated-shared-prefix":
-        input_ids, input_len, output_len = sample_generated_shared_prefix_requests(
-            batch_size=batch_size,
-            num_groups=gsp_num_groups,
-            system_prompt_len=gsp_system_prompt_len,
-            question_len=gsp_question_len,
-            output_len=gsp_output_len,
-            tokenizer=tokenizer,
+    # Load input token ids via bench_serving.get_dataset
+    supported_datasets = ("random", "mmmu", "generated-shared-prefix")
+    if dataset_name not in supported_datasets:
+        raise ValueError(
+            f"Unsupported dataset for batch benchmark: {dataset_name}. "
+            f"Supported: {supported_datasets}"
         )
+
+    actual_gsp_groups = min(gsp_num_groups, batch_size)
+    dataset_args = SimpleNamespace(
+        dataset_name=dataset_name,
+        num_prompts=batch_size,
+        random_input_len=input_len,
+        random_output_len=output_len,
+        random_range_ratio=1.0,
+        dataset_path=dataset_path,
+        tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
+        backend=backend,
+        seed=BenchArgs.seed,
+        gsp_num_groups=actual_gsp_groups,
+        gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+    )
+    tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
+    dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
+    input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
+
+    if dataset_name == "generated-shared-prefix":
+        input_requests = input_requests[:batch_size]
+        input_ids = [tokenizer.encode(req.prompt) for req in input_requests]
+        input_len = sum(len(ids) for ids in input_ids) // len(input_ids)
+        output_len = gsp_output_len
         image_data = None
     elif dataset_name == "mmmu":
-        input_requests = sample_mmmu_requests(
-            num_requests=batch_size,
-            processor=tokenizer,
-            fixed_output_len=output_len,
-            random_sample=False,
-        )
-        input_ids = []
-        tokenizer = tokenizer.tokenizer
-        for input_req in input_requests:
-            input_ids += [tokenizer.encode(input_req.prompt)]
+        input_ids = [tok_inner.encode(req.prompt) for req in input_requests]
         image_data = [req.image_data for req in input_requests]
-    elif dataset_name == "random":
-        input_requests = sample_random_requests(
-            input_len=input_len,
-            output_len=output_len,
-            num_prompts=batch_size,
-            range_ratio=1.0,
-            tokenizer=tokenizer,
-            dataset_path=dataset_path,
-            random_sample=True,
-            return_text=False,
-        )
+    else:
         input_ids = [req.prompt for req in input_requests]
         image_data = None
 
