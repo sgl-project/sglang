@@ -61,9 +61,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
+        # MTP draft-head weights in the FP4 checkpoint are always BF16 (not
+        # quantized), so the inner model and lm_head must be built without the
+        # quant_config to keep parameter shapes consistent with the checkpoint.
         self.model = Qwen3_5ForCausalLM(
             config,
-            quant_config,
+            quant_config=None,
             prefix=add_prefix("model", prefix),
         )
 
@@ -74,7 +77,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=quant_config,
+                    quant_config=None,
                     prefix=add_prefix("lm_head", prefix),
                 )
 
