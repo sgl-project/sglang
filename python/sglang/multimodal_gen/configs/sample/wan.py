@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import WanTeaCacheParams
+from sglang.multimodal_gen.configs.sample.magcache import WanMagCacheParams
 
 
 @dataclass
@@ -47,6 +48,14 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
                 -8.29855975e00,
                 1.37887774e-01,
             ],
+        )
+    )
+
+    magcache_params: WanMagCacheParams = field(
+        default_factory=lambda: WanMagCacheParams(
+            threshold=0.06,
+            max_skip_steps=3,
+            use_ret_steps=True,
         )
     )
 
@@ -97,6 +106,14 @@ class WanT2V_14B_SamplingParams(SamplingParams):
         )
     )
 
+    magcache_params: WanMagCacheParams = field(
+        default_factory=lambda: WanMagCacheParams(
+            threshold=0.06,
+            max_skip_steps=3,
+            use_ret_steps=True,
+        )
+    )
+
 
 @dataclass
 class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
@@ -130,6 +147,14 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
                 256.27178429,
                 -13.02252404,
             ],
+        )
+    )
+
+    magcache_params: WanMagCacheParams = field(
+        default_factory=lambda: WanMagCacheParams(
+            threshold=0.06,
+            max_skip_steps=3,
+            use_ret_steps=True,
         )
     )
 

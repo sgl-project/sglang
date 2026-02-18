@@ -87,6 +87,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["negative_prompt"] = request.negative_prompt
     if request.enable_teacache is not None:
         sampling_kwargs["enable_teacache"] = request.enable_teacache
+    if request.enable_magcache is not None:
+        sampling_kwargs["enable_magcache"] = request.enable_magcache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
     if request.output_compression is not None:
@@ -176,6 +178,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_magcache: Optional[bool] = Form(False),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -237,6 +240,7 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_magcache=enable_magcache,
             output_compression=output_compression,
             output_quality=output_quality,
             **(

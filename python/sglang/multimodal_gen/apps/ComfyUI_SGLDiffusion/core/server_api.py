@@ -133,6 +133,7 @@ class SGLDiffusionServerAPI:
             output_format=output_format,
             generator_device=generator_device,
         )
+        ic(common_params)
 
         # If image_path is provided, use edit endpoint
         if image_path:
