@@ -884,6 +884,29 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 )
             return True
 
+        def _load_scalar_fused_expert_weights(
+            name: str,
+            params_dict: dict,
+            scalar_weight: torch.Tensor,
+            shard_ids: tuple,
+            num_experts: int,
+        ) -> bool:
+            """Load a 0-D scalar (e.g. FP4 input_scale) into every expert slot."""
+            if name not in params_dict:
+                return False
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            for expert_id in range(num_experts):
+                for shard_id in shard_ids:
+                    weight_loader(
+                        param,
+                        scalar_weight,
+                        name,
+                        shard_id,
+                        expert_id,
+                    )
+            return True
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -941,20 +964,70 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
-                        if "experts.gate_up_proj" in name:
-                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                        # FP4 checkpoint key → sglang param name fixups for
+                        # input_scale: "w13_weight.input_scale" → "w13_input_scale"
+                        if "experts.gate_up_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w13_weight.input_scale", ".w13_input_scale"
+                            )
+                        elif "experts.down_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w2_weight.input_scale", ".w2_input_scale"
+                            )
+                        if name_mapped not in params_dict:
+                            name = name_mapped
+                            break
+                        if "experts.gate_up_proj_scale_2" in name:
+                            # FP4: scale_2 is [E, 2]; col-0 = gate, col-1 = up.
+                            # Must split on dim=-1, not dim=-2 (which would split experts).
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                loaded_weight[0],
+                                loaded_weight[:, 0],
                                 "w1",
                                 num_experts,
                             )
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                loaded_weight[1],
+                                loaded_weight[:, 1],
                                 "w3",
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj.input_scale" in name:
+                            # FP4: input_scale is a 0-D scalar; broadcast to all experts.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w1", "w3"),
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj" in name:
+                            # Main weight [E, 2k, h/2] and weight_scale [E, 2k, h/g]:
+                            # chunk on dim=-2 splits gate rows (0..k-1) from up rows (k..2k-1).
+                            chunks = loaded_weight.chunk(2, dim=-2)
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                chunks[0],
+                                "w1",
+                                num_experts,
+                            )
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                chunks[1],
+                                "w3",
+                                num_experts,
+                            )
+                        elif "experts.down_proj.input_scale" in name:
+                            # FP4: input_scale is a 0-D scalar; broadcast to all experts.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w2",),
                                 num_experts,
                             )
                         else:
@@ -1190,6 +1263,29 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
             return True
 
+        def _load_scalar_fused_expert_weights(
+            name: str,
+            params_dict: dict,
+            scalar_weight: torch.Tensor,
+            shard_ids: tuple,
+            num_experts: int,
+        ) -> bool:
+            """Load a 0-D scalar (e.g. FP4 input_scale) into every expert slot."""
+            if name not in params_dict:
+                return False
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            for expert_id in range(num_experts):
+                for shard_id in shard_ids:
+                    weight_loader(
+                        param,
+                        scalar_weight,
+                        name,
+                        shard_id,
+                        expert_id,
+                    )
+            return True
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -1249,20 +1345,70 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
-                        if "experts.gate_up_proj" in name:
-                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                        # FP4 checkpoint key → sglang param name fixups for
+                        # input_scale: "w13_weight.input_scale" → "w13_input_scale"
+                        if "experts.gate_up_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w13_weight.input_scale", ".w13_input_scale"
+                            )
+                        elif "experts.down_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w2_weight.input_scale", ".w2_input_scale"
+                            )
+                        if name_mapped not in params_dict:
+                            name = name_mapped
+                            break
+                        if "experts.gate_up_proj_scale_2" in name:
+                            # FP4: scale_2 is [E, 2]; col-0 = gate, col-1 = up.
+                            # Must split on dim=-1, not dim=-2 (which would split experts).
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                loaded_weight[0],
+                                loaded_weight[:, 0],
                                 "w1",
                                 num_experts,
                             )
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
-                                loaded_weight[1],
+                                loaded_weight[:, 1],
                                 "w3",
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj.input_scale" in name:
+                            # FP4: input_scale is a 0-D scalar; broadcast to all experts.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w1", "w3"),
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj" in name:
+                            # Main weight [E, 2k, h/2] and weight_scale [E, 2k, h/g]:
+                            # chunk on dim=-2 splits gate rows (0..k-1) from up rows (k..2k-1).
+                            chunks = loaded_weight.chunk(2, dim=-2)
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                chunks[0],
+                                "w1",
+                                num_experts,
+                            )
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                chunks[1],
+                                "w3",
+                                num_experts,
+                            )
+                        elif "experts.down_proj.input_scale" in name:
+                            # FP4: input_scale is a 0-D scalar; broadcast to all experts.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w2",),
                                 num_experts,
                             )
                         else:
