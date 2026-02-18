@@ -471,8 +471,9 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         result.add_check("renderer", batch.extra.get("renderer"), V.not_none)
         return result
 
-    # Stage 2: TexGen (model loading + input prep + denoising + decode)class Hunyuan3DPaintTexGenStage(PipelineStage):
 
+# Stage 2: TexGen (model loading + input prep + denoising + decode)
+class Hunyuan3DPaintTexGenStage(PipelineStage):
     def __init__(
         self,
         config: Hunyuan3D2PipelineConfig,
