@@ -746,6 +746,13 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
+    if model_runner.gemm_ar_attn_op:
+        model_runner.gemm_ar_attn_op.finalize()
+        model_runner.gemm_ar_attn_op = None
+    if model_runner.gemm_ar_mlp_op:
+        model_runner.gemm_ar_mlp_op.finalize()
+        model_runner.gemm_ar_mlp_op = None
+
     if server_args.tp_size > 1:
         destroy_distributed_environment()
 
