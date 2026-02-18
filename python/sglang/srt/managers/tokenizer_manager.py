@@ -511,6 +511,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
+            # Validate LoRA configuration
+            self._validate_lora_enabled(obj)
+
             if self.server_args.enable_lora and obj.lora_path:
                 await self._resolve_lora_path(obj)
 
@@ -873,6 +876,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             raise ValueError(
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
+
+    def _validate_lora_enabled(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate that LoRA is enabled when a LoRA adapter is requested."""
+        if not obj.lora_path or self.server_args.enable_lora:
+            return
+
+        # Extract adapter name for error message
+        if isinstance(obj.lora_path, str):
+            adapter_name = obj.lora_path
+        elif isinstance(obj.lora_path, list):
+            adapter_name = next((a for a in obj.lora_path if a), "unknown")
+        else:
+            adapter_name = str(obj.lora_path)
+
+        raise ValueError(
+            f"LoRA adapter '{adapter_name}' was requested, but LoRA is not enabled. "
+            "Please launch the server with --enable-lora flag and preload adapters "
+            "using --lora-paths or /load_lora_adapter endpoint."
+        )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
