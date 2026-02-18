@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -187,49 +188,42 @@ class PiecewiseCudaGraphRunner:
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
 
-        # Graph inputs
-        with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            self.out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
-            )
-            self.out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                if model_runner.is_hybrid_swa
-                else None
-            )
-            self.mamba_track_indices = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.mamba_track_enabled
-                else None
-            )
-            self.mamba_track_mask = (
-                torch.zeros((self.max_bs,), dtype=torch.bool)
-                if self.mamba_track_enabled
-                else None
-            )
-            self.mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
-                if self.mamba_track_enabled
-                else None
-            )
-            self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+        # Graph input buffers — always call create(); the singleton logic inside
+        # _set_graph_input_buffers keeps the larger of existing vs new buffers,
+        # so buffer sizes never decrease (OOB prevention).
+        self.buffers: GraphInputBuffers = GraphInputBuffers.create(
+            device=self.device,
+            max_bs=self.max_bs,
+            max_num_token=self.max_num_tokens,
+            hidden_size=model_runner.model_config.hidden_size,
+            vocab_size=model_runner.model_config.vocab_size,
+            dtype=model_runner.dtype,
+            dp_size=self.dp_size,
+            pp_size=self.pp_size,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=False,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=0,
+            num_tokens_per_bs=1,
+            cache_loc_dtype=self._cache_loc_dtype(),
+            enable_mamba_track=self.mamba_track_enabled,
+            enable_swa_out_cache=model_runner.is_hybrid_swa,
+            is_pcg=True,
+            is_multimodal=self.is_multimodal,
+        )
 
-            self.tbo_plugin = TboCudaGraphRunnerPlugin()
+        self.input_ids = self.buffers.input_ids
+        self.input_embeds = self.buffers.input_embeds
+        self.out_cache_loc = self.buffers.out_cache_loc
+        self.out_cache_loc_swa = self.buffers.out_cache_loc_swa
+        self.mamba_track_indices = self.buffers.mamba_track_indices
+        self.mamba_track_mask = self.buffers.mamba_track_mask
+        self.mamba_track_seqlens = self.buffers.mamba_track_seqlens
+        self.positions = self.buffers.positions
+        self.mrope_positions = self.buffers.mrope_positions
+        self.custom_mask = self.buffers.custom_mask
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
-                # 1. In multimodal, we only compile and capture the language model part.
-                # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
-                # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
-                self.input_embeds = torch.zeros(
-                    (self.max_num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-                self.mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
+        self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
