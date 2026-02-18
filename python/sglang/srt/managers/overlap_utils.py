@@ -131,8 +131,8 @@ class FutureMap:
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at
             # model_worker_batch.spec_info and batch.spec_info), so the
-            # caching allocator could reclaim the memory before the GPU
-            # finishes reading it.
+            # caching allocator (torch GC) could reclaim the memory before
+            # the GPU finishes reading it.
             indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
