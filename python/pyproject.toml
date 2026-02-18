@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.2",
+  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.3",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -76,10 +76,10 @@ dependencies = [
   "uvloop",
   "xgrammar==0.1.27",
 
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
-  "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
+  "smg-grpc-proto>=0.3.3",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
+  "grpcio-health-checking>=1.78.0",
 ]
 
 [[tool.uv.index]]

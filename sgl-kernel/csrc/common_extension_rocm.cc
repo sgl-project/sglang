@@ -65,9 +65,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("all_reduce_unreg", torch::kCUDA, &all_reduce_unreg);
 
   // Deterministic all-reduce for ROCm
-  extern void deterministic_all_reduce_reg(int64_t _fa, torch::Tensor & inp, torch::Tensor & out);
+  extern void deterministic_all_reduce_reg(int64_t _fa, torch::Tensor& inp, torch::Tensor& out);
   extern void deterministic_all_reduce_unreg(
-      int64_t _fa, torch::Tensor & inp, torch::Tensor & reg_buffer, torch::Tensor & out);
+      int64_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
 
   m.def("deterministic_all_reduce_reg(int fa, Tensor inp, Tensor! out) -> ()");
   m.impl("deterministic_all_reduce_reg", torch::kCUDA, &deterministic_all_reduce_reg);
