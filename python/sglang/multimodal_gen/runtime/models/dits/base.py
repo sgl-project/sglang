@@ -105,24 +105,37 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
     _supported_attention_backends: set[AttentionBackendEnum] = (
         DiTConfig()._supported_attention_backends
     )
+    cache_type: str|None
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        self._init_teacache_state()  # Initializes shared state + TeaCache state
-        self._init_magcache_state()  # Adds MagCache-specific state
+
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if server_args.enable_teacache and server_args.enable_magcache:
+            raise ValueError("Cannot enable both MagCache and TeaCache at the same time.")
+        self.cache_type = (
+            "magcache" if server_args.enable_magcache else "teacache" if server_args.enable_magcache else None
+        )
+
+        if self.cache_type == "teacache":
+            self._init_teacache_state()
+        elif self.cache_type == "magcache":
+            self._init_magcache_state()
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""
-        self.reset_teacache_state()  # Resets shared state + TeaCache state
-        self.reset_magcache_state()  # Resets MagCache state
+        if self.cache_type == 'teacache':
+            self.reset_teacache_state()
+        elif self.cache_type == 'magcache':
+            self.reset_magcache_state()
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
     ) -> None:
         """
         Cache residual for later retrieval.
-
-        SHARED implementation - both TeaCache and MagCache cache residuals identically.
         """
         residual = hidden_states.squeeze(0) - original_hidden_states
         if not self.is_cfg_negative:
@@ -131,12 +144,7 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
             self.previous_residual_negative = residual
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Retrieve cached residual.
-
-        SHARED implementation - both TeaCache and MagCache retrieve identically.
-        """
-        ic(hidden_states.shape)
+        """Retrieve cached residual with CFG positive/negative separation."""
         if not self.is_cfg_negative:
             return hidden_states + self.previous_residual
         else:

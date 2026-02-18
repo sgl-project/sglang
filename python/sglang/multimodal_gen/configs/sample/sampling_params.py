@@ -131,12 +131,6 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
-    # TeaCache parameters
-    enable_teacache: bool = False
-
-    # MagCache parameters
-    enable_magcache: bool = False
-
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 5
@@ -524,17 +518,6 @@ class SamplingParams:
             "--num-frames-round-down",
             action="store_true",
             default=SamplingParams.num_frames_round_down,
-        )
-        parser.add_argument(
-            "--enable-teacache",
-            action="store_true",
-            default=SamplingParams.enable_teacache,
-        )
-        parser.add_argument(
-            "--enable-magcache",
-            action="store_true",
-            default=SamplingParams.enable_magcache,
-            help="Enable MagCache optimization for diffusion inference",
         )
 
         # profiling

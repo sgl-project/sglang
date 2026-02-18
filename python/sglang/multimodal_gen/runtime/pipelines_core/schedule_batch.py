@@ -20,14 +20,6 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.sample.teacache import (
-    TeaCacheParams,
-    WanTeaCacheParams,
-)
-from sglang.multimodal_gen.configs.sample.magcache import (
-    MagCacheParams,
-    WanMagCacheParams,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
@@ -142,12 +134,6 @@ class Req:
     extra: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
-
-    # TeaCache parameters
-    teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
-
-    # MagCache parameters
-    magcache_params: MagCacheParams | WanMagCacheParams | None = None
 
     # STA parameters
     STA_param: list | None = None

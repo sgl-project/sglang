@@ -822,13 +822,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             )
         else:
             sequence_shard_enabled = False
-        self.enable_teacache = (
-            forward_batch is not None and forward_batch.enable_teacache
-        )
-        self.enable_magcache = (
-            forward_batch is not None and forward_batch.enable_magcache
-        )
-
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -946,19 +939,19 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # If any cache is enabled, we need to cache the original hidden states
-            if self.enable_teacache or self.enable_magcache:
+            if self.cache_type is not None:
                 original_hidden_states = hidden_states.clone()
 
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
                 )
-            # Cache states for both TeaCache and MagCache (same operation)
-            if self.enable_teacache or self.enable_magcache:
+            # Cache states
+            if self.cache_type is not None:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
 
-            if self.calibrate_magcache:
-                self._calibrate_magcache(self.cnt, hidden_states, original_hidden_states, self.is_cfg_negative)
+            # if self.calibrate_magcache:
+            #     self._calibrate_magcache(self.cnt, hidden_states, original_hidden_states, self.is_cfg_negative)
         self.cnt += 1
 
         if sequence_shard_enabled:
@@ -1012,12 +1005,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
 
-        ic(self.enable_teacache, self.calibrate_magcache)
-        if self.calibrate_magcache:
-            return False
+        ic(self.cache_type)
+        # if self.calibrate_magcache:
+        #     return False
 
         # Try TeaCache first
-        if self.enable_teacache:
+        if self.cache_type == "teacache":
             ic('checking teacache')
             ctx = self._get_teacache_context()
             if ctx is None:
@@ -1060,7 +1053,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 return not should_calc
 
         # Try MagCache
-        if self.enable_magcache:
+        if self.cache_type == "magcache":
             ic('checking magcache')
             ctx = self._get_magcache_context()
             if ctx is None:
@@ -1068,6 +1061,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             # Get Wan-specific params
             magcache_params = ctx.magcache_params
+            ic(magcache_params, type(magcache_params))
             assert isinstance(
                 magcache_params, WanMagCacheParams
             ), "magcache_params is not a WanMagCacheParams"
@@ -1113,12 +1107,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         return False
 
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Retrieve cached residual with CFG positive/negative separation."""
-        if not self.is_cfg_negative:
-            return hidden_states + self.previous_residual
-        else:
-            return hidden_states + self.previous_residual_negative
 
 
 EntryClass = WanTransformer3DModel

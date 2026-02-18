@@ -38,6 +38,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams, WanTeaCacheParams
+from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams, WanMagCacheParams
 from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
@@ -243,6 +245,12 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+
+    # Cache acceleration
+    enable_teacache: bool = False
+    enable_magcache: bool = False
+    teacache_params: TeaCacheParams | WanTeaCacheParams = field(default_factory=TeaCacheParams)
+    magcache_params: MagCacheParams | WanMagCacheParams = field(default_factory=MagCacheParams)
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -383,6 +391,14 @@ class ServerArgs:
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        self._adjust_cache_params()
+
+    def _adjust_cache_params(self):
+        """Deserialize --teacache-params / --magcache-params JSON dicts into dataclass instances."""
+        if isinstance(self.teacache_params, dict):
+            self.teacache_params = WanTeaCacheParams(**self.teacache_params) # if self.pipeline_config.prefix == "wan" else TeaCacheParams(**self.teacache_params)
+        if isinstance(self.magcache_params, dict):
+            self.magcache_params = WanMagCacheParams(**self.magcache_params) # if self.pipeline_config.prefix == "wan" else MagCacheParams(**self.magcache_params)
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -642,6 +658,36 @@ class ServerArgs:
             dest="attention_backend",
             default=None,
             help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--enable-teacache",
+            action="store_true",
+            default=False,
+            help="Enable TeaCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--teacache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
+                "Fields map directly to TeaCacheParams dataclass fields."
+            ),
+        )
+        parser.add_argument(
+            "--enable-magcache",
+            action="store_true",
+            default=False,
+            help="Enable MagCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--magcache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
+                "Fields map directly to MagCacheParams dataclass fields."
+            ),
         )
         parser.add_argument(
             "--cache-dit-config",

@@ -130,7 +130,6 @@ def generate_cmd(args: argparse.Namespace):
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
-    ic(generator)
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
     prompt = sampling_params_kwargs.get("prompt")

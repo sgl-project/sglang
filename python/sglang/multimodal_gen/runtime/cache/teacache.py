@@ -267,25 +267,18 @@ class TeaCacheMixin:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if not server_args.enable_teacache:
+            return None
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
-
-        # Early return checks
-        if forward_batch is None or not forward_batch.enable_teacache:
-            ic("forward_batch is None or enable_teacache is False")
+        if forward_batch is None:
             return None
 
-        # Get teacache_params from forward_batch, or fall back to sampling_params
-        teacache_params = forward_batch.teacache_params
-        if teacache_params is None and hasattr(forward_batch, 'sampling_params'):
-            teacache_params = getattr(forward_batch.sampling_params, 'teacache_params', None)
-
-        if teacache_params is None:
-            ic("teacache_params is None even after fallback")
-            return None
-
-        # Extract common values
+        teacache_params = server_args.teacache_params
         current_timestep = forward_context.current_timestep
         num_inference_steps = forward_batch.num_inference_steps
         do_cfg = forward_batch.do_classifier_free_guidance

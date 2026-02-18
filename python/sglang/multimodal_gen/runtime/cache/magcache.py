@@ -344,22 +344,18 @@ class MagCacheMixin:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        if not server_args.enable_magcache:
+            return None
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
-
-        # Early return checks
-        if forward_batch is None or not forward_batch.enable_magcache:
+        if forward_batch is None:
             return None
 
-        # Get magcache_params from forward_batch, or fall back to sampling_params
-        magcache_params = forward_batch.magcache_params
-        if magcache_params is None and hasattr(forward_batch, 'sampling_params'):
-            magcache_params = getattr(forward_batch.sampling_params, 'magcache_params', None)
-
-        if magcache_params is None:
-            ic("magcache_params is None even after fallback")
-            return None
+        magcache_params = server_args.magcache_params
 
         # Reset at timestep 0
         if forward_context.current_timestep == 0 and not self.is_cfg_negative:
