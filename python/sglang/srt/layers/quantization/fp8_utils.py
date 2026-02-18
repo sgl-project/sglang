@@ -172,7 +172,10 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer.gemm import gemm_fp8_nt_groupwise
+else:
+    flashinfer_mm_mxfp8 = None
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
@@ -195,6 +198,23 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
     # Auto mode: Select based purely on hardware/backend availability
     return _dispatch_auto_backend()
+
+
+def dispatch_w8a8_mxfp8_linear() -> Callable:
+    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
+
+    For MXFP8, Triton remains the default path. We only route to FlashInfer
+    when backend is explicitly set to flashinfer_trtllm.
+    """
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_flashinfer_trtllm():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "MXFP8 FlashInfer GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
+                "but FlashInfer is unavailable or unsupported on this hardware."
+            )
+        return flashinfer_mxfp8_blockscaled_linear
+    return triton_mxfp8_blockscaled_linear
 
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
@@ -725,6 +745,75 @@ def triton_mxfp8_blockscaled_linear(
         block_k=block_k,
     )
     output = output[:m, :]
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def flashinfer_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear via FlashInfer mm_mxfp8."""
+    if flashinfer_mm_mxfp8 is None:
+        raise RuntimeError(
+            "MXFP8 FlashInfer GEMM requested, but flashinfer.mm_mxfp8 is unavailable."
+        )
+
+    if not (_is_cuda and is_sm100_supported()):
+        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    m, k = input_2d.shape
+    n, k_w = weight.shape
+    if k != k_w:
+        raise ValueError(f"Input K={k} does not match weight K={k_w}.")
+    if k % 32 != 0:
+        raise ValueError(f"K={k} must be divisible by 32 for MXFP8.")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError("MXFP8 weight must be FP8 E4M3.")
+    if weight_scale.dtype != torch.uint8:
+        raise TypeError("MXFP8 weight_scale must be UE8M0 uint8.")
+    expected_weight_scale_shape = (n, k // 32)
+    if weight_scale.shape != expected_weight_scale_shape:
+        raise ValueError(
+            f"Expected weight_scale shape {expected_weight_scale_shape}, got {weight_scale.shape}."
+        )
+
+    if input_scale is None:
+        q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
+    else:
+        q_input = input_2d
+        x_scale_u8 = input_scale
+        if x_scale_u8.dtype != torch.uint8:
+            raise TypeError("MXFP8 input_scale must be UE8M0 uint8.")
+        expected_input_scale_shape = (m, k // 32)
+        if x_scale_u8.shape != expected_input_scale_shape:
+            raise ValueError(
+                f"Expected input_scale shape {expected_input_scale_shape}, got {x_scale_u8.shape}."
+            )
+
+    if output_dtype is None:
+        if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            output_dtype = input_2d.dtype
+        else:
+            output_dtype = torch.bfloat16
+
+    output = flashinfer_mm_mxfp8(
+        q_input,
+        weight.t().contiguous(),
+        x_scale_u8,
+        weight_scale.t().contiguous(),
+        out_dtype=output_dtype,
+        backend="auto",
+    )
+
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)

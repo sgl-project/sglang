@@ -2105,19 +2105,26 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
-                logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
-                    f"Overriding {self.moe_runner_backend!r}."
+            if self.moe_runner_backend not in [
+                "auto",
+                "cutlass",
+                "flashinfer_cutlass",
+            ]:
+                raise ValueError(
+                    "mxfp8 quantization supports --moe-runner-backend in "
+                    "{'auto', 'cutlass', 'flashinfer_cutlass'}, but got "
+                    f"{self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+            if self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "cutlass"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
                 "modelopt_fp8",
+                "mxfp8",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'mxfp8', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
