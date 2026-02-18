@@ -24,9 +24,6 @@ def npu_fused_experts_w4a4(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
-    w13_offset: torch.Tensor,
-    w2_offset: torch.Tensor,
-    **kwargs,
 ):  
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
