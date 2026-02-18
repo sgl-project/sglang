@@ -260,6 +260,7 @@ class BenchArgs:
     image_count: int = 1
     image_resolution: str = "1080p"
     image_content: str = "random"
+    image_token: str = "<|image|>"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -350,6 +351,12 @@ class BenchArgs:
             default=BenchArgs.image_content,
             choices=["random", "blank"],
             help="Content for generated synthetic images. Supports random and blank.",
+        )
+        parser.add_argument(
+            "--image-token",
+            type=str,
+            default=BenchArgs.image_token,
+            help="Image placeholder token string used by the model (e.g. '<|image|>' for Llama-4, '<image>' for other models).",
         )
 
     @classmethod
@@ -488,7 +495,9 @@ def generate_random_images(
     return images
 
 
-def process_images_to_multimodal_inputs(images, model_runner, tokenizer, input_ids):
+def process_images_to_multimodal_inputs(
+    images, model_runner, tokenizer, input_ids, image_token_str="<|image|>"
+):
     """
     Process PIL images into MultimodalInputs format by using the model's image processor.
 
@@ -507,80 +516,98 @@ def process_images_to_multimodal_inputs(images, model_runner, tokenizer, input_i
     if not images:
         return None
 
+    # Stage 1: load the processor
     try:
         from transformers import AutoProcessor
 
-        # Load the processor for the model
         processor = AutoProcessor.from_pretrained(
             model_runner.model_config.model_path, trust_remote_code=True
         )
+    except ImportError as e:
+        print(f"Failed to import transformers AutoProcessor: {e}")
+        return None
+    except OSError as e:
+        print(
+            f"Failed to load processor from '{model_runner.model_config.model_path}': {e}"
+        )
+        return None
 
-        # Create a dummy text with image placeholders for processor
-        # Llama-4 uses <|image|> as the placeholder token
-        image_token_str = "<|image|>"
-        dummy_text = image_token_str * len(images)
-
-        # Process images - this creates the tensors needed by the vision encoder
+    # Stage 2: run the processor on the images
+    dummy_text = image_token_str * len(images)
+    try:
         processor_output = processor(
             text=[dummy_text], images=images, return_tensors="pt"
         )
+    except Exception as e:
+        print(f"Failed during image processing (processor call): {e}")
+        import traceback
 
-        # Move tensors to the model's device
+        traceback.print_exc()
+        return None
+
+    # Stage 3: move tensors to the model's device
+    try:
         device = model_runner.device
         for key in processor_output:
             if isinstance(processor_output[key], torch.Tensor):
                 processor_output[key] = processor_output[key].to(device)
+    except Exception as e:
+        print(
+            f"Failed while moving processor outputs to device '{model_runner.device}': {e}"
+        )
+        import traceback
 
-        # Create MultimodalDataItem for the processor output
-        # For Llama-4 and similar models, pixel_values contains the processed images
-        if "pixel_values" not in processor_output:
-            print(
-                f"WARNING: pixel_values not found in processor output. Keys: {processor_output.keys()}"
-            )
-            return None
+        traceback.print_exc()
+        return None
 
-        # Get the image token ID
-        image_token_id = None
-        try:
-            image_token_ids = tokenizer.encode(
-                image_token_str, add_special_tokens=False
-            )
-            if len(image_token_ids) > 0:
-                image_token_id = image_token_ids[0]
-        except Exception:
-            # Fallback to vocabulary lookup
-            if hasattr(tokenizer, "vocab") and image_token_str in tokenizer.vocab:
-                image_token_id = tokenizer.vocab[image_token_str]
-            elif hasattr(tokenizer, "get_vocab"):
-                vocab = tokenizer.get_vocab()
-                if image_token_str in vocab:
-                    image_token_id = vocab[image_token_str]
+    # Validate pixel_values are present before proceeding
+    if "pixel_values" not in processor_output:
+        print(
+            f"WARNING: pixel_values not found in processor output. Keys: {list(processor_output.keys())}"
+        )
+        return None
 
-        if image_token_id is None:
-            print(f"WARNING: Could not find image token ID for '{image_token_str}'")
-            return None
+    # Stage 4: resolve the image token ID from the tokenizer
+    image_token_id = None
+    try:
+        image_token_ids = tokenizer.encode(image_token_str, add_special_tokens=False)
+        if len(image_token_ids) > 0:
+            image_token_id = image_token_ids[0]
+    except Exception as e:
+        print(f"Failed to encode image token '{image_token_str}' via tokenizer: {e}")
 
-        # Find image token positions in input_ids
-        image_token_positions = [
-            idx for idx, token_id in enumerate(input_ids) if token_id == image_token_id
-        ]
+    if image_token_id is None:
+        # Fallback to vocabulary lookup
+        if hasattr(tokenizer, "vocab") and image_token_str in tokenizer.vocab:
+            image_token_id = tokenizer.vocab[image_token_str]
+        elif hasattr(tokenizer, "get_vocab"):
+            vocab = tokenizer.get_vocab()
+            if image_token_str in vocab:
+                image_token_id = vocab[image_token_str]
 
-        if not image_token_positions:
-            print(f"WARNING: Image token {image_token_id} not found in input_ids")
-            print(f"  Input IDs (first 20): {input_ids[:20]}")
-            return None
+    if image_token_id is None:
+        print(f"WARNING: Could not find image token ID for '{image_token_str}'")
+        return None
 
-        # For Llama-4, we need to create offsets for where images appear
-        # Each image token position gets its own offset
-        offsets = [(pos, pos) for pos in image_token_positions]
+    # Stage 5: locate image token positions in input_ids
+    image_token_positions = [
+        idx for idx, token_id in enumerate(input_ids) if token_id == image_token_id
+    ]
+    if not image_token_positions:
+        print(f"WARNING: Image token {image_token_id} not found in input_ids")
+        print(f"  Input IDs (first 20): {input_ids[:20]}")
+        return None
 
-        # Create model-specific data dict with all processor outputs except pixel_values
-        model_specific_data = {}
-        for key, value in processor_output.items():
-            if key != "pixel_values" and isinstance(value, torch.Tensor):
-                model_specific_data[key] = value
+    # For Llama-4, each image token position gets its own offset
+    offsets = [(pos, pos) for pos in image_token_positions]
 
-        # Create a single MultimodalDataItem with all the images
+    # Stage 6: build the MultimodalInputs object
+    try:
+        model_specific_data = {
+            key: value
+            for key, value in processor_output.items()
+            if key != "pixel_values" and isinstance(value, torch.Tensor)
+        }
         mm_item = MultimodalDataItem(
             modality=Modality.MULTI_IMAGES if len(images) > 1 else Modality.IMAGE,
             format=MultimodalInputFormat.PROCESSOR_OUTPUT,
@@ -589,32 +616,19 @@ def process_images_to_multimodal_inputs(images, model_runner, tokenizer, input_i
             model_specific_data=model_specific_data,
         )
         mm_item.set_pad_value()
-
-        # Create MultimodalInputs object
         mm_inputs = MultimodalInputs(mm_items=[mm_item])
         mm_inputs.im_token_id = image_token_id
-
-        print(
-            f"✓ Created MultimodalInputs with {len(images)} image(s), offsets={offsets}, im_token_id={image_token_id}"
-        )
-
-        return mm_inputs
-
     except Exception as e:
-        print(f"Error processing images: {e}")
-        print("=" * 80)
-        print("WARNING: Image processing failed")
-        print("=" * 80)
-        print()
-        print("For reliable multimodal benchmarking, consider using:")
-        print("1. examples/multimodal_bench_wrapper.py (uses Engine API)")
-        print("2. test/srt/test_vlm_input_format.py for working examples")
-        print()
+        print(f"Failed to construct MultimodalInputs: {e}")
         import traceback
 
         traceback.print_exc()
-        print("=" * 80)
         return None
+
+    print(
+        f"✓ Created MultimodalInputs with {len(images)} image(s), offsets={offsets}, im_token_id={image_token_id}"
+    )
+    return mm_inputs
 
 
 def prepare_inputs_for_correctness_test(
@@ -633,7 +647,7 @@ def prepare_inputs_for_correctness_test(
     # For multimodal, use image description prompt with image tokens
     if bench_args.image_test and images:
         # For multimodal models, we need to include image placeholder tokens in the prompt
-        image_token_str = "<|image|>"
+        image_token_str = bench_args.image_token
         image_placeholders = " ".join([image_token_str] * len(images))
         prompts = [f"{image_placeholders} Describe the images in detail."]
 
@@ -661,7 +675,11 @@ def prepare_inputs_for_correctness_test(
         # Add multimodal inputs if images are provided
         if bench_args.image_test and images and model_runner:
             req.multimodal_inputs = process_images_to_multimodal_inputs(
-                images, model_runner, tokenizer, req.origin_input_ids
+                images,
+                model_runner,
+                tokenizer,
+                req.origin_input_ids,
+                image_token_str=bench_args.image_token,
             )
 
         reqs.append(req)
@@ -697,14 +715,13 @@ def prepare_synthetic_inputs_for_latency_test(
     images=None,
     model_runner=None,
     tokenizer=None,
+    image_token_str="<|image|>",
 ):
 
     # For multimodal tests, we need to create input sequences with image placeholder tokens
     image_token_positions = []
     if images and model_runner and tokenizer:
-        # Get the image placeholder token for this model
-        # Llama-4 uses <|image|> token
-        image_token = "<|image|>"
+        image_token = image_token_str
 
         # Create a simple prompt with image placeholders
         prompt_template = f"{image_token} Describe this image in detail."
@@ -1205,6 +1222,7 @@ def latency_test(
         images=images,
         model_runner=model_runner,
         tokenizer=tokenizer,
+        image_token_str=bench_args.image_token,
     )
 
     # Warm up
@@ -1265,6 +1283,7 @@ def latency_test(
             images=images,
             model_runner=model_runner,
             tokenizer=tokenizer,
+            image_token_str=bench_args.image_token,
         )
         ret = latency_test_run_once(
             bench_args.run_name,
