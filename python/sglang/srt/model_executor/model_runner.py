@@ -605,6 +605,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
+            # Pre-allocate symmetric memory pool before autotune and CUDA graph
+            # capture. This initializes the NCCL allocator (JIT compile +
+            # ncclMemAlloc/ncclCommWindowRegister) while all ranks are still
+            # synchronized. Autotune and CUDA graph capture then run with
+            # symm_mem disabled to avoid NCCL collective deadlocks during
+            # their divergent forward passes.
+            self.prealloc_symmetric_memory_pool()
             self.kernel_warmup()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
@@ -625,8 +632,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
-
-        self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
