@@ -346,9 +346,12 @@ class EAGLEDraftCudaGraphRunner:
             self.topk_p[raw_bs:bs].zero_()
             self.topk_index[raw_bs:bs].zero_()
             self.hidden_states[raw_bs:bs].zero_()
-            # Point padding slots to the first real request's pool entry
-            # so that the padding attention reads from a valid KV cache entry.
-            self.req_pool_indices[raw_bs:bs] = forward_batch.req_pool_indices[0]
+            # Point padding slots to a valid pool entry so that the padding
+            # attention reads from a valid KV cache entry.
+            if raw_bs > 0:
+                self.req_pool_indices[raw_bs:bs] = forward_batch.req_pool_indices[0]
+            else:
+                self.req_pool_indices[raw_bs:bs].fill_(0)
 
         num_tokens = bs * self.num_tokens_per_bs
 
