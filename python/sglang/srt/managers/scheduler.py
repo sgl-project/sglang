@@ -2658,9 +2658,10 @@ class Scheduler(
 
             evictable = getattr(self.tree_cache, "evictable_size_", "N/A")
             logger.info(
-                f"[PIN] flush_cache: evictable_size={evictable}, "
-                f"req_to_token_pool.size={self.req_to_token_pool.size}, "
-                f"tp_rank={self.tp_rank}"
+                "flush_cache: evictable_size=%s, req_to_token_pool.size=%d, tp_rank=%d",
+                evictable,
+                self.req_to_token_pool.size,
+                self.tp_rank,
             )
 
             if hasattr(self.tree_cache, "flush"):

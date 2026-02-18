@@ -723,15 +723,17 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    ##### PIN / UNPIN / FLUSH #####
+    ##### PIN / FLUSH #####
 
     def flush(self) -> dict:
         """Flush unpinned cache from GPU and CPU, preserving pinned blocks."""
         logger.debug(
-            f"[PIN] flush: ENTER evictable_size={self.evictable_size_}, "
-            f"protected_size={self.protected_size_}, "
-            f"evictable_leaves={len(self.evictable_leaves)}, "
-            f"evictable_host_leaves={len(self.evictable_host_leaves)}"
+            "flush: evictable_size=%d, protected_size=%d, "
+            "evictable_leaves=%d, evictable_host_leaves=%d",
+            self.evictable_size_,
+            self.protected_size_,
+            len(self.evictable_leaves),
+            len(self.evictable_host_leaves),
         )
 
         # Evict everything evictable from GPU
@@ -746,8 +748,10 @@ class HiRadixCache(RadixCache):
         host_after = len(self.evictable_host_leaves)
 
         logger.debug(
-            f"[PIN] flush: GPU evicted {gpu_evicted} tokens, "
-            f"host leaves {host_before}->{host_after}"
+            "flush: GPU evicted %d tokens, host leaves %d->%d",
+            gpu_evicted,
+            host_before,
+            host_after,
         )
         return {
             "gpu_evicted": gpu_evicted,
@@ -849,11 +853,10 @@ class HiRadixCache(RadixCache):
         return delta
 
     def _update_host_leaf_status(self, node: TreeNode):
-        # Lazy expiry check
-        if not self._is_pinned(node) and node.pin_expiry > 0:
-            self._clear_pin(node)
-
+        # Lazy expiry check (single _is_pinned call)
         pinned = self._is_pinned(node)
+        if not pinned and node.pin_expiry > 0:
+            self._clear_pin(node)
         if not node.evicted or node.lock_ref > 0 or pinned:
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
@@ -1024,11 +1027,13 @@ class HiRadixCache(RadixCache):
 
         total_host_tokens = sum(len(n.host_value) for n in nodes_to_load)
         logger.debug(
-            f"[PIN] load_back: ENTER node_id={last_hit_node.id}, "
-            f"nodes_to_load={len(nodes_to_load)}, "
-            f"total_host_tokens={total_host_tokens}, "
-            f"mem_quota={mem_quota}, "
-            f"evictable_size={self.evictable_size_}"
+            "load_back: node_id=%d, nodes_to_load=%d, "
+            "total_host_tokens=%d, mem_quota=%s, evictable_size=%d",
+            last_hit_node.id,
+            len(nodes_to_load),
+            total_host_tokens,
+            mem_quota,
+            self.evictable_size_,
         )
 
         # protect the ancestor nodes from eviction
@@ -1048,14 +1053,14 @@ class HiRadixCache(RadixCache):
         )
         if device_indices is None:
             logger.debug(
-                f"[PIN] load_back: first load attempt failed, "
-                f"evicting {len(host_indices)} tokens "
-                f"(evictable_size={self.evictable_size_})"
+                "load_back: first load failed, evicting %d tokens (evictable_size=%d)",
+                len(host_indices),
+                self.evictable_size_,
             )
             evict_result = self.evict(EvictParams(num_tokens=len(host_indices)))
             logger.debug(
-                f"[PIN] load_back: evicted {evict_result.num_tokens_evicted} tokens, "
-                f"retrying load"
+                "load_back: evicted %d tokens, retrying load",
+                evict_result.num_tokens_evicted,
             )
             device_indices = self.cache_controller.load(
                 host_indices=host_indices, node_id=last_hit_node.id
@@ -1064,9 +1069,11 @@ class HiRadixCache(RadixCache):
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
             logger.warning(
-                f"[PIN] load_back: FAILED to load {len(host_indices)} tokens "
-                f"for node {last_hit_node.id} even after eviction "
-                f"(evictable_size={self.evictable_size_})"
+                "load_back: FAILED to load %d tokens for node %d "
+                "even after eviction (evictable_size=%d)",
+                len(host_indices),
+                last_hit_node.id,
+                self.evictable_size_,
             )
             return None
 
@@ -1314,11 +1321,13 @@ class HiRadixCache(RadixCache):
 
         if host_hit_length > 0 or len(value) > 0:
             logger.debug(
-                f"[PIN] match_prefix: device_tokens={len(value)}, "
-                f"host_hit_length={host_hit_length}, "
-                f"key_len={page_aligned_len}, "
-                f"last_device_node={last_node.id}, "
-                f"last_host_node={last_host_node.id}"
+                "match_prefix: device_tokens=%d, host_hit_length=%d, "
+                "key_len=%d, last_device_node=%d, last_host_node=%d",
+                len(value),
+                host_hit_length,
+                page_aligned_len,
+                last_node.id,
+                last_host_node.id,
             )
 
         return MatchResult(
