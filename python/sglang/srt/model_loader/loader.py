@@ -2719,7 +2719,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
     """
     Model loader that uses Runai Model Streamer to load a model.
 
-    Supports object storage (S3, GCS) with lazy weight streaming.
+    Supports fast model loading from SSDs, shared filesystems and object storage (S3, GCS, Azure blob) with weight streaming.
 
     Configuration (via load_config.model_loader_extra_config):
         - distributed (bool): Enable distributed streaming - True by default for url paths (object storage)
