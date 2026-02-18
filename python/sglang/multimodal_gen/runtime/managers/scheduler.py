@@ -15,13 +15,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    StartProfileReq,
+    StopProfileReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
-    StartProfileReq,
-    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
