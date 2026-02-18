@@ -12,12 +12,10 @@ import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
-)
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     StartProfileReq,
     StopProfileReq,
+    _parse_size,
+    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
