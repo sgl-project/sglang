@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -65,8 +66,6 @@ from sglang.srt.utils.common import (
     torch_release,
     wait_port_available,
     xpu_has_xmx_support,
-    is_cpu,
-    cpu_has_amx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.utils import is_in_ci
@@ -2109,10 +2108,16 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "amx" and not is_cpu():
-            raise ValueError("AMX MoE backend is only supported on CPU, set SGLANG_USE_CPU_ENGINE=1 to use CPU-only execution.")
+            raise ValueError(
+                "AMX MoE backend is only supported on CPU, set SGLANG_USE_CPU_ENGINE=1 to use CPU-only execution."
+            )
 
         if is_cpu():
-            if cpu_has_amx_support() and self.moe_runner_backend != "amx" and self.moe_runner_backend != "torch_native":
+            if (
+                cpu_has_amx_support()
+                and self.moe_runner_backend != "amx"
+                and self.moe_runner_backend != "torch_native"
+            ):
                 self.moe_runner_backend = "amx"
                 logger.warning(
                     "CPU-only execution is enabled and amx is supported, setting moe_runner_backend to amx"

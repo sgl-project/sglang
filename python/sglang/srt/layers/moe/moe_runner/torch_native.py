@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import functools
-import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -20,20 +17,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
 
-
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-
-
-
 
 
 @dataclass
@@ -63,8 +55,8 @@ class TorchNativeRunnerOutput(RunnerOutput):
 
 @dataclass
 class TorchNativeMoeQuantInfo(MoeQuantInfo):
-  w13_weight: torch.Tensor
-  w2_weight: torch.Tensor
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
 
 
 class TorchNativeRunnerCore(MoeRunnerCore):
@@ -80,15 +72,15 @@ class TorchNativeRunnerCore(MoeRunnerCore):
     ) -> TorchNativeRunnerOutput:
 
         out_hidden_states = moe_forward_native(
-          x=runner_input.hidden_states,
-          sorted_tokens=runner_input.sorted_tokens,
-          tokens_per_expert=runner_input.tokens_per_expert,
-          topk_weights=runner_input.topk_weights,
-          topk_ids=runner_input.topk_ids,
-          activation=self.config.activation,
-          w13_weight=quant_info.w13_weight,
-          w2_weight=quant_info.w2_weight,
-          idxs=runner_input.idxs,
+            x=runner_input.hidden_states,
+            sorted_tokens=runner_input.sorted_tokens,
+            tokens_per_expert=runner_input.tokens_per_expert,
+            topk_weights=runner_input.topk_weights,
+            topk_ids=runner_input.topk_ids,
+            activation=self.config.activation,
+            w13_weight=quant_info.w13_weight,
+            w2_weight=quant_info.w2_weight,
+            idxs=runner_input.idxs,
         )
 
         return TorchNativeRunnerOutput(
@@ -108,10 +100,10 @@ def fused_experts_none_to_torch_native(
 ) -> StandardCombineInput:
 
     output = fused_moe_forward_native(
-      w13_weight=quant_info.w13_weight,
-      w2_weight=quant_info.w2_weight,
-      moe_runner_config=runner_config,
-      dispatch_output=dispatch_output,
+        w13_weight=quant_info.w13_weight,
+        w2_weight=quant_info.w2_weight,
+        moe_runner_config=runner_config,
+        dispatch_output=dispatch_output,
     )
 
     return output
@@ -141,7 +133,6 @@ def pre_permute_standard_to_torch_native(
     sorted_tokens = dispatch_output.hidden_states[idxs // topk_ids.shape[1]]
     tokens_per_expert = tokens_per_expert.cpu().numpy()
 
-
     return TorchNativeRunnerInput(
         hidden_states=dispatch_output.hidden_states,
         topk_weights=topk_weights,
@@ -170,7 +161,6 @@ def post_permute_torch_native_to_standard(
 Torch-native implementation for FusedMoE. This is used for torch.compile.
 It is based on https://github.com/pytorch-labs/gpt-fast/blob/32971d3129541c5bfb4f715abc33d1c5f408d204/mixtral-moe/model.py#L204
 """
-
 
 
 def fused_moe_forward_native(

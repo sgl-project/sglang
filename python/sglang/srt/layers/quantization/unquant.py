@@ -470,7 +470,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return StandardCombineInput(hidden_states=output)
         else:
-            from sglang.srt.layers.moe.moe_runner.torch_native import TorchNativeMoeQuantInfo
+            from sglang.srt.layers.moe.moe_runner.torch_native import (
+                TorchNativeMoeQuantInfo,
+            )
+
             quant_info = TorchNativeMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
