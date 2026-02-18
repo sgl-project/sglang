@@ -259,18 +259,21 @@ class NightlyBenchmarkRunner:
         avg_spec_accept_length = None
         model_description = f"{model_path}" + (f" ({variant})" if variant else "")
 
-        # Launch server
-        process = popen_launch_server(
-            model=model_path,
-            base_url=self.base_url,
-            other_args=other_args or [],
-            timeout=(
-                timeout if timeout is not None else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-            ),
-            env=env,
-        )
-
+        process = None
         try:
+            # Launch server
+            process = popen_launch_server(
+                model=model_path,
+                base_url=self.base_url,
+                other_args=other_args or [],
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                ),
+                env=env,
+            )
+
             # Generate filenames
             profile_path_prefix, json_output_file = self.generate_profile_filename(
                 model_path, variant
@@ -311,7 +314,8 @@ class NightlyBenchmarkRunner:
 
         finally:
             # Always clean up server process
-            kill_process_tree(process.pid)
+            if process is not None:
+                kill_process_tree(process.pid)
 
     def _get_spec_accept_length(self) -> Optional[float]:
         """Query the server for avg_spec_accept_length metric.
