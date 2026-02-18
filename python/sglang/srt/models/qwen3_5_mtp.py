@@ -203,6 +203,29 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
             return True
 
+        def _load_scalar_fused_expert_weights(
+            name: str,
+            params_dict: dict,
+            scalar_weight: torch.Tensor,
+            shard_ids: tuple,
+            num_experts: int,
+        ) -> bool:
+            """Load a 0-D scalar (e.g. FP4 input_scale) into every expert slot."""
+            if name not in params_dict:
+                return False
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            for expert_id in range(num_experts):
+                for shard_id in shard_ids:
+                    weight_loader(
+                        param,
+                        scalar_weight,
+                        name,
+                        shard_id,
+                        expert_id,
+                    )
+            return True
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
@@ -270,8 +293,48 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
                     # Fused experts: single checkpoint weight contains multiple experts
                     if is_fused_expert and num_experts is not None:
-                        if "experts.gate_up_proj" in name:
-                            # gate_up_proj fused: split into w1 / w3
+                        # Fix input_scale param name: checkpoint uses
+                        # "w13_weight.input_scale" but SGLang registers "w13_input_scale"
+                        if "experts.gate_up_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w13_weight.input_scale", ".w13_input_scale"
+                            )
+                        elif "experts.down_proj.input_scale" in name:
+                            name_mapped = name_mapped.replace(
+                                ".w2_weight.input_scale", ".w2_input_scale"
+                            )
+                        if name_mapped not in params_dict:
+                            name = name_mapped
+                            break
+                        if "experts.gate_up_proj_scale_2" in name:
+                            # FP4: scale_2 is [E, 2]; col-0 = gate, col-1 = up.
+                            # Must split on dim=-1, not dim=-2 (expert axis).
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[:, 0],
+                                "w1",
+                                num_experts,
+                            )
+                            load_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight[:, 1],
+                                "w3",
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj.input_scale" in name:
+                            # FP4: input_scale is a 0-D scalar; broadcast to all experts.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w1", "w3"),
+                                num_experts,
+                            )
+                        elif "experts.gate_up_proj" in name:
+                            # Main weight [E, 2k, h/2] or weight_scale [E, 2k, h/g]:
+                            # gate rows = first half, up rows = second half (dim=-2).
                             loaded_w1, loaded_w3 = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
@@ -287,8 +350,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                                 "w3",
                                 num_experts,
                             )
+                        elif "experts.down_proj.input_scale" in name:
+                            # FP4: down_proj input_scale scalar.
+                            _load_scalar_fused_expert_weights(
+                                name_mapped,
+                                params_dict,
+                                loaded_weight,
+                                ("w2",),
+                                num_experts,
+                            )
                         else:
-                            # down_proj fused: distribute entire weight
+                            # down_proj weight / scale / scale_2: load directly as w2.
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
