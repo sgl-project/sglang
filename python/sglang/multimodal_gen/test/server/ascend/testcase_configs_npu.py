@@ -9,7 +9,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
-        "flux_image_t2i",
+        "flux_image_t2i_npu",
         DiffusionServerArgs(
             model_path="/root/.cache/modelscope/hub/models/black-forest-labs/FLUX.1-dev",
             modality="image",
@@ -18,7 +18,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_image_t2i",
+        "flux_2_image_t2i_2npu",
         DiffusionServerArgs(
             model_path="/root/.cache/modelscope/hub/models/black-forest-labs/FLUX.2-dev",
             modality="image",
