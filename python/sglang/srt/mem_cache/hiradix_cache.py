@@ -896,8 +896,9 @@ class HiRadixCache(RadixCache):
             elif x.pin_expiry > 0:
                 # Expired pin: clear and fall through to normal eviction
                 self._clear_pin(x)
-                logger.info(
-                    f"[PIN] evict: pin expired on node {x.id}, allowing eviction"
+                logger.debug(
+                    "[PIN] evict: pin expired on node %d, allowing eviction",
+                    x.id,
                 )
 
             if not x.backuped:
@@ -973,16 +974,18 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
             if self._is_pinned(x):
-                logger.info(
-                    f"[PIN] evict_host: skipping pinned node {x.id} "
-                    f"(expires in {x.pin_expiry - time.monotonic():.1f}s)"
+                logger.debug(
+                    "[PIN] evict_host: skipping pinned node %d (expires in %.1fs)",
+                    x.id,
+                    x.pin_expiry - time.monotonic(),
                 )
                 continue
             elif x.pin_expiry > 0:
                 # Expired pin: clear and fall through to normal host eviction
                 self._clear_pin(x)
-                logger.info(
-                    f"[PIN] evict_host: pin expired on node {x.id}, allowing eviction"
+                logger.debug(
+                    "[PIN] evict_host: pin expired on node %d, allowing eviction",
+                    x.id,
                 )
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
