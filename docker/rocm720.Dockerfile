@@ -156,7 +156,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi \
+     && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
 # -----------------------
 # Build vLLM
