@@ -1329,7 +1329,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 40
         run: |
-          cd test && python3 ../scripts/ci/cuda/warmup_deep_gemm.py --suite stage-c-test-8-gpu-h200 --tp 8
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
 
       - name: Run test
         timeout-minutes: 30
@@ -1474,7 +1476,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 40
         run: |
-          cd test && python3 ../scripts/ci/cuda/warmup_deep_gemm.py --suite stage-c-test-deepep-8-gpu-h200 --tp 8
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
 
       - name: Run test
         timeout-minutes: 45
