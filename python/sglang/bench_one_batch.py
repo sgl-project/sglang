@@ -17,7 +17,13 @@ python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruc
 ## run with CUDA profiler (nsys):
 nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 --input-len 256 --profile --profile-activities CUDA_PROFILER
 # Usage (correctness test):
-python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correctness-test
+
+# Usage (multimodal/vision model testing):
+## Latency test with images:
+python -m sglang.bench_one_batch --model-path meta-llama/Llama-4-Scout-17B-Vision-Instruct --image-test --image-resolution 1080p --image-count 2 --batch-size 1 --input-len 512 --output-len 128
+## Correctness test with images:
+python -m sglang.bench_one_batch --model-path meta-llama/Llama-4-Scout-17B-Vision-Instruct --correctness-test --image-test --image-urls https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png --verify-image-understanding
 
 ## Reference output (of the correctness test above, can be gpu dependent):
 input_ids=[[1, 450, 7483, 310, 3444, 338], [1, 450, 7483, 310, 278, 3303, 13187, 290, 338], [1, 20628, 338, 263, 6575, 1460, 2462, 322, 306, 763]]
@@ -56,12 +62,15 @@ import logging
 import multiprocessing
 import os
 import time
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Tuple
 
 import numpy as np
+import requests
 import torch
 import torch.distributed as dist
+from PIL import Image
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
@@ -69,7 +78,14 @@ from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -89,6 +105,65 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+try:
+    from sglang.srt.mem_cache.swa_memory_pool import (
+        SWATokenToKVPoolAllocator as _SWAAlloc,
+    )
+except ImportError:
+    _SWAAlloc = None
+
+
+def _fix_swa_full_pool_if_empty(model_runner, rank_print=print):
+    """For hybrid-SWA models whose full-attention allocator was built with size 0,
+    redirect it to share the SWA allocator so bench correctness tests can allocate tokens.
+
+    The mapping tensor is referenced by three objects via weakref.proxy:
+      1. alloc.full_to_swa_index_mapping  (strong ref — owner)
+      2. kvcache.full_to_swa_index_mapping (weakref.proxy registered at alloc init)
+      3. xpu_backend.full_to_swa_index_mapping (copy of the weakref.proxy from kvcache)
+
+    We must keep the new identity tensor alive AND update all three holders so no
+    stale weakref.proxy remains pointing at the dead original tensor.
+    """
+    if _SWAAlloc is None:
+        return
+    alloc = getattr(model_runner, "token_to_kv_pool_allocator", None)
+    if not isinstance(alloc, _SWAAlloc):
+        return
+    if alloc.full_attn_allocator.available_size() > 0:
+        return
+
+    rank_print(
+        "[bench_one_batch] full-attention KV pool is empty (all-SWA model config). "
+        "Aliasing full allocator to SWA allocator for correctness test."
+    )
+
+    # Redirect full allocator → SWA allocator.
+    alloc.full_attn_allocator = alloc.swa_attn_allocator
+
+    # Build an identity mapping: full-index → same SWA index.
+    # Size must cover all SWA indices + page_size pad + sentinel at [-1].
+    swa_size = alloc.swa_attn_allocator.size
+    mapping_len = swa_size + alloc.page_size + 1
+    identity = torch.arange(mapping_len, dtype=torch.int64, device=alloc.device)
+    identity[-1] = -1  # sentinel: -1 maps to -1
+
+    # Update strong ref on the allocator (this is what keeps the tensor alive).
+    alloc.full_to_swa_index_mapping = identity
+
+    # Update kvcache — it stores whatever was passed to register_mapping(); replace it
+    # with the new strong-ref tensor (not a weakref.proxy) so it stays alive.
+    kvcache = getattr(alloc, "_kvcache", None)
+    if kvcache is not None and hasattr(kvcache, "full_to_swa_index_mapping"):
+        kvcache.full_to_swa_index_mapping = identity
+
+    # Update the attention backend — it captured kvcache.full_to_swa_index_mapping
+    # at __init__ time; replace its copy with the live tensor.
+    attn_backend = getattr(model_runner, "attn_backend", None)
+    if attn_backend is not None and hasattr(attn_backend, "full_to_swa_index_mapping"):
+        attn_backend.full_to_swa_index_mapping = identity
+
 
 profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     profiler_activity
@@ -179,6 +254,12 @@ class BenchArgs:
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    # Multimodal support
+    image_test: bool = False
+    image_urls: Tuple[str] = ()
+    image_count: int = 1
+    image_resolution: str = "1080p"
+    image_content: str = "random"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -234,6 +315,42 @@ class BenchArgs:
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
+        parser.add_argument(
+            "--image-test",
+            action="store_true",
+            help="Enable multimodal (vision) support for the benchmark.",
+        )
+        parser.add_argument(
+            "--image-urls",
+            type=str,
+            nargs="+",
+            default=[],
+            help="List of image URLs to use for multimodal testing. Can be local file paths or HTTP URLs.",
+        )
+        parser.add_argument(
+            "--image-count",
+            "--num-images",
+            dest="image_count",
+            type=int,
+            default=BenchArgs.image_count,
+            help="Number of images per request for generated synthetic image inputs.",
+        )
+        parser.add_argument(
+            "--image-resolution",
+            type=str,
+            default=BenchArgs.image_resolution,
+            help=(
+                "Resolution for generated synthetic images. "
+                "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            ),
+        )
+        parser.add_argument(
+            "--image-content",
+            type=str,
+            default=BenchArgs.image_content,
+            choices=["random", "blank"],
+            help="Content for generated synthetic images. Supports random and blank.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -269,12 +386,240 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         tokenizer_mode=server_args.tokenizer_mode,
         trust_remote_code=server_args.trust_remote_code,
     )
+
+    # Initialize multimodal embedding cache for vision models
+    if model_config.is_multimodal:
+        from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+
+        # Initialize with a reasonable cache size (100MB by default)
+        cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        init_mm_embedding_cache(max_size=cache_size_mb * 1024 * 1024)
+        rank_print(
+            f"Initialized multimodal embedding cache with size {cache_size_mb}MB"
+        )
+
     if server_args.tp_size > 1:
         dist.barrier()
     return model_runner, tokenizer
 
 
-def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+def load_images_from_urls(image_urls, rank_print):
+    """Load images from URLs or local file paths."""
+    images = []
+    for url in image_urls:
+        try:
+            if url.startswith("http://") or url.startswith("https://"):
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                images.append(Image.open(BytesIO(response.content)))
+                rank_print(f"Loaded image from URL: {url}")
+            else:
+                # Assume it's a local file path
+                images.append(Image.open(url))
+                rank_print(f"Loaded image from file: {url}")
+        except Exception as e:
+            rank_print(f"Failed to load image from {url}: {e}")
+            raise
+    return images
+
+
+def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
+    """Parse image resolution into (width, height).
+
+    Supports presets '4k', '1080p', '720p', '360p' and custom
+    'heightxwidth' format (e.g., '1080x1920' means height=1080, width=1920).
+    """
+    resolution_to_size = {
+        "4k": (3840, 2160),
+        "1080p": (1920, 1080),
+        "720p": (1280, 720),
+        "360p": (640, 360),
+    }
+
+    resolution = image_resolution.strip().lower()
+    if resolution in resolution_to_size:
+        return resolution_to_size[resolution]
+
+    if "x" in resolution:
+        parts = resolution.split("x")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            height = int(parts[0])
+            width = int(parts[1])
+            if height > 0 and width > 0:
+                return (width, height)
+
+    raise ValueError(
+        f"Unsupported image resolution: {image_resolution}. "
+        "Choose from 4k, 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
+    )
+
+
+def resolve_image_size(bench_args: BenchArgs) -> Tuple[int, int]:
+    """Resolve synthetic image size from --image-resolution."""
+    return parse_image_resolution(bench_args.image_resolution)
+
+
+def generate_random_images(
+    num_images, width, height, rank_print, image_content="random"
+):
+    """Generate random synthetic images for latency testing.
+
+    Args:
+        num_images: Number of images to generate
+        width: Image width in pixels
+        height: Image height in pixels
+        rank_print: Print function to use
+
+    Returns:
+        List of PIL Image objects with random RGB data
+    """
+    images = []
+    for i in range(num_images):
+        if image_content == "blank":
+            image_data = np.full((height, width, 3), 255, dtype=np.uint8)
+        else:
+            image_data = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
+        image = Image.fromarray(image_data, mode="RGB")
+        images.append(image)
+
+    rank_print(
+        f"Generated {num_images} {image_content} image(s) with size {width}x{height}"
+    )
+    return images
+
+
+def process_images_to_multimodal_inputs(images, model_runner, tokenizer, input_ids):
+    """
+    Process PIL images into MultimodalInputs format by using the model's image processor.
+
+    This function loads the model's processor and converts images into the format
+    expected by the model's forward pass.
+
+    Args:
+        images: List of PIL Image objects
+        model_runner: The ModelRunner instance
+        tokenizer: The tokenizer instance
+        input_ids: The token IDs that contain image placeholder tokens
+
+    Returns:
+        MultimodalInputs object
+    """
+    if not images:
+        return None
+
+    try:
+        from transformers import AutoProcessor
+
+        # Load the processor for the model
+        processor = AutoProcessor.from_pretrained(
+            model_runner.model_config.model_path, trust_remote_code=True
+        )
+
+        # Create a dummy text with image placeholders for processor
+        # Llama-4 uses <|image|> as the placeholder token
+        image_token_str = "<|image|>"
+        dummy_text = image_token_str * len(images)
+
+        # Process images - this creates the tensors needed by the vision encoder
+        processor_output = processor(
+            text=[dummy_text], images=images, return_tensors="pt"
+        )
+
+        # Move tensors to the model's device
+        device = model_runner.device
+        for key in processor_output:
+            if isinstance(processor_output[key], torch.Tensor):
+                processor_output[key] = processor_output[key].to(device)
+
+        # Create MultimodalDataItem for the processor output
+        # For Llama-4 and similar models, pixel_values contains the processed images
+        if "pixel_values" not in processor_output:
+            print(
+                f"WARNING: pixel_values not found in processor output. Keys: {processor_output.keys()}"
+            )
+            return None
+
+        # Get the image token ID
+        image_token_id = None
+        try:
+            image_token_ids = tokenizer.encode(
+                image_token_str, add_special_tokens=False
+            )
+            if len(image_token_ids) > 0:
+                image_token_id = image_token_ids[0]
+        except Exception:
+            # Fallback to vocabulary lookup
+            if hasattr(tokenizer, "vocab") and image_token_str in tokenizer.vocab:
+                image_token_id = tokenizer.vocab[image_token_str]
+            elif hasattr(tokenizer, "get_vocab"):
+                vocab = tokenizer.get_vocab()
+                if image_token_str in vocab:
+                    image_token_id = vocab[image_token_str]
+
+        if image_token_id is None:
+            print(f"WARNING: Could not find image token ID for '{image_token_str}'")
+            return None
+
+        # Find image token positions in input_ids
+        image_token_positions = [
+            idx for idx, token_id in enumerate(input_ids) if token_id == image_token_id
+        ]
+
+        if not image_token_positions:
+            print(f"WARNING: Image token {image_token_id} not found in input_ids")
+            print(f"  Input IDs (first 20): {input_ids[:20]}")
+            return None
+
+        # For Llama-4, we need to create offsets for where images appear
+        # Each image token position gets its own offset
+        offsets = [(pos, pos) for pos in image_token_positions]
+
+        # Create model-specific data dict with all processor outputs except pixel_values
+        model_specific_data = {}
+        for key, value in processor_output.items():
+            if key != "pixel_values" and isinstance(value, torch.Tensor):
+                model_specific_data[key] = value
+
+        # Create a single MultimodalDataItem with all the images
+        mm_item = MultimodalDataItem(
+            modality=Modality.MULTI_IMAGES if len(images) > 1 else Modality.IMAGE,
+            format=MultimodalInputFormat.PROCESSOR_OUTPUT,
+            feature=processor_output["pixel_values"],
+            offsets=offsets,
+            model_specific_data=model_specific_data,
+        )
+        mm_item.set_pad_value()
+
+        # Create MultimodalInputs object
+        mm_inputs = MultimodalInputs(mm_items=[mm_item])
+        mm_inputs.im_token_id = image_token_id
+
+        print(
+            f"✓ Created MultimodalInputs with {len(images)} image(s), offsets={offsets}, im_token_id={image_token_id}"
+        )
+
+        return mm_inputs
+
+    except Exception as e:
+        print(f"Error processing images: {e}")
+        print("=" * 80)
+        print("WARNING: Image processing failed")
+        print("=" * 80)
+        print()
+        print("For reliable multimodal benchmarking, consider using:")
+        print("1. examples/multimodal_bench_wrapper.py (uses Engine API)")
+        print("2. test/srt/test_vlm_input_format.py for working examples")
+        print()
+        import traceback
+
+        traceback.print_exc()
+        print("=" * 80)
+        return None
+
+
+def prepare_inputs_for_correctness_test(
+    bench_args, tokenizer, custom_prompts, images=None, model_runner=None
+):
     prompts = (
         custom_prompts
         if custom_prompts
@@ -284,6 +629,14 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             "Today is a sunny day and I like",
         ]
     )
+
+    # For multimodal, use image description prompt with image tokens
+    if bench_args.image_test and images:
+        # For multimodal models, we need to include image placeholder tokens in the prompt
+        image_token_str = "<|image|>"
+        image_placeholders = " ".join([image_token_str] * len(images))
+        prompts = [f"{image_placeholders} Describe the images in detail."]
+
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
@@ -304,6 +657,13 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         req.fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+
+        # Add multimodal inputs if images are provided
+        if bench_args.image_test and images and model_runner:
+            req.multimodal_inputs = process_images_to_multimodal_inputs(
+                images, model_runner, tokenizer, req.origin_input_ids
+            )
+
         reqs.append(req)
 
     return input_ids, reqs
@@ -320,21 +680,113 @@ def prepare_extend_inputs_for_correctness_test(
         ].to(req.prefix_indices.dtype)
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        # Release the req_pool_idx slot so the second extend() treats every
+        # request as a fresh allocation.  The actual KV-cache data is already
+        # captured in prefix_indices (indices into token_to_kv_pool), so
+        # freeing the row in req_to_token_pool does not lose any KV state.
+        if req.req_pool_idx is not None:
+            model_runner.req_to_token_pool.free(req)
+            req.kv_committed_len = 0
     return reqs
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size,
+    input_len,
+    custom_inputs=None,
+    images=None,
+    model_runner=None,
+    tokenizer=None,
 ):
-    input_ids = (
-        custom_inputs
-        if custom_inputs
-        else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
-    )
+
+    # For multimodal tests, we need to create input sequences with image placeholder tokens
+    image_token_positions = []
+    if images and model_runner and tokenizer:
+        # Get the image placeholder token for this model
+        # Llama-4 uses <|image|> token
+        image_token = "<|image|>"
+
+        # Create a simple prompt with image placeholders
+        prompt_template = f"{image_token} Describe this image in detail."
+
+        # Encode the prompt to get the token IDs
+        encoded = tokenizer.encode(prompt_template)
+
+        # Find where the image token appears in the encoded sequence
+        # Encode just the image token to find its ID
+        image_token_ids = tokenizer.encode(image_token, add_special_tokens=False)
+
+        print(f"image_token_str='{image_token}', image_token_ids={image_token_ids}")
+        print(f"Full prompt: '{prompt_template}'")
+        print(f"Encoded prompt: {encoded[:20]}... (showing first 20)")
+
+        if len(image_token_ids) > 0:
+            image_token_id = image_token_ids[0]
+            # Find all positions of the image token
+            positions = [
+                idx
+                for idx, token_id in enumerate(encoded)
+                if token_id == image_token_id
+            ]
+            print(f"Found image_token_id {image_token_id} at positions: {positions}")
+            if positions:
+                # For simplicity, use the first image token position
+                # In the real case, there might be multiple images
+                image_token_positions = [(positions[0], positions[0])]
+
+        if not image_token_positions:
+            print(f"WARNING: Could not find image token in encoded sequence!")
+            print(f"  This may cause issues with multimodal processing")
+
+        # If the encoded prompt is shorter than input_len, pad with random tokens
+        if len(encoded) < input_len:
+            # Pad with random tokens (excluding special tokens)
+            padding_tokens = np.random.randint(
+                100, 10000, input_len - len(encoded), dtype=np.int32
+            ).tolist()
+            encoded = encoded + padding_tokens
+        elif len(encoded) > input_len:
+            # Truncate if too long
+            encoded = encoded[:input_len]
+
+        # Create the same input for all requests in the batch
+        input_ids = [encoded] * batch_size
+    else:
+        # Non-multimodal: use random tokens or custom inputs
+        input_ids = (
+            custom_inputs
+            if custom_inputs
+            else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+        )
+
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
     )
+
+    # For multimodal batch processing, create multimodal inputs once and share across all requests
+    # This ensures consistent pad_value usage and avoids duplication
+    shared_multimodal_inputs = None
+    if images and model_runner and tokenizer:
+        # Create multimodal inputs once using the first request's input_ids as reference
+        shared_multimodal_inputs = process_images_to_multimodal_inputs(
+            images, model_runner, tokenizer, list(input_ids[0])
+        )
+        if shared_multimodal_inputs:
+            print(
+                f"✓ Created shared multimodal inputs for batch of {len(input_ids)} requests"
+            )
+
+            # Important: Call pad_input_ids to replace image tokens with pad_values
+            # This is required for the mask to find image tokens during forward pass
+            if hasattr(model_runner.model, "pad_input_ids"):
+                # Update the input_ids to use pad_values instead of image token IDs
+                padded_input_ids = model_runner.model.pad_input_ids(
+                    list(input_ids[0]), shared_multimodal_inputs
+                )
+                # Update all input_ids in the batch with the padded version
+                input_ids = [padded_input_ids] * len(input_ids)
+                print(f"✓ Applied pad_input_ids: {len(input_ids[0])} tokens")
 
     reqs = []
     for i in range(len(input_ids)):
@@ -347,6 +799,11 @@ def prepare_synthetic_inputs_for_latency_test(
         req.fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+
+        # Share the same multimodal inputs across all requests in the batch
+        if shared_multimodal_inputs:
+            req.multimodal_inputs = shared_multimodal_inputs
+
         reqs.append(req)
 
     return reqs
@@ -364,6 +821,27 @@ class TreeCacheNamespace(SimpleNamespace):
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
+
+    def evict(self, params):
+        return None
+
+    def pretty_print(self):
+        return None
+
+    def evictable_size(self):
+        return 0
+
+    def full_evictable_size(self):
+        return 0
+
+    def swa_evictable_size(self):
+        return 0
+
+    def full_lru_list_evictable_size(self):
+        return 0
+
+    def swa_lru_list_evictable_size(self):
+        return 0
 
 
 @torch.no_grad
@@ -470,10 +948,38 @@ def correctness_test(
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
+    # For hybrid-SWA models whose full-attention KV pool ended up with size 0
+    # (e.g. all-SWA or reduced model configs), alias the full allocator to the SWA
+    # allocator so correctness-test token allocations can succeed.
+    _fix_swa_full_pool_if_empty(model_runner, rank_print)
+
+    # Load or generate images if multimodal is enabled
+    images = None
+    if bench_args.image_test:
+        if bench_args.image_urls:
+            # Load real images from URLs/files for correctness test
+            rank_print(
+                f"Loading {len(bench_args.image_urls)} images for multimodal test..."
+            )
+            images = load_images_from_urls(bench_args.image_urls, rank_print)
+            rank_print(f"Loaded {len(images)} images successfully")
+        else:
+            width, height = resolve_image_size(bench_args)
+            rank_print(
+                f"Generating {bench_args.image_count} synthetic image(s) at {width}x{height}"
+            )
+            images = generate_random_images(
+                bench_args.image_count,
+                width,
+                height,
+                rank_print,
+                image_content=bench_args.image_content,
+            )
+
     # Prepare inputs
     custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
     input_ids, reqs = prepare_inputs_for_correctness_test(
-        bench_args, tokenizer, custom_prompts
+        bench_args, tokenizer, custom_prompts, images=images, model_runner=model_runner
     )
     rank_print(f"\n{input_ids=}\n")
 
@@ -501,8 +1007,9 @@ def correctness_test(
 
     # Print output texts
     for i in range(len(reqs)):
-        rank_print(f"========== Prompt {i} ==========")
-        rank_print(tokenizer.decode(output_ids[i]), "\n")
+        rank_print(f"========== Prompt {i} ===========")
+        output_text = tokenizer.decode(output_ids[i])
+        rank_print(output_text, "\n")
 
 
 def synchronize(device):
@@ -663,9 +1170,41 @@ def latency_test(
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
+    # For hybrid-SWA models whose full-attention KV pool ended up with size 0
+    # (e.g. all-SWA or reduced model configs), alias the full allocator to the SWA
+    # allocator so latency-test token allocations can succeed.
+    _fix_swa_full_pool_if_empty(model_runner, rank_print)
+
+    # Load or generate images if multimodal is enabled
+    images = None
+    if bench_args.image_test:
+        if bench_args.image_urls:
+            # Load real images from URLs/files
+            rank_print(
+                f"Loading {len(bench_args.image_urls)} images for multimodal test..."
+            )
+            images = load_images_from_urls(bench_args.image_urls, rank_print)
+            rank_print(f"Loaded {len(images)} images successfully")
+        else:
+            width, height = resolve_image_size(bench_args)
+            rank_print(
+                f"Generating {bench_args.image_count} synthetic image(s) at {width}x{height} for latency test..."
+            )
+            images = generate_random_images(
+                bench_args.image_count,
+                width,
+                height,
+                rank_print,
+                image_content=bench_args.image_content,
+            )
+
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        images=images,
+        model_runner=model_runner,
+        tokenizer=tokenizer,
     )
 
     # Warm up
@@ -719,7 +1258,14 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs,
+            il,
+            bs_aligned_inputs,
+            images=images,
+            model_runner=model_runner,
+            tokenizer=tokenizer,
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -752,6 +1298,11 @@ def latency_test(
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+
+    # bench_one_batch --image-test implies multimodal execution.
+    # Keep explicit user choice intact if --enable-multimodal is provided.
+    if bench_args.image_test and server_args.enable_multimodal is None:
+        server_args.enable_multimodal = True
 
     _set_envs_and_config(server_args)
 
