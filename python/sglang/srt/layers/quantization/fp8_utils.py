@@ -805,11 +805,13 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
+    # flashinfer.mm_mxfp8 runner transposes B internally before launching the
+    # CUDA op; passing weight.t() here keeps the internal mat2 contiguous.
     output = flashinfer_mm_mxfp8(
         q_input,
-        weight.t().contiguous(),
+        weight.t(),
         x_scale_u8,
-        weight_scale.t().contiguous(),
+        weight_scale.t(),
         out_dtype=output_dtype,
         backend="auto",
     )
