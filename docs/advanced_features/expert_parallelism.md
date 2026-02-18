@@ -35,6 +35,8 @@ Currently, DeepEP, Mooncake, `ascend_fuseep` and MORI only support cases where `
 | `flashinfer_cutlass`     | FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently. | Blackwell with FP4/FP8 models. |
 | `flashinfer_mxfp4`       | FlashInfer variant optimized for MXFP4 (mixed FP4) quantization in MoE runners, focusing on memory-efficient low-precision inference. | Low-precision models with MXFP4. |
 | `flashinfer_cutedsl`     | FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with ModelOpt FP4 quantization. | Low-precision models with NVFP4. |
+| `torch_native`            | PyTorch's native tensor operations for MoE computation without specialized kernels. | CPU execution, compatibility, and debugging. |
+| `amx`                     | Intel Advanced Matrix Extensions for optimized CPU-based MoE computation using specialized matrix instructions. | Intel CPU deployments with AMX support. |
 
 ### Examples
 
