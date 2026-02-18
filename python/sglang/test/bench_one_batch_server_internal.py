@@ -454,17 +454,14 @@ def run_one_case(
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
 ):
-    # For shared-prefix, skip cache flush so the prefix stays cached across calls.
-    # For other datasets, flush the cache as usual.
-    if dataset_name != "generated-shared-prefix":
-        if backend == "vllm":
-            response = requests.post(
-                url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT
-            )
-            response.raise_for_status()
-        else:
-            response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
-            response.raise_for_status()
+    if backend == "vllm":
+        response = requests.post(
+            url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT
+        )
+        response.raise_for_status()
+    else:
+        response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
 
     # Load input token ids
     # TODO: reuse bench_serving.get_dataset ?
