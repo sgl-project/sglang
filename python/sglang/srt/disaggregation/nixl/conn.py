@@ -144,18 +144,19 @@ class KVArgsRegisterInfo:
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
-    # KV chunks received per pp_rank: {pp_rank: set of chunk_ids}
-    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(
+    # KV chunks received per sender: {sender_key: set of chunk_ids}
+    # sender_key is the NIXL peer_name, which uniquely identifies each prefill TP rank
+    received_kvs_per_sender: Dict[str, Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
-    # Expected chunk count per pp_rank (set when is_last=True): {pp_rank: expected_count}
-    expected_kvs_per_pp: Dict[int, int] = dataclasses.field(default_factory=dict)
-    # Number of PP ranks expected to send data.
-    num_pp_ranks_expected: Optional[int] = None
+    # Expected chunk count per sender (set when is_last=True): {sender_key: expected_count}
+    expected_kvs_per_sender: Dict[str, int] = dataclasses.field(default_factory=dict)
+    # Number of senders expected to send data.
+    num_senders_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
-    # PP ranks that have sent state data (state is layer-specific, each PP rank sends its portion).
-    received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
+    # Senders that have sent state data.
+    received_state_per_sender: Set[str] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
     expects_state: bool = False
     # Mark as failed
@@ -164,20 +165,20 @@ class TransferStatus:
     def is_done(self):
         if self.is_failure:
             return True
-        if self.num_pp_ranks_expected is None or not self.received_aux:
+        if self.num_senders_expected is None or not self.received_aux:
             return False
-        # If state data is expected, check all PP ranks have sent it
+        # If state data is expected, check all senders have sent it
         if (
             self.expects_state
-            and len(self.received_state_per_pp) < self.num_pp_ranks_expected
+            and len(self.received_state_per_sender) < self.num_senders_expected
         ):
             return False
-        # All PP ranks must have reported their expected count
-        if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
+        # All senders must have reported their expected count
+        if len(self.expected_kvs_per_sender) < self.num_senders_expected:
             return False
-        # Each PP rank must have received all expected chunks
-        for pp_rank, expected in self.expected_kvs_per_pp.items():
-            if len(self.received_kvs_per_pp[pp_rank]) != expected:
+        # Each sender must have received all expected chunks
+        for sender_key, expected in self.expected_kvs_per_sender.items():
+            if len(self.received_kvs_per_sender[sender_key]) != expected:
                 return False
         return True
 
@@ -1367,35 +1368,35 @@ class NixlKVManager(CommonKVManager):
         # Process notifications from received transfers.
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
-            # We could also check that self.bootstrap_info['agent_name'] matches
-            # the message sender. But the bootstrap room alone should be
-            # sufficient to map the status.
+            # Use peer_name as the unique sender key. This correctly handles
+            # mixed TP where multiple prefill TP ranks (each with a unique
+            # NIXL agent/peer_name) send to the same decode rank.
             for msg in messages:
                 components = msg.decode("ascii").split("_", 4)
                 room = int(components[0])
                 if components[1] == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
-                    pp_rank = int(components[4]) if len(components) > 4 else 0
-                    # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
-                        chunk_id
-                    )
+                    sender_key = peer_name
+                    # Track received chunks per sender
+                    self.transfer_statuses[room].received_kvs_per_sender[
+                        sender_key
+                    ].add(chunk_id)
                     if is_last:
-                        # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
-                            chunk_id + 1
-                        )
-                        # Set num_pp_ranks_expected from table (or default to 1)
-                        if self.transfer_statuses[room].num_pp_ranks_expected is None:
-                            self.transfer_statuses[room].num_pp_ranks_expected = (
+                        # Record expected chunk count for this sender
+                        self.transfer_statuses[room].expected_kvs_per_sender[
+                            sender_key
+                        ] = (chunk_id + 1)
+                        # Set num_senders_expected from table (or default to 1)
+                        if self.transfer_statuses[room].num_senders_expected is None:
+                            self.transfer_statuses[room].num_senders_expected = (
                                 self.required_prefill_response_num_table.get(room, 1)
                             )
                 elif components[1] == "aux":
                     self.transfer_statuses[room].received_aux = True
                 elif components[1] == "state":
-                    pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                    sender_key = peer_name
+                    self.transfer_statuses[room].received_state_per_sender.add(sender_key)
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
