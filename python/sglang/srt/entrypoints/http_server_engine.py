@@ -20,6 +20,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
     start_time = time.perf_counter()
 
+    ssl_verify = server_args.ssl_verify()
+
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             try:
@@ -27,7 +29,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
                     "Content-Type": "application/json; charset=utf-8",
                     "Authorization": f"Bearer {server_args.api_key}",
                 }
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(
+                    f"{base_url}/health_generate", headers=headers, verify=ssl_verify
+                )
                 if response.status_code == 200:
                     return p
             except requests.RequestException:
@@ -64,8 +68,10 @@ class HttpServerEngineAdapter(EngineBase):
         Returns:
             The JSON response from the server
         """
-        url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        url = f"{self.server_args.url()}/{endpoint}"
+        response = requests.post(
+            url, json=payload or {}, verify=self.server_args.ssl_verify()
+        )
         response.raise_for_status()
         return response.json()
 
