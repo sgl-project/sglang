@@ -194,6 +194,8 @@ class PiecewiseCudaGraphRunner:
         )
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
+        # Track memory relocation version for HiCache - graphs captured at version 0
+        self.captured_memory_version: int = 0
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -420,6 +422,12 @@ class PiecewiseCudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        # Disable CUDA graph when hierarchical cache loading is active
+        if forward_batch.hicache_consumer_index >= 0:
+            return False
+        # Disable when HiCache has relocated memory since graphs were captured
+        if forward_batch.hicache_memory_version != self.captured_memory_version:
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -428,9 +436,8 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
-        if num_tokens <= self.max_num_tokens:
-            return True
-        return False
+
+        return num_tokens <= self.max_num_tokens
 
     def capture(self) -> None:
         # Trigger CUDA graph capture for specific shapes.

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -103,6 +106,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
+
+        # Track memory relocation version for HiCache - graphs captured at version 0
+        self.captured_memory_version: int = 0
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -222,6 +228,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable CUDA graph when hierarchical cache loading is active
+        is_loading_inactive = forward_batch.hicache_consumer_index < 0
+
+        # Disable when HiCache has relocated memory since graphs were captured
+        is_memory_version_ok = (
+            forward_batch.hicache_memory_version == self.captured_memory_version
+        )
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -241,7 +255,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        return is_bs_supported
+        can_run = is_bs_supported and is_loading_inactive and is_memory_version_ok
+
+        return can_run
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()

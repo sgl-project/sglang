@@ -992,6 +992,14 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
+    def is_hicache_loading_in_progress(self) -> bool:
+        """Check if hierarchical cache loading is currently in progress."""
+        return self.cache_controller.is_loading_in_progress()
+
+    def get_memory_relocation_version(self) -> int:
+        """Get memory relocation version from cache controller."""
+        return self.cache_controller.get_memory_relocation_version()
+
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()

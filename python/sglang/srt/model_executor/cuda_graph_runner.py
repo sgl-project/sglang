@@ -555,6 +555,8 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        # Track memory relocation version for HiCache - graphs captured at version 0
+        self.captured_memory_version: int = 0
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
@@ -745,13 +747,26 @@ class CudaGraphRunner:
             else True
         )
 
-        return (
+        # Check if hierarchical cache loading is inactive
+        is_hicache_loading_inactive = forward_batch.hicache_consumer_index < 0
+
+        # Check if HiCache has relocated memory since graphs were captured
+        is_memory_version_ok = (
+            forward_batch.hicache_memory_version == self.captured_memory_version
+        )
+
+        # Compute final result
+        can_run = (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_hicache_loading_inactive
+            and is_memory_version_ok
         )
+
+        return can_run
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
@@ -1237,6 +1252,7 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

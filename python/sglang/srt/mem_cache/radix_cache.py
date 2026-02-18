@@ -651,6 +651,13 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def get_memory_relocation_version(self) -> int:
+        """Get memory relocation version for CUDA graph invalidation.
+
+        Non-hierarchical RadixCache never relocates memory, so always returns 0.
+        """
+        return 0
+
     def all_values_flatten(self):
         values = []
 

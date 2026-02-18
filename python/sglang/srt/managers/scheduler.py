@@ -2578,11 +2578,21 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
         )
+        # Always set memory relocation version for CUDA graph invalidation
+        # This tracks all KV cache free operations (request completions, evictions)
+        new_batch.hicache_memory_version = (
+            self.tree_cache.get_memory_relocation_version()
+        )
+
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            # Check both: start new loading AND check if any loading is in progress
+            # hicache_consumer_index >= 0 disables CUDA graphs in can_run() methods
+            new_idx = self.tree_cache.ready_to_load_host_cache()
+            is_loading = self.tree_cache.is_hicache_loading_in_progress()
+            # Set >= 0 if EITHER new loading started OR loading in progress
             new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
+                new_idx if new_idx >= 0 else (0 if is_loading else -1)
             )
 
         new_batch.prepare_for_extend()
@@ -2699,6 +2709,23 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+
+        # Always set memory relocation version for CUDA graph invalidation
+        # This tracks all KV cache free operations (request completions, evictions)
+        batch.hicache_memory_version = (
+            self.tree_cache.get_memory_relocation_version()
+        )
+
+        # Set hicache_consumer_index for decode batches to disable CUDA graphs during loading
+        if self.enable_hierarchical_cache:
+            # Check both: start new loading AND check if any loading is in progress
+            new_idx = self.tree_cache.ready_to_load_host_cache()
+            is_loading = self.tree_cache.is_hicache_loading_in_progress()
+            # Set >= 0 if EITHER new loading started OR loading in progress
+            batch.hicache_consumer_index = (
+                new_idx if new_idx >= 0 else (0 if is_loading else -1)
+            )
+
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):

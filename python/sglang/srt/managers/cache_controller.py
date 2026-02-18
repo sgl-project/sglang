@@ -96,6 +96,13 @@ class LayerDoneCounter:
         self.producer_index = -1
         self.consumer_index = -1
 
+    def is_loading_in_progress(self) -> bool:
+        """Check if any loading operation is currently in progress."""
+        if self.producer_index < 0:
+            return False
+        # Check if the last producer's finish event has NOT completed
+        return not self.events[self.producer_index].finish_event.query()
+
 
 class CacheOperation:
 
@@ -300,6 +307,10 @@ class HiCacheController:
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+
+        # Track memory relocations for CUDA graph invalidation
+        # Incremented each time load() allocates new device memory
+        self.memory_relocation_version: int = 0
 
         if write_policy not in [
             "write_through",
@@ -715,6 +726,13 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
+
+        # Memory relocated from host to device - increment relocation version
+        self.memory_relocation_version += 1
+        logger.info(
+            f"[HiCache] Load: memory_relocation_version={self.memory_relocation_version}"
+        )
+
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
@@ -782,8 +800,25 @@ class HiCacheController:
         )
         return producer_id
 
+    def is_loading_in_progress(self) -> bool:
+        """Check if any hicache loading is currently in progress."""
+        return self.layer_done_counter.is_loading_in_progress()
+
+    def get_memory_relocation_version(self) -> int:
+        """Get current memory relocation version for CUDA graph invalidation.
+
+        Only incremented on actual HiCache memory relocations (load/evict),
+        NOT on every normal free/alloc cycle.
+        """
+        return self.memory_relocation_version
+
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
+        # Memory relocated from device to host - increment relocation version
+        self.memory_relocation_version += 1
+        logger.info(
+            f"[HiCache] Device eviction: memory_relocation_version={self.memory_relocation_version}"
+        )
         return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:

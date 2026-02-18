@@ -20,6 +20,7 @@ Page-aligned memory pool.
 """
 
 import abc
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +28,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -55,6 +58,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         self.free_group = []
 
+        # Version counter for CUDA graph invalidation
+        # Incremented when KV cache slots are freed
+        self.kv_free_version: int = 0
+
     def debug_print(self) -> str:
         return ""
 
@@ -77,6 +84,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
+            # Increment version once for batched free - memory layout changing
+            self.kv_free_version += 1
             self.free(torch.cat(self.free_group))
 
     def merge_and_sort_free(self):
@@ -146,6 +155,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         if need_size > len(self.free_pages):
+            logger.warning(
+                f"[KVAlloc] alloc FAILED: need={need_size}, available={len(self.free_pages)}"
+            )
             return None
 
         select_index = self.free_pages[:need_size]
@@ -157,6 +169,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            # Increment version - memory layout changed, CUDA graphs need invalidation
+            self.kv_free_version += 1
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
@@ -492,6 +506,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            # Increment version - memory layout changed, CUDA graphs need invalidation
+            self.kv_free_version += 1
             free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
