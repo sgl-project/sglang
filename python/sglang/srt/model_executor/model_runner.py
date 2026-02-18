@@ -2660,13 +2660,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
+        # JIT-compile the NCCL allocator before any collective memory
+        # operations. The compilation takes ~90s and different ranks may
+        # finish at different times. Without this barrier, the first rank
+        # to finish would call ncclMemAlloc/ncclCommWindowRegister
+        # (collective ops) while other ranks are still compiling.
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            get_nccl_mem_pool,
+        )
+
+        get_nccl_mem_pool()
+        torch.distributed.barrier()
+
         # Memory allocation is tied to a cuda stream, use the forward stream
         with torch.get_device_module(self.device).stream(self.forward_stream):
             logger.info(
                 f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
             )
             with use_symmetric_memory(get_tp_group()):
-                torch.empty(
+                # Keep the tensor alive to prevent ncclMemFree from being
+                # called (ncclMemFree is a collective that could deadlock
+                # if ranks free at different times).
+                self._symm_mem_prealloc = torch.empty(
                     (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
                     dtype=torch.uint8,
                     device=self.device,
