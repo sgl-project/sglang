@@ -414,9 +414,7 @@ def run_one_case(
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
-        response = requests.post(
-            url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT
-        )
+        response = requests.post(url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
     else:
         response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
@@ -808,7 +806,6 @@ def run_benchmark_internal(
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
         skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
-    # Common GSP kwargs to pass through to run_one_case
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
