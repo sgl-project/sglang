@@ -213,15 +213,19 @@ class PiecewiseCudaGraphRunner:
         )
 
         self.input_ids = self.buffers.input_ids
-        self.input_embeds = self.buffers.input_embeds
         self.out_cache_loc = self.buffers.out_cache_loc
         self.out_cache_loc_swa = self.buffers.out_cache_loc_swa
         self.mamba_track_indices = self.buffers.mamba_track_indices
         self.mamba_track_mask = self.buffers.mamba_track_mask
         self.mamba_track_seqlens = self.buffers.mamba_track_seqlens
         self.positions = self.buffers.positions
-        self.mrope_positions = self.buffers.mrope_positions
         self.custom_mask = self.buffers.custom_mask
+        if self.is_multimodal:
+            self.input_embeds = self.buffers.input_embeds
+            self.mrope_positions = self.buffers.mrope_positions
+        else:
+            self.input_embeds = None
+            self.mrope_positions = None
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
