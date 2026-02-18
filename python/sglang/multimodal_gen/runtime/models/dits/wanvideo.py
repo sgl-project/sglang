@@ -956,6 +956,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # Cache states for both TeaCache and MagCache (same operation)
             if self.enable_teacache or self.enable_magcache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+
+            if self.calibrate_magcache:
+                self._calibrate_magcache(self.cnt, hidden_states, original_hidden_states, self.is_cfg_negative)
         self.cnt += 1
 
         if sequence_shard_enabled:
@@ -1006,12 +1009,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         else:
             self.previous_residual_negative = residual
 
-        if self.calibrate_magcache:
-            self._calibrate_magcache(residual, is_negative=self.is_cfg_negative)
-
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
-        if self.calibrate_magcache: return False
+
+        ic(self.enable_teacache, self.calibrate_magcache)
+        if self.calibrate_magcache:
+            return False
 
         # Try TeaCache first
         if self.enable_teacache:

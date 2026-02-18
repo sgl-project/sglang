@@ -109,7 +109,7 @@ class MagCacheMixin:
 
         # Always set magcache flag
         self.enable_magcache = True
-        self.calibrate_magcache = True
+        self.calibrate_magcache = True # todo: fix
 
         # MagCache-specific state
         self.previous_residual_norm: float = 0.0
@@ -207,7 +207,7 @@ class MagCacheMixin:
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
-    def _calibrate_magcache(self, residual: torch.Tensor, is_negative: bool = False) -> None:
+    def _calibrate_magcache(self, cnt:int, hidden_states:torch.Tensor, original_hidden_states:torch.Tensor, is_negative: bool = False) -> None:
         """
         Calibration mode to collect magnitude ratios and save them to a JSON file.
 
@@ -215,42 +215,23 @@ class MagCacheMixin:
         diffusion inference. The ratios are collected for both positive and negative
         CFG branches (interleaved) and saved to disk when generation completes.
         """
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            get_forward_context,
-        )
 
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
 
-        current_norm = residual.norm(p=2).item()
+        # only calibrate starting in the second denoising step
+        if cnt == 0: return
 
-        # Get previous norm based on branch
-        prev_norm = (
-            self.previous_residual_norm_negative if is_negative
-            else self.previous_residual_norm
-        )
+        current_residual = hidden_states.squeeze(0) - original_hidden_states
+        current_norm = current_residual.norm(p=2)
 
-        # Calculate and collect ratio if we have a previous norm
-        if prev_norm > 0:
-            ratio = current_norm / prev_norm
-            self.calibration_ratios.append(ratio)
+        previous_residual = self.previous_residual_negative if is_negative else self.previous_residual
+        assert previous_residual is not None
+        previous_norm = previous_residual.norm(p=2)
 
-        # Update norm for this branch
-        if is_negative:
-            self.previous_residual_norm_negative = current_norm
-        else:
-            self.previous_residual_norm = current_norm
+        import torch.nn.functional as F
+        norm_ratio = (current_norm / previous_norm).mean().item()
+        norm_std = (current_norm / previous_norm).std().item()
+        cos_dis = (1-F.cosine_similarity(current_residual, previous_residual, dim=-1, eps=1e-8)).mean().item()
 
-        # Save calibration data at the end of generation (last timestep, positive branch only)
-        if forward_batch is not None and forward_context is not None:
-            is_last_timestep = (
-                forward_context.current_timestep == forward_batch.num_inference_steps - 1
-            )
-            if is_last_timestep and not is_negative:
-                self._save_calibration_data(
-                    num_steps=forward_batch.num_inference_steps,
-                    do_cfg=forward_batch.do_classifier_free_guidance
-                )
 
     def _update_magcache_state(
         self, norm: float | None, error: float, skips: int

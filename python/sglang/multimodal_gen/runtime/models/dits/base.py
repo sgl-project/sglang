@@ -125,7 +125,6 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
         SHARED implementation - both TeaCache and MagCache cache residuals identically.
         """
         residual = hidden_states.squeeze(0) - original_hidden_states
-        ic(residual.shape)
         if not self.is_cfg_negative:
             self.previous_residual = residual
         else:
