@@ -1327,7 +1327,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           cd test && python3 ../scripts/ci/cuda/warmup_deep_gemm.py --suite stage-c-test-8-gpu-h200 --tp 8
 
@@ -1472,7 +1472,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           cd test && python3 ../scripts/ci/cuda/warmup_deep_gemm.py --suite stage-c-test-deepep-8-gpu-h200 --tp 8
 

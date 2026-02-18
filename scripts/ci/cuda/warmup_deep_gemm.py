@@ -477,6 +477,8 @@ def main():
             "--tp",
             str(tp),
             "--trust-remote-code",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
         ]
         result = subprocess.run(cmd)
         if result.returncode != 0:
