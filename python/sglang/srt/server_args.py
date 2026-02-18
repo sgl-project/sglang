@@ -660,6 +660,10 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Use pinned CPU buffer for NIXL KV transfers (Triton gather/scatter + single NIXL transfer)
+    nixl_use_cpu_buffer: bool = False
+    # Total size of pinned CPU buffer for NIXL KV transfers (GB)
+    nixl_cpu_buffer_size_gb: float = 16.0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4871,6 +4875,21 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--nixl-use-cpu-buffer",
+            action="store_true",
+            default=ServerArgs.nixl_use_cpu_buffer,
+            help="Use pinned CPU buffer for NIXL KV transfers. Uses Triton gather/scatter "
+            "kernels with a single NIXL transfer, reducing descriptor count from "
+            "O(tokens * layers) to O(1).",
+        )
+        parser.add_argument(
+            "--nixl-cpu-buffer-size-gb",
+            type=float,
+            default=ServerArgs.nixl_cpu_buffer_size_gb,
+            help="Total size of pinned CPU buffer for NIXL KV transfers (GB). "
+            "Should be sized for sum of max concurrent transfers. Default is 16.0.",
         )
 
         # Encode prefill disaggregation
