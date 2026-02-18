@@ -23,6 +23,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -1852,25 +1853,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return True
 
+    @contextmanager
+    def _disable_symm_mem(self):
+        """Temporarily disable symmetric memory to avoid NCCL deadlocks.
+
+        MoE forward passes use use_symmetric_memory() which triggers NCCL
+        collective operations. During warmup phases (autotune, CUDA graph
+        capture), these collectives can deadlock because different ranks may
+        execute different kernel configurations or batch sizes.
+        """
+        saved = self.server_args.enable_symm_mem
+        self.server_args.enable_symm_mem = False
+        try:
+            yield
+        finally:
+            self.server_args.enable_symm_mem = saved
+
     def _flashinfer_autotune(self):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
         logger.info("Running FlashInfer autotune...")
 
-        # Temporarily disable symmetric memory during autotune to avoid deadlock.
-        # MoE forward passes use use_symmetric_memory() which triggers NCCL collective
-        # operations. During autotune profiling, these collectives can deadlock because
-        # different ranks may execute different kernel configurations.
-        # is_symmetric_memory_enabled() reads server_args.enable_symm_mem directly,
-        # so we temporarily flip the flag.
-        saved_symm_mem = self.server_args.enable_symm_mem
-        self.server_args.enable_symm_mem = False
-        try:
-            with torch.inference_mode(), autotune():
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
-        finally:
-            self.server_args.enable_symm_mem = saved_symm_mem
+        with self._disable_symm_mem(), torch.inference_mode(), autotune():
+            self._dummy_run(batch_size=self.req_to_token_pool.size)
 
         logger.info("FlashInfer autotune completed.")
 
@@ -2153,7 +2159,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+        with self._disable_symm_mem():
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2228,7 +2235,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        with self._disable_symm_mem():
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
