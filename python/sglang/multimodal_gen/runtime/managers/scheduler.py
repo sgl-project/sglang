@@ -113,6 +113,13 @@ class Scheduler:
         self._dynamic_batch_delay_s = max(
             0.0, server_args.dynamic_batch_delay_ms / 1000.0
         )
+        # Track queue size across iterations for adaptive dispatch
+        self._prev_queue_len = 0
+
+        # ZMQ poller for efficient waiting (only on rank 0 which has receiver)
+        self._poller = zmq.Poller()
+        if self.receiver is not None:
+            self._poller.register(self.receiver, zmq.POLLIN)
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -248,6 +255,16 @@ class Scheduler:
         normalized = self._normalize_for_signature(sp_dict)
         return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
+    def _get_cached_signature(self, req: Req) -> str | None:
+        """Return cached signature for a request, computing it once."""
+        cached = getattr(req, "_dynamic_batch_sig", None)
+        if cached is not None:
+            return cached
+        sig = self._build_dynamic_batch_signature(req)
+        # Cache on the request object to avoid recomputing each poll cycle.
+        req._dynamic_batch_sig = sig  # type: ignore[attr-defined]
+        return sig
+
     def _can_dynamic_batch(self, base_req: Req, candidate_req: Req) -> bool:
         if base_req.is_warmup or candidate_req.is_warmup:
             return False
@@ -260,8 +277,8 @@ class Scheduler:
         if base_req.image_path is not None or candidate_req.image_path is not None:
             return False
 
-        base_sig = self._build_dynamic_batch_signature(base_req)
-        cand_sig = self._build_dynamic_batch_signature(candidate_req)
+        base_sig = self._get_cached_signature(base_req)
+        cand_sig = self._get_cached_signature(candidate_req)
         return base_sig is not None and base_sig == cand_sig
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
@@ -381,7 +398,15 @@ class Scheduler:
         return self._dynamic_batch_max_size > 1
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
-        """Pull one request or one dynamic batch from waiting_queue."""
+        """Pull one request or one dynamic batch from waiting_queue.
+
+        Non-contiguous batching: skips incompatible requests in the queue to
+        find more compatible ones, avoiding head-of-line blocking.
+
+        Adaptive dispatch: dispatches immediately when the queue has stopped
+        growing (no new requests arrived since last check), or when the delay
+        has expired, or when the batch is full.
+        """
         if not self.waiting_queue:
             return None
 
@@ -400,38 +425,47 @@ class Scheduler:
             identity, req, _ = self.waiting_queue.popleft()
             return [(identity, req)]
 
-        batch_len = 1
-        hit_incompatible_front = False
-        for idx, (_identity, candidate_req, _enqueue_time) in enumerate(
-            self.waiting_queue
-        ):
-            if idx == 0:
-                continue
-            if batch_len >= self._dynamic_batch_max_size:
+        # Non-contiguous scan: collect indices of all compatible requests in
+        # the queue (up to max_size), skipping incompatible ones.
+        compatible_indices: list[int] = [0]
+        for idx in range(1, len(self.waiting_queue)):
+            if len(compatible_indices) >= self._dynamic_batch_max_size:
                 break
-            if not isinstance(candidate_req, Req) or not self._can_dynamic_batch(
+            _identity, candidate_req, _enqueue_time = self.waiting_queue[idx]
+            if isinstance(candidate_req, Req) and self._can_dynamic_batch(
                 req, candidate_req
             ):
-                hit_incompatible_front = True
-                break
-            batch_len += 1
+                compatible_indices.append(idx)
 
+        batch_len = len(compatible_indices)
         if batch_len <= 0:
             return None
 
+        # Adaptive dispatch: decide whether to wait for more requests.
+        # Do NOT wait if:
+        #  - batch is already full
+        #  - delay has expired
+        #  - queue hasn't grown since last poll (no new requests arriving)
+        #  - we've scanned the entire queue and found all compatible requests
         oldest_wait_s = time.monotonic() - enqueue_time
+        queue_stopped_growing = len(self.waiting_queue) <= self._prev_queue_len
+        scanned_entire_queue = compatible_indices[-1] == len(self.waiting_queue) - 1
+
         should_wait_for_more = (
             batch_len < self._dynamic_batch_max_size
             and oldest_wait_s < self._dynamic_batch_delay_s
-            and not hit_incompatible_front
+            and not queue_stopped_growing
+            and not scanned_entire_queue
         )
         if should_wait_for_more:
             return None
 
-        batch_items: list[tuple[bytes | None, Any]] = []
-        for _ in range(batch_len):
-            item_identity, item_req, _ = self.waiting_queue.popleft()
-            batch_items.append((item_identity, item_req))
+        # Pop items from back to front so indices stay valid.
+        batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
+        for pos, idx in enumerate(reversed(compatible_indices)):
+            item_identity, item_req, _ = self.waiting_queue[idx]
+            batch_items[batch_len - 1 - pos] = (item_identity, item_req)
+            del self.waiting_queue[idx]
         return batch_items
 
     def prepare_server_warmup_reqs(self):
@@ -570,6 +604,8 @@ class Scheduler:
 
         while self._running:
             # 1: receive requests
+            # Snapshot queue size BEFORE receiving so we can detect growth.
+            queue_len_before_recv = len(self.waiting_queue)
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
@@ -598,10 +634,21 @@ class Scheduler:
                 continue
 
             # 2: execute, make sure a reply is always sent
+            self._prev_queue_len = queue_len_before_recv
             items = self.get_next_batch_to_run()
             if not items:
                 if self.waiting_queue and self._dynamic_batch_delay_s > 0:
-                    time.sleep(min(0.001, self._dynamic_batch_delay_s))
+                    # Use ZMQ poller to wait precisely: wake immediately when
+                    # a new request arrives, or after the remaining delay.
+                    oldest_ts = self.waiting_queue[0][2]
+                    elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
+                    remaining_ms = max(
+                        0, self._dynamic_batch_delay_s * 1000.0 - elapsed_ms
+                    )
+                    if remaining_ms > 0 and self.receiver is not None:
+                        self._poller.poll(timeout=remaining_ms)
+                    elif remaining_ms > 0:
+                        time.sleep(remaining_ms / 1000.0)
                 continue
 
             reqs = [item[1] for item in items]
