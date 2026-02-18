@@ -123,13 +123,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
 
-        # SWA hybrid model support.
-        self._swa_allocator: Optional[SWATokenToKVPoolAllocator] = (
-            model_runner.token_to_kv_pool_allocator
-            if isinstance(
-                model_runner.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-            )
-            else None
+        # Sliding Window Attention(SWA) hybrid model support.
+        # For hybrid SWA models, the KV cache is split into two pools (full and SWA)
+        # with separate index spaces. We maintain a translated page_table for SWA
+        # layers so the trtllm kernel reads from the correct pool.
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.use_sliding_window_kv_pool = isinstance(
+            allocator, SWATokenToKVPoolAllocator
+        )
+        self._swa_kv_pool: Optional[SWAKVPool] = (
+            allocator.get_kvcache() if self.use_sliding_window_kv_pool else None
         )
 
         # Forward metadata
@@ -139,10 +142,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """Translate full-pool token indices to SWA-pool indices, or return None."""
-        if self._swa_allocator is None:
+        if not self.use_sliding_window_kv_pool:
             return None
         shape = token_indices.shape
-        return self._swa_allocator.translate_loc_from_full_to_swa(
+        return self._swa_kv_pool.translate_loc_from_full_to_swa(
             token_indices.reshape(-1)
         ).reshape(shape)
 
@@ -150,11 +153,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
         """Allocate a SWA page_table buffer, or return None for non-SWA models."""
-        if self._swa_allocator is None:
+        if not self.use_sliding_window_kv_pool:
             return None
-        return torch.zeros(
-            max_bs, max_num_pages, dtype=torch.int32, device=self.device
-        )
+        return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
     def _copy_swa_page_table(
         self,
@@ -181,10 +182,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Return the correct page_table for the given layer (SWA or full)."""
         swa_pt = self.forward_metadata.swa_page_table
-        if swa_pt is not None and isinstance(
-            forward_batch.token_to_kv_pool, SWAKVPool
-        ):
-            _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[layer.layer_id]
+        if swa_pt is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
                 return swa_pt
         return self.forward_metadata.page_table
@@ -227,9 +226,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.decode_cuda_graph_metadata[
-                "swa_page_table_draft_decode"
-            ] = self._alloc_swa_page_table(max_bs, max_num_pages)
+            self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
+                self._alloc_swa_page_table(max_bs, max_num_pages)
+            )
 
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -318,8 +317,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "page_table_draft_decode"
                 ][:bs, :]
                 self._bind_swa_page_table(
-                    metadata, self.decode_cuda_graph_metadata,
-                    "swa_page_table_draft_decode", bs,
+                    metadata,
+                    self.decode_cuda_graph_metadata,
+                    "swa_page_table_draft_decode",
+                    bs,
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
@@ -342,7 +343,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     :bs, :
                 ]
                 self._bind_swa_page_table(
-                    metadata, self.decode_cuda_graph_metadata, "swa_page_table", bs,
+                    metadata,
+                    self.decode_cuda_graph_metadata,
+                    "swa_page_table",
+                    bs,
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
@@ -374,7 +378,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
-                metadata, self.target_verify_metadata, "swa_page_table", bs,
+                metadata,
+                self.target_verify_metadata,
+                "swa_page_table",
+                bs,
             )
 
             self.target_verify_metadata[bs] = metadata
@@ -401,7 +408,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
             self._bind_swa_page_table(
-                metadata, self.draft_extend_metadata, "swa_page_table", bs,
+                metadata,
+                self.draft_extend_metadata,
+                "swa_page_table",
+                bs,
             )
 
             self.draft_extend_metadata[bs] = metadata
