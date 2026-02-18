@@ -6,7 +6,7 @@ Usage:
     # launch a server and benchmark on it
 
     # T2V or T2I or any other multimodal generation model
-    sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -38,6 +38,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Patch size used for computing area units (e.g. in latent diffusion models).
+PATCH_SIZE = 16
+PATCH_AREA = PATCH_SIZE * PATCH_SIZE
 
 
 def is_dir_not_empty(path):
@@ -347,30 +351,32 @@ class RandomDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
+def _compute_scale_factor(req: RequestFuncInput, args) -> Optional[float]:
+    """Computes the composite scale factor (area × frames × steps) for a request."""
+    width = req.width or args.width
+    height = req.height or args.height
+    if None in (width, height):
+        return None
+    frames = req.num_frames or args.num_frames
+    steps = req.num_inference_steps or args.num_inference_steps
+
+    frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
+    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
+
+    area_units = max((float(width) * float(height)) / float(PATCH_AREA), 1.0)
+    return area_units * float(frame_scale) * float(step_scale)
+
+
 def _compute_expected_latency_ms_from_base(
     req: RequestFuncInput, args, base_time_ms: Optional[float]
 ) -> Optional[float]:
     """Scales latency linearly by pixel area, frame count, and inference steps."""
     if base_time_ms is None:
         return None
-
-    width = req.width if req.width is not None else args.width
-    height = req.height if req.height is not None else args.height
-    if width is None or height is None:
+    scale = _compute_scale_factor(req, args)
+    if scale is None:
         return None
-
-    frames = req.num_frames if req.num_frames is not None else args.num_frames
-    steps = (
-        req.num_inference_steps
-        if req.num_inference_steps is not None
-        else args.num_inference_steps
-    )
-
-    frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
-    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
-
-    area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
-    return float(base_time_ms) * area_units * frame_scale * step_scale
+    return float(base_time_ms) * scale
 
 
 def _infer_slo_base_time_ms_from_warmups(
@@ -380,29 +386,18 @@ def _infer_slo_base_time_ms_from_warmups(
     candidates_ms: List[float] = []
     for req, out in warmup_pairs:
         if not out.success or out.latency <= 0:
+            logger.warning(
+                "Skipping warmup result: success=%s, latency=%.3f",
+                out.success,
+                out.latency,
+            )
             continue
 
-        width = req.width if req.width is not None else args.width
-        height = req.height if req.height is not None else args.height
-        if width is None or height is None:
+        scale = _compute_scale_factor(req, args)
+        if scale is None or scale <= 0:
             continue
 
-        frames = req.num_frames if req.num_frames is not None else args.num_frames
-        steps = (
-            req.num_inference_steps
-            if req.num_inference_steps is not None
-            else args.num_inference_steps
-        )
-
-        frame_scale = int(frames) if isinstance(frames, int) and frames > 0 else 1
-        step_scale = int(steps) if isinstance(steps, int) and steps > 0 else 1
-
-        area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
-        denom = area_units * float(frame_scale) * float(step_scale)
-        if denom <= 0:
-            continue
-
-        candidates_ms.append((out.latency * 1000.0) / denom)
+        candidates_ms.append((out.latency * 1000.0) / scale)
 
     return float(np.median(candidates_ms)) if candidates_ms else None
 
