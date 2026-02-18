@@ -2113,19 +2113,24 @@ class ServerArgs:
             )
 
         if is_cpu():
-            if (
-                cpu_has_amx_support()
-                and self.moe_runner_backend != "amx"
-                and self.moe_runner_backend != "torch_native"
-            ):
-                self.moe_runner_backend = "amx"
-                logger.warning(
-                    "CPU-only execution is enabled and amx is supported, setting moe_runner_backend to amx"
-                )
-            elif self.moe_runner_backend != "torch_native":
+            has_amx = cpu_has_amx_support()
+            # If user did not specify a CPU backend, choose the best one.
+            if self.moe_runner_backend not in ["amx", "torch_native"]:
+                if has_amx:
+                    self.moe_runner_backend = "amx"
+                    logger.warning(
+                        "CPU-only execution is enabled and amx is supported, setting moe_runner_backend to amx"
+                    )
+                else:
+                    self.moe_runner_backend = "torch_native"
+                    logger.warning(
+                        "CPU-only execution is enabled and amx is not supported, setting moe_runner_backend to torch_native"
+                    )
+            # If user specified "amx" but it's not supported, fallback.
+            elif self.moe_runner_backend == "amx" and not has_amx:
                 self.moe_runner_backend = "torch_native"
                 logger.warning(
-                    "CPU-only execution is enabled and amx is not supported, setting moe_runner_backend to torch_native"
+                    "AMX MoE backend is not supported on this CPU, falling back to torch_native."
                 )
 
         if self.quantization == "mxfp8":
