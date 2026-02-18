@@ -60,7 +60,26 @@ class ParallelExecutor(PipelineExecutor):
         """
         Execute all pipeline stages respecting their declared parallelism type.
         """
+        # if server_args.enable_cfg_parallel:
+        #     rank = get_classifier_free_guidance_rank()
+        # else:
+        #     rank = (
+        #         torch.distributed.get_rank()
+        #         if torch.distributed.is_initialized()
+        #         else 0
+        #     )
         rank = get_classifier_free_guidance_rank()
+        cfg_rank = get_classifier_free_guidance_rank()
+        world_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        logger.info(
+            "parallel_executor rank: enable_cfg_parallel=%s cfg_rank=%s world_rank=%s rank_used=%s",
+            server_args.enable_cfg_parallel,
+            cfg_rank,
+            world_rank,
+            rank,
+        )
         cfg_group = get_cfg_group()
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
