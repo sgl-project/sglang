@@ -284,7 +284,9 @@ class ZImageTransformerBlock(nn.Module):
         )
 
         hidden_dim = int(dim / 3 * 8)
-        nunchaku_enabled = isinstance(quant_config, NunchakuConfig) and is_nunchaku_available()
+        nunchaku_enabled = (
+            isinstance(quant_config, NunchakuConfig) and is_nunchaku_available()
+        )
         if nunchaku_enabled:
             logger.info("ZImage block %s: using NunchakuFeedForward", prefix)
             import diffusers
@@ -302,6 +304,11 @@ class ZImageTransformerBlock(nn.Module):
                 "act_unsigned": quant_config.act_unsigned,
             }
             self.feed_forward = NunchakuFeedForward(ff, **nunchaku_kwargs)
+            # NunchakuFeedForward overrides net[2].act_unsigned=True for int4 (GELU-specific
+            # optimization for non-negative activations). Z-Image uses SwiGLU whose output
+            # can be negative, so we must restore the original act_unsigned value.
+            if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
+                self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
         else:
             self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
