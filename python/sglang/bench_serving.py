@@ -1617,8 +1617,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=input_lens[i],
-                    output_len=output_lens[i],
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
                 )
             )
     else:
@@ -1636,8 +1636,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=input_lens[i],
-                    output_len=output_lens[i],
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
                 )
             )
 
@@ -1960,7 +1960,7 @@ def sample_generated_shared_prefix_requests(
 
     # Generate system prompts for each group
     system_prompts = [
-        gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
+        gen_prompt(tokenizer, int(system_prompt_lens[i])) for i in range(num_groups)
     ]
 
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
