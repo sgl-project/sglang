@@ -555,8 +555,6 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        # Track memory relocation version for HiCache - graphs captured at version 0
-        self.captured_memory_version: int = 0
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
@@ -750,11 +748,6 @@ class CudaGraphRunner:
         # Check if hierarchical cache loading is inactive
         is_hicache_loading_inactive = forward_batch.hicache_consumer_index < 0
 
-        # Check if HiCache has relocated memory since graphs were captured
-        is_memory_version_ok = (
-            forward_batch.hicache_memory_version == self.captured_memory_version
-        )
-
         # Compute final result
         can_run = (
             is_bs_supported
@@ -763,7 +756,6 @@ class CudaGraphRunner:
             and capture_hidden_mode_matches
             and is_ngram_supported
             and is_hicache_loading_inactive
-            and is_memory_version_ok
         )
 
         return can_run

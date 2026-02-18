@@ -136,9 +136,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         seq_lens_cpu = cuda_graph_buffers["seq_lens_cpu"]
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
-        # Track memory relocation version for HiCache - graphs captured at version 0
-        self.captured_memory_version: int = 0
-
         if self.enable_torch_compile:
             set_torch_compile_config()
 
@@ -254,9 +251,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
     def can_run(self, forward_batch: ForwardBatch):
         # Disable CUDA graph when hierarchical cache loading is active
         if forward_batch.hicache_consumer_index >= 0:
-            return False
-        # Disable if memory relocation version changed
-        if forward_batch.hicache_memory_version != self.captured_memory_version:
             return False
 
         if self.require_mlp_tp_gather:

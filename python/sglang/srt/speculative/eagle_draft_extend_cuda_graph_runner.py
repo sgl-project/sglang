@@ -107,9 +107,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
-        # Track memory relocation version for HiCache - graphs captured at version 0
-        self.captured_memory_version: int = 0
-
         if self.enable_torch_compile:
             set_torch_compile_config()
 
@@ -231,11 +228,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Disable CUDA graph when hierarchical cache loading is active
         is_loading_inactive = forward_batch.hicache_consumer_index < 0
 
-        # Disable when HiCache has relocated memory since graphs were captured
-        is_memory_version_ok = (
-            forward_batch.hicache_memory_version == self.captured_memory_version
-        )
-
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -255,7 +247,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        can_run = is_bs_supported and is_loading_inactive and is_memory_version_ok
+        can_run = is_bs_supported and is_loading_inactive
 
         return can_run
 

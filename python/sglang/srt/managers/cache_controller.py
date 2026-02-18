@@ -729,9 +729,6 @@ class HiCacheController:
 
         # Memory relocated from host to device - increment relocation version
         self.memory_relocation_version += 1
-        logger.info(
-            f"[HiCache] Load: memory_relocation_version={self.memory_relocation_version}"
-        )
 
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
@@ -816,9 +813,6 @@ class HiCacheController:
         self.mem_pool_device_allocator.free(device_indices)
         # Memory relocated from device to host - increment relocation version
         self.memory_relocation_version += 1
-        logger.info(
-            f"[HiCache] Device eviction: memory_relocation_version={self.memory_relocation_version}"
-        )
         return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:

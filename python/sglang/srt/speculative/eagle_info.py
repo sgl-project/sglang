@@ -279,16 +279,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ),
             )
 
-        # Log verify entry with state
-        last_loc_min = self.last_loc.min().item() if hasattr(self, 'last_loc') and self.last_loc is not None and self.last_loc.numel() > 0 else 'N/A'
-        last_loc_max = self.last_loc.max().item() if hasattr(self, 'last_loc') and self.last_loc is not None and self.last_loc.numel() > 0 else 'N/A'
-        logger.info(
-            f"[EAGLE verify] entry: bs={batch.batch_size()}, "
-            f"out_cache_loc_range=[{batch.out_cache_loc.min().item()}, {batch.out_cache_loc.max().item()}], "
-            f"last_loc_range=[{last_loc_min}, {last_loc_max}], "
-            f"hicache_ver={batch.tree_cache.get_memory_relocation_version()}"
-        )
-
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
@@ -501,15 +491,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
-            to_free = batch.out_cache_loc[evict_mask]
-            logger.info(
-                f"[EAGLE verify] freeing slots (page_size=1): "
-                f"count={to_free.numel()}, "
-                f"range=[{to_free.min().item() if to_free.numel() > 0 else 'N/A'}, "
-                f"{to_free.max().item() if to_free.numel() > 0 else 'N/A'}], "
-                f"hicache_ver={batch.tree_cache.get_memory_relocation_version()}"
-            )
-            token_to_kv_pool_allocator.free(to_free)
+            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -520,15 +502,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )
-                to_free = batch.out_cache_loc[evict_mask]
-                logger.info(
-                    f"[EAGLE verify] freeing slots (topk=1): "
-                    f"count={to_free.numel()}, "
-                    f"range=[{to_free.min().item() if to_free.numel() > 0 else 'N/A'}, "
-                    f"{to_free.max().item() if to_free.numel() > 0 else 'N/A'}], "
-                    f"hicache_ver={batch.tree_cache.get_memory_relocation_version()}"
-                )
-                token_to_kv_pool_allocator.free(to_free)
+                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
@@ -567,13 +541,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
                 # Free the kv cache
-                logger.info(
-                    f"[EAGLE verify] freeing slots (paged): "
-                    f"count={to_free_slots.numel()}, "
-                    f"range=[{to_free_slots.min().item() if to_free_slots.numel() > 0 else 'N/A'}, "
-                    f"{to_free_slots.max().item() if to_free_slots.numel() > 0 else 'N/A'}], "
-                    f"hicache_ver={batch.tree_cache.get_memory_relocation_version()}"
-                )
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache

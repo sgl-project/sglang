@@ -194,8 +194,6 @@ class PiecewiseCudaGraphRunner:
         )
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        # Track memory relocation version for HiCache - graphs captured at version 0
-        self.captured_memory_version: int = 0
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -425,9 +423,7 @@ class PiecewiseCudaGraphRunner:
         # Disable CUDA graph when hierarchical cache loading is active
         if forward_batch.hicache_consumer_index >= 0:
             return False
-        # Disable when HiCache has relocated memory since graphs were captured
-        if forward_batch.hicache_memory_version != self.captured_memory_version:
-            return False
+
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
