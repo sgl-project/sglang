@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import shutil
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +48,9 @@ def list_safetensors(path: str = "") -> list[str]:
     return runai_list_safetensors(path)
 
 
-def is_runai_obj_uri(model_or_path: str) -> bool:
-    return model_or_path.lower().startswith(tuple(SUPPORTED_SCHEMES))
+def is_runai_obj_uri(model_or_path: str | Path) -> bool:
+    # Cast to str to handle pathlib.Path inputs which lack string methods (like .lower)
+    return str(model_or_path).lower().startswith(tuple(SUPPORTED_SCHEMES))
 
 
 class ObjectStorageModel:
