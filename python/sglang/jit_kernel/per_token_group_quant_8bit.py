@@ -9,10 +9,7 @@ from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_OUTPUT_DTYPE_MAP = {
-    torch.float8_e4m3fn: "fp8_e4m3_t",
-    torch.int8: "int8_t",
-}
+from sglang.jit_kernel.utils import CPP_DTYPE_MAP as OUTPUT_DTYPE_MAP
 
 
 @cache_once
@@ -20,7 +17,7 @@ def _jit_per_token_group_quant_8bit_module(
     dtype: torch.dtype, output_type: torch.dtype
 ) -> Module:
     input_args = make_cpp_args(dtype)
-    out_cpp = _OUTPUT_DTYPE_MAP[output_type]
+    out_cpp = OUTPUT_DTYPE_MAP[output_type]
     return load_jit(
         "per_token_group_quant_8bit",
         cuda_files=["gemm/per_token_group_quant_8bit.cuh"],
