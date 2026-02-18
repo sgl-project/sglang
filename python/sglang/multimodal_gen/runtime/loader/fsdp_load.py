@@ -94,7 +94,7 @@ def maybe_load_fsdp_model(
 
     with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
         model = model_cls(**init_params)
-
+        # print(f"{model.named_parameters().items()=}")
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
 
@@ -238,7 +238,10 @@ def load_model_from_full_model_state_dict(
     """
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
-    sharded_sd = {}
+
+    # print(f"{full_sd_iterator=}")
+
+    # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
@@ -250,7 +253,10 @@ def load_model_from_full_model_state_dict(
     # sort parameter names to ensure all ranks process parameters in the same order
     sorted_param_names = sorted(custom_param_sd.keys())
 
-    requires_grad = False
+    sharded_sd = {}
+
+    print(f"{sorted_param_names=}")
+    # print(f"{param_dict=}")
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
@@ -323,8 +329,23 @@ def load_model_from_full_model_state_dict(
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
-    # parameters in nn.Module that doesn't exist in safetensor files
-    unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
+
+    # diagnostic: show weight loading statistics
+    loaded_from_ckpt = set(sharded_sd.keys())
+    all_model_keys = set(meta_sd.keys())
+    unused_keys = all_model_keys - loaded_from_ckpt
+    ckpt_keys_not_in_model = set(custom_param_sd.keys()) - all_model_keys
+    logger.info(
+        "Weight loading stats: model_params=%d, loaded_from_ckpt=%d, "
+        "model_only=%d, ckpt_only=%d",
+        len(all_model_keys), len(loaded_from_ckpt),
+        len(unused_keys), len(ckpt_keys_not_in_model),
+    )
+    if ckpt_keys_not_in_model:
+        logger.warning(
+            "Checkpoint keys not found in model (skipped): %s",
+            sorted(ckpt_keys_not_in_model)[:20],
+        )
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 

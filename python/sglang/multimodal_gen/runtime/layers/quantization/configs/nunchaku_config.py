@@ -20,12 +20,20 @@ SVDQ_W4A4_LAYER_PATTERNS = [
     "attn.to_qkv",
     "attn.to_out",
     "attn.add_qkv_proj",
+    "attn.to_added_qkv",
     "attn.to_add_out",
     "img_mlp",
     "txt_mlp",
     # ZImage attention layers
     "attention.to_qkv",
     "attention.to_out",
+    # Flux (single block MLP and transformer block out proj)
+    "proj_mlp",
+    "proj_out",
+    "mlp_fc1",
+    "mlp_fc2",
+    "ff.net",
+    "ff_context.net",
 ]
 
 AWQ_W4A16_LAYER_PATTERNS = [

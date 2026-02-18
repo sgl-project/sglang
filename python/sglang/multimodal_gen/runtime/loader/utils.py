@@ -31,7 +31,7 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def get_param_names_mapping(
-    mapping_dict: dict[str, str],
+    mapping_dict: dict[str, str | tuple[str, int, int]],
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
@@ -44,21 +44,40 @@ def get_param_names_mapping(
     """
 
     def mapping_fn(name: str) -> tuple[str, Any, Any]:
-        # Try to match and transform the name using the regex patterns in mapping_dict
-        for pattern, replacement in mapping_dict.items():
-            match = re.match(pattern, name)
-            if match:
-                merge_index = None
-                total_split_params = None
-                if isinstance(replacement, tuple):
-                    merge_index = replacement[1]
-                    total_split_params = replacement[2]
-                    replacement = replacement[0]
-                name = re.sub(pattern, replacement, name)
-                return name, merge_index, total_split_params
+        # support chained conversions, e.g.:
+        # transformer.xxx.lora_down -> xxx.lora_down -> xxx.proj_down
+        merge_index = None
+        total_split_params = None
+        max_steps = max(8, len(mapping_dict) * 2)
 
-        # If no pattern matches, return the original name
-        return name, None, None
+        for _ in range(max_steps):
+            transformed = False
+            for pattern, replacement in mapping_dict.items():
+                if re.match(pattern, name) is None:
+                    continue
+
+                curr_merge_index = None
+                curr_total_split_params = None
+                if isinstance(replacement, tuple):
+                    curr_merge_index = replacement[1]
+                    curr_total_split_params = replacement[2]
+                    replacement = replacement[0]
+
+                new_name = re.sub(pattern, replacement, name)
+
+                if curr_merge_index is not None:
+                    merge_index = curr_merge_index
+                    total_split_params = curr_total_split_params
+
+                if new_name != name:
+                    name = new_name
+                    transformed = True
+                    break
+
+            if not transformed:
+                break
+
+        return name, merge_index, total_split_params
 
     return mapping_fn
 

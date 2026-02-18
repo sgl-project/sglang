@@ -94,7 +94,7 @@ class TransformerLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
-
+        # print(f"{nunchaku_config=}")
         if nunchaku_config is not None:
             # respect dtype from checkpoint
             # TODO: improve the condition
@@ -132,6 +132,7 @@ class TransformerLoader(ComponentLoader):
             and "quant_config" in inspect.signature(model_cls.__init__).parameters
         ):
             init_params["quant_config"] = nunchaku_config
+            # print(f"{init_params=}")
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
@@ -158,7 +159,7 @@ class TransformerLoader(ComponentLoader):
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
-        if next(model.parameters()).dtype != param_dtype:
+        if next(model.parameters()).dtype != param_dtype and param_dtype:
             logger.warning(
                 f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
             )
