@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A4Int4DynamicMoEMethod,
     NPUW4A8Int8DynamicMoEMethod,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
