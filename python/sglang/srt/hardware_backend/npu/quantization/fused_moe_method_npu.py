@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
-
 def npu_fused_experts_w4a4(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -24,7 +23,7 @@ def npu_fused_experts_w4a4(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
-):  
+):
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
     scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
@@ -49,7 +48,9 @@ def npu_fused_experts_w4a4(
     )
     expert_tokens = expert_tokens.to(torch.int64)
     # gmm1: gate_up_proj
-    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states, dst_type=torch.quint4x2)
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
+        hidden_states, dst_type=torch.quint4x2
+    )
     scale_args13 = {
         "scale": [w13_scale],
         "per_token_scale": [pertoken_scale],
@@ -238,14 +239,16 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w13_weight.data = self._pack_to_int32(layer.w13_weight.data.to(torch.int32))
-        
+        layer.w13_weight.data = self._pack_to_int32(
+            layer.w13_weight.data.to(torch.int32)
+        )
+
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
 
         scale_np = layer.w13_weight_scale.data.cpu().numpy()
         scale_np.dtype = np.uint32
         scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-        
+
         layer.w13_weight_scale = torch.nn.Parameter(
             scale_uint64_tensor.squeeze(-1), requires_grad=False
         )
@@ -264,18 +267,16 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
-            
+
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 8 int4 to int32, we use a int32 to represent a int4
         assert (
             weight.shape[-1] % 8 == 0
         ), "the last dim of weight needs to be divided by 8"
-        new_weight = torch.ops.npu.npu_convert_weight_to_int4pack(
-            weight.flatten(0, 1)
-        )
+        new_weight = torch.ops.npu.npu_convert_weight_to_int4pack(weight.flatten(0, 1))
         new_weight = new_weight.view(weight.shape[0], weight.shape[1], -1)
         return new_weight
-    
+
     def apply(
         self,
         layer,
