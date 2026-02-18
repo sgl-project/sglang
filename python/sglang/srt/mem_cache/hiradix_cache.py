@@ -1072,21 +1072,11 @@ class HiRadixCache(RadixCache):
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
-        pinned_count = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
-            if self._is_pinned(node):
-                pinned_count += 1
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
-
-        if pinned_count > 0:
-            logger.debug(
-                f"[PIN] load_back: loaded {len(nodes_to_load)} nodes "
-                f"({len(device_indices)} tokens) back to GPU, "
-                f"{pinned_count} are pinned"
-            )
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
