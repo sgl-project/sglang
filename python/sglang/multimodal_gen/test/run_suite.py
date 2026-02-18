@@ -38,6 +38,15 @@ SUITES = {
     ],
 }
 
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ]
+}
+
+SUITES.update(suites_ascend)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run multimodal_gen test suite")

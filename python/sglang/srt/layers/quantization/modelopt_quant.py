@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 fp4_quantize = None
 try:
@@ -304,6 +305,22 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
+        # Map excluded module patterns from HF layout to sglang layout.
+        # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
+        # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
+        if self.exclude_modules:
+            mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
+            expanded: List[str] = []
+            for name in mapped:
+                expanded.append(name)
+                if name.startswith("language_model."):
+                    expanded.append(name.removeprefix("language_model."))
+            # Preserve order, drop duplicates.
+            self.exclude_modules = list(dict.fromkeys(expanded))
+
 
 class ModelOptFp8Config(ModelOptQuantConfig):
     """Configuration for ModelOpt FP8 quantization, including serialization and compatibility checks."""
@@ -444,6 +461,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         input_size_per_partition: int,
         output_partition_sizes: List[int],
+        input_size: Optional[int],
+        output_size: Optional[int],
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:

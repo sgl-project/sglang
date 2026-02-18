@@ -29,6 +29,7 @@ The typical workflow is:
 If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
+
 import contextlib
 import datetime
 import os
@@ -71,7 +72,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: dict[str, torch.Tensor | Any]
+    tensor_dict: dict[str, torch.Tensor | Any],
 ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -248,7 +249,11 @@ def init_distributed_environment(
         # For MPS and MUSA, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
-            if (current_platform.is_mps() or current_platform.is_musa())
+            if (
+                current_platform.is_mps()
+                or current_platform.is_musa()
+                or current_platform.is_npu()
+            )
             else dict(device_id=device_id)
         )
 
@@ -618,6 +623,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
+        backend=current_platform.get_torch_distributed_backend_str(),
         timeout=dist_timeout,
     )
     initialize_model_parallel(

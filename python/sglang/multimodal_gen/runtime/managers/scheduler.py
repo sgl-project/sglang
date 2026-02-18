@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
     _parse_size,
     save_image_to_path,
@@ -87,6 +88,7 @@ class Scheduler:
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ShutdownReq: self._handle_shutdown,
         }
 
         # FIFO, new reqs are appended
@@ -122,6 +124,10 @@ class Scheduler:
 
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
+
+    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        self._running = False
+        return OutputBatch()
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
@@ -192,7 +198,6 @@ class Scheduler:
                         prompt="",
                         negative_prompt="",
                         image_path=[input_path],
-                        is_warmup=True,
                     )
                 else:
                     req = Req(
@@ -200,8 +205,8 @@ class Scheduler:
                         width=width,
                         height=height,
                         prompt="",
-                        is_warmup=True,
                     )
+                req.set_as_warmup()
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -236,9 +241,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
@@ -381,10 +390,9 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
-        self.context.term()
+        self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""

@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     add_common_data_to_response,
+    adjust_output_quality,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -90,6 +91,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_magcache"] = request.enable_magcache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.output_compression is not None:
+        sampling_kwargs["output_compression"] = request.output_compression
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
@@ -176,6 +179,8 @@ async def create_video(
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     enable_magcache: Optional[bool] = Form(False),
+    output_quality: Optional[str] = Form("default"),
+    output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -236,6 +241,8 @@ async def create_video(
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
             enable_magcache=enable_magcache,
+            output_compression=output_compression,
+            output_quality=output_quality,
             **(
                 {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
             ),
@@ -297,6 +304,10 @@ async def create_video(
         server_args=server_args,
         sampling_params=sampling_params,
     )
+    if batch.output_compression is None:
+        batch.output_compression = adjust_output_quality(
+            req.output_quality, batch.data_type
+        )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs

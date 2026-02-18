@@ -11,6 +11,10 @@ on:
       tag_name:
         type: string
         required: false
+      pr_number:
+        description: "PR number to build from (e.g. 12345)"
+        type: string
+        required: false
 
 concurrency:
   group: release-sglang-kernels-${{ github.ref }}
@@ -34,6 +38,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -46,7 +51,8 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
-          USE_CCACHE: 0
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
 
       - name: Upload to PyPI
         working-directory: sgl-kernel
@@ -65,6 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -127,6 +135,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -139,7 +148,8 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
-          USE_CCACHE: 0
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -152,6 +162,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -207,6 +219,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -231,6 +244,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
