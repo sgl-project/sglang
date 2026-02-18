@@ -77,8 +77,8 @@ class MoeRunner:
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
     ) -> CombineInput:
 
-        # if self.fused_func is not None:
-        #     return self.fused_func(dispatch_output, quant_info, self.config)
+        if self.fused_func is not None:
+            return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
         dispatch_format = dispatch_output.format.value
