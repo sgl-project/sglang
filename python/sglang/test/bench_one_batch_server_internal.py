@@ -455,6 +455,7 @@ def run_one_case(
     gsp_output_len: int = BenchArgs.gsp_output_len,
 ):
     if backend == "vllm":
+        # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         response = requests.post(
             url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT
         )
