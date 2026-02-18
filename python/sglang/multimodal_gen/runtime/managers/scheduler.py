@@ -113,10 +113,7 @@ class Scheduler:
         self._dynamic_batch_delay_s = max(
             0.0, server_args.dynamic_batch_delay_ms / 1000.0
         )
-        # Track queue size across iterations for adaptive dispatch
         self._prev_queue_len = 0
-
-        # ZMQ poller for efficient waiting (only on rank 0 which has receiver)
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -256,12 +253,10 @@ class Scheduler:
         return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
     def _get_cached_signature(self, req: Req) -> str | None:
-        """Return cached signature for a request, computing it once."""
         cached = getattr(req, "_dynamic_batch_sig", None)
         if cached is not None:
             return cached
         sig = self._build_dynamic_batch_signature(req)
-        # Cache on the request object to avoid recomputing each poll cycle.
         req._dynamic_batch_sig = sig  # type: ignore[attr-defined]
         return sig
 
@@ -398,15 +393,7 @@ class Scheduler:
         return self._dynamic_batch_max_size > 1
 
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
-        """Pull one request or one dynamic batch from waiting_queue.
-
-        Non-contiguous batching: skips incompatible requests in the queue to
-        find more compatible ones, avoiding head-of-line blocking.
-
-        Adaptive dispatch: dispatches immediately when the queue has stopped
-        growing (no new requests arrived since last check), or when the delay
-        has expired, or when the batch is full.
-        """
+        """Pull one request or one dynamic batch from waiting_queue."""
         if not self.waiting_queue:
             return None
 
@@ -425,8 +412,6 @@ class Scheduler:
             identity, req, _ = self.waiting_queue.popleft()
             return [(identity, req)]
 
-        # Non-contiguous scan: collect indices of all compatible requests in
-        # the queue (up to max_size), skipping incompatible ones.
         compatible_indices: list[int] = [0]
         for idx in range(1, len(self.waiting_queue)):
             if len(compatible_indices) >= self._dynamic_batch_max_size:
@@ -441,12 +426,6 @@ class Scheduler:
         if batch_len <= 0:
             return None
 
-        # Adaptive dispatch: decide whether to wait for more requests.
-        # Do NOT wait if:
-        #  - batch is already full
-        #  - delay has expired
-        #  - queue hasn't grown since last poll (no new requests arriving)
-        #  - we've scanned the entire queue and found all compatible requests
         oldest_wait_s = time.monotonic() - enqueue_time
         queue_stopped_growing = len(self.waiting_queue) <= self._prev_queue_len
         scanned_entire_queue = compatible_indices[-1] == len(self.waiting_queue) - 1
@@ -460,7 +439,6 @@ class Scheduler:
         if should_wait_for_more:
             return None
 
-        # Pop items from back to front so indices stay valid.
         batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
         for pos, idx in enumerate(reversed(compatible_indices)):
             item_identity, item_req, _ = self.waiting_queue[idx]
@@ -604,7 +582,6 @@ class Scheduler:
 
         while self._running:
             # 1: receive requests
-            # Snapshot queue size BEFORE receiving so we can detect growth.
             queue_len_before_recv = len(self.waiting_queue)
             try:
                 new_reqs = self.recv_reqs()
@@ -638,8 +615,6 @@ class Scheduler:
             items = self.get_next_batch_to_run()
             if not items:
                 if self.waiting_queue and self._dynamic_batch_delay_s > 0:
-                    # Use ZMQ poller to wait precisely: wake immediately when
-                    # a new request arrives, or after the remaining delay.
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(
