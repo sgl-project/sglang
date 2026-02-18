@@ -21,6 +21,7 @@ If you only need to use the distributed environment without model/pipeline
  parallelism, you can skip the model parallel initialization and destruction
  steps.
 """
+
 import contextlib
 import gc
 import logging
@@ -79,7 +80,7 @@ class P2PWork:
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
