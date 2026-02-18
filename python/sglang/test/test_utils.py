@@ -37,7 +37,9 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_cuda,
     is_port_available,
+    is_xpu,
     kill_process_tree,
     retry,
 )
@@ -126,6 +128,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -852,7 +855,9 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        env = env.copy()
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -1662,6 +1667,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1689,6 +1695,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output
@@ -1997,6 +2004,56 @@ async def send_concurrent_generate_requests_with_custom_params(
     return await asyncio.gather(*tasks)
 
 
+def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
+    """Spawn ``world_size`` processes, initialise torch.distributed in each,
+    run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
+    """
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    port = find_available_port(29500)
+
+    processes = []
+    for rank in range(world_size):
+        p = ctx.Process(
+            target=_distributed_worker,
+            args=(rank, world_size, backend, port, func, result_queue, kwargs),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    errors = [result_queue.get() for _ in range(world_size)]
+    errors = [e for e in errors if e]
+    if errors:
+        raise AssertionError("\n".join(errors))
+
+
+def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwargs):
+    import traceback
+
+    import torch.distributed as dist
+
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        func(rank, **kwargs)
+        result_queue.put(None)
+    except Exception as e:
+        result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
+    finally:
+        dist.destroy_process_group()
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
@@ -2238,6 +2295,44 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def get_gpu_count():
+    if get_device() == "cpu":
+        gpu_count = 0
+    else:
+        gpu_count = torch.accelerator.device_count()
+    return gpu_count
+
+
+def empty_gpu_cache():
+    """
+    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
+    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    """
+    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
+        return torch.accelerator.empty_cache()
+
+    # CUDA
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+
+    # XPU (Intel)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        return
+
+    return
+
+
+def get_gpu_memory_gb():
+    if is_cuda():
+        return torch.cuda.device_memory_used() / 1024**3
+    elif is_xpu():
+        return torch.xpu.memory_allocated() / 1024**3
+    else:
+        return 0
 
 
 def run_doctests(obj: Callable[..., Any] | ModuleType):

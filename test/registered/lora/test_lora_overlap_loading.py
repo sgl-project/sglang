@@ -11,104 +11,153 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""
-End-to-end tests for the --enable-lora-overlap-loading server argument.
-"""
 
 import multiprocessing as mp
 import unittest
+from typing import cast
+from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from torch.cuda import Event as CudaEvent
+from torch.cuda import Stream as CudaStream
+
+from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
-    TEST_MULTIPLE_BATCH_PROMPTS,
-    TORCH_DTYPES,
-    LoRAModelCase,
-    ensure_reproducibility,
+    run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase, calculate_rouge_l
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(
-    est_time=300,
-    suite="stage-b-test-small-1-gpu",
-    disabled="Flaky test - outputs differ between overlap/no-overlap loading modes. See https://github.com/sgl-project/sglang/actions/runs/21320657015/job/61370002606",
-)
+register_cuda_ci(est_time=75, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=75, suite="stage-b-test-small-1-gpu-amd")
 
 
-class TestLoRAPipelineLoading(CustomTestCase):
-
-    def _run_mixed_batch_test(
-        self,
-        model_case: LoRAModelCase,
-        torch_dtype,
-    ):
-        base_path = model_case.base
-        adaptor_paths = [a.name for a in model_case.adaptors]
-        print(
-            f"\n========== Testing mixed batch LoRA overlap loading on base '{base_path}' "
-            f"with dtype={torch_dtype} ==========\n"
-        )
-        ensure_reproducibility()
-        max_new_tokens = 32
-
-        prompts = TEST_MULTIPLE_BATCH_PROMPTS[:3]
-        configs = [
-            [None, adaptor_paths[0], adaptor_paths[1]],
-            [adaptor_paths[0], None, adaptor_paths[1]],
-            [adaptor_paths[0], adaptor_paths[1], None],
-            [adaptor_paths[1], adaptor_paths[0], adaptor_paths[1]],
-        ]
-        common_args = dict(
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            tp_size=model_case.tp_size,
-            lora_paths=adaptor_paths,
-            max_loras_per_batch=model_case.max_loras_per_batch,
-            max_loaded_loras=model_case.max_loaded_loras,
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            mem_fraction_static=0.65,
-            sleep_on_idle=True,
+class TestLoRAOverlapLoading(CustomTestCase):
+    def test_ci_lora_models_batch_splitting(self):
+        run_lora_batch_splitting_equivalence_test(
+            CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
         )
 
-        results_no_overlap_loading = []
-        with SRTRunner(
-            base_path, enable_lora_overlap_loading=False, **common_args
-        ) as runner:
-            for lora_paths in configs:
-                results_no_overlap_loading.append(
-                    runner.batch_forward(
-                        prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
-                    ).output_strs
-                )
 
-        results_overlap_loading = []
-        with SRTRunner(
-            base_path, enable_lora_overlap_loading=True, **common_args
-        ) as runner:
-            for lora_paths in configs:
-                results_overlap_loading.append(
-                    runner.batch_forward(
-                        prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
-                    ).output_strs
-                )
+class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
-        for i, (res_no_overlap_loading, res_overlap_loading) in enumerate(
-            zip(results_no_overlap_loading, results_overlap_loading)
-        ):
-            scores = calculate_rouge_l(res_overlap_loading, res_no_overlap_loading)
-            for j, score in enumerate(scores):
-                assert score >= model_case.rouge_l_tolerance, (
-                    f"Batch {i} prompt {j} mismatch: {score}\n"
-                    f"Overlap loading: {res_overlap_loading[j]}\n"
-                    f"No overlap loading: {res_no_overlap_loading[j]}"
-                )
+    mock_lora_manager: MagicMock
+    mock_stream: MagicMock
+    mock_stream_context: MagicMock
+    mock_device_module: MagicMock
+    mock_torch: MagicMock
 
-    def test_mixed_batch(self):
-        for model_case in CI_MULTI_LORA_MODELS:
-            for dtype in TORCH_DTYPES:
-                self._run_mixed_batch_test(model_case, dtype)
+    def setUp(self):
+        self.torch_patcher = patch("sglang.srt.lora.lora_overlap_loader.torch")
+        self.mock_torch = self.torch_patcher.start()
+
+        self.mock_device_module = MagicMock()
+        self.mock_stream = MagicMock(spec=CudaStream)
+        self.mock_stream_context = MagicMock()
+        self.mock_event = MagicMock(spec=CudaEvent)
+
+        self.mock_device_module.Stream.return_value = self.mock_stream
+        self.mock_device_module.stream.return_value = self.mock_stream_context
+        self.mock_device_module.Event.return_value = self.mock_event
+        self.mock_torch.get_device_module.return_value = self.mock_device_module
+        self.mock_torch.cuda.current_stream.return_value = MagicMock(spec=CudaStream)
+
+        self.mock_lora_manager = MagicMock(spec=LoRAManager)
+        self.mock_lora_manager.device = "cuda:0"
+        self.mock_lora_manager.validate_lora_batch.return_value = True
+
+    def tearDown(self):
+        self.torch_patcher.stop()
+
+    def _create_loader(self) -> LoRAOverlapLoader:
+        return LoRAOverlapLoader(cast(LoRAManager, self.mock_lora_manager))
+
+    def _create_mock_event(self, query_return: bool = False) -> MagicMock:
+        event = MagicMock(spec=CudaEvent)
+        event.query.return_value = query_return
+        return event
+
+    def test_full_lifecycle_single_lora_load(self):
+        loader = self._create_loader()
+
+        # Initially not loaded
+        status = loader._check_overlap_load_status("lora_A")
+        self.assertEqual(status, LoRAOverlapLoadStatus.NOT_LOADED)
+
+        # First call starts async load, returns False
+        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
+        self.assertFalse(result)
+        self.assertIn("lora_A", loader.lora_to_overlap_load_event)
+        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
+            {"lora_A"}, set()
+        )
+
+        # Simulate load still in progress - returns False, event persists
+        loader.lora_to_overlap_load_event["lora_A"].query.return_value = False
+        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
+        self.assertFalse(result)
+        self.assertEqual(
+            loader._check_overlap_load_status("lora_A"), LoRAOverlapLoadStatus.LOADING
+        )
+
+        # Simulate load complete - returns True, event removed
+        loader.lora_to_overlap_load_event["lora_A"].query.return_value = True
+        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
+        self.assertTrue(result)
+        self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
+
+    def test_capacity_constraints_block_new_loads(self):
+        loader = self._create_loader()
+
+        events = [self._create_mock_event() for _ in range(4)]
+        self.mock_device_module.Event.side_effect = events
+
+        # Load 3 loras successfully
+        for i in range(3):
+            self.assertTrue(
+                loader._try_start_overlap_load(f"lora_{i}", running_loras=set())
+            )
+        self.assertEqual(len(loader.lora_to_overlap_load_event), 3)
+
+        # Capacity full - new load blocked
+        self.mock_lora_manager.validate_lora_batch.return_value = False
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        result = loader.try_overlap_load_lora("lora_3", running_loras=set())
+        self.assertFalse(result)
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        self.assertNotIn("lora_3", loader.lora_to_overlap_load_event)
+
+        # First lora completes, freeing capacity
+        loader.lora_to_overlap_load_event["lora_0"].query.return_value = True
+
+        self.assertEqual(
+            loader._check_overlap_load_status("lora_0"), LoRAOverlapLoadStatus.LOADED
+        )
+
+        # Now new load succeeds
+        self.mock_lora_manager.validate_lora_batch.return_value = True
+        self.assertTrue(loader._try_start_overlap_load("lora_3", running_loras=set()))
+
+    def test_validation_includes_pending_and_running_loras(self):
+        loader = self._create_loader()
+
+        events = [self._create_mock_event() for _ in range(5)]
+        self.mock_device_module.Event.side_effect = events
+
+        # Start pending loads
+        loader._try_start_overlap_load("pending_1", running_loras=set())
+        loader._try_start_overlap_load("pending_2", running_loras=set())
+
+        # Load new lora with running_loras
+        self.mock_lora_manager.validate_lora_batch.reset_mock()
+        running = {"running_1", "running_2"}
+        loader.try_overlap_load_lora("new_lora", running_loras=running)
+
+        # Validation should include: pending + running + new
+        call_args = self.mock_lora_manager.validate_lora_batch.call_args[0][0]
+        expected = {"pending_1", "pending_2", "running_1", "running_2", "new_lora"}
+        self.assertEqual(call_args, expected)
 
 
 if __name__ == "__main__":

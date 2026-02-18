@@ -45,6 +45,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sglang.srt.configs import (
     AfmoeConfig,
+    BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -52,8 +53,10 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
@@ -61,7 +64,10 @@ from sglang.srt.configs import (
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Step3p5Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -73,6 +79,7 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
+    BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
@@ -86,13 +93,18 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     KimiLinearConfig,
     Qwen3NextConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     DotsVLMConfig,
     DotsOCRConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     DeepseekVLV2Config,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
+    Step3p5Config,
 ]
 
 _CONFIG_REGISTRY = {
@@ -228,11 +240,13 @@ def _load_mistral_large_3_for_causal_LM(
 def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
     # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
-    return (
-        getattr(config, "auto_map", None) is not None
-        and config.auto_map.get("AutoModel")
-        == "modeling_deepseekocr.DeepseekOCRForCausalLM"
-    )
+    auto_map = getattr(config, "auto_map", None) or {}
+    return auto_map.get("AutoModel") == "modeling_deepseekocr.DeepseekOCRForCausalLM"
+
+
+def _is_deepseek_ocr2_model(config: PretrainedConfig) -> bool:
+    auto_map = getattr(config, "auto_map", None) or {}
+    return auto_map.get("AutoModel") == "modeling_deepseekocr2.DeepseekOCR2ForCausalLM"
 
 
 def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
@@ -244,6 +258,30 @@ def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
         logger.warning(
             f"Overriding deepseek-ocr's v_head_dim from 0 to {V_HEAD_DIM_PATCH} to avoid potential issues."
         )
+
+
+def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> None:
+    text_config = getattr(config, "text_config", None)
+    language_config = getattr(config, "language_config", None)
+    target = text_config or language_config
+    if target is None:
+        return
+    if getattr(target, "v_head_dim", None) == 0:
+        setattr(target, "v_head_dim", patch)
+        logger.warning(
+            f"Overriding v_head_dim from 0 to {patch} to avoid potential issues."
+        )
+
+
+def _ensure_llama_flash_attention2_compat() -> None:
+    """Ensure LlamaFlashAttention2 symbol exists for remote code compatibility."""
+    try:
+        from transformers.models.llama import modeling_llama
+    except Exception:
+        return
+    if not hasattr(modeling_llama, "LlamaFlashAttention2"):
+        if hasattr(modeling_llama, "LlamaAttention"):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
 
 
 @lru_cache_frozenset(maxsize=32)
@@ -272,6 +310,7 @@ def get_config(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
     else:
+        _ensure_llama_flash_attention2_compat()
         try:
             config = AutoConfig.from_pretrained(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
@@ -306,20 +345,38 @@ def get_config(
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
-        for key, val in text_config.__dict__.items():
-            if not hasattr(config, key) and getattr(text_config, key, None) is not None:
+        items = (
+            text_config.items()
+            if hasattr(text_config, "items")
+            else vars(text_config).items()
+        )
+        for key, val in items:
+            if not hasattr(config, key) and val is not None:
                 setattr(config, key, val)
 
-    if config.model_type in _CONFIG_REGISTRY:
+    if _is_deepseek_ocr2_model(config):
+        _override_v_head_dim_if_zero(config)
+        # Temporary hack for load deepseek-ocr2
+        config.model_type = "deepseek-ocr"
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+        config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
+        _override_v_head_dim_if_zero(config)
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+        setattr(config, "_name_or_path", model)
+    elif config.model_type in _CONFIG_REGISTRY:
         model_type = config.model_type
         if model_type == "deepseek_vl_v2":
-            if _is_deepseek_ocr_model(config):
+            if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
 
         if _is_deepseek_ocr_model(config):
             _override_deepseek_ocr_v_head_dim(config)
+            config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+        elif _is_deepseek_ocr2_model(config):
+            _override_v_head_dim_if_zero(config)
+            config.update({"architectures": ["DeepseekOCRForCausalLM"]})
 
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
@@ -534,6 +591,7 @@ def get_processor(
             **kwargs,
         )
     else:
+        _ensure_llama_flash_attention2_compat()
         config = AutoConfig.from_pretrained(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
@@ -543,6 +601,12 @@ def get_processor(
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+    elif _is_deepseek_ocr2_model(config):
+        # Temporary hack for load deepseek-ocr2
+        config.model_type = "deepseek-ocr"
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
+        _override_v_head_dim_if_zero(config)
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:

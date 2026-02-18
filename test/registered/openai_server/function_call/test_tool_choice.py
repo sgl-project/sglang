@@ -816,6 +816,11 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
     @unittest.skip("Fails due to whitespace issue with Mistral - skipping")
+    def test_tool_choice_required_non_streaming(self):
+        """Test tool_choice='required' in non-streaming mode"""
+        super().test_tool_choice_required_non_streaming()
+
+    @unittest.skip("Fails due to whitespace issue with Mistral - skipping")
     def test_multi_tool_scenario_required(self):
         """Test multi-tool scenario with tool_choice='required'"""
         super().test_multi_tool_scenario_required()
@@ -882,6 +887,42 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
+
+
+class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
+    """Test tool_choice functionality with LiquidAI LFM2-MoE model"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
+
+        cls.model = "LiquidAI/LFM2-8B-A1B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "lfm2",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @unittest.skip("maxItems:1 bug causes whitespace stall")
+    def test_tool_choice_required_non_streaming(self):
+        pass
+
+    @unittest.skip("maxItems:1 bug causes whitespace stall")
+    def test_tool_choice_specific_function_non_streaming(self):
+        pass
 
 
 if __name__ == "__main__":

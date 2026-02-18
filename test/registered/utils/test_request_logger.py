@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -20,10 +21,14 @@ register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
+TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
+TEST_CUSTOM_HEADER_VALUE = "test-header-value-67890"
 
 
 class BaseTestRequestLogger:
     log_requests_format = None
+    env_vars: dict[str, str] = {}  # Env vars to set before server launch
+    request_headers: dict[str, str] = {"X-SMG-Routing-Key": TEST_ROUTING_KEY}
 
     @classmethod
     def setUpClass(cls):
@@ -42,6 +47,12 @@ class BaseTestRequestLogger:
             "stdout",
             cls.temp_dir,
         ]
+        # Set env vars and save old values for restoration
+        cls._old_env_vars = {}
+        for key, value in cls.env_vars.items():
+            cls._old_env_vars[key] = os.environ.get(key)
+            os.environ[key] = value
+
         cls.process = popen_launch_server(
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
@@ -56,6 +67,12 @@ class BaseTestRequestLogger:
         cls.stdout.close()
         cls.stderr.close()
         cls._temp_dir_obj.cleanup()
+        # Restore env vars
+        for key, old_value in cls._old_env_vars.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
     def _verify_logs(self, content: str, source_name: str):
         raise NotImplementedError
@@ -67,7 +84,7 @@ class BaseTestRequestLogger:
                 "text": "Hello",
                 "sampling_params": {"max_new_tokens": 8, "temperature": 0},
             },
-            headers={"X-SMG-Routing-Key": TEST_ROUTING_KEY},
+            headers=self.request_headers,
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
@@ -133,6 +150,41 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         )
         self.assertTrue(
             finished_found, f"request.finished event not found in {source_name}"
+        )
+
+
+class TestCustomHeaderViaEnvVar(BaseTestRequestLogger, CustomTestCase):
+    """Test that custom headers can be added via SGLANG_LOG_REQUEST_HEADERS env var."""
+
+    log_requests_format = "text"
+    env_vars = {"SGLANG_LOG_REQUEST_HEADERS": TEST_CUSTOM_HEADER_NAME}
+    request_headers = {
+        "X-SMG-Routing-Key": TEST_ROUTING_KEY,
+        TEST_CUSTOM_HEADER_NAME: TEST_CUSTOM_HEADER_VALUE,
+    }
+
+    def _verify_logs(self, content: str, source_name: str):
+        # Verify custom header is logged
+        self.assertIn(
+            TEST_CUSTOM_HEADER_NAME.lower(),
+            content,
+            f"Custom header name not found in {source_name}",
+        )
+        self.assertIn(
+            TEST_CUSTOM_HEADER_VALUE,
+            content,
+            f"Custom header value not found in {source_name}",
+        )
+        # Verify default header is still logged (env var appends, not replaces)
+        self.assertIn(
+            "x-smg-routing-key",
+            content,
+            f"Default header should still be in whitelist in {source_name}",
+        )
+        self.assertIn(
+            TEST_ROUTING_KEY,
+            content,
+            f"Default header value not found in {source_name}",
         )
 
 

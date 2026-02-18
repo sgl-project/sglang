@@ -20,10 +20,12 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
 import torch
+
+
+from sglang.jit_kernel.utils import cache_once
 
 
 import cuda.bindings.driver as cuda
@@ -51,7 +53,7 @@ from .block_sparsity import (
     get_block_sparse_broadcast_pattern,
 )
 
-@lru_cache(maxsize=None)
+@cache_once
 def _get_device_capability():
     """Cached device capability check."""
     return torch.cuda.get_device_capability()[0]
@@ -1362,6 +1364,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            return_lse=True,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale

@@ -3,10 +3,12 @@
 import os
 import pathlib
 from typing import Tuple
-from functools import partial, lru_cache
+from functools import partial
 from dataclasses import dataclass, fields
 
 import torch
+
+from sglang.jit_kernel.utils import cache_once
 
 try:
     from triton.tools.disasm import extract
@@ -33,12 +35,12 @@ torch2cute_dtype_map = {
 }
 
 
-@lru_cache
+@cache_once
 def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
-@lru_cache
+@cache_once
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
