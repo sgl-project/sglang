@@ -108,6 +108,9 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install uv
+    # Ensure user bin directory is in PATH (pip may install to ~/.local/bin on
+    # non-root runners where system site-packages is not writable)
+    export PATH="$HOME/.local/bin:$PATH"
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
