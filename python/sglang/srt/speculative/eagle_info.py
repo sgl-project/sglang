@@ -774,12 +774,22 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.accept_length is not None:
+                self.accept_length = self.accept_length[: len(new_indices)]
+            if self.accept_length_cpu is not None:
+                self.accept_length_cpu = self.accept_length_cpu[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.accept_length is not None:
+                self.accept_length = self.accept_length[new_indices]
+            if self.accept_length_cpu is not None:
+                self.accept_length_cpu = [
+                    self.accept_length_cpu[i] for i in new_indices.tolist()
+                ]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -796,6 +806,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.accept_length = spec_info.accept_length
+            self.accept_length_cpu = spec_info.accept_length_cpu
             return
         if spec_info.hidden_states is None:
             return
@@ -805,6 +817,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.accept_length is not None and spec_info.accept_length is not None:
+            self.accept_length = torch.cat(
+                [self.accept_length, spec_info.accept_length]
+            )
+            self.accept_length_cpu = (
+                self.accept_length_cpu + spec_info.accept_length_cpu
+            )
+        elif spec_info.accept_length is not None:
+            self.accept_length = spec_info.accept_length
+            self.accept_length_cpu = spec_info.accept_length_cpu
+        elif self.accept_length is not None:
+            # Dimensions would mismatch with merged hidden_states
+            self.accept_length = None
+            self.accept_length_cpu = None
 
 
 @dataclass

@@ -341,6 +341,14 @@ class EAGLEDraftCudaGraphRunner:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
+            # Zero padding slots for safety: stale values from previous runs
+            # could contain out-of-range indices causing illegal memory access.
+            self.topk_p[raw_bs:bs].zero_()
+            self.topk_index[raw_bs:bs].zero_()
+            self.hidden_states[raw_bs:bs].zero_()
+            # Point padding slots to the first real request's pool entry
+            # so that the padding attention reads from a valid KV cache entry.
+            self.req_pool_indices[raw_bs:bs] = forward_batch.req_pool_indices[0]
 
         num_tokens = bs * self.num_tokens_per_bs
 
