@@ -1,10 +1,14 @@
 import itertools
 import os
+from typing import Any, Dict, List
 
 import torch
 import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
+from sglang.jit_kernel.benchmark.utils import (
+    get_benchmark_range,
+)
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
 )
@@ -26,163 +30,134 @@ IS_CI = (
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
+NUM_TESTS = 300 if IS_CI else 30
 
-mode_concentrated = IS_CI or (os.environ.get("SGLANG_BENCH_MODE", "") == "concentrated")
+GROUP_SIZE_RANGE = [128]
+DST_DTYPE_RANGE = [fp8_type_]
 
-if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    configs = [
-        [
-            768 * 8,
-            2048,
-            128,
-            48,
-            fp8_type_,
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                # masked_layout_mode=None,
-                masked_layout_mode="balanced",
-                # masked_layout_mode="extreme",
-            ),
-        ]
-    ]
-elif mode_concentrated:
-    configs = list(
-        itertools.product(
-            [768],
-            [1536, 7168, 16384],
-            [128],
-            [None],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-            ],
-        )
-    ) + list(
-        itertools.product(
-            [768 * 8],
-            [2048],
-            [128],
-            [48],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="balanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="imbalanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="extreme",
-                ),
-            ],
-        )
+# ---- GEMM-like branch (num_ranks=None) ----
+NUM_TOKENS_RANGE_GEMM = get_benchmark_range(
+    full_range=[1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
+    ci_range=[768],
+)
+HIDDEN_DIM_RANGE_GEMM = [1536, 7168, 16384]
+NUM_RANKS_RANGE_GEMM = [None]
+
+
+FLAGS_GEMM_FULL: List[Dict[str, Any]] = [
+    dict(
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+]
+FLAGS_GEMM_CI: List[Dict[str, Any]] = [
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+]
+FLAGS_RANGE_GEMM = get_benchmark_range(
+    full_range=FLAGS_GEMM_FULL, ci_range=FLAGS_GEMM_CI
+)
+
+CONFIGS_GEMM = list(
+    itertools.product(
+        NUM_TOKENS_RANGE_GEMM,
+        HIDDEN_DIM_RANGE_GEMM,
+        GROUP_SIZE_RANGE,
+        NUM_RANKS_RANGE_GEMM,
+        DST_DTYPE_RANGE,
+        FLAGS_RANGE_GEMM,
     )
-else:
-    configs = list(
-        itertools.product(
-            [1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
-            [1536, 7168, 16384],
-            [128],
-            [None],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=False,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=False,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-            ],
-        )
-    ) + list(
-        itertools.product(
-            [1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-            [2048],
-            [128],
-            [8, 16, 32, 48],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="balanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="imbalanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="extreme",
-                ),
-            ],
-        )
+)
+
+# ---- MoE-like / multi-rank branch (hidden_dim=2048, num_ranks in {8,16,32,48}) ----
+NUM_TOKENS_RANGE_MOE = get_benchmark_range(
+    full_range=[1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+    ci_range=[768 * 8],
+)
+HIDDEN_DIM_RANGE_MOE = [2048]
+NUM_RANKS_RANGE_MOE = get_benchmark_range(
+    full_range=[8, 16, 32, 48],
+    ci_range=[48],
+)
+
+FLAGS_MOE: List[Dict[str, Any]] = [
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="balanced",
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="imbalanced",
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="extreme",
+    ),
+]
+FLAGS_RANGE_MOE = get_benchmark_range(full_range=FLAGS_MOE, ci_range=FLAGS_MOE)
+
+CONFIGS_MOE = list(
+    itertools.product(
+        NUM_TOKENS_RANGE_MOE,
+        HIDDEN_DIM_RANGE_MOE,
+        GROUP_SIZE_RANGE,
+        NUM_RANKS_RANGE_MOE,
+        DST_DTYPE_RANGE,
+        FLAGS_RANGE_MOE,
     )
+)
+
+# ---- Final configs ----
+CONFIGS = CONFIGS_GEMM + CONFIGS_MOE
+
+LINE_VALS = ["triton", "sglang"]
+LINE_NAMES = ["Triton (Inaccurate)", "SGL Kernel"]
+STYLES = [("blue", "-"), ("green", "-")]
 
 
 def _flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
@@ -264,12 +239,12 @@ def _make_sglang_bench_fn(
             "dst_dtype",
             "flags",
         ],
-        x_vals=configs,
+        x_vals=CONFIGS,
         line_arg="provider",
-        line_vals=["triton", "sglang"],
+        line_vals=LINE_VALS,
         # Triton has multi kernels and we only report the time for the core one
-        line_names=["Triton (Inaccurate)", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_names=LINE_NAMES,
+        styles=STYLES,
         ylabel="us",
         plot_name="per-token-group-quant-8bit-performance",
         args={},
@@ -307,9 +282,7 @@ def benchmark(
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    time_s = bench_kineto(
-        bench_fn, kernel_names=kernel_names, num_tests=300 if mode_concentrated else 30
-    )
+    time_s = bench_kineto(bench_fn, kernel_names=kernel_names, num_tests=NUM_TESTS)
     return time_s * 1e6
 
 
