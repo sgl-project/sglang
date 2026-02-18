@@ -1721,6 +1721,23 @@ def get_device_sm():
     return 0
 
 
+def _cuda_mem_fallback(reason: str) -> int:
+    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
+
+    Returns the total memory in MiB, or raises RuntimeError if CUDA is
+    unavailable or mem_get_info() fails.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(reason)
+    logger.warning(f"{reason} Falling back to torch.cuda.mem_get_info().")
+    try:
+        return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MiB
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
+        ) from e
+
+
 def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
@@ -1732,7 +1749,9 @@ def get_nvgpu_memory_capacity():
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+            return _cuda_mem_fallback(
+                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
+            )
 
         # Parse the output to extract memory values
         memory_values = [
@@ -1742,20 +1761,17 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # Fallback when nvidia-smi returns no parseable values,
             # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
-                )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
-            raise ValueError("No GPU memory values found.")
+            return _cuda_mem_fallback(
+                "Failed to get GPU memory capacity from nvidia-smi."
+            )
 
         # Return the minimum memory value
         return min(memory_values)
 
     except FileNotFoundError:
-        raise RuntimeError(
+        return _cuda_mem_fallback(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
 
