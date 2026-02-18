@@ -511,7 +511,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            # Validate LoRA configuration
             await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
@@ -2216,7 +2215,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
-        """Validate that LoRA is enabled when a LoRA adapter is requested."""
         if not obj.lora_path:
             return
 
