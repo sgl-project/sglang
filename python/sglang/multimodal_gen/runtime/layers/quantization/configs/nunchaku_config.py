@@ -23,6 +23,9 @@ SVDQ_W4A4_LAYER_PATTERNS = [
     "attn.to_add_out",
     "img_mlp",
     "txt_mlp",
+    # ZImage attention layers
+    "attention.to_qkv",
+    "attention.to_out",
 ]
 
 AWQ_W4A16_LAYER_PATTERNS = [
