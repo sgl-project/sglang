@@ -236,6 +236,7 @@ class Engine(EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -274,6 +275,7 @@ class Engine(EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -325,6 +327,7 @@ class Engine(EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -364,6 +367,7 @@ class Engine(EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
