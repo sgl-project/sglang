@@ -274,7 +274,7 @@ class TestDumperFileWriteControl:
             allow_sglang=True,
             SGLANG_DUMPER_ENABLE="1",
             SGLANG_DUMPER_DIR=str(tmp_path),
-            SGLANG_DUMPER_WRITE_FILE="0",
+            SGLANG_DUMPER_OUTPUT_FILE="0",
         ):
             run_distributed_test(self._test_write_disabled_func, tmpdir=str(tmp_path))
 
@@ -305,6 +305,32 @@ class TestDumperFileWriteControl:
 
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
+
+
+class TestOutputConsoleControl:
+    def test_console_enabled_by_default(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path)
+        d.dump("console_on", torch.randn(3, 3))
+
+        captured = capsys.readouterr()
+        assert "[Dumper.Value]" in captured.out
+        assert "console_on" in captured.out
+
+    def test_console_disabled(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path, enable_output_console=False)
+        d.dump("console_off", torch.randn(3, 3))
+
+        captured = capsys.readouterr()
+        assert "console_off" not in captured.out
+        _assert_files(_get_filenames(tmp_path), exist=["console_off"])
+
+    def test_console_only_no_file(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path, enable_output_file=False)
+        d.dump("console_only", torch.randn(3, 3))
+
+        captured = capsys.readouterr()
+        assert "console_only" in captured.out
+        assert len(_get_filenames(tmp_path)) == 0
 
 
 class TestDumpDictFormat:

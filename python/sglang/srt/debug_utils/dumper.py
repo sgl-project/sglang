@@ -49,7 +49,8 @@ class _Dumper:
         enable: bool,
         base_dir: Path,
         filter: Optional[str] = None,
-        enable_write_file: bool = True,
+        enable_output_file: bool = True,
+        enable_output_console: bool = True,
         enable_value: bool = True,
         enable_grad: bool = False,
         enable_model_value: bool = True,
@@ -64,7 +65,8 @@ class _Dumper:
         # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
         self._filter = filter
         self._base_dir = base_dir
-        self._enable_write_file = enable_write_file
+        self._enable_output_file = enable_output_file
+        self._enable_output_console = enable_output_console
         self._enable_value = enable_value
         self._enable_grad = enable_grad
         self._enable_model_value = enable_model_value
@@ -86,7 +88,8 @@ class _Dumper:
             enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
             base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
             filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            enable_write_file=get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1"),
+            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
+            enable_output_console=get_bool_env_var("SGLANG_DUMPER_OUTPUT_CONSOLE", "1"),
             enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
             enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
             enable_model_value=get_bool_env_var(
@@ -294,17 +297,18 @@ class _Dumper:
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
-        print(
-            f"[{tag}] [{rank}, {time.time()}] {path} "
-            f"type={type(value)} "
-            f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
-            f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
-            f"device={value.device if isinstance(value, torch.Tensor) else None} "
-            f"id={id(value)} "
-            f"sample_value={get_truncated_value(value)}"
-        )
+        if self._enable_output_console:
+            print(
+                f"[{tag}] [{rank}, {time.time()}] {path} "
+                f"type={type(value)} "
+                f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
+                f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
+                f"device={value.device if isinstance(value, torch.Tensor) else None} "
+                f"id={id(value)} "
+                f"sample_value={get_truncated_value(value)}"
+            )
 
-        if self._enable_write_file and save:
+        if self._enable_output_file and save:
             if self._pending_cleanup:
                 self._pending_cleanup = False
                 _cleanup_old_dumps(self._base_dir)
