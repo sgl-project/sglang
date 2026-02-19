@@ -439,7 +439,6 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    """exception types for CUDA/general OOM (torch.OutOfMemoryError exists only in some PyTorch builds)."""
     types = [torch.cuda.OutOfMemoryError, torch.OutOfMemoryError]
     return tuple(types)
 
