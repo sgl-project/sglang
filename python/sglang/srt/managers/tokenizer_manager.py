@@ -1195,11 +1195,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
-                    generators.append(
-                        self._wait_one_response(
-                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
-                        )
-                    )
+                    state = self.rid_to_state[tmp_obj.rid]
+                    state.obj = tmp_obj
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -1212,6 +1210,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         state = self.rid_to_state[tmp_obj.rid]
+                        state.obj = tmp_obj
                         self._send_one_request(tokenized_obj)
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
