@@ -934,7 +934,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
-        should_skip_forward = False # always compute for calibration
+        # should_skip_forward = False # always compute for calibration
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
@@ -957,7 +957,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
                 do_cfg = forward_batch.do_classifier_free_guidance
 
-                self.calibrate(hidden_states, original_hidden_states, current_timestep, do_cfg, self.is_cfg_negative)
+                # self.calibrate(hidden_states, original_hidden_states, current_timestep, do_cfg, self.is_cfg_negative)
                 self.maybe_cache_states(hidden_states, original_hidden_states)
 
         self.cnt += 1
@@ -1050,6 +1050,14 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
                 ret_steps = teacache_params.ret_steps
 
+                # Log params once at the start of each generation
+                if self.cnt == 0 and not self.is_cfg_negative:
+                    ic(teacache_params.teacache_thresh)
+                    ic(teacache_params.use_ret_steps)
+                    ic(teacache_params.ret_steps_coeffs)
+                    ic(teacache_params.non_ret_steps_coeffs)
+                    ic(ret_steps, cutoff_steps)
+
                 # Adjust ret_steps and cutoff_steps for non-CFG mode
                 if not ctx.do_cfg:
                     ret_steps = ret_steps // 2
@@ -1071,7 +1079,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     coefficients=ctx.coefficients,
                     teacache_thresh=ctx.teacache_thresh,
                 )
-                ic(should_calc)
+                ic(self.cnt, is_boundary_step, should_calc)
 
                 return not should_calc
 

@@ -249,7 +249,7 @@ class ServerArgs:
     # Cache acceleration
     enable_teacache: bool = False
     enable_magcache: bool = False
-    teacache_params: TeaCacheParams | WanTeaCacheParams = field(default_factory=TeaCacheParams)
+    teacache_params: TeaCacheParams | WanTeaCacheParams = field(default_factory=WanTeaCacheParams)
     magcache_params: MagCacheParams | WanMagCacheParams = field(default_factory=WanMagCacheParams) # todo: make MagCacheParams and automatically turn into WanMagCacheParams when needed
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers

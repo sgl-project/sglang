@@ -85,6 +85,11 @@ class MagCacheMixin:
         self.accumulated_error: float = 0.0
         self.consecutive_skips: int = 0
 
+        # save calibrated magnitude ratios
+        timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.calibration_path = f"cache/magcache_calibration_{timestamp}.jsonl"
+        os.makedirs(os.path.dirname(self.calibration_path), exist_ok=True)
+
         # CFG negative branch (only if supported)
         self._supports_cfg_cache = self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
         if self._supports_cfg_cache:
@@ -149,9 +154,11 @@ class MagCacheMixin:
     def calibrate(self, hidden_states, original_hidden_states, current_timestep, do_cfg, is_cfg_negative=False):
         cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
 
-        # todo: can we refactor to make simpler?
         prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
-        if prev_residual is None: # don't have a cached residual to compare to, so skip on first step
+        if prev_residual is None:
+            # Step 0 has no previous residual to compare against — write placeholder 1.0
+            with open(self.calibration_path, "a") as f:
+                f.write(json.dumps({"cnt": cnt, "mag_ratio": 1.0, "mag_std": 0.0, "cos_dis": 0.0, "negative": is_cfg_negative}) + "\n")
             return None
 
         curr_residual = hidden_states.squeeze(0) - original_hidden_states
@@ -159,5 +166,5 @@ class MagCacheMixin:
         mag_std = (curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).std().item()
         cos_dis = (1-F.cosine_similarity(curr_residual, prev_residual, dim=-1, eps=1e-8)).mean().item()
 
-        with open(f"magcache_calibration{'_neg' if is_cfg_negative else ''}.jsonl", "a") as f:
-            f.write(json.dumps({"cnt": cnt, "norm_ratio": mag_ratio, "norm_std": mag_std, "cos_dis": cos_dis}) + "\n")
+        with open(self.calibration_path, "a") as f:
+            f.write(json.dumps({"cnt": cnt, "mag_ratio": mag_ratio, "mag_std": mag_std, "cos_dis": cos_dis, "negative": is_cfg_negative}) + "\n")

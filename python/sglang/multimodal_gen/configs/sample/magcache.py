@@ -48,40 +48,11 @@ def get_interpolated_mag_ratios(sample_steps:int, raw_ratios=T2V_13B_MAG_RATIOS)
     return raw_ratios
 
 
-def load_calibrated_mag_ratios(
-    model_name: str, num_steps: int, do_cfg: bool = True
-) -> torch.Tensor | None:
-    """
-    Load calibrated magnitude ratios from cache directory.
-
-    Args:
-        model_name: Model identifier (e.g., "wan", "flux").
-        num_steps: Number of inference steps.
-        do_cfg: Whether CFG is enabled.
-
-    Returns:
-        Tensor of magnitude ratios, or None if not found.
-    """
-    cache_root = os.path.expanduser("~/.cache/sgl_diffusion")
-    calibration_dir = os.path.join(cache_root, "magcache_calibrations")
-
-    cfg_suffix = "_cfg" if do_cfg else "_nocfg"
-    filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
-    filepath = os.path.join(calibration_dir, filename)
-
-    if not os.path.exists(filepath):
-        return None
-
-    try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        mag_ratios = torch.tensor(data["mag_ratios"])
-        print(f"✓ Loaded calibrated MagCache ratios from: {filename}")
-        return mag_ratios
-    except Exception as e:
-        print(f"⚠ Failed to load calibration from {filepath}: {e}")
-        return None
-
+def load_mag_ratios(jsonl_path: str) -> torch.Tensor:
+    """Read calibration JSONL and return a 1D tensor of mag ratios indexed by cnt."""
+    records = [json.loads(l) for l in open(jsonl_path) if l.strip()]
+    records.sort(key=lambda r: r["cnt"])
+    return torch.tensor([r["mag_ratio"] for r in records])
 
 
 @dataclass
@@ -119,7 +90,9 @@ class WanMagCacheParams(MagCacheParams):
     the cache directory. If not found, it falls back to the default interpolated
     ratios from T2V_13B_MAG_RATIOS.
     """
-    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, T2V_13B_MAG_RATIOS) # hardcoded for now
+    # mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, T2V_13B_MAG_RATIOS) # hardcoded for now
+    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, load_mag_ratios("cache/magcache_calibration_20260219_212415.jsonl")) # hardcoded for now
+    ic(mag_ratios)
 
     @property
     def ret_steps(self) -> int:
