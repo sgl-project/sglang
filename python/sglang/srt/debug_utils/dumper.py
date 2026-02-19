@@ -34,7 +34,7 @@ class _Dumper:
     `SGLANG_DUMPER_ENABLE=1 python ...`
 
     Auto-cleanup old dumps before first write:
-    `SGLANG_DUMPER_CLEANUP=1 python ...`
+    `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
 
     Alternatively, disable at startup and enable via HTTP:
     1. `python ...`
@@ -56,7 +56,7 @@ class _Dumper:
         enable_model_grad: bool = True,
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
-        cleanup: bool = False,
+        cleanup_previous: bool = False,
     ):
         # Config
         self._enable = enable
@@ -76,7 +76,7 @@ class _Dumper:
         self._global_ctx = {}
         self._override_enable = None
         self._http_server_handled = not enable_http_server
-        self._pending_cleanup = cleanup
+        self._pending_cleanup = cleanup_previous
 
     @classmethod
     def from_env(cls) -> "_Dumper":
@@ -95,7 +95,7 @@ class _Dumper:
             enable_http_server=get_bool_env_var(
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
             ),
-            cleanup=get_bool_env_var("SGLANG_DUMPER_CLEANUP", "0"),
+            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
         )
 
     def on_forward_pass_start(self):
