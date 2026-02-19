@@ -8,6 +8,15 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.environ import envs
 
+if current_platform.is_npu():
+    import torch_npu
+
+    patches = [
+        ["profiler.profile", torch_npu.profiler.profile],
+        ["profiler.schedule", torch_npu.profiler.schedule],
+    ]
+    torch_npu._apply_patches(patches)
+
 logger = init_logger(__name__)
 
 
@@ -55,19 +64,27 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        torch_activities = self._resolve_activities(activities)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if current_platform.is_cuda_alike():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if current_platform.is_npu():
+            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
         common_torch_profiler_args = dict(
-            activities=torch_activities,
+            activities=activities,
             record_shapes=self.record_shapes,
             with_stack=self.with_stack,
-            on_trace_ready=None,
+            on_trace_ready=(
+                None
+                if not current_platform.is_npu()
+                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+            ),
         )
 
         logger.info(
             f"Profiler config: output_dir={self.log_dir}, "
             f"with_stack={self.with_stack}, record_shapes={self.record_shapes}, "
-            f"activities={[a.name for a in torch_activities]}"
+            f"activities={[a.name for a in activities]}"
         )
         if self.full_profile:
             # profile all stages
@@ -171,6 +188,9 @@ class SGLDiffusionProfiler:
         logger.info("Stopping Profiler...")
         if current_platform.is_cuda_alike():
             torch.cuda.synchronize()
+        if current_platform.is_npu():
+            torch.npu.synchronize()
+            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
         self.profiler.stop()
 
         if export_trace:
