@@ -396,16 +396,7 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-1-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -493,7 +484,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 70
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -525,16 +516,7 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-2-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
