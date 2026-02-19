@@ -57,6 +57,7 @@ class _Dumper:
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
         cleanup_previous: bool = False,
+        collective_timeout: int = 60,
     ):
         # Config
         self._enable = enable
@@ -68,6 +69,7 @@ class _Dumper:
         self._enable_grad = enable_grad
         self._enable_model_value = enable_model_value
         self._enable_model_grad = enable_model_grad
+        self._collective_timeout = collective_timeout
 
         # States
         self._partial_name = partial_name
@@ -96,6 +98,7 @@ class _Dumper:
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
             ),
             cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
+            collective_timeout=60,
         )
 
     def on_forward_pass_start(self):
@@ -119,11 +122,11 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self)
+        _start_maybe_http_server(self, timeout_seconds=self._collective_timeout)
 
     def _ensure_partial_name(self):
         if self._partial_name is None:
-            self._partial_name = _get_partial_name()
+            self._partial_name = _get_partial_name(timeout_seconds=self._collective_timeout)
             print(f"[Dumper] Choose partial_name={self._partial_name}")
 
     def set_ctx(self, **kwargs):
@@ -331,11 +334,37 @@ def _torch_save(value, path: str):
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
-def _get_partial_name():
+def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
+    completed = threading.Event()
+
+    def watchdog():
+        if not completed.wait(timeout=timeout_seconds):
+            print(
+                f"\n[Dumper] WARNING: '{operation_name}' has not completed after "
+                f"{timeout_seconds}s. This usually means not all ranks are "
+                f"participating in this collective operation.\n",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=watchdog, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        completed.set()
+
+
+def _get_partial_name(timeout_seconds: int = 60):
     rank = _get_rank()
     object_list = [str(time.time()) if rank == 0 else None]
+
     if dist.is_initialized():
-        dist.broadcast_object_list(object_list, device="cuda")
+        _collective_with_timeout(
+            lambda: dist.broadcast_object_list(object_list, device="cuda"),
+            operation_name="broadcast_object_list in _get_partial_name",
+            timeout_seconds=timeout_seconds,
+        )
+
     return object_list[0]
 
 
@@ -494,14 +523,16 @@ def _collect_megatron_parallel_info():
 # -------------------------------------- http control server ------------------------------------------
 
 
-def _start_maybe_http_server(dumper):
+def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
     if http_port <= 0:
         return
 
     local_handler = _DumperRpcHandler(dumper)
-    rpc_handles = _create_zmq_rpc_handles(local_handler, base_port=zmq_base_port)
+    rpc_handles = _create_zmq_rpc_handles(
+        local_handler, base_port=zmq_base_port, timeout_seconds=timeout_seconds
+    )
 
     if _get_rank() == 0:
         handler_class = _make_dumper_http_handler(rpc_handles=rpc_handles)
@@ -549,7 +580,9 @@ class _DumperRpcHandler:
 # -------------------------------------- zmq rpc ------------------------------------------
 
 
-def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHandle"]]:
+def _create_zmq_rpc_handles(
+    handler, base_port: int, timeout_seconds: int = 60
+) -> Optional[List["_ZmqRpcHandle"]]:
     import zmq
 
     rank = _get_rank()
@@ -578,7 +611,11 @@ def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHa
 
     if dist.is_initialized():
         all_addresses = [None] * world_size
-        dist.all_gather_object(all_addresses, local_addr)
+        _collective_with_timeout(
+            lambda: dist.all_gather_object(all_addresses, local_addr),
+            operation_name="all_gather_object in _create_zmq_rpc_handles",
+            timeout_seconds=timeout_seconds,
+        )
     else:
         all_addresses = [local_addr]
     print(f"[Dumper.ZmqRpc] rank={rank} all_addresses={all_addresses}")
