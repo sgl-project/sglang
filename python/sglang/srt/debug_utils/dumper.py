@@ -4,6 +4,7 @@ import re
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -79,6 +80,7 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx = {}
         self._override_enable = None
+        self._captured_output_data: Optional[dict] = None
         self._http_server_handled = not enable_http_server
         self._pending_cleanup = cleanup_previous
 
@@ -146,6 +148,15 @@ class _Dumper:
         self._global_ctx = {
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
+
+    @contextmanager
+    def capture_output(self):
+        assert self._captured_output_data is None
+        self._captured_output_data = {}
+        try:
+            yield self._captured_output_data
+        finally:
+            self._captured_output_data = None
 
     def override_enable(self, value: bool):
         self._override_enable = value
@@ -308,17 +319,23 @@ class _Dumper:
                 f"sample_value={get_truncated_value(value)}"
             )
 
-        if self._enable_output_file and save:
-            if self._pending_cleanup:
-                self._pending_cleanup = False
-                _cleanup_old_dumps(self._base_dir)
-
-            path.parent.mkdir(parents=True, exist_ok=True)
+        capturing = self._captured_output_data is not None
+        if save and (self._enable_output_file or capturing):
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
                 "meta": dict(**full_kwargs, **self._static_meta),
             }
-            _torch_save(output_data, str(path))
+
+            if capturing:
+                output_data["value"] = _deepcopy_or_clone(output_data["value"])
+                self._captured_output_data[name] = output_data
+            else:
+                if self._pending_cleanup:
+                    self._pending_cleanup = False
+                    _cleanup_old_dumps(self._base_dir)
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _torch_save(output_data, str(path))
 
     @cached_property
     def _static_meta(self) -> dict:
@@ -422,6 +439,12 @@ def _materialize_value(value):
     if callable(value):
         value = value()
     return value
+
+
+def _deepcopy_or_clone(x):
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    return deepcopy(x)
 
 
 # -------------------------------------- static meta ------------------------------------------

@@ -317,6 +317,48 @@ class TestOutputControl:
         assert "console_off" not in capsys.readouterr().out
         _assert_files(_get_filenames(tmp_path), exist=["console_off"])
 
+    def test_capture_output_basic(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 4)
+
+        with d.capture_output() as captured:
+            d.dump("cap_basic", tensor)
+
+        assert "cap_basic" in captured
+        assert set(captured["cap_basic"].keys()) == {"value", "meta"}
+        assert torch.equal(captured["cap_basic"]["value"], tensor)
+        assert captured["cap_basic"]["meta"]["name"] == "cap_basic"
+
+    def test_capture_output_no_file(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+
+        with d.capture_output() as captured:
+            d.dump("cap_no_file", torch.randn(3, 3))
+
+        assert "cap_no_file" in captured
+        assert len(_get_filenames(tmp_path)) == 0
+
+    def test_capture_output_multiple(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+
+        with d.capture_output() as captured:
+            d.dump("first", torch.randn(2, 2))
+            d.dump("second", torch.randn(3, 3))
+
+        assert set(captured.keys()) == {"first", "second"}
+        assert captured["first"]["value"].shape == (2, 2)
+        assert captured["second"]["value"].shape == (3, 3)
+
+    def test_capture_output_value_cloned(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.zeros(3, 3)
+
+        with d.capture_output() as captured:
+            d.dump("clone_check", tensor)
+
+        tensor.fill_(999.0)
+        assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
+
 
 class TestDumpDictFormat:
     """Verify that dump files use the dict output format: {"value": ..., "meta": {...}}."""
