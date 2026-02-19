@@ -6,6 +6,7 @@ DEVICE = "cuda"
 DTYPE = torch.bfloat16
 MAX_SEQ_LEN = 131072  # common seq length
 ROPE_BASE = 10000.0
+CACHE_SIZE = 1024 * 128
 
 
 def create_cos_sin_cache(
@@ -99,7 +100,7 @@ DTYPE_LIST = [torch.bfloat16, torch.float16]
 @pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
-def test_rope_v2(
+def test_rope(
     batch_size: int,
     gqa_ratio: int,
     num_kv_heads: int,
@@ -127,7 +128,7 @@ def test_rope_v2(
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_rope_v2_position_dtypes(dtype: torch.dtype) -> None:
+def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
     batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
     is_neox = True
@@ -148,11 +149,28 @@ def test_rope_v2_position_dtypes(dtype: torch.dtype) -> None:
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
-# ---------------------------------------------------------------------------
-# Fused RoPE + KV cache store tests
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("batch_size", BS_LIST)
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_rope_slicing(batch_size: int, is_neox: bool, head_dim: int) -> None:
+    """Ensure both int32 and int64 position tensors work correctly."""
+    num_qo_heads, num_kv_heads, rope_dim = 8, 2, 64
 
-CACHE_SIZE = 1024 * 1024
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    q_fi, k_fi = q.clone(), k.clone()
+    q_jit, k_jit = q.clone(), k.clone()
+    rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
+
+    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+    sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+
+    atol = rtol = 1e-2
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)

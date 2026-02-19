@@ -361,10 +361,15 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
+            q_rope = query.view(batch_size, -1, self.head_size)
+            k_rope = key.view(batch_size, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
-                q=query.view(batch_size, -1, self.head_size),
-                k=key.view(batch_size, -1, self.head_size),
+                q=q_rope,
+                k=k_rope,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
                 fused_args=fused_set_kv_buffer_arg,
