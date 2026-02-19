@@ -1917,9 +1917,7 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-                new_batch, log_stats=False
-            )
+            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1934,9 +1932,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-            ret, need_sync=need_mlp_sync
-        )
+        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
@@ -2095,8 +2091,6 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                self.maybe_release_mamba_cache(req)
-
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -2193,25 +2187,6 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
-
-    def maybe_release_mamba_cache(self, req: Req) -> None:
-        """Release mamba slot if allocated via COW but scheduling failed.
-
-        Without this, the slot remains held by a waiting request, causing
-        check_memory() to detect a "memory leak" and crash the server.
-        The next schedule round will re-allocate safely via match_prefix().
-
-        Note: In disaggregation DECODE mode, mamba state is transferred from PREFILL and
-        is not recoverable if freed, so we do not free it here. To avoid false-positive
-        leak checks in this situation, self_check_during_idle skips memory checking when
-        the waiting queue is not empty.
-        """
-        if (
-            req.mamba_pool_idx is not None
-            and self.disaggregation_mode != DisaggregationMode.DECODE
-        ):
-            self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
-            req.mamba_pool_idx = None
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
