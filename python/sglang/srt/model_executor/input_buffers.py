@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from typing import Dict
+import weakref
 
 import torch
 
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
 
-@dataclass
 class ForwardInputBuffers:
 
     def _build_one_buffer(self, name: str, input_buffer: torch.Tensor) -> torch.Tensor:
@@ -28,13 +28,14 @@ class ForwardInputBuffers:
                 input_buffer.device == old_buffer.device
             ), f"Buffer {name} has different device than before."
             if old_buffer.numel() > input_buffer.numel():
-                input_buffer = old_buffer.view(-1)
+                buffer = old_buffer.view(-1)
             else:
-                input_buffer = input_buffer.view(-1)
+                buffer = input_buffer.view(-1)
 
-        _forward_input_buffer_pool[name] = input_buffer
+        _forward_input_buffer_pool[name] = buffer
+        buffer = weakref.proxy(buffer)
         # output_buffer = input_buffer.as_strided(buffer_size, buffer_stride)
-        output_buffer = input_buffer[:buffer_numel].view(buffer_size)
+        output_buffer = buffer[:buffer_numel].view(buffer_size)
 
         assert output_buffer.is_contiguous()
 
