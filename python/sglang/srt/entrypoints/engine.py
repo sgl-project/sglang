@@ -80,7 +80,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
-from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA, PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -107,61 +107,44 @@ _is_cuda = is_cuda()
 
 @dataclasses.dataclass
 class SchedulerInitResult:
-    """Unified result from launching schedulers (mp or Ray mode).
-
-    This abstraction hides the mode-specific details, providing a common interface
-    for both multiprocessing and Ray-based scheduler launching.
-    """
+    """Base result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
 
-    # Ray mode fields
-    _actors: Optional[List[Any]] = None  # List[ray.actor.ActorHandle]
-    _event_loop_refs: Optional[List[Any]] = None  # List[ray.ObjectRef]
+    def wait_for_ready(self) -> None:
+        """Wait for schedulers to be ready. Default: no-op."""
+        pass
 
-    # mp mode fields
+    def wait_for_completion(self) -> None:
+        """Block until all schedulers terminate."""
+        raise NotImplementedError
+
+    def cleanup(self) -> None:
+        """Clean up scheduler resources. Default: no-op."""
+        pass
+
+
+@dataclasses.dataclass
+class MpSchedulerInitResult(SchedulerInitResult):
     _procs: Optional[List[mp.Process]] = None
     _pipe_readers: Optional[List[Connection]] = None
 
     def wait_for_ready(self) -> None:
-        """Wait for schedulers to be ready (mp mode only, no-op for Ray).
-
-        In Ray mode, schedulers are already ready when this object is created
-        (ray.get() was called during launch). In mp mode, we need to wait for
-        pipe messages from the subprocesses.
-        """
         if self._procs is not None and self._pipe_readers is not None:
-            # mp mode: wait for pipe messages
             infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
             self.scheduler_infos.extend(infos)
 
     def wait_for_completion(self) -> None:
-        """Block until all schedulers terminate (used for non-zero rank nodes)."""
-        if self._actors is not None:
-            import ray
-
-            try:
-                ray.get(self._event_loop_refs)
-            except Exception as e:
-                logger.error(f"Ray scheduler actor terminated with error: {e}")
-        elif self._procs is not None:
+        if self._procs is not None:
             for proc in self._procs:
                 proc.join()
                 logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                    f"Scheduler or DataParallelController {proc.pid} "
+                    f"terminated with {proc.exitcode}"
                 )
 
     def cleanup(self) -> None:
-        """Clean up Ray actors."""
-        if self._actors is not None:
-            import ray
-
-            for actor in self._actors:
-                try:
-                    ray.kill(actor)
-                except Exception:
-                    pass
-            self._actors = None
+        pass
 
 
 def init_tokenizer_manager(
@@ -1021,10 +1004,9 @@ def _launch_scheduler_processes(
         For mp mode, call result.wait_for_ready() to populate scheduler_infos.
     """
     if server_args.use_ray:
-        return _launch_scheduler_ray_actors(
-            server_args,
-            port_args,
-        )
+        from sglang.srt.ray.launch import launch_scheduler_ray_actors
+
+        return launch_scheduler_ray_actors(server_args, port_args)
     else:
         return _launch_scheduler_processes_mp(
             server_args, port_args, run_scheduler_process_func
@@ -1070,11 +1052,11 @@ def _launch_scheduler_processes_mp(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-) -> SchedulerInitResult:
+) -> MpSchedulerInitResult:
     """Launch scheduler processes using multiprocessing.
 
     Returns:
-        SchedulerInitResult with _procs and _pipe_readers set.
+        MpSchedulerInitResult with _procs and _pipe_readers set.
         scheduler_infos will be empty; call result.wait_for_ready() to populate it.
     """
     scheduler_procs = []
@@ -1142,140 +1124,10 @@ def _launch_scheduler_processes_mp(
         proc.start()
         scheduler_procs.append(proc)
 
-    return SchedulerInitResult(
+    return MpSchedulerInitResult(
         scheduler_infos=[],
         _procs=scheduler_procs,
         _pipe_readers=scheduler_pipe_readers,
-    )
-
-
-def _get_rank0_node_ip(placement_group) -> str:
-    """Get the IP address of the node where rank 0 will run.
-
-    Uses a probe task to discover the IP of the placement group's first bundle node.
-    This is needed because rank 0 starts the TCPStore server for torch.distributed,
-    so dist_init_addr must be the IP of the node where rank 0 runs, not the driver node.
-    """
-    import ray
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-    @ray.remote(num_cpus=0, num_gpus=0)
-    def get_node_ip():
-        return ray.util.get_node_ip_address()
-
-    return ray.get(
-        get_node_ip.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group,
-                placement_group_bundle_index=0,
-            ),
-        ).remote()
-    )
-
-
-def _launch_scheduler_ray_actors(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-) -> SchedulerInitResult:
-    """Launch scheduler actors using Ray (unified single/multi-node).
-
-    Auto-detects the current placement group via ``ray.util.get_current_placement_group()``.
-    The caller must schedule the enclosing actor/task onto a placement group with one
-    bundle per node, each bundle having ``gpus_per_node`` GPUs.  Multiple SchedulerActors
-    (``num_gpus=1`` each) share a bundle's GPU pool.
-    """
-    import ray
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-    from sglang.srt.managers.scheduler_actor import SchedulerActor
-
-    # TODO(xyuzh): Implement Ray support for dp_size > 1
-    if server_args.dp_size > 1:
-        raise NotImplementedError(
-            "Ray support for dp_size > 1 is not yet implemented. "
-            "Set dp_size=1 or use_ray=False."
-        )
-
-    pg = ray.util.get_current_placement_group()
-    if pg is None:
-        raise RuntimeError(
-            "use_ray=True requires a placement group, but none was detected. "
-            "Schedule the Engine actor onto a placement group with one bundle per node:\n"
-            "  pg = placement_group([{'GPU': gpus_per_node}] * nnodes, strategy='STRICT_PACK')\n"
-            "  ray.get(pg.ready())\n"
-            "  actor = MyActor.options(scheduling_strategy=\n"
-            "      PlacementGroupSchedulingStrategy(placement_group=pg, "
-            "placement_group_bundle_index=0)).remote(...)"
-        )
-
-    world_size = server_args.tp_size * server_args.pp_size
-    nnodes = server_args.nnodes
-    gpus_per_node = world_size // nnodes
-
-    logger.info(
-        f"Ray cluster: {nnodes} nodes, "
-        f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
-    )
-
-    # Discover rank 0's node IP for torch.distributed init
-    rank0_node_ip = _get_rank0_node_ip(pg)
-    dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
-    logger.info(f"dist_init_addr: {dist_init_addr}")
-
-    # Create scheduler actors using shared rank calculation
-    scheduler_actors = []
-
-    for node_idx in range(nnodes):
-        pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-            nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
-        )
-        for pp_rank in pp_range:
-            for tp_rank in tp_range:
-                local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
-                    tp_rank % tp_per_node
-                )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-
-                actor = SchedulerActor.options(
-                    num_cpus=0,
-                    num_gpus=1,
-                    name=f"sglang_scheduler_rank0node={rank0_node_ip}_pp{pp_rank}_tp{tp_rank}",
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=node_idx,
-                    ),
-                ).remote(
-                    server_args=server_args,
-                    port_args=port_args,
-                    gpu_id=local_gpu_idx,
-                    tp_rank=tp_rank,
-                    moe_ep_rank=moe_ep_rank,
-                    pp_rank=pp_rank,
-                    dp_rank=0,
-                    dist_init_addr=dist_init_addr,
-                )
-                scheduler_actors.append(actor)
-
-    # Wait for initialization
-    try:
-        scheduler_infos = ray.get(
-            [actor.get_info.remote() for actor in scheduler_actors]
-        )
-    except ray.exceptions.RayActorError as e:
-        for actor in scheduler_actors:
-            try:
-                ray.kill(actor)
-            except Exception:
-                pass
-        raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
-
-    # Start event loops (non-blocking)
-    event_loop_refs = [actor.run_event_loop.remote() for actor in scheduler_actors]
-
-    return SchedulerInitResult(
-        scheduler_infos=scheduler_infos,
-        _actors=scheduler_actors,
-        _event_loop_refs=event_loop_refs,
     )
 
 
