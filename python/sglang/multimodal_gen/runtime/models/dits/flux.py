@@ -36,7 +36,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
 )
-from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -65,10 +64,120 @@ try:
         NunchakuAdaLayerNormZero,
         NunchakuAdaLayerNormZeroSingle,
     )
+    from nunchaku.ops.gemm import (
+        svdq_gemm_w4a4_cuda as _svdq_gemm_w4a4,  # type: ignore[import]
+    )
+    from nunchaku.ops.quantize import (
+        svdq_quantize_w4a4_act_fuse_lora_cuda as _svdq_quantize_w4a4,  # type: ignore[import]
+    )
+
+    _nunchaku_fused_ops_available = True
 except Exception:
     NunchakuFeedForward = None
     NunchakuAdaLayerNormZero = None
     NunchakuAdaLayerNormZeroSingle = None
+    _svdq_gemm_w4a4 = None
+    _svdq_quantize_w4a4 = None
+    _nunchaku_fused_ops_available = False
+
+
+def _fused_gelu_mlp(
+    x: torch.Tensor,
+    fc1,
+    fc2,
+    pad_size: int = 256,
+) -> torch.Tensor:
+    """
+    Fused GELU MLP matching nunchaku's fused_gelu_mlp kernel path.
+
+    nunchaku's single-block MLP checkpoint is calibrated for the fused path where:
+      1. fc1 GEMM + GELU + 0.171875 shift + unsigned re-quantization + fc2.lora_down
+         are all done in a single fused kernel call
+      2. fc2 GEMM then receives unsigned INT4 activations (act_unsigned=True)
+
+    Using the sequential path (fc1 → GELU → fc2 with symmetric quantization) is
+    fundamentally incompatible with these wscales, causing visually wrong outputs.
+    """
+    batch_size, seq_len, channels = x.shape
+    x_2d = x.view(batch_size * seq_len, channels)
+
+    quantized_x, ascales, lora_act = _svdq_quantize_w4a4(
+        x_2d,
+        lora_down=fc1.proj_down,
+        smooth=fc1.smooth_factor,
+        fp4=fc1.precision == "nvfp4",
+        pad_size=pad_size,
+    )
+
+    batch_size_pad = (batch_size * seq_len + pad_size - 1) // pad_size * pad_size
+    is_fp4 = fc2.precision == "nvfp4"
+
+    qout_act = torch.empty(
+        batch_size_pad,
+        fc1.output_size_per_partition // 2,
+        dtype=torch.uint8,
+        device=x_2d.device,
+    )
+    if is_fp4:
+        qout_ascales = torch.empty(
+            fc1.output_size_per_partition // 16,
+            batch_size_pad,
+            dtype=torch.float8_e4m3fn,
+            device=x_2d.device,
+        )
+    else:
+        qout_ascales = torch.empty(
+            fc1.output_size_per_partition // 64,
+            batch_size_pad,
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+    qout_lora_act = torch.empty(
+        batch_size_pad, fc2.proj_down.shape[1], dtype=torch.float32, device=x_2d.device
+    )
+
+    # fused: fc1 GEMM + GELU + shift + unsigned quantize + fc2.lora_down
+    _svdq_gemm_w4a4(
+        act=quantized_x,
+        wgt=fc1.qweight,
+        qout=qout_act,
+        ascales=ascales,
+        wscales=fc1.wscales,
+        oscales=qout_ascales,
+        lora_act_in=lora_act,
+        lora_up=fc1.proj_up,
+        lora_down=fc2.proj_down,
+        lora_act_out=qout_lora_act,
+        bias=fc1.bias,
+        smooth_factor=fc2.smooth_factor,
+        fp4=is_fp4,
+        alpha=getattr(fc1, "_nunchaku_alpha", None),
+        wcscales=getattr(fc1, "wcscales", None),
+    )
+
+    output = torch.empty(
+        batch_size * seq_len,
+        fc2.output_size_per_partition,
+        dtype=x_2d.dtype,
+        device=x_2d.device,
+    )
+    # fc2 GEMM with unsigned INT4 activations (fused kernel shifted by 0.171875)
+    _svdq_gemm_w4a4(
+        act=qout_act,
+        wgt=fc2.qweight,
+        out=output,
+        ascales=qout_ascales,
+        wscales=fc2.wscales,
+        lora_act_in=qout_lora_act,
+        lora_up=fc2.proj_up,
+        bias=fc2.bias,
+        fp4=is_fp4,
+        alpha=getattr(fc2, "_nunchaku_alpha", None),
+        wcscales=getattr(fc2, "wcscales", None),
+        act_unsigned=True,
+    )
+
+    return output.view(batch_size, seq_len, -1)
 
 
 def _get_qkv_projections(
@@ -168,8 +277,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             )
             if dropout != 0.0:
                 self.to_out.append(torch.nn.Dropout(dropout))
-
-        print(f"{self.added_kv_proj_dim=}")
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -334,15 +441,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp_fc2" if prefix else "mlp_fc2",
             )
-            if (
-                quant_config is not None
-                and hasattr(quant_config, "precision")
-                and quant_config.precision != "nvfp4"
-            ):
-                # nunchaku int4 expects unsigned activation quantization for this projection
-                # self.mlp_fc2.act_unsigned = True
-                if hasattr(self.mlp_fc2, "quant_method"):
-                    self.mlp_fc2.quant_method.act_unsigned = True
 
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -397,9 +495,14 @@ class FluxSingleTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         if self.use_nunchaku_structure:
-            mlp_out, _ = self.mlp_fc1(norm_hidden_states)
-            mlp_hidden_states = self.act_mlp(mlp_out)
-            mlp_hidden_states, _ = self.mlp_fc2(mlp_hidden_states)
+            if _nunchaku_fused_ops_available:
+                mlp_hidden_states = _fused_gelu_mlp(
+                    norm_hidden_states, self.mlp_fc1, self.mlp_fc2
+                )
+            else:
+                mlp_out, _ = self.mlp_fc1(norm_hidden_states)
+                mlp_hidden_states = self.act_mlp(mlp_out)
+                mlp_hidden_states, _ = self.mlp_fc2(mlp_hidden_states)
 
             attn_output = self.attn(
                 x=norm_hidden_states,
@@ -479,9 +582,7 @@ class FluxTransformerBlock(nn.Module):
             and NunchakuFeedForward is not None
         )
         self.use_nunchaku_structure = nunchaku_enabled
-        self.ff = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
-        )
+        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
         self.ff_context = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
@@ -534,9 +635,9 @@ class FluxTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
         norm_hidden_states = self.norm2(hidden_states)
         if self.use_nunchaku_structure:
-            norm_hidden_states = norm_hidden_states * scale_mlp[:, None] + shift_mlp[
-                :, None
-            ]
+            norm_hidden_states = (
+                norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
+            )
         else:
             norm_hidden_states = (
                 norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -556,8 +657,7 @@ class FluxTransformerBlock(nn.Module):
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
         if self.use_nunchaku_structure:
             norm_encoder_hidden_states = (
-                norm_encoder_hidden_states * c_scale_mlp[:, None]
-                + c_shift_mlp[:, None]
+                norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
             )
         else:
             norm_encoder_hidden_states = (

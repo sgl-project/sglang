@@ -255,8 +255,6 @@ def load_model_from_full_model_state_dict(
 
     sharded_sd = {}
 
-    print(f"{sorted_param_names=}")
-    # print(f"{param_dict=}")
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
@@ -334,18 +332,6 @@ def load_model_from_full_model_state_dict(
     loaded_from_ckpt = set(sharded_sd.keys())
     all_model_keys = set(meta_sd.keys())
     unused_keys = all_model_keys - loaded_from_ckpt
-    ckpt_keys_not_in_model = set(custom_param_sd.keys()) - all_model_keys
-    logger.info(
-        "Weight loading stats: model_params=%d, loaded_from_ckpt=%d, "
-        "model_only=%d, ckpt_only=%d",
-        len(all_model_keys), len(loaded_from_ckpt),
-        len(unused_keys), len(ckpt_keys_not_in_model),
-    )
-    if ckpt_keys_not_in_model:
-        logger.warning(
-            "Checkpoint keys not found in model (skipped): %s",
-            sorted(ckpt_keys_not_in_model)[:20],
-        )
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
