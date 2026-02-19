@@ -445,6 +445,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
+                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
@@ -467,6 +468,7 @@ class ModelRunnerKVCacheMixin:
                     cache_params=config.mamba2_cache_params,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
