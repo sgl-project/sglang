@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.2
+FLASHINFER_VERSION=0.6.3
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -26,6 +26,8 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 # Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
+# Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
+apt-get update || true
 apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
@@ -286,6 +288,9 @@ if [ "$FLASHINFER_INSTALLED" = false ]; then
     echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
     exit 1
 fi
+
+# Download flashinfer cubins if the local set is incomplete
+bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
 # Show current packages
 $PIP_CMD list
