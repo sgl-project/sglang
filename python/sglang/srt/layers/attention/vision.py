@@ -34,6 +34,7 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 if _is_cuda:
+    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 if _is_npu:
@@ -452,6 +453,87 @@ class VisionFlash4Attention(nn.Module):
         return output
 
 
+class VisionFlashInferAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlashInferAttention is only available for cuda")
+        super().__init__()
+        self.workspace_buffer = (
+            kwargs["workspace_buffer"] if "workspace_buffer" in kwargs else None
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if "sequence_lengths" not in kwargs:
+            raise RuntimeError(
+                "sequence_lengths should be prepared for flashinfer backend"
+            )
+        if "max_seqlen" not in kwargs:
+            raise RuntimeError("max_seqlen should be prepared for flashinfer backend")
+        sequence_lengths = kwargs["sequence_lengths"]
+        max_seqlen = kwargs["max_seqlen"]
+
+        is_reshaped = q.dim() == 4
+        if is_reshaped:
+            reshape_batch_size = q.shape[0]
+            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+
+        assert len(cu_seqlens) % 3 == 0, "cu_seqlens must be divisible by 3"
+        cu_seqlength = len(cu_seqlens) // 3
+        cu_qk = cu_seqlens[:cu_seqlength]
+        cu_v = cu_seqlens[cu_seqlength : cu_seqlength * 2]
+        cu_o = cu_seqlens[cu_seqlength * 2 :]
+        batch_offsets_qk = cu_qk.view(-1, 1, 1, 1)
+        batch_offsets_v = cu_v.view(-1, 1, 1, 1)
+        batch_offsets_o = cu_o.view(-1, 1, 1, 1)
+        sequence_lengths = sequence_lengths.view(-1, 1, 1, 1)
+        max_seqlen = max_seqlen.item()
+
+        _, _, head_size = q.shape
+        scale = head_size**-0.5
+
+        output, _ = cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            scale,
+            self.workspace_buffer,
+            max_token_per_sequence=max_seqlen,
+            max_sequence_kv=max_seqlen,
+            actual_seq_lens_q=sequence_lengths,
+            actual_seq_lens_kv=sequence_lengths,
+            causal=False,
+            return_lse=False,
+            batch_offsets_q=batch_offsets_qk,
+            batch_offsets_k=batch_offsets_qk,
+            batch_offsets_v=batch_offsets_v,
+            batch_offsets_o=batch_offsets_o,
+            is_cuda_graph_compatible=True,
+        )
+
+        if is_reshaped:
+            output = rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
+
+        return output
+
+
 class VisionAiterAttention(nn.Module):
     def __init__(
         self,
@@ -552,6 +634,7 @@ QKV_BACKEND_IMPL = {
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,
+    "fi": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
 }
@@ -594,6 +677,7 @@ class VisionAttention(nn.Module):
         use_data_parallel: bool = False,
         use_dp_attention_reduce: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         super().__init__()
@@ -651,6 +735,7 @@ class VisionAttention(nn.Module):
             flatten_batch=flatten_batch,
             softmax_in_single_precision=softmax_in_single_precision,
             use_data_parallel=use_data_parallel,
+            workspace_buffer=workspace_buffer,
         )
 
         self.use_qkv_parallel = use_qkv_parallel
@@ -686,6 +771,8 @@ class VisionAttention(nn.Module):
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
+
+        self.workspace_buffer = workspace_buffer
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
 
@@ -829,6 +916,10 @@ class VisionAttention(nn.Module):
         kv_head = self.num_attention_kv_heads_per_partition
 
         attn_output_ws = kwargs["output_ws"] if "output_ws" in kwargs else None
+        max_seqlen = kwargs["max_seqlen"] if "max_seqlen" in kwargs else None
+        sequence_lengths = (
+            kwargs["sequence_lengths"] if "sequence_lengths" in kwargs else None
+        )
         if self.use_qkv_parallel:
             # [b, s, embed_dim] --> [b, s, embed_dim]
             qkv, _ = self.qkv_proj(x)
@@ -935,6 +1026,8 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            sequence_lengths=sequence_lengths,
+            max_seqlen=max_seqlen,
             output_ws=attn_output_ws,
         )
 
