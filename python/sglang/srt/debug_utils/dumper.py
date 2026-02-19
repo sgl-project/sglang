@@ -126,7 +126,9 @@ class _Dumper:
 
     def _ensure_partial_name(self):
         if self._partial_name is None:
-            self._partial_name = _get_partial_name(timeout_seconds=self._collective_timeout)
+            self._partial_name = _get_partial_name(
+                timeout_seconds=self._collective_timeout
+            )
             print(f"[Dumper] Choose partial_name={self._partial_name}")
 
     def set_ctx(self, **kwargs):
