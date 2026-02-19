@@ -89,5 +89,11 @@ def report():
 
 
 # Auto-inject CUDA coredump env vars at import time.
-if is_enabled():
+# The sentinel env var is inherited by child processes, so injection only
+# happens once in the top-level process.
+_SENTINEL = "_SGLANG_CUDA_COREDUMP_INJECTED"
+
+if is_enabled() and _SENTINEL not in os.environ:
+    os.environ[_SENTINEL] = "1"
+    logger.info("Injecting CUDA coredump env vars (pid=%d)", os.getpid())
     _inject_env()
