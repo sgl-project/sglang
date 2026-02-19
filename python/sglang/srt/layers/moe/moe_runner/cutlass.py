@@ -125,35 +125,22 @@ class CutlassRunnerCore(MoeRunnerCore):
         # Standard mode
         moe_type = quant_info.moe_type
 
-        if moe_type == CutlassMoEType.DeepEP_LL:
-            down_output = self.cutlass_w4a8_moe_deepep_ll(
-                runner_input.gate_up_input,  # Use preprocessed input
-                quant_info.w13_weight,
-                quant_info.w2_weight,
-                quant_info.w13_scale,
-                quant_info.w2_scale,
-                runner_input.topk_ids,
-                runner_input.masked_m,
-                quant_info.params,
-                running_state,
-                quant_info.w13_input_scale,
-                quant_info.w2_input_scale,
-            )
-            return CutlassRunnerOutput(hidden_states=down_output)
-
-        elif moe_type == CutlassMoEType.DeepEP_Normal:
-            down_output = self.cutlass_w4a8_moe_deepep_normal(
-                a=runner_input.gate_up_input,
+        if moe_type in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal, CutlassMoEType.W4A8]:
+            down_output = self.w4a8_moe(
+                a=runner_input.gate_up_input,  # Use preprocessed input
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
                 w2_scale=quant_info.w2_scale,
-                topk_ids_=runner_input.topk_ids,
+                topk_ids=runner_input.topk_ids,
                 params=quant_info.params,
                 a1_scale=quant_info.w13_input_scale,
                 a2_scale=quant_info.w2_input_scale,
+                masked_m=runner_input.masked_m,
             )
-            return CutlassRunnerOutput(hidden_states=down_output)
+            if moe_type in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal]:
+                return CutlassRunnerOutput(hidden_states=down_output)
+            # Post-processing will be done in post_permute_cutlass_to_standard
 
         elif moe_type == CutlassMoEType.BlockscaledFP8:
             if not cutlass_fp8_supported():
@@ -190,19 +177,6 @@ class CutlassRunnerCore(MoeRunnerCore):
                 params=quant_info.params,
             )
 
-        elif moe_type == CutlassMoEType.W4A8:
-            down_output = self.cutlass_w4a8_moe(
-                a=runner_input.gate_up_input,  # Use preprocessed input
-                w1_q=quant_info.w13_weight,
-                w2_q=quant_info.w2_weight,
-                w1_scale=quant_info.w13_scale,
-                w2_scale=quant_info.w2_scale,
-                topk_ids=runner_input.topk_ids,
-                params=quant_info.params,
-                a1_scale=quant_info.w13_input_scale,
-                a2_scale=quant_info.w2_input_scale,
-            )
-            # Post-processing will be done in post_permute_cutlass_to_standard
         # Optional no-combine path: return (M, topk, K) without reduction
         if self.config.no_combine:
             reordered = shuffle_rows(
@@ -229,7 +203,7 @@ class CutlassRunnerCore(MoeRunnerCore):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.CUTLASS
 
-    def cutlass_w4a8_moe(
+    def w4a8_moe(
         self,
         a: torch.Tensor,
         w1_q: torch.Tensor,
@@ -240,7 +214,11 @@ class CutlassRunnerCore(MoeRunnerCore):
         params: CutlassMoEParams,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
+        masked_m: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_per_tensor_quant_fwd,
+        )
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_mul_static_tensorwise_quant_for_cutlass_moe,
         )
@@ -250,10 +228,17 @@ class CutlassRunnerCore(MoeRunnerCore):
         using two sets of quantized weights, w1_q and w2_q, and top-k gating
         mechanism. The matrix multiplications are implemented with CUTLASS
         grouped gemm.
+        
+        This unified function handles three MoE types:
+        1. DeepEP_LL: Post-per-tensor quantized FP8 input
+            - `a` Shape: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, K]
+        2. DeepEP_Normal: Preprocessed FP8 input (permuted and quantized)
+            - `a` Shape: [M * topk, K]
+        3. W4A8: Standard preprocessed FP8 input
+            - `a` Shape: [M * topk, K]
 
         Parameters:
-        - a (torch.Tensor): The input tensor to the MoE layer.
-            Shape: [M, K]
+        - a (torch.Tensor): The preprocessed FP8 input tensor to the MoE layer.
         - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
             Shape: [num_experts, N * 2,  K // 2]
             (the weights are passed transposed and int4-packed)
@@ -271,225 +256,34 @@ class CutlassRunnerCore(MoeRunnerCore):
         - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
             quantize the intermediate result between the gemms.
             Shape: scalar or [1, N]
+        - masked_m (Optional[torch.Tensor]): The valid tokens mask for DeepEP_LL mode.
 
         Returns:
-        - torch.Tensor: The fp8 output tensor after applying the MoE layer.
+        - torch.Tensor: The output tensor after applying the MoE layer (pre-reordered for W4A8, otherwise fully processed).
         """
-        # Preprocessing is done in pre_permute_standard_to_cutlass
-        # Input 'a' is already the preprocessed gateup_input
+        moe_type = params.moe_type
         gateup_input = a
         k = w1_q.size(2) * 2  # w1_q is transposed and packed
         n = w2_q.size(2) * 2  # w2_q is transposed and packed
         topk = topk_ids.size(1)
-        m = gateup_input.shape[0] // topk  # number of tokens
-
-        # The preprocessing (input reordering) is done in pre_permute_standard_to_cutlass
-        # The problem sizes and GEMM operations remain here
 
         device = a.device
 
-        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-        c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
+        if moe_type == CutlassMoEType.DeepEP_LL:
+            num_experts = w1_q.size(0)
+            m = a.size(1)
+            c1_shape = (num_experts, m, n * 2)
+            c2_shape = (num_experts, m, k)
+        else:
+            m_tokens = topk_ids.size(0)
+            c1_shape = (m_tokens * topk, n * 2)
+            c2_shape = (m_tokens * topk, k)
 
-
-        cutlass_w4a8_moe_mm(
-            c1,
-            gateup_input,
-            w1_q,
-            a1_scale.float(),
-            w1_scale,
-            params.expert_offsets[:-1],
-            params.problem_sizes1,
-            params.a_strides1,
-            params.b_strides1,
-            params.c_strides1,
-            params.s_strides13,
-            128,
-            topk,
-        )
-
-        intermediate_q = torch.empty(
-            (m * topk, n), dtype=torch.float8_e4m3fn, device=device
-        )
-
-
-        silu_mul_static_tensorwise_quant_for_cutlass_moe(
-            c1, intermediate_q, a2_scale.float(), params.expert_offsets[-1:], m * topk, n
-        )
-
-
-        cutlass_w4a8_moe_mm(
-            c2,
-            intermediate_q,
-            w2_q,
-            a2_scale.float(),
-            w2_scale,
-            params.expert_offsets[:-1],
-            params.problem_sizes2,
-            params.a_strides2,
-            params.b_strides2,
-            params.c_strides2,
-            params.s_strides2,
-            128,
-            topk,
-        )
-
-        # Post-processing (reordering back to token order) is done in post_permute_cutlass_to_standard
-        return c2
-
-    def cutlass_w4a8_moe_deepep_normal(
-        self,
-        a: torch.Tensor,
-        w1_q: torch.Tensor,
-        w2_q: torch.Tensor,
-        w1_scale: torch.Tensor,
-        w2_scale: torch.Tensor,
-        topk_ids_: torch.Tensor,
-        params: CutlassMoEParams,
-        a1_scale: Optional[torch.Tensor] = None,
-        a2_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        This function computes a w4a8-quantized Mixture of Experts (MoE) layer
-        using two sets of quantized weights, w1_q and w2_q, and top-k gating
-        mechanism. The matrix multiplications are implemented with CUTLASS
-        grouped gemm.
-
-        Parameters:
-        - a (torch.Tensor): The preprocessed input tensor (already permuted and quantized to fp8).
-            Shape: [M * topk, K]
-        - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
-            Shape: [num_experts, N * 2,  K // 2]
-            (the weights are passed transposed and int4-packed)
-        - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
-            Shape: [num_experts, K, N // 2]
-            (the weights are passed transposed and int4-packed)
-        - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-            Shape: [num_experts, K // 512, N * 8]
-        - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-            Shape: [num_experts, N // 512, K * 4]
-        - params (CutlassMoEParams): The initialized Cutlass MoE parameters.
-        - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
-            Shape: scalar or [1, K]
-        - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
-            quantize the intermediate result between the gemms.
-            Shape: scalar or [1, N]
-
-        Returns:
-        - torch.Tensor: The fp8 output tensor after applying the MoE layer.
-        """
-        # Input 'a' is already preprocessed (permuted and quantized to fp8)
-        gateup_input = a
-        n = w2_q.size(2) * 2  # w2_q is transposed and packed
-        k = w1_q.size(2) * 2  # w1_q is transposed and packed
-
-        topk = topk_ids_.size(1)
-        m = topk_ids_.size(0)  # number of tokens
-
-        device = a.device
-        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-        c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
-
-
-        cutlass_w4a8_moe_mm(
-            c1,
-            gateup_input,
-            w1_q,
-            a1_scale.float(),
-            w1_scale,
-            params.expert_offsets[:-1],
-            params.problem_sizes1,
-            params.a_strides1,
-            params.b_strides1,
-            params.c_strides1,
-            params.s_strides13,
-            128,
-            topk,
-        )
-        intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
-        silu_and_mul(c1, intermediate)
-
-        intermediate_q = torch.empty(
-            intermediate.shape, dtype=torch.float8_e4m3fn, device=device
-        )
-        sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
-
-
-        cutlass_w4a8_moe_mm(
-            c2,
-            intermediate_q,
-            w2_q,
-            a2_scale.float(),
-            w2_scale,
-            params.expert_offsets[:-1],
-            params.problem_sizes2,
-            params.a_strides2,
-            params.b_strides2,
-            params.c_strides2,
-            params.s_strides2,
-            128,
-            topk,
-        )
-
-        return c2
-
-    def cutlass_w4a8_moe_deepep_ll(
-        self,
-        a: torch.Tensor,
-        w1_q: torch.Tensor,
-        w2_q: torch.Tensor,
-        w1_scale: torch.Tensor,
-        w2_scale: torch.Tensor,
-        topk_ids_: torch.Tensor,
-        masked_m: torch.Tensor,
-        params: CutlassMoEParams,
-        running_state: Dict[str, torch.Tensor],
-        a1_scale: Optional[torch.Tensor] = None,
-        a2_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.kernels import (
-            silu_and_mul_masked_post_per_tensor_quant_fwd,
-        )
-
-        """
-        This function computes a w4a8-quantized Mixture of Experts (MoE) layer
-        using two sets of quantized weights, w1_q and w2_q, and top-k gating
-        mechanism. The matrix multiplications are implemented with CUTLASS
-        grouped gemm.
-
-        Parameters:
-        - a (torch.Tensor): The preprocessed FP8-quantized input tensor.
-            Shape: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, K]
-        - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
-            Shape: [num_experts, N * 2,  K // 2]
-            (the weights are passed transposed and int4-packed)
-        - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
-            Shape: [num_experts, K, N // 2]
-            (the weights are passed transposed and int4-packed)
-        - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-            Shape: [num_experts, K // 512, N * 8]
-        - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-            Shape: [num_experts, N // 512, K * 4]
-        - params (CutlassMoEParams): The initialized Cutlass MoE parameters.
-        - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
-            Shape: scalar or [1, K]
-        - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
-            quantize the intermediate result between the gemms.
-            Shape: scalar or [1, N]
-
-        Returns:
-        - torch.Tensor: The fp8 output tensor after applying the MoE layer.
-        """
-        # Input 'a' is already preprocessed (quantized to FP8)
-        gateup_input = a
-        num_experts = w1_q.size(0)
-        m = a.size(1)
-        k = w1_q.size(2) * 2  # w1_q is transposed and packed
-        n = w2_q.size(2) * 2  # w2_q is transposed and packed
-        topk = topk_ids_.size(1)
-
-        c1 = torch.empty((num_experts, m, n * 2), device=a.device, dtype=torch.bfloat16)
-        c2 = torch.empty((num_experts, m, k), device=a.device, dtype=torch.bfloat16)
+        c1 = torch.empty(c1_shape, device=device, dtype=torch.bfloat16)
+        if moe_type == CutlassMoEType.DeepEP_Normal:
+            c2 = torch.zeros(c2_shape, device=device, dtype=torch.bfloat16)
+        else:
+            c2 = torch.empty(c2_shape, device=device, dtype=torch.bfloat16)
 
         cutlass_w4a8_moe_mm(
             c1,
@@ -507,12 +301,29 @@ class CutlassRunnerCore(MoeRunnerCore):
             topk,
         )
 
-        intermediate_q = torch.empty(
-            (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
-        )
-        silu_and_mul_masked_post_per_tensor_quant_fwd(
-            c1, intermediate_q, masked_m, a2_scale
-        )
+        if moe_type == CutlassMoEType.DeepEP_LL:
+            intermediate_q = torch.empty(
+                (num_experts, m, n), dtype=torch.float8_e4m3fn, device=device
+            )
+            silu_and_mul_masked_post_per_tensor_quant_fwd(
+                c1, intermediate_q, masked_m, a2_scale
+            )
+        elif moe_type == CutlassMoEType.DeepEP_Normal:
+            intermediate = torch.empty(c1_shape[0], n, device=device, dtype=torch.bfloat16)
+            silu_and_mul(c1, intermediate)
+
+            intermediate_q = torch.empty(
+                intermediate.shape, dtype=torch.float8_e4m3fn, device=device
+            )
+            sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+        else:
+            intermediate_q = torch.empty(
+                (c1_shape[0], n), dtype=torch.float8_e4m3fn, device=device
+            )
+            silu_mul_static_tensorwise_quant_for_cutlass_moe(
+                c1, intermediate_q, a2_scale.float(), params.expert_offsets[-1:], c1_shape[0], n
+            )
+
         cutlass_w4a8_moe_mm(
             c2,
             intermediate_q,
@@ -606,8 +417,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         n = w2_q.size(1)
 
         device = a.device
-
-
         rep_a_q = a
 
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
