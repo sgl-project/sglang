@@ -1,10 +1,9 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_bmm_fp8.py
 
+import flashinfer
 import pytest
 import torch
 import torch.nn.functional as F
-
-import flashinfer
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
