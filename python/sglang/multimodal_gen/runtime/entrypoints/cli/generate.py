@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
-    RequestTimings,
+    RequestMetrics,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -64,15 +64,17 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
         return
 
     if isinstance(results, list):
-        result = results[0] if results else {}
+        result = results[0] if results else None
     else:
         result = results
 
-    timings_dict = result.get("timings")
+    timings_dict = getattr(result, "timings", None) or (
+        result.get("timings") if isinstance(result, dict) else None
+    )
     if not (args.perf_dump_path and timings_dict):
         return
 
-    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings = RequestMetrics(request_id=timings_dict.get("request_id"))
     timings.stages = timings_dict.get("stages", {})
     timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)

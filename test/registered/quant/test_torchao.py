@@ -7,7 +7,7 @@ from sglang import Engine
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=230, suite="stage-b-test-small-1-gpu-amd")
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval

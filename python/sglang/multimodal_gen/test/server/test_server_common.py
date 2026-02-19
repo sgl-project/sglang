@@ -18,7 +18,7 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -87,8 +87,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.warmup:
-        extra_args += f" --warmup"
+    # default warmup
+    extra_args += f" --warmup"
+
+    for arg in server_args.extras:
+        extra_args += f" {arg}"
 
     # Build custom environment variables
     env_vars = {}
@@ -131,6 +134,7 @@ class DiffusionServerBase:
 
     _perf_results: list[dict[str, Any]] = []
     _improved_baselines: list[dict[str, Any]] = []
+    _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
@@ -139,9 +143,21 @@ class DiffusionServerBase:
 
     @classmethod
     def teardown_class(cls):
-        for result in cls._perf_results:
-            result["class_name"] = cls.__name__
-            _GLOBAL_PERF_RESULTS.append(result)
+        print(
+            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
+        )
+        if cls._pytest_config:
+            # Add results to pytest stash (shared across all import contexts)
+            for result in cls._perf_results:
+                result["class_name"] = cls.__name__
+            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
+            print(
+                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
+            )
+        else:
+            print(
+                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
+            )
 
         if cls._improved_baselines:
             import json
@@ -156,6 +172,11 @@ Consider updating perf_baselines.json with the snippets below:
                     f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
                 )
             print(output)
+
+    @pytest.fixture(autouse=True)
+    def _capture_pytest_config(self, request):
+        """Capture pytest config for use in teardown_class."""
+        self.__class__._pytest_config = request.config
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
@@ -258,6 +279,9 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
+        print(
+            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
+        )
 
     def _check_for_improvement(
         self,
