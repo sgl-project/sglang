@@ -1649,13 +1649,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Disable piecewise CUDA graph because piecewise_cuda_graph has conflict with torch compile",
             )
             return False
-        if self.pp_size > 1:
-            # TODO(yuwei): support PP
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
-            )
-            return False
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO(yuwei): fix the compilation errors for MOE A2A backend
             log_info_on_rank0(
