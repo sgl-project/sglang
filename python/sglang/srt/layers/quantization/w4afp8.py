@@ -37,15 +37,6 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
-def _debug_tensor_str(name: str, val) -> str:
-    """Return a debug string for a tensor, handling None gracefully."""
-    if val is None:
-        return f"{name}: None\n"
-    if hasattr(val, "shape") and hasattr(val, "dtype"):
-        return f"{name}: shape={val.shape}, dtype={val.dtype}, tensor={val}\n"
-    return f"{name}: {val}\n"
-
-
 class W4AFp8Config(QuantizationConfig):
     """Config class for MIXED_PRECISION W4AFp8."""
 
@@ -309,29 +300,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         if self.runner.runner_backend.is_cutlass():
-            # from sglang.srt.distributed import get_tensor_model_parallel_rank
-            # if get_tensor_model_parallel_rank() == 1:
-            #     with open("debug_refactor.log", "a") as f:
-            #         f.write("DEBUG: CutlassMoeQuantInfo inputs:\n")
-            #         f.write(_debug_tensor_str("moe_type", CutlassMoEType.W4A8))
-            #         f.write(_debug_tensor_str("w13_weight", layer.w13_weight))
-            #         f.write(_debug_tensor_str("w2_weight", layer.w2_weight))
-            #         f.write(_debug_tensor_str("w13_scale", layer.w13_weight_scale_inv))
-            #         f.write(_debug_tensor_str("w2_scale", layer.w2_weight_scale_inv))
-            #         f.write(_debug_tensor_str("expert_offsets", self.expert_offsets))
-            #         f.write(_debug_tensor_str("problem_sizes1", self.problem_sizes1))
-            #         f.write(_debug_tensor_str("problem_sizes2", self.problem_sizes2))
-            #         f.write(_debug_tensor_str("a_strides1", self.a_strides1))
-            #         f.write(_debug_tensor_str("b_strides1", self.b_strides1))
-            #         f.write(_debug_tensor_str("c_strides1", self.c_strides1))
-            #         f.write(_debug_tensor_str("a_strides2", self.a_strides2))
-            #         f.write(_debug_tensor_str("b_strides2", self.b_strides2))
-            #         f.write(_debug_tensor_str("c_strides2", self.c_strides2))
-            #         f.write(_debug_tensor_str("s_strides13", self.s_strides13))
-            #         f.write(_debug_tensor_str("s_strides2", self.s_strides2))
-            #         f.write(_debug_tensor_str("w13_input_scale", layer.w13_input_scale))
-            #         f.write(_debug_tensor_str("w2_input_scale", layer.w2_input_scale))
-            #         f.write("\n")
             quant_info = CutlassMoeQuantInfo(
                 moe_type=CutlassMoEType.W4A8,
                 w13_weight=layer.w13_weight,
@@ -359,29 +327,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-        # from sglang.srt.distributed import get_tensor_model_parallel_rank
-        # if get_tensor_model_parallel_rank() == 1:
-        #     with open("debug_refactor.log", "a") as f:
-        #         f.write("DEBUG: CutlassMoeQuantInfo DeepEP_LL inputs:\n")
-        #         f.write(_debug_tensor_str("moe_type", CutlassMoEType.DeepEP_LL))
-        #         f.write(_debug_tensor_str("w13_weight", layer.w13_weight))
-        #         f.write(_debug_tensor_str("w2_weight", layer.w2_weight))
-        #         f.write(_debug_tensor_str("w13_scale", layer.w13_weight_scale_inv))
-        #         f.write(_debug_tensor_str("w2_scale", layer.w2_weight_scale_inv))
-        #         f.write(_debug_tensor_str("expert_offsets", self.expert_offsets))
-        #         f.write(_debug_tensor_str("problem_sizes1", self.problem_sizes1))
-        #         f.write(_debug_tensor_str("problem_sizes2", self.problem_sizes2))
-        #         f.write(_debug_tensor_str("a_strides1", self.a_strides1))
-        #         f.write(_debug_tensor_str("b_strides1", self.b_strides1))
-        #         f.write(_debug_tensor_str("c_strides1", self.c_strides1))
-        #         f.write(_debug_tensor_str("a_strides2", self.a_strides2))
-        #         f.write(_debug_tensor_str("b_strides2", self.b_strides2))
-        #         f.write(_debug_tensor_str("c_strides2", self.c_strides2))
-        #         f.write(_debug_tensor_str("s_strides13", self.s_strides13))
-        #         f.write(_debug_tensor_str("s_strides2", self.s_strides2))
-        #         f.write(_debug_tensor_str("w13_input_scale", layer.w13_input_scale))
-        #         f.write(_debug_tensor_str("w2_input_scale", layer.w2_input_scale))
-        #         f.write("\n")
         quant_info = CutlassMoeQuantInfo(
             moe_type=CutlassMoEType.DeepEP_LL,
             w13_weight=layer.w13_weight,
@@ -418,29 +363,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if num_tokens == 0:
             return hidden_states
 
-        # from sglang.srt.distributed import get_tensor_model_parallel_rank
-        # if get_tensor_model_parallel_rank() == 1:
-        #     with open("debug_refactor.log", "a") as f:
-        #         f.write("DEBUG: CutlassMoeQuantInfo DeepEP_Normal inputs:\n")
-        #         f.write(_debug_tensor_str("moe_type", CutlassMoEType.DeepEP_Normal))
-        #         f.write(_debug_tensor_str("w13_weight", layer.w13_weight))
-        #         f.write(_debug_tensor_str("w2_weight", layer.w2_weight))
-        #         f.write(_debug_tensor_str("w13_scale", layer.w13_weight_scale_inv))
-        #         f.write(_debug_tensor_str("w2_scale", layer.w2_weight_scale_inv))
-        #         f.write(_debug_tensor_str("expert_offsets", self.expert_offsets))
-        #         f.write(_debug_tensor_str("problem_sizes1", self.problem_sizes1))
-        #         f.write(_debug_tensor_str("problem_sizes2", self.problem_sizes2))
-        #         f.write(_debug_tensor_str("a_strides1", self.a_strides1))
-        #         f.write(_debug_tensor_str("b_strides1", self.b_strides1))
-        #         f.write(_debug_tensor_str("c_strides1", self.c_strides1))
-        #         f.write(_debug_tensor_str("a_strides2", self.a_strides2))
-        #         f.write(_debug_tensor_str("b_strides2", self.b_strides2))
-        #         f.write(_debug_tensor_str("c_strides2", self.c_strides2))
-        #         f.write(_debug_tensor_str("s_strides13", self.s_strides13))
-        #         f.write(_debug_tensor_str("s_strides2", self.s_strides2))
-        #         f.write(_debug_tensor_str("w13_input_scale", layer.w13_input_scale))
-        #         f.write(_debug_tensor_str("w2_input_scale", layer.w2_input_scale))
-        #         f.write("\n")
         quant_info = CutlassMoeQuantInfo(
             moe_type=CutlassMoEType.DeepEP_Normal,
             w13_weight=layer.w13_weight,
