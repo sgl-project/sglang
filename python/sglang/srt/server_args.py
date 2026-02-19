@@ -217,6 +217,8 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
+MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -461,6 +463,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    mamba_backend: str = "triton"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -739,6 +742,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_mamba_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -2073,6 +2077,22 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+
+    def _handle_mamba_backend(self):
+        if self.mamba_backend == "flashinfer":
+            if is_flashinfer_available():
+                try:
+                    import flashinfer.mamba  # noqa: F401
+
+                    logger.info("Successfully imported FlashInfer mamba module")
+                except (ImportError, AttributeError):
+                    raise ValueError(
+                        "FlashInfer mamba module not available, please check flashinfer installation."
+                    )
+            else:
+                raise ValueError(
+                    "FlashInfer mamba module not available, please check flashinfer installation."
+                )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
@@ -4236,6 +4256,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-backend",
+            type=str,
+            choices=MAMBA_BACKEND_CHOICES,
+            default=ServerArgs.mamba_backend,
+            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
+            "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
         )
 
         # Hierarchical cache
