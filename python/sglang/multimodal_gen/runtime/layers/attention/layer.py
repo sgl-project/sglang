@@ -31,7 +31,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
 
 
@@ -316,14 +315,8 @@ class USPAttention(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
-        # If enable_uaa is not explicitly set, try to get it from server_args
         if enable_uaa is None:
-            try:
-                server_args = get_global_server_args()
-                enable_uaa = server_args.enable_uaa
-            except (ValueError, AttributeError):
-                # If server_args is not set or doesn't have enable_uaa, default to False
-                enable_uaa = False
+            enable_uaa = False
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(

@@ -86,7 +86,9 @@ def _usp_gather_for_ulysses(x: torch.Tensor, dim: int, world_size: int) -> torch
 
     # Collect the actual sizes from each rank
     local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=x.device)
-    all_sizes_list = [torch.zeros(1, dtype=torch.long, device=x.device) for _ in range(world_size)]
+    all_sizes_list = [
+        torch.zeros(1, dtype=torch.long, device=x.device) for _ in range(world_size)
+    ]
     torch.distributed.all_gather(all_sizes_list, local_size_tensor, group=ulysses_pg)
     all_sizes = [int(s.item()) for s in all_sizes_list]
     max_size = max(all_sizes)
