@@ -13,18 +13,15 @@ import os
 import time
 from typing import Any, List, Union
 
-import numpy as np
-
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    GenerationResult,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
     format_lora_message,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
@@ -157,65 +154,33 @@ class DiffGenerator:
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
-    ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]] | None:
-        """
-        Generate a image/video based on the given prompt.
+    ) -> GenerationResult | list[GenerationResult] | None:
+        """Generate image(s)/video(s) based on the given prompt(s).
 
-        Args:
-
-        Returns:
-            Either the output dictionary, list of frames, or list of results for batch processing
+        Returns a single GenerationResult for a single prompt, a list for
+        multiple prompts, or None when every request failed.
         """
         # 1. prepare requests
-        prompt = sampling_params_kwargs.get("prompt", None)
-        prompts: list[str] = []
-        # Handle batch processing from text file
-        if self.server_args.prompt_file_path is not None:
-            prompt_txt_path = self.server_args.prompt_file_path
-            if not os.path.exists(prompt_txt_path):
-                raise FileNotFoundError(
-                    f"Prompt text file not found: {prompt_txt_path}"
-                )
-            # Read prompts from file
-            with open(prompt_txt_path, encoding="utf-8") as f:
-                prompts.extend(line.strip() for line in f if line.strip())
-
-            if not prompts:
-                raise ValueError(f"No prompts found in file: {prompt_txt_path}")
-
-            logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        else:
-            if prompt is None:
-                prompt = " "
-            if isinstance(prompt, str):
-                prompts.append(prompt)
-            elif isinstance(prompt, list):
-                prompts.extend(prompt)
+        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
         sampling_params = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
 
-        # Extract diffusers_kwargs if passed
-        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
-
         requests: list[Req] = []
-        for output_idx, p in enumerate(prompts):
+        for p in prompts:
             sampling_params.prompt = p
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
             )
-            # Add diffusers_kwargs to request's extra dict
-            if diffusers_kwargs:
-                req.extra["diffusers_kwargs"] = diffusers_kwargs
             requests.append(req)
 
-        results = []
+        results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
 
-        # 2. send requests to scheduler, one at a time
+        # 2. send requests to scheduler one at a time
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             try:
@@ -235,101 +200,115 @@ class DiffGenerator:
                             request_idx + 1,
                         )
                         continue
-                    audio_sample_rate = output_batch.audio_sample_rate
+
+                    common = dict(
+                        prompt=req.prompt,
+                        size=(req.height, req.width, req.num_frames),
+                        generation_time=timer.duration,
+                        peak_memory_mb=output_batch.peak_memory_mb,
+                        timings=(
+                            output_batch.timings.to_dict()
+                            if output_batch.timings
+                            else {}
+                        ),
+                        trajectory_latents=output_batch.trajectory_latents,
+                        trajectory_timesteps=output_batch.trajectory_timesteps,
+                        trajectory_decoded=output_batch.trajectory_decoded,
+                    )
 
                     if req.save_output and req.return_file_paths_only:
-                        for output_idx, output_path in enumerate(
-                            output_batch.output_file_paths
-                        ):
-                            result_item: dict[str, Any] = {
-                                "samples": None,
-                                "frames": None,
-                                "audio": None,
-                                "prompts": req.prompt,
-                                "size": (req.height, req.width, req.num_frames),
-                                "generation_time": timer.duration,
-                                "peak_memory_mb": output_batch.peak_memory_mb,
-                                "timings": (
-                                    output_batch.timings.to_dict()
-                                    if output_batch.timings
-                                    else {}
-                                ),
-                                "trajectory": output_batch.trajectory_latents,
-                                "trajectory_timesteps": output_batch.trajectory_timesteps,
-                                "trajectory_decoded": output_batch.trajectory_decoded,
-                                "prompt_index": output_idx,
-                                "output_file_path": output_path,
-                            }
-                            results.append(result_item)
+                        for idx, path in enumerate(output_batch.output_file_paths):
+                            results.append(
+                                GenerationResult(
+                                    **common,
+                                    prompt_index=idx,
+                                    output_file_path=path,
+                                )
+                            )
                         continue
 
                     samples_out: list[Any] = []
                     audios_out: list[Any] = []
                     frames_out: list[Any] = []
+                    num_outputs = len(output_batch.output)
                     save_outputs(
                         output_batch.output,
                         req.data_type,
                         req.fps,
                         req.save_output,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        lambda idx: req.output_file_path(num_outputs, idx),
                         audio=output_batch.audio,
-                        audio_sample_rate=audio_sample_rate,
+                        audio_sample_rate=output_batch.audio_sample_rate,
                         samples_out=samples_out,
                         audios_out=audios_out,
                         frames_out=frames_out,
+                        output_compression=req.output_compression,
                     )
 
-                    for output_idx in range(len(samples_out)):
-                        result_item: dict[str, Any] = {
-                            "samples": samples_out[output_idx],
-                            "frames": frames_out[output_idx],
-                            "audio": audios_out[output_idx],
-                            "prompts": req.prompt,
-                            "size": (req.height, req.width, req.num_frames),
-                            "generation_time": timer.duration,
-                            "peak_memory_mb": output_batch.peak_memory_mb,
-                            "timings": (
-                                output_batch.timings.to_dict()
-                                if output_batch.timings
-                                else {}
-                            ),
-                            "trajectory": output_batch.trajectory_latents,
-                            "trajectory_timesteps": output_batch.trajectory_timesteps,
-                            "trajectory_decoded": output_batch.trajectory_decoded,
-                            "prompt_index": output_idx,
-                        }
-                        results.append(result_item)
-            except Exception:
+                    for idx in range(len(samples_out)):
+                        results.append(
+                            GenerationResult(
+                                **common,
+                                samples=samples_out[idx],
+                                frames=frames_out[idx],
+                                audio=audios_out[idx],
+                                prompt_index=idx,
+                                output_file_path=req.output_file_path(num_outputs, idx),
+                            )
+                        )
+            except Exception as e:
+                logger.error(
+                    "Generation failed for prompt %d/%d: %s",
+                    request_idx + 1,
+                    len(requests),
+                    e,
+                    exc_info=True,
+                )
                 continue
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
+        self._log_summary(results)
 
-        if results:
-            if self.server_args.warmup:
-                total_duration_ms = results[0]["timings"]["total_duration_ms"]
-                logger.info(
-                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
-                    total_duration_ms / 1000.0,
-                )
-
-            peak_memories = [r.get("peak_memory_mb", 0) for r in results]
-            if peak_memories:
-                max_peak_memory = max(peak_memories)
-                avg_peak_memory = sum(peak_memories) / len(peak_memories)
-                logger.info(
-                    f"Memory usage - Max peak: {max_peak_memory:.2f} MB, "
-                    f"Avg peak: {avg_peak_memory:.2f} MB"
-                )
-
-        if len(results) == 0:
+        if not results:
             return None
-        else:
-            if requests[0].return_frames:
-                results = [r["frames"] for r in results]
-            if len(results) == 1:
-                return results[0]
-            return results
+        return results[0] if len(results) == 1 else results
+
+    def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
+        """Collect prompts from the argument or from a prompt file."""
+        if self.server_args.prompt_file_path is not None:
+            path = self.server_args.prompt_file_path
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Prompt text file not found: {path}")
+            with open(path, encoding="utf-8") as f:
+                prompts = [line.strip() for line in f if line.strip()]
+            if not prompts:
+                raise ValueError(f"No prompts found in file: {path}")
+            logger.info("Found %d prompts in %s", len(prompts), path)
+            return prompts
+
+        if prompt is None:
+            return [" "]
+        if isinstance(prompt, str):
+            return [prompt]
+        return list(prompt)
+
+    def _log_summary(self, results: list[GenerationResult]) -> None:
+        if not results:
+            return
+        if self.server_args.warmup:
+            total_duration_ms = results[0].timings.get("total_duration_ms", 0)
+            logger.info(
+                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                total_duration_ms / 1000.0,
+            )
+
+        peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
+        if peak_memories:
+            logger.info(
+                f"Memory usage - Max peak: {max(peak_memories):.2f} MB, "
+                f"Avg peak: {sum(peak_memories) / len(peak_memories):.2f} MB"
+            )
 
     def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
         """
@@ -414,20 +393,15 @@ class DiffGenerator:
             "Failed to merge LoRA weights",
         )
 
-    def list_loras(self) -> OutputBatch:
-        """
-        List loaded LoRA adapters and current application status per module.
-        """
-
+    def list_loras(self) -> dict:
+        """List loaded LoRA adapters and current application status per module."""
         output = self._send_lora_request(
             req=ListLorasReq(),
             success_msg="Successfully listed LoRA adapters",
             failure_msg="Failed to list LoRA adapters",
         )
-        if output.error is None:
-            return output.output or {}
-        else:
-            raise RuntimeError(f"Failed to list LoRA adapters: {output.error}")
+        # _send_lora_request already raises on error, so output.error is always None here
+        return output.output or {}
 
     def _ensure_lora_state(
         self,
@@ -503,6 +477,9 @@ class DiffGenerator:
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def __enter__(self):
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()

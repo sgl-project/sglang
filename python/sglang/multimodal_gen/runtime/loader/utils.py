@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 """Utilities for selecting and loading models."""
+
 import contextlib
 import glob
 import os
@@ -30,7 +31,7 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def get_param_names_mapping(
-    mapping_dict: dict[str, str]
+    mapping_dict: dict[str, str],
 ) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
@@ -86,6 +87,8 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
+            continue
         reverse_param_names_mapping[target_param_name] = (
             source_param_name,
             merge_index,
@@ -145,13 +148,15 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+BYTES_PER_GB = 1024**3
+
+
 def get_memory_usage_of_component(module) -> float | None:
     """
     returned value is in GB, rounded to 2 decimal digits
     """
     if not isinstance(module, nn.Module):
         return None
-    BYTES_PER_GB = 1024**3
     if hasattr(module, "get_memory_footprint"):
         usage = module.get_memory_footprint() / BYTES_PER_GB
     else:

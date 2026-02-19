@@ -237,6 +237,7 @@ class Engine(EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -275,6 +276,7 @@ class Engine(EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -318,6 +320,7 @@ class Engine(EngineBase):
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -326,6 +329,7 @@ class Engine(EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -356,6 +360,7 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -365,6 +370,7 @@ class Engine(EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -380,6 +386,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -393,6 +400,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -407,6 +415,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -422,6 +431,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            lora_path=lora_path,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -839,7 +849,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.2",
+                "0.6.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -936,7 +946,29 @@ def _launch_scheduler_processes(
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                attn_dp_size = (
+                    server_args.dp_size if server_args.enable_dp_attention else 1
+                )
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
+                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
@@ -946,6 +978,8 @@ def _launch_scheduler_processes(
                             port_args,
                             gpu_id,
                             tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
                             moe_ep_rank,
                             pp_rank,
                             None,
