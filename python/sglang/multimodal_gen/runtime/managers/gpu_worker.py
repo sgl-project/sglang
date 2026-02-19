@@ -278,6 +278,8 @@ class GPUWorker:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
+            if isinstance(e, _oom_exceptions()):
+                logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
@@ -427,13 +429,19 @@ OOM detected. Possible solutions:
   - If the OOM occurs during loading:
     1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
   - If the OOM occurs during runtime:
-    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    2. Enable SP and/or TP
+    1. Enable SP and/or TP (in a multi-GPU setup)
+    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     3. Opt for a sparse-attention backend
     4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
     5. Enable quantization (e.g. nunchaku)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
+
+
+def _oom_exceptions():
+    """exception types for CUDA/general OOM (torch.OutOfMemoryError exists only in some PyTorch builds)."""
+    types = [torch.cuda.OutOfMemoryError, torch.OutOfMemoryError]
+    return tuple(types)
 
 
 def run_scheduler_process(
@@ -483,7 +491,7 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except torch.OutOfMemoryError as _e:
+    except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise
     finally:
