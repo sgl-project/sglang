@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -145,3 +145,33 @@ class HybridAttnBackend(AttentionBackend):
     ) -> Optional[BaseIndexerMetadata]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
+
+    def forward(
+        self,
+        q: Optional[torch.Tensor] = None,  # For full attention
+        k: Optional[torch.Tensor] = None,  # For full attention
+        v: Optional[torch.Tensor] = None,  # For full attention
+        layer: RadixAttention = None,
+        forward_batch: ForwardBatch = None,
+        save_kv_cache: bool = True,
+        mixed_qkv: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+        ] = None,  # For GDN linear attention
+        a: Optional[torch.Tensor] = None,  # For GDN linear attention
+        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        **kwargs,
+    ):
+        """Forward method that supports both regular attention (q, k, v) and linear attention (mixed_qkv, a, b)."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            **kwargs,
+        )
