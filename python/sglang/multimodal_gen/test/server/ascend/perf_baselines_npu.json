@@ -141,7 +141,7 @@
         "wan2_1_t2v_1.3b_1_npu": {
             "stages_ms": {
                 "LatentPreparationStage": 0.18,
-                "per_frame_generation": Infinity,
+                "per_frame_generation": null,
                 "TextEncodingStage": 1609.27,
                 "TimestepPreparationStage": 3.23,
                 "ConditioningStage": 0.02,
