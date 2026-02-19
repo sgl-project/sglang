@@ -444,6 +444,8 @@ class DecodePreallocQueue:
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                if decode_req.req.time_stats.bootstrap_done_time == 0.0:
+                    decode_req.req.time_stats.bootstrap_done_time = time.perf_counter()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -595,6 +597,15 @@ class DecodePreallocQueue:
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
+            # Set bootstrap and alloc waiting durations
+            ts = decode_req.req.time_stats
+            if ts.bootstrap_done_time > 0 and ts.decode_prealloc_queue_entry_time > 0:
+                ts.bootstrap_duration = (
+                    ts.bootstrap_done_time - ts.decode_prealloc_queue_entry_time
+                )
+                ts.alloc_waiting_duration = (
+                    ts.decode_transfer_queue_entry_time - ts.bootstrap_done_time
+                )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             trace_slice_end(
                 RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True

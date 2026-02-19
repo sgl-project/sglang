@@ -67,7 +67,9 @@ class TimeStats:
     prefill_transfer_queue_entry_time: float = 0.0
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
-    # TODO: correct set them
+    bootstrap_done_time: float = (
+        0.0  # When bootstrap completes (poll -> WaitingForInput)
+    )
     bootstrap_duration: float = 0.0
     alloc_waiting_duration: float = 0.0
     prefill_start_time_host: float = 0.0
