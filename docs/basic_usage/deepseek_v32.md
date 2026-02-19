@@ -66,9 +66,13 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --n
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
+  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires QKV bf16 or QKV fp8.
 - On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
   - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
   - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
+- On Blackwell platform, with slightly accuracy drop, the performance can boost up to 3x-5x
+  - B200: by choosing `trtllm` for both `--nsa-prefill-backend` and `--nsa-decode-backend`, the prefill attention use MHA via TRT-LLM ragged for both short and long sequence (**accuracy impact**). Combine the `trtllm` with `fp8_e4m3` kv cache, the kv cache dim is `576` (kv_lora_rank + qk_rope_head_dim) (**accuracy impact**), compare to the combination of `flashmla_auto` and `fp8_e4m` kv cache dim is `656` (kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage).
+
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
@@ -306,11 +310,9 @@ DeepSeek-V3.2-Speciale:
 
 For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
 
-### In sequence splitting (default setting)
+### In sequence splitting
 
-The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
-
-The communication group for context parallel reuses the one for attention tp, thus `cp_size` equals `atten_tp_size = tp_size / dp_size`.
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
 
 Note that in sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
@@ -323,10 +325,10 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example:
 ```bash
 # In-seq splitting mode launched with EP + DP
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
 ```
 
-### Round robin splitting
+### Round robin splitting (default setting)
 
 This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
 
@@ -337,7 +339,7 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example usage:
 ```bash
 # Launch with FusedMoe + CP8
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
@@ -361,6 +363,7 @@ python3 -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
@@ -384,6 +387,7 @@ python3 -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
@@ -411,6 +415,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
@@ -436,6 +441,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
   --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
