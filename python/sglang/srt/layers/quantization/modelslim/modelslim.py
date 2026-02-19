@@ -226,8 +226,8 @@ class ModelSlimConfig(QuantizationConfig):
             == "W8A8_DYNAMIC"
         )
         if is_moe_w4a4_dynamic:
-            logger.info_once("Using ModelSlimW4A4Int8MoE")
-            return ModelSlimW4A8Int8MoE(self)
+            logger.info_once("Using ModelSlimW4A4Int4MoE")
+            return ModelSlimW4A4Int4MoE(self)
         elif is_moe_w4a8_dynamic:
             logger.info_once("Using ModelSlimW4A8Int8MoE")
             return ModelSlimW4A8Int8MoE(self)
