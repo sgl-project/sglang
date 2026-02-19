@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.rotary_embedding._base import RotaryEmbedding
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     get_device,
     is_hip,
     is_npu,

@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 
 from sglang.srt.layers.rotary_embedding._utils import _apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp

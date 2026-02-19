@@ -3,17 +3,18 @@
 
 from __future__ import annotations
 
-import itertools
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.rotary_embedding._base import RotaryEmbedding, apply_interleaved_rope
+from sglang.srt.layers.rotary_embedding._base import (
+    RotaryEmbedding,
+    apply_interleaved_rope,
+)
 from sglang.srt.layers.rotary_embedding._utils import _apply_rotary_emb
 from sglang.srt.layers.rotary_embedding._yarn import (
-    YaRNScalingRotaryEmbedding,
     _yarn_find_correction_range,
     _yarn_get_mscale,
     _yarn_linear_ramp_mask,
@@ -116,14 +117,22 @@ def _triton_mrope_forward_fused(
         first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
             tl.arange(0, pad_hd // 2)[None, :] < rd // 2
         )
-        q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(sin_row.dtype)
-        k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(sin_row.dtype)
+        q_tile_1 = tl.load(q_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_1 = tl.load(k_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(
+            sin_row.dtype
+        )
         second_half_q_offsets = first_half_q_offsets + (rd // 2)
         second_half_k_offsets = first_half_k_offsets + (rd // 2)
         second_q_mask = first_q_mask
         second_k_mask = first_k_mask
-        q_tile_2 = tl.load(q_ptr + second_half_q_offsets, mask=second_q_mask, other=0).to(sin_row.dtype)
-        k_tile_2 = tl.load(k_ptr + second_half_k_offsets, mask=second_k_mask, other=0).to(sin_row.dtype)
+        q_tile_2 = tl.load(
+            q_ptr + second_half_q_offsets, mask=second_q_mask, other=0
+        ).to(sin_row.dtype)
+        k_tile_2 = tl.load(
+            k_ptr + second_half_k_offsets, mask=second_k_mask, other=0
+        ).to(sin_row.dtype)
         new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
         tl.store(q_ptr + first_half_q_offsets, new_q_tile_1, mask=first_q_mask)
         new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
@@ -148,10 +157,18 @@ def _triton_mrope_forward_fused(
         odd_q_mask = qn_mask & idx_mask
         even_k_mask = kn_mask & idx_mask
         odd_k_mask = kn_mask & idx_mask
-        q_tile_1 = tl.load(q_ptr + even_q_offsets, mask=even_q_mask, other=0).to(sin_row.dtype)
-        k_tile_1 = tl.load(k_ptr + even_k_offsets, mask=even_k_mask, other=0).to(sin_row.dtype)
-        q_tile_2 = tl.load(q_ptr + odd_q_offsets, mask=odd_q_mask, other=0).to(sin_row.dtype)
-        k_tile_2 = tl.load(k_ptr + odd_k_offsets, mask=odd_k_mask, other=0).to(sin_row.dtype)
+        q_tile_1 = tl.load(q_ptr + even_q_offsets, mask=even_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_1 = tl.load(k_ptr + even_k_offsets, mask=even_k_mask, other=0).to(
+            sin_row.dtype
+        )
+        q_tile_2 = tl.load(q_ptr + odd_q_offsets, mask=odd_q_mask, other=0).to(
+            sin_row.dtype
+        )
+        k_tile_2 = tl.load(k_ptr + odd_k_offsets, mask=odd_k_mask, other=0).to(
+            sin_row.dtype
+        )
         new_q_tile_1 = q_tile_1 * cos_row - q_tile_2 * sin_row
         tl.store(q_ptr + even_q_offsets, new_q_tile_1, mask=even_q_mask)
         new_q_tile_2 = q_tile_2 * cos_row + q_tile_1 * sin_row
@@ -205,12 +222,25 @@ def triton_mrope_fused(
     pad_n_kh = triton.next_power_of_2(n_kh)
     pad_hd = triton.next_power_of_2(head_size)
     _triton_mrope_forward_fused[(num_tokens,)](
-        q, k, cos_sin_cache, positions,
-        q.stride(0), k.stride(0), positions.stride(0),
-        n_qh, n_kh, head_size, rotary_dim,
-        pad_n_qh, pad_n_kh, pad_hd,
-        mrope_section[0], mrope_section[1], mrope_section[2],
-        mrope_interleaved, is_neox_style,
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        q.stride(0),
+        k.stride(0),
+        positions.stride(0),
+        n_qh,
+        n_kh,
+        head_size,
+        rotary_dim,
+        pad_n_qh,
+        pad_n_kh,
+        pad_hd,
+        mrope_section[0],
+        mrope_section[1],
+        mrope_section[2],
+        mrope_interleaved,
+        is_neox_style,
     )
 
 
@@ -353,9 +383,15 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert self.mrope_section
         self._match_cos_sin_cache_dtype(query)
         triton_mrope_fused(
-            query, key, self.cos_sin_cache, positions,
-            self.mrope_section, self.head_size, self.rotary_dim,
-            self.mrope_interleaved, self.is_neox_style,
+            query,
+            key,
+            self.cos_sin_cache,
+            positions,
+            self.mrope_section,
+            self.head_size,
+            self.rotary_dim,
+            self.mrope_interleaved,
+            self.is_neox_style,
         )
         return query, key
 
@@ -375,8 +411,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         rotary_mode = "half" if self.is_neox_style else "interleave"
         mrope_section = [0, 0, 0]
         query_out, key_out = torch_npu.npu_mrope(
-            positions, query, key, self.cos_sin_cache, self.head_size,
-            mrope_section=mrope_section, rotary_mode=rotary_mode,
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
         )
         return query_out, key_out
 
@@ -402,16 +443,31 @@ class MRotaryEmbedding(RotaryEmbedding):
             _get_rope_index_impl,
             _get_rope_index_qwen3_omni_impl,
         )
+
         if model_type == "qwen3_omni_moe":
             return _get_rope_index_qwen3_omni_impl(
-                spatial_merge_size, image_token_id, video_token_id,
-                vision_start_token_id, tokens_per_second, input_ids,
-                image_grid_thw, video_grid_thw, second_per_grid_ts, **kwargs,
+                spatial_merge_size,
+                image_token_id,
+                video_token_id,
+                vision_start_token_id,
+                tokens_per_second,
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                second_per_grid_ts,
+                **kwargs,
             )
         return _get_rope_index_impl(
-            spatial_merge_size, image_token_id, video_token_id,
-            vision_start_token_id, model_type, tokens_per_second,
-            input_ids, image_grid_thw, video_grid_thw, second_per_grid_ts,
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            model_type,
+            tokens_per_second,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            second_per_grid_ts,
         )
 
     # Adapted from https://github.com/vllm-project/vllm/blob/3779eb8c81449b924a23457fc77e45a0e6171178/vllm/model_executor/layers/rotary_embedding.py#L1120
@@ -428,8 +484,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         from sglang.srt.layers.rotary_embedding._mrope_rope_index import (
             _get_rope_index_glm4v_impl,
         )
+
         return _get_rope_index_glm4v_impl(
-            input_ids, hf_config, image_grid_thw, video_grid_thw, attention_mask, **kwargs
+            input_ids,
+            hf_config,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+            **kwargs,
         )
 
     @staticmethod
@@ -444,6 +506,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         from sglang.srt.layers.rotary_embedding._mrope_rope_index import (
             _get_rope_index_ernie45_impl,
         )
+
         return _get_rope_index_ernie45_impl(
             input_ids, hf_config, image_grid_thw, video_grid_thw, **kwargs
         )
@@ -520,8 +583,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         self.truncate = truncate
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype,
-            mrope_section=mrope_section, mrope_interleaved=mrope_interleaved,
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            mrope_section=mrope_section,
+            mrope_interleaved=mrope_interleaved,
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -531,11 +600,16 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
         low, high = _yarn_find_correction_range(
-            self.beta_fast, self.beta_slow, self.rotary_dim, self.base,
-            self.max_position_embeddings, self.truncate,
+            self.beta_fast,
+            self.beta_slow,
+            self.rotary_dim,
+            self.base,
+            self.max_position_embeddings,
+            self.truncate,
         )
         inv_freq_mask = (
-            1 - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+            1
+            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
@@ -592,7 +666,9 @@ def _triton_ernie45_rope_qk_fused(
     use_h = (ridx & 1) == 0
     pos = tl.where(use_hw, tl.where(use_h, hpos, wpos), tpos)
     cos = tl.load(cos_sin_cache_ptr + pos * rd + ridx, mask=rmask, other=0.0)
-    sin = tl.load(cos_sin_cache_ptr + pos * rd + (ridx + half_rd), mask=rmask, other=0.0)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * rd + (ridx + half_rd), mask=rmask, other=0.0
+    )
     if is_neox_style:
         q_head = tl.arange(0, pad_n_qh)[:, None]
         k_head = tl.arange(0, pad_n_kh)[:, None]
@@ -621,15 +697,23 @@ def _triton_ernie45_rope_qk_fused(
         k_mask = (k_head < n_kh) & (p < half_rd)
         even = 2 * p
         odd = even + 1
-        q_even = tl.load(q_ptr + q_head * hd + even, mask=q_mask, other=0.0).to(cos.dtype)
+        q_even = tl.load(q_ptr + q_head * hd + even, mask=q_mask, other=0.0).to(
+            cos.dtype
+        )
         q_odd = tl.load(q_ptr + q_head * hd + odd, mask=q_mask, other=0.0).to(cos.dtype)
-        k_even = tl.load(k_ptr + k_head * hd + even, mask=k_mask, other=0.0).to(cos.dtype)
+        k_even = tl.load(k_ptr + k_head * hd + even, mask=k_mask, other=0.0).to(
+            cos.dtype
+        )
         k_odd = tl.load(k_ptr + k_head * hd + odd, mask=k_mask, other=0.0).to(cos.dtype)
         cos_b = cos[None, :]
         sin_b = sin[None, :]
-        tl.store(q_ptr + q_head * hd + even, q_even * cos_b - q_odd * sin_b, mask=q_mask)
+        tl.store(
+            q_ptr + q_head * hd + even, q_even * cos_b - q_odd * sin_b, mask=q_mask
+        )
         tl.store(q_ptr + q_head * hd + odd, q_odd * cos_b + q_even * sin_b, mask=q_mask)
-        tl.store(k_ptr + k_head * hd + even, k_even * cos_b - k_odd * sin_b, mask=k_mask)
+        tl.store(
+            k_ptr + k_head * hd + even, k_even * cos_b - k_odd * sin_b, mask=k_mask
+        )
         tl.store(k_ptr + k_head * hd + odd, k_odd * cos_b + k_even * sin_b, mask=k_mask)
 
 
@@ -657,7 +741,9 @@ def triton_ernie45_rope_fused_inplace(
     assert rd % 2 == 0 and rd <= head_size
     section_h, section_w, section_t = mrope_section
     assert section_h == section_w, "Ernie4.5 layout assumes section_h == section_w"
-    assert section_h + section_w + section_t == rd // 2, "mrope_section must sum to rotary_dim//2"
+    assert (
+        section_h + section_w + section_t == rd // 2
+    ), "mrope_section must sum to rotary_dim//2"
     if cos_sin_cache.dtype != q.dtype or cos_sin_cache.device != q.device:
         cos_sin_cache = cos_sin_cache.to(device=q.device, dtype=q.dtype)
     pad_n_qh = triton.next_power_of_2(n_qh)
@@ -665,10 +751,20 @@ def triton_ernie45_rope_fused_inplace(
     pad_hd = triton.next_power_of_2(head_size)
     num_warps = 4 if (pad_n_qh * pad_hd) <= 8192 else 8
     _triton_ernie45_rope_qk_fused[(num_tokens,)](
-        q, k, cos_sin_cache, positions,
-        q.stride(0), k.stride(0), positions.stride(0),
-        n_qh=n_qh, n_kh=n_kh, hd=head_size, rd=rd,
-        pad_n_qh=pad_n_qh, pad_n_kh=pad_n_kh, pad_hd=pad_hd,
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        q.stride(0),
+        k.stride(0),
+        positions.stride(0),
+        n_qh=n_qh,
+        n_kh=n_kh,
+        hd=head_size,
+        rd=rd,
+        pad_n_qh=pad_n_qh,
+        pad_n_kh=pad_n_kh,
+        pad_hd=pad_hd,
         section_hw=section_h + section_w,
         is_neox_style=is_neox_style,
         num_warps=num_warps,
@@ -690,8 +786,14 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype,
-            mrope_section=mrope_section, mrope_interleaved=mrope_interleaved,
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            mrope_section=mrope_section,
+            mrope_interleaved=mrope_interleaved,
         )
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -724,19 +826,25 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
             section_cos_h = cos[..., : section_h + section_w : 2]
             section_cos_w = cos[..., 1 : section_h + section_w : 2]
             cos_t, cos_h, cos_w = section_cos_t[0], section_cos_h[1], section_cos_w[2]
-            cos_hw = torch.stack([cos_h, cos_w], dim=-1).reshape(cos_h.shape[:-1] + (cos_h.shape[-1] * 2,))
+            cos_hw = torch.stack([cos_h, cos_w], dim=-1).reshape(
+                cos_h.shape[:-1] + (cos_h.shape[-1] * 2,)
+            )
             cos = torch.cat([cos_hw, cos_t], dim=-1)
             section_sin_t = sin[..., -section_t:]
             section_sin_h = sin[..., : section_h + section_w : 2]
             section_sin_w = sin[..., 1 : section_h + section_w : 2]
             sin_t, sin_h, sin_w = section_sin_t[0], section_sin_h[1], section_sin_w[2]
-            sin_hw = torch.stack([sin_h, sin_w], dim=-1).reshape(sin_h.shape[:-1] + (sin_h.shape[-1] * 2,))
+            sin_hw = torch.stack([sin_h, sin_w], dim=-1).reshape(
+                sin_h.shape[:-1] + (sin_h.shape[-1] * 2,)
+            )
             sin = torch.cat([sin_hw, sin_t], dim=-1)
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = self._apply_rotary_emb_wrapped(query_rot, cos, sin, self.is_neox_style)
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
@@ -758,15 +866,23 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section is not None
             triton_ernie45_rope_fused_inplace(
-                q=query, k=key, cos_sin_cache=self.cos_sin_cache, positions=positions,
-                mrope_section=self.mrope_section, head_size=self.head_size,
-                rotary_dim=self.rotary_dim, is_neox_style=self.is_neox_style,
+                q=query,
+                k=key,
+                cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                mrope_section=self.mrope_section,
+                head_size=self.head_size,
+                rotary_dim=self.rotary_dim,
+                is_neox_style=self.is_neox_style,
             )
             return query, key
         if _is_cuda and (apply_rope_with_cos_sin_cache_inplace is not None):
             apply_rope_with_cos_sin_cache_inplace(
-                positions=positions, query=query, key=key,
-                head_size=self.head_size, cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
             )
             return query, key
