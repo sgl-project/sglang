@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
-    fused_fp8_set_kv_buffer,
+    fused_fp8_set_qkv_buffer,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -123,6 +123,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
+        # Q FP8 buffer for fused QKV quantization (lazy allocated on first use)
+        self.q_fp8_buffer: Optional[torch.Tensor] = None
+        self.num_q_heads = config.num_attention_heads // model_runner.tp_size
+        self.head_dim = config.head_dim
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -130,6 +135,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
+        # Pre-allocate Q FP8 buffer for fused QKV quantization
+        # This buffer is reused across forward calls to avoid allocation during CUDA graph
+        if self.data_type == torch.float8_e4m3fn:
+            self.q_fp8_buffer = torch.empty(
+                max_num_tokens,
+                self.num_q_heads,
+                self.head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -429,10 +445,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         return 1
 
     def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
-        """Check if we should use the fused FP8 KV cache write path."""
+        """Check if we should use the fused FP8 QKV quantization path."""
         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
 
-    def _fused_fp8_set_kv_buffer(
+    def _ensure_q_fp8_buffer(self, num_tokens: int) -> None:
+        """Lazy allocate q_fp8_buffer if needed."""
+        if self.q_fp8_buffer is None or self.q_fp8_buffer.shape[0] < num_tokens:
+            buffer_size = max(num_tokens, 1024)
+            self.q_fp8_buffer = torch.empty(
+                buffer_size,
+                self.num_q_heads,
+                self.head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+
+    def _fused_fp8_set_qkv_buffer(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -440,23 +468,35 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         **kwargs,
-    ):
-        """Fused FP8 quantization and KV cache write."""
+    ) -> torch.Tensor:
+        """Fused FP8 quantization for Q, K, V in a single kernel. Returns q_fp8."""
         cache_loc = forward_batch.out_cache_loc
-
-        # Get K/V cache buffers from token_to_kv_pool
+        num_tokens = q.shape[0]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        fused_fp8_set_kv_buffer(
+        self._ensure_q_fp8_buffer(num_tokens)
+        q_out = self.q_fp8_buffer[:num_tokens]
+        k_scale, v_scale = layer.k_scale, layer.v_scale
+        if k_scale is not None and v_scale is not None:
+            inv_k_scale = 1.0 / float(k_scale)
+            inv_v_scale = 1.0 / float(v_scale)
+        else:
+            inv_k_scale = None
+            inv_v_scale = None
+        fused_fp8_set_qkv_buffer(
+            q=q,
             k=k,
             v=v,
             k_cache=k_cache,
             v_cache=v_cache,
             cache_loc=cache_loc,
-            k_scale=layer.k_scale,  # May be None
-            v_scale=layer.v_scale,  # May be None
+            q_out=q_out,
+            inv_k_scale=inv_k_scale,
+            inv_v_scale=inv_v_scale,
             page_size=self.page_size,
         )
+
+        return q_out
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -580,8 +620,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
+            # Use fused FP8 quantization for Q, K, V in a single kernel
+            # This eliminates the separate q.to(fp8) kernel launch
+            q = self._fused_fp8_set_qkv_buffer(
                 q=q,
                 k=k,
                 v=v,
@@ -596,9 +637,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+            # Non-fused path: cast Q to FP8 separately
+            if self.data_type == torch.float8_e4m3fn:
+                q = q.to(torch.float8_e4m3fn)
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -663,8 +705,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
+            # Use fused FP8 quantization for Q, K, V in a single kernel
+            # This eliminates the separate q.to(fp8) kernel launch
+            q = self._fused_fp8_set_qkv_buffer(
                 q=q,
                 k=k,
                 v=v,
@@ -679,9 +722,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+            # Non-fused path: cast Q to FP8 separately
+            if self.data_type == torch.float8_e4m3fn:
+                q = q.to(torch.float8_e4m3fn)
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
