@@ -3411,7 +3411,9 @@ def get_rope(
         elif "type" in rope_scaling:
             scaling_type = rope_scaling["type"]
         else:
-            raise ValueError("Unknown RoPE scaling type")
+            raise ValueError(
+                f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}"
+            )
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
