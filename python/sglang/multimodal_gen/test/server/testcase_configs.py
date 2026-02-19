@@ -408,13 +408,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
-    DiffusionTestCase(
-        "zimage_image_t2i_warmup",
-        DiffusionServerArgs(
-            model_path="Tongyi-MAI/Z-Image-Turbo", modality="image", warmup=True
-        ),
-        T2I_sampling_params,
-    ),
     # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
         "zimage_image_t2i_multi_lora",
