@@ -82,38 +82,14 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     moe_type: CutlassMoEType
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    expert_offsets: torch.Tensor
-    problem_sizes1: torch.Tensor
-    problem_sizes2: torch.Tensor
-    ab_strides_13: Optional[torch.Tensor] = None
-    ab_strides_2: Optional[torch.Tensor] = None
-    c_strides_13: Optional[torch.Tensor] = None
-    c_strides_2: Optional[torch.Tensor] = None
-    workspace: Optional[torch.Tensor] = None
-    a_ptrs: Optional[torch.Tensor] = None
-    b_ptrs: Optional[torch.Tensor] = None
-    out_ptrs: Optional[torch.Tensor] = None
-    a_scales_ptrs: Optional[torch.Tensor] = None
-    b_scales_ptrs: Optional[torch.Tensor] = None
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     w1_blockscale: Optional[torch.Tensor] = None
     w2_blockscale: Optional[torch.Tensor] = None
     w1_alpha: Optional[torch.Tensor] = None
     w2_alpha: Optional[torch.Tensor] = None
-    use_mxfp8: Optional[bool] = False,
+    use_mxfp8: Optional[bool] = False
     enable_es: Optional[Tuple[bool, bool]] = (False, False)
-
-
-    # W4A8 specific fields
-    a_strides1: Optional[torch.Tensor] = None
-    b_strides1: Optional[torch.Tensor] = None
-    c_strides1: Optional[torch.Tensor] = None
-    a_strides2: Optional[torch.Tensor] = None
-    b_strides2: Optional[torch.Tensor] = None
-    c_strides2: Optional[torch.Tensor] = None
-    s_strides13: Optional[torch.Tensor] = None
-    s_strides2: Optional[torch.Tensor] = None
     w13_input_scale: Optional[torch.Tensor] = None
     w2_input_scale: Optional[torch.Tensor] = None
     params: Optional[CutlassMoEParams] = None
@@ -123,10 +99,8 @@ class CutlassRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
-        if not is_cuda():
+        if not is_cuda(): # TODO (Jonahcb): maybe move this to server args
             raise RuntimeError("Cutlass runner requires CUDA support.")
-        # if not is_sm90_supported():
-        #     raise RuntimeError("Cutlass runner requires NVIDIA SM90 or newer GPUs.")
         if self.config.activation not in ("silu", None):
             raise ValueError("Cutlass runner currently supports SiLU activation only.")
 
@@ -161,17 +135,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 quant_info.w2_scale,
                 runner_input.topk_ids,
                 runner_input.masked_m,
-                quant_info.a_strides1,
-                quant_info.b_strides1,
-                quant_info.c_strides1,
-                quant_info.a_strides2,
-                quant_info.b_strides2,
-                quant_info.c_strides2,
-                quant_info.s_strides13,
-                quant_info.s_strides2,
-                quant_info.expert_offsets,
-                quant_info.problem_sizes1,
-                quant_info.problem_sizes2,
+                quant_info.params,
                 running_state,
                 quant_info.w13_input_scale,
                 quant_info.w2_input_scale,
@@ -186,17 +150,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w1_scale=quant_info.w13_scale,
                 w2_scale=quant_info.w2_scale,
                 topk_ids_=runner_input.topk_ids,
-                a_strides1=quant_info.a_strides1,
-                b_strides1=quant_info.b_strides1,
-                c_strides1=quant_info.c_strides1,
-                a_strides2=quant_info.a_strides2,
-                b_strides2=quant_info.b_strides2,
-                c_strides2=quant_info.c_strides2,
-                s_strides13=quant_info.s_strides13,
-                s_strides2=quant_info.s_strides2,
-                expert_offsets=quant_info.expert_offsets,
-                problem_sizes1=quant_info.problem_sizes1,
-                problem_sizes2=quant_info.problem_sizes2,
+                params=quant_info.params,
                 a1_scale=quant_info.w13_input_scale,
                 a2_scale=quant_info.w2_input_scale,
             )
@@ -214,19 +168,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w1_scale=quant_info.w13_scale,
                 w2_scale=quant_info.w2_scale,
                 topk_ids=runner_input.topk_ids,
-                a1_strides=quant_info.ab_strides_13,
-                c1_strides=quant_info.c_strides_13,
-                a2_strides=quant_info.ab_strides_2,
-                c2_strides=quant_info.c_strides_2,
-                workspace=quant_info.workspace,
-                a_ptrs=quant_info.a_ptrs,
-                b_ptrs=quant_info.b_ptrs,
-                out_ptrs=quant_info.out_ptrs,
-                a_scales_ptrs=quant_info.a_scales_ptrs,
-                b_scales_ptrs=quant_info.b_scales_ptrs,
-                expert_offsets=quant_info.expert_offsets,
-                problem_sizes1=quant_info.problem_sizes1,
-                problem_sizes2=quant_info.problem_sizes2,
+                params=quant_info.params,
                 rep_a1_scales=runner_input.rep_aux,
                 use_mxfp8=quant_info.use_mxfp8,
                 blockscale_offsets=running_state.get("blockscale_offsets", None),
@@ -238,7 +180,6 @@ class CutlassRunnerCore(MoeRunnerCore):
             down_output = self.cutlass_moe_fp4(
                 a=runner_input.rep_primary,  # Use preprocessed input
                 rep_aux=runner_input.rep_aux,
-                a1_gscale=quant_info.w13_input_scale,
                 w1_fp4=quant_info.w13_weight,
                 w1_blockscale=quant_info.w1_blockscale,
                 w1_alphas=quant_info.w1_alpha,
@@ -258,17 +199,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w1_scale=quant_info.w13_scale,
                 w2_scale=quant_info.w2_scale,
                 topk_ids=runner_input.topk_ids,
-                a_strides1=quant_info.a_strides1,
-                b_strides1=quant_info.b_strides1,
-                c_strides1=quant_info.c_strides1,
-                a_strides2=quant_info.a_strides2,
-                b_strides2=quant_info.b_strides2,
-                c_strides2=quant_info.c_strides2,
-                s_strides13=quant_info.s_strides13,
-                s_strides2=quant_info.s_strides2,
-                expert_offsets=quant_info.expert_offsets,
-                problem_sizes1=quant_info.problem_sizes1,
-                problem_sizes2=quant_info.problem_sizes2,
+                params=quant_info.params,
                 a1_scale=quant_info.w13_input_scale,
                 a2_scale=quant_info.w2_input_scale,
             )
@@ -292,10 +223,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         running_state["c_map"] = runner_input.c_map
         running_state["topk_weights"] = runner_input.topk_weights
         running_state["original_hidden_states_shape"] = runner_input.hidden_states.shape
-        running_state["moe_type"] = quant_info.moe_type
-        running_state["apply_router_weight_on_input"] = (
-            self.config.apply_router_weight_on_input
-        )
 
         return CutlassRunnerOutput(hidden_states=down_output)
 
@@ -311,17 +238,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         w1_scale: torch.Tensor,
         w2_scale: torch.Tensor,
         topk_ids: torch.Tensor,
-        a_strides1: torch.Tensor,
-        b_strides1: torch.Tensor,
-        c_strides1: torch.Tensor,
-        a_strides2: torch.Tensor,
-        b_strides2: torch.Tensor,
-        c_strides2: torch.Tensor,
-        s_strides13: torch.Tensor,
-        s_strides2: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        problem_sizes1: torch.Tensor,
-        problem_sizes2: torch.Tensor,
+        params: CutlassMoEParams,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -349,14 +266,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
             Shape: [num_experts, N // 512, K * 4]
         - topk_ids (torch.Tensor): The ids of each token->expert mapping.
-        - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
-        - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
-        - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
-        - a_strides2 (torch.Tensor): The input strides of the second grouped gemm.
-        - b_strides2 (torch.Tensor): The weights strides of the second grouped gemm.
-        - c_strides2 (torch.Tensor): The output strides of the second grouped gemm.
-        - s_strides13 (torch.Tensor): The input and scale strides of the first grouped gemm.
-        - s_strides2 (torch.Tensor): The scale strides of the second grouped gemm.
+        - params (CutlassMoEParams): The initialized Cutlass MoE parameters.
         - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
             Shape: scalar or [1, K]
         - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
@@ -389,12 +299,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w1_q,
             a1_scale.float(),
             w1_scale,
-            expert_offsets[:-1],
-            problem_sizes1,
-            a_strides1,
-            b_strides1,
-            c_strides1,
-            s_strides13,
+            params.expert_offsets[:-1],
+            params.problem_sizes1,
+            params.a_strides1,
+            params.b_strides1,
+            params.c_strides1,
+            params.s_strides13,
             128,
             topk,
         )
@@ -405,7 +315,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
 
         silu_mul_static_tensorwise_quant_for_cutlass_moe(
-            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+            c1, intermediate_q, a2_scale.float(), params.expert_offsets[-1:], m * topk, n
         )
 
 
@@ -415,12 +325,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w2_q,
             a2_scale.float(),
             w2_scale,
-            expert_offsets[:-1],
-            problem_sizes2,
-            a_strides2,
-            b_strides2,
-            c_strides2,
-            s_strides2,
+            params.expert_offsets[:-1],
+            params.problem_sizes2,
+            params.a_strides2,
+            params.b_strides2,
+            params.c_strides2,
+            params.s_strides2,
             128,
             topk,
         )
@@ -436,17 +346,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         w1_scale: torch.Tensor,
         w2_scale: torch.Tensor,
         topk_ids_: torch.Tensor,
-        a_strides1: torch.Tensor,
-        b_strides1: torch.Tensor,
-        c_strides1: torch.Tensor,
-        a_strides2: torch.Tensor,
-        b_strides2: torch.Tensor,
-        c_strides2: torch.Tensor,
-        s_strides13: torch.Tensor,
-        s_strides2: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        problem_sizes1: torch.Tensor,
-        problem_sizes2: torch.Tensor,
+        params: CutlassMoEParams,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -469,14 +369,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             Shape: [num_experts, K // 512, N * 8]
         - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
             Shape: [num_experts, N // 512, K * 4]
-        - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
-        - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
-        - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
-        - a_strides2 (torch.Tensor): The input strides of the second grouped gemm.
-        - b_strides2 (torch.Tensor): The weights strides of the second grouped gemm.
-        - c_strides2 (torch.Tensor): The output strides of the second grouped gemm.
-        - s_strides13 (torch.Tensor): The input and scale strides of the first grouped gemm.
-        - s_strides2 (torch.Tensor): The scale strides of the second grouped gemm.
+        - params (CutlassMoEParams): The initialized Cutlass MoE parameters.
         - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
             Shape: scalar or [1, K]
         - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
@@ -505,12 +398,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w1_q,
             a1_scale.float(),
             w1_scale,
-            expert_offsets[:-1],
-            problem_sizes1,
-            a_strides1,
-            b_strides1,
-            c_strides1,
-            s_strides13,
+            params.expert_offsets[:-1],
+            params.problem_sizes1,
+            params.a_strides1,
+            params.b_strides1,
+            params.c_strides1,
+            params.s_strides13,
             128,
             topk,
         )
@@ -529,12 +422,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w2_q,
             a2_scale.float(),
             w2_scale,
-            expert_offsets[:-1],
-            problem_sizes2,
-            a_strides2,
-            b_strides2,
-            c_strides2,
-            s_strides2,
+            params.expert_offsets[:-1],
+            params.problem_sizes2,
+            params.a_strides2,
+            params.b_strides2,
+            params.c_strides2,
+            params.s_strides2,
             128,
             topk,
         )
@@ -550,17 +443,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         w2_scale: torch.Tensor,
         topk_ids_: torch.Tensor,
         masked_m: torch.Tensor,
-        a_strides1: torch.Tensor,
-        b_strides1: torch.Tensor,
-        c_strides1: torch.Tensor,
-        a_strides2: torch.Tensor,
-        b_strides2: torch.Tensor,
-        c_strides2: torch.Tensor,
-        s_strides13: torch.Tensor,
-        s_strides2: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        problem_sizes1: torch.Tensor,
-        problem_sizes2: torch.Tensor,
+        params: CutlassMoEParams,
         running_state: Dict[str, torch.Tensor],
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
@@ -588,14 +471,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             Shape: [num_experts, K // 512, N * 8]
         - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
             Shape: [num_experts, N // 512, K * 4]
-        - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
-        - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
-        - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
-        - a_strides2 (torch.Tensor): The input strides of the second grouped gemm.
-        - b_strides2 (torch.Tensor): The weights strides of the second grouped gemm.
-        - c_strides2 (torch.Tensor): The output strides of the second grouped gemm.
-        - s_strides13 (torch.Tensor): The input and scale strides of the first grouped gemm.
-        - s_strides2 (torch.Tensor): The scale strides of the second grouped gemm.
+        - params (CutlassMoEParams): The initialized Cutlass MoE parameters.
         - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
             Shape: scalar or [1, K]
         - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
@@ -622,12 +498,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w1_q,
             a1_scale.float(),
             w1_scale,
-            expert_offsets[:-1],
+            params.expert_offsets[:-1],
             running_state["problem_sizes1"],
-            a_strides1,
-            b_strides1,
-            c_strides1,
-            s_strides13,
+            params.a_strides1,
+            params.b_strides1,
+            params.c_strides1,
+            params.s_strides13,
             128,
             topk,
         )
@@ -644,12 +520,12 @@ class CutlassRunnerCore(MoeRunnerCore):
             w2_q,
             a2_scale.float(),
             w2_scale,
-            expert_offsets[:-1],
+            params.expert_offsets[:-1],
             running_state["problem_sizes2"],
-            a_strides2,
-            b_strides2,
-            c_strides2,
-            s_strides2,
+            params.a_strides2,
+            params.b_strides2,
+            params.c_strides2,
+            params.s_strides2,
             128,
             topk,
         )
@@ -664,19 +540,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         w1_scale: torch.Tensor,
         w2_scale: torch.Tensor,
         topk_ids: torch.Tensor,
-        a1_strides: torch.Tensor,
-        c1_strides: torch.Tensor,
-        a2_strides: torch.Tensor,
-        c2_strides: torch.Tensor,
-        workspace: torch.Tensor,
-        a_ptrs: torch.Tensor,
-        b_ptrs: torch.Tensor,
-        out_ptrs: torch.Tensor,
-        a_scales_ptrs: torch.Tensor,
-        b_scales_ptrs: torch.Tensor,
-        expert_offsets: torch.Tensor,
-        problem_sizes1: torch.Tensor,
-        problem_sizes2: torch.Tensor,
+        params: CutlassMoEParams,
         rep_a1_scales: torch.Tensor,
         use_fp8_blockscale: bool = True,
         blockscale_offsets: Optional[torch.Tensor] = None,
@@ -720,24 +584,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 Shape: `(E, num_blocks_k, num_blocks_n)`. Dtype: `torch.float32`.
             topk_ids (torch.Tensor): Indices of the selected top-k experts for each token.
                 Shape: `(m, topk)`. Dtype: `torch.int32`.
-            a1_strides (torch.Tensor): Stride information for the first GEMM's 'a' input.
-                Passed directly to the underlying kernel. Expected shape `(E,)`, dtype `torch.int64`.
-                Note: Its exact usage within `fp8_blockwise_scaled_grouped_mm` needs clarification
-                as it's passed as both a_stride and b_stride in the first call.
-            c1_strides (torch.Tensor): Stride information for the first GEMM's 'c' output.
-                Passed directly to the underlying kernel. Expected shape `(E,)`, dtype `torch.int64`.
-            a2_strides (torch.Tensor): Stride information for the second GEMM's 'a' input.
-                Passed directly to the underlying kernel. Expected shape `(E,)`, dtype `torch.int64`.
-                Note: Its exact usage within `fp8_blockwise_scaled_grouped_mm` needs clarification
-                as it's passed as both a_stride and b_stride in the second call.
-            c2_strides (torch.Tensor): Stride information for the second GEMM's 'c' output.
-                Passed directly to the underlying kernel. Expected shape `(E,)`, dtype `torch.int64`.
-            workspace (torch.Tensor): Reusable workspace for the underlying kernel.
-            a_ptrs (torch.Tensor): Pointers container for calculating offsets of the input activations for each expert.
-            b_ptrs (torch.Tensor): Pointers container for calculating offsets of the input weights for each expert.
-            out_ptrs (torch.Tensor): Pointers container for calculating offsets of the output activations for each expert.
-            a_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
-            b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
+            params (CutlassMoEParams): The initialized Cutlass MoE parameters.
             use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
                 block scaling. Currently, only `True` is supported. Defaults to `True`.
             enable_es (tuple(bool, bool)): Flag indicating usage of expert specialization kernel for (up-projection, down-projection)
@@ -777,12 +624,12 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w1_q,
                 rep_a1_scales,
                 w1_scale,
-                a1_strides,
-                a1_strides,
-                c1_strides,
-                problem_sizes1,
-                expert_offsets[:-1],
-                workspace,
+                params.ab_strides_13,
+                params.ab_strides_13,
+                params.c_strides_13,
+                params.problem_sizes1,
+                params.expert_offsets[:-1],
+                params.workspace,
             )
         elif use_mxfp8 and es_up:
             es_sm100_mxfp8_blockscaled_grouped_mm(
@@ -791,30 +638,30 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w1_q,
                 rep_a1_scales,
                 w1_scale,
-                problem_sizes1,
-                expert_offsets[:-1],
+                params.problem_sizes1,
+                params.expert_offsets[:-1],
                 blockscale_offsets[:-1],
             )
         else:
             fp8_blockwise_scaled_grouped_mm(
                 c1,
-                a_ptrs,
-                b_ptrs,
-                out_ptrs,
-                a_scales_ptrs,
-                b_scales_ptrs,
+                params.a_ptrs,
+                params.b_ptrs,
+                params.out_ptrs,
+                params.a_scales_ptrs,
+                params.b_scales_ptrs,
                 rep_a_q,
                 w1_q,
                 rep_a1_scales,
                 w1_scale,
-                a1_strides,
-                a1_strides,
-                c1_strides,
+                params.ab_strides_13,
+                params.ab_strides_13,
+                params.c_strides_13,
                 a_sf_layout,
                 w_sf_layout,
-                problem_sizes1,
-                expert_offsets[:-1],
-                workspace,
+                params.problem_sizes1,
+                params.expert_offsets[:-1],
+                params.workspace,
             )
 
         intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
@@ -827,8 +674,8 @@ class CutlassRunnerCore(MoeRunnerCore):
             )
             es_sm100_mxfp8_blockscaled_grouped_quant(
                 intermediate,
-                problem_sizes2,
-                expert_offsets[:-1],
+                params.problem_sizes2,
+                params.expert_offsets[:-1],
                 blockscale_offsets[:-1],
                 intemediate_q,
                 a2_scale,
@@ -843,12 +690,12 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w2_q,
                 a2_scale,
                 w2_scale,
-                a2_strides,
-                a2_strides,
-                c2_strides,
-                problem_sizes2,
-                expert_offsets[:-1],
-                workspace,
+                params.ab_strides_2,
+                params.ab_strides_2,
+                params.c_strides_2,
+                params.problem_sizes2,
+                params.expert_offsets[:-1],
+                params.workspace,
             )
         elif use_mxfp8 and es_down:
             es_sm100_mxfp8_blockscaled_grouped_mm(
@@ -857,30 +704,30 @@ class CutlassRunnerCore(MoeRunnerCore):
                 w2_q,
                 a2_scale,
                 w2_scale,
-                problem_sizes2,
-                expert_offsets[:-1],
+                params.problem_sizes2,
+                params.expert_offsets[:-1],
                 blockscale_offsets[:-1],
             )
         else:
             fp8_blockwise_scaled_grouped_mm(
                 c2,
-                a_ptrs,
-                b_ptrs,
-                out_ptrs,
-                a_scales_ptrs,
-                b_scales_ptrs,
+                params.a_ptrs,
+                params.b_ptrs,
+                params.out_ptrs,
+                params.a_scales_ptrs,
+                params.b_scales_ptrs,
                 intemediate_q,
                 w2_q,
                 a2_scale,
                 w2_scale,
-                a2_strides,
-                a2_strides,
-                c2_strides,
+                params.ab_strides_2,
+                params.ab_strides_2,
+                params.c_strides_2,
                 a_sf_layout,
                 w_sf_layout,
-                problem_sizes2,
-                expert_offsets[:-1],
-                workspace,
+                params.problem_sizes2,
+                params.expert_offsets[:-1],
+                params.workspace,
             )
 
         return c2
@@ -889,7 +736,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         self,
         a: torch.Tensor,
         rep_aux: torch.Tensor,
-        a1_gscale: torch.Tensor,
         w1_fp4: torch.Tensor,
         w1_blockscale: torch.Tensor,
         w1_alphas: torch.Tensor,
@@ -905,7 +751,6 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         # Gemm 1
         a: Preprocessed FP4 input tensor: [m * topk, k // 2] (uint8, FP4 quantized and reordered)
-        a1_gscale: Activation scale per expert: [e]  (float32)
         w1(gate up) (not an argument to cutlass_moe_fp4): [e, 2 * n, k]
         w1_fp4: [e, 2 * n, k // 2], dtype: torch.uint8 (stacked fp4: E2M1)
         (Note: `n` is the up projection output dim, `k` is the input dim in
@@ -1015,9 +860,9 @@ def pre_permute_standard_to_cutlass(
         w2_q = quant_info.w2_weight
         w1_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
-        expert_offsets = quant_info.expert_offsets
-        problem_sizes1 = quant_info.problem_sizes1
-        problem_sizes2 = quant_info.problem_sizes2
+        expert_offsets = quant_info.params.expert_offsets
+        problem_sizes1 = quant_info.params.problem_sizes1
+        problem_sizes2 = quant_info.params.problem_sizes2
 
 
         enable_es = quant_info.enable_es
@@ -1145,11 +990,7 @@ def pre_permute_standard_to_cutlass(
         params = quant_info.params
 
         # Store state for post_permute
-        running_state["moe_type"] = CutlassMoEType.BlockscaledFP4
         running_state["original_hidden_states_shape"] = hidden_states.shape
-        running_state["apply_router_weight_on_input"] = (
-            runner_config.apply_router_weight_on_input
-        )
 
         # Pre-permutation validation logic
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -1217,7 +1058,6 @@ def pre_permute_standard_to_cutlass(
         )
 
         # Store state for post_permute
-        running_state["moe_type"] = CutlassMoEType.W4A8
         running_state["original_hidden_states_shape"] = hidden_states.shape
 
         # Pre-permutation validation logic for W4A8
@@ -1246,7 +1086,6 @@ def pre_permute_standard_to_cutlass(
         n = quant_info.w2_weight.size(2) * 2  # w2_q is transposed and packed
         topk = topk_ids.size(1)
 
-        running_state["topk"] = topk
         running_state["num_local_experts"] = num_local_experts
 
         if runner_config.apply_router_weight_on_input:
@@ -1289,9 +1128,9 @@ def pre_permute_standard_to_cutlass(
 
         get_cutlass_w4a8_moe_mm_data(
             topk_ids,
-            quant_info.expert_offsets,
-            quant_info.problem_sizes1,
-            quant_info.problem_sizes2,
+            quant_info.params.expert_offsets,
+            quant_info.params.problem_sizes1,
+            quant_info.params.problem_sizes2,
             a_map,
             c_map,
             num_local_experts,
@@ -1323,7 +1162,7 @@ def post_permute_cutlass_to_standard(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     down_output = runner_output.hidden_states
-    moe_type = running_state["moe_type"]
+    moe_type = quant_info.moe_type
 
     if moe_type == CutlassMoEType.BlockscaledFP8:
         num_tokens, hidden_size = running_state["original_hidden_states_shape"]
@@ -1353,7 +1192,7 @@ def post_permute_cutlass_to_standard(
             (num_tokens * topk, hidden_size),
         )
         reordered = reordered.view(num_tokens, topk, hidden_size)
-        if not running_state["apply_router_weight_on_input"]:
+        if not runner_config.apply_router_weight_on_input:
             reordered.mul_(
                 running_state["topk_weights"]
                 .view(num_tokens, topk, 1)
@@ -1368,7 +1207,7 @@ def post_permute_cutlass_to_standard(
 
         num_tokens = running_state["original_hidden_states_shape"][0]
         hidden_size = running_state["original_hidden_states_shape"][1]
-        topk = running_state["topk"]
+        topk = running_state["topk_ids"].size(1)
 
         result = torch.empty(
             (num_tokens, hidden_size),
@@ -1433,16 +1272,16 @@ def pre_permute_deepep_ll_to_cutlass(
     ), "w2 scales expert number mismatch"
 
     assert (
-        quant_info.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        quant_info.params.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "A Strides 1 expert number mismatch"
     assert (
-        quant_info.b_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        quant_info.params.b_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "B Strides 1 expert number mismatch"
     assert (
-        quant_info.a_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        quant_info.params.a_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "A Strides 2 expert number mismatch"
     assert (
-        quant_info.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        quant_info.params.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "B Strides 2 expert number mismatch"
     num_experts = quant_info.w13_weight.size(0)
     k = quant_info.w13_weight.size(2) * 2  # w1_q is transposed and packed
@@ -1452,8 +1291,8 @@ def pre_permute_deepep_ll_to_cutlass(
 
     problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
         masked_m,
-        quant_info.problem_sizes1,
-        quant_info.problem_sizes2,
+        quant_info.params.problem_sizes1,
+        quant_info.params.problem_sizes2,
         num_experts,
         n,
         k,
@@ -1533,16 +1372,16 @@ def pre_permute_deepep_normal_to_cutlass(
     ), "w2 scales expert number mismatch"
 
     assert (
-        quant_info.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        quant_info.params.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "A Strides 1 expert number mismatch"
     assert (
-        quant_info.b_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        quant_info.params.b_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "B Strides 1 expert number mismatch"
     assert (
-        quant_info.a_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        quant_info.params.a_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "A Strides 2 expert number mismatch"
     assert (
-        quant_info.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        quant_info.params.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "B Strides 2 expert number mismatch"
     num_experts = quant_info.w13_weight.size(0)
     k = quant_info.w13_weight.size(2) * 2  # w1_q is transposed and packed
@@ -1588,16 +1427,16 @@ def pre_permute_deepep_normal_to_cutlass(
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
 
 
-    quant_info.problem_sizes1.zero_()
-    quant_info.problem_sizes2.zero_()
+    quant_info.params.problem_sizes1.zero_()
+    quant_info.params.problem_sizes2.zero_()
     # Safely zero offsets too if the kernel calculates them via cumsum
-    quant_info.expert_offsets.zero_()
+    quant_info.params.expert_offsets.zero_()
 
     get_cutlass_w4a8_moe_mm_data(
         local_topk_ids,
-        quant_info.expert_offsets,
-        quant_info.problem_sizes1,
-        quant_info.problem_sizes2,
+        quant_info.params.expert_offsets,
+        quant_info.params.problem_sizes1,
+        quant_info.params.problem_sizes2,
         a_map,
         c_map,
         num_experts,
@@ -1607,7 +1446,6 @@ def pre_permute_deepep_normal_to_cutlass(
 
     # Store additional state for the main function
     running_state["src2dst"] = src2dst
-    running_state["topk"] = topk
     running_state["a_map"] = a_map
     running_state["c_map"] = c_map
 
@@ -1634,7 +1472,7 @@ def post_permute_cutlass_to_deepep_normal(
     src2dst = running_state["src2dst"]
     topk_ids_ = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
-    topk = running_state["topk"]
+    topk = topk_ids_.size(1)
     hidden_size = c2.shape[1]  # Use c2.shape[1] directly
 
     num_tokens = src2dst.shape[0] // topk

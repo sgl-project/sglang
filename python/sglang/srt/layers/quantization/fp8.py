@@ -1429,19 +1429,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight.transpose(1, 2),
                 w13_scale=layer.w13_weight_scale_inv.transpose(1, 2),
                 w2_scale=layer.w2_weight_scale_inv.transpose(1, 2),
-                expert_offsets=self.expert_offsets,
-                problem_sizes1=self.problem_sizes1,
-                problem_sizes2=self.problem_sizes2,
-                ab_strides_13=self.ab_strides1,
-                ab_strides_2=self.ab_strides2,
-                c_strides_13=self.c_strides1,
-                c_strides_2=self.c_strides2,
-                workspace=self.workspace,
-                a_ptrs=self.a_ptr,
-                b_ptrs=self.b_ptr,
-                out_ptrs=self.out_ptr,
-                a_scales_ptrs=self.a_scales_ptr,
-                b_scales_ptrs=self.b_scales_ptr,
+                params=layer.cutlass_moe_params,
                 use_mxfp8=use_mxfp8,
                 enable_es=(use_mxfp8, use_mxfp8),
             )
@@ -1518,7 +1506,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
-        if getattr(self, "_cutlass_buffers_ready", False):
+        if getattr(self, "_cutlass_buffer_ready", False):
             return
 
         device = layer.w13_weight.device
@@ -1526,41 +1514,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_size = layer.w2_weight.shape[1]
         intermediate_size_per_partition = layer.intermediate_size_per_partition
 
-        self.ab_strides1 = torch.full(
-            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+        layer.cutlass_moe_params = CutlassMoEParams(
+            CutlassMoEType.BlockscaledFP8,
+            device,
+            num_experts=num_experts,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            hidden_size=hidden_size,
         )
-        self.c_strides1 = torch.full(
-            (num_experts,),
-            2 * intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.ab_strides2 = torch.full(
-            (num_experts,),
-            intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.c_strides2 = torch.full(
-            (num_experts,), hidden_size, device=device, dtype=torch.int64
-        )
-        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
-        self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.a_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.b_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.expert_offsets = torch.empty(
-            num_experts + 1, device=device, dtype=torch.int32
-        )
-        self.problem_sizes1 = torch.empty(
-            num_experts, 3, device=device, dtype=torch.int32
-        )
-        self.problem_sizes2 = torch.empty(
-            num_experts, 3, device=device, dtype=torch.int32
-        )
-
-        self._cutlass_buffers_ready = True
+        self._cutlass_buffer_ready = True
 
     def maybe_apply_hip_fused_experts(
         self,

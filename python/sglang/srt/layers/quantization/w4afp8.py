@@ -215,46 +215,15 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
-        # Pre-populate the strides
+        # Initialize CutlassMoEParams
         device = layer.w13_weight.device
-
-        self.a_strides1 = torch.full(
-            (num_experts, 3),
-            hidden_size,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.c_strides1 = torch.full(
-            (num_experts, 3),
-            2 * intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.a_strides2 = torch.full(
-            (num_experts, 3),
-            intermediate_size_per_partition,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.c_strides2 = torch.full(
-            (num_experts, 3),
-            hidden_size,
-            device=device,
-            dtype=torch.int64,
-        )
-        self.b_strides1 = self.a_strides1
-        self.s_strides13 = self.c_strides1
-        self.b_strides2 = self.a_strides2
-        self.s_strides2 = self.c_strides2
-
-        self.expert_offsets = torch.empty(
-            (num_experts + 1), dtype=torch.int32, device=device
-        )
-        self.problem_sizes1 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
-        )
-        self.problem_sizes2 = torch.empty(
-            (num_experts, 3), dtype=torch.int32, device=device
+        from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+        layer.cutlass_moe_params = CutlassMoEParams(
+            CutlassMoEType.W4A8,
+            device,
+            num_experts=num_experts,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            hidden_size=hidden_size,
         )
 
         return
@@ -306,19 +275,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 w2_weight=layer.w2_weight,
                 w13_scale=layer.w13_weight_scale_inv,
                 w2_scale=layer.w2_weight_scale_inv,
-                expert_offsets=self.expert_offsets,
-                problem_sizes1=self.problem_sizes1,
-                problem_sizes2=self.problem_sizes2,
-                a_strides1=self.a_strides1,
-                b_strides1=self.b_strides1,
-                c_strides1=self.c_strides1,
-                a_strides2=self.a_strides2,
-                b_strides2=self.b_strides2,
-                c_strides2=self.c_strides2,
-                s_strides13=self.s_strides13,
-                s_strides2=self.s_strides2,
                 w13_input_scale=layer.w13_input_scale,
                 w2_input_scale=layer.w2_input_scale,
+                params=layer.cutlass_moe_params,
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -333,19 +292,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
-            expert_offsets=self.expert_offsets,
-            problem_sizes1=self.problem_sizes1,
-            problem_sizes2=self.problem_sizes2,
-            a_strides1=self.a_strides1,
-            b_strides1=self.b_strides1,
-            c_strides1=self.c_strides1,
-            a_strides2=self.a_strides2,
-            b_strides2=self.b_strides2,
-            c_strides2=self.c_strides2,
-            s_strides13=self.s_strides13,
-            s_strides2=self.s_strides2,
             w13_input_scale=layer.w13_input_scale,
             w2_input_scale=layer.w2_input_scale,
+            params=layer.cutlass_moe_params,
         )
         combine_input = self.runner.run(dispatch_output, quant_info)
         return combine_input.hidden_states
@@ -369,19 +318,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
-            expert_offsets=self.expert_offsets,
-            problem_sizes1=self.problem_sizes1,
-            problem_sizes2=self.problem_sizes2,
-            a_strides1=self.a_strides1,
-            b_strides1=self.b_strides1,
-            c_strides1=self.c_strides1,
-            a_strides2=self.a_strides2,
-            b_strides2=self.b_strides2,
-            c_strides2=self.c_strides2,
-            s_strides13=self.s_strides13,
-            s_strides2=self.s_strides2,
             w13_input_scale=layer.w13_input_scale,
             w2_input_scale=layer.w2_input_scale,
+            params=layer.cutlass_moe_params,
         )
         combine_input = self.runner.run(dispatch_output, quant_info)
         return combine_input.hidden_states

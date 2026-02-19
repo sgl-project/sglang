@@ -46,52 +46,63 @@ class CutlassMoEParams:
     # ab_strides_2: [e] dtype: int64 [Gemm 2: Activation / Weight strides]
     # c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
     # c_strides_2: [e] dtype: int64 [Gemm 2: Output Strides]
-    ab_strides_13: torch.Tensor
-    ab_strides_2: torch.Tensor
-    c_strides_13: torch.Tensor
-    c_strides_2: torch.Tensor
+    ab_strides_13: Optional[torch.Tensor] = None
+    ab_strides_2: Optional[torch.Tensor] = None
+    c_strides_13: Optional[torch.Tensor] = None
+    c_strides_2: Optional[torch.Tensor] = None
 
     # m: Total number of tokens
     # n: intermediate size per partition
     # k: hidden size per expert
     # e: Number of experts
     # device: Device to run computation on and store tensors
-    m: int
-    intermediate_size_per_partition: int
-    hidden_size: int
-    num_experts: int
-    device: torch.device
+    m: int = 0
+    intermediate_size_per_partition: int = 0
+    hidden_size: int = 0
+    num_experts: int = 0
+    device: Optional[torch.device] = None
 
     # Pointers container for calculating offsets of the input activations for each expert
     # a_ptrs: [e] dtype: int64
-    a_ptrs: torch.Tensor
+    a_ptrs: Optional[torch.Tensor] = None
 
     # Pointers container for calculating offsets of the input weights for each expert
     # b_ptrs: [e] dtype: int64
-    b_ptrs: torch.Tensor
+    b_ptrs: Optional[torch.Tensor] = None
 
     # Pointers container for calculating offsets of the output activations for each expert
     # out_ptrs: [e] dtype: int64
-    out_ptrs: torch.Tensor
+    out_ptrs: Optional[torch.Tensor] = None
     # Pointers container for calculating offsets of the input scales for each expert
     # a_scales_ptrs: [e] dtype: int64
     # b_scales_ptrs: [e] dtype: int64
-    a_scales_ptrs: torch.Tensor
-    b_scales_ptrs: torch.Tensor
+    a_scales_ptrs: Optional[torch.Tensor] = None
+    b_scales_ptrs: Optional[torch.Tensor] = None
 
     # Offsets that mark at which token index each expert begins its computation
     # The number of tokens computed with expert E is expert_offsets[E + 1] - expert_offsets[E]
     # expert_offsets: [e+1] dtype: int32
-    expert_offsets: torch.Tensor
+    expert_offsets: Optional[torch.Tensor] = None
 
     # Problem size: (num_experts, (m,2n,k)) for first GEMM
     # problem_sizes1: [e, 3] dtype: int32
     # Problem size: (num_experts, (m,n,k)) for second GEMM
     # problem_sizes2: [e, 3] dtype: int32
-    problem_sizes1: torch.Tensor
-    problem_sizes2: torch.Tensor
+    problem_sizes1: Optional[torch.Tensor] = None
+    problem_sizes2: Optional[torch.Tensor] = None
     # Similar to expert_offsets, but for blockscales for FP4 blockscaled Group GEMM
     blockscale_offsets: Optional[torch.Tensor] = None
+
+    # W4A8 specific fields
+    a_strides1: Optional[torch.Tensor] = None
+    b_strides1: Optional[torch.Tensor] = None
+    c_strides1: Optional[torch.Tensor] = None
+    a_strides2: Optional[torch.Tensor] = None
+    b_strides2: Optional[torch.Tensor] = None
+    c_strides2: Optional[torch.Tensor] = None
+    s_strides13: Optional[torch.Tensor] = None
+    s_strides2: Optional[torch.Tensor] = None
+    workspace: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -109,18 +120,44 @@ class CutlassMoEParams:
         self.n = self.intermediate_size_per_partition
         self.k = self.hidden_size
         self.e = self.num_experts
-        self.ab_strides_13 = torch.full(
-            (self.e,), self.k, dtype=torch.int64, device=self.device
+        
+        is_w4a8 = self.cutlass_moe_type in (
+            CutlassMoEType.W4A8,
+            CutlassMoEType.DeepEP_LL,
+            CutlassMoEType.DeepEP_Normal,
         )
-        self.ab_strides_2 = torch.full(
-            (self.e,), self.n, dtype=torch.int64, device=self.device
-        )
-        self.c_strides_13 = torch.full(
-            (self.e,), 2 * self.n, dtype=torch.int64, device=self.device
-        )
-        self.c_strides_2 = torch.full(
-            (self.e,), self.k, dtype=torch.int64, device=self.device
-        )
+
+        if is_w4a8:
+            self.a_strides1 = torch.full(
+                (self.e, 3), self.k, dtype=torch.int64, device=self.device
+            )
+            self.c_strides1 = torch.full(
+                (self.e, 3), 2 * self.n, dtype=torch.int64, device=self.device
+            )
+            self.a_strides2 = torch.full(
+                (self.e, 3), self.n, dtype=torch.int64, device=self.device
+            )
+            self.c_strides2 = torch.full(
+                (self.e, 3), self.k, dtype=torch.int64, device=self.device
+            )
+            self.b_strides1 = self.a_strides1
+            self.s_strides13 = self.c_strides1
+            self.b_strides2 = self.a_strides2
+            self.s_strides2 = self.c_strides2
+        else:
+            self.ab_strides_13 = torch.full(
+                (self.e,), self.k, dtype=torch.int64, device=self.device
+            )
+            self.ab_strides_2 = torch.full(
+                (self.e,), self.n, dtype=torch.int64, device=self.device
+            )
+            self.c_strides_13 = torch.full(
+                (self.e,), 2 * self.n, dtype=torch.int64, device=self.device
+            )
+            self.c_strides_2 = torch.full(
+                (self.e,), self.k, dtype=torch.int64, device=self.device
+            )
+
         self.expert_offsets = torch.empty(
             (self.e + 1,), dtype=torch.int32, device=self.device
         )
@@ -130,21 +167,32 @@ class CutlassMoEParams:
         self.problem_sizes2 = torch.empty(
             (self.e, 3), dtype=torch.int32, device=self.device
         )
+        
         if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP4:
             self.blockscale_offsets = torch.empty(
                 (self.e + 1,), dtype=torch.int32, device=self.device
             )
         else:
             self.blockscale_offsets = None
-        self.a_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
-        self.b_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
-        self.out_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
-        self.a_scales_ptrs = torch.empty(
-            (self.e,), dtype=torch.int64, device=self.device
-        )
-        self.b_scales_ptrs = torch.empty(
-            (self.e,), dtype=torch.int64, device=self.device
-        )
+            
+        if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP8:
+            self.workspace = torch.empty(90000, device=self.device, dtype=torch.uint8)
+            self.a_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
+            self.b_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
+            self.out_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
+            self.a_scales_ptrs = torch.empty(
+                (self.e,), dtype=torch.int64, device=self.device
+            )
+            self.b_scales_ptrs = torch.empty(
+                (self.e,), dtype=torch.int64, device=self.device
+            )
+        else:
+            self.workspace = None
+            self.a_ptrs = None
+            self.b_ptrs = None
+            self.out_ptrs = None
+            self.a_scales_ptrs = None
+            self.b_scales_ptrs = None
 
     def to_gemm1_args(self) -> dict:
         return {
