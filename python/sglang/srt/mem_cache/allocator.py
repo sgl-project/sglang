@@ -411,7 +411,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.seen_max_num_extend_tokens_next_power_of_2 = max(
             self.seen_max_num_extend_tokens_next_power_of_2,
-            next_power_of_2(extend_num_tokens),
+            min(tl.core.TRITON_MAX_TENSOR_NUMEL, next_power_of_2(extend_num_tokens)),
         )
 
         bs = len(prefix_lens)
@@ -433,7 +433,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 out_indices,
                 next_power_of_2(bs),
                 self.page_size,
-                next_power_of_2(extend_num_tokens),
+                self.seen_max_num_extend_tokens_next_power_of_2,
             )
         else:
             alloc_extend_naive(
