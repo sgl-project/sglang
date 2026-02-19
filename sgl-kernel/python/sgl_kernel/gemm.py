@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 
+import flashinfer
 import torch
 from sgl_kernel.scalar_type import ScalarType
 
@@ -50,8 +51,6 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    import flashinfer
-
     return flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, out=out)
 
 
