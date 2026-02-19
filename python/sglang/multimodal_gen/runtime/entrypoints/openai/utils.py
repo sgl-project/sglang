@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
-import dataclasses
 import os
 import re
 import time
@@ -9,72 +8,43 @@ from typing import Any, List, Optional, Union
 import httpx
 from fastapi import UploadFile
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ListLorasReq,
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    ShutdownReq,
+    UnmergeLoraWeightsReq,
+    format_lora_message,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
     log_generation_timer,
 )
 
+# re-export LoRA protocol types for backward compatibility
+__all__ = [
+    "SetLoraReq",
+    "MergeLoraWeightsReq",
+    "UnmergeLoraWeightsReq",
+    "ListLorasReq",
+    "ShutdownReq",
+    "format_lora_message",
+]
+
 logger = init_logger(__name__)
 
-
-@dataclasses.dataclass
-class SetLoraReq:
-    lora_nickname: Union[str, List[str]]
-    lora_path: Optional[Union[str, List[Optional[str]]]] = None
-    target: Union[str, List[str]] = "all"
-    strength: Union[float, List[float]] = 1.0  # LoRA strength for merge, default 1.0
-
-
-@dataclasses.dataclass
-class MergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-    strength: float = 1.0  # LoRA strength for merge, default 1.0
-
-
-@dataclasses.dataclass
-class UnmergeLoraWeightsReq:
-    target: str = "all"  # "all", "transformer", "transformer_2", "critic"
-
-
-@dataclasses.dataclass
-class ListLorasReq:
-    # Empty payload; used only as a type marker for listing LoRA status
-    pass
-
-
-@dataclasses.dataclass
-class ShutdownReq:
-    pass
-
-
-def format_lora_message(
-    lora_nickname: Union[str, List[str]],
-    target: Union[str, List[str]],
-    strength: Union[float, List[float]],
-) -> tuple[str, str, str]:
-    """Format success message for single or multiple LoRAs"""
-    if isinstance(lora_nickname, list):
-        nickname_str = ", ".join(lora_nickname)
-        target_str = ", ".join(target) if isinstance(target, list) else target
-        strength_str = (
-            ", ".join(f"{s:.2f}" for s in strength)
-            if isinstance(strength, list)
-            else f"{strength:.2f}"
-        )
-    else:
-        nickname_str = lora_nickname
-        target_str = target if isinstance(target, str) else ", ".join(target)
-        strength_str = (
-            f"{strength:.2f}"
-            if isinstance(strength, (int, float))
-            else ", ".join(f"{s:.2f}" for s in strength)
-        )
-    return nickname_str, target_str, strength_str
+OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+DEFAULT_FPS = 24
+DEFAULT_VIDEO_SECONDS = 4
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -86,6 +56,62 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return w, h
     except Exception:
         return None, None
+
+
+def choose_output_image_ext(
+    output_format: Optional[str], background: Optional[str]
+) -> str:
+    fmt = (output_format or "").lower()
+    if fmt in {"png", "webp", "jpeg", "jpg"}:
+        return "jpg" if fmt == "jpeg" else fmt
+    if (background or "auto").lower() == "transparent":
+        return "png"
+    return "jpg"
+
+
+def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
+    """Build SamplingParams from request parameters.
+
+    Handles size parsing, output_quality resolution, and None filtering before
+    delegating to SamplingParams.from_user_sampling_params_args. Callers pass
+    only the parameters they have; None values are stripped automatically so
+    that SamplingParams defaults apply.
+    """
+    server_args = get_global_server_args()
+
+    # pop HTTP-layer params that aren't SamplingParams fields
+    output_quality = kwargs.pop("output_quality", None)
+
+    has_explicit_compression = kwargs.get("output_compression") is not None
+
+    # parse "WxH" size string if provided
+    size = kwargs.pop("size", None)
+    if size:
+        w, h = _parse_size(size)
+        if w is not None:
+            kwargs.setdefault("width", w)
+            kwargs.setdefault("height", h)
+
+    # filter out None values to let SamplingParams defaults apply
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    kwargs.setdefault("save_output", True)
+
+    sampling_params = SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
+        server_args=server_args,
+        request_id=request_id,
+        **kwargs,
+    )
+
+    # resolve output_quality → output_compression with the correct data_type.
+    # SamplingParams.__post_init__ may have resolved with the wrong data_type
+    # (default VIDEO) before _adjust() set the correct one.
+    if not has_explicit_compression and output_quality is not None:
+        resolved = adjust_output_quality(output_quality, sampling_params.data_type)
+        if resolved is not None:
+            sampling_params.output_compression = resolved
+
+    return sampling_params
 
 
 async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
@@ -169,24 +195,23 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     """Decode base64 image data and save to target path."""
 
+    _B64_FMT_HINT = (
+        "Failed to decode base64 image. "
+        "Expected format: `data:[<media-type>];base64,<data>`"
+    )
+
     # split `data:[<media-type>][;base64],<data>` to media-type base64 data
     pattern = r"data:(.*?)(;base64)?,(.*)"
     match = re.match(pattern, base64_data)
     if not match:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(_B64_FMT_HINT)
     media_type = match.group(1)
     is_base64 = match.group(2)
     if not is_base64:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(f"{_B64_FMT_HINT} (missing ;base64 marker)")
     data = match.group(3)
     if not data:
-        raise ValueError(
-            f"Failed to decoding base64 image, please make sure the url format `data:[<media-type>][;base64],<data>` "
-        )
+        raise ValueError(f"{_B64_FMT_HINT} (empty data payload)")
     # get ext from url
     if media_type.startswith("image/"):
         ext = media_type.split("/")[-1].lower()
@@ -210,7 +235,7 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
-) -> tuple[str, OutputBatch]:
+) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
@@ -220,38 +245,21 @@ async def process_generation_batch(
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
-        save_file_path_list = []
-        # If output_file_paths is provided, use it instead of output.
+
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
         else:
-            audio_sample_rate = result.audio_sample_rate
-            if batch.data_type == DataType.VIDEO:
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda _idx: str(
-                        os.path.join(batch.output_path, batch.output_file_name)
-                    ),
-                    audio=result.audio,
-                    audio_sample_rate=audio_sample_rate,
-                )
-            else:
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda idx: str(
-                        os.path.join(
-                            batch.output_path,
-                            f"sample_{idx}_" + batch.output_file_name,
-                        )
-                    ),
-                    audio_sample_rate=audio_sample_rate,
-                )
+            num_outputs = len(result.output)
+            save_file_path_list = save_outputs(
+                result.output,
+                batch.data_type,
+                batch.fps,
+                batch.save_output,
+                lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                audio=result.audio,
+                audio_sample_rate=result.audio_sample_rate,
+                output_compression=batch.output_compression,
+            )
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
@@ -302,3 +310,9 @@ def add_common_data_to_response(
     response["id"] = request_id
 
     return response
+
+
+def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+    if output_quality == "default":
+        return 50 if data_type == DataType.VIDEO else 75
+    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)
