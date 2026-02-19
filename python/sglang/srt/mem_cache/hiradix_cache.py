@@ -166,8 +166,6 @@ class HiRadixCache(RadixCache):
 
         self.evictable_host_leaves = set()
 
-        # PIN infrastructure
-
         super().__init__(params=params)
 
     def shutdown(self):
@@ -804,7 +802,7 @@ class HiRadixCache(RadixCache):
                 child_key = self.get_child_key_fn(key)
 
         logger.info(
-            f"[PIN] pin_prefix: pinned {pinned} nodes, ttl={ttl_seconds}s"
+            "[PIN] pin_prefix: pinned %d nodes, ttl=%ds", pinned, ttl_seconds
         )
         return pinned
 

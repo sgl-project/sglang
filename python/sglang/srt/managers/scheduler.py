@@ -2599,6 +2599,12 @@ class Scheduler(
                 message="PIN requires --enable-hierarchical-cache",
             )
         pinned = self.tree_cache.pin_prefix(recv_req.token_ids, recv_req.ttl_seconds)
+        if pinned == 0:
+            return PinPrefixReqOutput(
+                success=False,
+                pinned_count=0,
+                message="No matching prefix found in cache to pin",
+            )
         return PinPrefixReqOutput(
             success=True,
             pinned_count=pinned,
@@ -2628,8 +2634,8 @@ class Scheduler(
     def flush_cache(self):
         """Flush the memory pool and cache.
 
-        If there are pinned blocks, selectively evicts unpinned entries
-        while preserving pinned blocks. Otherwise does a full reset.
+        HiRadixCache uses selective flush (evicts unpinned entries,
+        preserves any active pins). Plain RadixCache does a full reset.
         """
         if self._is_no_request():
             self.cur_batch = None
