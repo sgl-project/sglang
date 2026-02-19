@@ -12,12 +12,16 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        pad_id: int,
+        use_lpadding: bool,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        self.pad_id = pad_id
+        self.use_lpadding = use_lpadding
 
     @staticmethod
     def from_server_args(
@@ -32,9 +36,15 @@ class DllmConfig:
             model_revision=server_args.revision,
         )
 
+        pad_id = 0
+        use_lpadding = False
         if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
             block_size = 32
             mask_id = 156895
+        elif model_config.hf_config.architectures[0] == "PanguEmbeddedForCausalLM":
+            block_size = 32
+            mask_id = 45830
+            use_lpadding = True
         else:
             raise RuntimeError(
                 f"Unknown diffusion LLM: {model_config.hf_config.architectures[0]}"
@@ -67,4 +77,6 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            pad_id=pad_id,
+            use_lpadding=use_lpadding,
         )

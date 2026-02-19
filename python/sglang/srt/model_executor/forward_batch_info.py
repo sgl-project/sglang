@@ -433,6 +433,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+            if hasattr(batch.dllm_config, "use_lpadding") and batch.dllm_config.use_lpadding:
+                start_idx = 0
+                for prompt_padding, block_offset in zip(batch.dllm_prompt_paddings, batch.dllm_block_offsets):
+                    if block_offset==0:
+                        ret.positions[start_idx:start_idx + prompt_padding] = 1
+                        ret.positions[start_idx + prompt_padding: start_idx + block_size] = ret.positions[
+                            start_idx + prompt_padding: start_idx + block_size] - prompt_padding
+                    else:
+                        ret.positions[start_idx: start_idx + block_size] = ret.positions[
+                            start_idx: start_idx + block_size] - prompt_padding
+                    start_idx += block_size
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync

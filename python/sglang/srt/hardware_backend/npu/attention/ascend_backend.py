@@ -11,6 +11,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -252,6 +253,14 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
+        # dllm model config
+        self.dllm_algorithm = model_runner.server_args.dllm_algorithm
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = False
+        if self.dllm_config is not None:
+            self.is_dllm_model = True
+            self.dllm_block_size = self.dllm_config.block_size
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -353,6 +362,19 @@ class AscendAttnBackend(AttentionBackend):
         metadata = ForwardMetadata()
 
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if self.is_dllm_model:
+            max_len = int(seq_lens[:bs].max().item())
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                (
+                    self.req_to_token[req_pool_indices[:bs], :max_len][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                ).to(torch.int32)
+            )
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
@@ -373,6 +395,17 @@ class AscendAttnBackend(AttentionBackend):
                 [1 + i * 1 for i in range(bs)],
                 dtype=torch.int32,
                 device=seq_lens.device,
+            )
+
+        if forward_mode.is_dllm_extend():
+            extend_seq_lens = self.dllm_block_size
+            extend_seq_lens_cpu_int = torch.tensor(
+                [self.dllm_block_size for i in range(bs)],
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            metadata.seq_lens_list_cumsum = (
+                torch.cumsum(extend_seq_lens_cpu_int, dim=0).int().tolist()
             )
 
         self.graph_metadata[bs] = metadata
@@ -741,6 +774,15 @@ class AscendAttnBackend(AttentionBackend):
                 k_rope,
                 topk_indices,
             )
+        if self.is_dllm_model:
+            return self.forward_dllm(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+            )
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -1082,6 +1124,68 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def forward_dllm(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+        num_tokens = q.shape[0]
+
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_k_head_num*layer.qk_head_dim
+        ).contiguous()
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_v_head_num*layer.v_head_dim
+        ).contiguous()
+
+        if self.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_len_kv = torch.from_numpy(
+                np.array(self.forward_metadata.seq_lens_cpu_list).astype(np.int32)
+            )
+        else:
+            actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
+
+        if self.forward_metadata.extend_seq_lens_cpu_int is not None:
+            actual_seq_lengths = self.forward_metadata.extend_seq_lens_cpu_int
+        elif self.forward_metadata.seq_lens_list_cumsum is not None:
+            actual_seq_lengths = torch.tensor(self.forward_metadata.seq_lens_list_cumsum)
+        else:
+            current_q_tokens = q.shape[0]
+            actual_seq_lengths = torch.full((1,), current_q_tokens).to(torch.int32)
+
+        query = q.view(-1,  num_tokens, layer.tp_q_head_num,layer.qk_head_dim).contiguous()
+
+        states = getattr(forward_batch, "model_specific_states", {}) or {}
+        attention_mask = states.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = ~attention_mask
+
+        attn_output, _ =torch_npu.npu_fused_infer_attention_score(
+            query,
+            k_cache,
+            v_cache,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="BSND",
+            atten_mask=attention_mask,
+            block_size=self.page_size,
+            block_table=self.forward_metadata.block_tables,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            scale=layer.scaling
+        )
+        attn_output = attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim).contiguous()
+
+        return attn_output
+    
     def forward_mtp(
         self,
         q,
