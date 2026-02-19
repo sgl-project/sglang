@@ -130,12 +130,14 @@ class SchedulerUpdateWeightsMixin:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
-
+        # NOTE: offload_tags is updated *after* each tag's teardown so that
+        # flush_cache() (called inside the KV-cache branch) still sees the
+        # pool as live and performs the necessary .clear().  Code that runs
+        # later (e.g. update_weights_from_tensor → flush_cache) will then
+        # see "kv_cache" in offload_tags and correctly skip the clear.
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
@@ -146,6 +148,10 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        # Mark any remaining/future tags that don't have dedicated handling.
+        for tag in tags:
+            self.offload_tags.add(tag)
 
         torch.get_device_module().synchronize()
 

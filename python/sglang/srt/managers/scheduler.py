@@ -2623,8 +2623,11 @@ class Scheduler(
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
+            # Skip pool clear when KV cache memory is offloaded (freed by memory_saver),
+            # as the underlying CUDA memory is not on GPU.
+            if "kv_cache" not in self.offload_tags:
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()
 
