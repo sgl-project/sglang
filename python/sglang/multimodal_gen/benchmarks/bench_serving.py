@@ -844,17 +844,20 @@ async def benchmark(args):
         # Run warmup requests
         warmup_pairs: List[tuple] = []
         if args.warmup_requests and requests_list:
+            # The server always overrides warmup requests to use
+            # num_inference_steps=1 (see Req.set_as_warmup), so we match
+            # that here to keep the benchmark's SLO estimation consistent.
+            warmup_steps = 1
             logger.info(
                 f"Running {args.warmup_requests} warmup request(s) with "
-                f"num_inference_steps={args.warmup_num_inference_steps}..."
+                f"num_inference_steps={warmup_steps}..."
             )
             for i in range(args.warmup_requests):
                 warm_req = requests_list[i % len(requests_list)]
-                if args.warmup_num_inference_steps is not None:
-                    warm_req = replace(
-                        warm_req,
-                        num_inference_steps=args.warmup_num_inference_steps,
-                    )
+                warm_req = replace(
+                    warm_req,
+                    num_inference_steps=warmup_steps,
+                )
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
                 logger.info(
@@ -1063,12 +1066,6 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before measurement.",
-    )
-    parser.add_argument(
-        "--warmup-num-inference-steps",
-        type=int,
-        default=1,
-        help="num_inference_steps used for warmup requests.",
     )
     parser.add_argument(
         "--num-inference-steps",
