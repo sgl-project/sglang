@@ -14,7 +14,7 @@ CUDA_* env vars in the shell before launching Python.
 
 import glob
 import os
-import sys
+import warnings
 
 from sglang.srt.environ import envs
 
@@ -46,10 +46,10 @@ def _inject_env():
     }
     for key, value in env_vars.items():
         if key in os.environ:
-            print(
-                f"WARNING: CUDA coredump env var {key} is already set to "
+            warnings.warn(
+                f"CUDA coredump env var {key} is already set to "
                 f"'{os.environ[key]}', skipping injection of '{value}'.",
-                file=sys.stderr,
+                stacklevel=2,
             )
         else:
             os.environ[key] = value
