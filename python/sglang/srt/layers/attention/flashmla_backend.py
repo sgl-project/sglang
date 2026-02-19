@@ -211,7 +211,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            num_q_heads = self.num_q_heads * (self.num_draft_tokens or 1)
+            if self.num_draft_tokens:
+                num_q_heads = self.num_draft_tokens * self.num_q_heads
+            else:
+                num_q_heads = self.num_q_heads
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
@@ -288,7 +291,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
-            num_q_heads = self.num_q_heads * (self.num_draft_tokens or 1)
+            if self.num_draft_tokens:
+                num_q_heads = self.num_draft_tokens * self.num_q_heads
+            else:
+                num_q_heads = self.num_q_heads
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
