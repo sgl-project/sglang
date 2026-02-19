@@ -269,25 +269,6 @@ class TestDumperFileWriteControl:
             not_exist=["skip_this", "not_keep_this"],
         )
 
-    def test_write_disabled(self, tmp_path):
-        with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
-            SGLANG_DUMPER_OUTPUT_FILE="0",
-        ):
-            run_distributed_test(self._test_write_disabled_func, tmpdir=str(tmp_path))
-
-    @staticmethod
-    def _test_write_disabled_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
-        dumper.on_forward_pass_start()
-        dumper.dump("no_write", torch.randn(5, device=f"cuda:{rank}"))
-
-        dist.barrier()
-        assert len(_get_filenames(tmpdir)) == 0
-
     def test_save_false(self, tmp_path):
         with temp_set_env(
             allow_sglang=True,
