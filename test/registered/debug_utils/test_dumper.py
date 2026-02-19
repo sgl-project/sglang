@@ -1,4 +1,5 @@
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import torch.distributed as dist
 from sglang.srt.debug_utils.dumper import (
     _collect_megatron_parallel_info,
     _collect_sglang_parallel_info,
+    _collective_with_timeout,
     _Dumper,
     _materialize_value,
     _obj_to_dict,
@@ -86,6 +88,39 @@ class TestTorchSave:
         assert "skip the tensor" in captured.out
 
 
+class TestCollectiveTimeout:
+    def test_watchdog_fires_on_timeout(self):
+        import io
+
+        block_event = threading.Event()
+
+        old_stdout = sys.stdout
+        captured = io.StringIO()
+        sys.stdout = captured
+
+        def run_with_timeout():
+            try:
+                _collective_with_timeout(
+                    lambda: block_event.wait(),
+                    operation_name="test_blocked_op",
+                    timeout_seconds=2,
+                )
+            finally:
+                sys.stdout = old_stdout
+
+        worker = threading.Thread(target=run_with_timeout)
+        worker.start()
+
+        time.sleep(4)
+        block_event.set()
+        worker.join(timeout=5)
+
+        output = captured.getvalue()
+        assert "WARNING" in output
+        assert "test_blocked_op" in output
+        assert "2s" in output
+
+
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
         with temp_set_env(
@@ -124,6 +159,41 @@ class TestDumperDistributed:
             exist=["tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"],
             not_exist=["tensor_skip"],
         )
+
+    def test_collective_timeout(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
+            run_distributed_test(self._test_collective_timeout_func)
+
+    @staticmethod
+    def _test_collective_timeout_func(rank):
+        import io
+
+        dumper = _Dumper(
+            enable=True,
+            base_dir=Path("/tmp"),
+            partial_name=None,
+            enable_http_server=False,
+            collective_timeout=3,
+        )
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+
+        try:
+            if rank == 0:
+                dumper.on_forward_pass_start()
+            else:
+                time.sleep(6)
+                dumper.on_forward_pass_start()
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+
+        if rank == 0:
+            assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
+            assert "has not completed after 3s" in output
 
     def test_http_enable(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
