@@ -109,6 +109,7 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w2_blockscale: Optional[torch.Tensor] = None
     w1_alpha: Optional[torch.Tensor] = None
     w2_alpha: Optional[torch.Tensor] = None
+    enable_es: Optional[Tuple[bool, bool]] = (False, False)
 
 
     # W4A8 specific fields
@@ -240,6 +241,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 problem_sizes1=quant_info.problem_sizes1,
                 problem_sizes2=quant_info.problem_sizes2,
                 rep_a1_scales=runner_input.rep_aux,
+                enable_es=quant_info.enable_es,
             )
 
         elif moe_type == CutlassMoEType.BlockscaledFP4:

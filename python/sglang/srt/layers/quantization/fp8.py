@@ -1422,6 +1422,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         elif self.runner.runner_backend.is_cutlass():
+            use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
             quant_info = CutlassMoeQuantInfo(
                 moe_type=CutlassMoEType.BlockscaledFP8,
                 w13_weight=layer.w13_weight.transpose(1, 2),
@@ -1441,6 +1442,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 out_ptrs=self.out_ptr,
                 a_scales_ptrs=self.a_scales_ptr,
                 b_scales_ptrs=self.b_scales_ptr,
+                enable_es=(use_mxfp8, use_mxfp8),
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
