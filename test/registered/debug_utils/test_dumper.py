@@ -558,5 +558,29 @@ class TestDumpModel:
         assert all("grad" in f for f in filenames)
 
 
+class TestCleanup:
+    def test_cleanup_removes_old_dumps(self, tmp_path):
+        old_dir = tmp_path / "sglang_dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, needs_cleanup=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not old_dir.exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+    def test_no_cleanup_by_default(self, tmp_path):
+        old_dir = tmp_path / "sglang_dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert old_dir.exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
