@@ -73,16 +73,50 @@ def _usp_gather_for_ulysses(x: torch.Tensor, dim: int, world_size: int) -> torch
     Gather tensors from all ranks along dimension.
 
     Handles varying sizes per rank (UAA capability).
+    Uses pad-then-slice strategy to work with standard all_gather
+    which requires equal-sized tensors across ranks.
     """
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
 
-    # Gather tensors from all ranks
-    gathered = [torch.zeros_like(x) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered, x, group=ulysses_pg)
+    # Ensure input is contiguous - tensor_split/narrow may return non-contiguous views
+    x = x.contiguous()
 
-    # Concatenate along the specified dimension
-    return torch.cat(gathered, dim=dim)
+    local_size = x.shape[dim]
+
+    # Collect the actual sizes from each rank
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=x.device)
+    all_sizes_list = [torch.zeros(1, dtype=torch.long, device=x.device) for _ in range(world_size)]
+    torch.distributed.all_gather(all_sizes_list, local_size_tensor, group=ulysses_pg)
+    all_sizes = [int(s.item()) for s in all_sizes_list]
+    max_size = max(all_sizes)
+
+    if all(s == max_size for s in all_sizes):
+        # All ranks have the same size - use simple all_gather
+        gathered = [torch.zeros_like(x) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, x, group=ulysses_pg)
+        return torch.cat(gathered, dim=dim)
+
+    # Pad local tensor to max_size along dim so all ranks have equal size
+    pad_size = max_size - local_size
+    if pad_size > 0:
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        x_padded = torch.cat([x, padding], dim=dim)
+    else:
+        x_padded = x
+
+    # All ranks now have the same size along dim - safe to all_gather
+    gathered = [torch.zeros_like(x_padded) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, x_padded, group=ulysses_pg)
+
+    # Slice each gathered tensor to its actual size and concatenate
+    sliced = []
+    for i, g in enumerate(gathered):
+        sliced.append(g.narrow(dim, 0, all_sizes[i]))
+
+    return torch.cat(sliced, dim=dim)
 
 
 def _usp_input_all_to_all(
