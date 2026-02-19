@@ -3,6 +3,8 @@ from typing import Optional, Union
 import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
+import flashinfer.sampling
+
 
 def _top_k_renorm_probs_internal(
     probs: torch.Tensor,
@@ -77,8 +79,6 @@ def top_k_renorm_probs(
     if probs.device.type == "musa":
         return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
     else:
-        import flashinfer.sampling
-
         return flashinfer.sampling.top_k_renorm_probs(probs, top_k)
 
 
@@ -118,8 +118,6 @@ def top_p_renorm_probs(
     if probs.device.type == "musa":
         return _top_p_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_p))
     else:
-        import flashinfer.sampling
-
         return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
 
 
@@ -465,8 +463,6 @@ def top_k_mask_logits(
     if logits.device.type == "musa":
         return _top_k_mask_logits_internal(logits, *_to_tensor_scalar_tuple(top_k))
     else:
-        import flashinfer.sampling
-
         return flashinfer.sampling.top_k_mask_logits(logits, top_k)
 
 
