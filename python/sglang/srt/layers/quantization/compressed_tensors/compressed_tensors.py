@@ -80,6 +80,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         linear_fp8_config: Optional[Any] = None,
+        _modelopt_bridge: bool = False,
     ):
         super().__init__()
         self.ignore = ignore
@@ -93,6 +94,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         # FP8 config for linear layers, compressed tensor currently does not support block fp8, this is used for ktransformers
         self.linear_fp8_config = linear_fp8_config
+        # True only when config is from ModelOpt bridge; gates attention KV scales and 1D scale reshape
+        self._modelopt_bridge = _modelopt_bridge
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -140,11 +143,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
-        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-        from sglang.srt.layers.radix_attention import RadixAttention
+        if self._modelopt_bridge:
+            from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+            from sglang.srt.layers.radix_attention import RadixAttention
 
-        if isinstance(layer, RadixAttention):
-            return BaseKVCacheMethod(self)
+            if isinstance(layer, RadixAttention):
+                return BaseKVCacheMethod(self)
         return None
 
     @classmethod
@@ -174,6 +178,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_block_size=fp8_cfg.get("weight_block_size"),
             )
 
+        _modelopt_bridge = config.get("_modelopt_bridge", False)
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -183,6 +188,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
+            _modelopt_bridge=_modelopt_bridge,
         )
 
     @classmethod

@@ -168,13 +168,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     loaded_weight = loaded_weight.narrow(
                         self.output_dim, start_idx, shard_size
                     )
-        # Per-channel scale: checkpoint may be 1D (out,) while param is (out, 1)
-        if (
+        # Per-channel scale: only reshape 1D->2D when loading ModelOpt-bridge checkpoints
+        # (native llm_compressor uses 2D scales; reshaping there can break accuracy)
+        if getattr(self, "_allow_1d_scale_reshape", False) and (
             len(loaded_weight.shape) == 1
             and param_data.dim() == 2
             and param_data.shape[1] == 1
         ):
-            loaded_weight = loaded_weight.reshape(-1, 1)
+            loaded_weight = loaded_weight.reshape(-1, 1).contiguous()
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -223,13 +224,13 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
-        # Per-channel scale: checkpoint may be 1D (out,) while param is (out, 1)
-        if (
+        # Per-channel scale: only reshape 1D->2D when loading ModelOpt-bridge checkpoints
+        if getattr(self, "_allow_1d_scale_reshape", False) and (
             len(loaded_weight.shape) == 1
             and param_data.dim() == 2
             and param_data.shape[1] == 1
         ):
-            loaded_weight = loaded_weight.reshape(-1, 1)
+            loaded_weight = loaded_weight.reshape(-1, 1).contiguous()
         assert (
             param_data.shape == loaded_weight.shape
         ), f"{param_data.shape=}, {loaded_weight.shape=}"

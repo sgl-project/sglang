@@ -695,19 +695,24 @@ def apply_fp8_linear(
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
         # for sgl-kernel fp8_scaled_mm, it support per channel W now
+        # Ensure scale_b is float32 and (N, 1) for kernel (ModelOpt bridge may load bf16)
+        n_out = weight.shape[1]
+        scale_b = weight_scale.contiguous().view(-1, 1)
+        if scale_b.shape[0] != n_out:
+            scale_b = scale_b[:n_out].contiguous()
+        scale_b = scale_b.to(torch.float32)
+
         if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
-            print("yyyyyy" * 100)
             # Fall back to vllm cutlass w8a8 fp8 kernel
             output = ops.cutlass_scaled_mm(
                 qinput,
                 weight,
                 out_dtype=input.dtype,
                 scale_a=x_scale,
-                scale_b=weight_scale,
+                scale_b=scale_b,
                 bias=bias,
             )
         else:
-            print("zzzzzz" * 100)
             cutlass_compatible_b = (
                 weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
             )
@@ -715,14 +720,14 @@ def apply_fp8_linear(
                 # Massage the input to be 2D
                 qinput = qinput.view(-1, qinput.shape[-1])
                 output = triton_scaled_mm(
-                    qinput, weight, x_scale, weight_scale, input.dtype, bias
+                    qinput, weight, x_scale, scale_b, input.dtype, bias
                 )
             else:
                 output = fp8_scaled_mm(
                     qinput,
                     weight,
                     x_scale,
-                    weight_scale,
+                    scale_b,
                     out_dtype=input.dtype,
                     bias=bias,
                 )
@@ -767,7 +772,6 @@ def apply_fp8_linear(
             # For CUDA platform please validate if the
             # torch._scaled_mm support rowwise scaled GEMM
             # Fused GEMM_DQ Rowwise GEMM
-            print("yes: rowwise!!!")
             output = torch._scaled_mm(
                 qinput,
                 weight,

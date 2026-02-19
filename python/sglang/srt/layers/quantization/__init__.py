@@ -62,6 +62,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
+    "fp8_per_channel_per_token": CompressedTensorsConfig,  # ModelOpt bridge (per-channel per-token)
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,

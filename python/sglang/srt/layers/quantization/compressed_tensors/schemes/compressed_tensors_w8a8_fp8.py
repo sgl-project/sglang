@@ -92,6 +92,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
+            # Same shape as compressed_tensors: (out, 1), contiguous. Kernel (fp8_scaled_mm) requires float32.
+            weight_scale = weight_scale.contiguous().view(-1, 1)
+            if weight_scale.dtype != torch.float32:
+                weight_scale = weight_scale.to(torch.float32)
+
             if _use_aiter:
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
@@ -140,11 +145,20 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # TODO: update create_xxx_parameter functions to return
         # the newly added parameters
         if self.strategy == QuantizationStrategy.CHANNEL:
-            print(f"yes: channel!!!{self.strategy == QuantizationStrategy.CHANNEL}")
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
                 output_dim=0,
                 weight_loader=weight_loader,
+            )
+            # Only allow 1D->2D reshape when loading ModelOpt-bridge checkpoints
+            quant_method = getattr(layer, "quant_method", None)
+            quant_config = getattr(
+                quant_method, "quantization_config", None
+            ) or getattr(quant_method, "quant_config", None)
+            setattr(
+                weight_scale,
+                "_allow_1d_scale_reshape",
+                getattr(quant_config, "_modelopt_bridge", False),
             )
         else:
             assert self.strategy == QuantizationStrategy.TENSOR
@@ -172,7 +186,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # print(f"layer.weight.shape: {layer.weight.shape}, layer.weight_scale.shape: {layer.weight_scale.shape}, layer.input_scale.shape: {x.shape}")
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
