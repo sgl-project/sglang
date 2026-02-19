@@ -116,10 +116,11 @@ class SchedulerRuntimeCheckerMixin:
         # must not be counted as leaked; they will be reused on the next scheduling
         # round without re-copying from the radix cache (preserving numerical
         # determinism for mamba models).
-        waiting_mamba_slots = set()
-        for req in self.waiting_queue:
-            if req.mamba_pool_idx is not None:
-                waiting_mamba_slots.add(int(req.mamba_pool_idx))
+        waiting_mamba_slots = {
+            int(req.mamba_pool_idx)
+            for req in self.waiting_queue
+            if req.mamba_pool_idx is not None
+        }
 
         memory_leak = (
             full_num_used != self.tree_cache.full_protected_size()
