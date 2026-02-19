@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -154,11 +154,9 @@ class HybridAttnBackend(AttentionBackend):
         layer: RadixAttention = None,
         forward_batch: ForwardBatch = None,
         save_kv_cache: bool = True,
-        mixed_qkv: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-        ] = None,  # For GDN linear attention
-        a: Optional[torch.Tensor] = None,  # For GDN linear attention
-        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
         **kwargs,
     ):
         """Forward method that supports both regular attention (q, k, v) and linear attention (mixed_qkv, a, b)."""
