@@ -936,6 +936,20 @@ class NixlKVSender(CommonKVSender):
         self.has_sent = False
         self.chunk_id = 0
 
+    def _release_xfer_handles(self):
+        """Release all outstanding transfer handles."""
+
+        if not self.xfer_handles:
+            return
+
+        for handle in self.xfer_handles:
+            try:
+                self.kv_mgr.agent.release_xfer_handle(handle)
+            except Exception:
+                logger.warning("Failed to release transfer handle", exc_info=True)
+
+        self.xfer_handles.clear()
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -964,11 +978,46 @@ class NixlKVSender(CommonKVSender):
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        if all([x == "DONE" for x in states]):
-            return KVPoll.Success  # type: ignore
-        if any([x == "ERR" for x in states]):
+        handles_to_release = [
+            handle
+            for handle, state in zip(self.xfer_handles, states)
+            if state in {"DONE", "ERR"}
+        ]
+        has_error = any(state == "ERR" for state in states)
+
+        if handles_to_release:
+            for handle in handles_to_release:
+                try:
+                    self.kv_mgr.agent.release_xfer_handle(handle)
+                except Exception:
+                    logger.warning(
+                        "Failed to release transfer handle", exc_info=True
+                    )
+
+            self.xfer_handles = [
+                handle
+                for handle, state in zip(self.xfer_handles, states)
+                if state not in {"DONE", "ERR"}
+            ]
+
+        if has_error:
             raise Exception("KVSender transfer encountered an error.")
+
+        if not self.xfer_handles:
+            return KVPoll.Success  # type: ignore
+
         return KVPoll.WaitingForInput  # type: ignore
+
+    def __del__(self):
+        # Ensure handles are returned even if poll() is not called again
+        self._release_xfer_handles()
+
+    def abort(self):
+        # Decode-side cancellation should release handles immediately instead of
+        # waiting for garbage collection at prefill teardown.
+        self._release_xfer_handles()
+        self.has_sent = False
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVSender Exception")
