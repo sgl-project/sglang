@@ -221,9 +221,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata=self.cuda_graph_mla_metadata,
-                num_splits=self.cuda_graph_num_splits[: bs + 1],
-                block_kv_indices=self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         elif forward_mode.is_target_verify():
             seq_lens = seq_lens + self.num_draft_tokens
@@ -247,9 +247,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
-                mla_metadata=self.cuda_graph_mla_metadata,
-                num_splits=self.cuda_graph_num_splits[: bs + 1],
-                block_kv_indices=self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                self.cuda_graph_mla_metadata,
+                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         else:
             super().init_forward_metadata_capture_cuda_graph(
