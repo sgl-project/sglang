@@ -256,8 +256,6 @@ def gather_kv_to_pinned_all_layers(
         ELEM_BYTES=elem_bytes,
     )
 
-    torch.cuda.synchronize()
-
 
 @triton.jit
 def _scatter_kv_all_layers_from_pinned_kernel(
@@ -481,5 +479,3 @@ def scatter_kv_with_staging_all_layers(
         BLOCK_DIM=BLOCK_DIM,
         ELEM_BYTES=elem_bytes,
     )
-
-    torch.cuda.synchronize()

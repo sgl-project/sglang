@@ -114,13 +114,8 @@ class KVArgsRegisterInfo:
         else:
             dst_state_data_ptrs = []
 
-        # Handle backwards compatibility - older senders may not include pinned buffer info
-        dst_pinned_ptr = 0
-        dst_pinned_size = 0
-        if len(msg) > 12:
-            dst_pinned_ptr = int(msg[12].decode("ascii"))
-        if len(msg) > 13:
-            dst_pinned_size = int(msg[13].decode("ascii"))
+        dst_pinned_ptr = int(msg[12].decode("ascii"))
+        dst_pinned_size = int(msg[13].decode("ascii"))
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -739,10 +734,10 @@ class NixlKVManager(CommonKVManager):
         This method:
         1. Allocates a region from the shared pinned buffer pool
         2. Uses gather_kv_to_pinned_all_layers to collect scattered KV data into the region
-        3. Transfers the contiguous pinned buffer to destination pinned buffer via NIXL
-        4. Destination will use scatter_kv to distribute to its KV cache
+        3. Records a CUDA event and returns (event, post_fn)
 
-        Returns (xfer_handle, pool, offset) for later release.
+        The caller should poll event.query() and call post_fn() when the event fires.
+        post_fn() initiates the NIXL transfer and returns (handles, pool_allocations).
         """
         gather_kv_all_layers, _ = _import_triton_kv_transfer()
         if gather_kv_all_layers is None:
@@ -818,41 +813,46 @@ class NixlKVManager(CommonKVManager):
             src_head_stride=self._src_head_stride,
             kv_elem_bytes=bytes_per_element,
         )
-        torch.cuda.synchronize()
 
-        # Transfer pinned buffer to destination via NIXL (single transfer)
+        # Record CUDA event — poll() will call post_fn() once event.query() is True,
+        # ensuring the gather kernel has written all data to pinned memory before NIXL reads it.
+        event = torch.cuda.Event()
+        event.record()
+
+        # Capture variables needed by post_fn
         head_stride_bytes = num_layers * 2 * num_tokens * head_dim * bytes_per_element
         dst_offset = dst_head_offset * head_stride_bytes
+        buf_ptr = buffer_region.data_ptr()
+        pool_ref = self._pinned_pool
 
-        if dst_pinned_ptr == 0:
-            self._pinned_pool.release(src_offset)
-            raise RuntimeError(
-                f"[TRITON-KV] Invalid dst_pinned_ptr=0 for {peer_name}."
+        def post_fn():
+            if dst_pinned_ptr == 0:
+                pool_ref.release(src_offset)
+                raise RuntimeError(
+                    f"[TRITON-KV] Invalid dst_pinned_ptr=0 for {peer_name}."
+                )
+
+            src_addrs = [(buf_ptr, transfer_bytes, 0)]
+            dst_addrs = [(dst_pinned_ptr + dst_offset, transfer_bytes, 0)]
+
+            src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+            dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
             )
+            if not xfer_handle:
+                pool_ref.release(src_offset)
+                raise Exception("[TRITON-KV] Failed to create Triton KV transfer")
 
-        src_addrs = [
-            (buffer_region.data_ptr(), transfer_bytes, 0)
-        ]
-        dst_addrs = [
-            (dst_pinned_ptr + dst_offset, transfer_bytes, 0)
-        ]
+            state = self.agent.transfer(xfer_handle)
+            if state == "ERR":
+                pool_ref.release(src_offset)
+                raise Exception("[TRITON-KV] Failed to post Triton KV transfer")
 
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+            return [xfer_handle], [(pool_ref, src_offset)]
 
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
-        )
-        if not xfer_handle:
-            self._pinned_pool.release(src_offset)
-            raise Exception("[TRITON-KV] Failed to create Triton KV transfer")
-
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            self._pinned_pool.release(src_offset)
-            raise Exception("[TRITON-KV] Failed to post Triton KV transfer")
-
-        return (xfer_handle, self._pinned_pool, src_offset)
+        return event, post_fn
 
     def _send_kvcache_triton_batched(
         self,
@@ -869,7 +869,8 @@ class NixlKVManager(CommonKVManager):
             total_heads: Total number of KV heads on this prefill rank
 
         Returns:
-            Tuple of (handles, pool_allocations)
+            Tuple of (event, post_fn) where post_fn() initiates all NIXL transfers and
+            returns (handles, pool_allocations).
         """
         gather_kv_all_layers, _ = _import_triton_kv_transfer()
         if gather_kv_all_layers is None:
@@ -926,44 +927,52 @@ class NixlKVManager(CommonKVManager):
             src_head_stride=self._src_head_stride,
             kv_elem_bytes=bytes_per_element,
         )
-        torch.cuda.synchronize()
 
-        # Calculate head stride for slicing
+        # Record CUDA event — poll() will call post_fn() once event.query() is True,
+        # ensuring the gather kernel has written all data to pinned memory before NIXL reads it.
+        event = torch.cuda.Event()
+        event.record()
+
+        # Capture variables needed by post_fn
         head_stride_bytes = num_layers * 2 * num_tokens * head_dim * bytes_per_element
+        buf_data_ptr = buffer_region.data_ptr()
+        pool_ref = self._pinned_pool
 
-        # Loop over requests, calculate slice offsets, initiate NIXL transfers
-        handles = []
-        for agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads in requests:
-            src_slice_ptr = buffer_region.data_ptr() + head_start * head_stride_bytes
-            slice_bytes = num_heads * head_stride_bytes
+        def post_fn():
+            handles = []
+            for agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads in requests:
+                src_slice_ptr = buf_data_ptr + head_start * head_stride_bytes
+                slice_bytes = num_heads * head_stride_bytes
 
-            if dst_pinned_ptr == 0:
-                self._pinned_pool.release(src_offset)
-                raise RuntimeError(
-                    f"[TRITON-KV-BATCHED] Invalid dst_pinned_ptr=0 for {agent_name}."
+                if dst_pinned_ptr == 0:
+                    pool_ref.release(src_offset)
+                    raise RuntimeError(
+                        f"[TRITON-KV-BATCHED] Invalid dst_pinned_ptr=0 for {agent_name}."
+                    )
+
+                src_addrs = [(src_slice_ptr, slice_bytes, 0)]
+                dst_addrs = [(dst_pinned_ptr, slice_bytes, 0)]
+
+                src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+                dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+
+                xfer_handle = self.agent.initialize_xfer(
+                    "WRITE", src_descs, dst_descs, agent_name, notif.encode("ascii")
                 )
+                if not xfer_handle:
+                    pool_ref.release(src_offset)
+                    raise Exception(f"[TRITON-KV-BATCHED] Failed to create transfer to {agent_name}")
 
-            src_addrs = [(src_slice_ptr, slice_bytes, 0)]
-            dst_addrs = [(dst_pinned_ptr, slice_bytes, 0)]
+                state = self.agent.transfer(xfer_handle)
+                if state == "ERR":
+                    pool_ref.release(src_offset)
+                    raise Exception(f"[TRITON-KV-BATCHED] Failed to post transfer to {agent_name}")
 
-            src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
-            dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+                handles.append(xfer_handle)
 
-            xfer_handle = self.agent.initialize_xfer(
-                "WRITE", src_descs, dst_descs, agent_name, notif.encode("ascii")
-            )
-            if not xfer_handle:
-                self._pinned_pool.release(src_offset)
-                raise Exception(f"[TRITON-KV-BATCHED] Failed to create transfer to {agent_name}")
+            return handles, [(pool_ref, src_offset)]
 
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                self._pinned_pool.release(src_offset)
-                raise Exception(f"[TRITON-KV-BATCHED] Failed to post transfer to {agent_name}")
-
-            handles.append(xfer_handle)
-
-        return handles, [(self._pinned_pool, src_offset)]
+        return event, post_fn
 
     def scatter_received_kv(
         self,
@@ -1016,7 +1025,10 @@ class NixlKVManager(CommonKVManager):
             self._dst_slot_stride = k_buffers[0].stride(0)
             self._dst_head_stride = k_buffers[0].stride(1)
 
-        # Scatter from shared pool's buffer to KV cache
+        # Scatter from shared pool's buffer to KV cache.
+        # No CPU sync needed: the scatter kernel runs on the default CUDA stream, and the
+        # subsequent model forward pass also runs on that stream, so GPU stream ordering
+        # guarantees the scatter completes before the forward reads the KV cache.
         scatter_kv_all_layers(
             pinned_input=self._pinned_pool.buffer,
             k_data_ptrs=self._k_data_ptrs,
@@ -1030,7 +1042,6 @@ class NixlKVManager(CommonKVManager):
             dst_head_stride=self._dst_head_stride,
             kv_elem_bytes=bytes_per_element,
         )
-        torch.cuda.synchronize()
 
     def send_aux(
         self,
@@ -1194,6 +1205,7 @@ class NixlKVManager(CommonKVManager):
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
         pool_allocations = []
+        pending_posts = []
 
         # Filter out dummy requests for CPU buffer batched path detection
         active_reqs = [req for req in reqs_to_be_processed if not req.is_dummy()]
@@ -1250,11 +1262,10 @@ class NixlKVManager(CommonKVManager):
                             heads_per_decode_rank,
                         ))
 
-                    batch_handles, batch_allocs = self._send_kvcache_triton_batched(
+                    batch_event, batch_post_fn = self._send_kvcache_triton_batched(
                         batch_requests, kv_indices, num_kv_heads
                     )
-                    handles.extend(batch_handles)
-                    pool_allocations.extend(batch_allocs)
+                    pending_posts.append((batch_event, batch_post_fn))
 
                     # Handle aux data separately
                     if is_last:
@@ -1273,7 +1284,7 @@ class NixlKVManager(CommonKVManager):
                     if is_last:
                         del self.transfer_infos[bootstrap_room]
 
-                    return handles, pool_allocations
+                    return handles, pool_allocations, pending_posts
 
         for req in reqs_to_be_processed:
             assert bootstrap_room == req.room
@@ -1298,6 +1309,7 @@ class NixlKVManager(CommonKVManager):
                 and not self.is_mla_backend
             )
 
+            kv_xfer_handle = None
             if use_cpu_buffer and prefill_tp_size >= decode_tp_size:
                 # Triton CPU buffer path for same-TP or prefill_tp > decode_tp
                 num_kv_heads = self.kv_args.kv_head_num
@@ -1321,7 +1333,7 @@ class NixlKVManager(CommonKVManager):
                     num_heads_to_send = num_kv_heads
                     dst_head_offset = 0
 
-                kv_xfer_handle, pool, offset = self.send_kvcache_triton(
+                kv_event, kv_post_fn = self.send_kvcache_triton(
                     peer_name=req.agent_name,
                     prefill_kv_indices=kv_indices,
                     dst_pinned_ptr=decode_info.dst_pinned_ptr,
@@ -1331,7 +1343,7 @@ class NixlKVManager(CommonKVManager):
                     num_heads_to_send=num_heads_to_send,
                     dst_head_offset=dst_head_offset,
                 )
-                pool_allocations.append((pool, offset))
+                pending_posts.append((kv_event, kv_post_fn))
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
@@ -1355,7 +1367,8 @@ class NixlKVManager(CommonKVManager):
                     dst_kv_item_len=decode_info.dst_kv_item_len,
                 )
 
-            handles.append(kv_xfer_handle)
+            if kv_xfer_handle is not None:
+                handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
             if is_last:
                 if state_indices is not None:
@@ -1383,7 +1396,7 @@ class NixlKVManager(CommonKVManager):
                 handles.append(aux_xfer_handle)
         if is_last:
             del self.transfer_infos[bootstrap_room]
-        return handles, pool_allocations
+        return handles, pool_allocations, pending_posts
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
@@ -1475,6 +1488,8 @@ class NixlKVSender(CommonKVSender):
         self.xfer_handles = []
         # Track pool allocations for release when transfer completes
         self._pool_allocations: List[tuple] = []
+        # Pending (event, post_fn) pairs: NIXL not yet posted, waiting for gather kernel
+        self._pending_posts: List[tuple] = []
         self.has_sent = False
         self.chunk_id = 0
 
@@ -1487,17 +1502,20 @@ class NixlKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
-        new_xfer_handles, new_pool_allocations = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last,
-            self.chunk_id,
-            self.aux_index,
-            state_indices,
+        new_xfer_handles, new_pool_allocations, new_pending_posts = (
+            self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                is_last,
+                self.chunk_id,
+                self.aux_index,
+                state_indices,
+            )
         )
         self.xfer_handles.extend(new_xfer_handles)
         self._pool_allocations.extend(new_pool_allocations)
+        self._pending_posts.extend(new_pending_posts)
         self.chunk_id += 1
         if is_last:
             self.has_sent = True
@@ -1506,6 +1524,24 @@ class NixlKVSender(CommonKVSender):
     def poll(self) -> KVPoll:
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
+
+        # Drain pending gather events: once a CUDA event fires, post the NIXL transfer.
+        if self._pending_posts:
+            remaining = []
+            for event, post_fn in self._pending_posts:
+                if event.query():
+                    new_handles, new_allocs = post_fn()
+                    self.xfer_handles.extend(new_handles)
+                    self._pool_allocations.extend(new_allocs)
+                else:
+                    remaining.append((event, post_fn))
+            self._pending_posts = remaining
+            if self._pending_posts:
+                return KVPoll.WaitingForInput  # type: ignore
+
+        if not self.xfer_handles:
+            return KVPoll.WaitingForInput  # type: ignore
+
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
             # Release pool allocations now that all transfers are complete
