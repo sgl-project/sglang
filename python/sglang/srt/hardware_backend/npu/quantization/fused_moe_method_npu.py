@@ -299,8 +299,6 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
-            w13_offset=layer.w13_weight_offset,
-            w2_offset=layer.w2_weight_offset,
         )
         return StandardCombineInput(hidden_states=output)
 
