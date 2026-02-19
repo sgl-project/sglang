@@ -762,7 +762,9 @@ def run_benchmark_internal(
 
         for i in range(dp_size):
             skip_token_capacity_threshold += (
-                internal_state[i].get("memory_usage", {}).get("token_capacity", 1000000000)
+                internal_state[i]
+                .get("memory_usage", {})
+                .get("token_capacity", 1000000000)
             )
 
         assert (
