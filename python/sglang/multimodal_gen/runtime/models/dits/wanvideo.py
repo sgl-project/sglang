@@ -931,11 +931,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # 4. Transformer blocks
         # if caching is enabled, we might be able to skip the forward pass
-        ic(temb)
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
-        ic(should_skip_forward)
+        should_skip_forward = False # always compute for calibration
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
@@ -950,10 +949,17 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 )
             # Cache states
             if self.cache_type is not None:
+                forward_context = get_forward_context()
+                forward_batch = forward_context.forward_batch
+                if forward_batch is None:
+                    return None
+                self.is_cfg_negative = forward_batch.is_cfg_negative
+                current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
+                do_cfg = forward_batch.do_classifier_free_guidance
+
+                self.calibrate(hidden_states, original_hidden_states, current_timestep, do_cfg, self.is_cfg_negative)
                 self.maybe_cache_states(hidden_states, original_hidden_states)
 
-            # if self.calibrate_magcache:
-            #     self._calibrate_magcache(self.cnt, hidden_states, original_hidden_states, self.is_cfg_negative)
         self.cnt += 1
 
         if sequence_shard_enabled:
@@ -1015,11 +1021,13 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if forward_batch is None:
             return None
         self.is_cfg_negative = forward_batch.is_cfg_negative
+        current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
+        do_cfg = forward_batch.do_classifier_free_guidance
 
-        ic(self.cache_type)
+        ic(self.cache_type, self.is_cfg_negative)
         if self.cache_type == "magcache":
             ic('checking magcache2')
-            return self.should_skip_forward(is_cfg_negative=self.is_cfg_negative)
+            return self.should_skip_forward(current_timestep, do_cfg, self.is_cfg_negative)
 
         # if self.calibrate_magcache:
         #     return False
@@ -1066,55 +1074,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 ic(should_calc)
 
                 return not should_calc
-
-        # Try MagCache
-        if self.cache_type == "magcache":
-            ic('checking magcache')
-            ctx = self._get_magcache_context()
-            if ctx is None:
-                return False
-
-            # Get Wan-specific params
-            magcache_params = ctx.magcache_params
-            assert isinstance(
-                magcache_params, WanMagCacheParams
-            ), "magcache_params is not a WanMagCacheParams"
-
-            ret_steps = magcache_params.ret_steps
-            cutoff_steps = magcache_params.get_cutoff_steps(ctx.num_inference_steps)
-
-            # Adjust for non-CFG
-            if not ctx.do_cfg:
-                ret_steps = ret_steps // 2
-                cutoff_steps = cutoff_steps // 2
-
-            # self.is_cfg_negative = ctx.is_cfg_negative
-
-            # Boundary detection
-            is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
-
-            # Need previous residual to make decision
-            prev_residual = (
-                self.previous_residual_negative
-                if ctx.is_cfg_negative
-                else self.previous_residual
-            )
-
-            # Use previous residual norm to decide
-            should_calc = self._compute_magcache_decision(
-                residual=prev_residual,
-                current_timestep=ctx.current_timestep,
-                mag_ratios=ctx.magcache_params.mag_ratios,
-                magcache_thresh=ctx.magcache_thresh,
-                max_skip_steps=ctx.max_skip_steps,
-                retention_steps=ctx.retention_steps,
-                is_boundary_step=is_boundary_step,
-                do_cfg=ctx.do_cfg,
-                is_cfg_negative=self.is_cfg_negative,
-            )
-            ic(should_calc)
-
-            return not should_calc
 
         return False
 

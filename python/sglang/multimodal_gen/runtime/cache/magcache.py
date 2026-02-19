@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models import DiTConfig
 
@@ -60,328 +61,6 @@ class MagCacheContext:
 
 
 class MagCacheMixin:
-    """
-    Standalone mixin for MagCache optimization (does NOT inherit from TeaCacheMixin).
-
-    MagCache accelerates diffusion inference by selectively skipping redundant
-    computation when consecutive diffusion steps have predictable magnitude ratios.
-
-    This mixin should be inherited by DiT model classes that want to support
-    MagCache optimization. It provides:
-    - State management for tracking magnitude ratios
-    - CFG-aware caching (separate caches for positive/negative branches)
-    - Decision logic for when to compute vs. use cache
-
-    Note: This mixin shares some state with TeaCacheMixin (previous_residual, cnt,
-    is_cfg_negative). The initialization checks if TeaCache already set these up.
-
-    Attributes:
-        enable_magcache: Whether MagCache is enabled.
-        previous_residual_norm: Norm of previous residual for positive branch.
-        accumulated_error: Accumulated error for positive branch.
-        consecutive_skips: Consecutive skip counter for positive branch.
-
-    CFG-specific attributes (only when _supports_cfg_cache is True):
-        previous_residual_norm_negative: Norm for negative branch.
-        accumulated_error_negative: Accumulated error for negative branch.
-        consecutive_skips_negative: Skip counter for negative branch.
-    """
-
-    # Models that support CFG cache separation (same as TeaCache)
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
-    config: DiTConfig
-
-    def _init_magcache_state(self) -> None:
-        """Initialize MagCache state."""
-        if not hasattr(self, "previous_residual"):
-            self.previous_residual: torch.Tensor | None = None
-            self.cnt = 0
-            self.is_cfg_negative = False
-            self._supports_cfg_cache = (
-                self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
-            )
-
-        # Always set magcache flag
-        self.enable_magcache = True
-        self.calibrate_magcache = True # todo: fix
-
-        # MagCache-specific state
-        self.previous_residual_norm: float = 0.0
-        self.accumulated_error: float = 0.0
-        self.consecutive_skips: int = 0
-
-        # CFG negative branch (only if supported)
-        if self._supports_cfg_cache:
-            if not hasattr(self, "previous_residual_negative"):
-                self.previous_residual_negative: torch.Tensor | None = None
-
-            self.previous_residual_norm_negative: float = 0.0
-            self.accumulated_error_negative: float = 0.0
-            self.consecutive_skips_negative: int = 0
-
-    def reset_magcache_state(self) -> None:
-        """Reset MagCache state at the start of each generation task."""
-        self.previous_residual_norm = 0.0
-        self.accumulated_error = 0.0
-        self.consecutive_skips = 0
-        self.enable_magcache = True
-
-        if self._supports_cfg_cache:
-            self.previous_residual_norm_negative = 0.0
-            self.accumulated_error_negative = 0.0
-            self.consecutive_skips_negative = 0
-
-    def _compute_magcache_decision(
-        self,
-        residual: torch.Tensor,
-        current_timestep: int,
-        mag_ratios: torch.Tensor,
-        magcache_thresh: float,
-        max_skip_steps: int,
-        retention_steps: int,
-        is_boundary_step: bool,
-        do_cfg: bool,
-        is_cfg_negative: bool,
-    ) -> bool:
-        """
-        Compute cache decision for MagCache.
-        """
-
-        # if MagCache is not enabled, always compute
-        if not self.enable_magcache:
-            return True
-
-        # must have previous residual to make decision
-        if residual is None:
-            return True
-
-        if is_boundary_step:
-            current_norm = residual.norm(p=2).item()
-            self._update_magcache_state(current_norm, 0.0, 0)
-            return True
-
-        # Select CFG branch state
-        prev_norm = (
-            self.previous_residual_norm_negative
-            if self.is_cfg_negative
-            else self.previous_residual_norm
-        )
-        accum_error = (
-            self.accumulated_error_negative
-            if self.is_cfg_negative
-            else self.accumulated_error
-        )
-        consec_skips = (
-            self.consecutive_skips_negative
-            if self.is_cfg_negative
-            else self.consecutive_skips
-        )
-
-        # First compute always
-        if prev_norm == 0.0:
-            current_norm = residual.norm(p=2).item()
-            self._update_magcache_state(current_norm, 0.0, 0)
-            return True
-
-        branch_offset = 1 if self.is_cfg_negative else 0
-        idx = current_timestep * 2 + branch_offset
-
-        # must compute if out of bounds (should not happen if mag_ratios is properly interpolated)
-        if idx >= len(mag_ratios):
-            return True
-
-        gamma_hat = mag_ratios[idx].item()
-        new_error = accum_error + abs(1.0 - gamma_hat)
-
-        can_skip = (
-            new_error <= magcache_thresh
-            and consec_skips < max_skip_steps
-            and self.cnt >= retention_steps
-        )
-
-        if can_skip:
-            self._update_magcache_state(None, new_error, consec_skips + 1)
-            return False
-        else:
-            current_norm = residual.norm(p=2).item()
-            self._update_magcache_state(current_norm, 0.0, 0)
-            return True
-
-    def _calibrate_magcache(self, cnt:int, hidden_states:torch.Tensor, original_hidden_states:torch.Tensor, is_negative: bool = False) -> None:
-        """
-        Calibration mode to collect magnitude ratios and save them to a JSON file.
-
-        This method tracks the magnitude ratios between consecutive residuals during
-        diffusion inference. The ratios are collected for both positive and negative
-        CFG branches (interleaved) and saved to disk when generation completes.
-        """
-
-
-        # only calibrate starting in the second denoising step
-        if cnt == 0: return
-
-        current_residual = hidden_states.squeeze(0) - original_hidden_states
-        current_norm = current_residual.norm(p=2)
-
-        previous_residual = self.previous_residual_negative if is_negative else self.previous_residual
-        assert previous_residual is not None
-        previous_norm = previous_residual.norm(p=2)
-
-        import torch.nn.functional as F
-        norm_ratio = (current_norm / previous_norm).mean().item()
-        norm_std = (current_norm / previous_norm).std().item()
-        cos_dis = (1-F.cosine_similarity(current_residual, previous_residual, dim=-1, eps=1e-8)).mean().item()
-
-
-    def _update_magcache_state(
-        self, norm: float | None, error: float, skips: int
-    ) -> None:
-        """Update MagCache state for active CFG branch."""
-
-        if not self.is_cfg_negative:
-            if norm is not None:
-                self.previous_residual_norm = norm
-            self.accumulated_error = error
-            self.consecutive_skips = skips
-        elif self._supports_cfg_cache:
-            if norm is not None:
-                self.previous_residual_norm_negative = norm
-            self.accumulated_error_negative = error
-            self.consecutive_skips_negative = skips
-
-    def _get_calibration_cache_dir(self) -> str:
-        """Get the directory for storing MagCache calibration files."""
-        from sglang.multimodal_gen import SGLANG_DIFFUSION_CACHE_ROOT
-        calibration_dir = os.path.join(SGLANG_DIFFUSION_CACHE_ROOT, "magcache_calibrations")
-        os.makedirs(calibration_dir, exist_ok=True)
-        return calibration_dir
-
-    def _save_calibration_data(self, num_steps: int, do_cfg: bool) -> None:
-        """
-        Save collected magnitude ratios to a JSON file.
-
-        Args:
-            num_steps: Number of inference steps used during calibration.
-            do_cfg: Whether classifier-free guidance was enabled.
-        """
-        if not self.calibration_ratios:
-            return
-
-        # Generate filename based on model and configuration
-        model_name = self.config.prefix.lower()  # e.g., "wan", "flux", etc.
-        cfg_suffix = "_cfg" if do_cfg else "_nocfg"
-        filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
-
-        calibration_dir = self._get_calibration_cache_dir()
-        filepath = os.path.join(calibration_dir, filename)
-
-        # Prepare calibration data
-        calibration_data = {
-            "model": model_name,
-            "num_steps": num_steps,
-            "do_cfg": do_cfg,
-            "mag_ratios": self.calibration_ratios,
-            "calibration_date": datetime.now().isoformat(),
-            "num_ratios": len(self.calibration_ratios),
-            "recommended_threshold": 0.12 if model_name == "wan" else 0.06,
-            "recommended_max_skip_steps": 4 if model_name == "wan" else 3,
-            "recommended_retention_ratio": 0.2,
-        }
-
-        # Save to JSON
-        try:
-            with open(filepath, 'w') as f:
-                json.dump(calibration_data, f, indent=2)
-            print(f"✓ MagCache calibration saved to: {filepath}")
-            print(f"  - Model: {model_name}")
-            print(f"  - Steps: {num_steps}")
-            print(f"  - CFG: {do_cfg}")
-            print(f"  - Ratios collected: {len(self.calibration_ratios)}")
-        except Exception as e:
-            print(f"⚠ Failed to save MagCache calibration: {e}")
-
-    @staticmethod
-    def load_calibration_data(
-        model_name: str, num_steps: int, do_cfg: bool
-    ) -> dict | None:
-        """
-        Load calibration data from disk.
-
-        Args:
-            model_name: Model identifier (e.g., "wan", "flux").
-            num_steps: Number of inference steps.
-            do_cfg: Whether CFG is enabled.
-
-        Returns:
-            Dictionary containing calibration data, or None if not found.
-        """
-        cache_root = os.path.expanduser("~/.cache/sgl_diffusion")
-        calibration_dir = os.path.join(cache_root, "magcache_calibrations")
-
-        cfg_suffix = "_cfg" if do_cfg else "_nocfg"
-        filename = f"{model_name}_{num_steps}steps{cfg_suffix}.json"
-        filepath = os.path.join(calibration_dir, filename)
-
-        if not os.path.exists(filepath):
-            return None
-
-        try:
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-            return data
-        except Exception as e:
-            print(f"⚠ Failed to load MagCache calibration from {filepath}: {e}")
-            return None
-
-    def _get_magcache_context(self) -> MagCacheContext | None:
-        """
-        Check MagCache preconditions and extract common context.
-
-        Returns:
-            MagCacheContext if MagCache is enabled and properly configured,
-            None if should skip MagCache logic entirely.
-        """
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            get_forward_context,
-        )
-        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-        server_args = get_global_server_args()
-        if not server_args.enable_magcache:
-            return None
-
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None:
-            return None
-
-        magcache_params = server_args.magcache_params
-
-        # Reset at timestep 0
-        if forward_context.current_timestep == 0 and not self.is_cfg_negative:
-            self.reset_magcache_state()
-
-        # Compute retention_steps
-        if hasattr(magcache_params, "ret_steps"):
-            retention_steps = magcache_params.ret_steps  # Wan-specific
-        else:
-            retention_steps = int(
-                magcache_params.retention_ratio * forward_batch.num_inference_steps
-            )
-
-        return MagCacheContext(
-            current_timestep=forward_context.current_timestep,
-            num_inference_steps=forward_batch.num_inference_steps,
-            do_cfg=forward_batch.do_classifier_free_guidance,
-            is_cfg_negative=forward_batch.is_cfg_negative,
-            magcache_thresh=magcache_params.threshold,
-            max_skip_steps=magcache_params.max_skip_steps,
-            retention_steps=retention_steps,
-            magcache_params=magcache_params,
-        )
-
-
-class MagCacheMixin2:
     # Models that support CFG cache separation (same as TeaCache)
     _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
     config: DiTConfig
@@ -395,9 +74,10 @@ class MagCacheMixin2:
         self.mag_ratios = magcache_params.mag_ratios
         self.use_ret_steps = magcache_params.use_ret_steps
 
-        # todo: do we need *2 for interleaving pos/neg cfg steps?
-        self.min_steps = int(self.num_steps * self.retention_ratio) if self.use_ret_steps else 2
-        self.max_steps = self.num_steps if self.use_ret_steps else self.num_steps - 2
+        # cnt = step * 2 + branch_offset, so ranges over [0, num_steps*2)
+        # min_steps and max_steps must be in the same cnt space
+        self.min_steps = int(self.num_steps * self.retention_ratio) * 2 if self.use_ret_steps else 2
+        self.max_steps = self.num_steps * 2 if self.use_ret_steps else self.num_steps * 2 - 2
 
         self.previous_residual: torch.Tensor | None = None
         self.previous_residual_norm: float = 0.0
@@ -416,42 +96,24 @@ class MagCacheMixin2:
 
     def reset(self, is_cfg_negative):
         if not is_cfg_negative:
-            self.previous_residual = None
-            self.previous_residual_norm = 0.0
             self.norm_ratio = 1.0
             self.accumulated_error = 0.0
             self.consecutive_skips = 0
         else:
-            self.previous_residual_negative = None
-            self.previous_residual_norm_negative = 0.0
             self.norm_ratio_negative = 1.0
             self.accumulated_error_negative = 0.0
             self.consecutive_skips_negative = 0
 
-    def should_skip_forward(self, current_timestep=None, do_cfg=None, is_cfg_negative=False):
+    def should_skip_forward(self, current_timestep, do_cfg, is_cfg_negative=False):
 
-        # determine if this model uses cfg
-        # if so, adjust cnt to reflect interleaving of pos/neg steps
-        if current_timestep is None or do_cfg is None:
-            from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-            forward_context = get_forward_context()
-            current_timestep = forward_context.current_timestep
-            forward_batch = forward_context.forward_batch
-            assert forward_batch is not None, "Forward batch should not be None when checking MagCache skip decision"
-            do_cfg = forward_batch.do_classifier_free_guidance
-
-        # if model uses cfg, magnitude ratios are interleaved for pos/neg branches, so we need to adjust the index accordingly
-        cnt = current_timestep
-        if do_cfg:
-            cnt = current_timestep // 2 + (1 if is_cfg_negative else 0)
+        # cnt is the global step index that accounts for both cond and uncond passes when doing CFG
+        cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
+        ic(current_timestep, cnt, do_cfg, is_cfg_negative)
 
         # reset at timestep 0
         if current_timestep == 0:
             self.reset(is_cfg_negative)
 
-        # todo: can we refactor to make simpler?
-        prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
-        prev_residual_norm = self.previous_residual_norm_negative if is_cfg_negative else self.previous_residual_norm
         accumulated_error = self.accumulated_error_negative if is_cfg_negative else self.accumulated_error
         consecutive_skips = self.consecutive_skips_negative if is_cfg_negative else self.consecutive_skips
         norm_ratio = self.norm_ratio_negative if is_cfg_negative else self.norm_ratio
@@ -459,17 +121,43 @@ class MagCacheMixin2:
         # always compute first few and last few steps
         is_boundary_step = cnt < self.min_steps or cnt >= self.max_steps
         if is_boundary_step:
+            ic(f"Boundary step (cnt={cnt}), computing without cache. Resetting MagCache state.")
             self.reset(is_cfg_negative)
             return False
 
         cur_mag_ratio = self.mag_ratios[cnt] # access pre-calibrated magnitude ratio for current step
-        norm_ratio = norm_ratio*cur_mag_ratio # magnitude ratio between current step and the cached step
+        norm_ratio = norm_ratio * cur_mag_ratio # magnitude ratio between current step and the cached step
         consecutive_skips += 1 # skip steps plus 1
-        cur_skip_err = torch.abs(1-norm_ratio) # skip error of current steps
+        cur_skip_err = abs(1 - norm_ratio) # skip error of current steps
         accumulated_error += cur_skip_err # accumulated error of multiple steps
 
-        if accumulated_error<self.magcache_thresh and consecutive_skips<=self.max_skip_steps:
+        if accumulated_error < self.magcache_thresh and consecutive_skips <= self.max_skip_steps:
+            # Write updated state back before returning
+            if is_cfg_negative:
+                self.norm_ratio_negative = norm_ratio
+                self.accumulated_error_negative = accumulated_error
+                self.consecutive_skips_negative = consecutive_skips
+            else:
+                self.norm_ratio = norm_ratio
+                self.accumulated_error = accumulated_error
+                self.consecutive_skips = consecutive_skips
             return True
         else:
             self.reset(is_cfg_negative)
             return False
+
+    def calibrate(self, hidden_states, original_hidden_states, current_timestep, do_cfg, is_cfg_negative=False):
+        cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
+
+        # todo: can we refactor to make simpler?
+        prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
+        if prev_residual is None: # don't have a cached residual to compare to, so skip on first step
+            return None
+
+        curr_residual = hidden_states.squeeze(0) - original_hidden_states
+        mag_ratio = ((curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).mean()).item()
+        mag_std = (curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).std().item()
+        cos_dis = (1-F.cosine_similarity(curr_residual, prev_residual, dim=-1, eps=1e-8)).mean().item()
+
+        with open(f"magcache_calibration{'_neg' if is_cfg_negative else ''}.jsonl", "a") as f:
+            f.write(json.dumps({"cnt": cnt, "norm_ratio": mag_ratio, "norm_std": mag_std, "cos_dis": cos_dis}) + "\n")
