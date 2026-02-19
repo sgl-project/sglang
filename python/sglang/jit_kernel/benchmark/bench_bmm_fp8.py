@@ -8,11 +8,10 @@ Usage:
 
 import argparse
 
+import flashinfer
 import torch
 import triton
 import triton.testing
-
-import flashinfer
 from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
