@@ -25,7 +25,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post2"
+ENV AITER_COMMIT="v0.1.10.post3"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -35,7 +35,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post2"
+ENV AITER_COMMIT="v0.1.10.post3"
 
 # ===============================
 # Base image 950 and args
@@ -43,9 +43,9 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="0"
+ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post2"
+ENV AITER_COMMIT="v0.1.10.post3"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -55,7 +55,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post2"
+ENV AITER_COMMIT="v0.1.10.post3"
 
 # ===============================
 # Chosen arch and args
@@ -94,7 +94,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="20920706a9004018dbd87c7387f207d08d0e05af"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -156,7 +156,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi \
+     && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
 # -----------------------
 # Build vLLM
