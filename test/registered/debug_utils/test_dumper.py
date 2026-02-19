@@ -307,7 +307,20 @@ class TestDumperFileWriteControl:
         assert len(_get_filenames(tmpdir)) == 0
 
 
-class TestOutputConsoleControl:
+class TestOutputControl:
+    def test_file_enabled_by_default(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.dump("file_on", torch.randn(3, 3))
+
+        _assert_files(_get_filenames(tmp_path), exist=["file_on"])
+
+    def test_file_disabled(self, tmp_path, capsys):
+        d = _make_test_dumper(tmp_path, enable_output_file=False)
+        d.dump("file_off", torch.randn(3, 3))
+
+        assert len(_get_filenames(tmp_path)) == 0
+        assert "file_off" in capsys.readouterr().out
+
     def test_console_enabled_by_default(self, tmp_path, capsys):
         d = _make_test_dumper(tmp_path)
         d.dump("console_on", torch.randn(3, 3))
@@ -320,17 +333,8 @@ class TestOutputConsoleControl:
         d = _make_test_dumper(tmp_path, enable_output_console=False)
         d.dump("console_off", torch.randn(3, 3))
 
-        captured = capsys.readouterr()
-        assert "console_off" not in captured.out
+        assert "console_off" not in capsys.readouterr().out
         _assert_files(_get_filenames(tmp_path), exist=["console_off"])
-
-    def test_console_only_no_file(self, tmp_path, capsys):
-        d = _make_test_dumper(tmp_path, enable_output_file=False)
-        d.dump("console_only", torch.randn(3, 3))
-
-        captured = capsys.readouterr()
-        assert "console_only" in captured.out
-        assert len(_get_filenames(tmp_path)) == 0
 
 
 class TestDumpDictFormat:
