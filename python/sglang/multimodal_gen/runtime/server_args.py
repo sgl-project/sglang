@@ -507,14 +507,6 @@ class ServerArgs:
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
             num_gpus_per_group = self.dp_size * self.tp_size
-            if (
-                self.enable_cfg_parallel is None
-                and (self.num_gpus // num_gpus_per_group) >= 2
-            ):
-                logger.info(
-                    f"Automatically set enable_cfg_parallel for best performance"
-                )
-                self.enable_cfg_parallel = True
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= 2
             if self.num_gpus % num_gpus_per_group == 0:

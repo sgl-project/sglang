@@ -94,7 +94,7 @@ def maybe_load_fsdp_model(
 
     with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
         model = model_cls(**init_params)
-        # print(f"{model.named_parameters().items()=}")
+
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
 
@@ -239,8 +239,6 @@ def load_model_from_full_model_state_dict(
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
 
-    # print(f"{full_sd_iterator=}")
-
     # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
@@ -254,7 +252,6 @@ def load_model_from_full_model_state_dict(
     sorted_param_names = sorted(custom_param_sd.keys())
 
     sharded_sd = {}
-
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
@@ -327,11 +324,8 @@ def load_model_from_full_model_state_dict(
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
-
-    # diagnostic: show weight loading statistics
-    loaded_from_ckpt = set(sharded_sd.keys())
-    all_model_keys = set(meta_sd.keys())
-    unused_keys = all_model_keys - loaded_from_ckpt
+    # parameters in nn.Module that doesn't exist in safetensor files
+    unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 

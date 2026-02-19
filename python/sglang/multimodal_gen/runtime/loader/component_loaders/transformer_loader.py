@@ -94,7 +94,6 @@ class TransformerLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
-        # print(f"{nunchaku_config=}")
         if nunchaku_config is not None:
             # respect dtype from checkpoint
             # TODO: improve the condition
@@ -132,7 +131,6 @@ class TransformerLoader(ComponentLoader):
             and "quant_config" in inspect.signature(model_cls.__init__).parameters
         ):
             init_params["quant_config"] = nunchaku_config
-            # print(f"{init_params=}")
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
