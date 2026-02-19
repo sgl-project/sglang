@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import os
 import logging
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -53,6 +54,7 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
     is_sm120_supported,
+    log_info_on_rank0,
     next_power_of_2,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -108,6 +110,17 @@ logger = logging.getLogger(__name__)
 _logged_flashinfer_cutedsl_input_scale_cast = False
 _logged_flashinfer_cutedsl_standard_path = False
 
+_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY = os.getenv(
+    "SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY", "scalar_max"
+).strip().lower()
+if _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY not in {"scalar_max", "strict"}:
+    logger.warning(
+        "Invalid SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=%r. "
+        "Falling back to 'scalar_max'.",
+        _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY,
+    )
+    _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY = "scalar_max"
+
 
 def _sglang_fp4_gemm_fake(
     input: torch.Tensor,
@@ -121,6 +134,30 @@ def _sglang_fp4_gemm_fake(
     M = input.shape[-2]
     N = int(out_features)
     return input.new_empty((M, N), dtype=out_dtype)
+
+
+def _resolve_cutedsl_standard_input_scale(input_scale: torch.Tensor) -> torch.Tensor:
+    if input_scale.numel() <= 1:
+        return input_scale
+
+    if _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY == "strict":
+        raise ValueError(
+            "flashinfer_cutedsl standard path got non-scalar w13_input_scale_quant "
+            f"(shape={tuple(input_scale.shape)}), and "
+            "SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=strict. "
+            "Use scalar weights/input scales or switch strategy to 'scalar_max'."
+        )
+
+    global _logged_flashinfer_cutedsl_input_scale_cast
+    if not _logged_flashinfer_cutedsl_input_scale_cast:
+        log_info_on_rank0(
+            logger,
+            "flashinfer_cutedsl standard path uses scalar activation quant scale; "
+            "using max(layer.w13_input_scale_quant). "
+            "Set SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=strict to disable fallback.",
+        )
+        _logged_flashinfer_cutedsl_input_scale_cast = True
+    return input_scale.max().view(1)
 
 
 @register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
@@ -1689,23 +1726,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # The standard path dispatch does not provide FP4 activations, so quantize
             # hidden states to NVFP4 here for CuteDSL.
-            # Use a scalar input scale for activation quantization.
-            input_scale = layer.w13_input_scale_quant
-            if input_scale.numel() > 1:
-                global _logged_flashinfer_cutedsl_input_scale_cast
-                if not _logged_flashinfer_cutedsl_input_scale_cast:
-                    logger.warning(
-                        "flashinfer_cutedsl standard path requires scalar input scale "
-                        "for activation quantization; using max(layer.w13_input_scale_quant)."
-                    )
-                    _logged_flashinfer_cutedsl_input_scale_cast = True
-                input_scale = input_scale.max().view(1)
+            input_scale = _resolve_cutedsl_standard_input_scale(
+                layer.w13_input_scale_quant
+            )
 
             global _logged_flashinfer_cutedsl_standard_path
             if not _logged_flashinfer_cutedsl_standard_path:
-                logger.warning(
+                log_info_on_rank0(
+                    logger,
                     "Using experimental flashinfer_cutedsl standard MoE path "
-                    "(moe_a2a_backend=none)."
+                    "(moe_a2a_backend=none).",
                 )
                 _logged_flashinfer_cutedsl_standard_path = True
 

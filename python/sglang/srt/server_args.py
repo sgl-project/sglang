@@ -2018,7 +2018,7 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
             if self.moe_a2a_backend == "none":
-                logger.warning(
+                logger.info(
                     "moe_runner_backend=flashinfer_cutedsl with moe_a2a_backend=none "
                     "uses the experimental standard CuteDSL FP4 MoE path."
                 )
