@@ -17,7 +17,13 @@ class ForwardInputBuffers:
 
         buffer_size = input_buffer.size()
         buffer_numel = input_buffer.numel()
-        # buffer_stride = input_buffer.stride()
+
+        # Skip buffer pooling when in inference mode (e.g. during warmup /
+        # FlashInfer autotune).  Inference-mode tensors cannot be updated
+        # in-place outside InferenceMode, so storing them in the pool would
+        # break later CUDA-graph capture that runs outside InferenceMode.
+        if torch.is_inference_mode_enabled():
+            return input_buffer
 
         old_buffer = _forward_input_buffer_pool.get(name, None)
         if old_buffer is not None:
@@ -31,10 +37,11 @@ class ForwardInputBuffers:
                 buffer = old_buffer.view(-1)
             else:
                 buffer = input_buffer.view(-1)
+        else:
+            buffer = input_buffer.view(-1)
 
         _forward_input_buffer_pool[name] = buffer
         buffer = weakref.proxy(buffer)
-        # output_buffer = input_buffer.as_strided(buffer_size, buffer_stride)
         output_buffer = buffer[:buffer_numel].view(buffer_size)
 
         assert output_buffer.is_contiguous()
@@ -42,8 +49,6 @@ class ForwardInputBuffers:
         return output_buffer
 
     def build(self):
-
-        assert not torch.is_inference_mode_enabled()
 
         for f in fields(self):
             name = f.name
