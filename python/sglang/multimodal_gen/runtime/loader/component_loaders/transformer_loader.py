@@ -133,7 +133,10 @@ class TransformerLoader(ComponentLoader):
         ):
             init_params["quant_config"] = nunchaku_config
 
-        # Load the model using FSDP loader
+        # Load the model using FSDP loader.
+        # When dit_layerwise_offload is enabled, dit_cpu_offload is forced False at runtime,
+        # but we still need cpu_offload at load time so weights are loaded to CPU first and
+        # do not OOM the GPU (layerwise offload moves them to GPU per layer during inference).
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
@@ -141,7 +144,8 @@ class TransformerLoader(ComponentLoader):
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=server_args.dit_cpu_offload,
+            cpu_offload=server_args.dit_cpu_offload
+            or server_args.dit_layerwise_offload,
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
             # TODO(will): make these configurable
