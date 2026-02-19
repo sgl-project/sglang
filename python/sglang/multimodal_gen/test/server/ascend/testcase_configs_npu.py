@@ -17,17 +17,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
-    DiffusionTestCase(
-        "flux_2_image_t2i_2npu",
-        DiffusionServerArgs(
-            model_path="/root/.cache/modelscope/hub/models/black-forest-labs/FLUX.2-dev",
-            modality="image",
-            warmup=True,
-            num_gpus=2,
-            tp_size=2,
-        ),
-        T2I_sampling_params,
-    ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_1_npu",
@@ -40,5 +29,20 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
+    ),
+]
+
+TWO_NPU_CASES: list[DiffusionTestCase] = [
+    # === Text to Image (T2I) ===
+    DiffusionTestCase(
+        "flux_2_image_t2i_2npu",
+        DiffusionServerArgs(
+            model_path="/root/.cache/modelscope/hub/models/black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup=True,
+            num_gpus=2,
+            tp_size=2,
+        ),
+        T2I_sampling_params,
     ),
 ]
