@@ -105,6 +105,7 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+_logged_flashinfer_cutedsl_standard_noop = False
 
 
 def _sglang_fp4_gemm_fake(
@@ -1664,6 +1665,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
+
+        # No-op scaffolding for Phase 1:
+        # flashinfer_cutedsl currently has a dedicated DeepEP low-latency masked path
+        # (apply_without_routing_weights), but no dedicated standard (moe_a2a=none)
+        # path in apply(). Keep behavior unchanged for now and make the fallback explicit.
+        if self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_none():
+            global _logged_flashinfer_cutedsl_standard_noop
+            if not _logged_flashinfer_cutedsl_standard_noop:
+                logger.warning(
+                    "moe_runner_backend=flashinfer_cutedsl with moe_a2a_backend=none "
+                    "does not have a dedicated standard path yet. Falling back to "
+                    "cutlass_moe_fp4 for now."
+                )
+                _logged_flashinfer_cutedsl_standard_noop = True
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

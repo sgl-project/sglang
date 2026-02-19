@@ -2009,6 +2009,21 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
+        if self.moe_runner_backend == "flashinfer_cutedsl":
+            assert self.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            if self.moe_a2a_backend == "none":
+                logger.warning(
+                    "moe_runner_backend=flashinfer_cutedsl with moe_a2a_backend=none "
+                    "currently falls back to the CUTLASS FP4 standard path. "
+                    "A dedicated standard CuteDSL path is not wired yet."
+                )
+
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
                 "modelopt_fp4",
