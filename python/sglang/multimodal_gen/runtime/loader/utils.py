@@ -134,11 +134,11 @@ def _normalize_component_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-        "_name_or_path",
-        "transformers_version",
-        "model_type",
-        "tokenizer_class",
-        "torch_dtype",
+            "_name_or_path",
+            "transformers_version",
+            "model_type",
+            "tokenizer_class",
+            "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -148,13 +148,15 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+BYTES_PER_GB = 1024 ** 3
+
+
 def get_memory_usage_of_component(module) -> float | None:
     """
     returned value is in GB, rounded to 2 decimal digits
     """
     if not isinstance(module, nn.Module):
         return None
-    BYTES_PER_GB = 1024**3
     if hasattr(module, "get_memory_footprint"):
         usage = module.get_memory_footprint() / BYTES_PER_GB
     else:
@@ -163,7 +165,7 @@ def get_memory_usage_of_component(module) -> float | None:
         buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
 
         total_size_bytes = param_size + buffer_size
-        usage = total_size_bytes / (1024**3)
+        usage = total_size_bytes / (1024 ** 3)
 
     return round(usage, 2)
 

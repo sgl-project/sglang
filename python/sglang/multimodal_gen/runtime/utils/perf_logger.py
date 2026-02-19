@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -16,7 +15,6 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
@@ -201,10 +199,7 @@ class StageProfiler:
 
     def __enter__(self):
         if self.log_stage_start_end:
-            msg = f"[{self.stage_name}] started..."
-            if self.logger.isEnabledFor(logging.DEBUG):
-                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
-            self.logger.info(msg)
+            self.logger.info(f"[{self.stage_name}] started...")
 
         if (self.log_timing and self.timings) or self.log_stage_start_end:
             if (
