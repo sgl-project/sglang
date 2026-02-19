@@ -439,7 +439,10 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    types = [torch.cuda.OutOfMemoryError, torch.OutOfMemoryError]
+    # torch.OutOfMemoryError exists only in some PyTorch builds
+    types = [torch.cuda.OutOfMemoryError]
+    if hasattr(torch, "OutOfMemoryError"):
+        types.append(torch.OutOfMemoryError)
     return tuple(types)
 
 
