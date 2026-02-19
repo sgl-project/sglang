@@ -1670,6 +1670,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
+        elif get_moe_runner_backend().is_cutlass():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.CUTLASS, moe_runner_config
+            )
 
     def apply(
         self,
@@ -1790,8 +1794,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w1_alpha=layer.g1_alphas,
             w2_alpha=layer.g2_alphas,
-            a1_gscale=layer.w13_input_scale_quant,
-            a2_gscale=layer.w2_input_scale_quant,
+            w13_input_scale=layer.w13_input_scale_quant,
+            w2_input_scale=layer.w2_input_scale_quant,
             expert_offsets=params.expert_offsets,
             problem_sizes1=params.problem_sizes1,
             problem_sizes2=params.problem_sizes2,

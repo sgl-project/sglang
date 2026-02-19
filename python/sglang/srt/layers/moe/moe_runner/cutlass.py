@@ -245,11 +245,12 @@ class CutlassRunnerCore(MoeRunnerCore):
         elif moe_type == CutlassMoEType.BlockscaledFP4:
             down_output = self.cutlass_moe_fp4(
                 a=runner_input.rep_primary,  # Use preprocessed input
-                a1_gscale=quant_info.a1_gscale,
+                rep_aux=runner_input.rep_aux,
+                a1_gscale=quant_info.w13_input_scale,
                 w1_fp4=quant_info.w13_weight,
                 w1_blockscale=quant_info.w1_blockscale,
                 w1_alphas=quant_info.w1_alpha,
-                a2_gscale=quant_info.a2_gscale,
+                a2_gscale=quant_info.w2_input_scale,
                 w2_fp4=quant_info.w2_weight,
                 w2_blockscale=quant_info.w2_blockscale,
                 w2_alphas=quant_info.w2_alpha,
@@ -853,8 +854,8 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         device = a.device
 
-        # Input 'a' is already quantized and shuffled
-        rep_a_q = a  # check this
+
+        rep_a_q = a
 
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
         c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -942,7 +943,9 @@ class CutlassRunnerCore(MoeRunnerCore):
         return c2
 
     def cutlass_moe_fp4(
+        self,
         a: torch.Tensor,
+        rep_aux: torch.Tensor,
         a1_gscale: torch.Tensor,
         w1_fp4: torch.Tensor,
         w1_blockscale: torch.Tensor,
@@ -999,7 +1002,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         """
         # Input 'a' is already preprocessed (FP4 quantized and reordered)
         rep_a_fp4 = a
-        rep_a_blockscale = None  # Blockscale is not needed for FP4 after preprocessing
+        rep_a_blockscale = rep_aux
 
         out_dtype = torch.bfloat16  # Default output dtype for FP4 operations
         num_topk = topk_ids.shape[1]
@@ -1041,7 +1044,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             params.to_gemm2_args(),
         )
         del int_fp4, int_blockscale
-        return CutlassRunnerOutput(hidden_states=c2)
+        return c2
 
 
 @register_pre_permute("standard", "cutlass")
@@ -1248,7 +1251,7 @@ def pre_permute_standard_to_cutlass(
 
         rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
             hidden_states,
-            quant_info.a1_gscale,
+            quant_info.w13_input_scale,
             params.expert_offsets,
             params.blockscale_offsets,
             topk_ids.shape[1],
