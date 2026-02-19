@@ -118,6 +118,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     set_torch_compile_config,
+    torch_compile,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -2121,6 +2122,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         if self.device != "cpu" and self.server_args.disable_cuda_graph:
+            if self.server_args.enable_torch_compile:
+                torch_compile(self.model, self.server_args, self.model_config)
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
