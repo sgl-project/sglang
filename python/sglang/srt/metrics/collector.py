@@ -84,6 +84,9 @@ class TimeStats:
     # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
     prefill_finished_ts: float = 0.0
 
+    # Running request count snapshot when this request enters prefill.
+    batch_size_prefill: Optional[int] = None
+
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 

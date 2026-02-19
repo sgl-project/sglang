@@ -101,6 +101,9 @@ class RequestTimingMetricsMixin:
     # This marks when the prefill computation finishes.
     prefill_finished_ts: Optional[List[Optional[float]]]
 
+    # Running request count snapshot when request enters prefill.
+    batch_size_prefill: Optional[List[Optional[int]]]
+
 
 @dataclass
 class SpeculativeDecodingMetricsMixin:
