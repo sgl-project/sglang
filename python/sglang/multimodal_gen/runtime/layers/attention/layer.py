@@ -1,10 +1,13 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import logging
 from typing import Type
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -343,9 +346,6 @@ class USPAttention(nn.Module):
 
         # Validate UAA restrictions (based on diffusers PR)
         if self.enable_uaa and get_ring_parallel_world_size() > 1:
-            import logging
-
-            logger = logging.getLogger(__name__)
             logger.warning(
                 "UAA with ring_degree > 1 is not yet supported. "
                 "Consider using only ulysses_degree or disabling UAA."
@@ -388,9 +388,6 @@ class USPAttention(nn.Module):
         if get_ring_parallel_world_size() > 1:
             if self.enable_uaa:
                 # UAA with ring attention not fully supported yet
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.warning("Using ring attention with UAA - this is experimental")
             out = ring_attn(
                 q,

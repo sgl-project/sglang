@@ -54,17 +54,14 @@ def _usp_split_for_ulysses(x: torch.Tensor, dim: int, world_size: int) -> torch.
     Unlike chunk(), tensor_split correctly handles non-divisible sizes.
     Returns the shard for the current rank.
     """
+    rank = get_ulysses_parallel_rank()
     if x.shape[dim] % world_size == 0:
         # Evenly divisible - use simple indexing
         chunk_size = x.shape[dim] // world_size
-        rank = get_ulysses_parallel_rank()
         start_idx = rank * chunk_size
-        end_idx = start_idx + chunk_size
         return x.narrow(dim, start_idx, chunk_size)
-
     # Unevenly divisible - use tensor_split
     chunks = torch.tensor_split(x, world_size, dim=dim)
-    rank = get_ulysses_parallel_rank()
     return chunks[rank]
 
 
