@@ -133,7 +133,7 @@ class TransformerLoader(ComponentLoader):
         ):
             init_params["quant_config"] = nunchaku_config
 
-        # Load the model using FSDP loader.
+        # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
