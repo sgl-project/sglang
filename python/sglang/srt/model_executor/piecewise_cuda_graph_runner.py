@@ -20,7 +20,7 @@ import gc
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import tqdm
@@ -69,13 +69,13 @@ if TYPE_CHECKING:
 class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
-    out_cache_loc_swa: Union[torch.Tensor, None]
-    mamba_track_indices: Union[torch.Tensor, None]
-    mamba_track_mask: Union[torch.Tensor, None]
-    mamba_track_seqlens: Union[torch.Tensor, None]
+    out_cache_loc_swa: Optional[torch.Tensor]
+    mamba_track_indices: Optional[torch.Tensor]
+    mamba_track_mask: Optional[torch.Tensor]
+    mamba_track_seqlens: Optional[torch.Tensor]
     positions: torch.Tensor
-    input_embeds: Union[torch.Tensor, None]
-    mrope_positions: Union[torch.Tensor, None]
+    input_embeds: Optional[torch.Tensor]
+    mrope_positions: Optional[torch.Tensor]
 
 
 @contextmanager
