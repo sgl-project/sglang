@@ -126,7 +126,31 @@ def launch_scheduler_ray_actors(
                 local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
                     tp_rank % tp_per_node
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+
+                # Compute parallelism ranks (must match mp launcher logic)
+                attn_dp_size = (
+                    server_args.dp_size
+                    if server_args.enable_dp_attention
+                    else 1
+                )
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (
+                    (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                )
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
 
                 actor = SchedulerActor.options(
                     num_cpus=0,
@@ -141,6 +165,8 @@ def launch_scheduler_ray_actors(
                     port_args=port_args,
                     gpu_id=local_gpu_idx,
                     tp_rank=tp_rank,
+                    attn_cp_rank=attn_cp_rank,
+                    moe_dp_rank=moe_dp_rank,
                     moe_ep_rank=moe_ep_rank,
                     pp_rank=pp_rank,
                     dp_rank=0,

@@ -41,6 +41,8 @@ class SchedulerActor:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
@@ -71,7 +73,13 @@ class SchedulerActor:
 
         # Configure worker (logging, process title, etc.)
         dp_rank = configure_scheduler(
-            server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
+            server_args,
+            tp_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            moe_ep_rank,
+            pp_rank,
+            dp_rank,
         )
 
         # Create scheduler (loads model into GPU, initializes NCCL)
@@ -82,6 +90,8 @@ class SchedulerActor:
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
             dp_rank=dp_rank,
         )
 

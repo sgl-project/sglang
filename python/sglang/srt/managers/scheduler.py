@@ -3140,12 +3140,16 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    dp_rank = configure_scheduler(server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank)
+    dp_rank = configure_scheduler(
+        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    )
 
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
