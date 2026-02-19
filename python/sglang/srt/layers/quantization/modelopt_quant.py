@@ -105,7 +105,8 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
-_logged_flashinfer_cutedsl_standard_noop = False
+_logged_flashinfer_cutedsl_input_scale_cast = False
+_logged_flashinfer_cutedsl_standard_path = False
 
 
 def _sglang_fp4_gemm_fake(
@@ -1666,19 +1667,87 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
-        # No-op scaffolding for Phase 1:
-        # flashinfer_cutedsl currently has a dedicated DeepEP low-latency masked path
-        # (apply_without_routing_weights), but no dedicated standard (moe_a2a=none)
-        # path in apply(). Keep behavior unchanged for now and make the fallback explicit.
+        # Standard-path FlashInfer CuteDSL branch (moe_a2a=none).
+        # DeepEP low-latency masked path remains in apply_without_routing_weights().
         if self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_none():
-            global _logged_flashinfer_cutedsl_standard_noop
-            if not _logged_flashinfer_cutedsl_standard_noop:
-                logger.warning(
-                    "moe_runner_backend=flashinfer_cutedsl with moe_a2a_backend=none "
-                    "does not have a dedicated standard path yet. Falling back to "
-                    "cutlass_moe_fp4 for now."
+            try:
+                from flashinfer import (
+                    CuteDslMoEWrapper,
+                    fp4_quantize as flashinfer_fp4_quantize,
                 )
-                _logged_flashinfer_cutedsl_standard_noop = True
+            except ImportError as e:
+                raise ImportError(
+                    "Can't import CuteDslMoEWrapper from flashinfer. "
+                    "Please check flashinfer version to use flashinfer_cutedsl backend "
+                    "on standard MoE path."
+                ) from e
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            topk_ids = topk_ids.to(torch.int32)
+
+            # The standard path dispatch does not provide FP4 activations, so quantize
+            # hidden states to NVFP4 here for CuteDSL.
+            # Use a scalar input scale for activation quantization.
+            input_scale = layer.w13_input_scale_quant
+            if input_scale.numel() > 1:
+                global _logged_flashinfer_cutedsl_input_scale_cast
+                if not _logged_flashinfer_cutedsl_input_scale_cast:
+                    logger.warning(
+                        "flashinfer_cutedsl standard path requires scalar input scale "
+                        "for activation quantization; using max(layer.w13_input_scale_quant)."
+                    )
+                    _logged_flashinfer_cutedsl_input_scale_cast = True
+                input_scale = input_scale.max().view(1)
+
+            global _logged_flashinfer_cutedsl_standard_path
+            if not _logged_flashinfer_cutedsl_standard_path:
+                logger.warning(
+                    "Using experimental flashinfer_cutedsl standard MoE path "
+                    "(moe_a2a_backend=none)."
+                )
+                _logged_flashinfer_cutedsl_standard_path = True
+
+            x_fp4, x_sf = flashinfer_fp4_quantize(
+                x,
+                input_scale,
+                16,  # sf_vec_size
+                False,  # sf_use_ue8m0 / use_ue8m0 (version-dependent name)
+                False,  # is_sf_swizzled_layout
+            )
+
+            if not hasattr(layer, "_flashinfer_cutedsl_moe_wrapper"):
+                layer._flashinfer_cutedsl_moe_wrapper = CuteDslMoEWrapper(
+                    num_experts=layer.num_experts,
+                    top_k=(
+                        layer.top_k
+                        if layer.top_k is not None
+                        else moe_runner_config.top_k
+                    ),
+                    hidden_size=layer.hidden_size,
+                    intermediate_size=layer.intermediate_size_per_partition,
+                    use_cuda_graph=False,
+                    num_local_experts=layer.num_local_experts,
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    output_dtype=x.dtype,
+                    device=str(x.device),
+                )
+
+            output = layer._flashinfer_cutedsl_moe_wrapper.run(
+                x=x_fp4,
+                x_sf=x_sf,
+                token_selected_experts=topk_ids,
+                token_final_scales=topk_weights,
+                w1_weight=layer.w13_weight,
+                w1_weight_sf=layer.w13_blockscale_swizzled,
+                w1_alpha=layer.g1_alphas,
+                fc2_input_scale=layer.w2_input_scale_quant,
+                w2_weight=layer.w2_weight,
+                w2_weight_sf=layer.w2_blockscale_swizzled,
+                w2_alpha=layer.g2_alphas,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

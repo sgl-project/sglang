@@ -2020,8 +2020,7 @@ class ServerArgs:
             if self.moe_a2a_backend == "none":
                 logger.warning(
                     "moe_runner_backend=flashinfer_cutedsl with moe_a2a_backend=none "
-                    "currently falls back to the CUTLASS FP4 standard path. "
-                    "A dedicated standard CuteDSL path is not wired yet."
+                    "uses the experimental standard CuteDSL FP4 MoE path."
                 )
 
         if self.moe_runner_backend == "flashinfer_trtllm":
