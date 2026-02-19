@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
@@ -111,22 +111,19 @@ class KVArgsRegisterInfo:
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
-    # KV chunks received per sender: {(pp_rank, tp_rank): set of chunk_ids}
-    received_kvs_per_sender: Dict[Tuple[int, int], Set[int]] = dataclasses.field(
+    # KV chunks received per sender: {sender_id: set of chunk_ids}
+    # sender_id = (pp_rank << 16) | tp_rank
+    received_kvs_per_sender: Dict[int, Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
-    # Expected chunk count per sender (set when is_last=True): {(pp_rank, tp_rank): expected_count}
-    expected_kvs_per_sender: Dict[Tuple[int, int], int] = dataclasses.field(
-        default_factory=dict
-    )
+    # Expected chunk count per sender (set when is_last=True): {sender_id: expected_count}
+    expected_kvs_per_sender: Dict[int, int] = dataclasses.field(default_factory=dict)
     # Number of senders expected to send data.
     num_senders_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
     # Senders that have sent state data.
-    received_state_per_sender: Set[Tuple[int, int]] = dataclasses.field(
-        default_factory=set
-    )
+    received_state_per_sender: Set[int] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
     expects_state: bool = False
     # Mark as failed
@@ -857,38 +854,35 @@ class NixlKVManager(CommonKVManager):
             # the message sender. But the bootstrap room alone should be
             # sufficient to map the status.
             for msg in messages:
-                components = msg.decode("ascii").split("_")
+                components = msg.decode("ascii").split("_", 5)
                 room = int(components[0])
-                if components[1] == "kv":
+                status = self.transfer_statuses[room]
+                msg_type = components[1]
+
+                if msg_type == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
                     tp_rank = int(components[5]) if len(components) > 5 else 0
-                    sender_id = (pp_rank, tp_rank)
+                    sender_id = (pp_rank << 16) | tp_rank
 
                     # Track received chunks per sender
-                    self.transfer_statuses[room].received_kvs_per_sender[sender_id].add(
-                        chunk_id
-                    )
+                    status.received_kvs_per_sender[sender_id].add(chunk_id)
                     if is_last:
                         # Record expected chunk count for this sender
-                        self.transfer_statuses[room].expected_kvs_per_sender[
-                            sender_id
-                        ] = (chunk_id + 1)
+                        status.expected_kvs_per_sender[sender_id] = chunk_id + 1
                         # Set num_senders_expected from table (or default to 1)
-                        if self.transfer_statuses[room].num_senders_expected is None:
-                            self.transfer_statuses[room].num_senders_expected = (
+                        if status.num_senders_expected is None:
+                            status.num_senders_expected = (
                                 self.required_prefill_response_num_table.get(room, 1)
                             )
-                elif components[1] == "aux":
-                    self.transfer_statuses[room].received_aux = True
-                elif components[1] == "state":
+                elif msg_type == "aux":
+                    status.received_aux = True
+                elif msg_type == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     tp_rank = int(components[3]) if len(components) > 3 else 0
-                    sender_id = (pp_rank, tp_rank)
-                    self.transfer_statuses[room].received_state_per_sender.add(
-                        sender_id
-                    )
+                    sender_id = (pp_rank << 16) | tp_rank
+                    status.received_state_per_sender.add(sender_id)
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
