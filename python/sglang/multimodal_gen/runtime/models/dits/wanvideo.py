@@ -689,6 +689,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
+        ic(config, hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
@@ -930,6 +931,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # 4. Transformer blocks
         # if caching is enabled, we might be able to skip the forward pass
+        ic(temb)
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
@@ -1005,7 +1007,20 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
 
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        if forward_batch is None:
+            return None
+        self.is_cfg_negative = forward_batch.is_cfg_negative
+
         ic(self.cache_type)
+        if self.cache_type == "magcache":
+            ic('checking magcache2')
+            return self.should_skip_forward(is_cfg_negative=self.is_cfg_negative)
+
         # if self.calibrate_magcache:
         #     return False
 

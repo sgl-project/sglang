@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.models import DiTConfig
 # For backwards compatibility, re-export from the new location
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
-from sglang.multimodal_gen.runtime.cache.magcache import MagCacheMixin
+from sglang.multimodal_gen.runtime.cache.magcache import MagCacheMixin, MagCacheMixin2
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -84,7 +84,7 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
+class CachableDiT(MagCacheMixin2, TeaCacheMixin, MagCacheMixin, BaseDiT):
     """
     Intermediate base class that provides both TeaCache and MagCache optimization.
 
@@ -122,7 +122,10 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
         if self.cache_type == "teacache":
             self._init_teacache_state()
         elif self.cache_type == "magcache":
-            self._init_magcache_state()
+            # self._init_magcache_state()
+            from sglang.multimodal_gen.configs.sample.magcache import WanMagCacheParams
+            ic('running magcache init')
+            self.init(WanMagCacheParams())
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""

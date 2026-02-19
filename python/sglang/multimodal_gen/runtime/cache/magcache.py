@@ -379,3 +379,97 @@ class MagCacheMixin:
             retention_steps=retention_steps,
             magcache_params=magcache_params,
         )
+
+
+class MagCacheMixin2:
+    # Models that support CFG cache separation (same as TeaCache)
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+    config: DiTConfig
+
+    def init(self, magcache_params: "MagCacheParams") -> None:
+
+        self.num_steps = magcache_params.num_steps # todo: don't hardcode
+        self.retention_ratio = magcache_params.retention_ratio
+        self.magcache_thresh = magcache_params.threshold
+        self.max_skip_steps = magcache_params.max_skip_steps
+        self.mag_ratios = magcache_params.mag_ratios
+        self.use_ret_steps = magcache_params.use_ret_steps
+
+        # todo: do we need *2 for interleaving pos/neg cfg steps?
+        self.min_steps = int(self.num_steps * self.retention_ratio) if self.use_ret_steps else 2
+        self.max_steps = self.num_steps if self.use_ret_steps else self.num_steps - 2
+
+        self.previous_residual: torch.Tensor | None = None
+        self.previous_residual_norm: float = 0.0
+        self.norm_ratio: float = 1.0
+        self.accumulated_error: float = 0.0
+        self.consecutive_skips: int = 0
+
+        # CFG negative branch (only if supported)
+        self._supports_cfg_cache = self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+        if self._supports_cfg_cache:
+            self.previous_residual_negative: torch.Tensor | None = None
+            self.previous_residual_norm_negative: float = 0.0
+            self.norm_ratio_negative: float = 1.0
+            self.accumulated_error_negative: float = 0.0
+            self.consecutive_skips_negative: int = 0
+
+    def reset(self, is_cfg_negative):
+        if not is_cfg_negative:
+            self.previous_residual = None
+            self.previous_residual_norm = 0.0
+            self.norm_ratio = 1.0
+            self.accumulated_error = 0.0
+            self.consecutive_skips = 0
+        else:
+            self.previous_residual_negative = None
+            self.previous_residual_norm_negative = 0.0
+            self.norm_ratio_negative = 1.0
+            self.accumulated_error_negative = 0.0
+            self.consecutive_skips_negative = 0
+
+    def should_skip_forward(self, current_timestep=None, do_cfg=None, is_cfg_negative=False):
+
+        # determine if this model uses cfg
+        # if so, adjust cnt to reflect interleaving of pos/neg steps
+        if current_timestep is None or do_cfg is None:
+            from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+            forward_context = get_forward_context()
+            current_timestep = forward_context.current_timestep
+            forward_batch = forward_context.forward_batch
+            assert forward_batch is not None, "Forward batch should not be None when checking MagCache skip decision"
+            do_cfg = forward_batch.do_classifier_free_guidance
+
+        # if model uses cfg, magnitude ratios are interleaved for pos/neg branches, so we need to adjust the index accordingly
+        cnt = current_timestep
+        if do_cfg:
+            cnt = current_timestep // 2 + (1 if is_cfg_negative else 0)
+
+        # reset at timestep 0
+        if current_timestep == 0:
+            self.reset(is_cfg_negative)
+
+        # todo: can we refactor to make simpler?
+        prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
+        prev_residual_norm = self.previous_residual_norm_negative if is_cfg_negative else self.previous_residual_norm
+        accumulated_error = self.accumulated_error_negative if is_cfg_negative else self.accumulated_error
+        consecutive_skips = self.consecutive_skips_negative if is_cfg_negative else self.consecutive_skips
+        norm_ratio = self.norm_ratio_negative if is_cfg_negative else self.norm_ratio
+
+        # always compute first few and last few steps
+        is_boundary_step = cnt < self.min_steps or cnt >= self.max_steps
+        if is_boundary_step:
+            self.reset(is_cfg_negative)
+            return False
+
+        cur_mag_ratio = self.mag_ratios[cnt] # access pre-calibrated magnitude ratio for current step
+        norm_ratio = norm_ratio*cur_mag_ratio # magnitude ratio between current step and the cached step
+        consecutive_skips += 1 # skip steps plus 1
+        cur_skip_err = torch.abs(1-norm_ratio) # skip error of current steps
+        accumulated_error += cur_skip_err # accumulated error of multiple steps
+
+        if accumulated_error<self.magcache_thresh and consecutive_skips<=self.max_skip_steps:
+            return True
+        else:
+            self.reset(is_cfg_negative)
+            return False
