@@ -181,11 +181,9 @@ class TestDumperDistributed:
         sys.stdout = captured
 
         try:
-            if rank == 0:
-                dumper.on_forward_pass_start()
-            else:
+            if rank != 0:
                 time.sleep(6)
-                dumper.on_forward_pass_start()
+            dumper.on_forward_pass_start()
         finally:
             sys.stdout = old_stdout
 
