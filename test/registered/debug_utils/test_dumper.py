@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.dumper import (
     _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
+    _DumperConfig,
     _materialize_value,
     _obj_to_dict,
     _torch_save,
@@ -38,6 +39,11 @@ def _capture_stdout():
         yield captured
     finally:
         sys.stdout = old_stdout
+
+
+class TestDumperConfig:
+    def test_from_env_defaults_match_dataclass_defaults(self):
+        assert _DumperConfig.from_env() == _DumperConfig()
 
 
 class TestDumperPureFunctions:
@@ -175,11 +181,9 @@ class TestDumperDistributed:
     @staticmethod
     def _test_collective_timeout_func(rank):
         dumper = _Dumper(
-            enable=True,
-            base_dir=Path("/tmp"),
-            partial_name=None,
-            enable_http_server=False,
-            collective_timeout=3,
+            config=_DumperConfig(
+                enable=True, collective_timeout=3, enable_http_server=False,
+            ),
         )
 
         with _capture_stdout() as captured:
@@ -202,7 +206,7 @@ class TestDumperDistributed:
     def _test_http_func(rank):
         from sglang.srt.debug_utils.dumper import dumper
 
-        assert not dumper._enable
+        assert not dumper._config.enable
         dumper.on_forward_pass_start()
 
         for enable in [True, False]:
@@ -213,7 +217,7 @@ class TestDumperDistributed:
                     "http://localhost:40000/dumper", json={"enable": enable}
                 ).raise_for_status()
             dist.barrier()
-            assert dumper._enable == enable
+            assert dumper._config.enable == enable
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
@@ -407,13 +411,11 @@ class TestDumpDictFormat:
 
 def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
-    defaults: dict = dict(
-        enable=True,
-        base_dir=tmp_path,
-        partial_name="test",
-        enable_http_server=False,
+    config = _DumperConfig(
+        enable=True, base_dir=tmp_path, partial_name="test",
+        enable_http_server=False, **overrides,
     )
-    d = _Dumper(**{**defaults, **overrides})
+    d = _Dumper(config=config)
     d.on_forward_pass_start()
     return d
 

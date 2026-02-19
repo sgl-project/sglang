@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -15,6 +16,47 @@ import torch
 import torch.distributed as dist
 
 # -------------------------------------- dumper core ------------------------------------------
+
+
+@dataclass(frozen=True)
+class _DumperConfig:
+    enable: bool = False
+    filter: Optional[str] = None
+    base_dir: Path = Path("/tmp")
+    enable_output_file: bool = True
+    enable_output_console: bool = True
+    enable_value: bool = True
+    enable_grad: bool = False
+    enable_model_value: bool = True
+    enable_model_grad: bool = True
+    partial_name: Optional[str] = None
+    enable_http_server: bool = True
+    cleanup_previous: bool = False
+    collective_timeout: int = 60
+
+    @classmethod
+    def from_env(cls) -> "_DumperConfig":
+        return cls(
+            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
+            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
+            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
+            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
+            enable_output_console=get_bool_env_var(
+                "SGLANG_DUMPER_OUTPUT_CONSOLE", "1"
+            ),
+            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
+            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
+            enable_model_value=get_bool_env_var(
+                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
+            ),
+            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
+            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
+            enable_http_server=get_bool_env_var(
+                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
+            ),
+            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
+            collective_timeout=60,
+        )
 
 
 class _Dumper:
@@ -44,67 +86,22 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(
-        self,
-        *,
-        enable: bool,
-        base_dir: Path,
-        filter: Optional[str] = None,
-        enable_output_file: bool = True,
-        enable_output_console: bool = True,
-        enable_value: bool = True,
-        enable_grad: bool = False,
-        enable_model_value: bool = True,
-        enable_model_grad: bool = True,
-        partial_name: Optional[str] = None,
-        enable_http_server: bool = True,
-        cleanup_previous: bool = False,
-        collective_timeout: int = 60,
-    ):
-        # Config
-        self._enable = enable
+    def __init__(self, *, config: _DumperConfig):
         # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
-        self._filter = filter
-        self._base_dir = base_dir
-        self._enable_output_file = enable_output_file
-        self._enable_output_console = enable_output_console
-        self._enable_value = enable_value
-        self._enable_grad = enable_grad
-        self._enable_model_value = enable_model_value
-        self._enable_model_grad = enable_model_grad
-        self._collective_timeout = collective_timeout
+        self._config = config
 
-        # States
-        self._partial_name = partial_name
+        self._http_server_handled = not config.enable_http_server
+        self._cleanup_previous_handled = not config.cleanup_previous
+
         self._dump_index = 0
         self._forward_pass_id = 0
-        self._global_ctx = {}
-        self._override_enable = None
+        self._global_ctx: dict = {}
+        self._override_enable: Optional[bool] = None
         self._captured_output_data: Optional[dict] = None
-        self._http_server_handled = not enable_http_server
-        self._pending_cleanup = cleanup_previous
 
     @classmethod
     def from_env(cls) -> "_Dumper":
-        return cls(
-            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
-            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
-            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
-            enable_output_console=get_bool_env_var("SGLANG_DUMPER_OUTPUT_CONSOLE", "1"),
-            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
-            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
-            enable_model_value=get_bool_env_var(
-                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
-            ),
-            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
-            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
-            enable_http_server=get_bool_env_var(
-                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
-            ),
-            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
-            collective_timeout=60,
-        )
+        return cls(config=_DumperConfig.from_env())
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -112,7 +109,7 @@ class _Dumper:
         # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
         self._ensure_http_server()
 
-        if not self._enable:
+        if not self._config.enable:
             return
 
         # Users may want to `dump` only on some ranks, thus determine name here
@@ -127,14 +124,15 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self, timeout_seconds=self._collective_timeout)
+        _start_maybe_http_server(self, timeout_seconds=self._config.collective_timeout)
 
     def _ensure_partial_name(self):
-        if self._partial_name is None:
-            self._partial_name = _get_partial_name(
-                timeout_seconds=self._collective_timeout
+        if self._config.partial_name is None:
+            name = _get_partial_name(
+                timeout_seconds=self._config.collective_timeout
             )
-            print(f"[Dumper] Choose partial_name={self._partial_name}")
+            self._config = replace(self._config, partial_name=name)
+            print(f"[Dumper] Choose partial_name={name}")
 
     def set_ctx(self, **kwargs):
         """
@@ -172,9 +170,9 @@ class _Dumper:
             value=value,
             extra_kwargs=kwargs,
             save=save,
-            enable_value=self._enable_value,
+            enable_value=self._config.enable_value,
             enable_curr_grad=False,
-            enable_future_grad=self._enable_grad,
+            enable_future_grad=self._config.enable_grad,
             value_tag="Dumper.Value",
             grad_tag="Dumper.Grad",
         )
@@ -192,8 +190,8 @@ class _Dumper:
                 value=param,
                 extra_kwargs=kwargs,
                 save=save,
-                enable_value=self._enable_model_value,
-                enable_curr_grad=self._enable_model_grad,
+                enable_value=self._config.enable_model_value,
+                enable_curr_grad=self._config.enable_model_grad,
                 enable_future_grad=False,
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
@@ -214,9 +212,9 @@ class _Dumper:
     ) -> None:
         self._ensure_http_server()
 
-        if not (self._enable and (self._override_enable is not False)):
+        if not (self._config.enable and (self._override_enable is not False)):
             return
-        if (f := self._filter) is not None and re.search(f, name) is None:
+        if (f := self._config.filter) is not None and re.search(f, name) is None:
             return
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
@@ -306,9 +304,9 @@ class _Dumper:
             **self._global_ctx,
         )
         full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
-        path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
+        path = self._config.base_dir / f"sglang_dump_{self._config.partial_name}" / full_filename
 
-        if self._enable_output_console:
+        if self._config.enable_output_console:
             print(
                 f"[{tag}] [{rank}, {time.time()}] {path} "
                 f"type={type(value)} "
@@ -320,7 +318,7 @@ class _Dumper:
             )
 
         capturing = self._captured_output_data is not None
-        if save and (self._enable_output_file or capturing):
+        if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
                 "meta": dict(**full_kwargs, **self._static_meta),
@@ -330,9 +328,9 @@ class _Dumper:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
                 self._captured_output_data[name] = output_data
             else:
-                if self._pending_cleanup:
-                    self._pending_cleanup = False
-                    _cleanup_old_dumps(self._base_dir)
+                if not self._cleanup_previous_handled:
+                    self._cleanup_previous_handled = True
+                    _cleanup_old_dumps(self._config.base_dir)
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
@@ -603,7 +601,7 @@ class _DumperRpcHandler:
 
     def set_enable(self, enable: bool):
         print(f"[DumperRpcHandler] set_enable {enable=}")
-        self._dumper._enable = enable
+        self._dumper._config = replace(self._dumper._config, enable=enable)
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
