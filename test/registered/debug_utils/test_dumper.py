@@ -1,6 +1,8 @@
+import io
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,17 @@ from sglang.test.test_utils import run_distributed_test
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
+
+
+@contextmanager
+def _capture_stdout():
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        yield captured
+    finally:
+        sys.stdout = old_stdout
 
 
 class TestDumperPureFunctions:
@@ -90,23 +103,17 @@ class TestTorchSave:
 
 class TestCollectiveTimeout:
     def test_watchdog_fires_on_timeout(self):
-        import io
-
         block_event = threading.Event()
-
-        old_stdout = sys.stdout
-        captured = io.StringIO()
-        sys.stdout = captured
+        captured_output = [None]
 
         def run_with_timeout():
-            try:
+            with _capture_stdout() as captured:
                 _collective_with_timeout(
                     lambda: block_event.wait(),
                     operation_name="test_blocked_op",
                     timeout_seconds=2,
                 )
-            finally:
-                sys.stdout = old_stdout
+            captured_output[0] = captured.getvalue()
 
         worker = threading.Thread(target=run_with_timeout)
         worker.start()
@@ -115,7 +122,7 @@ class TestCollectiveTimeout:
         block_event.set()
         worker.join(timeout=5)
 
-        output = captured.getvalue()
+        output = captured_output[0]
         assert "WARNING" in output
         assert "test_blocked_op" in output
         assert "2s" in output
@@ -166,8 +173,6 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_collective_timeout_func(rank):
-        import io
-
         dumper = _Dumper(
             enable=True,
             base_dir=Path("/tmp"),
@@ -176,16 +181,10 @@ class TestDumperDistributed:
             collective_timeout=3,
         )
 
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-
-        try:
+        with _capture_stdout() as captured:
             if rank != 0:
                 time.sleep(6)
             dumper.on_forward_pass_start()
-        finally:
-            sys.stdout = old_stdout
 
         output = captured.getvalue()
 
