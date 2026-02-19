@@ -564,7 +564,7 @@ class TestCleanup:
         old_dir.mkdir()
         (old_dir / "dummy.pt").touch()
 
-        dumper = _make_test_dumper(tmp_path, needs_cleanup=True)
+        dumper = _make_test_dumper(tmp_path, cleanup_previous=True)
         dumper.dump("new_tensor", torch.randn(3, 3))
 
         assert not old_dir.exists()
