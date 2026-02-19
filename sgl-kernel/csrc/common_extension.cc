@@ -591,24 +591,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
-
-  /*
-   * From fast-hadamard-transform
-   */
-  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
-
-  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_12N", torch::kCUDA, &fast_hadamard_transform_12N);
-
-  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_20N", torch::kCUDA, &fast_hadamard_transform_20N);
-
-  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_28N", torch::kCUDA, &fast_hadamard_transform_28N);
-
-  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
 }
 
 REGISTER_EXTENSION(common_ops)

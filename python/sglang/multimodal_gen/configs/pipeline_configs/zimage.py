@@ -7,10 +7,8 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.configs.models.encoders import (
-    BaseEncoderOutput,
-    TextEncoderConfig,
-)
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -49,7 +47,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (TextEncoderConfig(),)
+        default_factory=lambda: (Qwen3TextConfig(),)
     )
 
     preprocess_text_funcs: tuple[Callable, ...] = field(
@@ -274,7 +272,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             device=device,
         ).flatten(0, 2)
 
-        C = self.dit_config.num_channels_latents
         F = 1
         H = height // self.vae_config.arch_config.spatial_compression_ratio
         W = width // self.vae_config.arch_config.spatial_compression_ratio

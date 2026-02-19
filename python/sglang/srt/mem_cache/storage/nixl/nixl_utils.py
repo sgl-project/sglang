@@ -63,7 +63,7 @@ class NixlBackendConfig:
             config_data = self.config
 
         for key, value in config_data.items():
-            initparams[key] = value
+            initparams[key] = str(value)
 
         return initparams
 
@@ -233,6 +233,22 @@ class NixlFileManager:
         else:
             os.makedirs(base_dir, exist_ok=True)
             logger.debug(f"Initialized file manager with base directory: {base_dir}")
+
+    def clear(self) -> None:
+        """Clear all files in the base directory."""
+        if self.base_dir == "":
+            logger.warning("Base directory is empty, skipping clear operation")
+            return
+
+        try:
+            for root, dirs, files in os.walk(self.base_dir):
+                for file in files:
+                    os.remove(os.path.join(root, file))
+            logger.debug(f"Cleared all files in base directory: {self.base_dir}")
+        except Exception as e:
+            logger.error(
+                f"Failed to clear files in base directory {self.base_dir}: {e}"
+            )
 
     def get_file_path(self, key: str) -> str:
         """Get full file path for a given key."""

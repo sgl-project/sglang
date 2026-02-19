@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -87,6 +88,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -98,7 +100,6 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
-    multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -191,10 +192,33 @@ logger = logging.getLogger(__name__)
 def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
-    packed_modules_mapping: Dict[str, List[str]],
-    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
+    model_class, _ = get_model_architecture(model_config)
+    packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    remap_prefix = getattr(model_class, "remap_prefix", None)
+    if _is_npu:
+        packed_modules_mapping.update(
+            {
+                "visual": {
+                    "qkv_proj": ["qkv"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
+                "vision_model": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "proj": ["out_proj"],
+                },
+                "model": {
+                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                    "fused_qkv_a_proj_with_mqa": [
+                        "q_a_proj",
+                        "kv_a_proj_with_mqa",
+                    ],
+                },
+            }
+        )
+
     if model_config.quantization is not None:
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping, remap_prefix
@@ -222,6 +246,10 @@ def _get_quantization_config(
                 f"method {model_config.quantization}. Supported dtypes: "
                 f"{supported_dtypes}"
             )
+        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        # pass mappings by reference to quant_config
+        if hf_to_sglang_mapper is not None and quant_config is not None:
+            quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
         return quant_config
     return None
 
@@ -229,42 +257,10 @@ def _get_quantization_config(
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
+    quant_config: Optional[QuantizationConfig] = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
-    remap_prefix = getattr(model_class, "remap_prefix", None)
-    if _is_npu:
-        packed_modules_mapping.update(
-            {
-                "visual": {
-                    "qkv_proj": ["qkv"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                },
-                "vision_model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "proj": ["out_proj"],
-                },
-                "model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                    "fused_qkv_a_proj_with_mqa": [
-                        "q_a_proj",
-                        "kv_a_proj_with_mqa",
-                    ],
-                },
-            }
-        )
-
-    quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping, remap_prefix
-    )
-    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
-    # pass mappings by reference to quant_config
-    if hf_to_sglang_mapper is not None and quant_config is not None:
-        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
-
-    # Build kwargs conditionally
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -308,6 +304,8 @@ class DefaultModelLoader(BaseModelLoader):
 
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
+
+    _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
 
     @dataclasses.dataclass
     class Source:
@@ -356,11 +354,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
+    ) -> str:
         """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
 
-        Returns the path to the downloaded model, or None if the model is not
-        downloaded from ModelScope."""
+        Returns the path to the downloaded model, or the original model path if
+        not downloaded from ModelScope."""
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
@@ -378,7 +376,7 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 model_path = model
             return model_path
-        return None
+        return model
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
@@ -386,9 +384,8 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        model_name_or_path = (
-            self._maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
+        model_name_or_path = self._maybe_download_from_modelscope(
+            model_name_or_path, revision
         )
 
         is_local = os.path.isdir(model_name_or_path)
@@ -479,6 +476,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
+        use_multithread = extra_config.get("enable_multithread_load", False)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -509,8 +507,8 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                 )
-            elif extra_config.get("enable_multithread_load"):
-                weights_iterator = multi_thread_safetensors_weights_iterator(
+            elif use_multithread:
+                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
@@ -523,7 +521,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
         else:
-            if extra_config.get("enable_multithread_load"):
+            if use_multithread:
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -534,27 +532,33 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
-            import re
-
-            pattern = r"model.mtp.layers.(\d+)."
-            filtered_weights = []
-            for name, tensor in weights_iterator:
-                group = re.match(pattern, name)
-                if group is not None:
-                    idx = int(group.group(1))
-                    if idx != self.load_config.draft_model_idx:
-                        continue
-                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
-                else:
-                    new_name = name
-                filtered_weights.append((source.prefix + new_name, tensor))
-            return tuple(filtered_weights)
+            return self._filter_mtp_weights(
+                weights_iterator, source.prefix, self.load_config.draft_model_idx
+            )
 
         if self.counter_before_loading_weights == 0.0:
-            logger.info("Beginning to load weights")
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @classmethod
+    def _filter_mtp_weights(
+        cls, weights_iterator, prefix: str, draft_model_idx: int
+    ) -> Tuple[Tuple[str, torch.Tensor], ...]:
+        """Filter MTP (Multi-Token Prediction) weights to keep only the
+        specified draft model layer and remap it to layer 0."""
+        filtered_weights = []
+        for name, tensor in weights_iterator:
+            match = cls._MTP_PATTERN.match(name)
+            if match is not None:
+                idx = int(match.group(1))
+                if idx != draft_model_idx:
+                    continue
+                new_name = name.replace(match.group(), "model.mtp.layers.0.")
+            else:
+                new_name = name
+            filtered_weights.append((prefix + new_name, tensor))
+        return tuple(filtered_weights)
 
     def _get_all_weights(
         self,
@@ -661,11 +665,13 @@ class DefaultModelLoader(BaseModelLoader):
             return model.eval()
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             self.load_weights_and_postprocess(
@@ -673,10 +679,6 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
-        logger.info(
-            "Loading weights took %.2f seconds",
-            self.counter_after_loading_weights - self.counter_before_loading_weights,
-        )
         return model.eval()
 
     @staticmethod
@@ -717,6 +719,7 @@ class LayeredModelLoader(DefaultModelLoader):
 
         torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
 
         with set_default_torch_dtype(model_config.dtype):
             # Create model on meta device
@@ -724,6 +727,7 @@ class LayeredModelLoader(DefaultModelLoader):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             # Check model's layered load support
@@ -1268,11 +1272,14 @@ class DummyModelLoader(BaseModelLoader):
                 self, model_config=model_config, device_config=device_config
             )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             for _, module in model.named_modules():
@@ -1386,9 +1393,11 @@ class ShardedStateLoader(BaseModelLoader):
             model_config.model_path, model_config.revision
         )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -1938,11 +1947,13 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
                 self._load_weights(model_config, model)
@@ -2040,9 +2051,10 @@ class GGUFModelLoader(BaseModelLoader):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
@@ -2084,9 +2096,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
 
         if (
             load_config.remote_instance_weight_loader_backend
@@ -2374,9 +2387,11 @@ class RemoteModelLoader(BaseModelLoader):
         if hasattr(model_config, "model_weights"):
             model_weights = model_config.model_weights
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
 
             with create_remote_connector(
                 model_weights, device=device_config.device
@@ -2401,10 +2416,12 @@ def load_model_with_cpu_quantization(
     device_config: DeviceConfig,
 ) -> nn.Module:
     target_device = torch.device(device_config.device)
+    quant_config = _get_quantization_config(model_config, self.load_config)
     with set_default_torch_dtype(model_config.dtype):
         model = _initialize_model(
             model_config,
             self.load_config,
+            quant_config,
         )
 
         if not isinstance(self, DummyModelLoader):
