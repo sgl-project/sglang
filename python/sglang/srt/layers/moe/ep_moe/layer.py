@@ -620,7 +620,9 @@ class MoriEPMoE(DeepEPMoE):
         output_dtype = torch.bfloat16
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
-        is_quark_w4a4 = isinstance(self.scheme, QuarkW4A4MXFp4MoE)
+        is_quark_w4a4 = hasattr(self, "scheme") and isinstance(
+            self.scheme, QuarkW4A4MXFp4MoE
+        )
 
         (
             dispatch_a1,
