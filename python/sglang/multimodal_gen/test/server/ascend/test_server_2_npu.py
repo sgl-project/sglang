@@ -25,5 +25,5 @@ class TestDiffusionServerTwoNpu(DiffusionServerBase):
 
     @pytest.fixture(params=TWO_NPU_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
-        """Provide a DiffusionTestCase for each 1-NPU test."""
+        """Provide a DiffusionTestCase for each 2-NPU test."""
         return request.param
