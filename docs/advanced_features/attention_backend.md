@@ -58,7 +58,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-For FP4 KV cache scenarios, FA4 can be used as a prefill-only backend with a different `--decode-attention-backend`. Except for `trtllm_mha` being incompatible with FA4, all other decode backends behave as shown in the table. For MHA models on SM90+, FA4 can also handle both prefill and decode natively with `--attention-backend fa4 --page-size 128`.
+For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-backend to run. Except for trtllm_mha being incompatible with FA4, all other decode backends behave as shown in the table.
 ```
 
 ```{tip}
