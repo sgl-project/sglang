@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
+    ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
@@ -211,7 +212,11 @@ class ModelSlimConfig(QuantizationConfig):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
 
-        prefix_in_quant_config = prefix + ".0.down_proj.weight"
+        prefix_in_quant_config = prefix + ".0.gate_proj.weight"
+        is_moe_w4a4_dynamic = (
+            self.quant_description.get(prefix_in_quant_config, "STATIC")
+            == "W4A4_DYNAMIC"
+        )
         is_moe_w4a8_dynamic = (
             self.quant_description.get(prefix_in_quant_config, "STATIC")
             == "W4A8_DYNAMIC"
@@ -220,7 +225,10 @@ class ModelSlimConfig(QuantizationConfig):
             self.quant_description.get(prefix_in_quant_config, "STATIC")
             == "W8A8_DYNAMIC"
         )
-        if is_moe_w4a8_dynamic:
+        if is_moe_w4a4_dynamic:
+            logger.info_once("Using ModelSlimW4A4Int8MoE")
+            return ModelSlimW4A8Int8MoE(self)
+        elif is_moe_w4a8_dynamic:
             logger.info_once("Using ModelSlimW4A8Int8MoE")
             return ModelSlimW4A8Int8MoE(self)
         elif is_moe_w8a8_dynamic:
