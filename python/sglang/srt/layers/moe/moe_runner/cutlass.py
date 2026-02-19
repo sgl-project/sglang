@@ -51,13 +51,12 @@ if is_cuda():
 
 @dataclass
 class CutlassRunnerInput(RunnerInput):
-    hidden_states: torch.Tensor
+    gate_up_input: torch.Tensor
     topk_ids: torch.Tensor
     # Standard mode fields
     topk_weights: Optional[torch.Tensor] = None
     a_map: Optional[torch.Tensor] = None
     c_map: Optional[torch.Tensor] = None
-    rep_primary: Optional[torch.Tensor] = None
     rep_aux: Optional[torch.Tensor] = None
     # DeepEP mode fields
     masked_m: Optional[torch.Tensor] = None
@@ -128,7 +127,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         if moe_type == CutlassMoEType.DeepEP_LL:
             down_output = self.cutlass_w4a8_moe_deepep_ll(
-                runner_input.rep_primary,  # Use preprocessed input
+                runner_input.gate_up_input,  # Use preprocessed input
                 quant_info.w13_weight,
                 quant_info.w2_weight,
                 quant_info.w13_scale,
@@ -144,7 +143,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif moe_type == CutlassMoEType.DeepEP_Normal:
             down_output = self.cutlass_w4a8_moe_deepep_normal(
-                a=runner_input.hidden_states,
+                a=runner_input.gate_up_input,
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
@@ -162,7 +161,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                     "CUTLASS FP8 kernels are not available on this system."
                 )
             down_output = self.cutlass_fused_experts_fp8(
-                a=runner_input.rep_primary,  # Use preprocessed quantized input
+                a=runner_input.gate_up_input,  # Use preprocessed quantized input
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
@@ -178,7 +177,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif moe_type == CutlassMoEType.BlockscaledFP4:
             down_output = self.cutlass_moe_fp4(
-                a=runner_input.rep_primary,  # Use preprocessed input
+                a=runner_input.gate_up_input,  # Use preprocessed input
                 rep_aux=runner_input.rep_aux,
                 w1_fp4=quant_info.w13_weight,
                 w1_blockscale=quant_info.w1_blockscale,
@@ -193,7 +192,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif moe_type == CutlassMoEType.W4A8:
             down_output = self.cutlass_w4a8_moe(
-                a=runner_input.rep_primary,  # Use preprocessed input
+                a=runner_input.gate_up_input,  # Use preprocessed input
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
@@ -499,7 +498,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             a1_scale.float(),
             w1_scale,
             params.expert_offsets[:-1],
-            running_state["problem_sizes1"],
+            params.problem_sizes1,
             params.a_strides1,
             params.b_strides1,
             params.c_strides1,
@@ -521,7 +520,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             a2_scale.float(),
             w2_scale,
             params.expert_offsets[:-1],
-            running_state["problem_sizes2"],
+            params.problem_sizes2,
             params.a_strides2,
             params.b_strides2,
             params.c_strides2,
@@ -971,18 +970,17 @@ def pre_permute_standard_to_cutlass(
 
         # ----------------------------------------------------------
         # Return the prepared input data
-        rep_primary = rep_a_q  # The quantized and shuffled input
+        gateup_input = rep_a_q  # The quantized and shuffled input
         rep_aux = rep_a1_scales  # The scales for the quantized input
 
         running_state["blockscale_offsets"] = blockscale_offsets
 
         return CutlassRunnerInput(
-            hidden_states=hidden_states,
+            gate_up_input=rep_a_q,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             a_map=a_map,
             c_map=c_map,
-            rep_primary=rep_primary,
             rep_aux=rep_aux,
         )
 
@@ -1036,7 +1034,7 @@ def pre_permute_standard_to_cutlass(
             params.blockscale_offsets,
         )
 
-        rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
+        gateup_input, rep_a_blockscale = scaled_fp4_experts_quant(
             hidden_states,
             quant_info.w13_input_scale,
             params.expert_offsets,
@@ -1045,7 +1043,6 @@ def pre_permute_standard_to_cutlass(
             expert_map=a_map,
         )
 
-        rep_primary = rep_a_fp4
         rep_aux = rep_a_blockscale
 
     elif quant_info.moe_type == CutlassMoEType.W4A8:
@@ -1138,16 +1135,14 @@ def pre_permute_standard_to_cutlass(
             k,
         )
 
-        rep_primary = gateup_input
         rep_aux = None
 
     return CutlassRunnerInput(
-        hidden_states=hidden_states,
+        gate_up_input=gateup_input,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         a_map=a_map,
         c_map=c_map,
-        rep_primary=rep_primary,
         rep_aux=rep_aux,
     )
 
@@ -1289,7 +1284,7 @@ def pre_permute_deepep_ll_to_cutlass(
 
     device = hidden_states.device
 
-    problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
+    quant_info.params.problem_sizes1, quant_info.params.problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
         masked_m,
         quant_info.params.problem_sizes1,
         quant_info.params.problem_sizes2,
@@ -1305,16 +1300,12 @@ def pre_permute_deepep_ll_to_cutlass(
         hidden_states, gateup_input, quant_info.w13_input_scale.float(), True
     )
 
-    # Store additional state for the main function
-    running_state["problem_sizes1"] = problem_sizes1
-    running_state["problem_sizes2"] = problem_sizes2
 
     return CutlassRunnerInput(
-        hidden_states=gateup_input,  # Preprocessed and quantized input
+        gate_up_input=gateup_input,  # Preprocessed and quantized input
         topk_ids=topk_ids,
         masked_m=masked_m,
         expected_m=expected_m,
-        rep_primary=gateup_input,  # Use preprocessed quantized input
     )
 
 
@@ -1450,7 +1441,7 @@ def pre_permute_deepep_normal_to_cutlass(
     running_state["c_map"] = c_map
 
     return CutlassRunnerInput(
-        hidden_states=gateup_input,
+        gate_up_input=gateup_input,
         topk_ids=topk_ids_,
         topk_weights=topk_weights,
         a_map=a_map,
