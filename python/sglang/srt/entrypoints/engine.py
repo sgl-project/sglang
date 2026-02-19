@@ -206,6 +206,7 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
+        logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
         # Store the atexit function so we can unregister it later
