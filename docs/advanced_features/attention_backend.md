@@ -49,7 +49,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-- FlashAttention 4 supports both prefill and decode on SM90+ (Hopper) and SM100+ (Blackwell). On SM90, paged KV requires `page_size` to be a multiple of the internal block size (e.g., 128). On SM100, `page_size` is fixed at 128.
+- FlashAttention 4 supports both prefill and decode on SM90 (Hopper) and SM100 (Blackwell). On SM90, `page_size` must be 128.
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
