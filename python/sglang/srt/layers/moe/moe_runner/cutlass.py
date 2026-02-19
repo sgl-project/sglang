@@ -228,7 +228,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         using two sets of quantized weights, w1_q and w2_q, and top-k gating
         mechanism. The matrix multiplications are implemented with CUTLASS
         grouped gemm.
-        
+
         This unified function handles three MoE types:
         1. DeepEP_LL: Post-per-tensor quantized FP8 input
             - `a` Shape: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, K]
@@ -261,7 +261,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer (pre-reordered for W4A8, otherwise fully processed).
         """
-        moe_type = params.moe_type
+        moe_type = params.cutlass_moe_type
         gateup_input = a
         k = w1_q.size(2) * 2  # w1_q is transposed and packed
         n = w2_q.size(2) * 2  # w2_q is transposed and packed
