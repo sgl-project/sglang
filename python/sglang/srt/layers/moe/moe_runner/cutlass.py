@@ -46,6 +46,7 @@ if is_cuda():
         cutlass_fp4_group_mm,
         cutlass_w4a8_moe_mm,
         es_fp8_blockwise_scaled_grouped_mm,
+        es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         get_cutlass_w4a8_moe_mm_data,
@@ -109,6 +110,7 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w2_blockscale: Optional[torch.Tensor] = None
     w1_alpha: Optional[torch.Tensor] = None
     w2_alpha: Optional[torch.Tensor] = None
+    use_mxfp8: Optional[bool] = False,
     enable_es: Optional[Tuple[bool, bool]] = (False, False)
 
 
@@ -124,8 +126,6 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w13_input_scale: Optional[torch.Tensor] = None
     w2_input_scale: Optional[torch.Tensor] = None
     params: Optional[CutlassMoEParams] = None
-    enable_es: Optional[Tuple[bool, bool]] = (False, False)
-    use_mxfp8: Optional[bool] = False
 
 
 class CutlassRunnerCore(MoeRunnerCore):
@@ -241,6 +241,9 @@ class CutlassRunnerCore(MoeRunnerCore):
                 problem_sizes1=quant_info.problem_sizes1,
                 problem_sizes2=quant_info.problem_sizes2,
                 rep_a1_scales=runner_input.rep_aux,
+                use_mxfp8=quant_info.use_mxfp8,
+                blockscale_offsets=running_state.get("blockscale_offsets", None),
+                max_blockscale=running_state.get("max_blockscale", None),
                 enable_es=quant_info.enable_es,
             )
 
@@ -778,10 +781,14 @@ class CutlassRunnerCore(MoeRunnerCore):
         problem_sizes2: torch.Tensor,
         rep_a1_scales: torch.Tensor,
         use_fp8_blockscale: bool = True,
+        blockscale_offsets: Optional[torch.Tensor] = None,
+        max_blockscale: Optional[int] = None,
+        use_mxfp8: bool = False,
         enable_es: Tuple[bool, bool] = (False, False),
     ) -> torch.Tensor:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
+
         )
 
         """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
@@ -879,6 +886,17 @@ class CutlassRunnerCore(MoeRunnerCore):
                 expert_offsets[:-1],
                 workspace,
             )
+        elif use_mxfp8 and es_up:
+            es_sm100_mxfp8_blockscaled_grouped_mm(
+                c1,
+                rep_a_q,
+                w1_q,
+                rep_a1_scales,
+                w1_scale,
+                problem_sizes1,
+                expert_offsets[:-1],
+                blockscale_offsets[:-1],
+            )
         else:
             fp8_blockwise_scaled_grouped_mm(
                 c1,
@@ -904,7 +922,21 @@ class CutlassRunnerCore(MoeRunnerCore):
         intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
         silu_and_mul(c1, intermediate)
 
-        intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+        if use_mxfp8 and es_down:
+            intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
+            a2_scale = torch.empty(
+                (max_blockscale, n // 32), dtype=torch.uint8, device=device
+            )
+            es_sm100_mxfp8_blockscaled_grouped_quant(
+                intermediate,
+                problem_sizes2,
+                expert_offsets[:-1],
+                blockscale_offsets[:-1],
+                intemediate_q,
+                a2_scale,
+            )
+        else:
+            intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
         if is_sm90_supported() and es_down:
             es_fp8_blockwise_scaled_grouped_mm(
@@ -919,6 +951,17 @@ class CutlassRunnerCore(MoeRunnerCore):
                 problem_sizes2,
                 expert_offsets[:-1],
                 workspace,
+            )
+        elif use_mxfp8 and es_down:
+            es_sm100_mxfp8_blockscaled_grouped_mm(
+                c2,
+                intemediate_q,
+                w2_q,
+                a2_scale,
+                w2_scale,
+                problem_sizes2,
+                expert_offsets[:-1],
+                blockscale_offsets[:-1],
             )
         else:
             fp8_blockwise_scaled_grouped_mm(
@@ -1078,9 +1121,9 @@ def pre_permute_standard_to_cutlass(
         problem_sizes1 = quant_info.problem_sizes1
         problem_sizes2 = quant_info.problem_sizes2
 
-        # Get parameters from quant_info, with defaults from original function
+
         enable_es = quant_info.enable_es
-        use_mxfp8 = quant_info.use_mxfp8
+        use_mxfp8 = enable_es[0]
 
         # ----------------------------------------------------------
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -1143,6 +1186,8 @@ def pre_permute_standard_to_cutlass(
                 (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
             ) * mxfp8_blockscale_align
 
+            running_state["max_blockscale"] = max_blockscale
+
         blockscale_offsets = None
         if use_mxfp8 and (es_up or es_down):
             blockscale_offsets = torch.empty(
@@ -1186,6 +1231,8 @@ def pre_permute_standard_to_cutlass(
         # Return the prepared input data
         rep_primary = rep_a_q  # The quantized and shuffled input
         rep_aux = rep_a1_scales  # The scales for the quantized input
+
+        running_state["blockscale_offsets"] = blockscale_offsets
 
         return CutlassRunnerInput(
             hidden_states=hidden_states,

@@ -1442,6 +1442,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 out_ptrs=self.out_ptr,
                 a_scales_ptrs=self.a_scales_ptr,
                 b_scales_ptrs=self.b_scales_ptr,
+                use_mxfp8=use_mxfp8,
                 enable_es=(use_mxfp8, use_mxfp8),
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
