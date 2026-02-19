@@ -1,0 +1,90 @@
+name: Patch Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to patch (leave empty to patch with latest main)"
+        required: false
+        default: ""
+      image_tag:
+        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
+        required: true
+
+concurrency:
+  group: patch-docker-${{ inputs.image_tag }}
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "Generating diff from PR #${{ inputs.pr_number }}"
+            gh pr diff ${{ inputs.pr_number }} > /tmp/sglang.patch
+          else
+            echo "Generating diff from image commit to latest main"
+            docker pull "${IMAGE}"
+            BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD)
+            echo "Image built from commit: ${BASE_SHA}"
+            git fetch origin main
+            git diff "${BASE_SHA}..origin/main" > /tmp/sglang.patch
+          fi
+
+          LINES=$(wc -l < /tmp/sglang.patch)
+          echo "Patch: ${LINES} lines"
+
+          if [ "${LINES}" -eq 0 ]; then
+            echo "::warning::Patch is empty — image is already up to date"
+            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build patched image
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+
+          mkdir -p /tmp/patch-ctx
+          cp /tmp/sglang.patch /tmp/patch-ctx/
+
+          cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          COPY sglang.patch /tmp/sglang.patch
+          RUN cd /sgl-workspace/sglang \
+              && git apply --verbose --stat /tmp/sglang.patch \
+              && git apply /tmp/sglang.patch \
+              && rm /tmp/sglang.patch
+          DOCKERFILE
+
+          docker build \
+            --no-cache \
+            --build-arg BASE_IMAGE="${IMAGE}" \
+            -t "${IMAGE}" \
+            /tmp/patch-ctx/
+
+      - name: Push patched image
+        if: env.SKIP_BUILD != 'true'
+        run: |
+          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+          docker push "${IMAGE}"
+
+          echo "### Patched Docker Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image:** \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Source:** ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
