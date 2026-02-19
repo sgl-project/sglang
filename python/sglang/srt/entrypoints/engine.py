@@ -1158,6 +1158,7 @@ def _launch_workers(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
+    logger.info(f"{server_args=}")
 
     # Launch schedulers (unified interface for both mp and Ray modes)
     scheduler_result = _launch_scheduler_processes(
