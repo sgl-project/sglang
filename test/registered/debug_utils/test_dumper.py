@@ -359,6 +359,16 @@ class TestOutputControl:
         tensor.fill_(999.0)
         assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
 
+    def test_capture_output_respects_filter(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="^keep")
+
+        with d.capture_output() as captured:
+            d.dump("keep_this", torch.randn(3, 3))
+            d.dump("skip_this", torch.randn(3, 3))
+
+        assert "keep_this" in captured
+        assert "skip_this" not in captured
+
 
 class TestDumpDictFormat:
     """Verify that dump files use the dict output format: {"value": ..., "meta": {...}}."""
