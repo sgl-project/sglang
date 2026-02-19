@@ -104,16 +104,17 @@ class TestTorchSave:
 class TestCollectiveTimeout:
     def test_watchdog_fires_on_timeout(self):
         block_event = threading.Event()
-        captured_output = [None]
+        output = ""
 
         def run_with_timeout():
+            nonlocal output
             with _capture_stdout() as captured:
                 _collective_with_timeout(
                     lambda: block_event.wait(),
                     operation_name="test_blocked_op",
                     timeout_seconds=2,
                 )
-            captured_output[0] = captured.getvalue()
+            output = captured.getvalue()
 
         worker = threading.Thread(target=run_with_timeout)
         worker.start()
@@ -122,7 +123,7 @@ class TestCollectiveTimeout:
         block_event.set()
         worker.join(timeout=5)
 
-        output = captured_output[0]
+        print(f"Captured output: {output!r}")
         assert "WARNING" in output
         assert "test_blocked_op" in output
         assert "2s" in output
@@ -187,6 +188,7 @@ class TestDumperDistributed:
             dumper.on_forward_pass_start()
 
         output = captured.getvalue()
+        print(f"Rank {rank} captured output: {output!r}")
 
         if rank == 0:
             assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
