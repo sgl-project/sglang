@@ -10,12 +10,6 @@
 
 #include <cstdint>
 
-#ifdef USE_ROCM
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
-#endif
-
 namespace {
 
 struct StoreKVCacheParams {

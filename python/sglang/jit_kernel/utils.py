@@ -3,12 +3,9 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
-import stat
-import weakref
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
 import torch
-from torch.utils.dlpack import to_dlpack
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -79,113 +76,11 @@ CPP_DTYPE_MAP = {
     torch.bfloat16: "bf16_t",
 }
 
+
 # AMD/ROCm note:
-# tvm_ffi's generic Python torch fallback path can break HIP graph capture and
-# add avoidable per-call overhead. We keep a cached torch->tvm_ffi bridge and a
-# HIP stream cache here so all HIP-enabled JIT kernels can share the same fix.
-_tvm_tensor_cache: dict[int, tuple[weakref.ReferenceType[torch.Tensor], Any]] = {}
-_hip_tvm_stream_cache: dict[tuple[int, int], int] = {}
-
-
 @cache_once
 def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
-
-
-@cache_once
-def _prepare_rocm_cuda_shim() -> str:
-    """Create a CUDA-home-compatible shim that forwards nvcc to hipcc."""
-    shim_root = pathlib.Path.home() / ".cache" / "sglang_jit_rocm_cuda_shim"
-    bin_dir = shim_root / "bin"
-    lib64_dir = shim_root / "lib64"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    lib64_dir.mkdir(parents=True, exist_ok=True)
-
-    libcudart = lib64_dir / "libcudart.so"
-    if libcudart.exists() or libcudart.is_symlink():
-        libcudart.unlink()
-    libcudart.symlink_to("/opt/rocm/lib/libamdhip64.so")
-
-    nvcc_path = bin_dir / "nvcc"
-    wrapper = """#!/usr/bin/env bash
-set -euo pipefail
-
-depfile=""
-out=""
-src=""
-args=()
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --generate-dependencies-with-compile)
-      shift
-      ;;
-    --dependency-output)
-      depfile="$2"
-      shift 2
-      ;;
-    -gencode=*)
-      shift
-      ;;
-    --expt-relaxed-constexpr)
-      shift
-      ;;
-    -Xcompiler)
-      # Keep the wrapped compiler flag, drop only the nvcc forwarding token.
-      if [[ $# -ge 2 ]]; then
-        args+=("$2")
-      fi
-      shift 2
-      ;;
-    -o)
-      out="$2"
-      args+=("$1" "$2")
-      shift 2
-      ;;
-    -c)
-      args+=("$1")
-      if [[ $# -ge 2 ]]; then
-        src="$2"
-      fi
-      shift
-      ;;
-    *)
-      args+=("$1")
-      shift
-      ;;
-  esac
-done
-
-if [[ -n "${src}" ]]; then
-  hip_src="${src}.hip.cu"
-  /opt/rocm/bin/hipify-perl "${src}" > "${hip_src}"
-  for i in "${!args[@]}"; do
-    if [[ "${args[$i]}" == "${src}" ]]; then
-      args[$i]="${hip_src}"
-      break
-    fi
-  done
-fi
-
-/opt/rocm/bin/hipcc -DUSE_ROCM "${args[@]}"
-rc=$?
-if [[ $rc -ne 0 ]]; then
-  exit $rc
-fi
-
-if [[ -n "${depfile}" ]]; then
-  if [[ -n "${out}" && -n "${src}" ]]; then
-    echo "${out}: ${src}" > "${depfile}"
-  else
-    : > "${depfile}"
-  fi
-fi
-"""
-    nvcc_path.write_text(wrapper)
-    nvcc_path.chmod(
-        nvcc_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-    )
-    return str(shim_root)
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -199,38 +94,6 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
-
-
-def to_tvm_tensor_cached(tensor: torch.Tensor):
-    """AMD/ROCm helper: cached torch->tvm_ffi conversion for HIP capture safety."""
-    key = id(tensor)
-    entry = _tvm_tensor_cache.get(key)
-    if entry is not None:
-        ref, cached = entry
-        if ref() is tensor:
-            return cached
-        _tvm_tensor_cache.pop(key, None)
-    from tvm_ffi import from_dlpack
-
-    tvm_tensor = from_dlpack(to_dlpack(tensor))
-    _tvm_tensor_cache[key] = (weakref.ref(tensor), tvm_tensor)
-    return tvm_tensor
-
-
-def hip_ensure_tvm_ffi_stream(tensor: torch.Tensor) -> None:
-    """AMD/ROCm helper: keep tvm_ffi stream aligned with the current HIP stream."""
-    from tvm_ffi.core import _env_set_current_stream
-
-    dl_device_type, dl_device_id = tensor.__dlpack_device__()
-    device_type = int(dl_device_type)
-    device_id = int(dl_device_id)
-    # Faster than constructing torch.cuda.current_stream(...) Python object.
-    current_stream = int(torch._C._cuda_getCurrentRawStream(device_id))
-    key = (device_type, device_id)
-    if _hip_tvm_stream_cache.get(key) == current_stream:
-        return
-    _env_set_current_stream(device_type, device_id, current_stream)
-    _hip_tvm_stream_cache[key] = current_stream
 
 
 def load_jit(
@@ -299,12 +162,12 @@ def load_jit(
     # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     env_existed = env_key in os.environ
-    cuda_home_existed = "CUDA_HOME" in os.environ
-    old_cuda_home = os.environ.get("CUDA_HOME")
-
-    # tvm_ffi currently assumes a CUDA-style toolchain. On ROCm, provide a shim.
+    base_cuda_cflags = DEFAULT_CUDA_CFLAGS
     if is_hip_runtime():
-        os.environ["CUDA_HOME"] = _prepare_rocm_cuda_shim()
+        # HIP clang does not support this nvcc-only flag.
+        base_cuda_cflags = [
+            flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+        ]
         extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
@@ -314,7 +177,7 @@ def load_jit(
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
+            extra_cuda_cflags=base_cuda_cflags + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,
@@ -323,12 +186,6 @@ def load_jit(
         # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
         if not env_existed:
             del os.environ[env_key]
-        if is_hip_runtime():
-            if cuda_home_existed:
-                assert old_cuda_home is not None
-                os.environ["CUDA_HOME"] = old_cuda_home
-            else:
-                os.environ.pop("CUDA_HOME", None)
 
 
 @cache_once
