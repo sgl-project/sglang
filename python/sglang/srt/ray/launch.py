@@ -129,16 +129,12 @@ def launch_scheduler_ray_actors(
 
                 # Compute parallelism ranks (must match mp launcher logic)
                 attn_dp_size = (
-                    server_args.dp_size
-                    if server_args.enable_dp_attention
-                    else 1
+                    server_args.dp_size if server_args.enable_dp_attention else 1
                 )
                 attn_tp_size = (
                     server_args.tp_size // attn_dp_size // server_args.attn_cp_size
                 )
-                attn_cp_rank = (
-                    (tp_rank // attn_tp_size) % server_args.attn_cp_size
-                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
                 moe_dp_rank = tp_rank // (
                     server_args.tp_size // server_args.moe_dp_size
                 )
