@@ -911,6 +911,8 @@ def recenter_image(image, border_ratio=0.2):
         return image
     elif image.mode == "L":
         return image.convert("RGB")
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
 
     alpha_channel = np.array(image)[:, :, 3]
     non_zero_indices = np.argwhere(alpha_channel > 0)
