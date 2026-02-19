@@ -11,24 +11,34 @@ _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 @dataclass
 class ForwardInputBuffers:
 
-    def _build_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
+    def _build_one_buffer(self, name: str, input_buffer: torch.Tensor) -> torch.Tensor:
 
-        buffer_size = new_buffer.size()
-        buffer_stride = new_buffer.stride()
+        assert input_buffer.is_contiguous()
+
+        buffer_size = input_buffer.size()
+        buffer_numel = input_buffer.numel()
+        # buffer_stride = input_buffer.stride()
 
         old_buffer = _forward_input_buffer_pool.get(name, None)
         if old_buffer is not None:
             assert (
-                new_buffer.dtype == old_buffer.dtype
+                input_buffer.dtype == old_buffer.dtype
             ), f"Buffer {name} has different dtype than before."
             assert (
-                new_buffer.device == old_buffer.device
+                input_buffer.device == old_buffer.device
             ), f"Buffer {name} has different device than before."
-            if old_buffer.numel() > new_buffer.numel():
-                new_buffer = old_buffer
+            if old_buffer.numel() > input_buffer.numel():
+                input_buffer = old_buffer.view(-1)
+            else:
+                input_buffer = input_buffer.view(-1)
 
-        _forward_input_buffer_pool[name] = new_buffer
-        return new_buffer.as_strided(buffer_size, buffer_stride)
+        _forward_input_buffer_pool[name] = input_buffer
+        # output_buffer = input_buffer.as_strided(buffer_size, buffer_stride)
+        output_buffer = input_buffer[:buffer_numel].view(buffer_size)
+
+        assert output_buffer.is_contiguous()
+
+        return output_buffer
 
     def build(self):
 
