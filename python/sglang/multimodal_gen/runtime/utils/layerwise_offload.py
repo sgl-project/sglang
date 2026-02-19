@@ -276,6 +276,86 @@ class LayerwiseOffloadManager:
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
 
+    @torch.compiler.disable
+    def update_cpu_weights(
+        self, weight_dict: Dict[str, torch.Tensor]
+    ) -> Set[str] | None:
+        """Update consolidated CPU buffers with new weights.
+
+        When layerwise offload (--dit-layerwise-offload) is enabled, the
+        offload manager replaces GPU parameters with small torch.empty((1,))
+        placeholders while real weights live in consolidated pinned CPU
+        buffers.
+
+        The refit process writes new weights directly into the CPU buffers,
+        bypassing the placeholders.  For any layer that happens to be resident
+        on the GPU at update time, the live GPU tensor is also updated.
+
+        Args:
+            weight_dict: Mapping of parameter name to new weight tensor.
+
+        Returns:
+            Set of parameter names that were successfully updated.
+
+        Raises:
+            ValueError: If a weight's shape does not match the recorded
+                metadata (i.e., the real shape, not the placeholder shape).
+        """
+        if not self.enabled:
+            return None
+
+        updated_names: Set[str] = set()
+        for name, loaded_weight in weight_dict.items():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None:
+                continue
+            meta_layer = self._weight_metadata.get(layer_idx)
+            if meta_layer is None or name not in meta_layer:
+                continue
+
+            meta = meta_layer[name]
+            if tuple(meta["shape"]) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    f"Shape mismatch for {name}: "
+                    f"expected={tuple(meta['shape'])}, "
+                    f"loaded={tuple(loaded_weight.shape)}"
+                )
+
+            dtype = meta["dtype"]
+            offset = meta["offset"]
+            numel = meta["numel"]
+            cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+            cpu_buffer[offset : offset + numel].copy_(
+                loaded_weight.to(dtype=dtype).flatten()
+            )
+
+            # If this layer is currently on GPU, update the live parameter.
+            if layer_idx in self._gpu_layers:
+                target = self.get_target_with_name(name)
+                target.data.copy_(loaded_weight.to(dtype=target.dtype))
+
+            updated_names.add(name)
+
+        return updated_names
+
+    def iter_cpu_weights(self):
+        """Yield (name, tensor) pairs from consolidated CPU buffers.
+
+        This reconstructs the original weight tensors (with correct shapes)
+        from the flat CPU buffers using stored metadata.  Unlike
+        model.named_parameters(), which returns (1,) placeholders
+        when offload is enabled, this method returns the real weights and
+        can be used for checksum computation.
+        """
+        for layer_idx in sorted(self._weight_metadata):
+            for name, meta in self._weight_metadata[layer_idx].items():
+                dtype = meta["dtype"]
+                offset = meta["offset"]
+                numel = meta["numel"]
+                shape = meta["shape"]
+                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                yield name, cpu_buffer[offset : offset + numel].reshape(shape)
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
@@ -383,3 +463,32 @@ class OffloadableDiTMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+
+def iter_materialized_weights(module: torch.nn.Module):
+    """Yield (name, tensor) pairs with materialized weights, even under offload.
+
+    When layerwise offload is active, module.named_parameters() returns
+    (1,) placeholders for offloaded layers.  This function reads the
+    actual data from the offload manager's CPU buffers and chains it with
+    the non-offloaded parameters.
+    """
+    offload_managers: list = []
+    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+
+    if not offload_managers:
+        yield from module.named_parameters()
+        return
+
+    # Collect offloaded names and their real tensors from CPU buffers.
+    offloaded_names: set[str] = set()
+    for manager in offload_managers:
+        for name, tensor in manager.iter_cpu_weights():
+            offloaded_names.add(name)
+            yield name, tensor
+
+    # Yield non-offloaded parameters (e.g. final norms, embeddings).
+    for name, param in module.named_parameters():
+        if name not in offloaded_names:
+            yield name, param
