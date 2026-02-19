@@ -118,8 +118,8 @@ class CutlassRunnerCore(MoeRunnerCore):
             quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
         ), "Expert number mismatch between w13 and w2"
 
-        num_tokens = runner_input.hidden_states.shape[0]
-        hidden_size = runner_input.hidden_states.shape[1]
+        num_tokens = runner_input.gate_up_input.shape[0]
+        hidden_size = runner_input.gate_up_input.shape[1]
         topk = runner_input.topk_ids.shape[1]
 
         # Standard mode
@@ -221,7 +221,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         # Store combination info for post_permute function
         running_state["c_map"] = runner_input.c_map
         running_state["topk_weights"] = runner_input.topk_weights
-        running_state["original_hidden_states_shape"] = runner_input.hidden_states.shape
+        running_state["original_hidden_states_shape"] = runner_input.gate_up_input.shape
 
         return CutlassRunnerOutput(hidden_states=down_output)
 
