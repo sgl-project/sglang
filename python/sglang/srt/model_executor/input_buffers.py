@@ -42,6 +42,8 @@ class ForwardInputBuffers:
 
     def build(self):
 
+        assert not torch.is_inference_mode_enabled()
+
         for f in fields(self):
             name = f.name
             buffer = getattr(self, name)

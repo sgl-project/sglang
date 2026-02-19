@@ -134,6 +134,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
     ) -> "DecodeInputBuffers":
+        assert not torch.is_inference_mode_enabled(), "DecodeInputBuffers should not be created in inference mode."
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
