@@ -237,8 +237,7 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
         layer.w13_weight.data = self._pack_to_int32(
             layer.w13_weight.data.to(torch.int32)
         )
