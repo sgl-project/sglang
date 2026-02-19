@@ -56,7 +56,7 @@ class _Dumper:
         enable_model_grad: bool = True,
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
-        needs_cleanup: bool = False,
+        cleanup: bool = False,
     ):
         # Config
         self._enable = enable
@@ -76,7 +76,7 @@ class _Dumper:
         self._global_ctx = {}
         self._override_enable = None
         self._http_server_handled = not enable_http_server
-        self._needs_cleanup = needs_cleanup
+        self._pending_cleanup = cleanup
 
     @classmethod
     def from_env(cls) -> "_Dumper":
@@ -95,7 +95,7 @@ class _Dumper:
             enable_http_server=get_bool_env_var(
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
             ),
-            needs_cleanup=get_bool_env_var("SGLANG_DUMPER_CLEANUP", "0"),
+            cleanup=get_bool_env_var("SGLANG_DUMPER_CLEANUP", "0"),
         )
 
     def on_forward_pass_start(self):
@@ -300,8 +300,8 @@ class _Dumper:
         )
 
         if self._enable_write_file and save:
-            if self._needs_cleanup:
-                self._needs_cleanup = False
+            if self._pending_cleanup:
+                self._pending_cleanup = False
                 _cleanup_old_dumps(self._base_dir)
 
             path.parent.mkdir(parents=True, exist_ok=True)
