@@ -28,6 +28,8 @@ from typing import Sequence
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
+DEFAULT_SMALL_MODEL = "Tongyi-MAI/Z-Image-Turbo"
+
 
 @dataclass
 class ToleranceConfig:
@@ -338,8 +340,6 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     fps=4,
 )
-
-DEFAULT_SMALL_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
