@@ -16,6 +16,8 @@ from .base_config import QuantizationConfig, QuantizeMethodBase
 
 logger = init_logger(__name__)
 
+# map to nunchaku layers directly if the pattern matches
+
 SVDQ_W4A4_LAYER_PATTERNS = [
     "attn.to_qkv",
     "attn.to_out",

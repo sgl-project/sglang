@@ -288,7 +288,6 @@ class ZImageTransformerBlock(nn.Module):
             isinstance(quant_config, NunchakuConfig) and is_nunchaku_available()
         )
         if nunchaku_enabled:
-            logger.info("ZImage block %s: using NunchakuFeedForward", prefix)
             import diffusers
 
             ff = diffusers.models.attention.FeedForward(
