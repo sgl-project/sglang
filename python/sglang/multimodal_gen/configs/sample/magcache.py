@@ -90,9 +90,8 @@ class WanMagCacheParams(MagCacheParams):
     the cache directory. If not found, it falls back to the default interpolated
     ratios from T2V_13B_MAG_RATIOS.
     """
-    # mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, T2V_13B_MAG_RATIOS) # hardcoded for now
-    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, load_mag_ratios("cache/magcache_calibration_20260219_212415.jsonl")) # hardcoded for now
-    ic(mag_ratios)
+    # # mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, T2V_13B_MAG_RATIOS) # hardcoded for now
+    # mag_ratios: torch.Tensor = get_interpolated_mag_ratios(NUM_STEPS, load_mag_ratios("cache/magcache_calibration_20260219_212415.jsonl")) # hardcoded for now
 
     @property
     def ret_steps(self) -> int:

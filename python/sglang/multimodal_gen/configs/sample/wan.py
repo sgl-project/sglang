@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
+import torch
+
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import WanTeaCacheParams
 from sglang.multimodal_gen.configs.sample.magcache import WanMagCacheParams
@@ -53,9 +55,22 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
 
     magcache_params: WanMagCacheParams = field(
         default_factory=lambda: WanMagCacheParams(
-            threshold=0.06,
-            max_skip_steps=3,
+            threshold=0.12,
+            max_skip_steps=4,
+            retention_ratio=0.2,
             use_ret_steps=True,
+            mag_ratios=torch.tensor([1.0000, 1.0000, 1.0211, 1.0229, 0.9903, 0.9907, 0.9877, 0.9883, 0.9903,
+                      0.9900, 0.9878, 0.9879, 0.9911, 0.9909, 0.9937, 0.9935, 0.9892, 0.9890,
+                      0.9921, 0.9920, 0.9885, 0.9885, 0.9917, 0.9916, 0.9910, 0.9910, 0.9892,
+                      0.9893, 0.9912, 0.9912, 0.9877, 0.9877, 0.9913, 0.9913, 0.9885, 0.9886,
+                      0.9888, 0.9888, 0.9889, 0.9889, 0.9885, 0.9884, 0.9870, 0.9870, 0.9878,
+                      0.9878, 0.9870, 0.9869, 0.9880, 0.9880, 0.9857, 0.9857, 0.9852, 0.9852,
+                      0.9846, 0.9846, 0.9838, 0.9838, 0.9825, 0.9825, 0.9836, 0.9835, 0.9794,
+                      0.9794, 0.9795, 0.9795, 0.9783, 0.9783, 0.9767, 0.9766, 0.9763, 0.9762,
+                      0.9729, 0.9728, 0.9744, 0.9743, 0.9676, 0.9675, 0.9671, 0.9670, 0.9642,
+                      0.9640, 0.9599, 0.9598, 0.9570, 0.9568, 0.9535, 0.9533, 0.9462, 0.9460,
+                      0.9405, 0.9403, 0.9356, 0.9355, 0.9272, 0.9269, 0.9342, 0.9337, 0.9733,
+                      0.9719]),
         )
     )
 

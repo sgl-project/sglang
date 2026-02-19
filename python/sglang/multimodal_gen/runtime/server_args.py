@@ -391,16 +391,6 @@ class ServerArgs:
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
-        self._adjust_cache_params()
-
-    def _adjust_cache_params(self):
-        """Deserialize --teacache-params / --magcache-params JSON dicts into dataclass instances."""
-        if isinstance(self.teacache_params, dict):
-            ic(type(self.teacache_params))
-            self.teacache_params = WanTeaCacheParams(**self.teacache_params) # if self.pipeline_config.prefix == "wan" else TeaCacheParams(**self.teacache_params)
-            ic(type(self.teacache_params))
-        if isinstance(self.magcache_params, dict):
-            self.magcache_params = WanMagCacheParams(**self.magcache_params) # if self.pipeline_config.prefix == "wan" else MagCacheParams(**self.magcache_params)
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
