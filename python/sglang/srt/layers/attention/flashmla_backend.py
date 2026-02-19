@@ -159,35 +159,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
+        """Initialize CUDA graph state - only kv_indices buffer is needed.
+
+        Note: mla_metadata and num_splits are computed on-the-fly during
+        capture/replay to avoid shape mismatch issues with num_sm_parts.
+        """
         if block_kv_indices is None:
-            cuda_graph_kv_indices = torch.full(
+            self.cuda_graph_kv_indices = torch.full(
                 (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
                 1,
                 dtype=torch.int32,
                 device="cuda",
             )
         else:
-            cuda_graph_kv_indices = block_kv_indices
-
-        if self.num_draft_tokens:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
-        else:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
-        self.cuda_graph_kv_indices = cuda_graph_kv_indices
+            self.cuda_graph_kv_indices = block_kv_indices
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -215,17 +200,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_q_heads = self.num_draft_tokens * self.num_q_heads
             else:
                 num_q_heads = self.num_q_heads
+            # Compute mla_metadata on-the-fly to ensure correct shape for num_sm_parts
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            # Use directly returned tensors instead of copying to pre-allocated buffers
+            # to avoid shape mismatch with num_sm_parts
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
+                mla_metadata,
+                num_splits,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         elif forward_mode.is_target_verify():
@@ -241,17 +227,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
+            # Compute mla_metadata on-the-fly to ensure correct shape for num_sm_parts
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            # Use directly returned tensors instead of copying to pre-allocated buffers
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
+                mla_metadata,
+                num_splits,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         else:
@@ -295,16 +281,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_q_heads = self.num_draft_tokens * self.num_q_heads
             else:
                 num_q_heads = self.num_q_heads
+            # Compute mla_metadata on-the-fly to ensure correct shape for num_sm_parts
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            # Use directly returned tensors instead of copying to pre-allocated buffers
+            self.forward_metadata.mla_metadata = mla_metadata
+            self.forward_metadata.num_splits = num_splits
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -321,16 +307,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
+            # Compute mla_metadata on-the-fly to ensure correct shape for num_sm_parts
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            # Use directly returned tensors instead of copying to pre-allocated buffers
+            self.forward_metadata.mla_metadata = mla_metadata
+            self.forward_metadata.num_splits = num_splits
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
