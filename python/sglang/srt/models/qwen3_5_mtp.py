@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only Qwen3_5 MTP model."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -24,112 +25,13 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-
-class Qwen3_5MultiTokenPredictor(nn.Module):
-    def __init__(self, config: PretrainedConfig, quant_config=None, prefix: str = ""):
-        super().__init__()
-
-        self.config = config
-
-        self.vocab_size = config.vocab_size
-
-        self.mtp_start_layer_idx = config.num_hidden_layers
-        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
-
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
-
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-
-        config.full_attention_interval = 1
-        self.layers = torch.nn.ModuleList(
-            [
-                Qwen3_5AttentionDecoderLayer(
-                    config,
-                    idx,
-                    quant_config,
-                    prefix=add_prefix(f"layers.{idx}", prefix),
-                )
-                for idx in range(self.num_mtp_layers)
-            ]
-        )
-
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_fc_norm_embedding = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: torch.Tensor,
-        input_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        # if get_pp_group().is_first_rank:
-        assert input_embeds is None
-        input_embeds = forward_batch.mm_input_embeds
-        if (
-            forward_batch.forward_mode.is_extend()
-            and forward_batch.contains_mm_inputs()
-            and not forward_batch.forward_mode.is_draft_extend()
-        ):
-            assert input_embeds is not None
-            input_embeds = torch.cat(
-                [input_embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-            )
-
-        if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = forward_batch.spec_info.hidden_states
-
-        # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
-        if not forward_batch.forward_mode.is_idle():
-            input_embeds = self.pre_fc_norm_embedding(input_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-
-        hidden_states = self.fc(hidden_states)
-        residual = None
-
-        if self.num_mtp_layers == 1:
-            hidden_states, residual = self.layers[0](
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
-        else:
-            raise ("not implementation for other mtp layers[self.num_mtp_layers > 1]")
-
-        if not get_pp_group().is_last_rank:
-            # For pipeline parallel, return intermediate tensors
-            return hidden_states
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -140,7 +42,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
 
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
@@ -151,8 +53,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.model = Qwen3_5MultiTokenPredictor(
-            config, quant_config, prefix=add_prefix("mtp", prefix)
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        RMSNorm_cls = GemmaRMSNorm
+        self.pre_fc_norm_embedding = RMSNorm_cls(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+        config.num_hidden_layers = 1
+        config.full_attention_interval = 1
+        self.model = Qwen3_5ForCausalLM(
+            config,
+            quant_config,
+            prefix=add_prefix("mtp", prefix),
         )
 
         if get_pp_group().is_last_rank:
@@ -165,9 +77,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
-        else:
-            # For pipeline parallel, create a placeholder layer
-            self.lm_head = nn.Linear(1, 1, bias=False)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -193,16 +102,36 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        assert input_embeds is None
+        input_embeds = forward_batch.mm_input_embeds
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend()
+        ):
+            assert input_embeds is not None
+            input_embeds = torch.cat(
+                [input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))]
+            )
+
+        if input_embeds is None:
+            input_embeds = self.model.embed_tokens(input_ids)
+
+        hidden_states = forward_batch.spec_info.hidden_states
+
+        if not forward_batch.forward_mode.is_idle():
+            input_embeds = self.pre_fc_norm_embedding(input_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+
+        hidden_states = self.fc(hidden_states)
+
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
-            input_embeds,
+            hidden_states,
         )
-
-        if not get_pp_group().is_last_rank:
-            # For pipeline parallel, return intermediate results
-            return hidden_states
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -285,13 +214,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if "mtp" not in name:
                 continue
 
-            # Some checkpoints use model.language_model.mtp.* prefix
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-
             if name.startswith("mtp."):
                 # Remove the mtp. prefix for processing
                 name = name.replace("mtp.", "model.")
+
+                name = name.replace("model.fc", "fc")
+                name = name.replace("model.pre_fc", "pre_fc")
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")

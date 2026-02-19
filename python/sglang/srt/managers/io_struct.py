@@ -117,6 +117,12 @@ class SpeculativeDecodingMetricsMixin:
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
 
+    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
+    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # Empty list [] when speculative decoding is disabled.
+    spec_acceptance_histogram: List[List[int]]
+
 
 @dataclass
 class APIServingTimingMixin:
@@ -1303,6 +1309,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Tensor metadata
+    manifest: Optional[Dict[str, Any]] = None
 
 
 @dataclass
