@@ -208,7 +208,7 @@ python3 -m sglang.launch_server \
 
 - FlashAttention 4 (MHA & MLA)
 ```bash
-# FA4 for both prefill and decode on SM90+ (e.g., H100)
+# FA4 for both prefill and decode on SM90/SM100
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
   --attention-backend fa4 \
