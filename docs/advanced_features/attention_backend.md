@@ -215,7 +215,6 @@ python3 -m sglang.launch_server \
   --page-size 128 \
   --trust-remote-code
 
-# FA4 as prefill-only backend with separate decode backend (e.g., for FP4 KV cache)
 python3 -m sglang.launch_server \
   --tp 8 \
   --model deepseek-ai/DeepSeek-R1 \
