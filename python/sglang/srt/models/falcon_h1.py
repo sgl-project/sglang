@@ -514,6 +514,8 @@ class FalconH1ForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
+        from sglang.srt.layers.parameter import PerTensorScaleParameter
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -523,12 +525,41 @@ class FalconH1ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        # Only skip scale tensors that truly have no corresponding model parameter.
+        # - output_scale: activation output scale, not registered as nn.Parameter.
+        # - k_scale / v_scale: KV-cache scales managed by the attention backend.
+        # weight_scale and input_scale ARE registered parameters on FP8 linear
+        # layers (attention, MLP) and must be loaded so that
+        # process_weights_after_loading can apply correct requantisation.
+        # For mamba layers (which are BF16 with no quant_config), weight_scale /
+        # input_scale are not registered, so the "not in params_dict" guard below
+        # will skip them naturally.
+        _no_param_scale_suffixes = (".output_scale", ".k_scale", ".v_scale")
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
 
-            if "rotary_emb.inv_freq" in name:
+        # Materialise the weight iterator so we can build a weight-scale look-up
+        # table for mamba layers (BF16) which require explicit dequantisation.
+        # The table is keyed by the checkpoint base-name (without ".weight_scale")
+        # so the lookup works before any name transformations below.
+        all_weights = dict(weights)
+        weight_scale_map = {
+            name[: -len(".weight_scale")]: tensor
+            for name, tensor in all_weights.items()
+            if name.endswith(".weight_scale")
+        }
+
+        for orig_name, loaded_weight in all_weights.items():
+
+            if "rotary_emb.inv_freq" in orig_name:
                 continue
+
+            # Drop scale tensors that have no model parameter in any configuration.
+            if orig_name.endswith(_no_param_scale_suffixes):
+                continue
+
+            name = orig_name
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
@@ -536,35 +567,54 @@ class FalconH1ForCausalLM(nn.Module):
             if "A_log" in name:
                 name = name.replace("A_log", "A")
 
+            matched_shard_id = None
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
-                #     continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader")
-                weight_loader(param, loaded_weight, shard_id)
+                matched_shard_id = shard_id
                 break
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+
+            # Dequantise FP8 weights only for BF16 model parameters (mamba
+            # in_proj / out_proj, which are created without quant_config).
+            # For FP8 linear layers (attention, MLP) the FP8 tensor is loaded
+            # as-is so that process_weights_after_loading can apply proper
+            # requantisation using the correct per-shard weight_scale values.
+            if (
+                loaded_weight.dtype == torch.float8_e4m3fn
+                and param.dtype != torch.float8_e4m3fn
+            ):
+                base_name = (
+                    orig_name[: -len(".weight")]
+                    if orig_name.endswith(".weight")
+                    else orig_name
+                )
+                if base_name in weight_scale_map:
+                    scale = weight_scale_map[base_name].to(torch.float32)
+                    loaded_weight = loaded_weight.to(torch.float32) * scale
+                loaded_weight = loaded_weight.to(torch.bfloat16)
+
+            # PerTensorScaleParameter (weight_scale / input_scale) in stacked
+            # layers: the standard weight_loader cannot map a scalar checkpoint
+            # value into the correct slot of the fused (N,) array because it
+            # lacks an output_dim. Use _load_into_shard_id directly instead.
+            if (
+                isinstance(param, PerTensorScaleParameter)
+                and matched_shard_id is not None
+            ):
+                param._load_into_shard_id(loaded_weight, matched_shard_id)
+            elif matched_shard_id is not None:
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, loaded_weight, matched_shard_id)
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-
                 weight_loader(param, loaded_weight)
 
             loaded_params.add(name)
