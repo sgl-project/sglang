@@ -559,6 +559,8 @@ class FalconH1ForCausalLM(nn.Module):
                     continue
                 # if is_pp_missing_parameter(name, self):
                 #     continue
+                if name not in params_dict:
+                    continue
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
