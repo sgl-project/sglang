@@ -29,20 +29,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Generate patch
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Pull base image and extract commit
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+          docker pull "${IMAGE}"
+          BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD)
+          echo "Image built from commit: ${BASE_SHA}"
+          echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+
+      - name: Generate patch
+        run: |
+          # Fetch the exact commit the image was built from (branch-agnostic)
+          git fetch origin "${BASE_SHA}"
 
           if [ -n "${{ inputs.pr_number }}" ]; then
-            echo "Generating diff from PR #${{ inputs.pr_number }}"
-            gh pr diff ${{ inputs.pr_number }} > /tmp/sglang.patch
+            echo "Generating diff: image ${BASE_SHA} → PR #${{ inputs.pr_number }}"
+            git fetch origin "pull/${{ inputs.pr_number }}/head:pr-${{ inputs.pr_number }}"
+            git diff "${BASE_SHA}..pr-${{ inputs.pr_number }}" > /tmp/sglang.patch
           else
-            echo "Generating diff from image commit to latest main"
-            docker pull "${IMAGE}"
-            BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD)
-            echo "Image built from commit: ${BASE_SHA}"
+            echo "Generating diff: image ${BASE_SHA} → latest main"
             git fetch origin main
             git diff "${BASE_SHA}..origin/main" > /tmp/sglang.patch
           fi
