@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ModelSlimW8A8Int8MoE",
+    "ModelSlimW4A4Int4MoE",
 ]
 
 
