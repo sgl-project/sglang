@@ -1,4 +1,4 @@
-"""Benchmark: sgl_kernel (AOT cuBLASLt) vs flashinfer (JIT) for bmm_fp8.
+"""Benchmark: flashinfer (JIT) bmm_fp8.
 
 Usage:
     python python/sglang/jit_kernel/benchmark/bench_bmm_fp8.py
@@ -11,8 +11,6 @@ import argparse
 import torch
 import triton
 import triton.testing
-from sgl_kernel.gemm import _bmm_fp8_internal
-from sgl_kernel.utils import _get_cache_buf
 
 import flashinfer
 from sglang.jit_kernel.benchmark.utils import (
@@ -43,9 +41,9 @@ N_VALS = get_benchmark_range(_cli.n or [256, 512, 1024], [256])
         x_vals=BATCH_SIZES,
         x_log=False,
         line_arg="provider",
-        line_vals=["sgl_kernel", "flashinfer"],
-        line_names=["sgl_kernel (AOT cuBLASLt)", "flashinfer (JIT)"],
-        styles=[("blue", "-"), ("orange", "-")],
+        line_vals=["flashinfer"],
+        line_names=["flashinfer (JIT)"],
+        styles=[("orange", "-")],
         ylabel="us",
         plot_name="bmm_fp8",
         args={},
@@ -58,16 +56,7 @@ def benchmark(batch_size, provider, M, K, N):
     B_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     out_dtype = torch.bfloat16
 
-    if provider == "sgl_kernel":
-        out = torch.empty(batch_size, M, N, device="cuda", dtype=out_dtype)
-        workspace = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-        return run_benchmark(
-            lambda: _bmm_fp8_internal(workspace, A, B, out, A_scale, B_scale)
-        )
-    else:  # flashinfer
-        return run_benchmark(
-            lambda: flashinfer.bmm_fp8(A, B, A_scale, B_scale, out_dtype)
-        )
+    return run_benchmark(lambda: flashinfer.bmm_fp8(A, B, A_scale, B_scale, out_dtype))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@ from typing import Optional, Tuple
 
 import torch
 from sgl_kernel.scalar_type import ScalarType
-from sgl_kernel.utils import _get_cache_buf
 
 
 def awq_dequantize(
@@ -43,26 +42,6 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
-def _bmm_fp8_internal(
-    workspace_buffer: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-) -> None:
-    cublas_handle = torch.cuda.current_blas_handle()
-    torch.ops.sgl_kernel.bmm_fp8.default(
-        A,
-        B,
-        D,
-        A_scale,
-        B_scale,
-        workspace_buffer,
-        cublas_handle,
-    )
-
-
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -70,38 +49,10 @@ def bmm_fp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: str = "sgl_kernel",
 ) -> torch.Tensor:
-    """Batched matrix multiplication for FP8 tensors.
+    import flashinfer
 
-    Args:
-        A: Input tensor of shape (batch, M, K), FP8 dtype.
-        B: Input tensor of shape (batch, K, N), FP8 dtype.
-        A_scale: Scale for A (scalar or per-tensor float32).
-        B_scale: Scale for B (scalar or per-tensor float32).
-        dtype: Output dtype (torch.bfloat16 or torch.float16).
-        out: Optional pre-allocated output tensor of shape (batch, M, N).
-        backend: ``"sgl_kernel"`` (AOT cuBLASLt, default) or
-                 ``"flashinfer"`` (JIT, supports multiple sub-backends).
-
-    Returns:
-        Output tensor of shape (batch, M, N) with the requested *dtype*.
-    """
-    if backend == "flashinfer":
-        import flashinfer
-
-        return flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, out=out)
-
-    # Default: sgl_kernel AOT cuBLASLt path
-    if out is None:
-        out = torch.empty(
-            (A.shape[0], A.shape[1], B.shape[2]),
-            device=A.device,
-            dtype=dtype,
-        )
-    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-    _bmm_fp8_internal(workspace_buffer, A, B, out, A_scale, B_scale)
-    return out
+    return flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, out=out)
 
 
 def dsv3_fused_a_gemm(
