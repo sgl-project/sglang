@@ -523,28 +523,28 @@
         },
         "zimage_image_t2i": {
             "stages_ms": {
-                "ConditioningStage": 0.01,
-                "DecodingStage": 33.93,
-                "TextEncodingStage": 409.74,
                 "InputValidationStage": 0.03,
-                "DenoisingStage": 808.69,
-                "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 1.33
+                "TextEncodingStage": 403.47,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.41,
+                "LatentPreparationStage": 0.11,
+                "DenoisingStage": 756.21,
+                "DecodingStage": 29.41
             },
             "denoise_step_ms": {
-                "0": 23.4,
-                "1": 28.26,
-                "2": 100.72,
-                "3": 100.48,
-                "4": 99.62,
-                "5": 99.83,
-                "6": 99.67,
-                "7": 99.3,
-                "8": 100.83
+                "0": 22.29,
+                "1": 75.04,
+                "2": 93.82,
+                "3": 93.34,
+                "4": 93.38,
+                "5": 93.58,
+                "6": 94.01,
+                "7": 93.97,
+                "8": 94.32
             },
-            "expected_e2e_ms": 1461.08,
-            "expected_avg_denoise_ms": 89.36,
-            "expected_median_denoise_ms": 99.67
+            "expected_e2e_ms": 1192.92,
+            "expected_avg_denoise_ms": 83.75,
+            "expected_median_denoise_ms": 93.58
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
@@ -595,31 +595,6 @@
             "expected_e2e_ms": 1464.87,
             "expected_avg_denoise_ms": 144.49,
             "expected_median_denoise_ms": 156.16
-        },
-        "zimage_image_t2i_warmup": {
-            "stages_ms": {
-                "InputValidationStage": 0.02,
-                "TextEncodingStage": 456.16,
-                "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 0.98,
-                "LatentPreparationStage": 0.06,
-                "DenoisingStage": 889.42,
-                "DecodingStage": 37.81
-            },
-            "denoise_step_ms": {
-                "0": 16.49,
-                "1": 94.63,
-                "2": 109.65,
-                "3": 110.05,
-                "4": 109.39,
-                "5": 110.58,
-                "6": 109.52,
-                "7": 110.54,
-                "8": 115.24
-            },
-            "expected_e2e_ms": 1184.45,
-            "expected_avg_denoise_ms": 98.46,
-            "expected_median_denoise_ms": 109.65
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {

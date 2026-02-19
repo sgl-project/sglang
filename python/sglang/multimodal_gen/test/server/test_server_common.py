@@ -87,8 +87,8 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.warmup:
-        extra_args += f" --warmup"
+    # default warmup
+    extra_args += f" --warmup"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
