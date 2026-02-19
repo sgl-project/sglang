@@ -387,9 +387,7 @@ def _infer_slo_base_time_ms_from_warmups(
     for req, out in warmup_pairs:
         if not out.success or out.latency <= 0:
             logger.warning(
-                "Skipping warmup result: success=%s, latency=%.3f",
-                out.success,
-                out.latency,
+                f"Skipping warmup result: success={out.success}, latency={out.latency:.3f}"
             )
             continue
 
