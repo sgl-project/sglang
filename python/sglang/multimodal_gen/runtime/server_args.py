@@ -250,7 +250,7 @@ class ServerArgs:
     enable_teacache: bool = False
     enable_magcache: bool = False
     teacache_params: TeaCacheParams | WanTeaCacheParams = field(default_factory=TeaCacheParams)
-    magcache_params: MagCacheParams | WanMagCacheParams = field(default_factory=MagCacheParams)
+    magcache_params: MagCacheParams | WanMagCacheParams = field(default_factory=WanMagCacheParams) # todo: make MagCacheParams and automatically turn into WanMagCacheParams when needed
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -396,7 +396,9 @@ class ServerArgs:
     def _adjust_cache_params(self):
         """Deserialize --teacache-params / --magcache-params JSON dicts into dataclass instances."""
         if isinstance(self.teacache_params, dict):
+            ic(type(self.teacache_params))
             self.teacache_params = WanTeaCacheParams(**self.teacache_params) # if self.pipeline_config.prefix == "wan" else TeaCacheParams(**self.teacache_params)
+            ic(type(self.teacache_params))
         if isinstance(self.magcache_params, dict):
             self.magcache_params = WanMagCacheParams(**self.magcache_params) # if self.pipeline_config.prefix == "wan" else MagCacheParams(**self.magcache_params)
 
@@ -606,6 +608,7 @@ class ServerArgs:
         configure_logger(server_args=self)
 
         # 1. adjust parameters
+        ic('adjusting params')
         self._adjust_parameters()
 
         # 2. Validate parameters

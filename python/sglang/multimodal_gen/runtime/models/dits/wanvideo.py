@@ -1061,7 +1061,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             # Get Wan-specific params
             magcache_params = ctx.magcache_params
-            ic(magcache_params, type(magcache_params))
             assert isinstance(
                 magcache_params, WanMagCacheParams
             ), "magcache_params is not a WanMagCacheParams"
@@ -1074,22 +1073,17 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 ret_steps = ret_steps // 2
                 cutoff_steps = cutoff_steps // 2
 
-            self.is_cfg_negative = ctx.is_cfg_negative
+            # self.is_cfg_negative = ctx.is_cfg_negative
 
             # Boundary detection
             is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
 
-            ic(ret_steps, cutoff_steps, ctx.do_cfg, is_boundary_step)
-
             # Need previous residual to make decision
             prev_residual = (
                 self.previous_residual_negative
-                if self.is_cfg_negative
+                if ctx.is_cfg_negative
                 else self.previous_residual
             )
-            if prev_residual is None:
-                ic('no previous residual, computing')
-                return False  # No cache yet, compute
 
             # Use previous residual norm to decide
             should_calc = self._compute_magcache_decision(
@@ -1100,6 +1094,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 max_skip_steps=ctx.max_skip_steps,
                 retention_steps=ctx.retention_steps,
                 is_boundary_step=is_boundary_step,
+                do_cfg=ctx.do_cfg,
+                is_cfg_negative=self.is_cfg_negative,
             )
             ic(should_calc)
 

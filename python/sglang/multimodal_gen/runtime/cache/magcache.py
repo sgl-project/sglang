@@ -92,13 +92,7 @@ class MagCacheMixin:
     config: DiTConfig
 
     def _init_magcache_state(self) -> None:
-        """
-        Initialize MagCache state.
-
-        Checks if shared state is already initialized by TeaCacheMixin.
-        If not, initializes shared state, then adds MagCache-specific state.
-        """
-        # Initialize shared state if not present (TeaCache might have already done this)
+        """Initialize MagCache state."""
         if not hasattr(self, "previous_residual"):
             self.previous_residual: torch.Tensor | None = None
             self.cnt = 0
@@ -146,12 +140,19 @@ class MagCacheMixin:
         max_skip_steps: int,
         retention_steps: int,
         is_boundary_step: bool,
+        do_cfg: bool,
+        is_cfg_negative: bool,
     ) -> bool:
         """
         Compute cache decision for MagCache.
         """
 
+        # if MagCache is not enabled, always compute
         if not self.enable_magcache:
+            return True
+
+        # must have previous residual to make decision
+        if residual is None:
             return True
 
         if is_boundary_step:
@@ -182,11 +183,10 @@ class MagCacheMixin:
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
-
         branch_offset = 1 if self.is_cfg_negative else 0
         idx = current_timestep * 2 + branch_offset
 
-        # must compute if out of bounds (should not happen if mag_ratios is properly calibrated/interpolated)
+        # must compute if out of bounds (should not happen if mag_ratios is properly interpolated)
         if idx >= len(mag_ratios):
             return True
 
