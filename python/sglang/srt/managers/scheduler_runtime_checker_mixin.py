@@ -110,9 +110,21 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size,
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
+
+        # Slots held by waiting requests are legitimately allocated via COW during
+        # init_next_round_input, but not yet associated with any cache node. They
+        # must not be counted as leaked; they will be reused on the next scheduling
+        # round without re-copying from the radix cache (preserving numerical
+        # determinism for mamba models).
+        waiting_mamba_slots = set()
+        for req in self.waiting_queue:
+            if req.mamba_pool_idx is not None:
+                waiting_mamba_slots.add(int(req.mamba_pool_idx))
+
         memory_leak = (
             full_num_used != self.tree_cache.full_protected_size()
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+            or mamba_num_used
+            != self.tree_cache.mamba_protected_size() + len(waiting_mamba_slots)
         )
         if memory_leak:
             free_full_pages = set(
@@ -134,7 +146,10 @@ class SchedulerRuntimeCheckerMixin:
             )
             expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
             leaked_mamba_pages = (
-                expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+                expected_mamba_pages
+                - free_mamba_pages
+                - cached_mamba_pages
+                - waiting_mamba_slots
             )
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
