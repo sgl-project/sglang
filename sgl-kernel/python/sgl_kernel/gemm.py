@@ -70,7 +70,29 @@ def bmm_fp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    backend: str = "sgl_kernel",
 ) -> torch.Tensor:
+    """Batched matrix multiplication for FP8 tensors.
+
+    Args:
+        A: Input tensor of shape (batch, M, K), FP8 dtype.
+        B: Input tensor of shape (batch, K, N), FP8 dtype.
+        A_scale: Scale for A (scalar or per-tensor float32).
+        B_scale: Scale for B (scalar or per-tensor float32).
+        dtype: Output dtype (torch.bfloat16 or torch.float16).
+        out: Optional pre-allocated output tensor of shape (batch, M, N).
+        backend: ``"sgl_kernel"`` (AOT cuBLASLt, default) or
+                 ``"flashinfer"`` (JIT, supports multiple sub-backends).
+
+    Returns:
+        Output tensor of shape (batch, M, N) with the requested *dtype*.
+    """
+    if backend == "flashinfer":
+        import flashinfer
+
+        return flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, out=out)
+
+    # Default: sgl_kernel AOT cuBLASLt path
     if out is None:
         out = torch.empty(
             (A.shape[0], A.shape[1], B.shape[2]),
