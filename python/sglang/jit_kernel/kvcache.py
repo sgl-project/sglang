@@ -7,13 +7,19 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    hip_ensure_tvm_ffi_stream,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
+    to_tvm_tensor_cached,
 )
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+_is_hip = is_hip_runtime()
 
 
 @cache_once
@@ -74,6 +80,19 @@ def store_cache(
             num_split = 2
         else:
             num_split = 1
+    if _is_hip:
+        # HIP-only fast path: avoid per-call Python stream context-manager overhead.
+        hip_ensure_tvm_ffi_stream(k)
+        module.store_cache(
+            to_tvm_tensor_cached(k),
+            to_tvm_tensor_cached(v),
+            to_tvm_tensor_cached(k_cache),
+            to_tvm_tensor_cached(v_cache),
+            to_tvm_tensor_cached(indices),
+            num_split,
+        )
+        return
+
     module.store_cache(
         k,
         v,

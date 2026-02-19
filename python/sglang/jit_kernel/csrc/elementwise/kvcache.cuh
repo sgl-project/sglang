@@ -10,6 +10,12 @@
 
 #include <cstdint>
 
+#ifdef USE_ROCM
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+#endif
+
 namespace {
 
 struct StoreKVCacheParams {
@@ -149,7 +155,7 @@ struct StoreKVCacheKernel {
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     auto indice_dtype = SymbolicDType{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLCUDA, kDLROCM>();
 
     TensorMatcher({B, D})  //
         .with_strides({KS, 1})
