@@ -186,10 +186,13 @@ class _Dumper:
         self._http_server_handled = True
 
         http_port = self._config.server_port_parsed
-        zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
+        if http_port is None:
+            return
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
-            self, base_port=zmq_base_port, timeout_seconds=self._config.collective_timeout
+            self,
+            base_port=get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800),
+            timeout_seconds=self._config.collective_timeout,
         )
 
         if _get_rank() == 0:
