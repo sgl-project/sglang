@@ -986,6 +986,62 @@ class TestHookDumper:
         assert "model" in captured
         assert torch.allclose(captured["model"]["value"], output)
 
+    def test_skips_intermediate_containers(self, tmp_path):
+        class Attention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv_proj = torch.nn.Linear(4, 12)
+                self.o_proj = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                _qkv = self.qkv_proj(x)
+                return self.o_proj(x)
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.mlp = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                x = self.self_attn(x)
+                return self.mlp(x)
+
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer()])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path)
+        model = OuterModel()
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "model.layers.0.self_attn.qkv_proj" in captured
+        assert "model.layers.0.self_attn.o_proj" in captured
+        assert "model.layers.0.mlp" in captured
+        assert "model" in captured
+
+        assert "model.layers.0.self_attn" not in captured
+        assert "model.layers.0" not in captured
+        assert "model.layers" not in captured
+
     def test_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
             def forward(self, x):
