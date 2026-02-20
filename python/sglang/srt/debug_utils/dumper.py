@@ -63,7 +63,6 @@ class _Dumper:
     ):
         # Config
         self._enable = enable
-        # TODO (1) support filtering kv instead of name only (2) allow HTTP req change it
         self._filter = filter
         self._base_dir = base_dir
         self._enable_output_file = enable_output_file
@@ -216,8 +215,11 @@ class _Dumper:
 
         if not (self._enable and (self._override_enable is not False)):
             return
-        if (f := self._filter) is not None and re.search(f, name) is None:
+
+        tags = dict(name=name, **extra_kwargs, **self._global_ctx)
+        if (f := self._filter) is not None and re.search(f, _format_tags(tags)) is None:
             return
+
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
 
@@ -229,9 +231,8 @@ class _Dumper:
         if enable_value:
             self._dump_single(
                 tag=value_tag,
-                name=name,
+                tags=tags,
                 value=value,
-                extra_kwargs=extra_kwargs,
                 save=save,
             )
 
@@ -242,9 +243,8 @@ class _Dumper:
         ):
             self._dump_single(
                 tag=grad_tag,
-                name=f"grad__{name}",
+                tags={**tags, "name": f"grad__{name}"},
                 value=g,
-                extra_kwargs=extra_kwargs,
                 save=save,
             )
 
@@ -252,12 +252,17 @@ class _Dumper:
             self._register_dump_grad_hook(
                 name=name,
                 tensor=value,
+                extra_kwargs=extra_kwargs,
                 save=save,
-                **extra_kwargs,
             )
 
     def _register_dump_grad_hook(
-        self, *, name: str, tensor, save: bool, **kwargs
+        self,
+        *,
+        name: str,
+        tensor,
+        extra_kwargs: dict,
+        save: bool,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
@@ -265,14 +270,13 @@ class _Dumper:
             return
 
         captured_forward_pass_id = self._forward_pass_id
-        captured_extra = deepcopy(dict(**kwargs))
+        captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
             self._dump_single(
                 tag="Dumper.Grad",
-                name=f"grad__{name}",
+                tags=captured_tags,
                 value=grad,
-                extra_kwargs=captured_extra,
                 save=save,
                 forward_pass_id=captured_forward_pass_id,
             )
@@ -283,9 +287,8 @@ class _Dumper:
         self,
         *,
         tag: str,
-        name: str,
+        tags: dict,
         value,
-        extra_kwargs: dict,
         save: bool,
         forward_pass_id: Optional[int] = None,
     ) -> None:
@@ -300,12 +303,10 @@ class _Dumper:
                 else self._forward_pass_id
             ),
             rank=rank,
-            name=name,
             dump_index=self._dump_index,
-            **extra_kwargs,
-            **self._global_ctx,
+            **tags,
         )
-        full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
+        full_filename = _format_tags(full_kwargs) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
         if self._enable_output_console:
@@ -328,7 +329,7 @@ class _Dumper:
 
             if capturing:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
-                self._captured_output_data[name] = output_data
+                self._captured_output_data[tags["name"]] = output_data
             else:
                 if self._pending_cleanup:
                     self._pending_cleanup = False
@@ -439,6 +440,10 @@ def _materialize_value(value):
     if callable(value):
         value = value()
     return value
+
+
+def _format_tags(kwargs: dict) -> str:
+    return "___".join(f"{k}={v}" for k, v in kwargs.items())
 
 
 def _deepcopy_or_clone(x):
