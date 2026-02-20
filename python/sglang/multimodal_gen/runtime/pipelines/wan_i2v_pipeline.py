@@ -40,7 +40,7 @@ class WanImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_standard_ti2v_stages(prompt_stage_name=None)
+        self.add_standard_ti2v_stages()
 
 
 EntryClass = WanImageToVideoPipeline

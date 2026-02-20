@@ -259,8 +259,8 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -369,12 +369,10 @@ class ComposedPipelineBase(ABC):
         self,
         condition: bool | Callable[[], bool],
         stage: PipelineStage,
-        stage_name: str | None = None,
     ) -> "ComposedPipelineBase":
-
         should_add = condition() if callable(condition) else condition
         if should_add:
-            self.add_stage(stage, stage_name)
+            self.add_stage(stage)
         return self
 
     def get_stage(self, stage_name: str) -> PipelineStage | None:
@@ -383,7 +381,6 @@ class ComposedPipelineBase(ABC):
 
     def add_standard_text_encoding_stage(
         self,
-        stage_name: str | None = None,
         text_encoder_key: str = "text_encoder",
         tokenizer_key: str = "tokenizer",
     ) -> "ComposedPipelineBase":
@@ -393,12 +390,10 @@ class ComposedPipelineBase(ABC):
                 text_encoders=[self.get_module(text_encoder_key)],
                 tokenizers=[self.get_module(tokenizer_key)],
             ),
-            stage_name,
         )
 
     def add_standard_timestep_preparation_stage(
         self,
-        stage_name: str | None = None,
         scheduler_key: str = "scheduler",
         prepare_extra_kwargs: list[Callable] | None = [],
     ) -> "ComposedPipelineBase":
@@ -408,12 +403,10 @@ class ComposedPipelineBase(ABC):
                 scheduler=self.get_module(scheduler_key),
                 prepare_extra_set_timesteps_kwargs=prepare_extra_kwargs,
             ),
-            stage_name,
         )
 
     def add_standard_latent_preparation_stage(
         self,
-        stage_name: str | None = None,
         scheduler_key: str = "scheduler",
         transformer_key: str = "transformer",
     ) -> "ComposedPipelineBase":
@@ -422,12 +415,10 @@ class ComposedPipelineBase(ABC):
                 scheduler=self.get_module(scheduler_key),
                 transformer=self.get_module(transformer_key),
             ),
-            stage_name,
         )
 
     def add_standard_denoising_stage(
         self,
-        stage_name: str | None = None,
         transformer_key: str = "transformer",
         transformer_2_key: str | None = "transformer_2",
         scheduler_key: str = "scheduler",
@@ -450,17 +441,15 @@ class ComposedPipelineBase(ABC):
                 kwargs["vae"] = vae
                 kwargs["pipeline"] = self
 
-        return self.add_stage(DenoisingStage(**kwargs), stage_name)
+        return self.add_stage(DenoisingStage(**kwargs))
 
     def add_standard_decoding_stage(
         self,
-        stage_name: str | None = None,
         vae_key: str = "vae",
     ) -> "ComposedPipelineBase":
 
         return self.add_stage(
             DecodingStage(vae=self.get_module(vae_key), pipeline=self),
-            stage_name,
         )
 
     def add_standard_t2i_stages(
@@ -538,12 +527,10 @@ class ComposedPipelineBase(ABC):
         *,
         include_input_validation: bool = True,
         vae_image_processor: Any | None = None,
-        prompt_stage_name: str | None = "prompt_encoding_stage_primary",
         text_encoder_key: str = "text_encoder",
         tokenizer_key: str = "tokenizer",
         image_encoder_key: str = "image_encoder",
         image_processor_key: str = "image_processor",
-        image_encoding_stage_name: str | None = None,
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         image_vae_encoding_position: Literal[
@@ -551,7 +538,6 @@ class ComposedPipelineBase(ABC):
         ] = "before_timestep",
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
-        denoising_stage_name: str | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -559,7 +545,6 @@ class ComposedPipelineBase(ABC):
             )
 
         self.add_standard_text_encoding_stage(
-            stage_name=prompt_stage_name,
             text_encoder_key=text_encoder_key,
             tokenizer_key=tokenizer_key,
         )
@@ -572,7 +557,6 @@ class ComposedPipelineBase(ABC):
                 image_encoder=image_encoder,
                 image_processor=image_processor,
             ),
-            stage_name=image_encoding_stage_name,
         )
 
         if image_vae_encoding_position == "before_timestep":
@@ -600,9 +584,9 @@ class ComposedPipelineBase(ABC):
             )
 
         if denoising_stage_factory is None:
-            self.add_standard_denoising_stage(stage_name=denoising_stage_name)
+            self.add_standard_denoising_stage()
         else:
-            self.add_stage(denoising_stage_factory(), denoising_stage_name)
+            self.add_stage(denoising_stage_factory())
 
         self.add_standard_decoding_stage()
         return self

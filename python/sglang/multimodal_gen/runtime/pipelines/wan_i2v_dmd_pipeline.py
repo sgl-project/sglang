@@ -42,7 +42,6 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_standard_ti2v_stages(
-            prompt_stage_name=None,
             image_vae_encoding_position="after_latent",
             denoising_stage_factory=lambda: DmdDenoisingStage(
                 transformer=self.get_module("transformer"),
