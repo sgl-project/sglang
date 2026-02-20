@@ -295,6 +295,9 @@ void verify_tree_greedy(
   uint32_t num_spec_step = static_cast<uint32_t>(accept_index.size(1));
 
   RuntimeCheck(predicts.ndim() == 1, "predicts must be 1D");
+  RuntimeCheck(
+      static_cast<uint32_t>(predicts.size(0)) == batch_size * num_draft_tokens,
+      "predicts size must equal batch_size * num_draft_tokens");
   RuntimeCheck(predicts.dtype().code == kDLInt && predicts.dtype().bits == 32, "predicts must be int32");
   RuntimeCheck(predicts.is_contiguous(), "predicts must be contiguous");
 
