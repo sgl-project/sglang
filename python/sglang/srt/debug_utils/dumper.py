@@ -163,6 +163,8 @@ class _Dumper:
         self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
+    # ------------------------------- public core API ---------------------------------
+
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
 
@@ -179,40 +181,6 @@ class _Dumper:
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
         )
 
-    # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
-    def _ensure_http_server(self):
-        if self._http_server_handled:
-            return
-        self._http_server_handled = True
-
-        http_port = self._config.server_port_parsed
-        if http_port is None:
-            return
-
-        rpc_broadcast = _create_zmq_rpc_broadcast(
-            self,
-            base_port=get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800),
-            timeout_seconds=self._config.collective_timeout,
-        )
-
-        if _get_rank() == 0:
-            assert rpc_broadcast is not None
-            self._rpc_broadcast = rpc_broadcast
-
-            if http_port == "reuse":
-                print(
-                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
-                )
-            else:
-                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
-                print(f"[Dumper] HTTP server started on port {http_port}")
-
-    def _ensure_partial_name(self):
-        if self._config.partial_name is None:
-            name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
-            self.configure(partial_name=name)
-            print(f"[Dumper] Choose partial_name={name}")
-
     def set_ctx(self, **kwargs):
         """
         Example:
@@ -225,54 +193,6 @@ class _Dumper:
         self._global_ctx = {
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
-
-    def reset(self) -> None:
-        self._dump_index = 0
-        self._forward_pass_id = 0
-        self._global_ctx = {}
-
-    @contextmanager
-    def capture_output(self):
-        assert self._captured_output_data is None
-        self._captured_output_data = {}
-        try:
-            yield self._captured_output_data
-        finally:
-            self._captured_output_data = None
-
-    def get_state(self) -> dict:
-        return {
-            "config": asdict(self._config),
-            "dump_index": self._dump_index,
-            "forward_pass_id": self._forward_pass_id,
-        }
-
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
-
-    def _handle_http_control_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self.get_state()
-        elif method == "configure":
-            self.configure(**body)
-            return {}
-        elif method == "reset":
-            self.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
-
-    def configure(self, **kwargs) -> None:
-        self._config = replace(self._config, **kwargs)
-
-    def configure_default(self, **kwargs) -> None:
-        self._config = self._config.with_defaults(**kwargs)
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
         data = _obj_to_dict(data)
@@ -311,6 +231,58 @@ class _Dumper:
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
             )
+
+    # ------------------------------- public secondary API ---------------------------------
+
+    def configure(self, **kwargs) -> None:
+        self._config = replace(self._config, **kwargs)
+
+    def configure_default(self, **kwargs) -> None:
+        self._config = self._config.with_defaults(**kwargs)
+
+    def reset(self) -> None:
+        self._dump_index = 0
+        self._forward_pass_id = 0
+        self._global_ctx = {}
+
+    @contextmanager
+    def capture_output(self):
+        assert self._captured_output_data is None
+        self._captured_output_data = {}
+        try:
+            yield self._captured_output_data
+        finally:
+            self._captured_output_data = None
+
+    def get_state(self) -> dict:
+        return {
+            "config": asdict(self._config),
+            "dump_index": self._dump_index,
+            "forward_pass_id": self._forward_pass_id,
+        }
+
+    # ------------------------------- private ---------------------------------
+
+    def _handle_http_control_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
+
+    def _handle_http_control_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self.get_state()
+        elif method == "configure":
+            self.configure(**body)
+            return {}
+        elif method == "reset":
+            self.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     def _dump_inner(
         self,
@@ -461,6 +433,40 @@ class _Dumper:
     @cached_property
     def _static_meta(self) -> dict:
         return _compute_static_meta()
+
+    # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
+    def _ensure_http_server(self):
+        if self._http_server_handled:
+            return
+        self._http_server_handled = True
+
+        http_port = self._config.server_port_parsed
+        if http_port is None:
+            return
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            self,
+            base_port=get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800),
+            timeout_seconds=self._config.collective_timeout,
+        )
+
+        if _get_rank() == 0:
+            assert rpc_broadcast is not None
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port == "reuse":
+                print(
+                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
+                )
+            else:
+                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
+                print(f"[Dumper] HTTP server started on port {http_port}")
+
+    def _ensure_partial_name(self):
+        if self._config.partial_name is None:
+            name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
+            self.configure(partial_name=name)
+            print(f"[Dumper] Choose partial_name={name}")
 
 
 def _torch_save(value, path: str):
