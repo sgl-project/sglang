@@ -50,6 +50,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
@@ -1054,8 +1055,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
                 self.pp_rank,
             )
-
-        from sglang.srt.debug_utils.dumper import dumper
 
         if dumper.may_enable:
             dumper.register_non_intrusive_dumper(self.model)
@@ -2438,8 +2437,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
-
-        from sglang.srt.debug_utils.dumper import dumper
 
         if dumper.may_enable:
             dumper.step()
