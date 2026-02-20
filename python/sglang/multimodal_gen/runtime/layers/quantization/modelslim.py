@@ -16,13 +16,15 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 
 from types import MappingProxyType
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimW4A4Int4,
+    ModelSlimW8A8Int8,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
-        ModelSlimW4A4Int4,
-        ModelSlimW8A8Int8,
     )
 
 logger = logging.getLogger(__name__)
