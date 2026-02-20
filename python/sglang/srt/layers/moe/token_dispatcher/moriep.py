@@ -147,6 +147,8 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     )
 
     return {
+        # TODO(billishyahao): need to tune different configs for intra node async
+        # Also could be tuned for different AMD platform
         EpMode.INTRA_NODE: EpDispatchConfig(
             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
             warp_num_per_block=16,
@@ -159,7 +161,6 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
             block_num=64,
             rdma_block_num=32,
         ),
-        # TODO(billishyahao): need to tune different configs for intra node async
         EpMode.LOW_LATENCY: EpDispatchConfig(
             kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL,
             warp_num_per_block=8,
@@ -241,7 +242,7 @@ class CommStreamPool:
         return (torch.cuda.current_device(), id(group))
 
     @classmethod
-    def getStreamFromPool(cls, group) -> torch.cuda.Stream:
+    def get_stream_from_pool(cls, group) -> torch.cuda.Stream:
         key = cls._make_key(group)
         stream = cls._streams.get(key)
         if stream is None:
@@ -346,7 +347,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
-            self._comm_stream = CommStreamPool.getStreamFromPool(self.group)
+            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"
