@@ -18,26 +18,6 @@ import torch.distributed as dist
 # -------------------------------------- dumper core ------------------------------------------
 
 
-_ENV_PREFIX = "SGLANG_DUMPER_"
-
-
-def _env_name(field_name: str) -> str:
-    return f"{_ENV_PREFIX}{field_name.upper()}"
-
-
-def _parse_env_field(env_name: str, default):
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default
-    if isinstance(default, bool):
-        return raw.lower() in ("true", "1")
-    if isinstance(default, int):
-        return int(raw)
-    if isinstance(default, Path):
-        return Path(raw)
-    return raw
-
-
 @dataclass(frozen=True)
 class _DumperConfig:
     enable: bool = False
@@ -68,6 +48,26 @@ class _DumperConfig:
             if os.getenv(_env_name(key)) is None
         }
         return replace(self, **actual) if actual else self
+
+
+_ENV_PREFIX = "SGLANG_DUMPER_"
+
+
+def _env_name(field_name: str) -> str:
+    return f"{_ENV_PREFIX}{field_name.upper()}"
+
+
+def _parse_env_field(env_name: str, default):
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    if isinstance(default, bool):
+        return raw.lower() in ("true", "1")
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, Path):
+        return Path(raw)
+    return raw
 
 
 class _Dumper:
