@@ -187,6 +187,11 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
+    def reset(self) -> None:
+        self._dump_index = 0
+        self._forward_pass_id = 0
+        self._global_ctx = {}
+
     @contextmanager
     def capture_output(self):
         assert self._captured_output_data is None

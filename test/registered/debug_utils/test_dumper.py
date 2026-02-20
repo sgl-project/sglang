@@ -817,5 +817,31 @@ class TestCleanup:
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
 
+class TestReset:
+    def test_reset_clears_state(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.set_ctx(layer_id=1)
+        d.dump("before_reset", torch.randn(3, 3))
+
+        d.reset()
+
+        assert d._dump_index == 0
+        assert d._forward_pass_id == 0
+        assert d._global_ctx == {}
+
+    def test_dump_works_after_reset(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.dump("pre", torch.randn(3, 3))
+
+        d.reset()
+        d.on_forward_pass_start()
+        d.dump("post", torch.randn(3, 3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["pre", "post"])
+        post_file = _find_dump_file(tmp_path, name="post")
+        assert "dump_index=1" in post_file.name
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
