@@ -981,10 +981,14 @@ class TestHookDumper:
         with d.capture_output() as captured:
             output = model(x)
 
-        assert "model.linear.output" in captured
-        assert "model.relu.output" in captured
-        assert "output" in captured
-        assert torch.allclose(captured["output"]["value"], output)
+        assert "hook__model.linear.output" in captured
+        assert "hook__model.relu.output" in captured
+        assert "hook__output" in captured
+        assert torch.allclose(captured["hook__output"]["value"], output)
+
+        assert "hook__model.linear.inputs.0" in captured
+        assert "hook__model.relu.inputs.0" in captured
+        assert "hook__inputs.0" in captured
 
     def test_skips_intermediate_containers(self, tmp_path):
         class Attention(torch.nn.Module):
@@ -1033,15 +1037,16 @@ class TestHookDumper:
         with d.capture_output() as captured:
             model(x)
 
-        assert "model.layers.0.self_attn.qkv_proj.output" in captured
-        assert "model.layers.0.self_attn.o_proj.output" in captured
-        assert "model.layers.0.mlp.output" in captured
-        assert "output" in captured
+        P = "hook__"
+        assert f"{P}model.layers.0.self_attn.qkv_proj.output" in captured
+        assert f"{P}model.layers.0.self_attn.o_proj.output" in captured
+        assert f"{P}model.layers.0.mlp.output" in captured
+        assert f"{P}output" in captured
 
-        assert not any(k.startswith("model.layers.0.self_attn.output") for k in captured)
-        assert not any(k.startswith("model.layers.0.output") for k in captured)
-        assert not any(k.startswith("model.layers.output") for k in captured)
-        assert not any(k.startswith("model.output") for k in captured)
+        assert not any(k == f"{P}model.layers.0.self_attn.output" for k in captured)
+        assert not any(k == f"{P}model.layers.0.output" for k in captured)
+        assert not any(k == f"{P}model.layers.output" for k in captured)
+        assert not any(k == f"{P}model.output" for k in captured)
 
     def test_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
@@ -1074,7 +1079,7 @@ class TestHookDumper:
         with d.capture_output() as captured:
             model(x)
 
-        assert "model.split.output.0" in captured or "model.split.output" in captured
+        assert "hook__model.split.output.0" in captured or "hook__model.split.output" in captured
 
     def test_respects_dumper_filter(self, tmp_path):
         class InnerModel(torch.nn.Module):
@@ -1094,7 +1099,7 @@ class TestHookDumper:
             def forward(self, x):
                 return self.model(x)
 
-        d = _make_test_dumper(tmp_path, filter="name=model.linear.output")
+        d = _make_test_dumper(tmp_path, filter="name=hook__model.linear.output")
         model = OuterModel()
         d.register_model_forward_hook(model)
 
@@ -1102,8 +1107,8 @@ class TestHookDumper:
         with d.capture_output() as captured:
             model(x)
 
-        assert "model.linear.output" in captured
-        assert "model.relu.output" not in captured
+        assert "hook__model.linear.output" in captured
+        assert "hook__model.relu.output" not in captured
 
     def test_disabled_dumper_no_output(self, tmp_path):
         class InnerModel(torch.nn.Module):

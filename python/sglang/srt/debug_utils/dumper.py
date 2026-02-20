@@ -477,6 +477,8 @@ class _Dumper:
 class _HookDumper:
     """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
 
+    _NAME_PREFIX = "hook__"
+
     def __init__(
         self,
         dumper: _Dumper,
@@ -490,14 +492,13 @@ class _HookDumper:
 
             if is_leaf or is_root:
                 module.register_forward_hook(
-                    self._make_forward_hook(name=name, is_root=is_root)
+                    self._make_forward_hook(name=name)
                 )
 
-    def _make_forward_hook(self, name: str, is_root: bool):
+    def _make_forward_hook(self, name: str):
         def _hook(_module, _input, output):
-            if is_root:
-                for item in _input:
-                    self._dump_converted(name, item, role="inputs")
+            for item in _input:
+                self._dump_converted(name, item, role="inputs")
 
             if output is not None:
                 self._dump_converted(name, output, role="output")
@@ -507,7 +508,7 @@ class _HookDumper:
     def _dump_converted(self, name: str, value, role: str) -> None:
         for key, tensor in self._convert_hook_output(value).items():
             parts = [p for p in (name, role, key) if p]
-            self._dumper.dump(".".join(parts), tensor)
+            self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
     @staticmethod
     def _convert_hook_output(value) -> dict[str, torch.Tensor]:
