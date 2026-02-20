@@ -1527,16 +1527,18 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
 
 
 class TestDumperE2E:
-    """End-to-end test: real sglang server (tp=2) with dumper integration."""
+    """End-to-end test: real sglang server (tp=2) with dumper integration.
+
+    Server starts with dumper disabled; we enable it via HTTP, send inference,
+    then verify step counter and dump files.
+    """
 
     def test_step_and_non_intrusive_hooks(self, tmp_path):
         base_url = DEFAULT_URL_FOR_TEST
         dump_dir = str(tmp_path)
         env = {
             **os.environ,
-            "DUMPER_ENABLE": "1",
             "DUMPER_SERVER_PORT": "reuse",
-            "DUMPER_DIR": dump_dir,
             "DUMPER_NON_INTRUSIVE_MODE": "core",
         }
         proc = popen_launch_server(
@@ -1547,6 +1549,15 @@ class TestDumperE2E:
             env=env,
         )
         try:
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            for state in states:
+                assert state["config"]["enable"] is False
+
+            requests.post(
+                f"{base_url}/dumper/configure",
+                json={"enable": True, "dir": dump_dir},
+            ).raise_for_status()
+
             resp = requests.post(
                 f"{base_url}/generate",
                 json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
