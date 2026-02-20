@@ -35,17 +35,7 @@ class _DumperConfig:
     collective_timeout: int = 60
 
     def __post_init__(self):
-        hints = get_type_hints(type(self))
-        for f in fields(self):
-            value = getattr(self, f.name)
-            if value is None:
-                continue
-            expected = _unwrap_type(hints[f.name])
-            if not isinstance(value, expected):
-                raise TypeError(
-                    f"_DumperConfig.{f.name}: expected {expected.__name__}, "
-                    f"got {type(value).__name__}"
-                )
+        _verify_dataclass_types(self)
 
     @classmethod
     def from_env(cls) -> "_DumperConfig":
@@ -61,6 +51,21 @@ class _DumperConfig:
             if os.getenv(_env_name(key)) is None
         }
         return replace(self, **actual) if actual else self
+
+
+def _verify_dataclass_types(instance) -> None:
+    hints = get_type_hints(type(instance))
+    cls_name = type(instance).__name__
+    for f in fields(instance):
+        value = getattr(instance, f.name)
+        if value is None:
+            continue
+        expected = _unwrap_type(hints[f.name])
+        if not isinstance(value, expected):
+            raise TypeError(
+                f"{cls_name}.{f.name}: expected {expected.__name__}, "
+                f"got {type(value).__name__}"
+            )
 
 
 def _unwrap_type(hint) -> type:
