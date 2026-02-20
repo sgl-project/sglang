@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Self, Union, get_args, get_type_hints
+from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
@@ -47,7 +47,7 @@ class _FrozenConfig(ABC):
         return f"{cls._env_prefix()}{field_name.upper()}"
 
     @classmethod
-    def from_env(cls) -> Self:
+    def from_env(cls) -> "_FrozenConfig":
         return cls(
             **{
                 f.name: cls._parse_env_field(cls._env_name(f.name), f.default)
@@ -55,7 +55,7 @@ class _FrozenConfig(ABC):
             }
         )
 
-    def with_defaults(self, **kwargs) -> Self:
+    def with_defaults(self, **kwargs) -> "_FrozenConfig":
         cls = type(self)
         actual = {
             key: value
