@@ -83,9 +83,7 @@ class GPUWorker:
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
         self.metrics_collector = (
-            get_diffusion_metrics_collector(server_args)
-            if server_args.enable_metrics and rank == 0
-            else None
+            get_diffusion_metrics_collector(server_args) if rank == 0 else None
         )
 
         self.init_device_and_model()

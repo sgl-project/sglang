@@ -455,9 +455,7 @@ def get_diffusion_metrics_collector(
     if _diffusion_metrics_collector is not None:
         return _diffusion_metrics_collector
 
-    if server_args is not None and not server_args.enable_metrics:
-        return None
-    if server_args is None:
+    if server_args is None or not server_args.enable_metrics:
         return None
 
     with _diffusion_metrics_collector_lock:

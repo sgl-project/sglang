@@ -117,9 +117,7 @@ class Scheduler:
         self.prepare_server_warmup_reqs()
 
         self.metrics_collector = (
-            get_diffusion_metrics_collector(server_args)
-            if server_args.enable_metrics and gpu_id == 0
-            else None
+            get_diffusion_metrics_collector(server_args) if gpu_id == 0 else None
         )
         if self.metrics_collector is not None:
             self.metrics_collector.set_queue_depth(self._generation_waiting_count)
