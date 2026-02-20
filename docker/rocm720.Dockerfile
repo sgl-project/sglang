@@ -106,7 +106,7 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution
-RUN cd /opt/rocm/share/amd_smi && python3 -m pip install .
+RUN cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .
 
 WORKDIR /sgl-workspace
 
