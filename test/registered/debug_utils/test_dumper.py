@@ -1527,19 +1527,12 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
 
 
 class TestDumperE2E:
-    """End-to-end test: real sglang server (tp=2) with dumper integration.
-
-    Server starts with dumper disabled; we enable it via HTTP, send inference,
-    then verify step counter and dump files.
-    """
-
     def test_step_and_non_intrusive_hooks(self, tmp_path):
         base_url = DEFAULT_URL_FOR_TEST
         dump_dir = str(tmp_path)
         env = {
             **os.environ,
             "DUMPER_SERVER_PORT": "reuse",
-            "DUMPER_NON_INTRUSIVE_MODE": "core",
         }
         proc = popen_launch_server(
             "Qwen/Qwen3-0.6B",
