@@ -59,7 +59,7 @@ python3 -m sglang.launch_server \
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.
 
 ```{note}
-Currently, only per-tensor (scalar) scaling factors are supported.
+Currently, only per-tensor (scalar) scaling factors are supported, and each layer must provide two scalars: `k_scale` and `v_scale`. If they are the same, you still need to provide both values (e.g., `[x, x]`).
 ```
 
 Scaling factors can be:
@@ -75,8 +75,8 @@ The JSON file should follow this format:
     "dtype": "float8_e4m3fn",
     "scaling_factor": {
       "0": {
-        "0": 1.0,
-        "1": 1.0
+        "0": [1.0, 1.0],
+        "1": [1.0, 1.0]
       }
     }
   }
