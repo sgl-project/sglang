@@ -35,6 +35,7 @@ SUITES = {
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
+        "../cli/test_generate_t2i_backend_diffusers.py",
         # unit tests (no server needed)
         "../test_sampling_params_validate.py",
         "test_update_weights_from_disk.py",
