@@ -144,6 +144,106 @@ def test_linear_chain_no_siblings():
 
 
 # ---------------------------------------------------------------------------
+# Known-answer: branching tree
+#
+# Tree structure (draft_token_num=5, bs=1):
+#
+#         0  (root, depth 0)
+#        / \
+#       1   2  (depth 1, siblings: next_sibling[1]=2)
+#      / \
+#     3   4  (depth 2, siblings: next_sibling[3]=4, children of 1)
+#
+# Ancestor sets:
+#   token 0: {}
+#   token 1: {0}
+#   token 2: {0}
+#   token 3: {0, 1}
+#   token 4: {0, 1}
+#
+# Expected outputs (seq_len=3):
+#   positions:            [3, 4, 4, 5, 5]
+#   retrive_next_token:   [1, 3, -1, -1, -1]
+#   retrive_next_sibling: [-1, 2, -1, 4, -1]
+# ---------------------------------------------------------------------------
+
+
+def build_branching_tree_mask(device=DEVICE):
+    """
+    Build tree_mask for the 5-token branching tree described above.
+    tree_mask[i*N + j] = True if token j is an ancestor of token i.
+    """
+    N = 5
+    mask = torch.zeros(N * N, dtype=torch.bool, device=device)
+    # token 1: ancestor 0
+    mask[1 * N + 0] = True
+    # token 2: ancestor 0
+    mask[2 * N + 0] = True
+    # token 3: ancestors 0, 1
+    mask[3 * N + 0] = True
+    mask[3 * N + 1] = True
+    # token 4: ancestors 0, 1
+    mask[4 * N + 0] = True
+    mask[4 * N + 1] = True
+    return mask
+
+
+def test_branching_tree_positions():
+    """positions reflect actual tree depth, not sequential order."""
+    from sglang.jit_kernel.ngram_utils import reconstruct_indices_from_tree_mask
+
+    bs, draft_token_num, seq_len = 1, 5, 3
+    inputs = make_inputs(bs, draft_token_num)
+    inputs["tree_mask"] = build_branching_tree_mask()
+    inputs["verified_seq_len"].fill_(seq_len)
+
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
+
+    expected_positions = [3, 4, 4, 5, 5]
+    for i, exp in enumerate(expected_positions):
+        got = inputs["positions"][i].item()
+        assert got == exp, f"positions[{i}]={got}, expected {exp}"
+
+
+def test_branching_tree_next_token():
+    """retrive_next_token points to the first child of each node."""
+    from sglang.jit_kernel.ngram_utils import reconstruct_indices_from_tree_mask
+
+    bs, draft_token_num = 1, 5
+    inputs = make_inputs(bs, draft_token_num)
+    inputs["tree_mask"] = build_branching_tree_mask()
+
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
+
+    expected_next = [1, 3, -1, -1, -1]
+    for i, exp in enumerate(expected_next):
+        got = inputs["retrive_next_token"][0, i].item()
+        assert got == exp, f"retrive_next_token[0,{i}]={got}, expected {exp}"
+
+
+def test_branching_tree_next_sibling():
+    """retrive_next_sibling links tokens that share the same parent."""
+    from sglang.jit_kernel.ngram_utils import reconstruct_indices_from_tree_mask
+
+    bs, draft_token_num = 1, 5
+    inputs = make_inputs(bs, draft_token_num)
+    inputs["tree_mask"] = build_branching_tree_mask()
+
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
+
+    expected_sibling = [-1, 2, -1, 4, -1]
+    for i, exp in enumerate(expected_sibling):
+        got = inputs["retrive_next_sibling"][0, i].item()
+        assert got == exp, f"retrive_next_sibling[0,{i}]={got}, expected {exp}"
+
+
+# ---------------------------------------------------------------------------
 # JIT vs AOT cross-validation
 # ---------------------------------------------------------------------------
 
