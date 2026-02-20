@@ -57,21 +57,21 @@ class TestDumperConfig:
         assert _DumperConfig.from_env() == _DumperConfig()
 
     def test_from_env_bool(self):
-        with temp_set_env(allow_sglang=True, DUMPER_ENABLE="1"):
+        with temp_set_env(DUMPER_ENABLE="1"):
             assert _DumperConfig.from_env().enable is True
-        with temp_set_env(allow_sglang=True, DUMPER_ENABLE="false"):
+        with temp_set_env(DUMPER_ENABLE="false"):
             assert _DumperConfig.from_env().enable is False
 
     def test_from_env_str(self):
-        with temp_set_env(allow_sglang=True, DUMPER_FILTER="layer_id=0"):
+        with temp_set_env(DUMPER_FILTER="layer_id=0"):
             assert _DumperConfig.from_env().filter == "layer_id=0"
 
     def test_from_env_dir(self):
-        with temp_set_env(allow_sglang=True, DUMPER_DIR="/my/dir"):
+        with temp_set_env(DUMPER_DIR="/my/dir"):
             assert _DumperConfig.from_env().dir == "/my/dir"
 
     def test_from_env_int(self):
-        with temp_set_env(allow_sglang=True, DUMPER_COLLECTIVE_TIMEOUT="120"):
+        with temp_set_env(DUMPER_COLLECTIVE_TIMEOUT="120"):
             assert _DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
@@ -92,7 +92,7 @@ class TestDumperConfig:
             _DumperConfig(filter=123)
 
     def test_configure_default_skips_when_env_set(self):
-        with temp_set_env(allow_sglang=True, DUMPER_FILTER="from_env"):
+        with temp_set_env(DUMPER_FILTER="from_env"):
             d = _Dumper(config=_DumperConfig.from_env())
             d.configure_default(filter="from_code")
             assert d._config.filter == "from_env"
@@ -195,7 +195,6 @@ class TestCollectiveTimeout:
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
@@ -230,7 +229,7 @@ class TestDumperDistributed:
         )
 
     def test_collective_timeout(self):
-        with temp_set_env(allow_sglang=True, DUMPER_ENABLE="1"):
+        with temp_set_env(DUMPER_ENABLE="1"):
             run_distributed_test(self._test_collective_timeout_func)
 
     @staticmethod
@@ -257,7 +256,6 @@ class TestDumperDistributed:
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
@@ -283,7 +281,6 @@ class TestDumperDistributed:
 class TestDumperFileWriteControl:
     def test_filter(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
             DUMPER_FILTER="name=keep",
@@ -307,7 +304,6 @@ class TestDumperFileWriteControl:
 
     def test_save_false(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
