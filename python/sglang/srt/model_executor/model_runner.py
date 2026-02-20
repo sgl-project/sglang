@@ -1055,6 +1055,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.pp_rank,
             )
 
+        from sglang.srt.debug_utils.dumper import dumper
+
+        if dumper.may_enable:
+            dumper.register_non_intrusive_dumper(self.model)
+
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
@@ -2433,6 +2438,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        from sglang.srt.debug_utils.dumper import dumper
+
+        if dumper.may_enable:
+            dumper.step()
 
         return output
 

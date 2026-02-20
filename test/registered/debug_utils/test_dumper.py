@@ -102,6 +102,21 @@ class TestDumperConfig:
         d.configure_default(filter="from_code")
         assert d._config.filter == "from_code"
 
+    def test_may_enable_default_false(self):
+        d = _Dumper(config=_DumperConfig())
+        assert d.may_enable is False
+
+    def test_may_enable_true_when_enabled(self):
+        d = _Dumper(config=_DumperConfig(enable=True))
+        assert d.may_enable is True
+
+    def test_may_enable_true_when_server_port_set(self):
+        d = _Dumper(config=_DumperConfig(server_port="40000"))
+        assert d.may_enable is True
+
+        d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
+        assert d2.may_enable is True
+
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):

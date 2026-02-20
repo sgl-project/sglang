@@ -167,6 +167,10 @@ class _Dumper:
 
     # ------------------------------- public :: core ---------------------------------
 
+    @property
+    def may_enable(self) -> bool:
+        return self._config.enable or self._config.server_port_parsed is not None
+
     def step(self):
         """This should be called on all ranks at the end of each iteration."""
 
