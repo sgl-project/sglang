@@ -129,9 +129,10 @@ class _Dumper:
 
     Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
-    2. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
-    3. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
-    4. `curl -X POST http://localhost:40000/dumper/reset`
+    2. sglang mode:  `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true}'`
+       standalone:   `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
+    3. `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:30000/dumper/reset`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -615,19 +616,24 @@ def _collect_megatron_parallel_info():
 def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
-    if http_port <= 0:
-        return
 
     rpc_broadcast = _create_zmq_rpc_broadcast(
         dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
     )
 
-    if _get_rank() == 0:
-        handler_class = _make_http_handler(prefix="/dumper/", target=rpc_broadcast)
-        server = HTTPServer(("0.0.0.0", http_port), handler_class)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        print(f"[Dumper] HTTP server started on port {http_port}")
+    if _get_rank() == 0 and rpc_broadcast is not None:
+        dumper._rpc_broadcast = rpc_broadcast
+
+        if http_port > 0:
+            handler_class = _make_http_handler(
+                prefix="/dumper/", target=rpc_broadcast
+            )
+            server = HTTPServer(("0.0.0.0", http_port), handler_class)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            print(f"[Dumper] HTTP server started on port {http_port}")
+        else:
+            print("[Dumper] Standalone HTTP server disabled")
 
 
 def _make_http_handler(*, prefix: str, target):

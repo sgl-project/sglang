@@ -99,6 +99,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DumperConfigureReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -616,6 +617,19 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+# example usage:
+# curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true}'
+# curl -X POST http://localhost:30000/dumper/reset
+@app.api_route("/dumper/{method}", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def dumper_control(method: str, request: Request):
+    body_bytes = await request.body()
+    body = await request.json() if body_bytes else {}
+    obj = DumperConfigureReqInput(kwargs={"_method": method, **body})
+    results = await _global_state.tokenizer_manager.dumper_configure(obj)
+    return {"success": all(r.success for r in results)}
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)

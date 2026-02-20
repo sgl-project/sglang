@@ -90,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperConfigureReqInput,
+    DumperConfigureReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1082,6 +1084,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (DumperConfigureReqInput, self.handle_dumper_configure),
             ]
         )
 
@@ -2959,6 +2962,22 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def handle_dumper_configure(self, recv_req: DumperConfigureReqInput):
+        if self.tp_rank == 0:
+            from sglang.srt.debug_utils.dumper import dumper
+
+            rpc_broadcast = getattr(dumper, "_rpc_broadcast", None)
+            kwargs = dict(recv_req.kwargs)
+            method = kwargs.pop("_method", "configure")
+            if rpc_broadcast is not None:
+                getattr(rpc_broadcast, method)(**kwargs)
+            else:
+                getattr(dumper, method)(**kwargs)
+
+        self.send_to_tokenizer.send_output(
+            DumperConfigureReqOutput(success=True), recv_req
+        )
 
     # placeholder for override
     def update_cache_from_scheduler(

@@ -879,6 +879,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
         signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
+    # Disable dumper's standalone HTTP server — sglang exposes /dumper/* via FastAPI
+    os.environ.setdefault("SGLANG_DUMPER_SERVER_PORT", "0")
+
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
