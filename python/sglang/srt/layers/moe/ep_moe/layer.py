@@ -615,9 +615,6 @@ class MoriEPMoE(DeepEPMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
-        # TODO(billishyahao): check aiter path
-        # billishyahao: for now, fused_moe only support torch.bfloat16
-        output_dtype = torch.bfloat16
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
         is_quark_w4a4 = hasattr(self, "scheme") and isinstance(
@@ -632,6 +629,7 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_recv_token_num,
             origin_topk_ids,
             origin_topk_weights,
+            output_dtype,
         ) = (
             dispatch_output.hidden_states,
             dispatch_output.hidden_states_scale,
@@ -640,6 +638,7 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_output.num_recv_tokens_per_expert,
             dispatch_output.origin_topk_ids,
             dispatch_output.origin_topk_weights,
+            dispatch_output.out_dtype,
         )
 
         w13_weight = self.w13_weight

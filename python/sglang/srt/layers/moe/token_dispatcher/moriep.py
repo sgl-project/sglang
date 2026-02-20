@@ -61,6 +61,7 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     num_recv_tokens_per_expert: List[int]
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
+    out_dtype: torch.dtype
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -77,6 +78,7 @@ class MoriEPLLDispatchOutput(NamedTuple):
     num_recv_tokens_per_expert: List[int]
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
+    out_dtype: torch.dtype
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -373,6 +375,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         previous_event,
     ):
         num_token = hidden_states.shape[0]
+        output_dtype = hidden_states.dtype
         scale = None
 
         fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
@@ -420,6 +423,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             num_recv_tokens_per_expert=packed_recv_count,
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
+            out_dtype=output_dtype,
         )
 
     def _dispatch_core(
@@ -578,6 +582,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         ), "mori asyncll mismatch"
 
         num_tokens = hidden_states.shape[0]
+        output_dtype = hidden_states.dtype
         scale = None
 
         fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
@@ -617,6 +622,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             packed_recv_count,
             topk_weights,
             topk_ids,
+            output_dtype,
         )
 
     def dispatch_b(
@@ -628,6 +634,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         packed_recv_count,
         topk_weights,
         topk_ids,
+        output_dtype,
     ):
 
         ##TODO(billishyahao): add assertion here to check async
@@ -648,6 +655,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             num_recv_tokens_per_expert=packed_recv_count,
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
+            out_dtype=output_dtype,
         )
 
     def _dispatch_core(
