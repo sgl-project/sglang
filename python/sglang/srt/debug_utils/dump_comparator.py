@@ -16,14 +16,14 @@ from sglang.srt.debug_utils.dumper import get_truncated_value
 def main(args):
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
-        (pl.col("forward_pass_id") >= args.start_id)
-        & (pl.col("forward_pass_id") <= args.end_id)
+        (pl.col("curr_step") >= args.start_id)
+        & (pl.col("curr_step") <= args.end_id)
     )
     if args.filter:
         df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
     assert all(
         c in df_target.columns
-        for c in ["rank", "forward_pass_id", "dump_index", "name"]
+        for c in ["rank", "curr_step", "dump_index", "name"]
     )
 
     df_baseline = read_meta(args.baseline_path)
@@ -37,14 +37,14 @@ def main(args):
         path_target = Path(args.target_path) / row["filename"]
 
         if location_info_of_target_pass_id is not None:
-            location_info = location_info_of_target_pass_id.get(row["forward_pass_id"])
+            location_info = location_info_of_target_pass_id.get(row["curr_step"])
             if location_info is None:
                 continue
-            baseline_forward_pass_id = location_info.baseline_forward_pass_id
+            baseline_curr_step = location_info.baseline_curr_step
             baseline_token_slice = location_info.baseline_token_slice
         else:
-            baseline_forward_pass_id = (
-                row["forward_pass_id"] - args.start_id + args.baseline_start_id
+            baseline_curr_step = (
+                row["curr_step"] - args.start_id + args.baseline_start_id
             )
             baseline_token_slice = None
 
@@ -61,11 +61,11 @@ def main(args):
         row_baseline = find_row(
             df_baseline,
             conditions=dict(
-                forward_pass_id=baseline_forward_pass_id,
+                curr_step=baseline_curr_step,
                 **{
                     k: v
                     for k, v in row.items()
-                    if k not in ["forward_pass_id", "dump_index", "filename"]
+                    if k not in ["curr_step", "dump_index", "filename"]
                 },
             ),
         )
@@ -297,7 +297,7 @@ def _comparison_preprocessor(x_baseline, x_target, name):
 
 @dataclass
 class LocationInfo:
-    baseline_forward_pass_id: int
+    baseline_curr_step: int
     baseline_token_slice: slice
 
 

@@ -25,8 +25,8 @@ class DumpLoader:
 
         from sglang.srt.debug_utils.dumper import dumper
 
-        forward_pass_id = dumper._forward_pass_id
-        conditions = dict(name=name, forward_pass_id=forward_pass_id, **kwargs)
+        curr_step = dumper._curr_step
+        conditions = dict(name=name, curr_step=curr_step, **kwargs)
         row = find_row(self._df, conditions=conditions)
         assert (
             row is not None
@@ -65,7 +65,7 @@ def read_meta(directory):
 
     df = pl.DataFrame(rows)
     df = df.with_columns(
-        pl.col("forward_pass_id").cast(int),
+        pl.col("curr_step").cast(int),
         pl.col("rank").cast(int),
         pl.col("dump_index").cast(int),
     )

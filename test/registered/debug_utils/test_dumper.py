@@ -205,21 +205,21 @@ class TestDumperDistributed:
     def _test_basic_func(rank, tmpdir):
         tensor = torch.randn(10, 10, device=f"cuda:{rank}")
 
-        dumper.on_forward_pass_start()
         dumper.dump("tensor_a", tensor, arg=100)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.set_ctx(ctx_arg=200)
         dumper.dump("tensor_b", tensor)
         dumper.set_ctx(ctx_arg=None)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.configure(filter=r"^$")
         dumper.dump("tensor_skip", tensor)
         dumper.configure(filter=None)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
+        dumper.step()
 
         dist.barrier()
         filenames = _get_filenames(tmpdir)
@@ -246,7 +246,7 @@ class TestDumperDistributed:
         with _capture_stdout() as captured:
             if rank != 0:
                 time.sleep(6)
-            dumper.on_forward_pass_start()
+            dumper.step()
 
         output = captured.getvalue()
         print(f"Rank {rank} captured output: {output!r}")
@@ -267,8 +267,8 @@ class TestDumperDistributed:
     def _test_file_content_func(rank, tmpdir):
         tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
 
-        dumper.on_forward_pass_start()
         dumper.dump("content_check", tensor)
+        dumper.step()
 
         dist.barrier()
         path = _find_dump_file(tmpdir, rank=rank, name="content_check")
@@ -292,10 +292,10 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        dumper.on_forward_pass_start()
         dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("not_keep_this", torch.randn(5, device=f"cuda:{rank}"))
+        dumper.step()
 
         dist.barrier()
         filenames = _get_filenames(tmpdir)
@@ -315,8 +315,8 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        dumper.on_forward_pass_start()
         dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
+        dumper.step()
 
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
@@ -422,7 +422,7 @@ class TestDumpDictFormat:
         meta = raw["meta"]
         assert meta["name"] == "fmt_test"
         assert meta["custom_key"] == "hello"
-        assert "forward_pass_id" in meta
+        assert "curr_step" in meta
         assert "rank" in meta
         assert "dump_index" in meta
 
@@ -448,9 +448,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
         enable_http_server=False,
         **overrides,
     )
-    d = _Dumper(config=config)
-    d.on_forward_pass_start()
-    return d
+    return _Dumper(config=config)
 
 
 def _get_filenames(tmpdir):
@@ -584,18 +582,18 @@ class TestDumpGrad:
             not_exist=["grad__"],
         )
 
-    def test_dump_grad_captures_forward_pass_id(self, tmp_path):
+    def test_dump_grad_captures_curr_step(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
-        d._forward_pass_id = 42
+        d._curr_step = 42
         x = torch.randn(3, 3, requires_grad=True)
         y = (x * 2).sum()
 
         d.dump("id_test", x)
-        d._forward_pass_id = 999
+        d._curr_step = 999
         y.backward()
 
         grad_file = _find_dump_file(tmp_path, name="grad__id_test")
-        assert "forward_pass_id=42" in grad_file.name
+        assert "curr_step=42" in grad_file.name
 
     def test_dump_grad_file_content(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
@@ -807,7 +805,7 @@ class TestReset:
         d.reset()
 
         assert d._dump_index == 0
-        assert d._forward_pass_id == 0
+        assert d._curr_step == 0
         assert d._global_ctx == {}
 
     def test_dump_works_after_reset(self, tmp_path):
@@ -815,7 +813,6 @@ class TestReset:
         d.dump("pre", torch.randn(3, 3))
 
         d.reset()
-        d.on_forward_pass_start()
         d.dump("post", torch.randn(3, 3))
 
         filenames = _get_filenames(tmp_path)
@@ -863,7 +860,7 @@ class TestDumperHttp:
     @staticmethod
     def _standalone_mode_worker(rank, http_port: int, stop_event):
         dumper.configure(enable=False, server_port=str(http_port))
-        dumper.on_forward_pass_start()
+        dumper.step()
         stop_event.wait()
 
     @staticmethod
@@ -927,7 +924,7 @@ class TestDumperHttp:
         self._post(dumper_http_url, "reset")
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "dump_index", 0)
-        self._assert_all_ranks(states, "forward_pass_id", 0)
+        self._assert_all_ranks(states, "curr_step", 0)
 
     def test_get_state(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
@@ -936,7 +933,7 @@ class TestDumperHttp:
         self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
         for state in states:
             assert "dump_index" in state
-            assert "forward_pass_id" in state
+            assert "curr_step" in state
 
     def test_all_ranks_consistent(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, dir="/tmp/multi")

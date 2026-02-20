@@ -125,8 +125,8 @@ class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
 
     Example usage:
-    dumper.on_forward_pass_start()
     dumper.dump("layer_start__hidden_states", hidden_states, layer_id=self.layer_id)
+    dumper.step()
 
     Import from non-SGLang system:
     ```
@@ -158,15 +158,15 @@ class _Dumper:
         self._cleanup_previous_handled = not config.cleanup_previous
 
         self._dump_index = 0
-        self._forward_pass_id = 0
+        self._curr_step = 0
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
     # ------------------------------- public :: core ---------------------------------
 
-    def on_forward_pass_start(self):
-        """This should be called on all ranks."""
+    def step(self):
+        """This should be called on all ranks at the end of each iteration."""
 
         self._ensure_http_server()
 
@@ -176,10 +176,8 @@ class _Dumper:
         # Users may want to `dump` only on some ranks, thus determine name here
         self._ensure_partial_name()
 
-        self._forward_pass_id += 1
-        print(
-            f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
-        )
+        self._curr_step += 1
+        print(f"[Dumper] [{time.time()}] step curr_step={self._curr_step}")
 
     def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
         self._dump_inner(
@@ -242,7 +240,7 @@ class _Dumper:
 
     def reset(self) -> None:
         self._dump_index = 0
-        self._forward_pass_id = 0
+        self._curr_step = 0
         self._global_ctx = {}
 
     @contextmanager
@@ -258,7 +256,7 @@ class _Dumper:
         return {
             "config": asdict(self._config),
             "dump_index": self._dump_index,
-            "forward_pass_id": self._forward_pass_id,
+            "curr_step": self._curr_step,
         }
 
     # ------------------------- public :: only used internally -----------------------------
@@ -313,9 +311,6 @@ class _Dumper:
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
 
-        if self._forward_pass_id < 1:
-            print("Dump without on_forward_pass_start()")
-
         value = _materialize_value(value)
 
         if enable_value:
@@ -359,7 +354,7 @@ class _Dumper:
         if not tensor.requires_grad:
             return
 
-        captured_forward_pass_id = self._forward_pass_id
+        captured_curr_step = self._curr_step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -368,7 +363,7 @@ class _Dumper:
                 tags=captured_tags,
                 value=grad,
                 save=save,
-                forward_pass_id=captured_forward_pass_id,
+                curr_step=captured_curr_step,
             )
 
         tensor.register_hook(grad_hook)
@@ -380,17 +375,17 @@ class _Dumper:
         tags: dict,
         value,
         save: bool,
-        forward_pass_id: Optional[int] = None,
+        curr_step: Optional[int] = None,
     ) -> None:
         self._ensure_partial_name()
         self._dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            forward_pass_id=(
-                forward_pass_id
-                if forward_pass_id is not None
-                else self._forward_pass_id
+            curr_step=(
+                curr_step
+                if curr_step is not None
+                else self._curr_step
             ),
             rank=rank,
             dump_index=self._dump_index,

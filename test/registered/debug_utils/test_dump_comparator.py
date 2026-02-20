@@ -104,18 +104,18 @@ class TestEndToEnd(CustomTestCase):
                         enable_http_server=False,
                     )
                 )
-                dumper.on_forward_pass_start()
                 dumper.dump("tensor_a", tensor)
-                dumper.on_forward_pass_start()
+                dumper.step()
                 dumper.dump("tensor_b", tensor * 2)
+                dumper.step()
                 dump_dirs.append(Path(d) / f"sglang_dump_{dumper._config.partial_name}")
 
             args = Namespace(
                 baseline_path=str(dump_dirs[0]),
                 target_path=str(dump_dirs[1]),
-                start_id=1,
-                end_id=2,
-                baseline_start_id=1,
+                start_id=0,
+                end_id=1,
+                baseline_start_id=0,
                 diff_threshold=1e-3,
                 filter=None,
             )
