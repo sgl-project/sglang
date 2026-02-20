@@ -50,9 +50,7 @@ def set_default_backend(backend: BaseBackend):
     global_config.default_backend = backend
 
 
-def flush_cache(
-    backend: Optional[BaseBackend] = None, empty_cache: bool = True
-):
+def flush_cache(backend: Optional[BaseBackend] = None, empty_cache: bool = True):
     backend = backend or global_config.default_backend
     if backend is None:
         return False

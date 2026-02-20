@@ -692,9 +692,7 @@ async def flush_cache(
     if empty_cache is not None:
         obj.empty_cache = empty_cache
 
-    ret = await _global_state.tokenizer_manager.flush_cache(
-        empty_cache=obj.empty_cache
-    )
+    ret = await _global_state.tokenizer_manager.flush_cache(empty_cache=obj.empty_cache)
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
