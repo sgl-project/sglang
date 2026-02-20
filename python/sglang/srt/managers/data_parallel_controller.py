@@ -524,14 +524,14 @@ class DataParallelController:
             target_rank = compute_routing_key_dp_rank(
                 req.routing_key, len(self.workers)
             )
-            logger.info(
-                f"DP routing: rid={req.rid} → rank {target_rank} "
+            logger.warning(
+                f"DP routing: rid={req.rid} -> rank {target_rank} "
                 f"via routing_key='{req.routing_key}'"
             )
         else:
             target_rank = req.bootstrap_room % len(self.workers)
-            logger.info(
-                f"DP routing: rid={req.rid} → rank {target_rank} "
+            logger.warning(
+                f"DP routing: rid={req.rid} -> rank {target_rank} "
                 f"via bootstrap_room={req.bootstrap_room}"
             )
         self.workers[target_rank].send_pyobj(req)

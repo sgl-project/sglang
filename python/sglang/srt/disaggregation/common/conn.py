@@ -376,8 +376,8 @@ class CommonKVReceiver(BaseKVReceiver):
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
         if prefill_dp_rank is not None:
-            logger.info(
-                f"Decode DP routing: room={bootstrap_room} → "
+            logger.warning(
+                f"Decode DP routing: room={bootstrap_room} -> "
                 f"rank {prefill_dp_rank} via explicit prefill_dp_rank"
             )
             self.prefill_dp_rank = prefill_dp_rank
@@ -386,14 +386,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self.prefill_dp_rank = compute_routing_key_dp_rank(
                 self.routing_key, self.prefill_dp_size
             )
-            logger.info(
-                f"Decode DP routing: room={bootstrap_room} → "
+            logger.warning(
+                f"Decode DP routing: room={bootstrap_room} -> "
                 f"rank {self.prefill_dp_rank} via routing_key='{self.routing_key}'"
             )
         else:
             self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
-            logger.info(
-                f"Decode DP routing: room={bootstrap_room} → "
+            logger.warning(
+                f"Decode DP routing: room={bootstrap_room} -> "
                 f"rank {self.prefill_dp_rank} via bootstrap_room"
             )
 
