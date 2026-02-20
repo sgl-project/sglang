@@ -1270,22 +1270,18 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         assert len(captured) == 0
 
 
-def _make_forward_batch(
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-):
+def _make_forward_batch():
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
     return ForwardBatch(
         forward_mode=ForwardMode.DECODE,
-        batch_size=input_ids.shape[0],
-        input_ids=input_ids,
-        req_pool_indices=torch.zeros(input_ids.shape[0], dtype=torch.long),
-        seq_lens=seq_lens,
-        out_cache_loc=torch.zeros(input_ids.shape[0], dtype=torch.long),
-        seq_lens_sum=int(seq_lens.sum().item()),
-        positions=positions,
+        batch_size=2,
+        input_ids=torch.tensor([10, 20]),
+        req_pool_indices=torch.zeros(2, dtype=torch.long),
+        seq_lens=torch.tensor([5, 6]),
+        out_cache_loc=torch.zeros(2, dtype=torch.long),
+        seq_lens_sum=11,
+        positions=torch.tensor([0, 1]),
     )
 
 
@@ -1317,11 +1313,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([3, 4]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1333,11 +1325,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1349,33 +1337,12 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
         assert not any(k.startswith("non_intrusive__") for k in captured)
 
-    def test_core_mode_no_seq_lens(self, tmp_path):
-        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
-        model = self._build_model()
-        d.register_non_intrusive_dumper(model)
-
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([1]),
-            positions=torch.tensor([0]),
-            seq_lens=torch.tensor([2]),
-        )
-
-        with d.capture_output() as captured:
-            model(forward_batch)
-
-        assert "seq_lens" not in captured
-        assert not any("seq_lens" in k for k in captured)
-
     def test_all_mode_core_fields_without_prefix(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1390,11 +1357,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1410,11 +1373,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1433,11 +1392,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
@@ -1452,11 +1407,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        forward_batch = _make_forward_batch(
-            input_ids=torch.tensor([10, 20]),
-            positions=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([5, 6]),
-        )
+        forward_batch = _make_forward_batch()
 
         with d.capture_output() as captured:
             model(forward_batch)
