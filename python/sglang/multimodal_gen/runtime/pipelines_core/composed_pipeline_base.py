@@ -259,8 +259,8 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         for module_name, (
-            transformers_or_diffusers,
-            architecture,
+                transformers_or_diffusers,
+                architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -474,10 +474,10 @@ class ComposedPipelineBase(ABC):
 
         self.add_standard_text_encoding_stage()
 
+        self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_latent_preparation_stage()
         self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()
 
@@ -489,13 +489,11 @@ class ComposedPipelineBase(ABC):
         include_input_validation: bool = True,
         vae_image_processor: Any | None = None,
         prompt_encoding: Literal["text", "image_encoding"] = "text",
-        prompt_stage_name: str | None = "prompt_encoding_stage_primary",
         text_encoder_key: str = "text_encoder",
         tokenizer_key: str = "tokenizer",
         image_processor_key: str = "processor",
         prompt_text_encoder_key: str = "text_encoder",
         image_vae_key: str = "vae",
-        image_vae_stage_name: str | None = "image_encoding_stage_primary",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
@@ -506,7 +504,6 @@ class ComposedPipelineBase(ABC):
 
         if prompt_encoding == "text":
             self.add_standard_text_encoding_stage(
-                stage_name=prompt_stage_name,
                 text_encoder_key=text_encoder_key,
                 tokenizer_key=tokenizer_key,
             )
@@ -516,7 +513,6 @@ class ComposedPipelineBase(ABC):
                     image_processor=self.get_module(image_processor_key),
                     text_encoder=self.get_module(prompt_text_encoder_key),
                 ),
-                prompt_stage_name,
             )
         else:
             raise ValueError(f"Unknown prompt_encoding: {prompt_encoding}")
@@ -526,13 +522,13 @@ class ComposedPipelineBase(ABC):
                 vae=self.get_module(image_vae_key),
                 **(image_vae_stage_kwargs or {}),
             ),
-            image_vae_stage_name,
         )
+
+        self.add_standard_latent_preparation_stage()
 
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_latent_preparation_stage()
         self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()
         return self
@@ -549,7 +545,6 @@ class ComposedPipelineBase(ABC):
         image_processor_key: str = "image_processor",
         image_encoding_stage_name: str | None = None,
         image_vae_key: str = "vae",
-        image_vae_stage_name: str | None = None,
         image_vae_stage_kwargs: dict[str, Any] | None = None,
         image_vae_encoding_position: Literal[
             "before_timestep", "after_latent"
@@ -585,22 +580,19 @@ class ComposedPipelineBase(ABC):
                 ImageVAEEncodingStage(
                     vae=self.get_module(image_vae_key),
                     **(image_vae_stage_kwargs or {}),
-                ),
-                image_vae_stage_name,
+                )
             )
 
+        self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
-        self.add_standard_latent_preparation_stage()
-
         if image_vae_encoding_position == "after_latent":
             self.add_stage(
                 ImageVAEEncodingStage(
                     vae=self.get_module(image_vae_key),
                     **(image_vae_stage_kwargs or {}),
-                ),
-                image_vae_stage_name,
+                )
             )
         elif image_vae_encoding_position != "before_timestep":
             raise ValueError(

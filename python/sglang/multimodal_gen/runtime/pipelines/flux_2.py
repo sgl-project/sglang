@@ -51,6 +51,7 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_standard_ti2i_stages(
+            include_input_validation=True,
             vae_image_processor=vae_image_processor,
             prompt_encoding="text",
             image_vae_stage_kwargs={"vae_image_processor": vae_image_processor},
