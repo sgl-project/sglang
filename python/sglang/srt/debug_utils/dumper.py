@@ -127,9 +127,11 @@ class _Dumper:
     Auto-cleanup old dumps before first write:
     `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
 
-    Alternatively, disable at startup and enable via HTTP:
+    Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
-    2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
+    2. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
+    3. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:40000/dumper/reset`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -616,9 +618,8 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     if http_port <= 0:
         return
 
-    local_handler = _DumperRpcHandler(dumper)
     rpc_handles = _create_zmq_rpc_handles(
-        local_handler, base_port=zmq_base_port, timeout_seconds=timeout_seconds
+        dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
     )
 
     if _get_rank() == 0:
@@ -632,36 +633,37 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
 def _make_dumper_http_handler(rpc_handles):
     class _DumperHTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
-            if self.path == "/dumper":
-                try:
-                    self._handle_endpoint_dumper()
-                    self.send_response(200)
-                    self.end_headers()
-                except Exception as e:
-                    self.send_error(400, str(e))
-            else:
-                self.send_error(404)
+            try:
+                if self.path == "/dumper/configure":
+                    self._handle_configure()
+                elif self.path == "/dumper/reset":
+                    self._handle_reset()
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                self.send_error(400, str(e))
 
-        def _get_request_body(self):
+        def _get_request_body(self) -> dict:
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                return {}
             return json.loads(self.rfile.read(content_length))
 
-        def _handle_endpoint_dumper(self):
+        def _handle_configure(self):
             data = self._get_request_body()
-            print(f"[Dumper#{_get_rank()}] Handle HTTP endpoint {data=}")
+            print(f"[Dumper#{_get_rank()}] HTTP /dumper/configure {data=}")
             for rpc_handle in rpc_handles:
-                rpc_handle.set_enable(data["enable"])
+                rpc_handle.configure(**data)
+
+        def _handle_reset(self):
+            print(f"[Dumper#{_get_rank()}] HTTP /dumper/reset")
+            for rpc_handle in rpc_handles:
+                rpc_handle.reset()
 
     return _DumperHTTPHandler
-
-
-class _DumperRpcHandler:
-    def __init__(self, dumper):
-        self._dumper = dumper
-
-    def set_enable(self, enable: bool):
-        print(f"[DumperRpcHandler] set_enable {enable=}")
-        self._dumper.configure(enable=enable)
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
