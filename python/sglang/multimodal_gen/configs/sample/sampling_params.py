@@ -18,6 +18,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams
+    from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
@@ -158,7 +159,9 @@ class SamplingParams:
     return_file_paths_only: bool = True
     enable_sequence_shard: bool = False
 
-    # Cache acceleration
+    # Cache acceleration (per-request)
+    enable_teacache: bool = False
+    teacache_params: "TeaCacheParams | None" = None
     enable_magcache: bool = False
     magcache_params: "MagCacheParams | None" = None
 
@@ -341,10 +344,6 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
-        # Convert magcache_params dict (from CLI JSON) to MagCacheParams object
-        if isinstance(self.magcache_params, dict):
-            from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams
-            self.magcache_params = MagCacheParams(**self.magcache_params)
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
@@ -787,6 +786,21 @@ class SamplingParams:
             action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
+        )
+        parser.add_argument(
+            "--enable-teacache",
+            action="store_true",
+            default=SamplingParams.enable_teacache,
+            help="Enable TeaCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--teacache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
+                "Fields map directly to TeaCacheParams dataclass fields."
+            ),
         )
         parser.add_argument(
             "--enable-magcache",

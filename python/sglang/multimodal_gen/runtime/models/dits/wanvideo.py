@@ -1025,10 +1025,11 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         do_cfg = forward_batch.do_classifier_free_guidance
 
         enable_magcache = getattr(forward_batch.sampling_params, "enable_magcache", False)
-        if enable_magcache and self.cache_type == "teacache":
+        enable_teacache = getattr(forward_batch.sampling_params, "enable_teacache", False)
+        if enable_magcache and enable_teacache:
             raise ValueError("Cannot enable both MagCache and TeaCache at the same time.")
 
-        ic(self.cache_type, enable_magcache, self.is_cfg_negative)
+        ic(enable_teacache, enable_magcache, self.is_cfg_negative)
         if enable_magcache:
             ic('checking magcache2')
             return self.should_skip_forward(current_timestep, do_cfg, self.is_cfg_negative)
@@ -1036,8 +1037,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # if self.calibrate_magcache:
         #     return False
 
-        # Try TeaCache first
-        if self.cache_type == "teacache":
+        # Try TeaCache
+        if enable_teacache:
             ic('checking teacache')
             ctx = self._get_teacache_context()
             if ctx is None:

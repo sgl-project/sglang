@@ -177,3 +177,8 @@ class MagCacheMixin:
 
         with open(self.calibration_path, "a") as f:
             f.write(json.dumps({"cnt": cnt, "mag_ratio": mag_ratio, "mag_std": mag_std, "cos_dis": cos_dis, "negative": is_cfg_negative}) + "\n")
+
+    def _get_magcache_context():
+        from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+        forward_batch = get_forward_context().forward_batch
+        magcache_params = getattr(forward_batch.sampling_params, "magcache_params", None)

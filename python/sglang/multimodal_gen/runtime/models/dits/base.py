@@ -110,24 +110,6 @@ class CachableDiT(MagCacheMixin, TeaCacheMixin, BaseDiT):
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
 
-        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-        server_args = get_global_server_args()
-        # cache_type for teacache is determined at server startup from server_args.
-        # cache_type for magcache is determined per-request from sampling_params.
-        # Conflict between the two is checked at forward time in should_skip_forward_for_cached_states.
-        self.cache_type = "teacache" if server_args.enable_teacache else None
-
-        if self.cache_type == "teacache":
-            self._init_teacache_state(server_args.teacache_params)
-
-    def reset_cache_state(self) -> None:
-        """Reset both TeaCache and MagCache state."""
-        if self.cache_type == 'teacache':
-            self.reset_teacache_state()
-        elif self.cache_type == 'magcache':
-            self.reset_magcache_state()
-
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
     ) -> None:
