@@ -455,7 +455,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     config = _DumperConfig(
         enable=True,
         dir=str(tmp_path),
-        partial_name="test",
+        exp_name="test",
         enable_http_server=False,
         **overrides,
     )
@@ -463,7 +463,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
 
 
 def _get_filenames(tmpdir):
-    return {f.name for f in Path(tmpdir).glob("dump_*/*.pt")}
+    return {f.name for f in Path(tmpdir).glob("*/*.pt")}
 
 
 def _assert_files(filenames, *, exist=(), not_exist=()):
@@ -483,7 +483,7 @@ def _load_dump(path: Path) -> dict:
 def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
     matches = [
         f
-        for f in Path(tmpdir).glob("dump_*/*.pt")
+        for f in Path(tmpdir).glob("*/*.pt")
         if f"rank={rank}" in f.name and name in f.name
     ]
     assert (
@@ -1583,14 +1583,7 @@ class TestDumperE2E:
                 assert step > 0, f"rank {rank}: step should be > 0, got {step}"
             assert steps[0] == steps[1], f"step mismatch across ranks: {steps}"
 
-            # Diagnostic: list dump_dir contents
-            all_entries = sorted(Path(dump_dir).rglob("*"))
-            print(
-                f"[diag] dump_dir={dump_dir} "
-                f"entries({len(all_entries)})={[str(e) for e in all_entries[:30]]}"
-            )
-
-            dump_files = list(Path(dump_dir).glob("dump_*/*.pt"))
+            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 

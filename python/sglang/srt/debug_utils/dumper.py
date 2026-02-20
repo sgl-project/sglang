@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
+import functools
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -97,7 +98,7 @@ class _DumperConfig(_FrozenConfig):
     enable_grad: bool = False
     enable_model_value: bool = True
     enable_model_grad: bool = True
-    partial_name: Optional[str] = None
+    exp_name: Optional[str] = None
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
@@ -180,7 +181,7 @@ class _Dumper:
             return
 
         # Users may want to `dump` only on some ranks, thus determine name here
-        self._ensure_partial_name()
+        self._ensure_exp_name()
 
         self._step += 1
         print(f"[Dumper] [{time.time()}] step={self._step}")
@@ -392,7 +393,7 @@ class _Dumper:
         save: bool,
         step: Optional[int] = None,
     ) -> None:
-        self._ensure_partial_name()
+        self._ensure_exp_name()
         self._dump_index += 1
 
         rank = _get_rank()
@@ -405,7 +406,7 @@ class _Dumper:
         full_filename = _format_tags(full_kwargs) + ".pt"
         path = (
             Path(self._config.dir)
-            / f"dump_{self._config.partial_name}"
+            / self._config.exp_name
             / full_filename
         )
 
@@ -435,10 +436,6 @@ class _Dumper:
                     self._cleanup_previous_handled = True
                     _cleanup_old_dumps(Path(self._config.dir))
 
-                import sys
-
-                sys.stderr.write(f"[Dumper-Save] saving to {path}\n")
-                sys.stderr.flush()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
 
@@ -476,11 +473,11 @@ class _Dumper:
                 _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
                 print(f"[Dumper] HTTP server started on port {http_port}")
 
-    def _ensure_partial_name(self):
-        if self._config.partial_name is None:
-            name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
-            self.configure(partial_name=name)
-            print(f"[Dumper] Choose partial_name={name}")
+    def _ensure_exp_name(self):
+        if self._config.exp_name is None:
+            name = _get_default_exp_name(timeout_seconds=self._config.collective_timeout)
+            self.configure(exp_name=name)
+            print(f"[Dumper] Choose exp_name={name}")
 
 
 # -------------------------------------- hook dumper ------------------------------------------
@@ -504,12 +501,33 @@ class _NonIntrusiveDumper:
             if ctx := self._detect_module_ctx(module_name, module):
                 self._register_ctx_hooks(module, ctx=ctx)
 
-            module.register_forward_hook(
-                self._make_forward_hook(
-                    module_name=module_name,
-                    is_root=(module_name == ""),
+            is_root = module_name == ""
+            if is_root:
+                self._wrap_root_forward(module)
+            else:
+                module.register_forward_hook(
+                    self._make_forward_hook(
+                        module_name=module_name,
+                        is_root=False,
+                    )
                 )
-            )
+
+    def _wrap_root_forward(self, module: "torch.nn.Module") -> None:
+        """Wrap the root module's forward() so hooks fire even with direct .forward() calls.
+
+        sglang calls model.forward() directly (not model()), which bypasses
+        register_forward_hook. Wrapping forward ensures we capture root inputs/outputs.
+        """
+        hook = self._make_forward_hook(module_name="", is_root=True)
+        original_forward = module.forward
+
+        @functools.wraps(original_forward)
+        def wrapped_forward(*args, **kwargs):
+            output = original_forward(*args, **kwargs)
+            hook(module, args, output)
+            return output
+
+        module.forward = wrapped_forward
 
     @classmethod
     def _detect_module_ctx(
@@ -535,14 +553,6 @@ class _NonIntrusiveDumper:
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
-            if is_root:
-                import sys
-
-                sys.stderr.write(
-                    f"[Dumper-Hook] root hook fired, enable={self._dumper._config.enable}, "
-                    f"n_inputs={len(input)}\n"
-                )
-                sys.stderr.flush()
             for i, item in enumerate(input):
                 self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
 
@@ -620,14 +630,14 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
         completed.set()
 
 
-def _get_partial_name(timeout_seconds: int = 60):
+def _get_default_exp_name(timeout_seconds: int = 60):
     rank = _get_rank()
-    object_list = [str(time.time()) if rank == 0 else None]
+    object_list = [f"dump_{time.time()}" if rank == 0 else None]
 
     if dist.is_initialized():
         _collective_with_timeout(
             lambda: dist.broadcast_object_list(object_list, device="cuda"),
-            operation_name="broadcast_object_list in _get_partial_name",
+            operation_name="broadcast_object_list in _get_default_exp_name",
             timeout_seconds=timeout_seconds,
         )
 
