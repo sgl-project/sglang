@@ -1024,12 +1024,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         if self.enable_magcache:
             ctx = self._get_magcache_context()
-            assert ctx is not None
+            if ctx is None:
+                return False
             return self.should_skip_forward(ctx.current_timestep, ctx.cnt, ctx.do_cfg, ctx.is_cfg_negative)
 
         # Try TeaCache
         if self.enable_teacache:
-            ic('checking teacache')
             ctx = self._get_teacache_context()
             if ctx is None:
                 ic('teacache ctx is None')
