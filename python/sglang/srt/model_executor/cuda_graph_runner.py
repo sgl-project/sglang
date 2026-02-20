@@ -550,7 +550,7 @@ class CudaGraphRunner:
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
         )
-        self.buffers.build()
+        self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 

@@ -1919,7 +1919,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
         )
-        # buffers.build()
+        # buffers.share_buffers()
         buffers.num_token_non_padded[...] = num_tokens
 
         # For extend mode
