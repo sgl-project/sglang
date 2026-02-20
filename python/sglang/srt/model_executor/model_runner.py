@@ -152,6 +152,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
     dynamic_import,
+    empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_cpu_ids_by_node,
@@ -1861,12 +1862,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
-            self._dummy_run(batch_size=self.req_to_token_pool.size)
-
+        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        self.forward_stream.wait_stream(torch.cuda.current_stream())
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            with torch.inference_mode(), autotune():
+                self._dummy_run(
+                    batch_size=self.req_to_token_pool.size, run_ctx=autotune()
+                )
+        torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
-    def _dummy_run(self, batch_size: int):
+    def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
         if self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
@@ -2106,7 +2113,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        run_once()
+        with torch.inference_mode(), run_ctx or empty_context():
+            run_once()
 
     def init_device_graphs(self):
         """Capture device graphs."""
