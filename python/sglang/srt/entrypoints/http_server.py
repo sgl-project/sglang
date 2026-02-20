@@ -627,10 +627,7 @@ if TODO:
         body = await request.json() if body_bytes else {}
         obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
-        response: list = []
-        for r in results:
-            response.extend(r.response)
-        return response
+        return [x for result in results for x in result.response]
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
