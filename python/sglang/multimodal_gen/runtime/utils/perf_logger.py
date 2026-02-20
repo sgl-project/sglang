@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
-    init_logger,
+    init_logger, CYAN, RESET,
 )
 
 logger = init_logger(__name__)
@@ -314,7 +314,7 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
