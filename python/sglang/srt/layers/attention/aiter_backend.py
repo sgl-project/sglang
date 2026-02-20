@@ -501,7 +501,102 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
             )
 
+        elif forward_batch.forward_mode.is_draft_extend_v2():
+            # EAGLE V2: DRAFT_EXTEND_V2 mode - extend draft KV cache with all predicted tokens
+            if self.use_mla:
+                device = forward_batch.seq_lens.device
+
+                # Build qo_indptr from extend_seq_lens (all are num_draft_tokens)
+                extend_seq_lens_tensor = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+                qo_indptr[1:] = torch.cumsum(extend_seq_lens_tensor, dim=0)
+
+                # Build kv_indptr and kv_indices
+                kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+                kv_indptr[1:] = torch.cumsum(forward_batch.seq_lens, dim=0)
+
+                kv_indices = torch.empty(
+                    forward_batch.seq_lens_sum, dtype=torch.int32, device=device
+                )
+
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.size(1),
+                )
+
+                if _use_mla_ps_kernel:
+                    max_seqlen_qo = max(forward_batch.extend_seq_lens_cpu)
+                    (
+                        work_metadata,
+                        work_indptr,
+                        work_info_set,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+
+                    num_kv_splits = self.max_split_per_batch
+
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.kv_last_page_len[:bs],
+                        work_metadata,
+                        work_info_set,
+                        work_indptr,
+                        reduce_indptr,
+                        reduce_final_map,
+                        reduce_partial_map,
+                        max_seqlen_qo,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    self.kv_last_page_len[:bs],
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    run_graph=False,
+                )
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
         elif forward_batch.forward_mode.is_draft_extend():
+            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.accept_length
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -990,7 +1085,76 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
+        elif forward_mode.is_draft_extend_v2():
+            # EAGLE V2: Uses fixed num_draft_tokens per batch
+            num_tokens_per_bs = self.num_draft_tokens
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                step=num_tokens_per_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = num_tokens_per_bs
+
+            if _use_mla_ps_kernel:
+                num_kv_splits = self.max_split_per_batch
+
+                self.make_mla_meta_data(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_last_page_len,
+                    self.work_metadata,
+                    self.work_info_set,
+                    self.work_indptr,
+                    self.reduce_indptr,
+                    self.reduce_final_map,
+                    self.reduce_partial_map,
+                    max_q_len,
+                    fast_mode=fast_mode,
+                    max_split_per_batch=num_kv_splits,
+                    intra_batch_mode=intra_batch_mode,
+                )
+
+                work_metadata = self.work_metadata
+                work_info_set = self.work_info_set
+                work_indptr = self.work_indptr
+
+                reduce_indptr = self.reduce_indptr
+                reduce_final_map = self.reduce_final_map
+                reduce_partial_map = self.reduce_partial_map
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_q_len,
+                kv_indptr[-1].item(),
+                work_metadata=work_metadata,
+                work_info_set=work_info_set,
+                work_indptr=work_indptr,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                num_kv_splits=num_kv_splits,
+            )
         elif forward_mode.is_draft_extend():
+            # EAGLE V1: Uses speculative_num_steps + 1
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -1117,7 +1281,31 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
+        elif forward_mode.is_draft_extend_v2():
+            # EAGLE V2: Fixed num_draft_tokens per batch
+            seq_lens = seq_lens[:bs]
+            num_draft_tokens = self.num_draft_tokens
+            extend_lens = torch.full(
+                (bs,), num_draft_tokens, dtype=torch.int32, device=seq_lens.device
+            )
+
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
         elif forward_mode.is_draft_extend():
+            # EAGLE V1: Uses spec_info.accept_length
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -1187,6 +1375,7 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
@@ -1406,7 +1595,10 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
                 return o
-            elif forward_batch.forward_mode.is_draft_extend():
+            elif (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr

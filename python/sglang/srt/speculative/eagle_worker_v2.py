@@ -56,6 +56,7 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
@@ -63,6 +64,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -273,18 +275,27 @@ class EagleDraftWorker(BaseDraftWorker):
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
+        supports_hip_aiter_draft_extend_graph = False
+        if _is_hip:
+            # Keep import local so non-HIP environments do not require aiter.
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterMultiStepDraftBackend,
+            )
+
+            supports_hip_aiter_draft_extend_graph = isinstance(
+                self.draft_attn_backend, AiterMultiStepDraftBackend
+            )
+
+        supports_cuda_draft_extend_graph = _is_cuda and (
+            isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            or isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
+        )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
-            )
+            or supports_cuda_draft_extend_graph
+            or supports_hip_aiter_draft_extend_graph
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
