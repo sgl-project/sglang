@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.vision import (
+    get_vit_attn_backend,
+    vit_attention_forward,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
@@ -85,130 +89,6 @@ logger = logging.getLogger(__name__)
 # ====================== Vision Transformer Components ======================
 
 
-def _vit_flash_attn_varlen(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    dropout_p: float = 0.0,
-) -> torch.Tensor:
-    """FlashAttention variable-length attention for ViT.
-
-    Args:
-        query/key/value: [total_seq_len, num_heads, head_dim]
-        cu_seqlens: [batch_size + 1] cumulative sequence lengths
-        max_seqlen: maximum sequence length in the batch
-    """
-    from flash_attn import flash_attn_varlen_func
-
-    return flash_attn_varlen_func(
-        query,
-        key,
-        value,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        dropout_p=dropout_p,
-        causal=False,
-    )
-
-
-def _vit_sdpa_varlen(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    dropout_p: float = 0.0,
-) -> torch.Tensor:
-    """SDPA attention with variable-length sequences for ViT.
-
-    Args:
-        query/key/value: [1, num_heads, total_seq_len, head_dim]
-        cu_seqlens: [batch_size + 1] cumulative sequence lengths
-    """
-    outputs = []
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i].item()
-        end_idx = cu_seqlens[i + 1].item()
-        output_i = F.scaled_dot_product_attention(
-            query[:, :, start_idx:end_idx, :].contiguous(),
-            key[:, :, start_idx:end_idx, :].contiguous(),
-            value[:, :, start_idx:end_idx, :].contiguous(),
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
-        outputs.append(output_i)
-    return torch.cat(outputs, dim=2)
-
-
-def _vit_attention_forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: Optional[int] = None,
-    attn_backend: str = "flash_attention_2",
-    scaling: float = 1.0,
-    dropout_p: float = 0.0,
-) -> torch.Tensor:
-    """Unified attention forward for ViT supporting multiple backends.
-
-    Args:
-        query/key/value: [seq_len, num_heads, head_dim]
-        cu_seqlens: cumulative sequence lengths
-        attn_backend: "flash_attention_2", "sdpa", or "eager"
-    Returns:
-        output: [seq_len, hidden_dim]
-    """
-    seq_len, num_heads, head_dim = query.shape
-
-    if attn_backend == "flash_attention_2":
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        output = _vit_flash_attn_varlen(
-            query,
-            key,
-            value,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            dropout_p=dropout_p,
-        )
-        return output.reshape(seq_len, -1).contiguous()
-
-    # Reshape for SDPA/eager: [seq, heads, dim] -> [1, heads, seq, dim]
-    query = query.transpose(0, 1).unsqueeze(0)
-    key = key.transpose(0, 1).unsqueeze(0)
-    value = value.transpose(0, 1).unsqueeze(0)
-
-    if attn_backend == "sdpa":
-        output = _vit_sdpa_varlen(
-            query,
-            key,
-            value,
-            cu_seqlens=cu_seqlens,
-            dropout_p=dropout_p,
-        )
-    else:  # eager
-        split_indices = cu_seqlens[1:-1].to(dtype=torch.long, device="cpu")
-        q_splits = torch.tensor_split(query, split_indices, dim=2)
-        k_splits = torch.tensor_split(key, split_indices, dim=2)
-        v_splits = torch.tensor_split(value, split_indices, dim=2)
-
-        outputs = []
-        for q, k, v in zip(q_splits, k_splits, v_splits):
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scaling
-            attn_weights = F.softmax(attn_weights, dim=-1)
-            if dropout_p > 0:
-                attn_weights = F.dropout(attn_weights, p=dropout_p)
-            outputs.append(torch.matmul(attn_weights, v))
-        output = torch.cat(outputs, dim=2)
-
-    # [1, heads, seq, dim] -> [seq, hidden]
-    return output.squeeze(0).transpose(0, 1).reshape(seq_len, -1).contiguous()
-
-
 class Qwen2_5_VLVisionAttention(nn.Module):
     """Vision attention with unified backend support (FlashAttn2, SDPA, eager)."""
 
@@ -223,9 +103,9 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
 
-        self.attn_backend = getattr(config, "_attn_implementation", "flash_attention_2")
-        if self.attn_backend is None:
-            self.attn_backend = "flash_attention_2"
+        self.attn_backend = getattr(
+            config, "_vit_attn_backend", AttentionBackendEnum.FA
+        )
 
     def forward(
         self,
@@ -253,7 +133,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         if max_seqlen is not None and isinstance(max_seqlen, torch.Tensor):
             max_seqlen = max_seqlen.item()
 
-        attn_output = _vit_attention_forward(
+        attn_output = vit_attention_forward(
             query_states,
             key_states,
             value_states,
@@ -351,21 +231,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.config = config
-        if getattr(self.config, "_attn_implementation", None) is None:
-            self.config._attn_implementation = "flash_attention_2"
-
-        # If flash_attention_2 is requested but flash_attn is not installed,
-        # fall back to SDPA. The SDPA path uses .contiguous() on qkv slices
-        # in _vit_sdpa_varlen to avoid MIOpen precision issues on AMD GPUs.
-        if self.config._attn_implementation == "flash_attention_2":
-            try:
-                import flash_attn  # noqa: F401
-            except ImportError:
-                logger.warning(
-                    "flash_attn is not installed, overriding ViT attention "
-                    "from 'flash_attention_2' to 'sdpa'."
-                )
-                self.config._attn_implementation = "sdpa"
+        self.config._vit_attn_backend = get_vit_attn_backend(
+            getattr(self.config, "_attn_implementation", None)
+        )
 
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
@@ -464,7 +332,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     def _compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
         max_seqlen = torch.zeros([], device=cu_seqlens.device)
-        if getattr(self.config, "_attn_implementation", "eager") == "flash_attention_2":
+        if self.config._vit_attn_backend == AttentionBackendEnum.FA:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 

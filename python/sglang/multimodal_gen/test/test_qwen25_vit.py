@@ -3,9 +3,14 @@ Test custom Qwen2_5_VisionTransformer output consistency vs HuggingFace referenc
 
 Builds a mini ViT (depth=2, hidden=64, heads=4) with shared weights between
 HuggingFace and our custom implementation, then asserts numerical equivalence
-across different grid sizes and multi-image batches.
+across grid sizes representative of qwen_image_edit workloads.
+
+Grid sizes are derived from qwen_image_edit pipeline constants:
+- CONDITION_IMAGE_AREA = 384 * 384 (condition image target area)
+- Typical aspect ratios: 1:1, 4:3, 3:4, 16:9, 9:16
 """
 
+import math
 import os
 
 os.environ["SGLANG_USE_AITER"] = "0"
@@ -14,6 +19,72 @@ import copy
 
 import pytest
 import torch
+
+# ---------------------------------------------------------------------------
+# qwen_image_edit size helpers
+# ---------------------------------------------------------------------------
+
+CONDITION_IMAGE_AREA = 384 * 384
+
+
+def _calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
+    """Replicate qwen_image_edit's calculate_dimensions (rounds to 32)."""
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+    return int(width), int(height)
+
+
+def _pixel_to_grid(
+    h_pixels: int, w_pixels: int, patch_size: int = 14, merge_size: int = 2
+) -> tuple[int, int]:
+    """Convert pixel dimensions to ViT grid dimensions (in patches).
+
+    Mimics Qwen2.5-VL preprocessing: round to the nearest multiple of
+    (patch_size * merge_size), then divide by patch_size so that the
+    resulting grid is always divisible by merge_size.
+    """
+    unit = patch_size * merge_size
+    grid_h = max(round(h_pixels / unit), 1) * merge_size
+    grid_w = max(round(w_pixels / unit), 1) * merge_size
+    return grid_h, grid_w
+
+
+ASPECT_RATIOS: dict[str, float] = {
+    "1_1": 1.0,
+    "4_3": 4.0 / 3.0,
+    "3_4": 3.0 / 4.0,
+    "16_9": 16.0 / 9.0,
+    "9_16": 9.0 / 16.0,
+}
+
+
+def _build_grid_cases() -> list[tuple[str, list[tuple[int, int, int]]]]:
+    """Build (test_id, grid_specs) for qwen_image_edit-like scenarios."""
+    cases: list[tuple[str, list[tuple[int, int, int]]]] = []
+
+    for ratio_name, ratio in ASPECT_RATIOS.items():
+        w, h = _calculate_dimensions(CONDITION_IMAGE_AREA, ratio)
+        grid_h, grid_w = _pixel_to_grid(h, w)
+        cases.append((f"condition_{ratio_name}", [(1, grid_h, grid_w)]))
+
+    # Multi-image: condition + noisy (typical image-edit scenario)
+    w1, h1 = _calculate_dimensions(CONDITION_IMAGE_AREA, 1.0)
+    g1h, g1w = _pixel_to_grid(h1, w1)
+    w2, h2 = _calculate_dimensions(CONDITION_IMAGE_AREA, 4.0 / 3.0)
+    g2h, g2w = _pixel_to_grid(h2, w2)
+    cases.append(("edit_multi_same", [(1, g1h, g1w), (1, g1h, g1w)]))
+    cases.append(("edit_multi_mixed", [(1, g1h, g1w), (1, g2h, g2w)]))
+
+    return cases
+
+
+GRID_CASES = _build_grid_cases()
+
+# ---------------------------------------------------------------------------
+# Test infrastructure
+# ---------------------------------------------------------------------------
 
 _tp_initialized = False
 
@@ -92,11 +163,30 @@ def _copy_weights_hf_to_custom(hf_vit, custom_vit):
         custom_mlp.down_proj.bias.data.copy_(hf_mlp.down_proj.bias.data)
 
 
-class TestVisionTransformerConsistency:
-    """Verify custom Qwen2_5_VisionTransformer matches HuggingFace output."""
+def _make_pixel_values(grid_specs, vcfg):
+    """Create random pixel_values and grid_thw from grid specifications."""
+    grid_thw = torch.tensor(grid_specs)
+    total_patches = sum(t * h * w for t, h, w in grid_specs)
+    pixel_values = torch.randn(
+        total_patches * vcfg.temporal_patch_size,
+        vcfg.in_channels,
+        vcfg.patch_size,
+        vcfg.patch_size,
+    )
+    return pixel_values, grid_thw
 
-    @pytest.fixture
-    def models_and_input(self):
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestVisionTransformerConsistency:
+    """Verify custom Qwen2_5_VisionTransformer matches HuggingFace output
+    on grid sizes representative of qwen_image_edit workloads."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
         _ensure_tp_initialized()
 
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -107,74 +197,42 @@ class TestVisionTransformerConsistency:
             Qwen2_5_VisionTransformer,
         )
 
-        vcfg = _make_mini_vision_config(attn_implementation="eager")
+        use_cuda = torch.cuda.is_available()
+        attn_impl = "flash_attention_2" if use_cuda else "sdpa"
+        device = torch.device("cuda" if use_cuda else "cpu")
+        dtype = torch.bfloat16 if use_cuda else torch.float32
+
+        vcfg = _make_mini_vision_config(attn_implementation=attn_impl)
 
         hf_vit = Qwen2_5_VisionTransformerPretrainedModel._from_config(vcfg)
-        hf_vit.eval()
+        hf_vit.eval().to(device=device, dtype=dtype)
 
         custom_vit = Qwen2_5_VisionTransformer(copy.deepcopy(vcfg))
-        custom_vit.eval()
+        custom_vit.eval().to(device=device, dtype=dtype)
 
         _copy_weights_hf_to_custom(hf_vit, custom_vit)
 
-        t, h, w = 1, 28, 28
-        grid_thw = torch.tensor([[t, h // vcfg.patch_size, w // vcfg.patch_size]])
-        num_patches = t * (h // vcfg.patch_size) * (w // vcfg.patch_size)
-        pixel_values = torch.randn(
-            num_patches * vcfg.temporal_patch_size,
-            vcfg.in_channels,
-            vcfg.patch_size,
-            vcfg.patch_size,
-        )
+        return hf_vit, custom_vit, vcfg, device, dtype
 
-        return hf_vit, custom_vit, pixel_values, grid_thw
+    @pytest.mark.parametrize(
+        "name, grid_specs",
+        GRID_CASES,
+        ids=[c[0] for c in GRID_CASES],
+    )
+    def test_output_matches(self, models, name, grid_specs):
+        hf_vit, custom_vit, vcfg, device, dtype = models
+        pixel_values, grid_thw = _make_pixel_values(grid_specs, vcfg)
+        pixel_values = pixel_values.to(device=device, dtype=dtype)
+        grid_thw = grid_thw.to(device=device)
 
-    def test_output_matches(self, models_and_input):
-        hf_vit, custom_vit, pixel_values, grid_thw = models_and_input
-
-        with torch.no_grad():
-            hf_out = hf_vit(pixel_values, grid_thw=grid_thw)
-            custom_out = custom_vit(pixel_values, grid_thw=grid_thw)
-
-        assert hf_out.shape == custom_out.shape
-        torch.testing.assert_close(custom_out, hf_out, atol=1e-5, rtol=1e-5)
-
-    def test_output_matches_larger_grid(self, models_and_input):
-        hf_vit, custom_vit, _, _ = models_and_input
-        vcfg = hf_vit.config if hasattr(hf_vit, "config") else custom_vit.config
-
-        grid_thw = torch.tensor([[1, 4, 4]])
-        num_patches = 1 * 4 * 4
-        pixel_values = torch.randn(
-            num_patches * vcfg.temporal_patch_size,
-            vcfg.in_channels,
-            vcfg.patch_size,
-            vcfg.patch_size,
-        )
+        atol = 1e-2 if dtype == torch.bfloat16 else 1e-5
+        rtol = 1e-2 if dtype == torch.bfloat16 else 1e-5
 
         with torch.no_grad():
             hf_out = hf_vit(pixel_values, grid_thw=grid_thw)
             custom_out = custom_vit(pixel_values, grid_thw=grid_thw)
 
-        assert hf_out.shape == custom_out.shape
-        torch.testing.assert_close(custom_out, hf_out, atol=1e-5, rtol=1e-5)
-
-    def test_multi_image_batch(self, models_and_input):
-        hf_vit, custom_vit, _, _ = models_and_input
-        vcfg = hf_vit.config if hasattr(hf_vit, "config") else custom_vit.config
-
-        grid_thw = torch.tensor([[1, 2, 2], [1, 4, 4]])
-        total_patches = 2 * 2 + 4 * 4
-        pixel_values = torch.randn(
-            total_patches * vcfg.temporal_patch_size,
-            vcfg.in_channels,
-            vcfg.patch_size,
-            vcfg.patch_size,
-        )
-
-        with torch.no_grad():
-            hf_out = hf_vit(pixel_values, grid_thw=grid_thw)
-            custom_out = custom_vit(pixel_values, grid_thw=grid_thw)
-
-        assert hf_out.shape == custom_out.shape
-        torch.testing.assert_close(custom_out, hf_out, atol=1e-5, rtol=1e-5)
+        assert (
+            hf_out.shape == custom_out.shape
+        ), f"Shape mismatch for {name}: HF {hf_out.shape} vs custom {custom_out.shape}"
+        torch.testing.assert_close(custom_out, hf_out, atol=atol, rtol=rtol)
