@@ -51,22 +51,17 @@ void segment_packbits(
 
   RuntimeCheck(input_indptr.ndim() == 1, "input_indptr must be 1D");
   RuntimeCheck(input_indptr.is_contiguous(), "input_indptr must be contiguous");
-  RuntimeCheck(
-      input_indptr.dtype().code == kDLInt && input_indptr.dtype().bits == 32,
-      "input_indptr must be int32");
+  RuntimeCheck(input_indptr.dtype().code == kDLInt && input_indptr.dtype().bits == 32, "input_indptr must be int32");
   RuntimeCheck(input_indptr.size(0) >= batch_size + 1, "input_indptr size must be >= batch_size + 1");
 
   RuntimeCheck(output_indptr.ndim() == 1, "output_indptr must be 1D");
   RuntimeCheck(output_indptr.is_contiguous(), "output_indptr must be contiguous");
-  RuntimeCheck(
-      output_indptr.dtype().code == kDLInt && output_indptr.dtype().bits == 32,
-      "output_indptr must be int32");
+  RuntimeCheck(output_indptr.dtype().code == kDLInt && output_indptr.dtype().bits == 32, "output_indptr must be int32");
   RuntimeCheck(output_indptr.size(0) >= batch_size + 1, "output_indptr size must be >= batch_size + 1");
 
   RuntimeCheck(y.ndim() == 1, "y must be 1D");
   RuntimeCheck(y.is_contiguous(), "y must be contiguous");
-  RuntimeCheck(
-      y.dtype().code == kDLUInt && y.dtype().bits == 8, "y must be uint8");
+  RuntimeCheck(y.dtype().code == kDLUInt && y.dtype().bits == 8, "y must be uint8");
 
   cudaStream_t stream = LaunchKernel::resolve_device(x.device());
   cudaError_t status = flashinfer::quantization::SegmentPackBits(
