@@ -247,26 +247,84 @@ class TestDumperDistributed:
             assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
             assert "has not completed after 3s" in output
 
-    def test_http_enable(self):
+    def test_http_configure(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
-            run_distributed_test(self._test_http_func)
+            run_distributed_test(self._test_http_configure_func)
 
     @staticmethod
-    def _test_http_func(rank):
+    def _test_http_configure_func(rank):
         from sglang.srt.debug_utils.dumper import dumper
 
         assert not dumper._config.enable
         dumper.on_forward_pass_start()
 
+        base_url = "http://localhost:40000"
+
+        # (1) enable toggle
         for enable in [True, False]:
             dist.barrier()
             if rank == 0:
                 time.sleep(0.1)
                 requests.post(
-                    "http://localhost:40000/dumper", json={"enable": enable}
+                    f"{base_url}/dumper/configure", json={"enable": enable}
                 ).raise_for_status()
             dist.barrier()
             assert dumper._config.enable == enable
+
+        # (2) multi-field configure
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(
+                f"{base_url}/dumper/configure",
+                json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
+            ).raise_for_status()
+        dist.barrier()
+        assert dumper._config.enable is True
+        assert dumper._config.filter == "layer_id=0"
+        assert dumper._config.dir == "/tmp/test_http"
+
+        # (3) clear optional field
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(
+                f"{base_url}/dumper/configure",
+                json={"filter": None},
+            ).raise_for_status()
+        dist.barrier()
+        assert dumper._config.filter is None
+
+        # (4) reset
+        dumper._dump_index = 42
+        dumper._forward_pass_id = 99
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(f"{base_url}/dumper/reset").raise_for_status()
+        dist.barrier()
+        assert dumper._dump_index == 0
+        assert dumper._forward_pass_id == 0
+
+        # (5) error: unknown field -> 400
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            resp = requests.post(
+                f"{base_url}/dumper/configure",
+                json={"nonexistent_field": 123},
+            )
+            assert resp.status_code == 400
+
+        # (6) error: wrong type -> 400
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            resp = requests.post(
+                f"{base_url}/dumper/configure",
+                json={"enable": "not_a_bool"},
+            )
+            assert resp.status_code == 400
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
@@ -815,6 +873,32 @@ class TestCleanup:
 
         assert old_dir.exists()
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+
+class TestReset:
+    def test_reset_clears_state(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.set_ctx(layer_id=1)
+        d.dump("before_reset", torch.randn(3, 3))
+
+        d.reset()
+
+        assert d._dump_index == 0
+        assert d._forward_pass_id == 0
+        assert d._global_ctx == {}
+
+    def test_dump_works_after_reset(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.dump("pre", torch.randn(3, 3))
+
+        d.reset()
+        d.on_forward_pass_start()
+        d.dump("post", torch.randn(3, 3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["pre", "post"])
+        post_file = _find_dump_file(tmp_path, name="post")
+        assert "dump_index=1" in post_file.name
 
 
 if __name__ == "__main__":

@@ -127,9 +127,11 @@ class _Dumper:
     Auto-cleanup old dumps before first write:
     `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
 
-    Alternatively, disable at startup and enable via HTTP:
+    Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
-    2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
+    2. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
+    3. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:40000/dumper/reset`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -186,6 +188,11 @@ class _Dumper:
         self._global_ctx = {
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
+
+    def reset(self) -> None:
+        self._dump_index = 0
+        self._forward_pass_id = 0
+        self._global_ctx = {}
 
     @contextmanager
     def capture_output(self):
@@ -611,60 +618,50 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     if http_port <= 0:
         return
 
-    local_handler = _DumperRpcHandler(dumper)
-    rpc_handles = _create_zmq_rpc_handles(
-        local_handler, base_port=zmq_base_port, timeout_seconds=timeout_seconds
+    rpc_broadcast = _create_zmq_rpc_broadcast(
+        dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
     )
 
     if _get_rank() == 0:
-        handler_class = _make_dumper_http_handler(rpc_handles=rpc_handles)
+        handler_class = _make_http_handler(prefix="/dumper/", target=rpc_broadcast)
         server = HTTPServer(("0.0.0.0", http_port), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"[Dumper] HTTP server started on port {http_port}")
 
 
-def _make_dumper_http_handler(rpc_handles):
-    class _DumperHTTPHandler(BaseHTTPRequestHandler):
+def _make_http_handler(*, prefix: str, target):
+    class _HTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
-            if self.path == "/dumper":
-                try:
-                    self._handle_endpoint_dumper()
-                    self.send_response(200)
-                    self.end_headers()
-                except Exception as e:
-                    self.send_error(400, str(e))
-            else:
+            if not self.path.startswith(prefix):
                 self.send_error(404)
+                return
+            method = self.path[len(prefix) :]
+            try:
+                kwargs = self._get_request_body()
+                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
+                getattr(target, method)(**kwargs)
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                self.send_error(400, str(e))
 
-        def _get_request_body(self):
+        def _get_request_body(self) -> dict:
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                return {}
             return json.loads(self.rfile.read(content_length))
 
-        def _handle_endpoint_dumper(self):
-            data = self._get_request_body()
-            print(f"[Dumper#{_get_rank()}] Handle HTTP endpoint {data=}")
-            for rpc_handle in rpc_handles:
-                rpc_handle.set_enable(data["enable"])
-
-    return _DumperHTTPHandler
-
-
-class _DumperRpcHandler:
-    def __init__(self, dumper):
-        self._dumper = dumper
-
-    def set_enable(self, enable: bool):
-        print(f"[DumperRpcHandler] set_enable {enable=}")
-        self._dumper.configure(enable=enable)
+    return _HTTPHandler
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
 
 
-def _create_zmq_rpc_handles(
+def _create_zmq_rpc_broadcast(
     handler, base_port: int, timeout_seconds: int = 60
-) -> Optional[List["_ZmqRpcHandle"]]:
+) -> Optional["_ZmqRpcBroadcast"]:
+    """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
     rank = _get_rank()
@@ -695,7 +692,7 @@ def _create_zmq_rpc_handles(
         all_addresses = [None] * world_size
         _collective_with_timeout(
             lambda: dist.all_gather_object(all_addresses, local_addr),
-            operation_name="all_gather_object in _create_zmq_rpc_handles",
+            operation_name="all_gather_object in _create_zmq_rpc_broadcast",
             timeout_seconds=timeout_seconds,
         )
     else:
@@ -708,7 +705,7 @@ def _create_zmq_rpc_handles(
             req_socket = ctx.socket(zmq.REQ)
             req_socket.connect(addr)
             handles.append(_ZmqRpcHandle(req_socket, debug_name=f"rank-{i}"))
-        return handles
+        return _ZmqRpcBroadcast(handles)
     else:
         return None
 
@@ -716,7 +713,7 @@ def _create_zmq_rpc_handles(
 class _ZmqRpcHandle:
     """Proxy object to call remote handler methods via ZMQ."""
 
-    def __init__(self, socket, debug_name):
+    def __init__(self, socket, debug_name: str):
         self._socket = socket
         self._debug_name = debug_name
 
@@ -735,6 +732,20 @@ class _ZmqRpcHandle:
                     f"RPC error on {self._debug_name}: {response['error']}"
                 )
             return response["result"]
+
+        return call
+
+
+class _ZmqRpcBroadcast:
+    """Broadcasts method calls to all ZMQ RPC handles."""
+
+    def __init__(self, handles: List[_ZmqRpcHandle]):
+        self._handles = handles
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            for handle in self._handles:
+                getattr(handle, method_name)(*args, **kwargs)
 
         return call
 
