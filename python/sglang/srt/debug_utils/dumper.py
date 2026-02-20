@@ -492,9 +492,11 @@ class _NonIntrusiveDumper:
         self._dumper = dumper
         self._mode = mode
 
-        model.register_forward_hook(self._make_core_hook())
-
-        if mode == "all":
+        if mode == "core":
+            model.register_forward_hook(
+                self._make_forward_hook(module_name="", is_root=True)
+            )
+        elif mode == "all":
             for module_name, module in model.named_modules():
                 module.register_forward_hook(
                     self._make_forward_hook(
@@ -502,15 +504,6 @@ class _NonIntrusiveDumper:
                         is_root=(module_name == ""),
                     )
                 )
-
-    def _make_core_hook(self):
-        def _hook(_module, input, _output):
-            for item in input:
-                for key, tensor in self._convert_value(item).items():
-                    if key in self._CORE_FIELDS:
-                        self._dumper.dump(key, tensor)
-
-        return _hook
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
@@ -531,7 +524,13 @@ class _NonIntrusiveDumper:
             value, skip_forward_batch=(not is_root)
         ).items():
             if key in self._CORE_FIELDS:
+                if is_root:
+                    self._dumper.dump(key, tensor)
                 continue
+
+            if self._mode == "core":
+                continue
+
             parts = [p for p in (module_name, role, key) if p]
             self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
