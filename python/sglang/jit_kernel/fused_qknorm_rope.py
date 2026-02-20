@@ -17,6 +17,7 @@ def _jit_fused_qknorm_rope_module() -> Module:
         "fused_qknorm_rope",
         cuda_files=["elementwise/fused_qknorm_rope.cuh"],
         cuda_wrappers=[("fused_qk_norm_rope", "fused_qk_norm_rope")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
