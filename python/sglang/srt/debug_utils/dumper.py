@@ -163,7 +163,7 @@ class _Dumper:
         self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
-    # ------------------------------- public core API ---------------------------------
+    # ------------------------------- public :: core ---------------------------------
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -232,7 +232,7 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
-    # ------------------------------- public secondary API ---------------------------------
+    # ------------------------------- public :: secondary ---------------------------------
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
@@ -260,6 +260,29 @@ class _Dumper:
             "dump_index": self._dump_index,
             "forward_pass_id": self._forward_pass_id,
         }
+
+    # ------------------------- public :: only used internally -----------------------------
+
+    def _handle_http_control_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
+
+    def _handle_http_control_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self.get_state()
+        elif method == "configure":
+            self.configure(**body)
+            return {}
+        elif method == "reset":
+            self.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     # ------------------------- private :: related to dump -----------------------------
 
@@ -410,27 +433,6 @@ class _Dumper:
                 _torch_save(output_data, str(path))
 
     # ------------------------------- private :: misc ---------------------------------
-
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
-
-    def _handle_http_control_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self.get_state()
-        elif method == "configure":
-            self.configure(**body)
-            return {}
-        elif method == "reset":
-            self.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     @cached_property
     def _static_meta(self) -> dict:
