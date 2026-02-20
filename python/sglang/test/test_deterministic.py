@@ -268,15 +268,15 @@ def _test_mode_p_vs_d(args, batch_size):
     }
 
     def _create_prompts():
-        ans = [PROMPT_1, PROMPT_2]
-        for i in range(batch_size - len(ans)):
+        answers = [PROMPT_1, PROMPT_2]
+        for i in range(batch_size - len(answers)):
             end = random.randrange(1, 4096)
             if random.random() < 0.5:
                 begin = 0
             else:
                 begin = random.randrange(0, end)
-            ans.append(LONG_PROMPT[begin:end])
-        return ans[:batch_size]
+            answers.append(LONG_PROMPT[begin:end])
+        return answers[:batch_size]
 
     # warmup + flush
     send_single(args, input_ids=[1] * 64, max_new_tokens=65, return_full_response=True)
@@ -306,13 +306,13 @@ def _test_mode_p_vs_d(args, batch_size):
     )
     info_b = _extract_ids_and_logprobs(resp_b)
 
-    ans = []
+    answers = []
     for i, (info_a_item, info_b_item) in enumerate(zip(info_a, info_b, strict=True)):
         print(f"Compare sequence {i} in batch...")
         correct = TokenIdsAndLogprobs.compare(info_a_item["io"], info_b_item["input"])
-        ans.append(int(correct))
+        answers.append(int(correct))
 
-    return ans
+    return answers
 
 
 @dataclasses.dataclass
@@ -718,10 +718,10 @@ def test_deterministic(args):
 
     elif args.test_mode == "p_vs_d":
         # TODO also extract other modes to functions
-        ans = []
+        answer = []
         for i in range(1, args.n_trials + 1):
-            ans += _test_mode_p_vs_d(args, batch_size=i)
-        return ans
+            answer += _test_mode_p_vs_d(args, batch_size=i)
+        return answer
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
