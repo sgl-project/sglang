@@ -230,6 +230,18 @@ class PiecewiseCudaGraphRunner:
                 self.mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
+                if hasattr(self.model_runner.model, "num_deepstack_embeddings"):
+                    deepstack_slots = getattr(
+                        self.model_runner.model, "num_deepstack_embeddings", 3
+                    )
+                    self.input_deepstack_embeds = torch.zeros(
+                        (
+                            self.max_num_tokens,
+                            self.model_runner.model_config.hidden_size
+                            * deepstack_slots,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -358,6 +370,9 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
+        kwargs = {}
+        if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+            kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:num_tokens]
         with set_forward_context(
             forward_batch,
             self.attention_layers,
@@ -369,6 +384,7 @@ class PiecewiseCudaGraphRunner:
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **kwargs,
             )
 
     def _cache_loc_dtype(self):
@@ -510,6 +526,10 @@ class PiecewiseCudaGraphRunner:
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
+        kwargs = {}
+        if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+            kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[:num_tokens]
+
         # Run and capture
         def run_once():
             # Clean intermediate result cache for DP attention
@@ -523,7 +543,6 @@ class PiecewiseCudaGraphRunner:
             # It is True in this context but we need to set it to use low latency deepep mode.
             set_is_extend_in_batch(False)
 
-            kwargs = {}
             with set_forward_context(
                 forward_batch,
                 self.attention_layers,
@@ -695,6 +714,12 @@ class PiecewiseCudaGraphRunner:
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            kwargs = {}
+            if self.is_multimodal and hasattr(self, "input_deepstack_embeds"):
+                static_num_tokens = len(static_forward_batch.input_ids)
+                kwargs["input_deepstack_embeds"] = self.input_deepstack_embeds[
+                    :static_num_tokens
+                ]
             # Replay
             with set_forward_context(
                 static_forward_batch,
