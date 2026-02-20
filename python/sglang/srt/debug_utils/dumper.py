@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Literal, Optional, Self, Union, get_args, get_type_hints, Any
+from typing import Any, List, Literal, Optional, Self, Union, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
@@ -244,10 +244,16 @@ class _Dumper:
             "forward_pass_id": self._forward_pass_id,
         }
 
-    def _handle_http_control_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(method=method, body=body)
+    def _handle_http_control_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
 
-    def _handle_http_control_request_inner(self, *, method: str, body: dict[str, Any]) -> dict:
+    def _handle_http_control_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
         if method == "get_state":
             return self.get_state()
         elif method == "configure":
@@ -683,7 +689,9 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 req_body = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
-                result = target._handle_http_control_request(method=method, body=req_body)
+                result = target._handle_http_control_request(
+                    method=method, body=req_body
+                )
                 resp_body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
