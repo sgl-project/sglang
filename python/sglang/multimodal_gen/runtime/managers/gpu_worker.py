@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.metrics import get_diffusion_metrics_collector
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -109,6 +110,9 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.metrics_collector = (
+            get_diffusion_metrics_collector(server_args) if rank == 0 else None
+        )
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -118,6 +122,7 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._update_lora_metrics()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -304,11 +309,11 @@ class GPUWorker:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        status = "success"
+        start_time = time.monotonic()
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
-
-            start_time = time.monotonic()
 
             # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
@@ -387,7 +392,10 @@ class GPUWorker:
                     meta={"model": self.server_args.model_path},
                     tag="server_perf_dump",
                 )
+            if output_batch is not None and output_batch.error is not None:
+                status = "error"
         except Exception as e:
+            status = "error"
             logger.error(
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
@@ -401,7 +409,24 @@ class GPUWorker:
             # clean cache if OOM
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
+        finally:
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_request(
+                    status=status,
+                    is_warmup=req.is_warmup,
+                    latency_s=time.monotonic() - start_time,
+                )
         return output_batch
+
+    def _update_lora_metrics(self):
+        if self.metrics_collector is None:
+            return
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            self.metrics_collector.clear_lora_status()
+            return
+
+        self.metrics_collector.update_lora_status(self.pipeline.get_lora_status())
 
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
@@ -782,6 +807,7 @@ class GPUWorker:
         self.pipeline.set_lora(
             lora_nickname, lora_path, target, strength, merge_mode=merge_mode
         )
+        self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -797,6 +823,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -809,6 +836,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def list_loras(self) -> OutputBatch:

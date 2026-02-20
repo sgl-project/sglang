@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
+)
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -298,6 +302,10 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     app = FastAPI(lifespan=lifespan)
+
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        add_prometheus_track_response_middleware(app)
 
     app.include_router(health_router)
     app.include_router(vertex_router)

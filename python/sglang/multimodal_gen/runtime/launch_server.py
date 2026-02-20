@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.utils import set_prometheus_multiproc_dir
 
 
 def _find_available_port(
@@ -92,6 +93,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
+
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
 
     num_gpus = server_args.num_gpus
     processes = []

@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.metrics import get_diffusion_metrics_collector
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -157,7 +158,14 @@ class Scheduler(SchedulerDisaggMixin):
         self._warmup_total = 0
         self._warmup_processed = 0
 
+        self.metrics_collector = (
+            get_diffusion_metrics_collector(server_args) if gpu_id == 0 else None
+        )
+        if self.metrics_collector is not None:
+            self.metrics_collector.set_running_reqs(0)
+
         self.prepare_server_warmup_reqs()
+        self._set_generation_queue_depth_metric()
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -251,6 +259,26 @@ class Scheduler(SchedulerDisaggMixin):
     def _is_warmup_item(cls, req_or_group: Any) -> bool:
         req = cls._first_generation_req(req_or_group)
         return req.is_warmup if req is not None else False
+
+    def _generation_queue_depth(self) -> int:
+        return sum(
+            1
+            for _identity, req_or_group, _enqueue_time in self.waiting_queue
+            if self._first_generation_req(req_or_group) is not None
+        )
+
+    def _set_generation_queue_depth_metric(self) -> None:
+        if self.metrics_collector is not None:
+            self.metrics_collector.set_queue_depth(self._generation_queue_depth())
+
+    def _observe_generation_queue_time(
+        self, req_or_group: Any, enqueue_time: float
+    ) -> None:
+        if (
+            self.metrics_collector is not None
+            and self._first_generation_req(req_or_group) is not None
+        ):
+            self.metrics_collector.observe_queue_time(time.monotonic() - enqueue_time)
 
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
@@ -819,11 +847,13 @@ class Scheduler(SchedulerDisaggMixin):
                     effective_max_batch_size=1,
                     stop_reason="dynamic_disabled",
                 )
+            self._observe_generation_queue_time(req, enqueue_time)
             return [(identity, req)]
 
         identity, req, enqueue_time = self.waiting_queue[0]
         if not isinstance(req, Req):
-            identity, req, _ = self.waiting_queue.popleft()
+            identity, req, enqueue_time = self.waiting_queue.popleft()
+            self._observe_generation_queue_time(req, enqueue_time)
             return [(identity, req)]
 
         # If the head request itself is not eligible for dynamic batching
@@ -842,6 +872,7 @@ class Scheduler(SchedulerDisaggMixin):
                 reject_reasons=reject_reasons,
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
+            self._observe_generation_queue_time(req, head_enqueue_time)
             return [(identity, req)]
 
         compatible_indices: list[int] = [0]
@@ -885,8 +916,9 @@ class Scheduler(SchedulerDisaggMixin):
 
         batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
         for pos, idx in enumerate(reversed(compatible_indices)):
-            item_identity, item_req, _ = self.waiting_queue[idx]
+            item_identity, item_req, item_enqueue_time = self.waiting_queue[idx]
             batch_items[batch_len - 1 - pos] = (item_identity, item_req)
+            self._observe_generation_queue_time(item_req, item_enqueue_time)
             del self.waiting_queue[idx]
         stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
         if stop_reason is None:
@@ -1126,6 +1158,7 @@ class Scheduler(SchedulerDisaggMixin):
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                self._set_generation_queue_depth_metric()
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -1159,49 +1192,63 @@ class Scheduler(SchedulerDisaggMixin):
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
+            generation_running_reqs = sum(
+                1
+                for _identity, req_or_group in items
+                if self._first_generation_req(req_or_group) is not None
+            )
+            if self.metrics_collector is not None:
+                self.metrics_collector.set_running_reqs(generation_running_reqs)
+                self._set_generation_queue_depth_metric()
+
             try:
-                handler_result = self._dispatch_items(items)
-            except Exception as e:
-                logger.error(
-                    f"Error executing request in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                handler_result = OutputBatch(error=str(e))
-
-            if isinstance(handler_result, list):
-                output_batches = handler_result
-            else:
-                output_batches = [handler_result]
-
-            if len(output_batches) != len(items):
-                logger.error(
-                    "Handler returned %d output(s) for %d request(s). Returning error for unmatched requests.",
-                    len(output_batches),
-                    len(items),
-                )
-                output_batches = [
-                    OutputBatch(
-                        error=(
-                            f"Internal scheduler error: expected {len(items)} outputs, "
-                            f"got {len(output_batches)}."
-                        )
+                try:
+                    handler_result = self._dispatch_items(items)
+                except Exception as e:
+                    logger.error(
+                        f"Error executing request in scheduler event loop: {e}",
+                        exc_info=True,
                     )
-                    for _ in items
-                ]
+                    handler_result = OutputBatch(error=str(e))
 
-            # 3. return results
-            try:
-                for (identity, processed_req), output_batch in zip(
-                    items, output_batches, strict=True
-                ):
-                    is_warmup = self._is_warmup_item(processed_req)
-                    self._log_warmup_result(output_batch, is_warmup)
+                if isinstance(handler_result, list):
+                    output_batches = handler_result
+                else:
+                    output_batches = [handler_result]
 
-                    self.return_result(output_batch, identity, is_warmup=is_warmup)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
-                continue
+                if len(output_batches) != len(items):
+                    logger.error(
+                        "Handler returned %d output(s) for %d request(s). Returning error for unmatched requests.",
+                        len(output_batches),
+                        len(items),
+                    )
+                    output_batches = [
+                        OutputBatch(
+                            error=(
+                                f"Internal scheduler error: expected {len(items)} outputs, "
+                                f"got {len(output_batches)}."
+                            )
+                        )
+                        for _ in items
+                    ]
+
+                # 3. return results
+                try:
+                    for (identity, processed_req), output_batch in zip(
+                        items, output_batches, strict=True
+                    ):
+                        is_warmup = self._is_warmup_item(processed_req)
+                        self._log_warmup_result(output_batch, is_warmup)
+
+                        self.return_result(output_batch, identity, is_warmup=is_warmup)
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
+            finally:
+                if self.metrics_collector is not None:
+                    self.metrics_collector.set_running_reqs(0)
+                    self._set_generation_queue_depth_metric()
 
         self._log_batch_metrics_summary()
 
