@@ -329,25 +329,23 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # for nunchaku
+    # for nunchaku: allow init of extra params (wcscales, gate_compress, etc.) not in checkpoint
     ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
         "wtscale",
         "bias",
     ]
-    for new_param_name in unused_keys:
-        # check unallowed missing params
-        if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
-            logger.error(
-                "Unsupported new parameter: %s. Allowed patterns: %s",
-                new_param_name,
-                ALLOWED_NEW_PARAM_PATTERNS,
-            )
-            raise ValueError(
-                f"New parameter '{new_param_name}' is not supported. "
-                f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
-            )
+    allowed_new = [
+        n for n in unused_keys if any(p in n for p in ALLOWED_NEW_PARAM_PATTERNS)
+    ]
+    disallowed_new = [n for n in unused_keys if n not in allowed_new]
+    if disallowed_new:
+        raise ValueError(
+            "Checkpoint does not contain the following parameters (missing or mapping mismatch): "
+            + ", ".join(sorted(disallowed_new))
+        )
+    for new_param_name in allowed_new:
 
         meta_sharded_param = meta_sd.get(new_param_name)
 

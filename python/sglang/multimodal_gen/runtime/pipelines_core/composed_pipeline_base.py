@@ -8,8 +8,9 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
+import re
 from abc import ABC, abstractmethod
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import torch
 from tqdm import tqdm
@@ -21,8 +22,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
     PipelineExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    ConditioningStage,
+    DecodingStage,
+    DenoisingStage,
+    InputValidationStage,
+    LatentPreparationStage,
+    PipelineStage,
+    TextEncodingStage,
+    TimestepPreparationStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -109,9 +118,7 @@ class ComposedPipelineBase(ABC):
         self.create_pipeline_stages(self.server_args)
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
-        if module_name not in self.modules:
-            return default_value
-        return self.modules[module_name]
+        return self.modules.get(module_name, default_value)
 
     def add_module(self, module_name: str, module: Any):
         self.modules[module_name] = module
@@ -320,11 +327,164 @@ class ComposedPipelineBase(ABC):
 
         return loaded_components
 
-    def add_stage(self, stage_name: str, stage: PipelineStage):
+    @staticmethod
+    def _infer_stage_name(stage: PipelineStage) -> str:
+
+        class_name = stage.__class__.__name__
+        # convert CamelCase to snake_case
+        name = re.sub(r"(?<!^)(?=[A-Z])", "_", class_name).lower()
+        if not name.endswith("_stage"):
+            name += "_stage"
+        return name
+
+    def add_stage(
+        self, stage: PipelineStage, stage_name: str | None = None
+    ) -> "ComposedPipelineBase":
+
         assert self.modules is not None, "No modules are registered"
+
+        if stage_name is None:
+            stage_name = self._infer_stage_name(stage)
+        if stage_name in self._stage_name_mapping:
+            raise ValueError(f"Duplicate stage name detected: {stage_name}")
+
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
-        setattr(self, stage_name, stage)
+        return self
+
+    def add_stages(
+        self, stages: list[PipelineStage | tuple[PipelineStage, str]]
+    ) -> "ComposedPipelineBase":
+
+        for item in stages:
+            if isinstance(item, tuple):
+                stage, name = item
+                self.add_stage(stage, name)
+            else:
+                self.add_stage(item)
+        return self
+
+    def add_stage_if(
+        self,
+        condition: bool | Callable[[], bool],
+        stage: PipelineStage,
+        stage_name: str | None = None,
+    ) -> "ComposedPipelineBase":
+
+        should_add = condition() if callable(condition) else condition
+        if should_add:
+            self.add_stage(stage, stage_name)
+        return self
+
+    def get_stage(self, stage_name: str) -> PipelineStage | None:
+        """Get a stage by name."""
+        return self._stage_name_mapping.get(stage_name)
+
+    def add_standard_text_encoding_stage(
+        self,
+        stage_name: str | None = None,
+        text_encoder_key: str = "text_encoder",
+        tokenizer_key: str = "tokenizer",
+    ) -> "ComposedPipelineBase":
+
+        return self.add_stage(
+            TextEncodingStage(
+                text_encoders=[self.get_module(text_encoder_key)],
+                tokenizers=[self.get_module(tokenizer_key)],
+            ),
+            stage_name,
+        )
+
+    def add_standard_timestep_preparation_stage(
+        self,
+        stage_name: str | None = None,
+        scheduler_key: str = "scheduler",
+        prepare_extra_kwargs: list[Callable] | None = None,
+    ) -> "ComposedPipelineBase":
+
+        return self.add_stage(
+            TimestepPreparationStage(
+                scheduler=self.get_module(scheduler_key),
+                prepare_extra_set_timesteps_kwargs=prepare_extra_kwargs,
+            ),
+            stage_name,
+        )
+
+    def add_standard_latent_preparation_stage(
+        self,
+        stage_name: str | None = None,
+        scheduler_key: str = "scheduler",
+        transformer_key: str = "transformer",
+    ) -> "ComposedPipelineBase":
+        return self.add_stage(
+            LatentPreparationStage(
+                scheduler=self.get_module(scheduler_key),
+                transformer=self.get_module(transformer_key),
+            ),
+            stage_name,
+        )
+
+    def add_standard_denoising_stage(
+        self,
+        stage_name: str | None = None,
+        transformer_key: str = "transformer",
+        transformer_2_key: str | None = "transformer_2",
+        scheduler_key: str = "scheduler",
+        vae_key: str | None = "vae",
+    ) -> "ComposedPipelineBase":
+
+        kwargs = {
+            "transformer": self.get_module(transformer_key),
+            "scheduler": self.get_module(scheduler_key),
+        }
+
+        if transformer_2_key:
+            transformer_2 = self.get_module(transformer_2_key, None)
+            if transformer_2 is not None:
+                kwargs["transformer_2"] = transformer_2
+
+        if vae_key:
+            vae = self.get_module(vae_key, None)
+            if vae is not None:
+                kwargs["vae"] = vae
+                kwargs["pipeline"] = self
+
+        return self.add_stage(DenoisingStage(**kwargs), stage_name)
+
+    def add_standard_decoding_stage(
+        self,
+        stage_name: str | None = None,
+        vae_key: str = "vae",
+    ) -> "ComposedPipelineBase":
+
+        return self.add_stage(
+            DecodingStage(vae=self.get_module(vae_key), pipeline=self),
+            stage_name,
+        )
+
+    def add_standard_t2i_stages(
+        self,
+        include_input_validation: bool = True,
+        include_conditioning: bool = True,
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+    ) -> "ComposedPipelineBase":
+
+        if include_input_validation:
+            self.add_stage(InputValidationStage())
+
+        self.add_standard_text_encoding_stage()
+
+        if include_conditioning:
+            self.add_stage(ConditioningStage())
+
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=prepare_extra_timestep_kwargs
+        )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
+
+        return self
 
     # TODO(will): don't hardcode no_grad
     @torch.no_grad()
