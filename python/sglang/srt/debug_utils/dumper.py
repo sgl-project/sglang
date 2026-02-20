@@ -85,10 +85,6 @@ class _FrozenConfig(ABC):
 
 @dataclass(frozen=True)
 class _DumperConfig(_FrozenConfig):
-    @classmethod
-    def _env_prefix(cls) -> str:
-        return "SGLANG_DUMPER_"
-
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp"
@@ -102,6 +98,10 @@ class _DumperConfig(_FrozenConfig):
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
+
+    @classmethod
+    def _env_prefix(cls) -> str:
+        return "SGLANG_DUMPER_"
 
 
 # -------------------------------------- dumper core ------------------------------------------
