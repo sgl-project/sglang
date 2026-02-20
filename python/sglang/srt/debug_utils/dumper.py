@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional, Self, get_args, get_type_hints
+from typing import List, Optional, Self, get_args, get_type_hints, Union, Literal
 
 import torch
 import torch.distributed as dist
@@ -73,7 +73,10 @@ class _FrozenConfig(ABC):
 
     @staticmethod
     def _parse_env_field(env_name: str, default):
-        raw = os.getenv(env_name)
+        return _FrozenConfig._parse_env_value(os.getenv(env_name), default)
+
+    @staticmethod
+    def _parse_env_value(raw, default):
         if raw is None or not raw.strip():
             return default
         if isinstance(default, bool):
@@ -98,11 +101,18 @@ class _DumperConfig(_FrozenConfig):
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
-    server_port: str = "-1"  # Indeed `Union[int, Literal["reuse"]]`
+    server_port: str = "-1"
 
     @classmethod
     def _env_prefix(cls) -> str:
         return "SGLANG_DUMPER_"
+
+    @property
+    def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
+        x = self.server_port
+        if x == "reuse":
+            return "reuse"
+        return self._parse_env_value(x, _DumperConfig.server_port)
 
 
 # -------------------------------------- dumper core ------------------------------------------
