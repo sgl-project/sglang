@@ -217,9 +217,8 @@ class _Dumper:
             return
 
         user_kwargs = dict(name=name, **extra_kwargs, **self._global_ctx)
-        if (f := self._filter) is not None:
-            if re.search(f, _format_kwargs(user_kwargs)) is None:
-                return
+        if (f := self._filter) is not None and re.search(f, _format_kwargs(user_kwargs)) is None:
+            return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
