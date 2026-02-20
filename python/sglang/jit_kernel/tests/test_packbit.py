@@ -18,7 +18,9 @@ DEVICE = "cuda"
 # ---------------------------------------------------------------------------
 
 
-def cpu_segment_packbits(bits: torch.Tensor, input_indptr: torch.Tensor, output_indptr: torch.Tensor) -> torch.Tensor:
+def cpu_segment_packbits(
+    bits: torch.Tensor, input_indptr: torch.Tensor, output_indptr: torch.Tensor
+) -> torch.Tensor:
     """
     Reference implementation: pack bool bits into uint8 with little-endian bit order.
     Bit i within a byte is placed at position i % 8 (LSB first).
@@ -145,6 +147,24 @@ def test_vs_cpu_reference(bs, seg_len):
     assert torch.equal(y.cpu(), expected), f"mismatch for bs={bs} seg_len={seg_len}"
 
 
+def test_variable_length_segments():
+    """Segments of different lengths in the same batch — covers mixed partial/full bytes."""
+    import random
+
+    from sglang.jit_kernel.packbit import segment_packbits
+
+    # lengths chosen so some are exact multiples of 8, others have partial last byte
+    random.seed(7)
+    lengths = [1, 7, 8, 9, 15, 16, 17, 63, 64, 65]
+    segments = [[random.random() > 0.5 for _ in range(l)] for l in lengths]
+    x, input_indptr, output_indptr, y = make_inputs(segments)
+
+    segment_packbits(x, input_indptr, output_indptr, y, batch_size=len(segments))
+
+    expected = cpu_segment_packbits(x.cpu(), input_indptr.cpu(), output_indptr.cpu())
+    assert torch.equal(y.cpu(), expected), "mismatch for variable-length segments"
+
+
 # ---------------------------------------------------------------------------
 # JIT vs AOT cross-validation
 # ---------------------------------------------------------------------------
@@ -169,7 +189,9 @@ def test_vs_aot(bs, seg_len):
     segment_packbits_jit(x, input_indptr, output_indptr, y_jit, batch_size=bs)
     segment_packbits_aot(x, input_indptr, output_indptr, y_aot, batch_size=bs)
 
-    assert torch.equal(y_jit, y_aot), f"JIT vs AOT mismatch for bs={bs} seg_len={seg_len}"
+    assert torch.equal(
+        y_jit, y_aot
+    ), f"JIT vs AOT mismatch for bs={bs} seg_len={seg_len}"
 
 
 if __name__ == "__main__":
