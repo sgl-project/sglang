@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     DecodingStage,
     DenoisingStage,
     InputValidationStage,
@@ -465,7 +464,6 @@ class ComposedPipelineBase(ABC):
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
-        include_conditioning: bool = True,
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
 
@@ -474,8 +472,6 @@ class ComposedPipelineBase(ABC):
 
         self.add_standard_text_encoding_stage()
 
-        if include_conditioning:
-            self.add_stage(ConditioningStage())
 
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs

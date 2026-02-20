@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     InputValidationStage,
     TextEncodingStage,
 )
@@ -53,7 +52,6 @@ class HunyuanVideoPipeline(ComposedPipelineBase):
             ),
             "prompt_encoding_stage_primary",
         )
-        self.add_stage(ConditioningStage())
         self.add_standard_timestep_preparation_stage()
         self.add_standard_latent_preparation_stage()
         self.add_standard_denoising_stage()

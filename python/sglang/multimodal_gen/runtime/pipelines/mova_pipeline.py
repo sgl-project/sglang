@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     ImageVAEEncodingStage,
     InputValidationStage,
 )
@@ -63,7 +62,6 @@ class MOVAPipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
-        self.add_stage(ConditioningStage())
         if getattr(self.get_module("video_dit"), "require_vae_embedding", True):
             self.add_stage(ImageVAEEncodingStage(vae=self.get_module("video_vae")))
         self.add_stage(

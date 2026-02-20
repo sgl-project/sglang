@@ -8,7 +8,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     InputValidationStage,
     TextEncodingStage,
 )
@@ -82,7 +81,6 @@ class FluxPipeline(LoRAPipeline, ComposedPipelineBase):
             "prompt_encoding_stage_primary",
         )
 
-        self.add_stage(ConditioningStage())
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
         self.add_standard_latent_preparation_stage()
         self.add_standard_denoising_stage()

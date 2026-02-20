@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     CausalDMDDenoisingStage,
     InputValidationStage,
 )
@@ -40,7 +39,6 @@ class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         self.add_standard_text_encoding_stage()
-        self.add_stage(ConditioningStage())
         self.add_standard_latent_preparation_stage()
 
         self.add_stage(

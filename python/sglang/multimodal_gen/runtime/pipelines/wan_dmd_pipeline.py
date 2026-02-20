@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ConditioningStage,
     DmdDenoisingStage,
     InputValidationStage,
 )
@@ -59,12 +58,6 @@ class WanDMDPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_standard_text_encoding_stage()
-
-        self.add_stages(
-            [
-                ConditioningStage(),
-            ]
-        )
 
         self.add_standard_timestep_preparation_stage()
         self.add_standard_latent_preparation_stage()

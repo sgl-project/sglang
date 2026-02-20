@@ -13,9 +13,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ImageVAEEncodingStage,
     InputValidationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
-    ConditioningStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
 )
@@ -111,11 +108,6 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
         self.add_standard_latent_preparation_stage()
 
-        self.add_stages(
-            [
-                ConditioningStage(),
-            ]
-        )
 
         self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()
