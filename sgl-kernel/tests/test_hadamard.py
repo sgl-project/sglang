@@ -5,7 +5,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from scipy.linalg import hadamard
-from sgl_kernel import hadamard_transform
+
+try:
+    from sgl_kernel import hadamard_transform
+except Exception:
+    pytest.skip(
+        "sgl-kernel hadamard interface was removed (migrated to jit_kernel)",
+        allow_module_level=True,
+    )
 
 
 def hadamard_transform_ref(x, scale=1.0):
