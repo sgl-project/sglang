@@ -113,23 +113,13 @@ class CachableDiT(MagCacheMixin, TeaCacheMixin, BaseDiT):
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         server_args = get_global_server_args()
-        if server_args.enable_teacache and server_args.enable_magcache:
-            raise ValueError("Cannot enable both MagCache and TeaCache at the same time.")
-        self.cache_type = (
-            "magcache" if server_args.enable_magcache else "teacache" if server_args.enable_teacache else None
-        )
+        # cache_type for teacache is determined at server startup from server_args.
+        # cache_type for magcache is determined per-request from sampling_params.
+        # Conflict between the two is checked at forward time in should_skip_forward_for_cached_states.
+        self.cache_type = "teacache" if server_args.enable_teacache else None
 
         if self.cache_type == "teacache":
-            self._init_teacache_state(server_args.magcache_params)
-        elif self.cache_type == "magcache":
-            ic('running magcache init')
-            from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-            model_sampling_params = SamplingParams.from_pretrained(
-                server_args.model_path, backend=server_args.backend
-            )
-            magcache_params = getattr(model_sampling_params, "magcache_params", None) or server_args.magcache_params
-            ic(magcache_params)
-            self.init(magcache_params)
+            self._init_teacache_state(server_args.teacache_params)
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""

@@ -1024,8 +1024,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
         do_cfg = forward_batch.do_classifier_free_guidance
 
-        ic(self.cache_type, self.is_cfg_negative)
-        if self.cache_type == "magcache":
+        enable_magcache = getattr(forward_batch.sampling_params, "enable_magcache", False)
+        if enable_magcache and self.cache_type == "teacache":
+            raise ValueError("Cannot enable both MagCache and TeaCache at the same time.")
+
+        ic(self.cache_type, enable_magcache, self.is_cfg_negative)
+        if enable_magcache:
             ic('checking magcache2')
             return self.should_skip_forward(current_timestep, do_cfg, self.is_cfg_negative)
 

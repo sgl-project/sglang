@@ -39,7 +39,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams, WanTeaCacheParams
-from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams, WanMagCacheParams
 from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
@@ -248,9 +247,7 @@ class ServerArgs:
 
     # Cache acceleration
     enable_teacache: bool = False
-    enable_magcache: bool = False
     teacache_params: TeaCacheParams | WanTeaCacheParams = field(default_factory=WanTeaCacheParams)
-    magcache_params: MagCacheParams | WanMagCacheParams = field(default_factory=WanMagCacheParams) # todo: make MagCacheParams and automatically turn into WanMagCacheParams when needed
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -665,21 +662,6 @@ class ServerArgs:
             help=(
                 'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
                 "Fields map directly to TeaCacheParams dataclass fields."
-            ),
-        )
-        parser.add_argument(
-            "--enable-magcache",
-            action="store_true",
-            default=False,
-            help="Enable MagCache acceleration for diffusion inference.",
-        )
-        parser.add_argument(
-            "--magcache-params",
-            type=json.loads,
-            default=None,
-            help=(
-                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
-                "Fields map directly to MagCacheParams dataclass fields."
             ),
         )
         parser.add_argument(

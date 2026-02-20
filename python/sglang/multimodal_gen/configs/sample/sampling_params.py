@@ -12,9 +12,12 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
@@ -154,6 +157,10 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool = False
+
+    # Cache acceleration
+    enable_magcache: bool = False
+    magcache_params: "MagCacheParams | None" = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -334,6 +341,11 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
+        # Convert magcache_params dict (from CLI JSON) to MagCacheParams object
+        if isinstance(self.magcache_params, dict):
+            from sglang.multimodal_gen.configs.sample.magcache import MagCacheParams
+            self.magcache_params = MagCacheParams(**self.magcache_params)
+
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
@@ -775,6 +787,21 @@ class SamplingParams:
             action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
+        )
+        parser.add_argument(
+            "--enable-magcache",
+            action="store_true",
+            default=SamplingParams.enable_magcache,
+            help="Enable MagCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--magcache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
+                "Fields map directly to MagCacheParams dataclass fields."
+            ),
         )
         return parser
 

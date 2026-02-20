@@ -112,6 +112,14 @@ class MagCacheMixin:
 
     def should_skip_forward(self, current_timestep, do_cfg, is_cfg_negative=False):
 
+        # Re-initialize from per-request sampling params at the start of each generation
+        if current_timestep == 0:
+            from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+            forward_batch = get_forward_context().forward_batch
+            magcache_params = getattr(forward_batch.sampling_params, "magcache_params", None)
+            if magcache_params is not None:
+                self.init(magcache_params)
+
         # cnt is the global step index that accounts for both cond and uncond passes when doing CFG
         cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
         ic(current_timestep, cnt, do_cfg, is_cfg_negative)
