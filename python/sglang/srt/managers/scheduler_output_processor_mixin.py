@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -445,7 +446,7 @@ class SchedulerOutputProcessorMixin:
 
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
-
+        sparse_coordinator = get_sparse_coordinator()
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
@@ -479,6 +480,8 @@ class SchedulerOutputProcessorMixin:
                 else:
                     release_kv_cache(req, self.tree_cache)
 
+                if sparse_coordinator is not None:
+                    sparse_coordinator.on_request_end(req)
                 req.time_stats.completion_time = time.perf_counter()
 
             self.maybe_collect_customized_info(i, req, logits_output)

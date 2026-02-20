@@ -15,6 +15,10 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
+    SparseKVCacheManager,
+)
+from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +51,14 @@ def _create_backend_adaptor(
     device: torch.device,
     sparse_algorithm: BaseSparseAlgorithm,
     req_to_token_pool,
+    sparse_kv_cache_manager,
 ):
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+        return NSABackendAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
 
     if backend in ["fa3", "flashattention"]:
-        return FlashAttentionAdaptor(device)
+        return FlashAttentionAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
 
     raise ValueError(f"Unknown attention backend: {backend}")
 
@@ -69,8 +74,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             # Extract algorithm and backend
             algorithm = extra_config.pop("algorithm", "quest")
             backend = extra_config.pop("backend", "flashattention")
-            min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", 2048)
-
+            topk_tokens_cnt = extra_config.pop("topk_tokens_cnt", 2048)
+            device_buffer_cnt = extra_config.pop("device_buffer_cnt", 2048)
             # Everything else goes to algorithm_extra_config
             sparse_extra_config = extra_config
         except json.JSONDecodeError as e:
@@ -82,7 +87,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         algorithm=algorithm,
         backend=backend,
         page_size=server_args.page_size,
-        min_sparse_prompt_len=min_sparse_prompt_len,
+        topk_tokens_cnt=topk_tokens_cnt,
+        device_buffer_cnt=device_buffer_cnt,
         sparse_extra_config=sparse_extra_config,
     )
     return config
@@ -94,13 +100,23 @@ def create_sparse_coordinator(
     token_to_kv_pool,
     start_layer: int,
     end_layer: int,
+    token_to_kv_pool_allocator,
+    tp_group,
     server_args,
     **kwargs,
 ) -> SparseCoordinator:
+    bind_to_closest_numa_node_cuda()
     config = _parse_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
+    sparse_kv_cache_manager = SparseKVCacheManager(
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        tp_group=tp_group,
+        server_args=server_args,
+    )
+
     backend_adaptor = _create_backend_adaptor(
-        config.backend, device, algorithm, req_to_token_pool
+        config.backend, device, algorithm, req_to_token_pool, sparse_kv_cache_manager
     )
 
     coordinator = SparseCoordinator(
@@ -109,6 +125,7 @@ def create_sparse_coordinator(
         backend_adaptor=backend_adaptor,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=token_to_kv_pool,
+        sparse_kv_cache_manager=sparse_kv_cache_manager,
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
@@ -124,3 +141,7 @@ def register_sparse_coordinator(coordinator: SparseCoordinator) -> None:
 
 def get_sparse_coordinator() -> Optional[SparseCoordinator]:
     return _global_sparse_coordinator
+
+
+def is_hierarchical_sparse_attention_enabled() -> bool:
+    return _global_sparse_coordinator is not None

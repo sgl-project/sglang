@@ -116,6 +116,10 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
         self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
         self.page_valid[layer_id][target_pages] = True
+        if layer_id == 0:
+            logger.info(
+                f"Computed page representations for layer {layer_id}, start_page={start_page}, end_page={end_page}"
+            )
 
     def _retrieve_page_scores(
         self,

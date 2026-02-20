@@ -53,9 +53,11 @@ class NSABackendAdaptor(BackendAdaptor):
         self,
         device: torch.device,
         req_to_token_pool,
+        sparse_kv_cache_manager,
     ):
         super().__init__(device)
         self.req_to_token_pool = req_to_token_pool
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
 
     def adapt_for_attn_metadata(
         self,
@@ -69,15 +71,32 @@ class NSABackendAdaptor(BackendAdaptor):
         layer_id: int,
         **kwargs,
     ) -> Optional[torch.Tensor]:
-        """
-        Transform logical page indices to physical device indices for NSA backend.
-        """
-        # TODO: Implement NSA backend adaptor logic
-        pass
+        """Transform NSA topk indices to physical device indices."""
+        req_pool_indices = forward_batch.req_pool_indices
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        page_table = self.req_to_token_pool.req_to_token[:, :max_seqlen_k]
+        transformed_indices = self.sparse_kv_cache_manager.swap_in_selected_pages(
+            req_pool_indices=req_pool_indices,
+            top_k_result=selected_indices,
+            seq_lens=forward_batch.seq_lens,
+            sparse_mask=sparse_mask,
+            page_table=page_table,
+            layer_id=layer_id,
+            page_size=1,
+            out_cache_loc=forward_batch.out_cache_loc,
+        )
+        return transformed_indices
 
 
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
+
+    def __init__(
+        self, device: torch.device, req_to_token_pool, sparse_kv_cache_manager
+    ):
+        super().__init__(device)
+        self.req_to_token_pool = req_to_token_pool
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
 
     def save_original_metadata(self, metadata: Any) -> None:
         self._original_metadata = {
@@ -113,18 +132,20 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if not sparse_mask.any():
             return current_metadata
 
-        current_metadata.page_table.copy_(self._original_metadata["page_table"])
-        current_metadata.cache_seqlens_int32.copy_(
-            self._original_metadata["cache_seqlens_int32"]
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        page_table = self.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen_k
+        ]
+        physical_pages = self.sparse_kv_cache_manager.swap_in_selected_pages(
+            req_pool_indices=forward_batch.req_pool_indices,
+            top_k_result=selected_indices,
+            seq_lens=forward_batch.seq_lens,
+            sparse_mask=sparse_mask,
+            page_table=page_table,
+            layer_id=layer_id,
+            page_size=page_size,
+            out_cache_loc=forward_batch.out_cache_loc,
         )
-
-        physical_pages = self._logical_to_physical_pages_batch(
-            selected_indices,
-            forward_batch.req_pool_indices,
-            req_to_token,
-            page_size,
-        )
-
         max_selected = physical_pages.shape[1]
         valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(
             0
@@ -152,25 +173,3 @@ class FlashAttentionAdaptor(BackendAdaptor):
         )
         current_metadata.max_seq_len_k = int(current_metadata.cache_seqlens_int32.max())
         return current_metadata
-
-    def _logical_to_physical_pages_batch(
-        self,
-        logical_pages: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        page_size: int,
-    ) -> torch.Tensor:
-        bs, max_pages = logical_pages.shape
-
-        page_starts = logical_pages * page_size
-        page_starts_clamped = page_starts.clamp(min=0)
-
-        req_indices_expanded = req_pool_indices.unsqueeze(1).expand(-1, max_pages)
-        first_tokens = req_to_token[req_indices_expanded, page_starts_clamped]
-
-        physical_pages = first_tokens // page_size
-        physical_pages = torch.where(
-            logical_pages >= 0, physical_pages, torch.zeros_like(physical_pages)
-        )
-
-        return physical_pages.to(torch.int32)
