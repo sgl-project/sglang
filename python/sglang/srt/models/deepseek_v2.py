@@ -1066,7 +1066,10 @@ class DeepseekV2MoE(nn.Module):
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif not _use_aiter:
+        elif _use_aiter:
+            # fused in aiter_biased_grouped_topk so we can skip here
+            pass
+        else:
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
