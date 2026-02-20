@@ -257,7 +257,12 @@ class _Dumper:
             )
 
     def _register_dump_grad_hook(
-        self, *, name: str, tensor, extra_kwargs: dict, save: bool,
+        self,
+        *,
+        name: str,
+        tensor,
+        extra_kwargs: dict,
+        save: bool,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
