@@ -31,6 +31,7 @@
       "only float16 and bfloat16 is supported");
 
 namespace device::marlin_moe {
+using namespace device::marlin;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
