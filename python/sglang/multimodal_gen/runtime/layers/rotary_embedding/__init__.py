@@ -26,14 +26,9 @@
 # limitations under the License.
 """Rotary Positional Embeddings — unified public API (drop-in replacement)."""
 
-from ._base import LinearScalingRotaryEmbedding, RotaryEmbedding
+from ._base import RotaryEmbedding
 from ._factory import get_rope, get_rotary_pos_embed
-from ._mrope import (
-    NDRotaryEmbedding,
-    OneDRotaryEmbedding,
-    _to_tuple,
-    get_1d_rotary_pos_embed,
-)
+from ._mrope import NDRotaryEmbedding
 from ._utils import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
@@ -45,12 +40,8 @@ __all__ = [
     "apply_flashinfer_rope_qk_inplace",
     # _base
     "RotaryEmbedding",
-    "LinearScalingRotaryEmbedding",
     # _mrope
-    "OneDRotaryEmbedding",
     "NDRotaryEmbedding",
-    "_to_tuple",
-    "get_1d_rotary_pos_embed",
     # _factory
     "get_rope",
     "get_rotary_pos_embed",
