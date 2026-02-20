@@ -230,14 +230,18 @@ class Indexer(MultiPlatformOp):
             yield
 
     def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cuda and hasattr(deep_gemm, "bf16_gemm_nt"):
+        try:
+            from deep_gemm import bf16_gemm_nt
+        except ImportError:
+            bf16_gemm_nt = None
+        if bf16_gemm_nt is not None:
             weight = self.weights_proj.weight
             out = torch.empty(
                 (x.shape[0], weight.shape[0]),
                 dtype=torch.float32,
                 device=x.device,
             )
-            deep_gemm.bf16_gemm_nt(x, weight, out)
+            bf16_gemm_nt(x, weight, out)
             return out
 
         if _is_hip:
