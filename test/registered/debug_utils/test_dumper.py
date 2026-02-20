@@ -954,9 +954,23 @@ class TestDumperHttp:
         assert resp.status_code == 400
 
 
+def _make_hook_model(inner_cls):
+    """Wrap an inner module as OuterModel.model for hook testing."""
+
+    class OuterModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = inner_cls()
+
+        def forward(self, *args, **kwargs):
+            return self.model(*args, **kwargs)
+
+    return OuterModel()
+
+
 class TestHookDumper:
-    def test_basic_captures_leaf_outputs(self, tmp_path):
-        class InnerModel(torch.nn.Module):
+    def test_basic_inputs_and_outputs(self, tmp_path):
+        class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
@@ -965,32 +979,25 @@ class TestHookDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
         d = _make_test_dumper(tmp_path)
-        model = OuterModel()
+        model = _make_hook_model(Inner)
         d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             output = model(x)
 
-        assert "hook__model.linear.output" in captured
-        assert "hook__model.relu.output" in captured
         assert "hook__output" in captured
         assert torch.allclose(captured["hook__output"]["value"], output)
-
-        assert "hook__model.linear.inputs.0" in captured
-        assert "hook__model.relu.inputs.0" in captured
         assert "hook__inputs.0" in captured
+        assert "hook__model.output" in captured
+        assert "hook__model.inputs.0" in captured
+        assert "hook__model.linear.output" in captured
+        assert "hook__model.linear.inputs.0" in captured
+        assert "hook__model.relu.output" in captured
+        assert "hook__model.relu.inputs.0" in captured
 
-    def test_hooks_all_modules(self, tmp_path):
+    def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1011,7 +1018,7 @@ class TestHookDumper:
                 x = self.self_attn(x)
                 return self.mlp(x)
 
-        class InnerModel(torch.nn.Module):
+        class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.layers = torch.nn.ModuleList([Layer()])
@@ -1021,16 +1028,8 @@ class TestHookDumper:
                     x = layer(x)
                 return x
 
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
         d = _make_test_dumper(tmp_path)
-        model = OuterModel()
+        model = _make_hook_model(Inner)
         d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
@@ -1038,21 +1037,27 @@ class TestHookDumper:
             model(x)
 
         P = "hook__"
-        assert f"{P}model.layers.0.self_attn.qkv_proj.output" in captured
-        assert f"{P}model.layers.0.self_attn.o_proj.output" in captured
-        assert f"{P}model.layers.0.mlp.output" in captured
-        assert f"{P}output" in captured
+        for suffix in [
+            "output",
+            "model.output",
+            "model.layers.output",
+            "model.layers.0.output",
+            "model.layers.0.self_attn.output",
+            "model.layers.0.self_attn.qkv_proj.output",
+            "model.layers.0.self_attn.o_proj.output",
+            "model.layers.0.mlp.output",
+            "model.layers.0.self_attn.qkv_proj.inputs.0",
+            "model.layers.0.self_attn.o_proj.inputs.0",
+            "model.layers.0.mlp.inputs.0",
+        ]:
+            assert f"{P}{suffix}" in captured, f"missing {P}{suffix}"
 
-        assert f"{P}model.layers.0.self_attn.output" in captured
-        assert f"{P}model.layers.0.output" in captured
-        assert f"{P}model.output" in captured
-
-    def test_tuple_output(self, tmp_path):
+    def test_multi_tensor_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
             def forward(self, x):
                 return x, x * 2
 
-        class InnerModel(torch.nn.Module):
+        class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.split = TupleModule()
@@ -1062,26 +1067,135 @@ class TestHookDumper:
                 a, b = self.split(x)
                 return self.linear(a + b)
 
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
         d = _make_test_dumper(tmp_path)
-        model = OuterModel()
+        model = _make_hook_model(Inner)
         d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.split.output.0" in captured or "hook__model.split.output" in captured
+        assert "hook__model.split.output.0" in captured
+        assert "hook__model.split.output.1" in captured
+        assert torch.allclose(captured["hook__model.split.output.0"]["value"], x)
+
+    def test_single_tensor_tuple_collapses(self, tmp_path):
+        class SingleTupleModule(torch.nn.Module):
+            def forward(self, x):
+                return (x * 3,)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.wrap = SingleTupleModule()
+
+            def forward(self, x):
+                return self.wrap(x)[0]
+
+        d = _make_test_dumper(tmp_path)
+        model = _make_hook_model(Inner)
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "hook__model.wrap.output" in captured
+        assert "hook__model.wrap.output.0" not in captured
+
+    def test_multiple_forward_inputs(self, tmp_path):
+        class TwoInputModule(torch.nn.Module):
+            def forward(self, x, mask):
+                return x * mask
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mul = TwoInputModule()
+
+            def forward(self, x):
+                mask = torch.ones_like(x)
+                return self.mul(x, mask)
+
+        d = _make_test_dumper(tmp_path)
+        model = _make_hook_model(Inner)
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "hook__model.mul.inputs.0" in captured
+        assert "hook__model.mul.inputs.1" in captured
+
+    def test_none_output_only_dumps_inputs(self, tmp_path):
+        class NoneModule(torch.nn.Module):
+            def forward(self, x):
+                return None
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.sink = NoneModule()
+
+            def forward(self, x):
+                self.sink(x)
+                return x
+
+        d = _make_test_dumper(tmp_path)
+        model = _make_hook_model(Inner)
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "hook__model.sink.inputs.0" in captured
+        assert not any(k.startswith("hook__model.sink.output") for k in captured)
+
+    def test_non_tensor_value_silently_skipped(self, tmp_path):
+        class IntModule(torch.nn.Module):
+            def forward(self, x):
+                return 42
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.const = IntModule()
+
+            def forward(self, x):
+                self.const(x)
+                return x
+
+        d = _make_test_dumper(tmp_path)
+        model = _make_hook_model(Inner)
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "hook__model.const.inputs.0" in captured
+        assert not any(k.startswith("hook__model.const.output") for k in captured)
+
+    def test_root_module_name_no_malformed_dots(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        model = torch.nn.Linear(4, 4)
+        d.register_model_forward_hook(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        for key in captured:
+            assert not key.startswith("hook__."), f"malformed key: {key}"
+            assert ".." not in key, f"double dot in key: {key}"
+
+        assert "hook__output" in captured
+        assert "hook__inputs.0" in captured
 
     def test_respects_dumper_filter(self, tmp_path):
-        class InnerModel(torch.nn.Module):
+        class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
@@ -1090,16 +1204,8 @@ class TestHookDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
         d = _make_test_dumper(tmp_path, filter="name=hook__model.linear.output")
-        model = OuterModel()
+        model = _make_hook_model(Inner)
         d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
@@ -1108,9 +1214,10 @@ class TestHookDumper:
 
         assert "hook__model.linear.output" in captured
         assert "hook__model.relu.output" not in captured
+        assert "hook__model.linear.inputs.0" not in captured
 
     def test_disabled_dumper_no_output(self, tmp_path):
-        class InnerModel(torch.nn.Module):
+        class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
@@ -1118,17 +1225,9 @@ class TestHookDumper:
             def forward(self, x):
                 return self.linear(x)
 
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
-        model = OuterModel()
+        model = _make_hook_model(Inner)
         d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
@@ -1136,29 +1235,6 @@ class TestHookDumper:
             model(x)
 
         assert len(captured) == 0
-
-    def test_returns_hook_dumper_instance(self, tmp_path):
-        class InnerModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear = torch.nn.Linear(4, 4)
-
-            def forward(self, x):
-                return self.linear(x)
-
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = InnerModel()
-
-            def forward(self, x):
-                return self.model(x)
-
-        d = _make_test_dumper(tmp_path)
-        model = OuterModel()
-        result = d.register_model_forward_hook(model)
-
-        assert isinstance(result, _HookDumper)
 
 
 if __name__ == "__main__":
