@@ -14,17 +14,16 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizeMethodBase,
 )
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-
 from types import MappingProxyType
 
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.modelslim.schemes import (
-    ModelSlimScheme,
-    ModelSlimW4A4Int4,
-    ModelSlimW8A8Int8,
-)
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+    from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+    from sglang.srt.layers.quantization.modelslim.schemes import (
+        ModelSlimLinearScheme,
+        ModelSlimW4A4Int4,
+        ModelSlimW8A8Int8,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +107,7 @@ class ModelSlimConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self,
         layer_name: str,
-    ) -> ModelSlimScheme:
+    ) -> ModelSlimLinearScheme:
 
         quant_type = self.quant_description.get(layer_name + ".weight", "")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
@@ -123,7 +122,7 @@ class ModelSlimConfig(QuantizationConfig):
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[ModelSlimScheme]:
+    ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
@@ -190,7 +189,7 @@ class ModelSlimLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the ModelSlimScheme associated with each layer to create
+        Use the ModelSlimLinearScheme associated with each layer to create
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
