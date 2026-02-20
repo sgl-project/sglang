@@ -435,6 +435,7 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
         self.gemm_output_zero_allocator_size = 0
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+        self.enable_a2a_moe = False  # Glm4MoeLite does not use all-to-all MoE dispatch
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
