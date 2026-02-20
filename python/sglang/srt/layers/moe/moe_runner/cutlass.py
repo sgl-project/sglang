@@ -78,7 +78,6 @@ class CutlassRunnerOutput(RunnerOutput):
 
 @dataclass
 class CutlassMoeQuantInfo(MoeQuantInfo):
-    deepep_ll_or_deepep_normal: Optional[CutlassMoEType] = None
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
     w13_scale: Optional[torch.Tensor] = None
@@ -92,6 +91,7 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w13_input_scale: Optional[torch.Tensor] = None
     w2_input_scale: Optional[torch.Tensor] = None
     params: Optional[CutlassMoEParams] = None
+    deepep_ll_or_deepep_normal: Optional[CutlassMoEType] = None
 
 
 class CutlassRunnerCore(MoeRunnerCore):
