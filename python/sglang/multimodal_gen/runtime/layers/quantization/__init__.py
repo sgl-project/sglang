@@ -5,13 +5,16 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
 
-QuantizationMethods = Literal[None]
+QuantizationMethods = Literal["modelslim"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "modelslim": ModelSlimConfig,
+}
 
 
 def register_quantization_config(quantization: str):
