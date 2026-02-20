@@ -46,6 +46,24 @@ class TestDumperConfig:
     def test_from_env_defaults_match_dataclass_defaults(self):
         assert _DumperConfig.from_env() == _DumperConfig()
 
+    def test_from_env_bool(self):
+        with temp_set_env(SGLANG_DUMPER_ENABLE="1"):
+            assert _DumperConfig.from_env().enable is True
+        with temp_set_env(SGLANG_DUMPER_ENABLE="false"):
+            assert _DumperConfig.from_env().enable is False
+
+    def test_from_env_str(self):
+        with temp_set_env(SGLANG_DUMPER_FILTER="layer_id=0"):
+            assert _DumperConfig.from_env().filter == "layer_id=0"
+
+    def test_from_env_path(self):
+        with temp_set_env(SGLANG_DUMPER_DIR="/my/dir"):
+            assert _DumperConfig.from_env().dir == Path("/my/dir")
+
+    def test_from_env_int(self):
+        with temp_set_env(SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
+            assert _DumperConfig.from_env().collective_timeout == 120
+
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):

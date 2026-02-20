@@ -6,7 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -16,6 +16,26 @@ import torch
 import torch.distributed as dist
 
 # -------------------------------------- dumper core ------------------------------------------
+
+
+_ENV_PREFIX = "SGLANG_DUMPER_"
+
+
+def _env_name(field_name: str) -> str:
+    return f"{_ENV_PREFIX}{field_name.upper()}"
+
+
+def _parse_env_field(env_name: str, default):
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    if isinstance(default, bool):
+        return raw.lower() in ("true", "1")
+    if isinstance(default, int):
+        return int(raw)
+    if isinstance(default, Path):
+        return Path(raw)
+    return raw
 
 
 @dataclass(frozen=True)
@@ -36,27 +56,10 @@ class _DumperConfig:
 
     @classmethod
     def from_env(cls) -> "_DumperConfig":
-        return cls(
-            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
-            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
-            enable_output_file=get_bool_env_var("SGLANG_DUMPER_ENABLE_OUTPUT_FILE", "1"),
-            enable_output_console=get_bool_env_var(
-                "SGLANG_DUMPER_ENABLE_OUTPUT_CONSOLE", "1"
-            ),
-            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
-            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
-            enable_model_value=get_bool_env_var(
-                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
-            ),
-            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
-            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
-            enable_http_server=get_bool_env_var(
-                "SGLANG_DUMPER_ENABLE_HTTP_SERVER", "1"
-            ),
-            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
-            collective_timeout=60,
-        )
+        return cls(**{
+            f.name: _parse_env_field(_env_name(f.name), f.default)
+            for f in fields(cls)
+        })
 
 
 class _Dumper:
@@ -685,20 +688,6 @@ class _ZmqRpcHandle:
 
 
 # --------------------------------- copied code (avoid dependency) --------------------------------------
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-    truthy_values = ("true", "1")
-    return value in truthy_values
-
-
-def _get_str_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    return value
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
