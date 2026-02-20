@@ -551,6 +551,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--forward-hooks` | JSON-formatted list of forward hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
 
+## For MindStudio-probe(msProbe) dump
+| Argument | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `--msprobe-dump-config` | The path of the JSON configuration file for msProbe. If specified, enables msProbe dump. | `None` | Type: str |
+
 ## Deprecated arguments
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |

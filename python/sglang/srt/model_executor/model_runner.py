@@ -340,6 +340,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+
+        if server_args.msprobe_dump_config is not None:
+            self.init_msprobe()
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -429,6 +433,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+    def init_msprobe(self):
+        # Init the msprobe
+        try:
+            from msprobe.pytorch import PrecisionDebugger, seed_all
+        except ImportError:
+            logger.warning(
+                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+                "see https://gitcode.com/Ascend/msprobe for details."
+            )
+            return
+        seed_all(mode=True)
+        self.msprobe_debugger = PrecisionDebugger(
+            config_path=self.server_args.msprobe_dump_config
+        )
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -2394,6 +2413,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        if self.server_args.msprobe_dump_config is not None and hasattr(
+            self, "msprobe_debugger"
+        ):
+            rank_id = (
+                self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
+            )
+            self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
@@ -2437,6 +2464,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        if self.server_args.msprobe_dump_config is not None and hasattr(
+            self, "msprobe_debugger"
+        ):
+            self.msprobe_debugger.stop()
+            self.msprobe_debugger.step()
 
         return output
 

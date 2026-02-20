@@ -700,6 +700,9 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For msProbe
+    msprobe_dump_config: Optional[str] = None
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -2853,6 +2856,15 @@ class ServerArgs:
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
+
+        if self.msprobe_dump_config is not None:
+            logger.warning(
+                "When msProbe is enabled, "
+                "cuda graph is disabled(disable_cuda_graph=True) because msProbe only supports dump in eager mode, "
+                "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
@@ -5062,6 +5074,14 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        # For msProbe
+        parser.add_argument(
+            "--msprobe-dump-config",
+            type=str,
+            default=ServerArgs.msprobe_dump_config,
+            help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         )
 
     @classmethod
