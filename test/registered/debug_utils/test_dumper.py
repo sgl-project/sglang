@@ -1,4 +1,6 @@
 import io
+import multiprocessing
+import os
 import sys
 import threading
 import time
@@ -20,12 +22,20 @@ from sglang.srt.debug_utils.dumper import (
     _materialize_value,
     _obj_to_dict,
     _torch_save,
+    dumper,
     get_tensor_info,
     get_truncated_value,
 )
 from sglang.srt.environ import temp_set_env
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import run_distributed_test
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    find_available_port,
+    popen_launch_server,
+    run_distributed_test,
+)
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
@@ -193,8 +203,6 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_basic_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         tensor = torch.randn(10, 10, device=f"cuda:{rank}")
 
         dumper.on_forward_pass_start()
@@ -247,85 +255,6 @@ class TestDumperDistributed:
             assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
             assert "has not completed after 3s" in output
 
-    def test_http_configure(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
-            run_distributed_test(self._test_http_configure_func)
-
-    @staticmethod
-    def _test_http_configure_func(rank):
-        from sglang.srt.debug_utils.dumper import dumper
-
-        assert not dumper._config.enable
-        dumper.on_forward_pass_start()
-
-        base_url = "http://localhost:40000"
-
-        # (1) enable toggle
-        for enable in [True, False]:
-            dist.barrier()
-            if rank == 0:
-                time.sleep(0.1)
-                requests.post(
-                    f"{base_url}/dumper/configure", json={"enable": enable}
-                ).raise_for_status()
-            dist.barrier()
-            assert dumper._config.enable == enable
-
-        # (2) multi-field configure
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.enable is True
-        assert dumper._config.filter == "layer_id=0"
-        assert dumper._config.dir == "/tmp/test_http"
-
-        # (3) clear optional field
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"filter": None},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.filter is None
-
-        # (4) reset
-        dumper._dump_index = 42
-        dumper._forward_pass_id = 99
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(f"{base_url}/dumper/reset").raise_for_status()
-        dist.barrier()
-        assert dumper._dump_index == 0
-        assert dumper._forward_pass_id == 0
-
-        # (5) error: unknown field -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"nonexistent_field": 123},
-            )
-            assert resp.status_code == 400
-
-        # (6) error: wrong type -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": "not_a_bool"},
-            )
-            assert resp.status_code == 400
-
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
             allow_sglang=True,
@@ -336,8 +265,6 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
 
         dumper.on_forward_pass_start()
@@ -365,8 +292,6 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         dumper.on_forward_pass_start()
         dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
@@ -390,8 +315,6 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         dumper.on_forward_pass_start()
         dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
 
@@ -899,6 +822,142 @@ class TestReset:
         _assert_files(filenames, exist=["pre", "post"])
         post_file = _find_dump_file(tmp_path, name="post")
         assert "dump_index=1" in post_file.name
+
+
+class TestDumperHttp:
+    """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
+
+    @pytest.fixture(scope="class", params=["standalone", "sglang"])
+    def dumper_http_url(self, request):
+        if request.param == "standalone":
+            http_port = find_available_port(40000)
+            base_url = f"http://127.0.0.1:{http_port}"
+            stop_event = multiprocessing.get_context("spawn").Event()
+            thread = threading.Thread(
+                target=run_distributed_test,
+                args=(TestDumperHttp._standalone_mode_worker,),
+                kwargs={"http_port": http_port, "stop_event": stop_event},
+            )
+            thread.start()
+            try:
+                TestDumperHttp._wait_for_http(base_url)
+                yield base_url
+            finally:
+                stop_event.set()
+                thread.join(timeout=10)
+        else:
+            base_url = DEFAULT_URL_FOR_TEST
+            env = {**os.environ, "SGLANG_DUMPER_SERVER_PORT": "reuse"}
+            proc = popen_launch_server(
+                "Qwen/Qwen3-0.6B",
+                base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--max-total-tokens", "128"],
+                env=env,
+            )
+            try:
+                yield base_url
+            finally:
+                kill_process_tree(proc.pid)
+
+    @staticmethod
+    def _standalone_mode_worker(rank, http_port: int, stop_event):
+        dumper.configure(enable=False, server_port=str(http_port))
+        dumper.on_forward_pass_start()
+        stop_event.wait()
+
+    @staticmethod
+    def _wait_for_http(url: str, timeout: float = 30) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+                return
+            except requests.ConnectionError:
+                time.sleep(0.5)
+        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
+
+    @staticmethod
+    def _post(base_url: str, method: str, **kwargs) -> list[dict]:
+        resp = requests.post(f"{base_url}/dumper/{method}", json=kwargs or None)
+        resp.raise_for_status()
+        states = resp.json()
+        assert isinstance(states, list) and len(states) >= 1
+        return states
+
+    @staticmethod
+    def _assert_all_ranks(states: list[dict], path: str, expected):
+        """Assert that ``state[path]`` equals ``expected`` on every rank."""
+        keys = path.split(".")
+        for rank, state in enumerate(states):
+            val = state
+            for k in keys:
+                val = val[k]
+            assert (
+                val == expected
+            ), f"rank {rank}: {path}={val!r}, expected {expected!r}"
+
+    def test_configure_enable_toggle(self, dumper_http_url: str):
+        for enable in [True, False]:
+            self._post(dumper_http_url, "configure", enable=enable)
+            states = self._post(dumper_http_url, "get_state")
+            self._assert_all_ranks(states, "config.enable", enable)
+
+    def test_configure_multi_field(self, dumper_http_url: str):
+        self._post(
+            dumper_http_url,
+            "configure",
+            enable=True,
+            filter="layer_id=0",
+            dir="/tmp/test_http",
+        )
+        states = self._post(dumper_http_url, "get_state")
+        self._assert_all_ranks(states, "config.enable", True)
+        self._assert_all_ranks(states, "config.filter", "layer_id=0")
+        self._assert_all_ranks(states, "config.dir", "/tmp/test_http")
+
+    def test_configure_clear_optional(self, dumper_http_url: str):
+        self._post(dumper_http_url, "configure", filter="layer_id=0")
+        self._post(dumper_http_url, "configure", filter=None)
+        states = self._post(dumper_http_url, "get_state")
+        self._assert_all_ranks(states, "config.filter", None)
+
+    def test_reset(self, dumper_http_url: str):
+        self._post(dumper_http_url, "configure", enable=True)
+        self._post(dumper_http_url, "reset")
+        states = self._post(dumper_http_url, "get_state")
+        self._assert_all_ranks(states, "dump_index", 0)
+        self._assert_all_ranks(states, "forward_pass_id", 0)
+
+    def test_get_state(self, dumper_http_url: str):
+        self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
+        states = self._post(dumper_http_url, "get_state")
+        self._assert_all_ranks(states, "config.enable", True)
+        self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
+        for state in states:
+            assert "dump_index" in state
+            assert "forward_pass_id" in state
+
+    def test_all_ranks_consistent(self, dumper_http_url: str):
+        self._post(dumper_http_url, "configure", enable=True, dir="/tmp/multi")
+        states = self._post(dumper_http_url, "get_state")
+        configs = [s["config"] for s in states]
+        for rank_config in configs[1:]:
+            assert rank_config == configs[0], f"rank configs diverged: {configs}"
+
+    def test_error_unknown_field(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"nonexistent_field": 123},
+        )
+        assert resp.status_code == 400
+
+    def test_error_wrong_type(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"enable": "not_a_bool"},
+        )
+        assert resp.status_code == 400
 
 
 if __name__ == "__main__":

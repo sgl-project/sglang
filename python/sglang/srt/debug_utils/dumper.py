@@ -7,11 +7,11 @@ import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional, Self, get_args, get_type_hints
+from typing import Any, List, Literal, Optional, Self, Union, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
@@ -73,7 +73,10 @@ class _FrozenConfig(ABC):
 
     @staticmethod
     def _parse_env_field(env_name: str, default):
-        raw = os.getenv(env_name)
+        return _FrozenConfig._parse_env_value(os.getenv(env_name), default)
+
+    @staticmethod
+    def _parse_env_value(raw, default):
         if raw is None or not raw.strip():
             return default
         if isinstance(default, bool):
@@ -98,10 +101,21 @@ class _DumperConfig(_FrozenConfig):
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
+    server_port: str = "-1"
 
     @classmethod
     def _env_prefix(cls) -> str:
         return "SGLANG_DUMPER_"
+
+    @property
+    def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
+        raw = self.server_port
+        if raw == "reuse":
+            return "reuse"
+        port = int(raw)
+        if port <= 0:
+            return None
+        return port
 
 
 # -------------------------------------- dumper core ------------------------------------------
@@ -129,9 +143,10 @@ class _Dumper:
 
     Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
-    2. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
-    3. `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
-    4. `curl -X POST http://localhost:40000/dumper/reset`
+    2. sglang mode:  `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true}'`
+       standalone:   `curl -X POST http://localhost:40000/dumper/configure -d '{"enable": true}'`
+    3. `curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true, "filter": "layer_id=[0-3]"}'`
+    4. `curl -X POST http://localhost:30000/dumper/reset`
 
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
@@ -146,6 +161,7 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
+        self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -168,7 +184,28 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self, timeout_seconds=self._config.collective_timeout)
+
+        http_port = self._config.server_port_parsed
+        if http_port is None:
+            return
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            self,
+            base_port=get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800),
+            timeout_seconds=self._config.collective_timeout,
+        )
+
+        if _get_rank() == 0:
+            assert rpc_broadcast is not None
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port == "reuse":
+                print(
+                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
+                )
+            else:
+                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
+                print(f"[Dumper] HTTP server started on port {http_port}")
 
     def _ensure_partial_name(self):
         if self._config.partial_name is None:
@@ -202,6 +239,34 @@ class _Dumper:
             yield self._captured_output_data
         finally:
             self._captured_output_data = None
+
+    def get_state(self) -> dict:
+        return {
+            "config": asdict(self._config),
+            "dump_index": self._dump_index,
+            "forward_pass_id": self._forward_pass_id,
+        }
+
+    def _handle_http_control_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
+
+    def _handle_http_control_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self.get_state()
+        elif method == "configure":
+            self.configure(**body)
+            return {}
+        elif method == "reset":
+            self.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
@@ -612,22 +677,11 @@ def _collect_megatron_parallel_info():
 # -------------------------------------- http control server ------------------------------------------
 
 
-def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
-    http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
-    zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
-    if http_port <= 0:
-        return
-
-    rpc_broadcast = _create_zmq_rpc_broadcast(
-        dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
-    )
-
-    if _get_rank() == 0:
-        handler_class = _make_http_handler(prefix="/dumper/", target=rpc_broadcast)
-        server = HTTPServer(("0.0.0.0", http_port), handler_class)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        print(f"[Dumper] HTTP server started on port {http_port}")
+def _start_http_server(*, prefix: str, target: object, http_port: int):
+    handler_class = _make_http_handler(prefix=prefix, target=target)
+    server = HTTPServer(("0.0.0.0", http_port), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
 
 
 def _make_http_handler(*, prefix: str, target):
@@ -638,11 +692,17 @@ def _make_http_handler(*, prefix: str, target):
                 return
             method = self.path[len(prefix) :]
             try:
-                kwargs = self._get_request_body()
-                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                getattr(target, method)(**kwargs)
+                req_body = self._get_request_body()
+                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
+                result = target._handle_http_control_request(
+                    method=method, body=req_body
+                )
+                resp_body = json.dumps(result).encode()
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_body)))
                 self.end_headers()
+                self.wfile.write(resp_body)
             except Exception as e:
                 self.send_error(400, str(e))
 
@@ -736,16 +796,43 @@ class _ZmqRpcHandle:
         return call
 
 
-class _ZmqRpcBroadcast:
-    """Broadcasts method calls to all ZMQ RPC handles."""
+class _RpcBroadcastBase:
+    """Base for broadcasting method calls to dumper instance(s)."""
+
+    def __getattr__(self, method_name: str):
+        raise NotImplementedError
+
+    def __init__(self, handles: List[_ZmqRpcHandle]):
+        self._handles = handles
+
+class _LocalOnlyBroadcast(_RpcBroadcastBase):
+    """Calls methods directly on the local dumper, wrapping the result in a list."""
+
+    def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            return [getattr(self._dumper, method_name)(*args, **kwargs)]
+
+        return call
+
+
+class _ZmqRpcBroadcast(_RpcBroadcastBase):
+    """Broadcasts method calls to all ZMQ RPC handles.
+
+    Returns a list of results, one per rank (ordered by rank).
+    """
 
     def __init__(self, handles: List[_ZmqRpcHandle]):
         self._handles = handles
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
-            for handle in self._handles:
+            return [
                 getattr(handle, method_name)(*args, **kwargs)
+                for handle in self._handles
+            ]
 
         return call
 
