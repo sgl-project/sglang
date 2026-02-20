@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
+from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.parameter import (
@@ -993,6 +994,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
+            if get_moe_runner_backend().is_hpc_ops():
+                from sglang.srt.layers.quantization.fp8_utils import pad_scale_last_dim
+
+                hidden_size = layer.w2_weight.shape[1]
+                intermediate_size = layer.w2_weight.shape[2]
+                expected_w2_last_dim = ((intermediate_size // 128 + 3) // 4) * 4
+                expected_w13_last_dim = ((hidden_size // 128 + 3) // 4) * 4
+
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    pad_scale_last_dim(
+                        layer.w13_weight_scale_inv, expected_w13_last_dim
+                    ),
+                    requires_grad=False,
+                )
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    pad_scale_last_dim(layer.w2_weight_scale_inv, expected_w2_last_dim),
+                    requires_grad=False,
+                )
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -1353,6 +1372,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_hpc_ops()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1547,6 +1567,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+        elif self.runner.runner_backend.is_hpc_ops():
+            quant_info = HpcOpsMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                block_quant=self.block_quant,
+                num_local_experts=int(getattr(layer, "num_local_experts", 0)),
             )
         else:
             raise NotImplementedError(
