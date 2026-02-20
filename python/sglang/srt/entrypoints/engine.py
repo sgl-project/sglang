@@ -461,8 +461,10 @@ class Engine(EngineBase):
         self.shutdown()
         return False
 
-    def flush_cache(self):
-        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+    def flush_cache(self, empty_cache: bool = True):
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.flush_cache(empty_cache=empty_cache)
+        )
 
     def open_session(
         self,

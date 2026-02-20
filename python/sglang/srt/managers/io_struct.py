@@ -1190,7 +1190,7 @@ class ClearHiCacheReqOutput(BaseReq):
 
 @dataclass
 class FlushCacheReqInput(BaseReq):
-    pass
+    empty_cache: bool = True
 
 
 @dataclass

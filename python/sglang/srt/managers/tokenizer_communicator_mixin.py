@@ -334,8 +334,14 @@ class TokenizerCommunicatorMixin:
             ]
         )
 
-    async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+    async def flush_cache(
+        self: TokenizerManager, empty_cache: bool = True
+    ) -> FlushCacheReqOutput:
+        return (
+            await self.flush_cache_communicator(
+                FlushCacheReqInput(empty_cache=empty_cache)
+            )
+        )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
