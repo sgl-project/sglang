@@ -19,6 +19,7 @@ from sglang.srt.debug_utils.dumper import (
     _Dumper,
     _DumperConfig,
     _format_tags,
+    _HookDumper,
     _materialize_value,
     _obj_to_dict,
     _torch_save,
@@ -951,6 +952,185 @@ class TestDumperHttp:
             json={"enable": "not_a_bool"},
         )
         assert resp.status_code == 400
+
+
+class TestHookDumper:
+    def test_basic_captures_leaf_outputs(self, tmp_path):
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.relu = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.relu(self.linear(x))
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path)
+        model = OuterModel()
+        d.register_forward_hook_for_model(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            output = model(x)
+
+        assert "model.linear" in captured
+        assert "model.relu" in captured
+        assert "model" in captured
+        assert torch.allclose(captured["model"]["value"], output)
+
+    def test_layer_filtering(self, tmp_path):
+        class LayeredModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [torch.nn.Linear(4, 4) for _ in range(4)]
+                )
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LayeredModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path)
+        model = OuterModel()
+        d.register_forward_hook_for_model(model, dump_layers=[0, 2])
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "model.layers.0" in captured
+        assert "model.layers.2" in captured
+        assert "model.layers.1" not in captured
+        assert "model.layers.3" not in captured
+
+    def test_tuple_output(self, tmp_path):
+        class TupleModule(torch.nn.Module):
+            def forward(self, x):
+                return x, x * 2
+
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.split = TupleModule()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                a, b = self.split(x)
+                return self.linear(a + b)
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path)
+        model = OuterModel()
+        d.register_forward_hook_for_model(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "model.split" in captured or "model.split.0" in captured
+
+    def test_respects_dumper_filter(self, tmp_path):
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.relu = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.relu(self.linear(x))
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path, filter="name=model.linear")
+        model = OuterModel()
+        d.register_forward_hook_for_model(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "model.linear" in captured
+        assert "model.relu" not in captured
+
+    def test_disabled_dumper_no_output(self, tmp_path):
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path, enable=False)
+        model = OuterModel()
+        d.register_forward_hook_for_model(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert len(captured) == 0
+
+    def test_returns_hook_dumper_instance(self, tmp_path):
+        class InnerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = InnerModel()
+
+            def forward(self, x):
+                return self.model(x)
+
+        d = _make_test_dumper(tmp_path)
+        model = OuterModel()
+        result = d.register_forward_hook_for_model(model)
+
+        assert isinstance(result, _HookDumper)
 
 
 if __name__ == "__main__":
