@@ -925,17 +925,10 @@ class _FrameworkPlugin(ABC):
 
 
 class _SGLangPlugin(_FrameworkPlugin):
+    _available = True
     try:
         import sglang.srt.distributed as _dist
-    except ImportError:
-        _dist = None
-
-    try:
         import sglang.srt.layers.dp_attention as _dp_attn
-    except ImportError:
-        _dp_attn = None
-
-    try:
         from sglang.srt.layers.logits_processor import (
             LogitsProcessorOutput as _LogitsProcessorOutput,
         )
@@ -946,44 +939,39 @@ class _SGLangPlugin(_FrameworkPlugin):
             PPProxyTensors as _PPProxyTensors,
         )
     except ImportError:
-        _LogitsProcessorOutput = None
-        _ForwardBatch = None
-        _PPProxyTensors = None
+        _available = False
 
     @property
     def name(self) -> str:
         return "sglang"
 
     def collect_parallel_info(self) -> dict:
+        if not self._available:
+            return {}
+
         info = {}
 
-        if self._dist is not None:
-            try:
-                info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
-                info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
-                info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
-                info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
-                info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
-                info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
-                info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
-                info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
-            except (AttributeError, AssertionError):
-                info["distributed_error"] = True
-        else:
+        try:
+            info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
+            info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
+            info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
+            info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
+            info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
+            info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
+            info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
+            info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
+        except (AttributeError, AssertionError):
             info["distributed_error"] = True
 
-        if self._dp_attn is not None:
-            try:
-                info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
-                info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
-                info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
-                info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
-                info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
-                info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
-                info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
-            except (AttributeError, AssertionError):
-                info["dp_attention_error"] = True
-        else:
+        try:
+            info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+            info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
+            info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
+            info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
+            info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
+            info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
+            info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
+        except (AttributeError, AssertionError):
             info["dp_attention_error"] = True
 
         return info
@@ -991,7 +979,7 @@ class _SGLangPlugin(_FrameworkPlugin):
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
     ) -> Optional[dict[str, "torch.Tensor"]]:
-        if self._LogitsProcessorOutput is None:
+        if not self._available:
             return None
 
         if isinstance(value, self._LogitsProcessorOutput):
@@ -1016,18 +1004,19 @@ class _SGLangPlugin(_FrameworkPlugin):
 
 
 class _MegatronPlugin(_FrameworkPlugin):
+    _available = True
     try:
         from megatron.core import parallel_state as _mpu
     except ImportError:
-        _mpu = None
+        _available = False
 
     @property
     def name(self) -> str:
         return "megatron"
 
     def collect_parallel_info(self) -> dict:
-        if self._mpu is None:
-            return {"megatron_error": True}
+        if not self._available:
+            return {}
 
         info = {}
         try:
