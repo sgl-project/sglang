@@ -954,6 +954,16 @@ class TestDumperHttp:
 
 
 class TestNonIntrusiveDumper:
+    _PREFIX = "non_intrusive__"
+
+    @staticmethod
+    def _assert_captured_contains(
+        captured: dict, expected: list[str], prefix: str = "non_intrusive__"
+    ) -> None:
+        for suffix in expected:
+            key = f"{prefix}{suffix}"
+            assert key in captured, f"missing {key}"
+
     @staticmethod
     def _wrap_as_outer(inner_cls: type) -> torch.nn.Module:
         """Wrap an inner module class as OuterModel.model, mimicking typical model nesting."""
@@ -980,21 +990,27 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             output = model(x)
 
-        assert "non_intrusive__output" in captured
-        assert torch.allclose(captured["non_intrusive__output"]["value"], output)
-        assert "non_intrusive__inputs.0" in captured
-        assert "non_intrusive__model.output" in captured
-        assert "non_intrusive__model.inputs.0" in captured
-        assert "non_intrusive__model.linear.output" in captured
-        assert "non_intrusive__model.linear.inputs.0" in captured
-        assert "non_intrusive__model.relu.output" in captured
-        assert "non_intrusive__model.relu.inputs.0" in captured
+        self._assert_captured_contains(
+            captured,
+            [
+                "output",
+                "inputs.0",
+                "model.output",
+                "model.inputs.0",
+                "model.linear.output",
+                "model.linear.inputs.0",
+                "model.relu.output",
+                "model.relu.inputs.0",
+            ],
+        )
+        P = self._PREFIX
+        assert torch.allclose(captured[f"{P}output"]["value"], output)
 
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
@@ -1029,27 +1045,29 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        P = "non_intrusive__"
-        for suffix in [
-            "output",
-            "model.output",
-            "model.layers.output",
-            "model.layers.0.output",
-            "model.layers.0.self_attn.output",
-            "model.layers.0.self_attn.qkv_proj.output",
-            "model.layers.0.self_attn.o_proj.output",
-            "model.layers.0.mlp.output",
-            "model.layers.0.self_attn.qkv_proj.inputs.0",
-            "model.layers.0.self_attn.o_proj.inputs.0",
-            "model.layers.0.mlp.inputs.0",
-        ]:
-            assert f"{P}{suffix}" in captured, f"missing {P}{suffix}"
+        self._assert_captured_contains(
+            captured,
+            [
+                "output",
+                "model.output",
+                "model.layers.0.output",
+                "model.layers.0.self_attn.output",
+                "model.layers.0.self_attn.qkv_proj.output",
+                "model.layers.0.self_attn.o_proj.output",
+                "model.layers.0.mlp.output",
+                "model.layers.0.self_attn.qkv_proj.inputs.0",
+                "model.layers.0.self_attn.o_proj.inputs.0",
+                "model.layers.0.mlp.inputs.0",
+            ],
+        )
+        P = self._PREFIX
+        assert f"{P}model.layers.output" not in captured
 
     def test_multi_tensor_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
@@ -1068,7 +1086,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1095,7 +1113,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1120,7 +1138,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1145,7 +1163,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1172,7 +1190,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1186,7 +1204,7 @@ class TestNonIntrusiveDumper:
     def test_root_module_name_no_malformed_dots(self, tmp_path):
         d = _make_test_dumper(tmp_path)
         model = torch.nn.Linear(4, 4)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1213,7 +1231,7 @@ class TestNonIntrusiveDumper:
             tmp_path, filter="name=non_intrusive__model.linear.output"
         )
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1235,7 +1253,7 @@ class TestNonIntrusiveDumper:
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
         model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
+        d.register_model_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
