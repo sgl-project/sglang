@@ -277,15 +277,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
-        if lora_path:
-            first_adapter = (
-                lora_path
-                if isinstance(lora_path, str)
-                else next((a for a in lora_path if a), None)
-            )
-            if first_adapter:
-                self._validate_lora_enabled(first_adapter)
-
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
@@ -392,6 +383,20 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             messages = request.messages
             messages = [msg.model_dump() for msg in messages]
+
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                )
+                msg.update(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(

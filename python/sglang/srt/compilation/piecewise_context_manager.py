@@ -9,6 +9,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 

@@ -115,6 +115,10 @@ ALL_MODELS = [
         "LiquidAI/LFM2.5-1.2B-Instruct",
         trust_remote_code=True,
     ),
+    ModelCase(
+        "ibm-granite/granite-4.0-h-micro",
+        trust_remote_code=True,
+    ),
 ]
 
 MAMBA_MODEL_PATHS = [

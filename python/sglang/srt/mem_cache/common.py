@@ -508,20 +508,5 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     tree_cache.req_to_token_pool.free(req)
 
 
-def available_and_evictable_str(tree_cache) -> str:
-    token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-        full_available_size = token_to_kv_pool_allocator.full_available_size()
-        swa_available_size = token_to_kv_pool_allocator.swa_available_size()
-        full_evictable_size = tree_cache.full_evictable_size()
-        swa_evictable_size = tree_cache.swa_evictable_size()
-        return (
-            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
-            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
-        )
-    else:
-        available_size = token_to_kv_pool_allocator.available_size()
-        evictable_size = tree_cache.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()
