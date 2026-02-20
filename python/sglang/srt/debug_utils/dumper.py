@@ -476,8 +476,6 @@ class _Dumper:
 
 
 class _HookDumper:
-    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
-
     def __init__(
         self,
         dumper: _Dumper,
