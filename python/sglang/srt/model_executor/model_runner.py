@@ -1057,6 +1057,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if dumper.may_enable:
+            logger.warning("[Dumper-Integration] register_non_intrusive_dumper called")
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
@@ -2439,6 +2440,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eplb_manager.on_forward_pass_end()
 
         if dumper.may_enable:
+            logger.warning(
+                "[Dumper-Integration] step() called, enable=%s, step=%d",
+                dumper._config.enable,
+                dumper._step,
+            )
             dumper.step()
 
         return output

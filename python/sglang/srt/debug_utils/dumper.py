@@ -435,6 +435,10 @@ class _Dumper:
                     self._cleanup_previous_handled = True
                     _cleanup_old_dumps(Path(self._config.dir))
 
+                import sys
+
+                sys.stderr.write(f"[Dumper-Save] saving to {path}\n")
+                sys.stderr.flush()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
 
@@ -531,6 +535,14 @@ class _NonIntrusiveDumper:
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
+            if is_root:
+                import sys
+
+                sys.stderr.write(
+                    f"[Dumper-Hook] root hook fired, enable={self._dumper._config.enable}, "
+                    f"n_inputs={len(input)}\n"
+                )
+                sys.stderr.flush()
             for i, item in enumerate(input):
                 self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
 
