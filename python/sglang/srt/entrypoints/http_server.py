@@ -99,6 +99,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -616,6 +617,22 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+# Do not import `dumper.py` to avoid dependency
+if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
+
+    @app.api_route("/dumper/{method}", methods=["POST"])
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def _dumper_control_handler(method: str, request: Request):
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
+        obj = DumperControlReqInput(method=method, body=body)
+        results = await _global_state.tokenizer_manager.dumper_control(obj)
+        if any(not r.success for r in results):
+            errors = [r.error for r in results if not r.success]
+            return ORJSONResponse(status_code=400, content={"error": errors})
+        return [x for result in results for x in result.response]
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
