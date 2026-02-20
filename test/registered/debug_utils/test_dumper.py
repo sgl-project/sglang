@@ -899,29 +899,33 @@ class TestDumperHttp:
 
     def test_configure_enable_toggle(self, dumper_http_url: str):
         for enable in [True, False]:
-            states = self._post(dumper_http_url, "configure", enable=enable)
+            self._post(dumper_http_url, "configure", enable=enable)
+            states = self._post(dumper_http_url, "get_state")
             self._assert_all_ranks(states, "config.enable", enable)
 
     def test_configure_multi_field(self, dumper_http_url: str):
-        states = self._post(
+        self._post(
             dumper_http_url,
             "configure",
             enable=True,
             filter="layer_id=0",
             dir="/tmp/test_http",
         )
+        states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.enable", True)
         self._assert_all_ranks(states, "config.filter", "layer_id=0")
         self._assert_all_ranks(states, "config.dir", "/tmp/test_http")
 
     def test_configure_clear_optional(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", filter="layer_id=0")
-        states = self._post(dumper_http_url, "configure", filter=None)
+        self._post(dumper_http_url, "configure", filter=None)
+        states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.filter", None)
 
     def test_reset(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True)
-        states = self._post(dumper_http_url, "reset")
+        self._post(dumper_http_url, "reset")
+        states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "dump_index", 0)
         self._assert_all_ranks(states, "forward_pass_id", 0)
 
