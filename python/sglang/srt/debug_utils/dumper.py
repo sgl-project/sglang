@@ -112,7 +112,10 @@ class _DumperConfig(_FrozenConfig):
         x = self.server_port
         if x == "reuse":
             return "reuse"
-        return self._parse_env_value(x, _DumperConfig.server_port)
+        x = self._parse_env_value(x, _DumperConfig.server_port)
+        if x <= 0:
+            return None
+        return x
 
 
 # -------------------------------------- dumper core ------------------------------------------
