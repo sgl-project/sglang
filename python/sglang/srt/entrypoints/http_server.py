@@ -629,10 +629,10 @@ async def dumper_control(method: str, request: Request):
     body = await request.json() if body_bytes else {}
     obj = DumperControlReqInput(kwargs={"_method": method, **body})
     results = await _global_state.tokenizer_manager.dumper_control(obj)
-    return {
-        "success": all(r.success for r in results),
-        **results[0].state,
-    }
+    all_states: list = []
+    for r in results:
+        all_states.extend(r.state)
+    return all_states
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)

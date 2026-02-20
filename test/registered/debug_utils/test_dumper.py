@@ -908,64 +908,72 @@ class TestDumperHttp:
             kill_process_tree(proc.pid)
 
     @staticmethod
-    def _get_state(base_url: str) -> dict:
-        resp = requests.post(f"{base_url}/dumper/get_state")
+    def _post(base_url: str, method: str, **kwargs) -> list[dict]:
+        resp = requests.post(f"{base_url}/dumper/{method}", json=kwargs or None)
         resp.raise_for_status()
-        return resp.json()
+        states = resp.json()
+        assert isinstance(states, list) and len(states) >= 1
+        return states
+
+    @staticmethod
+    def _assert_all_ranks(states: list[dict], path: str, expected):
+        """Assert that ``state[path]`` equals ``expected`` on every rank."""
+        keys = path.split(".")
+        for rank, state in enumerate(states):
+            val = state
+            for k in keys:
+                val = val[k]
+            assert val == expected, (
+                f"rank {rank}: {path}={val!r}, expected {expected!r}"
+            )
 
     def test_configure_enable_toggle(self, dumper_http_url: str):
         for enable in [True, False]:
-            resp = requests.post(
-                f"{dumper_http_url}/dumper/configure", json={"enable": enable}
-            )
-            assert resp.status_code == 200
-            state = resp.json()
-            assert state["config"]["enable"] is enable
+            states = self._post(dumper_http_url, "configure", enable=enable)
+            self._assert_all_ranks(states, "config.enable", enable)
 
     def test_configure_multi_field(self, dumper_http_url: str):
-        resp = requests.post(
-            f"{dumper_http_url}/dumper/configure",
-            json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
+        states = self._post(
+            dumper_http_url,
+            "configure",
+            enable=True,
+            filter="layer_id=0",
+            dir="/tmp/test_http",
         )
-        assert resp.status_code == 200
-        config = resp.json()["config"]
-        assert config["enable"] is True
-        assert config["filter"] == "layer_id=0"
-        assert config["dir"] == "/tmp/test_http"
+        self._assert_all_ranks(states, "config.enable", True)
+        self._assert_all_ranks(states, "config.filter", "layer_id=0")
+        self._assert_all_ranks(states, "config.dir", "/tmp/test_http")
 
     def test_configure_clear_optional(self, dumper_http_url: str):
-        requests.post(
-            f"{dumper_http_url}/dumper/configure", json={"filter": "layer_id=0"}
-        ).raise_for_status()
-
-        resp = requests.post(
-            f"{dumper_http_url}/dumper/configure", json={"filter": None}
-        )
-        assert resp.status_code == 200
-        assert resp.json()["config"]["filter"] is None
+        self._post(dumper_http_url, "configure", filter="layer_id=0")
+        states = self._post(dumper_http_url, "configure", filter=None)
+        self._assert_all_ranks(states, "config.filter", None)
 
     def test_reset(self, dumper_http_url: str):
-        requests.post(
-            f"{dumper_http_url}/dumper/configure", json={"enable": True}
-        ).raise_for_status()
-
-        resp = requests.post(f"{dumper_http_url}/dumper/reset")
-        assert resp.status_code == 200
-        state = resp.json()
-        assert state["dump_index"] == 0
-        assert state["forward_pass_id"] == 0
+        self._post(dumper_http_url, "configure", enable=True)
+        states = self._post(dumper_http_url, "reset")
+        self._assert_all_ranks(states, "dump_index", 0)
+        self._assert_all_ranks(states, "forward_pass_id", 0)
 
     def test_get_state(self, dumper_http_url: str):
-        requests.post(
-            f"{dumper_http_url}/dumper/configure",
-            json={"enable": True, "filter": "layer_id=[0-3]"},
-        ).raise_for_status()
+        self._post(
+            dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]"
+        )
+        states = self._post(dumper_http_url, "get_state")
+        self._assert_all_ranks(states, "config.enable", True)
+        self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
+        for state in states:
+            assert "dump_index" in state
+            assert "forward_pass_id" in state
 
-        state = self._get_state(dumper_http_url)
-        assert state["config"]["enable"] is True
-        assert state["config"]["filter"] == "layer_id=[0-3]"
-        assert "dump_index" in state
-        assert "forward_pass_id" in state
+    def test_all_ranks_consistent(self, dumper_http_url: str):
+        self._post(dumper_http_url, "configure", enable=True, dir="/tmp/multi")
+        states = self._post(dumper_http_url, "get_state")
+        configs = [s["config"] for s in states]
+        for rank_config in configs[1:]:
+            assert rank_config == configs[0], (
+                f"rank configs diverged: {configs}"
+            )
 
     def test_error_unknown_field(self, dumper_http_url: str):
         resp = requests.post(

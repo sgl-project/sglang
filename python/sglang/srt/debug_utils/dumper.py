@@ -662,9 +662,10 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 kwargs = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                result = target._handle_http_control_request(
+                raw = target._handle_http_control_request(
                     _method=method, **kwargs
                 )
+                result = raw if isinstance(raw, list) else [raw]
                 body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -767,7 +768,7 @@ class _ZmqRpcHandle:
 class _ZmqRpcBroadcast:
     """Broadcasts method calls to all ZMQ RPC handles.
 
-    Returns the result from rank 0 (first handle).
+    Returns a list of results, one per rank (ordered by rank).
     """
 
     def __init__(self, handles: List[_ZmqRpcHandle]):
@@ -775,12 +776,10 @@ class _ZmqRpcBroadcast:
 
     def __getattr__(self, method_name: str):
         def call(*args, **kwargs):
-            result = None
-            for i, handle in enumerate(self._handles):
-                r = getattr(handle, method_name)(*args, **kwargs)
-                if i == 0:
-                    result = r
-            return result
+            return [
+                getattr(handle, method_name)(*args, **kwargs)
+                for handle in self._handles
+            ]
 
         return call
 
