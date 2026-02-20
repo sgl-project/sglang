@@ -439,7 +439,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             scale.format_ue8m0 = True
             layer.register_parameter("weight_scale_inv", scale)
-                layer.register_parameter("input_scale", None)
+            layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz

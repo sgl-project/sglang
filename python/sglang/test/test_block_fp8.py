@@ -457,6 +457,7 @@ class TestMXFP8DenseLinear(CustomTestCase):
         torch.set_default_device("cuda")
 
     def _mxfp8_dense_linear(self, M, NK, dtype, seed):
+        torch.cuda.empty_cache()
         N, K = NK
         torch.manual_seed(seed)
 
