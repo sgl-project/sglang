@@ -249,9 +249,11 @@ class _Dumper:
     def _handle_http_control_request(
         self, *, method: str, body: dict[str, Any]
     ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
+        if self._rpc_broadcast is not None:
+            return self._rpc_broadcast._handle_http_control_request_inner(
+                method=method, body=body
+            )
+        return [self._handle_http_control_request_inner(method=method, body=body)]
 
     def _handle_http_control_request_inner(
         self, *, method: str, body: dict[str, Any]
