@@ -39,7 +39,7 @@ NUM_TOKENS_RANGE = get_benchmark_range(
 # (num_experts, topk) — static dispatch + dynamic fallback
 EXPERT_CONFIGS = get_benchmark_range(
     full_range=[
-        (64, 2),   # static: small expert count
+        (64, 2),  # static: small expert count
         (128, 4),  # static: common config
         (256, 4),  # static: large power-of-2
     ],

@@ -161,12 +161,16 @@ def test_topk_softmax_with_softcapping(num_tokens, num_experts, topk, moe_softca
     topk_i = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
     topk_softmax(topk_w, topk_i, gating, moe_softcapping=moe_softcapping)
 
-    ref_w, ref_i = topk_softmax_ref(gating, topk, False, moe_softcapping=moe_softcapping)
+    ref_w, ref_i = topk_softmax_ref(
+        gating, topk, False, moe_softcapping=moe_softcapping
+    )
 
     assert torch.allclose(
         topk_w, ref_w, atol=1e-3, rtol=1e-3
     ), f"Weight mismatch with softcapping={moe_softcapping}"
-    assert torch.equal(topk_i, ref_i), f"Index mismatch with softcapping={moe_softcapping}"
+    assert torch.equal(
+        topk_i, ref_i
+    ), f"Index mismatch with softcapping={moe_softcapping}"
 
 
 # ---------------------------------------------------------------------------

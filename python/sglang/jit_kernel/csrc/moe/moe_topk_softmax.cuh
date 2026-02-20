@@ -478,8 +478,7 @@ namespace detail {
 template <typename T, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants {
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
-  static_assert(
-      EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
+  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
   static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
   static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
   static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
@@ -514,17 +513,36 @@ void topkGatingSoftmaxLauncherHelper(
 
   dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
   topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
-      input, finished, output, num_rows, indices, k, start_expert, end_expert, renormalize, moe_softcapping,
+      input,
+      finished,
+      output,
+      num_rows,
+      indices,
+      k,
+      start_expert,
+      end_expert,
+      renormalize,
+      moe_softcapping,
       correction_bias);
 }
 
 // ---------------------------------------------------------------------------
 // Static-dispatch launcher (switches on num_experts)
 // ---------------------------------------------------------------------------
-#define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)                               \
-  topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB>(                   \
-      gating_output, nullptr, topk_weights, topk_indices, num_tokens, topk, 0,        \
-      num_experts, renormalize, moe_softcapping, correction_bias, stream);
+#define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)             \
+  topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
+      gating_output,                                                \
+      nullptr,                                                      \
+      topk_weights,                                                 \
+      topk_indices,                                                 \
+      num_tokens,                                                   \
+      topk,                                                         \
+      0,                                                            \
+      num_experts,                                                  \
+      renormalize,                                                  \
+      moe_softcapping,                                              \
+      correction_bias,                                              \
+      stream);
 
 template <typename T>
 void topkGatingSoftmaxKernelLauncher(
@@ -571,12 +589,10 @@ void topkGatingSoftmaxKernelLauncher(
     default: {
       using namespace host;
       RuntimeCheck(
-          softmax_workspace != nullptr,
-          "softmax_workspace must be provided for num_experts that are not a power of 2");
+          softmax_workspace != nullptr, "softmax_workspace must be provided for num_experts that are not a power of 2");
       static constexpr int TPB = 256;
-      moeSoftmax<T, TPB>
-          <<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, softmax_workspace, num_experts, moe_softcapping,
-                                           correction_bias);
+      moeSoftmax<T, TPB><<<num_tokens, TPB, 0, stream>>>(
+          gating_output, nullptr, softmax_workspace, num_experts, moe_softcapping, correction_bias);
       if (topk == 1) {
         moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
             softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
@@ -626,8 +642,7 @@ void topk_softmax(
     RuntimeCheck(bias.dim() == 1, "correction_bias must be 1-D");
     RuntimeCheck(bias.shape()[0] == num_experts, "correction_bias size must equal num_experts");
     RuntimeCheck(
-        bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32,
-        "correction_bias must be float32");
+        bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32, "correction_bias must be float32");
   }
 
   const T* gating_ptr = static_cast<const T*>(gating_output.data_ptr());
