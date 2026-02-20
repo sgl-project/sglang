@@ -831,7 +831,7 @@ class TestDumperHttp:
         if request.param == "standalone":
             http_port = find_available_port(40000)
             base_url = f"http://127.0.0.1:{http_port}"
-            stop_event = multiprocessing.Event()
+            stop_event = multiprocessing.get_context("spawn").Event()
             thread = threading.Thread(
                 target=run_distributed_test,
                 args=(TestDumperHttp._standalone_mode_worker,),
