@@ -3,6 +3,7 @@
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -143,7 +144,8 @@ struct FloatVec {
 
   __device__ void fill(float v) {
 #pragma unroll
-    for (uint32_t i = 0; i < N; ++i) data[i] = v;
+    for (uint32_t i = 0; i < N; ++i)
+      data[i] = v;
   }
 
   __device__ void cast_load(const scalar_t* ptr) {
@@ -170,14 +172,18 @@ struct FloatVec {
     }
   }
 
-  __device__ float& operator[](uint32_t i) { return data[i]; }
-  __device__ const float& operator[](uint32_t i) const { return data[i]; }
+  __device__ float& operator[](uint32_t i) {
+    return data[i];
+  }
+  __device__ const float& operator[](uint32_t i) const {
+    return data[i];
+  }
 };
 
 template <typename scalar_t>
 __global__ void apply_shuffle_mul_sum_kernel(
-    const scalar_t* __restrict__ input,   // [m * topk, row_stride]
-    scalar_t* __restrict__ output,        // [m, row_stride]
+    const scalar_t* __restrict__ input,       // [m * topk, row_stride]
+    scalar_t* __restrict__ output,            // [m, row_stride]
     const int32_t* __restrict__ permutation,  // [m * topk]
     int m,
     int topk,
@@ -260,7 +266,8 @@ void prepare_moe_input(
 
   const int64_t topk_length = [&] {
     int64_t total = 1;
-    for (int d = 0; d < topk_ids.dim(); ++d) total *= topk_ids.size(d);
+    for (int d = 0; d < topk_ids.dim(); ++d)
+      total *= topk_ids.size(d);
     return total;
   }();
 
@@ -287,8 +294,7 @@ void prepare_moe_input(
     compute_expert_blockscale_offsets_kernel<<<1, 1, 0, stream>>>(
         problem_sizes1_ptr, expert_offsets_ptr, bs_offsets_ptr, atomic_ptr, num_experts);
   } else {
-    compute_expert_offsets_kernel<<<1, 1, 0, stream>>>(
-        problem_sizes1_ptr, expert_offsets_ptr, atomic_ptr, num_experts);
+    compute_expert_offsets_kernel<<<1, 1, 0, stream>>>(problem_sizes1_ptr, expert_offsets_ptr, atomic_ptr, num_experts);
   }
 
   compute_arg_sorts_kernel<<<num_blocks, num_threads, 0, stream>>>(
@@ -328,10 +334,7 @@ void shuffle_rows(TensorView input, TensorView dst2src_map, TensorView output) {
 
 template <typename scalar_t>
 static void launch_apply_shuffle_mul_sum(
-    TensorView input,
-    TensorView output,
-    TensorView permutation,
-    tvm::ffi::Optional<TensorView> factors) {
+    TensorView input, TensorView output, TensorView permutation, tvm::ffi::Optional<TensorView> factors) {
   using namespace host;
   const int m = static_cast<int>(output.size(0));
   const int topk_times_m = static_cast<int>(input.size(0));
@@ -339,12 +342,10 @@ static void launch_apply_shuffle_mul_sum(
   const int row_stride = static_cast<int>(output.size(1));
 
   constexpr uint32_t vec_size = 16u / sizeof(scalar_t);
-  const uint32_t block_threads = static_cast<uint32_t>(
-      std::min(static_cast<int>(row_stride / (int)vec_size), 1024));
+  const uint32_t block_threads = static_cast<uint32_t>(std::min(static_cast<int>(row_stride / (int)vec_size), 1024));
 
-  const scalar_t* factors_ptr = factors.has_value()
-      ? static_cast<const scalar_t*>(factors.value().data_ptr())
-      : nullptr;
+  const scalar_t* factors_ptr =
+      factors.has_value() ? static_cast<const scalar_t*>(factors.value().data_ptr()) : nullptr;
 
   cudaStream_t stream = LaunchKernel::resolve_device(input.device());
 
@@ -362,10 +363,7 @@ static void launch_apply_shuffle_mul_sum(
 }
 
 void apply_shuffle_mul_sum(
-    TensorView input,
-    TensorView output,
-    TensorView permutation,
-    tvm::ffi::Optional<TensorView> factors) {
+    TensorView input, TensorView output, TensorView permutation, tvm::ffi::Optional<TensorView> factors) {
   using namespace host;
 
   RuntimeCheck(input.dim() == 2, "input must be 2-D [m * topk, row_stride]");

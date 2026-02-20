@@ -63,7 +63,10 @@ STYLES = [(("blue", "--")), (("orange", "-"))] if AOT_AVAILABLE else [("blue", "
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens", "topk", "num_experts"],
-        x_vals=[(nt, tk, ne) for nt, (tk, ne) in itertools.product(NUM_TOKENS_RANGE, MOE_CONFIGS)],
+        x_vals=[
+            (nt, tk, ne)
+            for nt, (tk, ne) in itertools.product(NUM_TOKENS_RANGE, MOE_CONFIGS)
+        ],
         line_arg="provider",
         line_vals=LINE_VALS,
         line_names=LINE_NAMES,
@@ -73,10 +76,14 @@ STYLES = [(("blue", "--")), (("orange", "-"))] if AOT_AVAILABLE else [("blue", "
         args={},
     )
 )
-def bench_prepare_moe_input(num_tokens: int, topk: int, num_experts: int, provider: str):
+def bench_prepare_moe_input(
+    num_tokens: int, topk: int, num_experts: int, provider: str
+):
     device = "cuda"
     n, k = 4096, 4096
-    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device
+    )
 
     def alloc():
         return (
@@ -90,9 +97,13 @@ def bench_prepare_moe_input(num_tokens: int, topk: int, num_experts: int, provid
     eo, ps1, ps2, ip, op = alloc()
 
     if provider == "jit":
-        fn = lambda: prepare_moe_input_jit(topk_ids, eo, ps1, ps2, ip, op, num_experts, n, k)
+        fn = lambda: prepare_moe_input_jit(
+            topk_ids, eo, ps1, ps2, ip, op, num_experts, n, k
+        )
     elif provider == "aot":
-        fn = lambda: prepare_moe_input_aot(topk_ids, eo, ps1, ps2, ip, op, num_experts, n, k)
+        fn = lambda: prepare_moe_input_aot(
+            topk_ids, eo, ps1, ps2, ip, op, num_experts, n, k
+        )
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -210,8 +221,12 @@ def calculate_diff():
 
         eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit = alloc()
         eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot = alloc()
-        prepare_moe_input_jit(topk_ids, eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit, num_experts, n, k)
-        prepare_moe_input_aot(topk_ids, eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot, num_experts, n, k)
+        prepare_moe_input_jit(
+            topk_ids, eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit, num_experts, n, k
+        )
+        prepare_moe_input_aot(
+            topk_ids, eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot, num_experts, n, k
+        )
 
         match = torch.equal(eo_jit, eo_aot) and torch.equal(ps1_jit, ps1_aot)
         status = "OK" if match else "MISMATCH"
@@ -221,7 +236,10 @@ def calculate_diff():
         )
 
     # apply_shuffle_mul_sum
-    for dtype, m, topk, k in [(torch.bfloat16, 64, 4, 1024), (torch.float16, 128, 2, 512)]:
+    for dtype, m, topk, k in [
+        (torch.bfloat16, 64, 4, 1024),
+        (torch.float16, 128, 2, 512),
+    ]:
         perm = torch.randperm(m * topk, device=device).to(torch.int32)
         input_t = torch.randn((m * topk, k), dtype=dtype, device=device)
         factors = torch.rand((m * topk,), dtype=dtype, device=device)

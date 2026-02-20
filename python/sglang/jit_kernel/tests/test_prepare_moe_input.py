@@ -65,21 +65,31 @@ def prepare_moe_input_ref(topk_ids, num_experts, n, k):
         counts[eid] = (topk_flat == eid).sum()
 
     # Expert offsets (exclusive prefix sum)
-    expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int32, device=topk_ids.device)
+    expert_offsets = torch.zeros(
+        num_experts + 1, dtype=torch.int32, device=topk_ids.device
+    )
     for i in range(num_experts):
         expert_offsets[i + 1] = expert_offsets[i] + counts[i]
 
     # Problem sizes
-    problem_sizes1 = torch.zeros((num_experts, 3), dtype=torch.int32, device=topk_ids.device)
-    problem_sizes2 = torch.zeros((num_experts, 3), dtype=torch.int32, device=topk_ids.device)
+    problem_sizes1 = torch.zeros(
+        (num_experts, 3), dtype=torch.int32, device=topk_ids.device
+    )
+    problem_sizes2 = torch.zeros(
+        (num_experts, 3), dtype=torch.int32, device=topk_ids.device
+    )
     for eid in range(num_experts):
         c = counts[eid].item()
         problem_sizes1[eid] = torch.tensor([c, 2 * n, k], dtype=torch.int32)
         problem_sizes2[eid] = torch.tensor([c, k, n], dtype=torch.int32)
 
     # Permutations: sort topk_flat by expert
-    input_perm = torch.empty(num_tokens * topk, dtype=torch.int32, device=topk_ids.device)
-    output_perm = torch.empty(num_tokens * topk, dtype=torch.int32, device=topk_ids.device)
+    input_perm = torch.empty(
+        num_tokens * topk, dtype=torch.int32, device=topk_ids.device
+    )
+    output_perm = torch.empty(
+        num_tokens * topk, dtype=torch.int32, device=topk_ids.device
+    )
     expert_cursor = expert_offsets[:-1].clone()  # running offset per expert
     for i in range(num_tokens * topk):
         eid = topk_flat[i].item()
@@ -102,7 +112,9 @@ def prepare_moe_input_ref(topk_ids, num_experts, n, k):
 )
 def test_prepare_moe_input_vs_ref(num_tokens, topk, num_experts):
     torch.manual_seed(num_tokens * topk * num_experts)
-    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
     n, k = 128, 256
 
     expert_offsets_jit = torch.empty(num_experts + 1, dtype=torch.int32, device="cuda")
@@ -126,7 +138,9 @@ def test_prepare_moe_input_vs_ref(num_tokens, topk, num_experts):
     ref = prepare_moe_input_ref(topk_ids, num_experts, n, k)
     expert_offsets_ref, ps1_ref, ps2_ref, ip_ref, op_ref = ref
 
-    assert torch.equal(expert_offsets_jit, expert_offsets_ref), "expert_offsets mismatch"
+    assert torch.equal(
+        expert_offsets_jit, expert_offsets_ref
+    ), "expert_offsets mismatch"
     assert torch.equal(problem_sizes1_jit, ps1_ref), "problem_sizes1 mismatch"
     assert torch.equal(problem_sizes2_jit, ps2_ref), "problem_sizes2 mismatch"
     # Permutations may differ in tie-breaking order within an expert;
@@ -137,13 +151,17 @@ def test_prepare_moe_input_vs_ref(num_tokens, topk, num_experts):
     counts_ref = torch.bincount(
         topk_ids.flatten()[ip_ref.long()], minlength=num_experts
     )
-    assert torch.equal(counts_jit, counts_ref), "input_permutation expert counts mismatch"
+    assert torch.equal(
+        counts_jit, counts_ref
+    ), "input_permutation expert counts mismatch"
 
 
 def test_prepare_moe_input_with_blockscale_offsets():
     num_tokens, topk, num_experts = 64, 4, 8
     n, k = 128, 256
-    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
 
     expert_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device="cuda")
     blockscale_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device="cuda")
@@ -167,7 +185,9 @@ def test_prepare_moe_input_with_blockscale_offsets():
 
     # blockscale_offsets[i+1] - blockscale_offsets[i] must be a multiple of 128
     diffs = blockscale_offsets[1:] - blockscale_offsets[:-1]
-    assert (diffs % 128 == 0).all(), "blockscale_offsets spacing must be multiple of 128"
+    assert (
+        diffs % 128 == 0
+    ).all(), "blockscale_offsets spacing must be multiple of 128"
     assert blockscale_offsets[0].item() == 0, "blockscale_offsets must start at 0"
 
 
@@ -218,9 +238,9 @@ def test_apply_shuffle_mul_sum_vs_ref(dtype, m, topk, k):
 
     atol = 0.05 if dtype != torch.float32 else 1e-4
     rtol = 1e-2 if dtype != torch.float32 else 1e-4
-    assert torch.allclose(output_jit, ref, atol=atol, rtol=rtol), (
-        f"apply_shuffle_mul_sum mismatch (dtype={dtype}, m={m}, topk={topk}, k={k})"
-    )
+    assert torch.allclose(
+        output_jit, ref, atol=atol, rtol=rtol
+    ), f"apply_shuffle_mul_sum mismatch (dtype={dtype}, m={m}, topk={topk}, k={k})"
 
 
 def test_apply_shuffle_mul_sum_no_factors():
@@ -234,7 +254,9 @@ def test_apply_shuffle_mul_sum_no_factors():
 
     apply_shuffle_mul_sum(input_t, output, perm, None)
     ref = input_t[perm.long()].view(m, topk, k).sum(dim=1)
-    assert torch.allclose(output, ref, atol=1e-5), "apply_shuffle_mul_sum (no factors) mismatch"
+    assert torch.allclose(
+        output, ref, atol=1e-5
+    ), "apply_shuffle_mul_sum (no factors) mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +268,9 @@ def test_apply_shuffle_mul_sum_no_factors():
 @pytest.mark.parametrize("num_tokens, topk, num_experts", [(64, 4, 8), (256, 2, 16)])
 def test_prepare_moe_input_vs_aot(num_tokens, topk, num_experts):
     torch.manual_seed(42)
-    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
     n, k = 256, 512
 
     def alloc():
@@ -261,8 +285,12 @@ def test_prepare_moe_input_vs_aot(num_tokens, topk, num_experts):
     eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit = alloc()
     eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot = alloc()
 
-    prepare_moe_input(topk_ids, eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit, num_experts, n, k)
-    prepare_moe_input_aot(topk_ids, eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot, num_experts, n, k)
+    prepare_moe_input(
+        topk_ids, eo_jit, ps1_jit, ps2_jit, ip_jit, op_jit, num_experts, n, k
+    )
+    prepare_moe_input_aot(
+        topk_ids, eo_aot, ps1_aot, ps2_aot, ip_aot, op_aot, num_experts, n, k
+    )
 
     assert torch.equal(eo_jit, eo_aot), "expert_offsets mismatch vs AOT"
     assert torch.equal(ps1_jit, ps1_aot), "problem_sizes1 mismatch vs AOT"
@@ -278,7 +306,9 @@ def test_shuffle_rows_vs_aot(dtype):
 
     out_jit = shuffle_rows(input_t, dst2src, (128, 1024))
     out_aot = shuffle_rows_aot(input_t, dst2src, (128, 1024))
-    assert torch.equal(out_jit, out_aot), f"shuffle_rows vs AOT mismatch (dtype={dtype})"
+    assert torch.equal(
+        out_jit, out_aot
+    ), f"shuffle_rows vs AOT mismatch (dtype={dtype})"
 
 
 @pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel not available")
@@ -294,9 +324,9 @@ def test_apply_shuffle_mul_sum_vs_aot(dtype):
     out_aot = torch.empty((m, k), dtype=dtype, device="cuda")
     apply_shuffle_mul_sum(input_t, out_jit, perm, factors)
     apply_shuffle_mul_sum_aot(input_t, out_aot, perm, factors)
-    assert torch.allclose(out_jit, out_aot, atol=1e-3, rtol=1e-3), (
-        f"apply_shuffle_mul_sum vs AOT mismatch (dtype={dtype})"
-    )
+    assert torch.allclose(
+        out_jit, out_aot, atol=1e-3, rtol=1e-3
+    ), f"apply_shuffle_mul_sum vs AOT mismatch (dtype={dtype})"
 
 
 if __name__ == "__main__":
