@@ -17,35 +17,47 @@ namespace {
 // ---------------------------------------------------------------------------
 // moe_sum_kernel — one CTA per token, sums over topk expert outputs
 // ---------------------------------------------------------------------------
+// Grid is (num_tokens * hidden_blocks,) where hidden_blocks = ceil(hidden_size / blockDim.x).
+// Each block handles one (token, hidden-slice) pair, giving one element per thread and
+// maximizing parallelism for small token counts (e.g. tokens=1 with large hidden_size).
 template <typename T, int TOPK>
 __global__ void moe_sum_kernel(
     T* __restrict__ out,          // [num_tokens, hidden_size]
     const T* __restrict__ input,  // [num_tokens, topk, hidden_size]
-    const int hidden_size) {
-  const int64_t token_idx = blockIdx.x;
-  for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
+    const int hidden_size,
+    const int hidden_blocks) {
+  const int h_block = blockIdx.x % hidden_blocks;
+  const int64_t token_idx = blockIdx.x / hidden_blocks;
+  const int idx = h_block * blockDim.x + threadIdx.x;
+  if (idx >= hidden_size) return;
+
+  float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll
-    for (int k = 0; k < TOPK; ++k) {
-      x += static_cast<float>(__ldg(&input[token_idx * TOPK * hidden_size + k * hidden_size + idx]));
-    }
-    out[token_idx * hidden_size + idx] = static_cast<T>(x);
+  for (int k = 0; k < TOPK; ++k) {
+    x += static_cast<float>(__ldg(&input[token_idx * TOPK * hidden_size + k * hidden_size + idx]));
   }
+  out[token_idx * hidden_size + idx] = static_cast<T>(x);
 }
 
 // General fallback for topk not covered by static dispatch
 template <typename T>
-__global__ void
-moe_sum_kernel_general(T* __restrict__ out, const T* __restrict__ input, const int hidden_size, const int topk) {
-  const int64_t token_idx = blockIdx.x;
-  for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
+__global__ void moe_sum_kernel_general(
+    T* __restrict__ out,
+    const T* __restrict__ input,
+    const int hidden_size,
+    const int topk,
+    const int hidden_blocks) {
+  const int h_block = blockIdx.x % hidden_blocks;
+  const int64_t token_idx = blockIdx.x / hidden_blocks;
+  const int idx = h_block * blockDim.x + threadIdx.x;
+  if (idx >= hidden_size) return;
+
+  float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll 1
-    for (int k = 0; k < topk; ++k) {
-      x += static_cast<float>(__ldg(&input[token_idx * topk * hidden_size + k * hidden_size + idx]));
-    }
-    out[token_idx * hidden_size + idx] = static_cast<T>(x);
+  for (int k = 0; k < topk; ++k) {
+    x += static_cast<float>(__ldg(&input[token_idx * topk * hidden_size + k * hidden_size + idx]));
   }
+  out[token_idx * hidden_size + idx] = static_cast<T>(x);
 }
 
 }  // namespace
@@ -70,40 +82,29 @@ void moe_sum(TensorView input, TensorView output) {
   const T* in_ptr = static_cast<const T*>(input.data_ptr());
   T* out_ptr = static_cast<T*>(output.data_ptr());
 
-  dim3 grid(static_cast<unsigned>(num_tokens));
-  dim3 block(static_cast<unsigned>(std::min(hidden_size, 1024)));
+  constexpr int block_size = 1024;
+  const int hidden_blocks = (hidden_size + block_size - 1) / block_size;
+  dim3 grid(static_cast<unsigned>(num_tokens) * static_cast<unsigned>(hidden_blocks));
+  dim3 block(static_cast<unsigned>(std::min(hidden_size, block_size)));
 
   cudaStream_t stream = LaunchKernel::resolve_device(input.device());
 
+#define LAUNCH(TOPK) \
+  moe_sum_kernel<T, TOPK><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, hidden_blocks)
+
   switch (topk) {
-    case 1:
-      moe_sum_kernel<T, 1><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 2:
-      moe_sum_kernel<T, 2><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 3:
-      moe_sum_kernel<T, 3><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 4:
-      moe_sum_kernel<T, 4><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 5:
-      moe_sum_kernel<T, 5><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 6:
-      moe_sum_kernel<T, 6><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 7:
-      moe_sum_kernel<T, 7><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 8:
-      moe_sum_kernel<T, 8><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
-    case 9:
-      moe_sum_kernel<T, 9><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size);
-      break;
+    case 1: LAUNCH(1); break;
+    case 2: LAUNCH(2); break;
+    case 3: LAUNCH(3); break;
+    case 4: LAUNCH(4); break;
+    case 5: LAUNCH(5); break;
+    case 6: LAUNCH(6); break;
+    case 7: LAUNCH(7); break;
+    case 8: LAUNCH(8); break;
+    case 9: LAUNCH(9); break;
     default:
-      moe_sum_kernel_general<T><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, topk);
+      moe_sum_kernel_general<T><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, topk, hidden_blocks);
   }
+
+#undef LAUNCH
 }
