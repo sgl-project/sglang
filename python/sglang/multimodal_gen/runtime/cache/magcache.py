@@ -73,6 +73,7 @@ class MagCacheMixin:
         self.max_skip_steps = magcache_params.max_skip_steps
         self.mag_ratios = magcache_params.mag_ratios
         self.use_ret_steps = magcache_params.use_ret_steps
+        ic(self.mag_ratios)
 
         # cnt = step * 2 + branch_offset, so ranges over [0, num_steps*2)
         # min_steps and max_steps must be in the same cnt space

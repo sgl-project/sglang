@@ -120,12 +120,16 @@ class CachableDiT(MagCacheMixin, TeaCacheMixin, BaseDiT):
         )
 
         if self.cache_type == "teacache":
-            self._init_teacache_state()
+            self._init_teacache_state(server_args.magcache_params)
         elif self.cache_type == "magcache":
-            # self._init_magcache_state()
-            from sglang.multimodal_gen.configs.sample.magcache import WanMagCacheParams
             ic('running magcache init')
-            self.init(WanMagCacheParams())
+            from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+            model_sampling_params = SamplingParams.from_pretrained(
+                server_args.model_path, backend=server_args.backend
+            )
+            magcache_params = getattr(model_sampling_params, "magcache_params", None) or server_args.magcache_params
+            ic(magcache_params)
+            self.init(magcache_params)
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""

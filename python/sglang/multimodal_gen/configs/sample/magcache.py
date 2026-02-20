@@ -2,12 +2,10 @@
 from dataclasses import dataclass
 import json
 import os
-import torch
-
 from sglang.multimodal_gen.configs.sample.sampling_params import CacheParams
 
 # from https://github.com/Zehong-Ma/MagCache/blob/df81cb181776c2c61477c08e1d21f87fda1cd938/MagCache4Wan2.1/magcache_generate.py#L912
-T2V_13B_MAG_RATIOS = torch.tensor([
+T2V_13B_MAG_RATIOS = [
     1.0, 1.0,
     1.0124, 1.02213, 1.00166, 1.0041, 0.99791, 1.00061, 0.99682, 0.99762,
     0.99634, 0.99685, 0.99567, 0.99586, 0.99416, 0.99422, 0.99578, 0.99575,
@@ -22,19 +20,20 @@ T2V_13B_MAG_RATIOS = torch.tensor([
     0.97003, 0.97002, 0.96538, 0.96541, 0.9593, 0.95933, 0.95086, 0.95089,
     0.94013, 0.94019, 0.92402, 0.92414, 0.90241, 0.9026, 0.86821, 0.86868,
     0.81838, 0.81939
-])
+]
 
 NUM_STEPS = 50
 
-def nearest_interp(data:torch.Tensor, target_len:int):
+def nearest_interp(data: list[float], target_len: int) -> list[float]:
     """Simple nearest neighbor interpolation for 1D arrays."""
-    indices = torch.linspace(0, len(data) - 1, target_len)
-    return data[torch.round(indices).long()]
+    n = len(data)
+    indices = [round(i * (n - 1) / (target_len - 1)) for i in range(target_len)]
+    return [data[i] for i in indices]
 
-def get_interpolated_mag_ratios(sample_steps:int, raw_ratios=T2V_13B_MAG_RATIOS):
+def get_interpolated_mag_ratios(sample_steps: int, raw_ratios: list[float] = T2V_13B_MAG_RATIOS) -> list[float]:
     """
     Interpolates magnitude ratios to match the number of sampling steps.
-    Returns a flattened array of [cond, uncond] pairs.
+    Returns a flattened list of [cond, uncond] pairs.
     """
     # The original logic assumes ratios are stored as [cond, uncond, cond, uncond...]
     # If the current total length doesn't match steps * 2, interpolate
@@ -44,15 +43,15 @@ def get_interpolated_mag_ratios(sample_steps:int, raw_ratios=T2V_13B_MAG_RATIOS)
         mag_ratio_ucon = nearest_interp(raw_ratios[1::2], sample_steps)
 
         # Zip them back together and flatten
-        return torch.stack([mag_ratio_con, mag_ratio_ucon], dim=1).flatten()
+        return [v for pair in zip(mag_ratio_con, mag_ratio_ucon) for v in pair]
     return raw_ratios
 
 
-def load_mag_ratios(jsonl_path: str) -> torch.Tensor:
-    """Read calibration JSONL and return a 1D tensor of mag ratios indexed by cnt."""
+def load_mag_ratios(jsonl_path: str) -> list[float]:
+    """Read calibration JSONL and return a list of mag ratios indexed by cnt."""
     records = [json.loads(l) for l in open(jsonl_path) if l.strip()]
     records.sort(key=lambda r: r["cnt"])
-    return torch.tensor([r["mag_ratio"] for r in records])
+    return [r["mag_ratio"] for r in records]
 
 
 @dataclass
@@ -77,7 +76,7 @@ class MagCacheParams(CacheParams):
     max_skip_steps: int = 4
     retention_ratio: float = 0.2
     num_steps: int = NUM_STEPS # Hardcoded for now
-    mag_ratios: torch.Tensor | None = None
+    mag_ratios: list[float] | None = None
     use_ret_steps: bool = True
 
 

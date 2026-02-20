@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
+
 @dataclass
 class FluxSamplingParams(SamplingParams):
     num_frames: int = 1
