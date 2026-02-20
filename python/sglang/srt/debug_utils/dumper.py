@@ -623,17 +623,15 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     )
 
     if _get_rank() == 0:
-        handler_class = _make_dumper_http_handler(rpc_handles=rpc_handles)
+        handler_class = _make_rpc_http_handler(prefix="/dumper/", rpc_handles=rpc_handles)
         server = HTTPServer(("0.0.0.0", http_port), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"[Dumper] HTTP server started on port {http_port}")
 
 
-def _make_dumper_http_handler(rpc_handles):
-    prefix = "/dumper/"
-
-    class _DumperHTTPHandler(BaseHTTPRequestHandler):
+def _make_rpc_http_handler(*, prefix: str, rpc_handles):
+    class _RpcHTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             if not self.path.startswith(prefix):
                 self.send_error(404)
@@ -655,7 +653,7 @@ def _make_dumper_http_handler(rpc_handles):
                 return {}
             return json.loads(self.rfile.read(content_length))
 
-    return _DumperHTTPHandler
+    return _RpcHTTPHandler
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
