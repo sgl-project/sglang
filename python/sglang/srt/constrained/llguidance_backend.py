@@ -49,18 +49,36 @@ class GuidanceGrammar(BaseGrammarObject):
             self.serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
+        self._check_err()
+
         self.bitmask = None
+        self.eos_token = self.llguidance_tokenizer.eos_token
 
     def accept_token(self, token: int):
-        if not self.ll_matcher.consume_token(token):
-            logger.warning(f"matcher error: {self.ll_matcher.get_error()}")
+        if self.finished:
+            return
+        if self.ll_matcher.is_stopped() and token == self.eos_token:
             self.finished = True
+            return
+        self.ll_matcher.consume_token(token)
+        self._check_err()
+
+    def rollback(self, num_tokens: int) -> None:
+        if num_tokens <= 0:
+            return
+        if self.finished:
+            self.finished = False
+            # EOS token after stop isn't tracked in ll_matcher
+            num_tokens -= 1
+        self.ll_matcher.rollback(num_tokens)
+        self._check_err()
+
+    def is_terminated(self):
+        return self.finished
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        if self.ll_matcher.is_stopped():
-            self.finished = True
-
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)
+        self._check_err()
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
@@ -105,6 +123,10 @@ class GuidanceGrammar(BaseGrammarObject):
     ):
         pass
 
+    def _check_err(self) -> None:
+        if self.ll_matcher.is_error():
+            raise ValueError(f"LLGuidance matcher error: {self.ll_matcher.get_error()}")
+
 
 class GuidanceBackend(BaseGrammarBackend):
 
@@ -114,12 +136,14 @@ class GuidanceBackend(BaseGrammarBackend):
         any_whitespace: bool = True,
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
+        lenient: bool = True,
     ):
         super().__init__()
 
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
+        self.lenient = lenient
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
     def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
@@ -139,6 +163,7 @@ class GuidanceBackend(BaseGrammarBackend):
                 defaults={
                     "whitespace_flexible": self.any_whitespace,
                     "whitespace_pattern": self.whitespace_pattern,
+                    "lenient": self.lenient,
                 },
             )
         except Exception as e:
