@@ -261,6 +261,19 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+            # For FlashInfer GDN backend, make the pool K-contiguous so that
+            # .transpose(-2,-1) yields a standard C-contiguous VK view directly
+            # compatible with gated_delta_rule_mtp (PRETRANSPOSE convention).
+            from sglang.srt.server_args import get_global_server_args
+
+            _use_flashinfer_gdn = (
+                len(temporal_state_shape) == 3
+                and get_global_server_args().gdn_backend == "flashinfer"
+            )
+            if _use_flashinfer_gdn:
+                temporal_state = (
+                    temporal_state.transpose(-2, -1).contiguous().transpose(-2, -1)
+                )
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
@@ -276,6 +289,12 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
+                if _use_flashinfer_gdn:
+                    intermediate_ssm_state_cache = (
+                        intermediate_ssm_state_cache.transpose(-2, -1)
+                        .contiguous()
+                        .transpose(-2, -1)
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [

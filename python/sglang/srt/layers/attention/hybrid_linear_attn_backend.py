@@ -915,11 +915,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # a, b: [B, HV] → [B, 1, HV]
             a_fi = a.unsqueeze(1)
             b_fi = b.unsqueeze(1)
+            # K-contiguous pool: .transpose(-2,-1) gives standard C-contiguous
+            # [pool_size, HV, V, K] view expected by gated_delta_rule_mtp.
             core_attn_out, _ = self._flashinfer_mtp(
                 q=query,
                 k=key,
                 v=value,
-                initial_state=ssm_states,
+                initial_state=ssm_states.transpose(-2, -1),
                 initial_state_indices=cache_indices.to(torch.int32),
                 A_log=layer.A_log,
                 a=a_fi,
@@ -1062,17 +1064,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # a, b: [N*T, HV] → [N, T, HV]
             a_fi = a.view(n_seqs, draft_token_num, -1)
             b_fi = b.view(n_seqs, draft_token_num, -1)
+            # K-contiguous pool: .transpose(-2,-1) gives standard C-contiguous
+            # VK views expected by gated_delta_rule_mtp (PRETRANSPOSE convention).
             core_attn_out, _ = self._flashinfer_mtp(
                 q=query,
                 k=key,
                 v=value,
-                initial_state=ssm_states,
+                initial_state=ssm_states.transpose(-2, -1),
                 initial_state_indices=cache_indices[:n_seqs].to(torch.int32),
                 A_log=layer.A_log,
                 a=a_fi,
                 dt_bias=layer.dt_bias,
                 b=b_fi,
-                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_states_buffer=intermediate_state_cache.transpose(-2, -1),
                 disable_state_update=True,
                 use_qk_l2norm=True,
             )
@@ -1101,12 +1105,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
             else:
-                # Only cuda env uses fuse ssm_states update
-                recurrent_state = ssm_states
-                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-                if is_npu() or is_cpu():
+                # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
+                # FlashInfer/NPU/CPU: gather active entries (implicit K→V contiguous
+                # conversion for flashinfer's K-contiguous pool), run FLA, then scatter
+                # last_recurrent_state back (implicit V→K conversion).
+                use_gather_scatter = (
+                    self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
+                )
+                if use_gather_scatter:
                     recurrent_state = ssm_states[cache_indices]
                     recurrent_state_indices_args = {}
+                else:
+                    recurrent_state = ssm_states
+                    recurrent_state_indices_args = {"initial_state_indices": cache_indices}
                 core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
                     q=query,
                     k=key,
@@ -1119,11 +1130,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     use_qk_l2norm_in_kernel=True,
                     **recurrent_state_indices_args,
                 )
-                if is_npu() or is_cpu():
-                    last_recurrent_state = last_recurrent_state.to(
+                if use_gather_scatter:
+                    ssm_states[cache_indices] = last_recurrent_state.to(
                         ssm_states.dtype, copy=False
                     )
-                    ssm_states[cache_indices] = last_recurrent_state
 
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
