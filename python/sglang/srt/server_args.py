@@ -1586,20 +1586,19 @@ class ServerArgs:
             ]:
                 sm100_default_attn_backend = "triton"
                 if is_sm100_supported():
-                    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1
-                    # Use trtllm_mha only if radix cache is disabled because MambaRadixCache
-                    # requires page_size = 1 which trtllm_mha does not support. Radix cache
-                    # is also disabled when there is no extra buffer and spec decoding is enabled.
+                    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
+                    # _get_default_attn_backend handles the eagle_topk check.
+                    # There is only one case where page_size=1 is required,
+                    # which is when radix cache is enabled and both extra_buffer
+                    # and spec decoding are disabled.
                     default_attn_backend = self._get_default_attn_backend(
                         use_mla_backend=self.use_mla_backend(),
                         model_config=self.get_model_config(),
                     )
-                    if default_attn_backend == "trtllm_mha" and (
-                        self.disable_radix_cache
-                        or (
-                            not self.enable_mamba_extra_buffer()
-                            and self.speculative_algorithm
-                        )
+                    if default_attn_backend == "trtllm_mha" and not (
+                        not self.enable_mamba_extra_buffer()
+                        and not self.disable_radix_cache
+                        and self.speculative_algorithm is None
                     ):
                         sm100_default_attn_backend = "trtllm_mha"
 
