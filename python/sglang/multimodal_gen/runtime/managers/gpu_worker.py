@@ -43,7 +43,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
+from sglang.multimodal_gen.runtime.utils.common import (
+    get_diffusion_metrics_collector,
+    set_cuda_arch,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -79,6 +82,11 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.metrics_collector = (
+            get_diffusion_metrics_collector(server_args)
+            if server_args.enable_metrics and rank == 0
+            else None
+        )
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -88,6 +96,8 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+
+        self._update_lora_metrics()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -199,7 +209,7 @@ class GPUWorker:
         logger.info(
             f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb/peak_reserved_gb*100:.1f}%), "
+            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
@@ -212,11 +222,11 @@ class GPUWorker:
         assert self.pipeline is not None
         req = batch[0]
         output_batch = None
+        status = "success"
+        start_time = time.monotonic()
         try:
             if self.rank == 0:
                 torch.get_device_module().reset_peak_memory_stats()
-
-            start_time = time.monotonic()
 
             # capture memory baseline before forward
             if self.rank == 0 and req.metrics:
@@ -274,7 +284,10 @@ class GPUWorker:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+            if output_batch is not None and output_batch.error is not None:
+                status = "error"
         except Exception as e:
+            status = "error"
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
@@ -283,7 +296,24 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_request(
+                    status=status,
+                    is_warmup=req.is_warmup,
+                    latency_s=time.monotonic() - start_time,
+                )
         return output_batch
+
+    def _update_lora_metrics(self):
+        if self.metrics_collector is None:
+            return
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            self.metrics_collector.clear_lora_status()
+            return
+
+        self.metrics_collector.update_lora_status(self.pipeline.get_lora_status())
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -339,6 +369,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -354,6 +385,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -366,6 +398,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def list_loras(self) -> OutputBatch:

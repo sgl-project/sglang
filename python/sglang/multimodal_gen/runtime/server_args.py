@@ -327,6 +327,7 @@ class ServerArgs:
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -857,6 +858,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Enable Prometheus metrics endpoint at /metrics.",
         )
         parser.add_argument(
             "--webui",

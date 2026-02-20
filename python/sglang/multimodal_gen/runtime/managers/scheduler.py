@@ -4,6 +4,7 @@
 import asyncio
 import os
 import pickle
+import time
 from collections import deque
 from copy import deepcopy
 from typing import Any, List
@@ -34,7 +35,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.common import (
+    get_diffusion_metrics_collector,
+    get_zmq_socket,
+)
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
@@ -101,6 +105,8 @@ class Scheduler:
 
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
+        self._generation_waiting_count = 0
+        self._generation_enqueue_timestamps: dict[int, float] = {}
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -109,6 +115,15 @@ class Scheduler:
         self._warmup_processed = 0
 
         self.prepare_server_warmup_reqs()
+
+        self.metrics_collector = (
+            get_diffusion_metrics_collector(server_args)
+            if server_args.enable_metrics and gpu_id == 0
+            else None
+        )
+        if self.metrics_collector is not None:
+            self.metrics_collector.set_queue_depth(self._generation_waiting_count)
+            self.metrics_collector.set_running_reqs(0)
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
@@ -187,8 +202,31 @@ class Scheduler:
 
         # pop the first (earliest)
         item = self.waiting_queue.popleft()
+        self._on_req_dequeued(item[1])
+        if self.metrics_collector is not None:
+            self.metrics_collector.set_queue_depth(self._generation_waiting_count)
 
         return [item]
+
+    def _on_req_enqueued(self, req: Any) -> None:
+        if not isinstance(req, Req):
+            return
+        self._generation_waiting_count += 1
+        self._generation_enqueue_timestamps[id(req)] = time.monotonic()
+
+    def _on_req_dequeued(self, req: Any) -> None:
+        if not isinstance(req, Req):
+            return
+        if self._generation_waiting_count > 0:
+            self._generation_waiting_count -= 1
+        enqueue_ts = self._generation_enqueue_timestamps.pop(id(req), None)
+        if enqueue_ts is not None and self.metrics_collector is not None:
+            self.metrics_collector.observe_queue_time(time.monotonic() - enqueue_ts)
+
+    def _enqueue_received_reqs(self, new_reqs: list[tuple[bytes, Any]]) -> None:
+        self.waiting_queue.extend(new_reqs)
+        for _, req in new_reqs:
+            self._on_req_enqueued(req)
 
     def prepare_server_warmup_reqs(self):
         if (
@@ -235,6 +273,7 @@ class Scheduler:
                     )
                 req.set_as_warmup()
                 self.waiting_queue.append((None, req))
+                self._on_req_enqueued(req)
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 
@@ -334,7 +373,11 @@ class Scheduler:
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
-                self.waiting_queue.extend(new_reqs)
+                self._enqueue_received_reqs(new_reqs)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.set_queue_depth(
+                        self._generation_waiting_count
+                    )
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
@@ -362,60 +405,72 @@ class Scheduler:
 
             identities = [item[0] for item in items]
             reqs = [item[1] for item in items]
+            generation_running_reqs = sum(1 for req in reqs if isinstance(req, Req))
+            if self.metrics_collector is not None:
+                self.metrics_collector.set_running_reqs(generation_running_reqs)
 
             try:
-                processed_req = reqs[0]
-                handler = self.request_handlers.get(type(processed_req))
-                if handler:
-                    output_batch = handler(reqs)
-                else:
-                    output_batch = OutputBatch(
-                        error=f"Unknown request type: {type(processed_req)}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Error executing request in scheduler event loop: {e}",
-                    exc_info=True,
-                )
-                # Determine appropriate error response format
-                output_batch = (
-                    OutputBatch(error=str(e))
-                    if reqs and isinstance(reqs[0], Req)
-                    else OutputBatch(error=str(e))
-                )
-
-            # 3. return results
-            try:
-                # log warmup info
-                is_warmup = (
-                    processed_req.is_warmup if isinstance(processed_req, Req) else False
-                )
-                if is_warmup:
-                    if output_batch.error is None:
-                        if self._warmup_total > 0:
-                            logger.info(
-                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.metrics.total_duration_s,
-                            )
-                        else:
-                            logger.info(
-                                f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.metrics.total_duration_s,
-                            )
+                try:
+                    processed_req = reqs[0]
+                    handler = self.request_handlers.get(type(processed_req))
+                    if handler:
+                        output_batch = handler(reqs)
                     else:
-                        if self._warmup_total > 0:
-                            logger.info(
-                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
-                            )
-                        else:
-                            logger.info(f"Warmup req processing failed")
+                        output_batch = OutputBatch(
+                            error=f"Unknown request type: {type(processed_req)}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Error executing request in scheduler event loop: {e}",
+                        exc_info=True,
+                    )
+                    # Determine appropriate error response format
+                    output_batch = (
+                        OutputBatch(error=str(e))
+                        if reqs and isinstance(reqs[0], Req)
+                        else OutputBatch(error=str(e))
+                    )
 
-                # TODO: Support sending back to multiple identities if batched
-                self.return_result(output_batch, identities[0], is_warmup=is_warmup)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
-                continue
+                # 3. return results
+                try:
+                    # log warmup info
+                    is_warmup = (
+                        processed_req.is_warmup
+                        if isinstance(processed_req, Req)
+                        else False
+                    )
+                    if is_warmup:
+                        if output_batch.error is None:
+                            if self._warmup_total > 0:
+                                logger.info(
+                                    f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
+                                    output_batch.metrics.total_duration_s,
+                                )
+                            else:
+                                logger.info(
+                                    f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
+                                    output_batch.metrics.total_duration_s,
+                                )
+                        else:
+                            if self._warmup_total > 0:
+                                logger.info(
+                                    f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
+                                )
+                            else:
+                                logger.info(f"Warmup req processing failed")
+
+                    # TODO: Support sending back to multiple identities if batched
+                    self.return_result(output_batch, identities[0], is_warmup=is_warmup)
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
+            finally:
+                if self.metrics_collector is not None:
+                    self.metrics_collector.set_running_reqs(0)
+                    self.metrics_collector.set_queue_depth(
+                        self._generation_waiting_count
+                    )
 
         if self.receiver is not None:
             self.receiver.close()
