@@ -544,27 +544,16 @@ class _HookDumper:
 
         try:
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+            from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
             if isinstance(value, LogitsProcessorOutput):
                 return {name: value.next_token_logits}
-        except ImportError:
-            pass
-
-        try:
-            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
             if isinstance(value, ForwardBatch):
                 return {
                     f"{name}.forward_batch_info.input_ids": value.input_ids,
                     f"{name}.forward_batch_info.seq_lens": value.seq_lens,
                     f"{name}.forward_batch_info.positions": value.positions,
                 }
-        except ImportError:
-            pass
-
-        try:
-            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-
             if isinstance(value, PPProxyTensors):
                 return {
                     f"{name}.pp_proxy_tensors.{k}": v
