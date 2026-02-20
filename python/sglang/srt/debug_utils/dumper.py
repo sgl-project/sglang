@@ -720,7 +720,7 @@ def _make_http_handler(*, prefix: str, target):
 
 def _create_zmq_rpc_broadcast(
     handler, base_port: int, timeout_seconds: int = 60
-) -> Optional[_ZmqRpcBroadcast]:
+) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
