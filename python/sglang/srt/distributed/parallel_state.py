@@ -21,6 +21,7 @@ If you only need to use the distributed environment without model/pipeline
  parallelism, you can skip the model parallel initialization and destruction
  steps.
 """
+
 import contextlib
 import gc
 import logging
@@ -40,6 +41,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -79,7 +81,7 @@ class P2PWork:
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]]
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -611,6 +613,9 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
+        elif is_in_piecewise_cuda_graph():
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -628,7 +633,8 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm])
+        pynccl_comm = self.pynccl_comm
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -638,9 +644,14 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
-        else:
+        elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pynccl":
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                out = pynccl_comm.outplace_all_reduce(input_)
         assert out is not None
         return out
 

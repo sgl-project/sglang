@@ -15,7 +15,9 @@ from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 ImageWithPatches = tuple[Image.Image, list[Image.Image], list[int] | None]
 

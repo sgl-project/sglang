@@ -41,6 +41,17 @@ class AttentionBackendEnum(enum.Enum):
     def __str__(self):
         return self.name.lower()
 
+    @property
+    def is_sparse(self) -> bool:
+        return self in {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SLA_ATTN,
+            AttentionBackendEnum.SAGE_SLA_ATTN,
+        }
+
 
 class PlatformEnum(enum.Enum):
     CUDA = enum.auto()

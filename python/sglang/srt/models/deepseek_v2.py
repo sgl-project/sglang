@@ -15,6 +15,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
+
 from __future__ import annotations
 
 import logging
@@ -245,10 +246,14 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+        if not hasattr(self.gate_up_proj, "weight") and hasattr(
+            self.gate_up_proj, "weight_packed"
+        ):
+            self.gate_up_proj.weight = self.gate_up_proj.weight_packed
+        if not hasattr(self.down_proj, "weight") and hasattr(
+            self.down_proj, "weight_packed"
+        ):
+            self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -946,6 +951,7 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
+
         if shared_output is not None:
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
@@ -1049,10 +1055,20 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
+        if get_moe_a2a_backend().is_mori():
+            num_tokens = state.pop("num_tokens")
+            final_hidden_states = final_hidden_states[:num_tokens]
+
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            if _use_aiter:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
+        elif _use_aiter:
+            # fused in aiter_biased_grouped_topk so we can skip here
+            pass
         else:
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1488,6 +1504,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+        if self.current_attention_backend == "nsa":
+            return (
+                get_global_server_args().nsa_decode_backend == "trtllm"
+                or get_global_server_args().nsa_prefill_backend == "trtllm"
+            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+
         return (
             self.current_attention_backend == "trtllm_mla"
             and (
@@ -2438,6 +2460,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
+        state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(
                 forward_batch=forward_batch,
