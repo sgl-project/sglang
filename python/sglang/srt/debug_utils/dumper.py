@@ -105,7 +105,7 @@ class _DumperConfig(_FrozenConfig):
 
     @classmethod
     def _env_prefix(cls) -> str:
-        return "SGLANG_DUMPER_"
+        return "DUMPER_"
 
     @property
     def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
@@ -136,10 +136,10 @@ class _Dumper:
     ```
 
     Then run the program:
-    `SGLANG_DUMPER_ENABLE=1 python ...`
+    `DUMPER_ENABLE=1 python ...`
 
     Auto-cleanup old dumps before first write:
-    `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
+    `DUMPER_CLEANUP_PREVIOUS=1 python ...`
 
     Alternatively, disable at startup and configure via HTTP:
     1. `python ...`
@@ -429,7 +429,7 @@ class _Dumper:
     def _static_meta(self) -> dict:
         return _compute_static_meta()
 
-    # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
+    # Even if DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
     def _ensure_http_server(self):
         if self._http_server_handled:
             return
@@ -441,7 +441,7 @@ class _Dumper:
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
             self,
-            base_port=get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800),
+            base_port=get_int_env_var("DUMPER_ZMQ_BASE_PORT", 16800),
             timeout_seconds=self._config.collective_timeout,
         )
 
