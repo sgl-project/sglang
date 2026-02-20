@@ -217,6 +217,8 @@ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
+GDN_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -523,6 +525,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    gdn_backend: str = "triton"
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -4247,6 +4250,16 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--gdn-backend",
+            type=str,
+            choices=GDN_BACKEND_CHOICES,
+            default=ServerArgs.gdn_backend,
+            help="Choose the GDN (Gated Delta Networks) kernel backend. "
+            "Options: 'triton' (default, FLA Triton kernels), "
+            "'cutedsl' (CuTe DSL kernels, same as SGLANG_USE_CUTEDSL_GDN_DECODE=1), "
+            "'flashinfer' (FlashInfer VK-layout kernels).",
         )
 
         # Hierarchical cache
