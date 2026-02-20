@@ -230,18 +230,14 @@ class Indexer(MultiPlatformOp):
             yield
 
     def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
-        try:
-            from deep_gemm import bf16_gemm_nt
-        except ImportError:
-            bf16_gemm_nt = None
-        if bf16_gemm_nt is not None:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             weight = self.weights_proj.weight
             out = torch.empty(
                 (x.shape[0], weight.shape[0]),
                 dtype=torch.float32,
                 device=x.device,
             )
-            bf16_gemm_nt(x, weight, out)
+            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
             return out
 
         if _is_hip:
