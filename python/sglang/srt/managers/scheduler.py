@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -182,6 +183,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.auto_eagle import AutoTunerEagle
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -326,6 +328,14 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+
+        # auto_spec server args
+        self.auto_spec = server_args.auto_spec
+        if self.auto_spec:
+            self.spec_auto_tuner = AutoTunerEagle(server_args)
+            server_args.spec_auto_tuner = self.spec_auto_tuner
+        # add idle flag, auto_spec tune results will be saved to file when idle
+        self.last_loop_is_idle = True
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1122,9 +1132,19 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.last_loop_is_idle = False
             else:
+                if not self.last_loop_is_idle and self.server_args.save_tune_results:
+                    with open(
+                        self.model_worker.spec_auto_tuner.spec_tune_file, "w"
+                    ) as f:
+                        logger.info(
+                            f"[AUTOSPEC] auto tune results saved to file: {self.model_worker.spec_auto_tuner.spec_tune_file}"
+                        )
+                        json.dump(self.model_worker.spec_auto_tuner.results, f)
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self.last_loop_is_idle = True
 
             # Update last_batch
             self.last_batch = batch
@@ -2461,6 +2481,22 @@ class Scheduler(
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
+
+        if (
+            self.auto_spec
+            and batch.forward_mode.is_decode()
+            and self.model_worker.spec_auto_tuner.enable_watch_for_batch(
+                batch.batch_size()
+            )
+        ):
+            accept_length, accept_rate, throughput = self.get_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                self.model_worker.speculative_num_draft_tokens,
+            )
+            self.model_worker.spec_auto_tuner.compute_and_update_best_parameters(
+                batch.batch_size(), accept_length, accept_rate, throughput
+            )
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
