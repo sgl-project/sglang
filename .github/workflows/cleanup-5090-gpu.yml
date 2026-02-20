@@ -1,0 +1,38 @@
+name: Cleanup 5090 GPU Memory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup-gpu:
+    runs-on: 1-gpu-5090
+    strategy:
+      matrix:
+        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      fail-fast: false
+    timeout-minutes: 5
+    steps:
+      - name: Kill zombie GPU processes
+        run: |
+          echo "Runner: $(hostname) / $RUNNER_NAME"
+          echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+          echo ""
+          echo "=== GPU Status Before ==="
+          nvidia-smi
+          echo ""
+          echo "=== Killing zombie GPU processes ==="
+          # Get PIDs using the GPU (excluding nvidia-persistenced)
+          PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')
+          if [ -z "$PIDS" ]; then
+            echo "No GPU processes found. GPU is clean."
+          else
+            for PID in $PIDS; do
+              PROC_NAME=$(ps -p $PID -o comm= 2>/dev/null || echo "unknown")
+              echo "Killing PID $PID ($PROC_NAME)"
+              kill -9 $PID 2>/dev/null || echo "  Failed to kill $PID (already dead?)"
+            done
+            sleep 2
+            echo ""
+            echo "=== GPU Status After ==="
+            nvidia-smi
+          fi
