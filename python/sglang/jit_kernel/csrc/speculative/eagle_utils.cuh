@@ -390,8 +390,7 @@ void build_tree_kernel_efficient(
   RuntimeCheck(parent_list.device().device_type == kDLCUDA, "parent_list must be a CUDA tensor");
   RuntimeCheck(parent_list.ndim() == 2, "parent_list must be 2D: [bs, topk*(depth-1)+1]");
   RuntimeCheck(parent_list.is_contiguous(), "parent_list must be contiguous");
-  RuntimeCheck(
-      parent_list.dtype().code == kDLInt && parent_list.dtype().bits == 64, "parent_list must be int64");
+  RuntimeCheck(parent_list.dtype().code == kDLInt && parent_list.dtype().bits == 64, "parent_list must be int64");
 
   int bs = static_cast<int>(parent_list.size(0));
 
@@ -400,14 +399,12 @@ void build_tree_kernel_efficient(
   RuntimeCheck(
       selected_index.dtype().code == kDLInt && selected_index.dtype().bits == 64, "selected_index must be int64");
   RuntimeCheck(static_cast<int>(selected_index.size(0)) == bs, "selected_index batch_size mismatch");
-  RuntimeCheck(
-      selected_index.size(1) == draft_token_num - 1, "selected_index dim1 must equal draft_token_num - 1");
+  RuntimeCheck(selected_index.size(1) == draft_token_num - 1, "selected_index dim1 must equal draft_token_num - 1");
 
   RuntimeCheck(verified_seq_len.ndim() == 1, "verified_seq_len must be 1D: [bs]");
   RuntimeCheck(verified_seq_len.is_contiguous(), "verified_seq_len must be contiguous");
   RuntimeCheck(
-      verified_seq_len.dtype().code == kDLInt && verified_seq_len.dtype().bits == 64,
-      "verified_seq_len must be int64");
+      verified_seq_len.dtype().code == kDLInt && verified_seq_len.dtype().bits == 64, "verified_seq_len must be int64");
   RuntimeCheck(static_cast<int>(verified_seq_len.size(0)) == bs, "verified_seq_len batch_size mismatch");
 
   RuntimeCheck(tree_mask.is_contiguous(), "tree_mask must be contiguous");
@@ -420,13 +417,11 @@ void build_tree_kernel_efficient(
   RuntimeCheck(positions.is_contiguous(), "positions must be contiguous");
   RuntimeCheck(positions.dtype().code == kDLInt && positions.dtype().bits == 64, "positions must be int64");
   RuntimeCheck(
-      static_cast<int>(positions.size(0)) == bs && positions.size(1) == draft_token_num,
-      "positions shape mismatch");
+      static_cast<int>(positions.size(0)) == bs && positions.size(1) == draft_token_num, "positions shape mismatch");
 
   RuntimeCheck(retrive_index.ndim() == 2, "retrive_index must be 2D: [bs, draft_token_num]");
   RuntimeCheck(retrive_index.is_contiguous(), "retrive_index must be contiguous");
-  RuntimeCheck(
-      retrive_index.dtype().code == kDLInt && retrive_index.dtype().bits == 64, "retrive_index must be int64");
+  RuntimeCheck(retrive_index.dtype().code == kDLInt && retrive_index.dtype().bits == 64, "retrive_index must be int64");
   RuntimeCheck(
       static_cast<int>(retrive_index.size(0)) == bs && retrive_index.size(1) == draft_token_num,
       "retrive_index shape mismatch");
