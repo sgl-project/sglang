@@ -166,7 +166,6 @@ class _Dumper:
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
 
-        # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
         self._ensure_http_server()
 
         if not self._config.enable:
@@ -180,6 +179,7 @@ class _Dumper:
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
         )
 
+    # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
     def _ensure_http_server(self):
         if self._http_server_handled:
             return
