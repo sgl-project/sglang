@@ -483,16 +483,16 @@ class _HookDumper:
     ):
         self._dumper = dumper
         self._add_hooks(model=model)
-    
+
     def _add_hooks(self, model: "torch.nn.Module"):
-        top = self._dumper._config.top_level_module_name
+        top_level_module_name = self._dumper._config.top_level_module_name
         top_found = False
 
         for name, module in model.named_modules():
             if not name:
                 continue
 
-            is_top = name == top
+            is_top = name == top_level_module_name
             if is_top:
                 top_found = True
 
@@ -502,7 +502,7 @@ class _HookDumper:
                     self._make_forward_hook(name=name, is_top_level=is_top)
                 )
 
-        assert top_found, f"model should have a module named {top}"
+        assert top_found, f"model should have a module named {top_level_module_name}"
 
     def _make_forward_hook(self, name: str, is_top_level: bool):
         def _hook(_module, input, output):
