@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -32,6 +31,8 @@ except ImportError as e:
         "to run SGLang with SimmConnector."
     ) from e
 
+SGLANG_HICACHE_SIMM_JSON_ENV_VAR = "SGLANG_HICACHE_SIMM_CONFIG_PATH"
+
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
@@ -47,11 +48,11 @@ class SiMMConfig:
     @staticmethod
     def from_file() -> "SiMMConfig":
         """Load the config from a JSON file."""
-        if not envs.SGLANG_HICACHE_SIMM_CONFIG_PATH.is_set():
+        if os.environ.get(SGLANG_HICACHE_SIMM_JSON_ENV_VAR) is None:
             raise RuntimeError(
-                f"Config file path not set. Please set {envs.SGLANG_HICACHE_SIMM_CONFIG_PATH.name}"
+                f"Config file path not set. Please set {SGLANG_HICACHE_SIMM_JSON_ENV_VAR}"
             )
-        file_path = envs.SGLANG_HICACHE_SIMM_CONFIG_PATH.get()
+        file_path = os.environ.get(SGLANG_HICACHE_SIMM_JSON_ENV_VAR)
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
@@ -62,30 +63,9 @@ class SiMMConfig:
             raise ValueError("Manager_address is required in config file")
 
         return SiMMConfig(
-            manager_address=config.get(
-                "manager_address", envs.SIMM_CLUSTER_MANAGER.default
-            ),
-            clnt_threadpool_size=config.get(
-                "clnt_threadpool_size", envs.SIMM_CLNT_THREADPOOL_SIZE.default
-            ),
-            enable_profile=config.get(
-                "enable_profile", envs.SIMM_ENABLE_PROFILE.default
-            ),
-        )
-
-    @staticmethod
-    def load_from_env() -> "SiMMConfig":
-        """Load config from a file specified in the environment variable."""
-        # other required environment variables...
-        if not envs.SIMM_CLUSTER_MANAGER.is_set():
-            raise ValueError(
-                "The environment variable 'SIMM_CLUSTER_MANAGER' is not set."
-            )
-
-        return SiMMConfig(
-            manager_address=envs.SIMM_CLUSTER_MANAGER.get(),
-            clnt_threadpool_size=envs.SIMM_CLNT_THREADPOOL_SIZE.get(),
-            enable_profile=envs.SIMM_ENABLE_PROFILE.get(),
+            manager_address=config.get("manager_address"),
+            clnt_threadpool_size=config.get("clnt_threadpool_size", 10),
+            enable_profile=config.get("enable_profile", False),
         )
 
     @staticmethod
@@ -95,15 +75,9 @@ class SiMMConfig:
             raise ValueError("manager_address is required in extra_config")
 
         return SiMMConfig(
-            manager_address=extra_config.get(
-                "manager_address", envs.SIMM_CLUSTER_MANAGER.default
-            ),
-            clnt_threadpool_size=extra_config.get(
-                "clnt_threadpool_size", envs.SIMM_CLNT_THREADPOOL_SIZE.default
-            ),
-            enable_profile=extra_config.get(
-                "enable_profile", envs.SIMM_ENABLE_PROFILE.default
-            ),
+            manager_address=extra_config.get("manager_address"),
+            clnt_threadpool_size=extra_config.get("clnt_threadpool_size", 10),
+            enable_profile=extra_config.get("enable_profile", False),
         )
 
 
@@ -180,14 +154,10 @@ class HiCacheSiMM(HiCacheStorage):
                 # Load from extra_config
                 self.config = SiMMConfig.load_from_extra_config(extra_config)
                 logger.info("SiMM Configuration loaded from extra_config successfully.")
-            elif envs.SGLANG_HICACHE_SIMM_CONFIG_PATH.is_set():
+            else:
                 # Load from config file
                 self.config = SiMMConfig.from_file()
                 logger.info("SiMM Configuration loaded from file successfully.")
-            else:
-                # Load from environment variables
-                self.config = SiMMConfig.load_from_env()
-                logger.info("SiMM Configuration loaded from env successfully.")
 
             # Check if extra_backend_tag should be passed to SiMM data server
             self.extra_backend_tag = None
