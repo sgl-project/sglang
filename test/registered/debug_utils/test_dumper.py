@@ -1583,7 +1583,7 @@ class TestDumperE2E:
                 assert step > 0, f"rank {rank}: step should be > 0, got {step}"
             assert steps[0] == steps[1], f"step mismatch across ranks: {steps}"
 
-            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
+            dump_files = list(Path(dump_dir).glob("dump_*/*.pt"))
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 
