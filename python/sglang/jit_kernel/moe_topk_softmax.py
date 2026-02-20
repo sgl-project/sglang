@@ -19,6 +19,7 @@ def _jit_moe_topk_softmax_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["moe/moe_topk_softmax.cuh"],
         cuda_wrappers=[("topk_softmax", f"topk_softmax<{args}>")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
