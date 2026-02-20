@@ -678,6 +678,9 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        if model_config.quantization == "torchao":
+            model.torchao_applied = True
+
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
