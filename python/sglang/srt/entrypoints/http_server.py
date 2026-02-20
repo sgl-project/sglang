@@ -1876,13 +1876,6 @@ def launch_server(
         )
     )
 
-    from sglang.srt.debug_utils.dumper import _DumperConfig
-
-    if _DumperConfig.from_env().server_port <= 0:
-        app.add_api_route(
-            "/dumper/{method}", _dumper_control_handler, methods=["POST"]
-        )
-
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
