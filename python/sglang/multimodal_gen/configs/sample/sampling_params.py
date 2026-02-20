@@ -532,6 +532,36 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.num_frames_round_down,
         )
+        parser.add_argument(
+            "--enable-teacache",
+            action="store_true",
+            default=SamplingParams.enable_teacache,
+            help="Enable TeaCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--teacache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
+                "Fields map directly to TeaCacheParams dataclass fields."
+            ),
+        )
+        parser.add_argument(
+            "--enable-magcache",
+            action="store_true",
+            default=SamplingParams.enable_magcache,
+            help="Enable MagCache acceleration for diffusion inference.",
+        )
+        parser.add_argument(
+            "--magcache-params",
+            type=json.loads,
+            default=None,
+            help=(
+                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
+                "Fields map directly to MagCacheParams dataclass fields."
+            ),
+        )
 
         # profiling
         parser.add_argument(
@@ -788,36 +818,6 @@ class SamplingParams:
             action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
-        )
-        parser.add_argument(
-            "--enable-teacache",
-            action="store_true",
-            default=SamplingParams.enable_teacache,
-            help="Enable TeaCache acceleration for diffusion inference.",
-        )
-        parser.add_argument(
-            "--teacache-params",
-            type=json.loads,
-            default=None,
-            help=(
-                'TeaCache params as a JSON object, e.g. \'{"teacache_thresh": 0.08, "coefficients": [1.0, 2.0]}\'. '
-                "Fields map directly to TeaCacheParams dataclass fields."
-            ),
-        )
-        parser.add_argument(
-            "--enable-magcache",
-            action="store_true",
-            default=SamplingParams.enable_magcache,
-            help="Enable MagCache acceleration for diffusion inference.",
-        )
-        parser.add_argument(
-            "--magcache-params",
-            type=json.loads,
-            default=None,
-            help=(
-                'MagCache params as a JSON object, e.g. \'{"threshold": 0.12, "max_skip_steps": 4}\'. '
-                "Fields map directly to MagCacheParams dataclass fields."
-            ),
         )
         return parser
 
