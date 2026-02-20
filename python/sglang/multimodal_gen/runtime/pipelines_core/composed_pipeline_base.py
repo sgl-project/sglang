@@ -500,7 +500,9 @@ class ComposedPipelineBase(ABC):
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
-            self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
+            self.add_stage(
+                InputValidationStage(vae_image_processor=vae_image_processor)
+            )
 
         if prompt_encoding == "text":
             self.add_standard_text_encoding_stage(
@@ -549,13 +551,17 @@ class ComposedPipelineBase(ABC):
         image_vae_key: str = "vae",
         image_vae_stage_name: str | None = None,
         image_vae_stage_kwargs: dict[str, Any] | None = None,
-        image_vae_encoding_position: Literal["before_timestep", "after_latent"] = "before_timestep",
+        image_vae_encoding_position: Literal[
+            "before_timestep", "after_latent"
+        ] = "before_timestep",
         prepare_extra_timestep_kwargs: list[Callable] | None = None,
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
         denoising_stage_name: str | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
-            self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
+            self.add_stage(
+                InputValidationStage(vae_image_processor=vae_image_processor)
+            )
 
         self.add_standard_text_encoding_stage(
             stage_name=prompt_stage_name,
