@@ -869,8 +869,8 @@ void moe_wna16_marlin_gemm(
   device.set_options<kDLCUDA>();
 
   // Basic tensor verification
-  TensorMatcher().with_dtype<scalar_t>().with_device(device).verify(a);
-  TensorMatcher().with_dtype<scalar_t>().with_device(device).verify(c);
+  TensorMatcher({kAnySize, kAnySize}).with_dtype<scalar_t>().with_device(device).verify(a);
+  TensorMatcher({kAnySize, kAnySize}).with_dtype<scalar_t>().with_device(device).verify(c);
 
   // Early return for zero-size M
   if (size_m == 0) return;
