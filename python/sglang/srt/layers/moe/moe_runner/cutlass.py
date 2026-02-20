@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType, CutlassMoEType
+from sglang.srt.layers.moe.cutlass_moe_params import (
+    CutlassMoEParams,
+    CutlassMoEQuantType,
+    CutlassMoEType,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -130,7 +134,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             CutlassMoEType.DeepEP_Normal,
         ]:
             down_output = self.w4a8_moe(
-                a=runner_input.gate_up_input,  # Use preprocessed input
+                a=runner_input.gate_up_input,
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
@@ -142,9 +146,11 @@ class CutlassRunnerCore(MoeRunnerCore):
                 masked_m=runner_input.masked_m,
                 deepep_ll_or_deepep_normal=deepep_ll_or_deepep_normal,
             )
-            if deepep_ll_or_deepep_normal in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal]:
+            if deepep_ll_or_deepep_normal in [
+                CutlassMoEType.DeepEP_LL,
+                CutlassMoEType.DeepEP_Normal,
+            ]:
                 return CutlassRunnerOutput(hidden_states=down_output)
-            # Post-processing will be done in post_permute_cutlass_to_standard
 
         elif quant_type == CutlassMoEQuantType.BlockscaledFP8:
             if not cutlass_fp8_supported():
@@ -152,7 +158,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                     "CUTLASS FP8 kernels are not available on this system."
                 )
             down_output = self.cutlass_fused_experts_fp8(
-                a=runner_input.gate_up_input,  # Use preprocessed quantized input
+                a=runner_input.gate_up_input,
                 w1_q=quant_info.w13_weight,
                 w2_q=quant_info.w2_weight,
                 w1_scale=quant_info.w13_scale,
@@ -168,7 +174,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         elif quant_type == CutlassMoEQuantType.BlockscaledFP4:
             down_output = self.cutlass_moe_fp4(
-                a=runner_input.gate_up_input,  # Use preprocessed input
+                a=runner_input.gate_up_input,
                 rep_aux=runner_input.rep_aux,
                 w1_fp4=quant_info.w13_weight,
                 w1_blockscale=quant_info.w1_blockscale,
@@ -181,20 +187,6 @@ class CutlassRunnerCore(MoeRunnerCore):
                 params=quant_info.params,
             )
 
-        # Optional no-combine path: return (M, topk, K) without reduction
-        if self.config.no_combine:
-            reordered = shuffle_rows(
-                down_output,
-                running_state["c_map"],
-                (num_tokens * topk, hidden_size),
-            ).view(num_tokens, topk, hidden_size)
-            if not self.config.apply_router_weight_on_input:
-                reordered.mul_(
-                    runner_input.topk_weights.view(num_tokens, topk, 1).to(
-                        reordered.dtype
-                    )
-                )
-            return CutlassRunnerOutput(hidden_states=reordered)
 
         # Store combination info for post_permute function
         running_state["topk_weights"] = runner_input.topk_weights
@@ -806,7 +798,6 @@ def pre_permute_standard_to_cutlass(
     elif quant_info.params.quant_type == CutlassMoEQuantType.BlockscaledFP4:
         params = quant_info.params
 
-
         # Pre-permutation validation logic
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
         assert quant_info.w13_weight.dtype == torch.uint8, "weight 1 must be uint8"
@@ -870,8 +861,6 @@ def pre_permute_standard_to_cutlass(
             cutlass_w4_run_moe_ep_preproess,
             pre_reorder_for_cutlass_moe,
         )
-
-
 
         # Pre-permutation validation logic for W4A8
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -973,6 +962,24 @@ def post_permute_cutlass_to_standard(
     down_output = runner_output.hidden_states
     quant_type = quant_info.params.quant_type
 
+    # Optional no-combine path: return (M, topk, K) without reduction
+    if runner_config.no_combine:
+        num_tokens = running_state["topk_ids"].shape[0]
+        topk = running_state["c_map"].shape[0] // num_tokens
+        hidden_size = down_output.shape[1]
+        reordered = shuffle_rows(
+            down_output,
+            running_state["c_map"],
+            (num_tokens * topk, hidden_size),
+        ).view(num_tokens, topk, hidden_size)
+        if not runner_config.apply_router_weight_on_input:
+            reordered.mul_(
+                running_state["topk_weights"].view(num_tokens, topk, 1).to(
+                    reordered.dtype
+                )
+            )
+
+    down_output = reordered
     if quant_type == CutlassMoEQuantType.BlockscaledFP8:
         num_tokens = running_state["topk_ids"].shape[0]
         hidden_size = down_output.shape[1]
