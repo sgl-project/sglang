@@ -643,6 +643,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
         )
 
@@ -724,6 +725,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 # TODO: add attention_sink operation or nvfp4 scale factor if needed
                 sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
@@ -745,6 +747,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 # TODO: add attention_sink operation or nvfp4 scale factor if needed
                 sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
             )
 

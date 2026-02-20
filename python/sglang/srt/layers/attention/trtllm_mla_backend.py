@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -868,6 +869,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
 
         # Reshape output directly without slicing
@@ -1055,6 +1057,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
 
             if needs_unpad:
@@ -1092,6 +1095,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             "bmm1_scale": q_scale * k_scale * layer.scaling,
             "bmm2_scale": v_scale,
             "cum_seq_lens_q": self.forward_prefill_metadata.cum_seq_lens,
+            "skip_softmax_threshold_scale_factor": envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         }
 
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
