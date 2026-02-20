@@ -40,19 +40,28 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
-class LlamaDecoderLayer(LlamaDecoderLayer):
+class Eagle3LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fused_input=True,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
+        # fused_input denotes whether this decoder layer will
+        # also take embeddings as input
+        self.fused_input = fused_input
+
+        if fused_input:
+            hidden_size = 2 * self.hidden_size
+        else:
+            hidden_size = self.hidden_size
 
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
+            hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -75,17 +84,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     def forward(
         self,
         positions: torch.Tensor,
-        embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        embeds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         residual = hidden_states
-        embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        if self.fused_input:
+            embeds = self.input_layernorm(embeds)
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -97,7 +108,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-
         return hidden_states, residual
 
 
@@ -110,6 +120,7 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.num_hidden_layers = config.num_hidden_layers
 
         self.is_mrope_enabled = (
             hasattr(config, "rope_scaling")
@@ -138,7 +149,28 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+        # only requires fusing features if this is the first decoder
+        self.fuse_layer = Eagle3LlamaDecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix(f"midlayers.0", prefix),
+            fused_input=True,
+        )
+        self.additional_layers = None
+        if self.num_hidden_layers > 1:
+            self.additional_layers = nn.ModuleList(
+                [
+                    Eagle3LlamaDecoderLayer(
+                        config,
+                        i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"midlayers.{i}", prefix),
+                        fused_input=False,
+                    )
+                    for i in range(1, config.num_hidden_layers)
+                ]
+            )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -166,14 +198,29 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
-        residual = None
-        hidden_states, residual = self.midlayer(
+        hidden_states, residual = self.fuse_layer(
             positions,
-            embeds,
             hidden_states,
             forward_batch,
-            residual,
+            None,
+            embeds,
         )
+
+        if self.num_hidden_layers > 1:
+            for layer in self.additional_layers:
+                # The residual connections here are only internal to the
+                # draft model's multi decoder layers and has nothing to do with Eagle3 architecture
+                #
+                # The complication is that the Eagle3LlamaDecoderLayer for Eagle3 in SGLang derives
+                # from that of a target model, which returns hidden_states and residuals separately.
+                # However, the residuals are always added in Eagle3LlamaDecoderLayer of SpecForge.
+                # Therefore, the special handling of `hidden_states + residual` is necessary.
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states + residual,  # compatible with SpecForge
+                    forward_batch,
+                    None,
+                )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
@@ -194,9 +241,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
-        if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
 
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
