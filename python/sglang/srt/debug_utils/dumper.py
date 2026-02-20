@@ -482,7 +482,6 @@ class _HookDumper:
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
-        self._special_types = _HookDumper._load_special_types()
 
         matched, _ = self._add_hooks_recursive(model=model, prefix="")
         assert (
@@ -543,45 +542,38 @@ class _HookDumper:
                 return {name: tensors[0]}
             return {f"{name}.{i}": t for i, t in enumerate(tensors)}
 
-        st = self._special_types
-        if (cls := st.get("LogitsProcessorOutput")) and isinstance(value, cls):
-            return {name: value.next_token_logits}
-
-        if (cls := st.get("ForwardBatch")) and isinstance(value, cls):
-            return {
-                f"{name}.forward_batch_info.input_ids": value.input_ids,
-                f"{name}.forward_batch_info.seq_lens": value.seq_lens,
-                f"{name}.forward_batch_info.positions": value.positions,
-            }
-
-        if (cls := st.get("PPProxyTensors")) and isinstance(value, cls):
-            return {
-                f"{name}.pp_proxy_tensors.{k}": v
-                for k, v in value.tensors.items()
-            }
-
-        return {}
-
-    @staticmethod
-    def _load_special_types() -> dict:
-        types: dict[str, type] = {}
         try:
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-            types["LogitsProcessorOutput"] = LogitsProcessorOutput
+            if isinstance(value, LogitsProcessorOutput):
+                return {name: value.next_token_logits}
         except ImportError:
             pass
-        try:
-            from sglang.srt.model_executor.forward_batch_info import (
-                ForwardBatch,
-                PPProxyTensors,
-            )
 
-            types["ForwardBatch"] = ForwardBatch
-            types["PPProxyTensors"] = PPProxyTensors
+        try:
+            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+            if isinstance(value, ForwardBatch):
+                return {
+                    f"{name}.forward_batch_info.input_ids": value.input_ids,
+                    f"{name}.forward_batch_info.seq_lens": value.seq_lens,
+                    f"{name}.forward_batch_info.positions": value.positions,
+                }
         except ImportError:
             pass
-        return types
+
+        try:
+            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+            if isinstance(value, PPProxyTensors):
+                return {
+                    f"{name}.pp_proxy_tensors.{k}": v
+                    for k, v in value.tensors.items()
+                }
+        except ImportError:
+            pass
+
+        return {}
 
 
 # -------------------------------------- util fn ------------------------------------------
