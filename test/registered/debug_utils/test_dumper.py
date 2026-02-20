@@ -1325,25 +1325,31 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
     def test_core_mode(self, tmp_path):
         captured, fb = self._run(tmp_path, "core")
 
+        # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
+
+        # nothing with non_intrusive__ prefix
         assert not any(k.startswith("non_intrusive__") for k in captured)
 
     def test_all_mode(self, tmp_path):
         captured, fb = self._run(tmp_path, "all")
 
+        # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
 
+        # non-core ForwardBatch fields dumped with prefix
         assert "non_intrusive__inputs.0.seq_lens" in captured
         assert torch.equal(
             captured["non_intrusive__inputs.0.seq_lens"]["value"], fb.seq_lens
         )
 
+        # core fields NOT duplicated with prefix
         assert not any(
             k.startswith("non_intrusive__") and k.endswith("input_ids")
             for k in captured
@@ -1353,11 +1359,13 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
             for k in captured
         )
 
+        # ForwardBatch skipped on sub-modules (no duplication)
         assert not any(
             k.startswith("non_intrusive__layer.inputs.") and "seq_lens" in k
             for k in captured
         ), f"ForwardBatch skipped on sub-module, got: {list(captured.keys())}"
 
+        # regular tensor outputs on sub-modules still dumped
         assert "non_intrusive__layer.linear.output" in captured
         assert "non_intrusive__layer.output" in captured
 
