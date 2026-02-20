@@ -493,10 +493,9 @@ class _NonIntrusiveDumper:
         self._mode = mode
 
         for module_name, module in model.named_modules():
-            if self._LAYER_NAME_RE.fullmatch(module_name):
-                layer_id = self._detect_layer_id(module)
-                if layer_id is not None:
-                    self._register_layer_ctx_hooks(module, layer_id=layer_id)
+            ctx = self._detect_module_ctx(module_name, module)
+            if ctx:
+                self._register_ctx_hooks(module, ctx=ctx)
 
             module.register_forward_hook(
                 self._make_forward_hook(
@@ -505,24 +504,26 @@ class _NonIntrusiveDumper:
                 )
             )
 
-    @staticmethod
-    def _detect_layer_id(module: "torch.nn.Module") -> Optional[int]:
-        if hasattr(module, "layer_number"):
-            return module.layer_number - 1
-        if hasattr(module, "layer_id"):
-            return module.layer_id
+    @classmethod
+    def _detect_module_ctx(
+        cls, module_name: str, module: "torch.nn.Module"
+    ) -> Optional[dict]:
+        if cls._LAYER_NAME_RE.fullmatch(module_name):
+            if hasattr(module, "layer_number"):
+                return {"layer_id": module.layer_number - 1}
+            if hasattr(module, "layer_id"):
+                return {"layer_id": module.layer_id}
         return None
 
-    def _register_layer_ctx_hooks(
-        self, module: "torch.nn.Module", *, layer_id: int
-    ) -> None:
+    def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
+        clear_ctx = {k: None for k in ctx}
         module.register_forward_pre_hook(
-            lambda _mod, _input, _lid=layer_id: self._dumper.set_ctx(
-                layer_id=_lid
-            )
+            lambda _mod, _input, _ctx=ctx: self._dumper.set_ctx(**_ctx)
         )
         module.register_forward_hook(
-            lambda _mod, _input, _output: self._dumper.set_ctx(layer_id=None)
+            lambda _mod, _input, _output, _clear=clear_ctx: self._dumper.set_ctx(
+                **_clear
+            )
         )
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
