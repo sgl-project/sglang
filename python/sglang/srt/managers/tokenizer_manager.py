@@ -511,8 +511,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            if self.server_args.enable_lora and obj.lora_path:
-                await self._resolve_lora_path(obj)
+            await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -2212,6 +2211,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    async def _validate_and_resolve_lora(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not obj.lora_path:
+            return
+
+        if not self.server_args.enable_lora:
+            first_adapter = (
+                obj.lora_path
+                if isinstance(obj.lora_path, str)
+                else next((a for a in obj.lora_path if a), None)
+            )
+
+            raise ValueError(
+                f"LoRA adapter '{first_adapter}' was requested, but LoRA is not enabled. "
+                "Please launch the server with --enable-lora flag and preload adapters "
+                "using --lora-paths or /load_lora_adapter endpoint."
+            )
+
+        await self._resolve_lora_path(obj)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):

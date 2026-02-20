@@ -152,6 +152,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
     dynamic_import,
+    empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_cpu_ids_by_node,
@@ -1831,6 +1832,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
 
         backend_str = self.server_args.moe_runner_backend
+
+        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
+
         if backend_str not in [
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
@@ -1858,12 +1862,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
-            self._dummy_run(batch_size=self.req_to_token_pool.size)
+        self._dummy_run(
+            batch_size=self.req_to_token_pool.size,
+            run_ctx=autotune(),
+        )
 
         logger.info("FlashInfer autotune completed.")
 
-    def _dummy_run(self, batch_size: int):
+    def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
         if self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
@@ -2103,7 +2109,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        run_once()
+        with torch.inference_mode(), run_ctx or empty_context():
+            run_once()
 
     def init_device_graphs(self):
         """Capture device graphs."""

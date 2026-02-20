@@ -106,6 +106,29 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 **Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
 
+**Diffusion engine (SGLang-Diffusion):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
+
+- **All-or-nothing with rollback:** if any module fails to load, all previously updated modules are rolled back to the original weights by reloading from the original model path. No partial updates are left behind. If rollback itself fails, the exception propagates so the caller knows the model is in an inconsistent state.
+- **Offload-aware:** when layerwise offload (`--dit-layerwise-offload`) is enabled, the diffusion offload manager replaces GPU parameters with small `torch.empty((1,))` placeholders while real weights live in consolidated pinned CPU buffers. A naive `param.data.copy_()` would fail with a shape mismatch. Instead, the updater dynamically detects active offload managers and writes new weights directly into their CPU buffers, bypassing the placeholders entirely. For any layer that happens to be prefetched on GPU at update time, the live GPU tensor is also updated so the change takes effect immediately. This requires no extra GPU memory and does not disturb the offload state.
+- **DTensor-aware:** parameters distributed via `torch.distributed.tensor` (tensor parallelism) are updated through `distribute_tensor` so that each shard is correctly placed on the right device mesh.
+
+**Request body:**
+
+| Field | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `model_path` | The model path with the new weights. | Required | Type: str |
+| `flush_cache` | Flush TeaCache state after update. | `True` | Type: bool |
+| `target_modules` | List of module names to update (e.g. `["transformer"]`). If omitted, all `nn.Module` components are updated. | `None` | Type: list[str] |
+
+**Response body:**
+
+| Field | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `success` | Whether the update succeeded. | - | Type: bool |
+| `message` | Status / error message. | - | Type: str |
+
+> **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
+
 ### Update Weights from Tensor
 
 **When to use:**

@@ -105,7 +105,7 @@ class GenerationResult:
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0
     peak_memory_mb: float = 0.0
-    timings: dict = field(default_factory=dict)
+    metrics: dict = field(default_factory=dict)
     trajectory_latents: Any = None
     trajectory_timesteps: Any = None
     trajectory_decoded: Any = None
