@@ -64,6 +64,24 @@ class TestDumperConfig:
         with temp_set_env(SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
             assert _DumperConfig.from_env().collective_timeout == 120
 
+    def test_configure_overrides(self):
+        d = _make_test_dumper(Path("/tmp"))
+        d.configure(enable=False)
+        assert d._config.enable is False
+        d.configure(enable=True)
+        assert d._config.enable is True
+
+    def test_configure_default_skips_when_env_set(self):
+        with temp_set_env(SGLANG_DUMPER_FILTER="from_env"):
+            d = _Dumper(config=_DumperConfig.from_env())
+            d.configure_default(filter="from_code")
+            assert d._config.filter == "from_env"
+
+    def test_configure_default_applies_when_no_env(self):
+        d = _Dumper(config=_DumperConfig.from_env())
+        d.configure_default(filter="from_code")
+        assert d._config.filter == "from_code"
+
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):

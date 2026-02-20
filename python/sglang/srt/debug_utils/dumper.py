@@ -61,6 +61,14 @@ class _DumperConfig:
             for f in fields(cls)
         })
 
+    def with_defaults(self, **kwargs) -> "_DumperConfig":
+        actual = {
+            key: value
+            for key, value in kwargs.items()
+            if os.getenv(_env_name(key)) is None
+        }
+        return replace(self, **actual) if actual else self
+
 
 class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
@@ -157,6 +165,12 @@ class _Dumper:
             yield self._captured_output_data
         finally:
             self._captured_output_data = None
+
+    def configure(self, **kwargs) -> None:
+        self._config = replace(self._config, **kwargs)
+
+    def configure_default(self, **kwargs) -> None:
+        self._config = self._config.with_defaults(**kwargs)
 
     def override_enable(self, value: bool):
         self._override_enable = value
@@ -604,7 +618,7 @@ class _DumperRpcHandler:
 
     def set_enable(self, enable: bool):
         print(f"[DumperRpcHandler] set_enable {enable=}")
-        self._dumper._config = replace(self._dumper._config, enable=enable)
+        self._dumper.configure(enable=enable)
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
