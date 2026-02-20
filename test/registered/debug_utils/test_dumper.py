@@ -5,10 +5,14 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import multiprocessing
+
 import pytest
 import requests
 import torch
 import torch.distributed as dist
+import os
+
 
 from sglang.srt.debug_utils.dumper import (
     _collect_megatron_parallel_info,
@@ -20,6 +24,7 @@ from sglang.srt.debug_utils.dumper import (
     _materialize_value,
     _obj_to_dict,
     _torch_save,
+    dumper,
     get_tensor_info,
     get_truncated_value,
 )
@@ -200,8 +205,6 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_basic_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         tensor = torch.randn(10, 10, device=f"cuda:{rank}")
 
         dumper.on_forward_pass_start()
@@ -264,8 +267,6 @@ class TestDumperDistributed:
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
 
         dumper.on_forward_pass_start()
@@ -293,8 +294,6 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         dumper.on_forward_pass_start()
         dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
@@ -318,8 +317,6 @@ class TestDumperFileWriteControl:
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        from sglang.srt.debug_utils.dumper import dumper
-
         dumper.on_forward_pass_start()
         dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
 
@@ -833,13 +830,9 @@ class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
     @staticmethod
-    def _standalone_func(rank, http_port: int, stop_event):
-        import os
-
+    def _standalone_mode_worker(rank, http_port: int, stop_event):
         os.environ["SGLANG_DUMPER_ENABLE"] = "0"
         os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
-
-        from sglang.srt.debug_utils.dumper import dumper
 
         dumper.on_forward_pass_start()
         stop_event.wait()
@@ -857,15 +850,13 @@ class TestDumperHttp:
 
     @pytest.fixture(scope="class", params=["standalone", "sglang"])
     def dumper_http_url(self, request):
-        import multiprocessing
-
         if request.param == "standalone":
             http_port = find_available_port(40000)
             base_url = f"http://127.0.0.1:{http_port}"
             stop_event = multiprocessing.Event()
             thread = threading.Thread(
                 target=run_distributed_test,
-                args=(TestDumperHttp._standalone_func,),
+                args=(TestDumperHttp._standalone_mode_worker,),
                 kwargs={"http_port": http_port, "stop_event": stop_event},
             )
             thread.start()
