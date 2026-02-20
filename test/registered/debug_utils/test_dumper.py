@@ -344,9 +344,9 @@ class TestDumperDistributed:
         dumper.on_forward_pass_start()
 
         if rank == 0:
-            assert hasattr(dumper, "_rpc_broadcast"), (
-                "rank 0 should have _rpc_broadcast when SGLANG_DUMPER_SERVER_PORT=0"
-            )
+            assert hasattr(
+                dumper, "_rpc_broadcast"
+            ), "rank 0 should have _rpc_broadcast when SGLANG_DUMPER_SERVER_PORT=0"
 
         # Simulate what the scheduler handler does on rank 0
         dist.barrier()
