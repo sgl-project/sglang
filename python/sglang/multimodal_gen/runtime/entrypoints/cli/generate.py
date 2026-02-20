@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
@@ -78,6 +79,14 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
     timings.stages = timings_dict.get("stages", {})
     timings.steps = timings_dict.get("steps", [])
     timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
+    memory_snapshots = timings_dict.get("memory_snapshots", {})
+    for name, snapshot in memory_snapshots.items():
+        timings.memory_snapshots[name] = MemorySnapshot(
+            allocated_mb=snapshot.get("allocated_mb", 0.0),
+            reserved_mb=snapshot.get("reserved_mb", 0.0),
+            peak_allocated_mb=snapshot.get("peak_allocated_mb", 0.0),
+            peak_reserved_mb=snapshot.get("peak_reserved_mb", 0.0),
+        )
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
