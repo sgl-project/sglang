@@ -123,8 +123,7 @@ void reconstruct_indices_from_tree_mask(
   RuntimeCheck(tree_mask.device().device_type == kDLCUDA, "tree_mask must be a CUDA tensor");
   RuntimeCheck(tree_mask.ndim() == 1, "tree_mask must be 1D: [bs * draft_token_num * draft_token_num]");
   RuntimeCheck(tree_mask.is_contiguous(), "tree_mask must be contiguous");
-  RuntimeCheck(
-      host::dtype_bytes(tree_mask.dtype()) == 1, "tree_mask element size must be 1 byte (bool or uint8)");
+  RuntimeCheck(host::dtype_bytes(tree_mask.dtype()) == 1, "tree_mask element size must be 1 byte (bool or uint8)");
   RuntimeCheck(
       tree_mask.size(0) == batch_size * draft_token_num * draft_token_num,
       "tree_mask size must equal batch_size * draft_token_num * draft_token_num");
@@ -132,21 +131,18 @@ void reconstruct_indices_from_tree_mask(
   RuntimeCheck(verified_seq_len.ndim() == 1, "verified_seq_len must be 1D: [bs]");
   RuntimeCheck(verified_seq_len.is_contiguous(), "verified_seq_len must be contiguous");
   RuntimeCheck(
-      verified_seq_len.dtype().code == kDLInt && verified_seq_len.dtype().bits == 64,
-      "verified_seq_len must be int64");
+      verified_seq_len.dtype().code == kDLInt && verified_seq_len.dtype().bits == 64, "verified_seq_len must be int64");
   RuntimeCheck(verified_seq_len.size(0) == batch_size, "verified_seq_len size must equal batch_size");
 
   RuntimeCheck(positions.ndim() == 1, "positions must be 1D: [bs * draft_token_num]");
   RuntimeCheck(positions.is_contiguous(), "positions must be contiguous");
   RuntimeCheck(positions.dtype().code == kDLInt && positions.dtype().bits == 64, "positions must be int64");
   RuntimeCheck(
-      positions.size(0) == batch_size * draft_token_num,
-      "positions size must equal batch_size * draft_token_num");
+      positions.size(0) == batch_size * draft_token_num, "positions size must equal batch_size * draft_token_num");
 
   RuntimeCheck(retrive_index.ndim() == 2, "retrive_index must be 2D: [bs, draft_token_num]");
   RuntimeCheck(retrive_index.is_contiguous(), "retrive_index must be contiguous");
-  RuntimeCheck(
-      retrive_index.dtype().code == kDLInt && retrive_index.dtype().bits == 64, "retrive_index must be int64");
+  RuntimeCheck(retrive_index.dtype().code == kDLInt && retrive_index.dtype().bits == 64, "retrive_index must be int64");
   RuntimeCheck(
       retrive_index.size(0) == batch_size && retrive_index.size(1) == draft_token_num,
       "retrive_index shape must be [batch_size, draft_token_num]");

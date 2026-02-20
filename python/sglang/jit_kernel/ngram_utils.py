@@ -17,14 +17,22 @@ def _jit_ngram_utils_module() -> Module:
         "ngram_utils",
         cuda_files=["speculative/ngram_utils.cuh"],
         cuda_wrappers=[
-            ("reconstruct_indices_from_tree_mask", "reconstruct_indices_from_tree_mask"),
+            (
+                "reconstruct_indices_from_tree_mask",
+                "reconstruct_indices_from_tree_mask",
+            ),
         ],
     )
 
 
 @register_custom_op(
     op_name="reconstruct_indices_from_tree_mask_out",
-    mutates_args=["positions", "retrive_index", "retrive_next_token", "retrive_next_sibling"],
+    mutates_args=[
+        "positions",
+        "retrive_index",
+        "retrive_next_token",
+        "retrive_next_sibling",
+    ],
 )
 def reconstruct_indices_from_tree_mask(
     tree_mask: torch.Tensor,

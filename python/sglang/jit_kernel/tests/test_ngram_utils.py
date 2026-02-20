@@ -75,7 +75,9 @@ def test_smoke(bs, draft_token_num):
     inputs["tree_mask"] = build_linear_chain_mask(bs, draft_token_num)
     inputs["verified_seq_len"].fill_(10)
 
-    reconstruct_indices_from_tree_mask(**inputs, batch_size=bs, draft_token_num=draft_token_num)
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
 
     # retrive_index[b, i] must equal b * draft_token_num + i
     for b in range(bs):
@@ -97,14 +99,16 @@ def test_linear_chain_positions():
     inputs["tree_mask"] = build_linear_chain_mask(bs, draft_token_num)
     inputs["verified_seq_len"].fill_(seq_len)
 
-    reconstruct_indices_from_tree_mask(**inputs, batch_size=bs, draft_token_num=draft_token_num)
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
 
     for b in range(bs):
         for i in range(draft_token_num):
             expected = seq_len + i  # depth of token i in a chain = i
-            assert inputs["positions"][b * draft_token_num + i].item() == expected, (
-                f"positions[{b},{i}] = {inputs['positions'][b*draft_token_num+i].item()}, expected {expected}"
-            )
+            assert (
+                inputs["positions"][b * draft_token_num + i].item() == expected
+            ), f"positions[{b},{i}] = {inputs['positions'][b*draft_token_num+i].item()}, expected {expected}"
 
 
 def test_linear_chain_next_token():
@@ -115,7 +119,9 @@ def test_linear_chain_next_token():
     inputs = make_inputs(bs, draft_token_num)
     inputs["tree_mask"] = build_linear_chain_mask(bs, draft_token_num)
 
-    reconstruct_indices_from_tree_mask(**inputs, batch_size=bs, draft_token_num=draft_token_num)
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
 
     for i in range(draft_token_num - 1):
         assert inputs["retrive_next_token"][0, i].item() == i + 1
@@ -130,7 +136,9 @@ def test_linear_chain_no_siblings():
     inputs = make_inputs(bs, draft_token_num)
     inputs["tree_mask"] = build_linear_chain_mask(bs, draft_token_num)
 
-    reconstruct_indices_from_tree_mask(**inputs, batch_size=bs, draft_token_num=draft_token_num)
+    reconstruct_indices_from_tree_mask(
+        **inputs, batch_size=bs, draft_token_num=draft_token_num
+    )
 
     assert (inputs["retrive_next_sibling"] == -1).all()
 
@@ -163,14 +171,19 @@ def test_vs_aot(bs, draft_token_num):
     inputs_jit["verified_seq_len"].fill_(7)
 
     inputs_aot = {
-        k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs_jit.items()
+        k: v.clone() if isinstance(v, torch.Tensor) else v
+        for k, v in inputs_jit.items()
     }
 
     reconstruct_jit(**inputs_jit, batch_size=bs, draft_token_num=draft_token_num)
     reconstruct_aot(**inputs_aot, batch_size=bs, draft_token_num=draft_token_num)
 
-    assert torch.equal(inputs_jit["positions"], inputs_aot["positions"]), "positions mismatch"
-    assert torch.equal(inputs_jit["retrive_index"], inputs_aot["retrive_index"]), "retrive_index mismatch"
+    assert torch.equal(
+        inputs_jit["positions"], inputs_aot["positions"]
+    ), "positions mismatch"
+    assert torch.equal(
+        inputs_jit["retrive_index"], inputs_aot["retrive_index"]
+    ), "retrive_index mismatch"
     assert torch.equal(
         inputs_jit["retrive_next_token"], inputs_aot["retrive_next_token"]
     ), "retrive_next_token mismatch"
