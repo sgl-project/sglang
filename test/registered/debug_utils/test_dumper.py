@@ -931,9 +931,7 @@ class TestDumperSglangServer:
         kill_process_tree(cls.process.pid)
 
     def test_configure_enable(self):
-        resp = requests.post(
-            f"{self.base_url}/dumper/configure", json={"enable": True}
-        )
+        resp = requests.post(f"{self.base_url}/dumper/configure", json={"enable": True})
         assert resp.status_code == 200
         assert resp.json()["success"] is True
 
