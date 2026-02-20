@@ -20,6 +20,7 @@ class GraphInputBuffers:
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -51,6 +52,7 @@ class GraphInputBuffers:
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        is_hybrid_swa: bool,
     ) -> "GraphInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -58,6 +60,10 @@ class GraphInputBuffers:
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int32)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            if is_hybrid_swa:
+                out_cache_loc_swa = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            else:
+                out_cache_loc_swa = None
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -117,6 +123,7 @@ class GraphInputBuffers:
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -147,6 +154,8 @@ class GraphInputBuffers:
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -157,6 +166,12 @@ class GraphInputBuffers:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+        if self.out_cache_loc_swa is not None:
+            self.out_cache_loc_swa[:raw_num_token].copy_(
+                forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         if (
