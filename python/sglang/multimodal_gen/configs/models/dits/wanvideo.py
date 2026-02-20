@@ -16,8 +16,7 @@ class WanVideoArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            # (?!proj\.) avoids matching patch_embedding.proj.* so chained conversion won't duplicate .proj
-            r"^patch_embedding\.(?!proj\.)(.*)$": r"patch_embedding.proj.\1",
+            r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
             r"^condition_embedder\.text_embedder\.linear_1\.(.*)$": r"condition_embedder.text_embedder.fc_in.\1",
             r"^condition_embedder\.text_embedder\.linear_2\.(.*)$": r"condition_embedder.text_embedder.fc_out.\1",
             r"^condition_embedder\.time_embedder\.linear_1\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_in.\1",
