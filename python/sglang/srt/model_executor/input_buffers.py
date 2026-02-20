@@ -145,12 +145,14 @@ class GraphInputBuffers:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
         if bs != raw_bs:
-            self.seq_lens.fill_(seq_len_fill_value)
-            self.out_cache_loc.zero_()
+            # Only clear the padded region, not the entire buffer.
+            num_tokens = int(bs) * int(num_tokens_per_bs)
+            self.seq_lens[raw_bs:bs].fill_(seq_len_fill_value)
+            self.out_cache_loc[raw_num_token:num_tokens].zero_()
             if self.mamba_track_indices is not None:
-                self.mamba_track_indices.zero_()
+                self.mamba_track_indices[raw_bs:bs].zero_()
             if self.mamba_track_mask is not None:
-                self.mamba_track_mask.fill_(False)
+                self.mamba_track_mask[raw_bs:bs].fill_(False)
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
@@ -173,7 +175,7 @@ class GraphInputBuffers:
         seq_lens_cpu: Optional[torch.Tensor] = None
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
+                self.seq_lens_cpu[raw_bs:bs].fill_(seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             seq_lens_cpu = self.seq_lens_cpu[:bs]
 
