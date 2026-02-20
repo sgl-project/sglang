@@ -52,33 +52,6 @@ def _get_quant_section(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def modelopt_config_to_compressed_tensors_config_forced(
-    config: Dict[str, Any],
-    packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
-) -> CompressedTensorsConfig:
-    """
-    Build the CT bridge config for FP8 per-channel per-token, injecting the recipe
-    so the config does not need to contain quant_cfg. Use when the user explicitly
-    requests the per-channel method (e.g. --quantization fp8_per_channel_per_token).
-    """
-    import copy
-
-    config = copy.deepcopy(config)
-    quant = _get_quant_section(config)
-    if "quantization" in config:
-        config["quantization"] = dict(config["quantization"])
-        config["quantization"][
-            "quant_cfg"
-        ] = ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG.value
-    else:
-        config["quant_cfg"] = (
-            ModelOptQuantizationScheme.FP8_PER_CHANNEL_PER_TOKEN_CFG.value
-        )
-    return modelopt_config_to_compressed_tensors_config(
-        config, packed_modules_mapping=packed_modules_mapping
-    )
-
-
 def modelopt_config_to_compressed_tensors_config(
     config: Dict[str, Any],
     packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
