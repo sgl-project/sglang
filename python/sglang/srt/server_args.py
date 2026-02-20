@@ -35,7 +35,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    check_pkg_version_at_least,
     configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1618,12 +1617,10 @@ class ServerArgs:
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
-                    # Only enable flashinfer_trtllm if flashinfer-python version is >= 0.6.4
-                    if check_pkg_version_at_least("flashinfer-python", "0.6.4"):
-                        self.moe_runner_backend = "flashinfer_trtllm"
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
-                        )
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
+                    )
 
         elif model_arch in [
             "FalconH1ForCausalLM",
