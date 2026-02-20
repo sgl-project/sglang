@@ -42,13 +42,13 @@ jobs:
             build_type: all
             grace_blackwell: 0
             arch_tag: x86-cu13
-            version: 13.0.1
+            version: 13.0.2
           - runner: arm-docker-build-node
             platform: linux/arm64
             build_type: all
             grace_blackwell: 1
             arch_tag: arm64-cu13
-            version: 13.0.1
+            version: 13.0.2
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache

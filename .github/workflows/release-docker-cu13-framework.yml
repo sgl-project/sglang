@@ -69,7 +69,7 @@ jobs:
             --platform linux/amd64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
@@ -122,7 +122,7 @@ jobs:
             --platform linux/arm64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \

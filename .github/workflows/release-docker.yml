@@ -128,7 +128,7 @@ jobs:
             --platform linux/amd64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=0 \
@@ -147,7 +147,7 @@ jobs:
             --platform linux/amd64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=0 \
@@ -252,7 +252,7 @@ jobs:
             --platform linux/arm64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=1 \
@@ -271,7 +271,7 @@ jobs:
             --platform linux/arm64 \
             --push \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg CUDA_VERSION=13.0.2 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg SGL_VERSION=${version} \
