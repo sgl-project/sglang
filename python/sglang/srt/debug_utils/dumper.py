@@ -473,6 +473,9 @@ class _Dumper:
             print(f"[Dumper] Choose partial_name={name}")
 
 
+# -------------------------------------- util fn ------------------------------------------
+
+
 def _torch_save(value, path: str):
     try:
         try:
