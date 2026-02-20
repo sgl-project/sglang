@@ -31,14 +31,19 @@ class DllmConfig:
             model_path=server_args.model_path,
             model_revision=server_args.revision,
         )
+        DLLM_PARAMS = {
+            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+        }
 
-        if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
-            block_size = 32
-            mask_id = 156895
+        arch = model_config.hf_config.architectures[0]
+        if arch in DLLM_PARAMS:
+            params = DLLM_PARAMS[arch]
+            block_size = params["block_size"]
+            mask_id = params["mask_id"]
         else:
-            raise RuntimeError(
-                f"Unknown diffusion LLM: {model_config.hf_config.architectures[0]}"
-            )
+            raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
         max_running_requests = (
             1
