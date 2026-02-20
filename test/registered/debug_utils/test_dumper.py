@@ -975,7 +975,7 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = OuterModel()
-        d.register_forward_hook_for_model(model)
+        d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1009,7 +1009,7 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = OuterModel()
-        d.register_forward_hook_for_model(model, dump_layers=[0, 2])
+        d.register_model_forward_hook(model, dump_layers=[0, 2])
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1045,7 +1045,7 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = OuterModel()
-        d.register_forward_hook_for_model(model)
+        d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1073,7 +1073,7 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path, filter="name=model.linear")
         model = OuterModel()
-        d.register_forward_hook_for_model(model)
+        d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1102,7 +1102,7 @@ class TestHookDumper:
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
         model = OuterModel()
-        d.register_forward_hook_for_model(model)
+        d.register_model_forward_hook(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1129,7 +1129,7 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = OuterModel()
-        result = d.register_forward_hook_for_model(model)
+        result = d.register_model_forward_hook(model)
 
         assert isinstance(result, _HookDumper)
 
