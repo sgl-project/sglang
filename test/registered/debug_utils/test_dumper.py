@@ -860,9 +860,7 @@ class TestDumperHttp:
 
     @staticmethod
     def _standalone_mode_worker(rank, http_port: int, stop_event):
-        os.environ["SGLANG_DUMPER_ENABLE"] = "0"
-        os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
-
+        dumper.configure(enable=False, server_port=str(http_port))
         dumper.on_forward_pass_start()
         stop_event.wait()
 
