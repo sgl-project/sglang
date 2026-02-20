@@ -30,7 +30,7 @@
 // retrive_next_token: [bs, draft_token_num]
 // retrive_next_sibling: [bs, draft_token_num]
 __global__ void reconstructIndicesFromTreeMask(
-    bool* tree_mask,
+    uint8_t* tree_mask,
     int64_t* verified_seq_len,
     int64_t* positions,
     int64_t* retrive_index,
@@ -171,7 +171,7 @@ void reconstruct_indices_from_tree_mask(
 
   LaunchKernel(grid, block, stream)(
       reconstructIndicesFromTreeMask,
-      static_cast<bool*>(tree_mask.data_ptr()),
+      static_cast<uint8_t*>(tree_mask.data_ptr()),
       static_cast<int64_t*>(verified_seq_len.data_ptr()),
       static_cast<int64_t*>(positions.data_ptr()),
       static_cast<int64_t*>(retrive_index.data_ptr()),
