@@ -482,7 +482,10 @@ class _HookDumper:
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
-        top = dumper._config.top_level_module_name
+        self._add_hooks(model=model)
+    
+    def _add_hooks(self, model: "torch.nn.Module"):
+        top = self._dumper._config.top_level_module_name
         top_found = False
 
         for name, module in model.named_modules():
