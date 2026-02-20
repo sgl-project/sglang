@@ -158,8 +158,8 @@ class GPUWorker:
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         final_snapshot = capture_memory_snapshot()
-        if output_batch.timings:
-            output_batch.timings.record_memory_snapshot("mem_analysis", final_snapshot)
+        if output_batch.metrics:
+            output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
 
         # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
@@ -219,9 +219,9 @@ class GPUWorker:
             start_time = time.monotonic()
 
             # capture memory baseline before forward
-            if self.rank == 0 and req.timings:
+            if self.rank == 0 and req.metrics:
                 baseline_snapshot = capture_memory_snapshot()
-                req.timings.record_memory_snapshot("before_forward", baseline_snapshot)
+                req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
@@ -231,7 +231,7 @@ class GPUWorker:
                     output=result.output,
                     audio=getattr(result, "audio", None),
                     audio_sample_rate=getattr(result, "audio_sample_rate", None),
-                    timings=result.timings,
+                    metrics=result.metrics,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
                     noise_pred=getattr(result, "noise_pred", None),
@@ -241,9 +241,9 @@ class GPUWorker:
                 output_batch = result
 
             # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.timings:
+            if self.rank == 0 and output_batch.metrics:
                 peak_snapshot = capture_memory_snapshot()
-                output_batch.timings.record_memory_snapshot(
+                output_batch.metrics.record_memory_snapshot(
                     "after_forward", peak_snapshot
                 )
 
@@ -251,7 +251,7 @@ class GPUWorker:
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.timings.total_duration_ms = duration_ms
+            output_batch.metrics.total_duration_ms = duration_ms
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
@@ -273,11 +273,13 @@ class GPUWorker:
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
+            if isinstance(e, _oom_exceptions()):
+                logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
@@ -427,13 +429,21 @@ OOM detected. Possible solutions:
   - If the OOM occurs during loading:
     1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
   - If the OOM occurs during runtime:
-    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    2. Enable SP and/or TP
+    1. Enable SP and/or TP (in a multi-GPU setup)
+    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     3. Opt for a sparse-attention backend
     4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
     5. Enable quantization (e.g. nunchaku)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
+
+
+def _oom_exceptions():
+    # torch.OutOfMemoryError exists only in some PyTorch builds
+    types = [torch.cuda.OutOfMemoryError]
+    if hasattr(torch, "OutOfMemoryError"):
+        types.append(torch.OutOfMemoryError)
+    return tuple(types)
 
 
 def run_scheduler_process(
@@ -483,7 +493,7 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except torch.OutOfMemoryError as _e:
+    except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise
     finally:
