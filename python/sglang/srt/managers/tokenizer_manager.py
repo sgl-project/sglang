@@ -1078,10 +1078,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        self._validate_rid(obj)
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        self._validate_rid(obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = self.req_state_class(
             [], False, asyncio.Event(), obj, created_time=created_time
