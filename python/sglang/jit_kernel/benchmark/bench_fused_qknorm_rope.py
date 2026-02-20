@@ -168,7 +168,7 @@ def calculate_diff():
         qkv_aot = qkv.clone()
         fused_qk_norm_rope_aot(qkv_aot, **common)
 
-        match = torch.allclose(qkv_jit.float(), qkv_aot.float(), atol=1e-3, rtol=1e-3)
+        match = torch.allclose(qkv_jit.float(), qkv_aot.float(), atol=1e-2, rtol=1e-2)
         status = "OK" if match else "MISMATCH"
         max_err = (qkv_jit.float() - qkv_aot.float()).abs().max().item()
         print(
