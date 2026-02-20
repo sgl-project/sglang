@@ -39,9 +39,9 @@ NUM_TOKENS_RANGE = get_benchmark_range(
 # (hidden_dim, topk)
 CONFIGS_EXPERT = get_benchmark_range(
     full_range=[
-        (4096, 4),   # common: 4k hidden, topk=4
-        (7168, 8),   # DeepSeek-style: 7k hidden, topk=8
-        (2048, 2),   # smaller hidden
+        (4096, 4),  # common: 4k hidden, topk=4
+        (7168, 8),  # DeepSeek-style: 7k hidden, topk=8
+        (2048, 2),  # smaller hidden
     ],
     ci_range=[(4096, 4)],
 )
@@ -100,10 +100,20 @@ def calculate_diff():
         return
 
     print("Correctness diff (JIT vs AOT):")
-    for num_tokens, hidden_dim, topk in [(64, 4096, 4), (512, 7168, 8), (1024, 2048, 2)]:
-        x = torch.randn((num_tokens, topk, hidden_dim), dtype=torch.bfloat16, device="cuda")
-        out_jit = torch.empty((num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda")
-        out_aot = torch.empty((num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda")
+    for num_tokens, hidden_dim, topk in [
+        (64, 4096, 4),
+        (512, 7168, 8),
+        (1024, 2048, 2),
+    ]:
+        x = torch.randn(
+            (num_tokens, topk, hidden_dim), dtype=torch.bfloat16, device="cuda"
+        )
+        out_jit = torch.empty(
+            (num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda"
+        )
+        out_aot = torch.empty(
+            (num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda"
+        )
 
         moe_sum_reduce_jit(x, out_jit, 1.0)
         moe_sum_reduce_aot(x, out_aot, 1.0)

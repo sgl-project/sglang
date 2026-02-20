@@ -72,7 +72,9 @@ def moe_sum_reduce_ref(
 )
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("routed_scaling_factor", [1.0, 0.5])
-def test_moe_sum_reduce_vs_ref(num_tokens, topk, hidden_dim, dtype, routed_scaling_factor):
+def test_moe_sum_reduce_vs_ref(
+    num_tokens, topk, hidden_dim, dtype, routed_scaling_factor
+):
     torch.manual_seed(num_tokens * topk * hidden_dim)
     x = torch.randn((num_tokens, topk, hidden_dim), dtype=dtype, device="cuda")
     out = torch.empty((num_tokens, hidden_dim), dtype=dtype, device="cuda")
@@ -115,9 +117,9 @@ def test_bf16_vec_fast_path(hidden_dim, topk):
     out = torch.empty((num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda")
     moe_sum_reduce(x, out, 1.0)
     ref = moe_sum_reduce_ref(x, 1.0)
-    assert torch.allclose(out, ref, atol=1e-2, rtol=1e-3), (
-        f"BF16 vec path mismatch (hidden={hidden_dim}, topk={topk})"
-    )
+    assert torch.allclose(
+        out, ref, atol=1e-2, rtol=1e-3
+    ), f"BF16 vec path mismatch (hidden={hidden_dim}, topk={topk})"
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +158,9 @@ def test_moe_sum_reduce_vs_aot(num_tokens, topk, hidden_dim, dtype):
     moe_sum_reduce(x, out_jit, 1.0)
     moe_sum_reduce_aot(x, out_aot, 1.0)
 
-    assert torch.allclose(out_jit, out_aot, atol=1e-5, rtol=1e-5), (
-        f"JIT vs AOT mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
-    )
+    assert torch.allclose(
+        out_jit, out_aot, atol=1e-5, rtol=1e-5
+    ), f"JIT vs AOT mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
 
 
 if __name__ == "__main__":

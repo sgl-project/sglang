@@ -84,7 +84,8 @@ __global__ void moe_sum_reduce_warp_per_token_vec_kernel(
 
     float acc[VEC];
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) acc[i] = 0.f;
+    for (int i = 0; i < VEC; ++i)
+      acc[i] = 0.f;
 
     for (int64_t k = 0; k < topk_num; ++k) {
 #pragma unroll
@@ -92,18 +93,21 @@ __global__ void moe_sum_reduce_warp_per_token_vec_kernel(
         const int64_t offset = base + k * stride_topk + p * 8;
         Pack16B pack = {ldg_cg(reinterpret_cast<const uint4*>(x + offset))};
 #pragma unroll
-        for (int i = 0; i < 8; ++i) acc[p * 8 + i] += __bfloat162float(pack.u16[i]);
+        for (int i = 0; i < 8; ++i)
+          acc[p * 8 + i] += __bfloat162float(pack.u16[i]);
       }
     }
 
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) acc[i] *= scale;
+    for (int i = 0; i < VEC; ++i)
+      acc[i] *= scale;
 
 #pragma unroll
     for (int p = 0; p < PACKS; ++p) {
       Pack16B outp;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) outp.u16[i] = __float2bfloat16_rn(acc[p * 8 + i]);
+      for (int i = 0; i < 8; ++i)
+        outp.u16[i] = __float2bfloat16_rn(acc[p * 8 + i]);
       *reinterpret_cast<uint4*>(y + t * out_stride_token + d + p * 8) = outp.v;
     }
   }
@@ -131,7 +135,8 @@ __global__ void moe_sum_reduce_kernel_warp_token_topk(
     float acc = 0.f;
     const int64_t base = t * stride_token + d;
 #pragma unroll
-    for (int k = 0; k < TOPK; ++k) acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
+    for (int k = 0; k < TOPK; ++k)
+      acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
     acc *= scale;
     y[t * out_stride_token + d] = from_acc<T>(acc);
   }
@@ -155,7 +160,8 @@ __global__ void moe_sum_reduce_kernel(
       const int64_t base = t * stride_token + d;
       float acc = 0.f;
 #pragma unroll
-      for (int k = 0; k < TOPK; ++k) acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
+      for (int k = 0; k < TOPK; ++k)
+        acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
       acc *= scale;
       y[t * out_stride_token + d] = from_acc<T>(acc);
     }
@@ -181,7 +187,8 @@ __global__ void moe_sum_reduce_kernel_general(
       const int64_t base = t * stride_token + d;
       float acc = 0.f;
 #pragma unroll 1
-      for (int k = 0; k < topk_num; ++k) acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
+      for (int k = 0; k < topk_num; ++k)
+        acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
       acc *= scale;
       y[t * out_stride_token + d] = from_acc<T>(acc);
     }
@@ -208,7 +215,8 @@ __global__ void moe_sum_reduce_kernel_warp_token_general(
     float acc = 0.f;
     const int64_t base = t * stride_token + d;
 #pragma unroll 1
-    for (int k = 0; k < topk_num; ++k) acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
+    for (int k = 0; k < topk_num; ++k)
+      acc += to_acc<T>(x[base + (int64_t)k * stride_topk]);
     acc *= scale;
     y[t * out_stride_token + d] = from_acc<T>(acc);
   }
@@ -290,10 +298,9 @@ void moe_sum_reduce(TensorView input, TensorView output, double routed_scaling_f
     dim3 block(block_size);
     dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
 
-#define LAUNCH_SMALL(TOPK)                                                                                 \
-  moe_sum_reduce_kernel<T, TOPK><<<grid, block, 0, stream>>>(x_ptr, y_ptr, token_num, hidden_dim,         \
-                                                              in_stride_token, in_stride_topk,             \
-                                                              out_stride_token, scale);
+#define LAUNCH_SMALL(TOPK)                                    \
+  moe_sum_reduce_kernel<T, TOPK><<<grid, block, 0, stream>>>( \
+      x_ptr, y_ptr, token_num, hidden_dim, in_stride_token, in_stride_topk, out_stride_token, scale);
 
     switch (topk_num) {
       case 2:
@@ -310,8 +317,15 @@ void moe_sum_reduce(TensorView input, TensorView output, double routed_scaling_f
         break;
       default:
         moe_sum_reduce_kernel_general<T><<<grid, block, 0, stream>>>(
-            x_ptr, y_ptr, token_num, hidden_dim, in_stride_token, in_stride_topk, out_stride_token,
-            static_cast<int>(topk_num), scale);
+            x_ptr,
+            y_ptr,
+            token_num,
+            hidden_dim,
+            in_stride_token,
+            in_stride_topk,
+            out_stride_token,
+            static_cast<int>(topk_num),
+            scale);
     }
 #undef LAUNCH_SMALL
 
@@ -330,8 +344,8 @@ void moe_sum_reduce(TensorView input, TensorView output, double routed_scaling_f
     dim3 block(THREADS);
     dim3 grid(static_cast<unsigned>(gx), static_cast<unsigned>(gy));
 
-#define LAUNCH_WARP(TOPK)                                                                                         \
-  moe_sum_reduce_kernel_warp_token_topk<T, TOPK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(                   \
+#define LAUNCH_WARP(TOPK)                                                                      \
+  moe_sum_reduce_kernel_warp_token_topk<T, TOPK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>( \
       x_ptr, y_ptr, token_num, hidden_dim, in_stride_token, in_stride_topk, out_stride_token, scale);
 
     switch (topk_num) {
@@ -349,8 +363,15 @@ void moe_sum_reduce(TensorView input, TensorView output, double routed_scaling_f
         break;
       default:
         moe_sum_reduce_kernel_warp_token_general<T, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-            x_ptr, y_ptr, token_num, hidden_dim, in_stride_token, in_stride_topk, out_stride_token,
-            static_cast<int>(topk_num), scale);
+            x_ptr,
+            y_ptr,
+            token_num,
+            hidden_dim,
+            in_stride_token,
+            in_stride_topk,
+            out_stride_token,
+            static_cast<int>(topk_num),
+            scale);
     }
 #undef LAUNCH_WARP
   }
