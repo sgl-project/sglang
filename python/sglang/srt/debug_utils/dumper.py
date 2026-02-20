@@ -646,7 +646,7 @@ def _start_maybe_http_server(dumper: _Dumper):
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
 
     rpc_broadcast = _create_zmq_rpc_broadcast(
-        dumper, base_port=zmq_base_port, timeout_seconds=dumper._config.timeout_seconds
+        dumper, base_port=zmq_base_port, timeout_seconds=dumper._config.collective_timeout
     )
 
     if _get_rank() == 0 and rpc_broadcast is not None:
