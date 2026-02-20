@@ -1,7 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
-import os
 import logging
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -51,11 +50,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils.common import (
-    get_bool_env_var,
     is_cuda,
     is_sm120_supported,
     log_info_on_rank0,
     next_power_of_2,
+    print_warning_once,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -65,8 +64,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.topk import TopKOutput
 
 fp4_quantize = None
 try:
@@ -107,19 +108,28 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
-_logged_flashinfer_cutedsl_input_scale_cast = False
-_logged_flashinfer_cutedsl_standard_path = False
+_cutedsl_logged_scalarize: set = set()
 
-_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY = os.getenv(
-    "SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY", "scalar_max"
-).strip().lower()
-if _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY not in {"scalar_max", "strict"}:
-    logger.warning(
-        "Invalid SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=%r. "
-        "Falling back to 'scalar_max'.",
-        _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY,
-    )
-    _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY = "scalar_max"
+
+def _interleave_linear_and_gate(
+    tensor: torch.Tensor, group_size: int = 64, dim: int = 1
+) -> torch.Tensor:
+    """Interleave [gate, up] chunks along dim for SwiGLU GEMM1 layout."""
+    if tensor.shape[dim] % 2 != 0:
+        raise ValueError(
+            "Expected even size on interleave dimension for gate/up split."
+        )
+    split = tensor.shape[dim] // 2
+    if split % group_size != 0:
+        raise ValueError(
+            f"Expected split dim divisible by group_size={group_size}, got {split}."
+        )
+    gate = tensor.narrow(dim, 0, split)
+    up = tensor.narrow(dim, split, split)
+    gate_groups = gate.split(group_size, dim=dim)
+    up_groups = up.split(group_size, dim=dim)
+    interleaved = [item for pair in zip(gate_groups, up_groups) for item in pair]
+    return torch.cat(interleaved, dim=dim)
 
 
 def _sglang_fp4_gemm_fake(
@@ -136,28 +146,158 @@ def _sglang_fp4_gemm_fake(
     return input.new_empty((M, N), dtype=out_dtype)
 
 
-def _resolve_cutedsl_standard_input_scale(input_scale: torch.Tensor) -> torch.Tensor:
-    if input_scale.numel() <= 1:
-        return input_scale
+def _cutedsl_quant_scale_to_scalar(
+    quant_scale: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    """Reduce per-expert quant-domain scale vector to a single scalar.
 
-    if _CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY == "strict":
-        raise ValueError(
-            "flashinfer_cutedsl standard path got non-scalar w13_input_scale_quant "
-            f"(shape={tuple(input_scale.shape)}), and "
-            "SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=strict. "
-            "Use scalar weights/input scales or switch strategy to 'scalar_max'."
+    The quant domain is the reciprocal of the raw checkpoint scale:
+        quant_scale = 1 / raw_scale
+
+    Returns min(quant_scale) = 1/max(raw_scale), which is the TRTLLM CuteDSL
+    convention for global scalar activation scales (see TRTLLM quantization.py
+    lines 2137-2141: fc2_input_scale = tmp_fc2_input_scale.max().reciprocal()).
+
+    If quant_scale is already scalar (numel==1), returns it unchanged.
+    """
+    quant_scale = quant_scale.to(torch.float32)
+    if quant_scale.numel() == 0:
+        print_warning_once(
+            f"CuteDSL got empty {name}; using 1.0 fallback.",
         )
-
-    global _logged_flashinfer_cutedsl_input_scale_cast
-    if not _logged_flashinfer_cutedsl_input_scale_cast:
+        return torch.ones(1, device=quant_scale.device, dtype=torch.float32)
+    if quant_scale.numel() == 1:
+        return quant_scale.reshape(1)
+    if name not in _cutedsl_logged_scalarize:
         log_info_on_rank0(
             logger,
-            "flashinfer_cutedsl standard path uses scalar activation quant scale; "
-            "using max(layer.w13_input_scale_quant). "
-            "Set SGLANG_CUTEDSL_STANDARD_INPUT_SCALE_STRATEGY=strict to disable fallback.",
+            f"CuteDSL: reducing per-expert {name} to scalar via "
+            "min(quant_scale) = 1/max(raw_scale), matching TRTLLM convention.",
         )
-        _logged_flashinfer_cutedsl_input_scale_cast = True
-    return input_scale.max().view(1)
+        _cutedsl_logged_scalarize.add(name)
+    return quant_scale.min().reshape(1)
+
+
+def _resolve_cutedsl_standard_scales(
+    layer: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Resolve standard-path CuteDSL scales (baseline: scalar fc2/w13 input scales).
+
+    Returns (w1_alpha, fc2_input_scale, w2_alpha, used_input_scale).
+    used_input_scale is the scalarized w13 input scale for FP4 quantize and GEMM1.
+    """
+
+    def _to_fp32_tensor(x: torch.Tensor | float, ref: torch.Tensor) -> torch.Tensor:
+        # Be robust to scalar/python-number inputs from different call sites.
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, device=ref.device)
+        return x.to(device=ref.device, dtype=torch.float32)
+
+    def _align_scale_to_alpha(
+        scale: torch.Tensor, alpha: torch.Tensor, scale_name: str
+    ) -> torch.Tensor:
+        scale = scale.to(device=alpha.device, dtype=torch.float32)
+        alpha = alpha.to(torch.float32)
+        if scale.ndim == 0:
+            return scale
+        if scale.numel() == alpha.numel():
+            return scale
+        if scale.numel() == 1:
+            return scale.reshape(())
+
+        # Some EP setups may carry global-per-expert scale vectors while alphas are
+        # local-per-expert vectors. Slice to this rank's local expert range.
+        num_local_experts = getattr(layer, "num_local_experts", None)
+        num_experts = getattr(layer, "num_experts", None)
+        moe_ep_rank = getattr(layer, "moe_ep_rank", 0)
+        if (
+            num_local_experts is not None
+            and num_experts is not None
+            and scale.numel() == num_experts
+            and alpha.numel() == num_local_experts
+        ):
+            start = moe_ep_rank * num_local_experts
+            end = start + num_local_experts
+            return scale[start:end]
+
+        raise ValueError(
+            f"Unable to align {scale_name} shape={tuple(scale.shape)} "
+            f"to alpha shape={tuple(alpha.shape)} for CuteDSL standard scale resolution."
+        )
+
+    def _resolve_w1_alpha_from_scalar_input_scale(
+        used_input_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve GEMM1 alpha consistent with scalarized activation quant scale.
+
+        CuteDSL pre-quantizes x with a single scalar (used_input_scale), but
+        g1_alphas was derived with per-expert activation scales:
+            g1_alphas[e] = (1/w13_isq[e]) * w13_ws2[e]
+        Correct alpha for scalar quantization:
+            w1_alpha[e] = w13_ws2[e] / used_input_scale
+                        = g1_alphas[e] * w13_isq[e] / used_input_scale
+        When w13_isq is already scalar, this is a no-op (ratio = 1).
+        """
+        eps = 1e-12
+        scalar = torch.clamp(used_input_scale.to(torch.float32).reshape(()), min=eps)
+
+        if hasattr(layer, "w13_weight_scale_2"):
+            w13_weight_scale_2 = _align_scale_to_alpha(
+                layer.w13_weight_scale_2, layer.g1_alphas, "w13_weight_scale_2"
+            )
+            return w13_weight_scale_2.to(torch.float32) / scalar
+
+        w13_isq = _align_scale_to_alpha(
+            layer.w13_input_scale_quant, layer.g1_alphas, "w13_input_scale_quant"
+        )
+        w13_isq = torch.clamp(_to_fp32_tensor(w13_isq, layer.g1_alphas), min=eps)
+        return (layer.g1_alphas.to(torch.float32) * w13_isq / scalar).to(torch.float32)
+
+    def _resolve_w2_alpha_from_scalar_fc2_input_scale(
+        fc2_input_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve GEMM2 alpha consistent with scalarized FC2 input scale.
+
+        CuteDSL standard path uses a scalar global scale for GEMM1 FP4 output
+        quantization (`fc2_input_scale`). GEMM2 alpha must use the same scalar
+        convention: alpha2 = w2_weight_scale_2 / fc2_input_scale.
+        """
+        eps = 1e-12
+        fc2_input_scale = fc2_input_scale.to(torch.float32)
+        fc2_scalar = torch.clamp(fc2_input_scale.reshape(-1)[:1], min=eps).reshape(())
+
+        # Preferred source: explicit per-expert weight global scales.
+        if hasattr(layer, "w2_weight_scale_2"):
+            w2_weight_scale_2 = _align_scale_to_alpha(
+                layer.w2_weight_scale_2, layer.g2_alphas, "w2_weight_scale_2"
+            )
+            w2_weight_scale_2 = w2_weight_scale_2.to(torch.float32)
+            return w2_weight_scale_2 / fc2_scalar
+
+        # Compatibility fallback: derive w2_weight_scale_2 from g2_alphas and
+        # quant scale when explicit tensor is unavailable.
+        w2_q_for_w2 = _align_scale_to_alpha(
+            layer.w2_input_scale_quant, layer.g2_alphas, "w2_input_scale_quant"
+        )
+        w2_q_for_w2 = torch.clamp(
+            _to_fp32_tensor(w2_q_for_w2, layer.g2_alphas), min=eps
+        )
+        w2_weight_scale_2 = layer.g2_alphas.to(torch.float32) * w2_q_for_w2
+        return w2_weight_scale_2 / fc2_scalar
+
+    fc2_input_scale = _cutedsl_quant_scale_to_scalar(
+        layer.w2_input_scale_quant,
+        name="w2_input_scale_quant",
+    )
+    w2_alpha = _resolve_w2_alpha_from_scalar_fc2_input_scale(fc2_input_scale)
+    used_input_scale = _cutedsl_quant_scale_to_scalar(
+        layer.w13_input_scale_quant,
+        name="w13_input_scale_quant",
+    )
+    w1_alpha = _resolve_w1_alpha_from_scalar_input_scale(used_input_scale)
+    return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
 @register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
@@ -189,10 +329,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
     ):
         return
 
-
-CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
-)
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
@@ -752,9 +888,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -832,8 +969,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 )
 
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
             return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_flashinfer_cutlass():
@@ -880,8 +1015,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=activation,
             )[0]
-
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=output)
 
@@ -1457,7 +1590,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if not torch.allclose(
                 layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
             ):
-                logger.warning_once(
+                print_warning_once(
                     "w1_weight_scale_2 must match w3_weight_scale_2. "
                     "Accuracy may be affected."
                 )
@@ -1472,19 +1605,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
-            # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
-            # Thus we allow users to switch the flag to do thorough testing
-            if CUTEDSL_MOE_SCALAR_INPUT_SCALE:
-                w13_input_scale = (
-                    layer.w13_input_scale.max()
-                    .to(torch.float32)
-                    .repeat(layer.w13_input_scale.shape[0])
-                )
-            else:
-                w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(
-                    torch.float32
-                )
-
+            # CuteDSL standard path uses a single scalar input scale (all experts).
+            w13_input_scale = (
+                layer.w13_input_scale.max()
+                .to(torch.float32)
+                .repeat(layer.w13_input_scale.shape[0])
+            )
             w2_input_scale = layer.w2_input_scale
 
             def _slice_scale(w):
@@ -1614,6 +1740,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
+            if self.enable_flashinfer_cutedsl_moe and layer.moe_runner_config.is_gated:
+                # For CuteDSL FP4 path, apply TRT-LLM-style post-quant W1 interleave:
+                # interleave packed W1 rows and linear block-scales before swizzling.
+                layer.w13_weight = Parameter(
+                    _interleave_linear_and_gate(
+                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1
+                    ).contiguous(),
+                    requires_grad=False,
+                )
+                layer.w13_weight_scale = Parameter(
+                    _interleave_linear_and_gate(
+                        layer.w13_weight_scale, group_size=64, dim=1
+                    ).contiguous(),
+                    requires_grad=False,
+                )
+
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
             del layer.w13_weight_scale
@@ -1658,6 +1800,41 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
 
+            if self.enable_flashinfer_cutedsl_moe:
+                # CuteDSL expects MMA layout for weight scales. Convert from swizzled bytes.
+                from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+                sf_vec_size = 16
+                num_local_experts = layer.w13_weight.shape[0]
+                w13_m = layer.w13_weight.shape[1]
+                w13_k = layer.w13_weight.shape[2] * 2
+                w2_m = layer.w2_weight.shape[1]
+                w2_k = layer.w2_weight.shape[2] * 2
+                layer.w13_blockscale_mma = Parameter(
+                    convert_sf_to_mma_layout(
+                        layer.w13_blockscale_swizzled.contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                        m=w13_m,
+                        k=w13_k,
+                        num_groups=num_local_experts,
+                        sf_vec_size=sf_vec_size,
+                    ),
+                    requires_grad=False,
+                )
+                layer.w2_blockscale_mma = Parameter(
+                    convert_sf_to_mma_layout(
+                        layer.w2_blockscale_swizzled.contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                        m=w2_m,
+                        k=w2_k,
+                        num_groups=num_local_experts,
+                        sf_vec_size=sf_vec_size,
+                    ),
+                    requires_grad=False,
+                )
+
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
             # Set up CUTLASS MoE parameters
@@ -1672,19 +1849,103 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
-        return self.enable_flashinfer_cutlass_moe and self.moe_runner_config.is_gated
+        # FlashInfer CUTLASS/CuteDSL kernels assume [Up, Gate] Proj as W13.
+        return self.moe_runner_config.is_gated and (
+            self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
 
+    def _apply_flashinfer_cutedsl_standard(
+        self,
+        x: torch.Tensor,
+        layer: FusedMoE,
+        topk_output: TopKOutput,
+        moe_runner_config: MoeRunnerConfig,
+        standard_combine_input_cls: type[StandardCombineInput],
+    ) -> StandardCombineInput:
+        """Standard-path FlashInfer CuteDSL (moe_a2a=none): quantize x, run wrapper."""
+        try:
+            from flashinfer import CuteDslMoEWrapper
+            from flashinfer import fp4_quantize as flashinfer_fp4_quantize
+        except ImportError as e:
+            raise ImportError(
+                "Can't import CuteDslMoEWrapper from flashinfer. "
+                "Please check flashinfer version to use flashinfer_cutedsl backend "
+                "on standard MoE path."
+            ) from e
+
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int32)
+
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            _resolve_cutedsl_standard_scales(layer)
+        )
+
+        x_fp4, x_sf = flashinfer_fp4_quantize(
+            x,
+            used_input_scale,
+            16,  # sf_vec_size
+            False,  # sf_use_ue8m0 / use_ue8m0 (version-dependent name)
+            False,  # is_sf_swizzled_layout
+        )
+
+        if not hasattr(layer, "_flashinfer_cutedsl_moe_wrapper"):
+            from sglang.srt.server_args import get_global_server_args
+
+            _server_args = get_global_server_args()
+            _use_cuda_graph = (
+                _server_args is not None and not _server_args.disable_cuda_graph
+            )
+            _max_num_tokens = max(
+                getattr(_server_args, "cuda_graph_max_bs", None) or 512,
+                getattr(_server_args, "chunked_prefill_size", None) or 8192,
+            )
+
+            layer._flashinfer_cutedsl_moe_wrapper = CuteDslMoEWrapper(
+                num_experts=layer.num_experts,
+                top_k=(
+                    layer.top_k if layer.top_k is not None else moe_runner_config.top_k
+                ),
+                hidden_size=layer.hidden_size,
+                intermediate_size=layer.intermediate_size_per_partition,
+                use_cuda_graph=_use_cuda_graph,
+                max_num_tokens=_max_num_tokens,
+                num_local_experts=layer.num_local_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                output_dtype=x.dtype,
+                device=str(x.device),
+            )
+
+        w1_weight_sf = getattr(
+            layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+        )
+        w2_weight_sf = getattr(layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled)
+
+        output = layer._flashinfer_cutedsl_moe_wrapper.run(
+            x=x_fp4,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_weights,
+            w1_weight=layer.w13_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=layer.w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+        )
+        return standard_combine_input_cls(hidden_states=output)
+
     def apply(
         self,
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         x_sf = dispatch_output.hidden_states_scale
@@ -1700,84 +1961,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Check if this is a FlashInferFP4MoE layer that should handle its own forward
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
             # This layer was processed with flashinfer TRTLLM - delegate to its own forward
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
-        # Standard-path FlashInfer CuteDSL branch (moe_a2a=none).
-        # DeepEP low-latency masked path remains in apply_without_routing_weights().
+        # Standard-path FlashInfer CuteDSL (moe_a2a=none). Masked / DeepEP path is in apply_without_routing_weights().
         if self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_none():
-            try:
-                from flashinfer import (
-                    CuteDslMoEWrapper,
-                    fp4_quantize as flashinfer_fp4_quantize,
-                )
-            except ImportError as e:
-                raise ImportError(
-                    "Can't import CuteDslMoEWrapper from flashinfer. "
-                    "Please check flashinfer version to use flashinfer_cutedsl backend "
-                    "on standard MoE path."
-                ) from e
-
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-            topk_ids = topk_ids.to(torch.int32)
-
-            # The standard path dispatch does not provide FP4 activations, so quantize
-            # hidden states to NVFP4 here for CuteDSL.
-            input_scale = _resolve_cutedsl_standard_input_scale(
-                layer.w13_input_scale_quant
+            return self._apply_flashinfer_cutedsl_standard(
+                x, layer, topk_output, moe_runner_config, StandardCombineInput
             )
-
-            global _logged_flashinfer_cutedsl_standard_path
-            if not _logged_flashinfer_cutedsl_standard_path:
-                log_info_on_rank0(
-                    logger,
-                    "Using experimental flashinfer_cutedsl standard MoE path "
-                    "(moe_a2a_backend=none).",
-                )
-                _logged_flashinfer_cutedsl_standard_path = True
-
-            x_fp4, x_sf = flashinfer_fp4_quantize(
-                x,
-                input_scale,
-                16,  # sf_vec_size
-                False,  # sf_use_ue8m0 / use_ue8m0 (version-dependent name)
-                False,  # is_sf_swizzled_layout
-            )
-
-            if not hasattr(layer, "_flashinfer_cutedsl_moe_wrapper"):
-                layer._flashinfer_cutedsl_moe_wrapper = CuteDslMoEWrapper(
-                    num_experts=layer.num_experts,
-                    top_k=(
-                        layer.top_k
-                        if layer.top_k is not None
-                        else moe_runner_config.top_k
-                    ),
-                    hidden_size=layer.hidden_size,
-                    intermediate_size=layer.intermediate_size_per_partition,
-                    use_cuda_graph=False,
-                    num_local_experts=layer.num_local_experts,
-                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                    output_dtype=x.dtype,
-                    device=str(x.device),
-                )
-
-            output = layer._flashinfer_cutedsl_moe_wrapper.run(
-                x=x_fp4,
-                x_sf=x_sf,
-                token_selected_experts=topk_ids,
-                token_final_scales=topk_weights,
-                w1_weight=layer.w13_weight,
-                w1_weight_sf=layer.w13_blockscale_swizzled,
-                w1_alpha=layer.g1_alphas,
-                fc2_input_scale=layer.w2_input_scale_quant,
-                w2_weight=layer.w2_weight,
-                w2_weight_sf=layer.w2_blockscale_swizzled,
-                w2_alpha=layer.g2_alphas,
-            )
-            return StandardCombineInput(hidden_states=output)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
@@ -1818,7 +2008,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
                 input_sf=x_sf,
-                # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
+                # swizzled_input_sf intentionally omitted; not used for this path.
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -1835,8 +2025,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
-
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=output)
 
@@ -1859,8 +2047,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(
