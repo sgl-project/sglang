@@ -592,7 +592,6 @@ class ServerArgs:
         configure_logger(server_args=self)
 
         # 1. adjust parameters
-        ic('adjusting params')
         self._adjust_parameters()
 
         # 2. Validate parameters

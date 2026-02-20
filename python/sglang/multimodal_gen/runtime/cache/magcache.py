@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from icecream import ic
 import torch
 import torch.nn.functional as F
 
@@ -41,23 +42,15 @@ class MagCacheContext:
 
     Attributes:
         current_timestep: Current denoising timestep index (0-indexed).
-        num_inference_steps: Total number of inference steps.
         do_cfg: Whether classifier-free guidance is enabled.
         is_cfg_negative: True if currently processing negative CFG branch.
-        magcache_thresh: Threshold for accumulated error.
-        max_skip_steps: Maximum consecutive skips allowed.
-        retention_steps: Always compute for first N steps.
-        magcache_params: Full MagCacheParams for model-specific access.
     """
 
     current_timestep: int
-    num_inference_steps: int
+    cnt: int
     do_cfg: bool
     is_cfg_negative: bool
-    magcache_thresh: float
-    max_skip_steps: int
-    retention_steps: int
-    magcache_params: "MagCacheParams"
+    magcache_params: "MagCacheParams | None" = None
 
 
 class MagCacheMixin:
@@ -65,7 +58,7 @@ class MagCacheMixin:
     _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
     config: DiTConfig
 
-    def init(self, magcache_params: "MagCacheParams") -> None:
+    def init(self, is_cfg_negative:bool, magcache_params:"MagCacheParams") -> None:
 
         self.num_steps = magcache_params.num_steps # todo: don't hardcode
         self.retention_ratio = magcache_params.retention_ratio
@@ -73,60 +66,41 @@ class MagCacheMixin:
         self.max_skip_steps = magcache_params.max_skip_steps
         self.mag_ratios = magcache_params.mag_ratios
         self.use_ret_steps = magcache_params.use_ret_steps
-        ic(self.mag_ratios)
 
-        # cnt = step * 2 + branch_offset, so ranges over [0, num_steps*2)
-        # min_steps and max_steps must be in the same cnt space
         self.min_steps = int(self.num_steps * self.retention_ratio) * 2 if self.use_ret_steps else 2
         self.max_steps = self.num_steps * 2 if self.use_ret_steps else self.num_steps * 2 - 2
-
-        self.previous_residual: torch.Tensor | None = None
-        self.previous_residual_norm: float = 0.0
-        self.norm_ratio: float = 1.0
-        self.accumulated_error: float = 0.0
-        self.consecutive_skips: int = 0
 
         # save calibrated magnitude ratios
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.calibration_path = f"cache/magcache_calibration_{timestamp}.jsonl"
         os.makedirs(os.path.dirname(self.calibration_path), exist_ok=True)
 
-        # CFG negative branch (only if supported)
-        self._supports_cfg_cache = self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
-        if self._supports_cfg_cache:
+        # track previous residual separately for positive and negative branches in CFG
+        if not is_cfg_negative:
+            self.previous_residual: torch.Tensor | None = None
+            self.previous_residual_norm: float = 0.0
+        else:
             self.previous_residual_negative: torch.Tensor | None = None
             self.previous_residual_norm_negative: float = 0.0
-            self.norm_ratio_negative: float = 1.0
-            self.accumulated_error_negative: float = 0.0
-            self.consecutive_skips_negative: int = 0
+
+        # track magnitude ratio and accumulated error for skip decision
+        self.reset(is_cfg_negative)
 
     def reset(self, is_cfg_negative):
         if not is_cfg_negative:
             self.norm_ratio = 1.0
             self.accumulated_error = 0.0
             self.consecutive_skips = 0
+            self.previous_residual: torch.Tensor | None = None
+            self.previous_residual_norm: float = 0.0
         else:
             self.norm_ratio_negative = 1.0
             self.accumulated_error_negative = 0.0
             self.consecutive_skips_negative = 0
+            self.previous_residual_negative: torch.Tensor | None = None
+            self.previous_residual_norm_negative: float = 0.0
 
-    def should_skip_forward(self, current_timestep, do_cfg, is_cfg_negative=False):
-
-        # Re-initialize from per-request sampling params at the start of each generation
-        if current_timestep == 0:
-            from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-            forward_batch = get_forward_context().forward_batch
-            magcache_params = getattr(forward_batch.sampling_params, "magcache_params", None)
-            if magcache_params is not None:
-                self.init(magcache_params)
-
-        # cnt is the global step index that accounts for both cond and uncond passes when doing CFG
-        cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
-        ic(current_timestep, cnt, do_cfg, is_cfg_negative)
-
-        # reset at timestep 0
-        if current_timestep == 0:
-            self.reset(is_cfg_negative)
+    def should_skip_forward(self, current_timestep, cnt, do_cfg, is_cfg_negative=False):
 
         accumulated_error = self.accumulated_error_negative if is_cfg_negative else self.accumulated_error
         consecutive_skips = self.consecutive_skips_negative if is_cfg_negative else self.consecutive_skips
@@ -161,7 +135,6 @@ class MagCacheMixin:
             return False
 
     def calibrate(self, hidden_states, original_hidden_states, current_timestep, do_cfg, is_cfg_negative=False):
-        cnt = current_timestep * 2 + (1 if is_cfg_negative else 0) if do_cfg else current_timestep
 
         prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
         if prev_residual is None:
@@ -178,7 +151,33 @@ class MagCacheMixin:
         with open(self.calibration_path, "a") as f:
             f.write(json.dumps({"cnt": cnt, "mag_ratio": mag_ratio, "mag_std": mag_std, "cos_dis": cos_dis, "negative": is_cfg_negative}) + "\n")
 
-    def _get_magcache_context():
+    def _get_magcache_context(self) -> MagCacheContext | None:
         from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-        forward_batch = get_forward_context().forward_batch
-        magcache_params = getattr(forward_batch.sampling_params, "magcache_params", None)
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        if forward_batch is None:
+            return None
+
+        # unpack parameters
+        current_timestep=forward_context.current_timestep
+        do_cfg=forward_batch.do_classifier_free_guidance
+        is_cfg_negative=forward_batch.is_cfg_negative
+        magcache_params=getattr(forward_batch.sampling_params, "magcache_params", None)
+        assert magcache_params is not None, "MagCache parameters not found in sampling_params."
+
+        # init cache at the start of each generation
+        if current_timestep == 0:
+            self.init(is_cfg_negative, magcache_params)
+
+        # compute cnt index differently for cond and uncond branches in CFG
+        cnt = current_timestep
+        if do_cfg:
+            cnt = current_timestep * 2 + (1 if is_cfg_negative else 0)
+
+        return MagCacheContext(
+            current_timestep=current_timestep,
+            cnt=cnt,
+            do_cfg=do_cfg,
+            is_cfg_negative=is_cfg_negative,
+            magcache_params=magcache_params,
+        )

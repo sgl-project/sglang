@@ -689,7 +689,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def __init__(self, config: WanVideoConfig, hf_config: dict[str, Any]) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        ic(config, hf_config)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
@@ -823,6 +822,13 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             )
         else:
             sequence_shard_enabled = False
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
+        self.enable_magcache = (
+            forward_batch is not None and forward_batch.enable_magcache
+        )
+
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -934,7 +940,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
-        # should_skip_forward = False # always compute for calibration
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
@@ -1013,32 +1018,17 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
 
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            get_forward_context,
-        )
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None:
-            return None
-        self.is_cfg_negative = forward_batch.is_cfg_negative
-        current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
-        do_cfg = forward_batch.do_classifier_free_guidance
+        if self.enable_magcache and self.enable_teacache:
+            raise ValueError("Both MagCache and TeaCache cannot be enabled at the same time")
+        self.cache_type = 'magcache' if self.enable_magcache else 'teacache' if self.enable_teacache else None
 
-        enable_magcache = getattr(forward_batch.sampling_params, "enable_magcache", False)
-        enable_teacache = getattr(forward_batch.sampling_params, "enable_teacache", False)
-        if enable_magcache and enable_teacache:
-            raise ValueError("Cannot enable both MagCache and TeaCache at the same time.")
-
-        ic(enable_teacache, enable_magcache, self.is_cfg_negative)
-        if enable_magcache:
-            ic('checking magcache2')
-            return self.should_skip_forward(current_timestep, do_cfg, self.is_cfg_negative)
-
-        # if self.calibrate_magcache:
-        #     return False
+        if self.enable_magcache:
+            ctx = self._get_magcache_context()
+            assert ctx is not None
+            return self.should_skip_forward(ctx.current_timestep, ctx.cnt, ctx.do_cfg, ctx.is_cfg_negative)
 
         # Try TeaCache
-        if enable_teacache:
+        if self.enable_teacache:
             ic('checking teacache')
             ctx = self._get_teacache_context()
             if ctx is None:
@@ -1054,14 +1044,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 use_ret_steps = teacache_params.use_ret_steps
                 cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
                 ret_steps = teacache_params.ret_steps
-
-                # Log params once at the start of each generation
-                if self.cnt == 0 and not self.is_cfg_negative:
-                    ic(teacache_params.teacache_thresh)
-                    ic(teacache_params.use_ret_steps)
-                    ic(teacache_params.ret_steps_coeffs)
-                    ic(teacache_params.non_ret_steps_coeffs)
-                    ic(ret_steps, cutoff_steps)
 
                 # Adjust ret_steps and cutoff_steps for non-CFG mode
                 if not ctx.do_cfg:
