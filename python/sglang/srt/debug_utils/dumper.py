@@ -4,15 +4,105 @@ import re
 import socket
 import threading
 import time
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Self, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
+
+# -------------------------------------- frozen config base ------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FrozenConfig(ABC):
+    def __post_init__(self) -> None:
+        self._verify_types()
+
+    def _verify_types(self) -> None:
+        hints = get_type_hints(type(self))
+        cls_name = type(self).__name__
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is None:
+                continue
+            expected = self._unwrap_type(hints[f.name])
+            if not isinstance(value, expected):
+                raise TypeError(
+                    f"{cls_name}.{f.name}: expected {expected.__name__}, "
+                    f"got {type(value).__name__}"
+                )
+
+    @classmethod
+    @abstractmethod
+    def _env_prefix(cls) -> str: ...
+
+    @classmethod
+    def _env_name(cls, field_name: str) -> str:
+        return f"{cls._env_prefix()}{field_name.upper()}"
+
+    @classmethod
+    def from_env(cls) -> Self:
+        return cls(
+            **{
+                f.name: cls._parse_env_field(cls._env_name(f.name), f.default)
+                for f in fields(cls)
+            }
+        )
+
+    def with_defaults(self, **kwargs) -> Self:
+        cls = type(self)
+        actual = {
+            key: value
+            for key, value in kwargs.items()
+            if os.getenv(cls._env_name(key)) is None
+        }
+        return replace(self, **actual) if actual else self
+
+    @staticmethod
+    def _unwrap_type(hint) -> type:
+        args = get_args(hint)
+        if args:
+            return next(a for a in args if a is not type(None))
+        return hint
+
+    @staticmethod
+    def _parse_env_field(env_name: str, default):
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            return default
+        if isinstance(default, bool):
+            return raw.lower() in ("true", "1")
+        if isinstance(default, int):
+            return int(raw)
+        return raw
+
+
+@dataclass(frozen=True)
+class _DumperConfig(_FrozenConfig):
+    enable: bool = False
+    filter: Optional[str] = None
+    dir: str = "/tmp"
+    enable_output_file: bool = True
+    enable_output_console: bool = True
+    enable_value: bool = True
+    enable_grad: bool = False
+    enable_model_value: bool = True
+    enable_model_grad: bool = True
+    partial_name: Optional[str] = None
+    enable_http_server: bool = True
+    cleanup_previous: bool = False
+    collective_timeout: int = 60
+
+    @classmethod
+    def _env_prefix(cls) -> str:
+        return "SGLANG_DUMPER_"
+
 
 # -------------------------------------- dumper core ------------------------------------------
 
@@ -44,66 +134,16 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(
-        self,
-        *,
-        enable: bool,
-        base_dir: Path,
-        filter: Optional[str] = None,
-        enable_output_file: bool = True,
-        enable_output_console: bool = True,
-        enable_value: bool = True,
-        enable_grad: bool = False,
-        enable_model_value: bool = True,
-        enable_model_grad: bool = True,
-        partial_name: Optional[str] = None,
-        enable_http_server: bool = True,
-        cleanup_previous: bool = False,
-        collective_timeout: int = 60,
-    ):
-        # Config
-        self._enable = enable
-        self._filter = filter
-        self._base_dir = base_dir
-        self._enable_output_file = enable_output_file
-        self._enable_output_console = enable_output_console
-        self._enable_value = enable_value
-        self._enable_grad = enable_grad
-        self._enable_model_value = enable_model_value
-        self._enable_model_grad = enable_model_grad
-        self._collective_timeout = collective_timeout
+    def __init__(self, *, config: _DumperConfig):
+        self._config = config
 
-        # States
-        self._partial_name = partial_name
+        self._http_server_handled = not config.enable_http_server
+        self._cleanup_previous_handled = not config.cleanup_previous
+
         self._dump_index = 0
         self._forward_pass_id = 0
-        self._global_ctx = {}
-        self._override_enable = None
+        self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
-        self._http_server_handled = not enable_http_server
-        self._pending_cleanup = cleanup_previous
-
-    @classmethod
-    def from_env(cls) -> "_Dumper":
-        return cls(
-            enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
-            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
-            filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
-            enable_output_console=get_bool_env_var("SGLANG_DUMPER_OUTPUT_CONSOLE", "1"),
-            enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
-            enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
-            enable_model_value=get_bool_env_var(
-                "SGLANG_DUMPER_ENABLE_MODEL_VALUE", "1"
-            ),
-            enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
-            partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
-            enable_http_server=get_bool_env_var(
-                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
-            ),
-            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
-            collective_timeout=60,
-        )
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -111,7 +151,7 @@ class _Dumper:
         # Even if SGLANG_DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
         self._ensure_http_server()
 
-        if not self._enable:
+        if not self._config.enable:
             return
 
         # Users may want to `dump` only on some ranks, thus determine name here
@@ -126,20 +166,19 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self, timeout_seconds=self._collective_timeout)
+        _start_maybe_http_server(self, timeout_seconds=self._config.collective_timeout)
 
     def _ensure_partial_name(self):
-        if self._partial_name is None:
-            self._partial_name = _get_partial_name(
-                timeout_seconds=self._collective_timeout
-            )
-            print(f"[Dumper] Choose partial_name={self._partial_name}")
+        if self._config.partial_name is None:
+            name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
+            self.configure(partial_name=name)
+            print(f"[Dumper] Choose partial_name={name}")
 
     def set_ctx(self, **kwargs):
         """
         Example:
 
-        dumper.override_enable(self.layer_id <= 3)
+        dumper.configure_default(filter='layer_id=[0-3]')
         dumper.set_ctx(layer_id=self.layer_id)
         ...
         dumper.set_ctx(layer_id=None)
@@ -157,8 +196,11 @@ class _Dumper:
         finally:
             self._captured_output_data = None
 
-    def override_enable(self, value: bool):
-        self._override_enable = value
+    def configure(self, **kwargs) -> None:
+        self._config = replace(self._config, **kwargs)
+
+    def configure_default(self, **kwargs) -> None:
+        self._config = self._config.with_defaults(**kwargs)
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
         data = _obj_to_dict(data)
@@ -171,9 +213,9 @@ class _Dumper:
             value=value,
             extra_kwargs=kwargs,
             save=save,
-            enable_value=self._enable_value,
+            enable_value=self._config.enable_value,
             enable_curr_grad=False,
-            enable_future_grad=self._enable_grad,
+            enable_future_grad=self._config.enable_grad,
             value_tag="Dumper.Value",
             grad_tag="Dumper.Grad",
         )
@@ -191,8 +233,8 @@ class _Dumper:
                 value=param,
                 extra_kwargs=kwargs,
                 save=save,
-                enable_value=self._enable_model_value,
-                enable_curr_grad=self._enable_model_grad,
+                enable_value=self._config.enable_model_value,
+                enable_curr_grad=self._config.enable_model_grad,
                 enable_future_grad=False,
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
@@ -213,11 +255,13 @@ class _Dumper:
     ) -> None:
         self._ensure_http_server()
 
-        if not (self._enable and (self._override_enable is not False)):
+        if not self._config.enable:
             return
 
         tags = dict(name=name, **extra_kwargs, **self._global_ctx)
-        if (f := self._filter) is not None and re.search(f, _format_tags(tags)) is None:
+        if (f := self._config.filter) is not None and re.search(
+            f, _format_tags(tags)
+        ) is None:
             return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
@@ -307,9 +351,13 @@ class _Dumper:
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
-        path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
+        path = (
+            Path(self._config.dir)
+            / f"sglang_dump_{self._config.partial_name}"
+            / full_filename
+        )
 
-        if self._enable_output_console:
+        if self._config.enable_output_console:
             print(
                 f"[{tag}] [{rank}, {time.time()}] {path} "
                 f"type={type(value)} "
@@ -321,7 +369,7 @@ class _Dumper:
             )
 
         capturing = self._captured_output_data is not None
-        if save and (self._enable_output_file or capturing):
+        if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
                 "meta": dict(**full_kwargs, **self._static_meta),
@@ -331,9 +379,9 @@ class _Dumper:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
                 self._captured_output_data[tags["name"]] = output_data
             else:
-                if self._pending_cleanup:
-                    self._pending_cleanup = False
-                    _cleanup_old_dumps(self._base_dir)
+                if not self._cleanup_previous_handled:
+                    self._cleanup_previous_handled = True
+                    _cleanup_old_dumps(Path(self._config.dir))
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
@@ -608,7 +656,7 @@ class _DumperRpcHandler:
 
     def set_enable(self, enable: bool):
         print(f"[DumperRpcHandler] set_enable {enable=}")
-        self._dumper._enable = enable
+        self._dumper.configure(enable=enable)
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
@@ -694,20 +742,6 @@ class _ZmqRpcHandle:
 # --------------------------------- copied code (avoid dependency) --------------------------------------
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-    truthy_values = ("true", "1")
-    return value in truthy_values
-
-
-def _get_str_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    return value
-
-
 def get_int_env_var(name: str, default: int = 0) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -750,7 +784,7 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper.from_env()
+dumper = _Dumper(config=_DumperConfig.from_env())
 
 
 # -------------------------------------- other utility functions ------------------------------------------

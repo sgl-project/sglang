@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.dumper import (
     _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
+    _DumperConfig,
     _format_tags,
     _materialize_value,
     _obj_to_dict,
@@ -39,6 +40,57 @@ def _capture_stdout():
         yield captured
     finally:
         sys.stdout = old_stdout
+
+
+class TestDumperConfig:
+    def test_from_env_defaults_match_dataclass_defaults(self):
+        assert _DumperConfig.from_env() == _DumperConfig()
+
+    def test_from_env_bool(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
+            assert _DumperConfig.from_env().enable is True
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="false"):
+            assert _DumperConfig.from_env().enable is False
+
+    def test_from_env_str(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="layer_id=0"):
+            assert _DumperConfig.from_env().filter == "layer_id=0"
+
+    def test_from_env_dir(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_DIR="/my/dir"):
+            assert _DumperConfig.from_env().dir == "/my/dir"
+
+    def test_from_env_int(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
+            assert _DumperConfig.from_env().collective_timeout == 120
+
+    def test_configure_overrides(self):
+        d = _make_test_dumper("/tmp")
+        d.configure(enable=False)
+        assert d._config.enable is False
+        d.configure(enable=True)
+        assert d._config.enable is True
+
+    def test_type_validation(self):
+        with pytest.raises(TypeError, match="enable.*expected bool.*got str"):
+            _DumperConfig(enable="yes")
+        with pytest.raises(
+            TypeError, match="collective_timeout.*expected int.*got str"
+        ):
+            _DumperConfig(collective_timeout="abc")
+        with pytest.raises(TypeError, match="filter.*expected str.*got int"):
+            _DumperConfig(filter=123)
+
+    def test_configure_default_skips_when_env_set(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="from_env"):
+            d = _Dumper(config=_DumperConfig.from_env())
+            d.configure_default(filter="from_code")
+            assert d._config.filter == "from_env"
+
+    def test_configure_default_applies_when_no_env(self):
+        d = _Dumper(config=_DumperConfig.from_env())
+        d.configure_default(filter="from_code")
+        assert d._config.filter == "from_code"
 
 
 class TestDumperPureFunctions:
@@ -154,9 +206,9 @@ class TestDumperDistributed:
         dumper.set_ctx(ctx_arg=None)
 
         dumper.on_forward_pass_start()
-        dumper.override_enable(False)
+        dumper.configure(filter=r"^$")
         dumper.dump("tensor_skip", tensor)
-        dumper.override_enable(True)
+        dumper.configure(filter=None)
 
         dumper.on_forward_pass_start()
         dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
@@ -176,11 +228,11 @@ class TestDumperDistributed:
     @staticmethod
     def _test_collective_timeout_func(rank):
         dumper = _Dumper(
-            enable=True,
-            base_dir=Path("/tmp"),
-            partial_name=None,
-            enable_http_server=False,
-            collective_timeout=3,
+            config=_DumperConfig(
+                enable=True,
+                collective_timeout=3,
+                enable_http_server=False,
+            ),
         )
 
         with _capture_stdout() as captured:
@@ -203,7 +255,7 @@ class TestDumperDistributed:
     def _test_http_func(rank):
         from sglang.srt.debug_utils.dumper import dumper
 
-        assert not dumper._enable
+        assert not dumper._config.enable
         dumper.on_forward_pass_start()
 
         for enable in [True, False]:
@@ -214,7 +266,7 @@ class TestDumperDistributed:
                     "http://localhost:40000/dumper", json={"enable": enable}
                 ).raise_for_status()
             dist.barrier()
-            assert dumper._enable == enable
+            assert dumper._config.enable == enable
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
@@ -406,15 +458,16 @@ class TestDumpDictFormat:
         assert torch.equal(raw["value"], tensor)
 
 
-def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
+def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
-    defaults: dict = dict(
+    config = _DumperConfig(
         enable=True,
-        base_dir=tmp_path,
+        dir=str(tmp_path),
         partial_name="test",
         enable_http_server=False,
+        **overrides,
     )
-    d = _Dumper(**{**defaults, **overrides})
+    d = _Dumper(config=config)
     d.on_forward_pass_start()
     return d
 
@@ -487,7 +540,7 @@ class TestSaveValue:
 
 class TestStaticMetadata:
     def test_static_meta_contains_world_info(self):
-        dumper = _make_test_dumper(Path("/tmp"))
+        dumper = _make_test_dumper("/tmp")
         meta = dumper._static_meta
         assert "world_rank" in meta
         assert "world_size" in meta
@@ -495,7 +548,7 @@ class TestStaticMetadata:
         assert meta["world_size"] == 1
 
     def test_static_meta_caching(self):
-        dumper = _make_test_dumper(Path("/tmp"))
+        dumper = _make_test_dumper("/tmp")
         meta1 = dumper._static_meta
         meta2 = dumper._static_meta
         assert meta1 is meta2
