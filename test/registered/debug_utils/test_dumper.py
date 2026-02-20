@@ -1370,5 +1370,146 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         assert "non_intrusive__layer.output" in captured
 
 
+class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
+    """Tests for automatic layer_id context injection via set_ctx."""
+
+    def test_layer_id_from_layer_number(self, tmp_path):
+        """Megatron PP: layer_number (1-based global) -> layer_id = layer_number - 1."""
+
+        class Layer(torch.nn.Module):
+            def __init__(self, layer_number: int):
+                super().__init__()
+                self.layer_number = layer_number
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer(10), Layer(11)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        layer0_key = "non_intrusive__model.layers.0.linear.output"
+        layer1_key = "non_intrusive__model.layers.1.linear.output"
+        assert layer0_key in captured
+        assert layer1_key in captured
+        assert captured[layer0_key]["meta"]["layer_id"] == 9
+        assert captured[layer1_key]["meta"]["layer_id"] == 10
+
+        root_key = "non_intrusive__output"
+        assert root_key in captured
+        assert "layer_id" not in captured[root_key]["meta"]
+
+    def test_layer_id_from_layer_id_attr(self, tmp_path):
+        """SGLang style: module has layer_id attribute directly."""
+
+        class Layer(torch.nn.Module):
+            def __init__(self, layer_id: int):
+                super().__init__()
+                self.layer_id = layer_id
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer(5)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        layer_key = "non_intrusive__model.layers.0.linear.output"
+        assert layer_key in captured
+        assert captured[layer_key]["meta"]["layer_id"] == 5
+
+    def test_no_layer_id_when_no_attr(self, tmp_path):
+        """layers.N modules without layer_number/layer_id -> no layer_id injected."""
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)]
+                )
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert len(captured) > 0
+        for key, entry in captured.items():
+            assert "layer_id" not in entry["meta"], f"{key} has unexpected layer_id"
+
+    def test_filter_by_layer_id(self, tmp_path):
+        """filter='layer_id=0' keeps only layer 0 dumps."""
+
+        class Layer(torch.nn.Module):
+            def __init__(self, layer_number: int):
+                super().__init__()
+                self.layer_number = layer_number
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer(1), Layer(2)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        d = self._make_dumper(tmp_path, filter="layer_id=0")
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        layer0_keys = [k for k in captured if "layers.0" in k]
+        layer1_keys = [k for k in captured if "layers.1" in k]
+        assert len(layer0_keys) > 0, "layer 0 dumps should be kept"
+        assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
