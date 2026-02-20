@@ -49,10 +49,15 @@ def get_param_names_mapping(
         merge_index = None
         total_split_params = None
         max_steps = max(8, len(mapping_dict) * 2)
+        applied_patterns: set[str] = set()
+        visited_names: set[str] = {name}
 
         for _ in range(max_steps):
             transformed = False
             for pattern, replacement in mapping_dict.items():
+                # avoid re-applying the same rule on its own output
+                if pattern in applied_patterns:
+                    continue
                 if re.match(pattern, name) is None:
                     continue
 
@@ -65,12 +70,17 @@ def get_param_names_mapping(
 
                 new_name = re.sub(pattern, replacement, name)
 
-                if curr_merge_index is not None:
-                    merge_index = curr_merge_index
-                    total_split_params = curr_total_split_params
-
                 if new_name != name:
+                    if curr_merge_index is not None:
+                        merge_index = curr_merge_index
+                        total_split_params = curr_total_split_params
+
                     name = new_name
+                    applied_patterns.add(pattern)
+                    if name in visited_names:
+                        transformed = False
+                        break
+                    visited_names.add(name)
                     transformed = True
                     break
 
@@ -153,11 +163,11 @@ def _normalize_component_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-        "_name_or_path",
-        "transformers_version",
-        "model_type",
-        "tokenizer_class",
-        "torch_dtype",
+            "_name_or_path",
+            "transformers_version",
+            "model_type",
+            "tokenizer_class",
+            "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -167,27 +177,7 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
-BYTES_PER_GB = 1024**3
-
-
-def get_memory_usage_of_component(module) -> float | None:
-    """
-    returned value is in GB, rounded to 2 decimal digits
-    """
-    if not isinstance(module, nn.Module):
-        return None
-    if hasattr(module, "get_memory_footprint"):
-        usage = module.get_memory_footprint() / BYTES_PER_GB
-    else:
-        # manually
-        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
-        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
-
-        total_size_bytes = param_size + buffer_size
-        usage = total_size_bytes / (1024**3)
-
-    return round(usage, 2)
-
+BYTES_PER_GB = 1024 ** 3
 
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}
