@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import re
@@ -8,7 +9,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
-import functools
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -91,7 +91,7 @@ class _FrozenConfig(ABC):
 class _DumperConfig(_FrozenConfig):
     enable: bool = False
     filter: Optional[str] = None
-    dir: str = "/tmp"
+    dir: str = "/tmp/dumper"
     enable_output_file: bool = True
     enable_output_console: bool = True
     enable_value: bool = True
@@ -404,11 +404,7 @@ class _Dumper:
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
-        path = (
-            Path(self._config.dir)
-            / self._config.exp_name
-            / full_filename
-        )
+        path = Path(self._config.dir) / self._config.exp_name / full_filename
 
         if self._config.enable_output_console:
             print(
@@ -475,7 +471,9 @@ class _Dumper:
 
     def _ensure_exp_name(self):
         if self._config.exp_name is None:
-            name = _get_default_exp_name(timeout_seconds=self._config.collective_timeout)
+            name = _get_default_exp_name(
+                timeout_seconds=self._config.collective_timeout
+            )
             self.configure(exp_name=name)
             print(f"[Dumper] Choose exp_name={name}")
 
