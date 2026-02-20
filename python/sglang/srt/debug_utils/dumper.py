@@ -231,7 +231,7 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
-    def register_model_hook(
+    def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
     ) -> "_NonIntrusiveDumper":
