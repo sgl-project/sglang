@@ -18,7 +18,7 @@ from types import MappingProxyType
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig\
+    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
         ModelSlimW4A4Int4,
