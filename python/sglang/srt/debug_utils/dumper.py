@@ -493,8 +493,7 @@ class _HookDumper:
                 continue
 
             is_top = name == top_level_module_name
-            if is_top:
-                top_found = True
+            top_found |= is_top
 
             is_leaf = next(module.children(), None) is None
             if is_leaf or is_top:
