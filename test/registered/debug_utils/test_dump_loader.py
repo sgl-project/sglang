@@ -24,9 +24,7 @@ class TestDumpLoader(CustomTestCase):
 
             df = read_meta(tmpdir)
             self.assertEqual(len(df), 2)
-            self.assertTrue(
-                all(c in df.columns for c in ["step", "rank", "name"])
-            )
+            self.assertTrue(all(c in df.columns for c in ["step", "rank", "name"]))
 
     def test_find_row(self):
         from sglang.srt.debug_utils.dump_loader import find_row
