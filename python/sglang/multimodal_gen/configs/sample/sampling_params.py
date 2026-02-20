@@ -135,6 +135,12 @@ class SamplingParams:
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
+    # Cache acceleration
+    enable_teacache: bool = False
+    teacache_params: "TeaCacheParams | None" = None
+    enable_magcache: bool = False
+    magcache_params: "MagCacheParams | None" = None
+
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 5
@@ -158,12 +164,6 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool = False
-
-    # Cache acceleration (per-request)
-    enable_teacache: bool = False
-    teacache_params: "TeaCacheParams | None" = None
-    enable_magcache: bool = False
-    magcache_params: "MagCacheParams | None" = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -344,7 +344,6 @@ class SamplingParams:
         """
         final adjustment, called after merged with user params
         """
-
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
         if not isinstance(self.prompt, str):
@@ -391,6 +390,11 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             ic(self.num_frames, pipeline_config.task_type.is_image_gen())
@@ -398,7 +402,6 @@ class SamplingParams:
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
-                ic('override here', self.num_frames)
 
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
@@ -446,7 +449,6 @@ class SamplingParams:
                     server_args.num_gpus,
                 )
                 self.num_frames = new_num_frames
-
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
