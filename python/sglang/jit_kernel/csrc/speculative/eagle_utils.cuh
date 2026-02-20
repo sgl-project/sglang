@@ -387,8 +387,65 @@ void build_tree_kernel_efficient(
   RuntimeCheck(parent_list.device().device_type == kDLCUDA, "parent_list must be a CUDA tensor");
   RuntimeCheck(parent_list.ndim() == 2, "parent_list must be 2D: [bs, topk*(depth-1)+1]");
   RuntimeCheck(parent_list.is_contiguous(), "parent_list must be contiguous");
+  RuntimeCheck(
+      parent_list.dtype().code == kDLInt && parent_list.dtype().bits == 64, "parent_list must be int64");
 
   int bs = static_cast<int>(parent_list.size(0));
+
+  RuntimeCheck(selected_index.ndim() == 2, "selected_index must be 2D: [bs, draft_token_num-1]");
+  RuntimeCheck(selected_index.is_contiguous(), "selected_index must be contiguous");
+  RuntimeCheck(
+      selected_index.dtype().code == kDLInt && selected_index.dtype().bits == 64, "selected_index must be int64");
+  RuntimeCheck(static_cast<int>(selected_index.size(0)) == bs, "selected_index batch_size mismatch");
+  RuntimeCheck(
+      selected_index.size(1) == draft_token_num - 1, "selected_index dim1 must equal draft_token_num - 1");
+
+  RuntimeCheck(verified_seq_len.ndim() == 1, "verified_seq_len must be 1D: [bs]");
+  RuntimeCheck(verified_seq_len.is_contiguous(), "verified_seq_len must be contiguous");
+  RuntimeCheck(
+      verified_seq_len.dtype().code == kDLInt && verified_seq_len.dtype().bits == 64,
+      "verified_seq_len must be int64");
+  RuntimeCheck(static_cast<int>(verified_seq_len.size(0)) == bs, "verified_seq_len batch_size mismatch");
+
+  RuntimeCheck(tree_mask.is_contiguous(), "tree_mask must be contiguous");
+  // tree_mask is bool (torch.bool → kDLBool) for FULL_MASK/QLEN_ONLY and
+  // uint8 (torch.uint8 → kDLUInt) for QLEN_ONLY_BITPACKING.  Both are 1-byte
+  // elements; check only the element size to accept either dtype.
+  RuntimeCheck(host::dtype_bytes(tree_mask.dtype()) == 1, "tree_mask element size must be 1 byte (bool or uint8)");
+
+  RuntimeCheck(positions.ndim() == 2, "positions must be 2D: [bs, draft_token_num]");
+  RuntimeCheck(positions.is_contiguous(), "positions must be contiguous");
+  RuntimeCheck(positions.dtype().code == kDLInt && positions.dtype().bits == 64, "positions must be int64");
+  RuntimeCheck(
+      static_cast<int>(positions.size(0)) == bs && positions.size(1) == draft_token_num,
+      "positions shape mismatch");
+
+  RuntimeCheck(retrive_index.ndim() == 2, "retrive_index must be 2D: [bs, draft_token_num]");
+  RuntimeCheck(retrive_index.is_contiguous(), "retrive_index must be contiguous");
+  RuntimeCheck(
+      retrive_index.dtype().code == kDLInt && retrive_index.dtype().bits == 64, "retrive_index must be int64");
+  RuntimeCheck(
+      static_cast<int>(retrive_index.size(0)) == bs && retrive_index.size(1) == draft_token_num,
+      "retrive_index shape mismatch");
+
+  RuntimeCheck(retrive_next_token.ndim() == 2, "retrive_next_token must be 2D: [bs, draft_token_num]");
+  RuntimeCheck(retrive_next_token.is_contiguous(), "retrive_next_token must be contiguous");
+  RuntimeCheck(
+      retrive_next_token.dtype().code == kDLInt && retrive_next_token.dtype().bits == 64,
+      "retrive_next_token must be int64");
+  RuntimeCheck(
+      static_cast<int>(retrive_next_token.size(0)) == bs && retrive_next_token.size(1) == draft_token_num,
+      "retrive_next_token shape mismatch");
+
+  RuntimeCheck(retrive_next_sibling.ndim() == 2, "retrive_next_sibling must be 2D: [bs, draft_token_num]");
+  RuntimeCheck(retrive_next_sibling.is_contiguous(), "retrive_next_sibling must be contiguous");
+  RuntimeCheck(
+      retrive_next_sibling.dtype().code == kDLInt && retrive_next_sibling.dtype().bits == 64,
+      "retrive_next_sibling must be int64");
+  RuntimeCheck(
+      static_cast<int>(retrive_next_sibling.size(0)) == bs && retrive_next_sibling.size(1) == draft_token_num,
+      "retrive_next_sibling shape mismatch");
+
   cudaStream_t stream = LaunchKernel::resolve_device(parent_list.device());
   dim3 grid(bs);
   dim3 block(static_cast<unsigned>(draft_token_num));
