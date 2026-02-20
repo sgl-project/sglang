@@ -102,6 +102,8 @@ class _DumperConfig(_FrozenConfig):
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
+    top_level_module_name: str = "model"
+    layers_module_name: str = "layers"
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -234,10 +236,8 @@ class _Dumper:
     def register_model_forward_hook(
         self,
         model: "torch.nn.Module",
-        dump_layers: Optional[List[int]] = None,
-        **kwargs,
-    ):
-        _HookDumper(dumper=self, model=model, dump_layers=dump_layers, **kwargs)
+    ) -> "_HookDumper":
+        return _HookDumper(dumper=self, model=model)
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -477,26 +477,17 @@ class _Dumper:
 
 
 class _HookDumper:
-    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
-
     def __init__(
         self,
         dumper: _Dumper,
         model: "torch.nn.Module",
-        dump_layers: Optional[List[int]] = None,
-        top_level_module_name: str = "model",
-        layers_module_name: str = "layers",
     ):
         self._dumper = dumper
-        self._dump_layers = dump_layers
         self._special_types = _HookDumper._load_special_types()
 
-        top_level_module_name = os.getenv(
-            "TENSOR_DUMP_TOP_LEVEL_MODULE_NAME", top_level_module_name
-        )
-        layers_module_name = os.getenv(
-            "TENSOR_DUMP_LAYERS_MODULE_NAME", layers_module_name
-        )
+        config = dumper._config
+        top_level_module_name = config.top_level_module_name
+        layers_module_name = config.layers_module_name
 
         matched, _ = self._add_hooks_recursive(
             model=model,
@@ -514,7 +505,6 @@ class _HookDumper:
         layers_module_name: str,
     ) -> tuple:
         top_level_matched = False
-        layers_prefix = top_level_module_name + "." + layers_module_name
 
         for name, module in model._modules.items():
             is_top_level = False
@@ -525,14 +515,6 @@ class _HookDumper:
                     is_top_level = True
             else:
                 cur_name = prefix + "." + name
-
-            if (
-                self._dump_layers is not None
-                and name.isdigit()
-                and prefix == layers_prefix
-            ):
-                if int(name) not in self._dump_layers:
-                    continue
 
             if module is not None:
                 _, sub_count = self._add_hooks_recursive(
@@ -721,140 +703,6 @@ def _deepcopy_or_clone(x):
     if isinstance(x, torch.Tensor):
         return x.clone()
     return deepcopy(x)
-
-# -------------------------------------- hook-based (non-intrusive) dumper ------------------------------------------
-
-
-class _HookDumper:
-    def __init__(
-        self,
-        dumper: _Dumper,
-        model: "torch.nn.Module",
-        dump_layers: Optional[List[int]] = None,
-        top_level_module_name: str = "model",
-        layers_module_name: str = "layers",
-    ):
-        self._dumper = dumper
-        self._dump_layers = dump_layers
-        self._special_types = _HookDumper._load_special_types()
-
-        top_level_module_name = os.getenv(
-            "TENSOR_DUMP_TOP_LEVEL_MODULE_NAME", top_level_module_name
-        )
-        layers_module_name = os.getenv(
-            "TENSOR_DUMP_LAYERS_MODULE_NAME", layers_module_name
-        )
-
-        matched, _ = self._add_hooks_recursive(
-            model=model,
-            prefix="",
-            top_level_module_name=top_level_module_name,
-            layers_module_name=layers_module_name,
-        )
-        assert matched, f"model should have a module named {top_level_module_name}"
-
-    def _add_hooks_recursive(
-        self,
-        model: "torch.nn.Module",
-        prefix: str,
-        top_level_module_name: str,
-        layers_module_name: str,
-    ) -> tuple:
-        top_level_matched = False
-        layers_prefix = top_level_module_name + "." + layers_module_name
-
-        for name, module in model._modules.items():
-            is_top_level = False
-            if len(prefix) == 0:
-                cur_name = name
-                if cur_name == top_level_module_name:
-                    top_level_matched = True
-                    is_top_level = True
-            else:
-                cur_name = prefix + "." + name
-
-            if (
-                self._dump_layers is not None
-                and name.isdigit()
-                and prefix == layers_prefix
-            ):
-                if int(name) not in self._dump_layers:
-                    continue
-
-            if module is not None:
-                _, sub_count = self._add_hooks_recursive(
-                    model=module,
-                    prefix=cur_name,
-                    top_level_module_name=top_level_module_name,
-                    layers_module_name=layers_module_name,
-                )
-                # Leaf modules (sub_count==0) always get a hook.
-                # The top-level model module also gets one so its output is captured.
-                # Intermediate containers are skipped to avoid duplicate outputs.
-                if sub_count == 0 or is_top_level:
-                    module.register_forward_hook(self._make_forward_hook(cur_name))
-
-        return top_level_matched, len(model._modules)
-
-    def _make_forward_hook(self, name: str):
-        def _hook(_module, _input, output):
-            if output is not None:
-                self._dump_hook_output(name, output)
-
-        return _hook
-
-    def _dump_hook_output(self, name: str, output) -> None:
-        if isinstance(output, torch.Tensor):
-            self._dumper.dump(name, output)
-            return
-
-        if isinstance(output, (tuple, list)):
-            tensors = [t for t in output if isinstance(t, torch.Tensor)]
-            if len(tensors) == 1:
-                self._dumper.dump(name, tensors[0])
-            else:
-                for index, tensor in enumerate(tensors):
-                    self._dumper.dump(f"{name}.{index}", tensor)
-            return
-
-        st = self._special_types
-        if (cls := st.get("LogitsProcessorOutput")) and isinstance(output, cls):
-            self._dumper.dump(name, output.next_token_logits)
-            return
-
-        if (cls := st.get("ForwardBatch")) and isinstance(output, cls):
-            self._dumper.dump(f"{name}.forward_batch_info.input_ids", output.input_ids)
-            self._dumper.dump(f"{name}.forward_batch_info.seq_lens", output.seq_lens)
-            self._dumper.dump(f"{name}.forward_batch_info.positions", output.positions)
-            return
-
-        if (cls := st.get("PPProxyTensors")) and isinstance(output, cls):
-            for tensor_name, tensor_value in output.tensors.items():
-                self._dumper.dump(
-                    f"{name}.pp_proxy_tensors.{tensor_name}", tensor_value
-                )
-            return
-
-    @staticmethod
-    def _load_special_types() -> dict:
-        types: dict[str, type] = {}
-        try:
-            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-            types["LogitsProcessorOutput"] = LogitsProcessorOutput
-        except ImportError:
-            pass
-        try:
-            from sglang.srt.model_executor.forward_batch_info import (
-                ForwardBatch,
-                PPProxyTensors,
-            )
-
-            types["ForwardBatch"] = ForwardBatch
-            types["PPProxyTensors"] = PPProxyTensors
-        except ImportError:
-            pass
-        return types
 
 
 # -------------------------------------- static meta ------------------------------------------

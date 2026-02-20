@@ -986,40 +986,6 @@ class TestHookDumper:
         assert "model" in captured
         assert torch.allclose(captured["model"]["value"], output)
 
-    def test_layer_filtering(self, tmp_path):
-        class LayeredModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.layers = torch.nn.ModuleList(
-                    [torch.nn.Linear(4, 4) for _ in range(4)]
-                )
-
-            def forward(self, x):
-                for layer in self.layers:
-                    x = layer(x)
-                return x
-
-        class OuterModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = LayeredModel()
-
-            def forward(self, x):
-                return self.model(x)
-
-        d = _make_test_dumper(tmp_path)
-        model = OuterModel()
-        d.register_model_forward_hook(model, dump_layers=[0, 2])
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
-
-        assert "model.layers.0" in captured
-        assert "model.layers.2" in captured
-        assert "model.layers.1" not in captured
-        assert "model.layers.3" not in captured
-
     def test_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
             def forward(self, x):
