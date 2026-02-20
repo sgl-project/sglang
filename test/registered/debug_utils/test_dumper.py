@@ -953,21 +953,21 @@ class TestDumperHttp:
         assert resp.status_code == 400
 
 
-def _make_hook_model(inner_cls):
-    """Wrap an inner module as OuterModel.model for hook testing."""
-
-    class OuterModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = inner_cls()
-
-        def forward(self, *args, **kwargs):
-            return self.model(*args, **kwargs)
-
-    return OuterModel()
-
-
 class TestNonIntrusiveDumper:
+    @staticmethod
+    def _wrap_as_outer(inner_cls: type) -> torch.nn.Module:
+        """Wrap an inner module class as OuterModel.model, mimicking typical model nesting."""
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = inner_cls()
+
+            def forward(self, *args, **kwargs):
+                return self.model(*args, **kwargs)
+
+        return OuterModel()
+
     def test_basic_inputs_and_outputs(self, tmp_path):
         class Inner(torch.nn.Module):
             def __init__(self):
@@ -979,7 +979,7 @@ class TestNonIntrusiveDumper:
                 return self.relu(self.linear(x))
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1028,7 +1028,7 @@ class TestNonIntrusiveDumper:
                 return x
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1067,7 +1067,7 @@ class TestNonIntrusiveDumper:
                 return self.linear(a + b)
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1076,7 +1076,9 @@ class TestNonIntrusiveDumper:
 
         assert "non_intrusive__model.split.output.0" in captured
         assert "non_intrusive__model.split.output.1" in captured
-        assert torch.allclose(captured["non_intrusive__model.split.output.0"]["value"], x)
+        assert torch.allclose(
+            captured["non_intrusive__model.split.output.0"]["value"], x
+        )
 
     def test_single_tensor_tuple_collapses(self, tmp_path):
         class SingleTupleModule(torch.nn.Module):
@@ -1092,7 +1094,7 @@ class TestNonIntrusiveDumper:
                 return self.wrap(x)[0]
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1117,7 +1119,7 @@ class TestNonIntrusiveDumper:
                 return self.mul(x, mask)
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1142,7 +1144,7 @@ class TestNonIntrusiveDumper:
                 return x
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1150,7 +1152,9 @@ class TestNonIntrusiveDumper:
             model(x)
 
         assert "non_intrusive__model.sink.inputs.0" in captured
-        assert not any(k.startswith("non_intrusive__model.sink.output") for k in captured)
+        assert not any(
+            k.startswith("non_intrusive__model.sink.output") for k in captured
+        )
 
     def test_non_tensor_value_silently_skipped(self, tmp_path):
         class IntModule(torch.nn.Module):
@@ -1167,7 +1171,7 @@ class TestNonIntrusiveDumper:
                 return x
 
         d = _make_test_dumper(tmp_path)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1175,7 +1179,9 @@ class TestNonIntrusiveDumper:
             model(x)
 
         assert "non_intrusive__model.const.inputs.0" in captured
-        assert not any(k.startswith("non_intrusive__model.const.output") for k in captured)
+        assert not any(
+            k.startswith("non_intrusive__model.const.output") for k in captured
+        )
 
     def test_root_module_name_no_malformed_dots(self, tmp_path):
         d = _make_test_dumper(tmp_path)
@@ -1203,8 +1209,10 @@ class TestNonIntrusiveDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = _make_test_dumper(tmp_path, filter="name=non_intrusive__model.linear.output")
-        model = _make_hook_model(Inner)
+        d = _make_test_dumper(
+            tmp_path, filter="name=non_intrusive__model.linear.output"
+        )
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
@@ -1226,7 +1234,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
-        model = _make_hook_model(Inner)
+        model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
