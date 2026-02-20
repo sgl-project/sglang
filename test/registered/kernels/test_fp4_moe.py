@@ -428,7 +428,7 @@ def test_cutlass_fp4_moe_no_graph(
 
         # Create quant info
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.BlockscaledFP4,
+            deepep_ll_or_deepep_normal=None,
             w13_weight=w1_q,
             w2_weight=w2_q,
             w1_blockscale=w1_blockscale,

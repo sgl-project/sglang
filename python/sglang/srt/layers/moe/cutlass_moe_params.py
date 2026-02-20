@@ -5,16 +5,21 @@ from typing import Optional
 import torch
 
 
-class CutlassMoEType(Enum):
+class CutlassMoEQuantType(Enum):
     """
-    Enum for the different types of cutlass moe operations
-    that are currently supported in SGLang.
+    Enum for the different quantization types supported by cutlass moe operations.
     """
 
-    # Standard quantization-based modes
+    # Quantization types
+    W4A8 = auto()
     BlockscaledFP8 = auto()
     BlockscaledFP4 = auto()
-    W4A8 = auto()
+
+
+class CutlassMoEType(Enum):
+    """
+    Enum for the different execution modes supported by cutlass moe operations.
+    """
 
     # DeepEP distributed execution modes
     DeepEP_LL = auto()
@@ -27,8 +32,8 @@ class CutlassMoEParams:
     Parameters for the cutlass moe operation.
     """
 
-    #  Type as defined above
-    cutlass_moe_type: CutlassMoEType
+    # Quantization type as defined above
+    quant_type: CutlassMoEQuantType
 
     # Strides for activations, weights and output in logical number of elements.
     # The activations & output stride is the number of elements to the next row.
@@ -106,13 +111,13 @@ class CutlassMoEParams:
 
     def __init__(
         self,
-        cutlass_moe_type: CutlassMoEType,
+        quant_type: CutlassMoEQuantType,
         device: torch.device,
         num_experts: int,
         intermediate_size_per_partition: int,
         hidden_size: int,
     ):
-        self.cutlass_moe_type = cutlass_moe_type
+        self.quant_type = quant_type
         self.device = device
         self.num_experts = num_experts
         self.intermediate_size_per_partition = intermediate_size_per_partition
@@ -120,14 +125,8 @@ class CutlassMoEParams:
         self.n = self.intermediate_size_per_partition
         self.k = self.hidden_size
         self.e = self.num_experts
-        
-        is_w4a8 = self.cutlass_moe_type in (
-            CutlassMoEType.W4A8,
-            CutlassMoEType.DeepEP_LL,
-            CutlassMoEType.DeepEP_Normal,
-        )
 
-        if is_w4a8:
+        if self.quant_type == CutlassMoEQuantType.W4A8:
             self.a_strides1 = torch.full(
                 (self.e, 3), self.k, dtype=torch.int64, device=self.device
             )
@@ -167,19 +166,21 @@ class CutlassMoEParams:
         self.problem_sizes2 = torch.empty(
             (self.e, 3), dtype=torch.int32, device=self.device
         )
-        
-        if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP4:
+
+        if self.quant_type == CutlassMoEQuantType.BlockscaledFP4:
             self.blockscale_offsets = torch.empty(
                 (self.e + 1,), dtype=torch.int32, device=self.device
             )
         else:
             self.blockscale_offsets = None
-            
-        if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP8:
+
+        if self.quant_type == CutlassMoEQuantType.BlockscaledFP8:
             self.workspace = torch.empty(90000, device=self.device, dtype=torch.uint8)
             self.a_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
             self.b_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
-            self.out_ptrs = torch.empty((self.e,), dtype=torch.int64, device=self.device)
+            self.out_ptrs = torch.empty(
+                (self.e,), dtype=torch.int64, device=self.device
+            )
             self.a_scales_ptrs = torch.empty(
                 (self.e,), dtype=torch.int64, device=self.device
             )

@@ -158,7 +158,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     # CUTLASS runner setup
     cutlass_runner = MoeRunner(MoeRunnerBackend.CUTLASS, moe_runner_config)
     cutlass_quant_info = CutlassMoeQuantInfo(
-        moe_type=CutlassMoEType.BlockscaledFP8,
+        deepep_ll_or_deepep_normal=None,
         w13_weight=w1.transpose(1, 2),
         w2_weight=w2.transpose(1, 2),
         w13_scale=w1_scale.transpose(1, 2),

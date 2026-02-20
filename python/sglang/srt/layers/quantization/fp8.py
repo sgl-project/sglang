@@ -1424,7 +1424,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.runner.runner_backend.is_cutlass():
             use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
             quant_info = CutlassMoeQuantInfo(
-                moe_type=CutlassMoEType.BlockscaledFP8,
                 w13_weight=layer.w13_weight.transpose(1, 2),
                 w2_weight=layer.w2_weight.transpose(1, 2),
                 w13_scale=layer.w13_weight_scale_inv.transpose(1, 2),
@@ -1432,6 +1431,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 params=layer.cutlass_moe_params,
                 use_mxfp8=use_mxfp8,
                 enable_es=(use_mxfp8, use_mxfp8),
+                deepep_ll_or_deepep_normal=None,
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
@@ -1514,9 +1514,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_size = layer.w2_weight.shape[1]
         intermediate_size_per_partition = layer.intermediate_size_per_partition
 
-        from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+        from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType
         layer.cutlass_moe_params = CutlassMoEParams(
-            CutlassMoEType.BlockscaledFP8,
+            CutlassMoEQuantType.BlockscaledFP8,
             device,
             num_experts=num_experts,
             intermediate_size_per_partition=intermediate_size_per_partition,

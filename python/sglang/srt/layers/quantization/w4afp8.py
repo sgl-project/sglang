@@ -37,6 +37,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
+
 class W4AFp8Config(QuantizationConfig):
     """Config class for MIXED_PRECISION W4AFp8."""
 
@@ -217,9 +218,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         # Initialize CutlassMoEParams
         device = layer.w13_weight.device
-        from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+        from sglang.srt.layers.moe.cutlass_moe_params import (
+            CutlassMoEParams,
+            CutlassMoEQuantType,
+        )
+
         layer.cutlass_moe_params = CutlassMoEParams(
-            CutlassMoEType.W4A8,
+            CutlassMoEQuantType.W4A8,
             device,
             num_experts=num_experts,
             intermediate_size_per_partition=intermediate_size_per_partition,
@@ -270,7 +275,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         if self.runner.runner_backend.is_cutlass():
             quant_info = CutlassMoeQuantInfo(
-                moe_type=CutlassMoEType.W4A8,
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 w13_scale=layer.w13_weight_scale_inv,
@@ -278,6 +282,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 w13_input_scale=layer.w13_input_scale,
                 w2_input_scale=layer.w2_input_scale,
                 params=layer.cutlass_moe_params,
+                deepep_ll_or_deepep_normal=None,
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -287,7 +292,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.DeepEP_LL,
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,
@@ -295,6 +299,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             w13_input_scale=layer.w13_input_scale,
             w2_input_scale=layer.w2_input_scale,
             params=layer.cutlass_moe_params,
+            deepep_ll_or_deepep_normal=CutlassMoEType.DeepEP_LL,
         )
         combine_input = self.runner.run(dispatch_output, quant_info)
         return combine_input.hidden_states
@@ -313,7 +318,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             return hidden_states
 
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.DeepEP_Normal,
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale_inv,
@@ -321,6 +325,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             w13_input_scale=layer.w13_input_scale,
             w2_input_scale=layer.w2_input_scale,
             params=layer.cutlass_moe_params,
+            deepep_ll_or_deepep_normal=CutlassMoEType.DeepEP_Normal,
         )
         combine_input = self.runner.run(dispatch_output, quant_info)
         return combine_input.hidden_states

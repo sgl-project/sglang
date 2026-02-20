@@ -21,7 +21,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType
 from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
@@ -1650,7 +1650,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
             layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
+                CutlassMoEQuantType.BlockscaledFP4,
                 device,
                 num_experts=layer.num_experts,  # global num experts
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
@@ -1787,7 +1787,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params = layer.cutlass_moe_params
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         quant_info = CutlassMoeQuantInfo(
-            moe_type=CutlassMoEType.BlockscaledFP4,
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
@@ -1796,6 +1795,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_alpha=layer.g2_alphas,
             w13_input_scale=layer.w13_input_scale_quant,
             w2_input_scale=layer.w2_input_scale_quant,
+            deepep_ll_or_deepep_normal=None,
             expert_offsets=params.expert_offsets,
             problem_sizes1=params.problem_sizes1,
             problem_sizes2=params.problem_sizes2,

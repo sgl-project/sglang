@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -78,7 +78,7 @@ class CutlassRunnerOutput(RunnerOutput):
 
 @dataclass
 class CutlassMoeQuantInfo(MoeQuantInfo):
-    moe_type: CutlassMoEType
+    deepep_ll_or_deepep_normal: Optional[CutlassMoEType] = None
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
     w13_scale: Optional[torch.Tensor] = None
@@ -98,7 +98,7 @@ class CutlassRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
-        if not is_cuda(): # TODO (Jonahcb): maybe move this to server args
+        if not is_cuda():  # TODO (Jonahcb): maybe move this to server args
             raise RuntimeError("Cutlass runner requires CUDA support.")
         if self.config.activation not in ("silu", None):
             raise ValueError("Cutlass runner currently supports SiLU activation only.")
@@ -123,9 +123,13 @@ class CutlassRunnerCore(MoeRunnerCore):
         topk = runner_input.topk_ids.shape[1]
 
         # Standard mode
-        moe_type = quant_info.moe_type
+        quant_type = quant_info.params.quant_type
+        deepep_ll_or_deepep_normal = quant_info.deepep_ll_or_deepep_normal
 
-        if moe_type in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal, CutlassMoEType.W4A8]:
+        if quant_type == CutlassMoEQuantType.W4A8 or deepep_ll_or_deepep_normal in [
+            CutlassMoEType.DeepEP_LL,
+            CutlassMoEType.DeepEP_Normal,
+        ]:
             down_output = self.w4a8_moe(
                 a=runner_input.gate_up_input,  # Use preprocessed input
                 w1_q=quant_info.w13_weight,
@@ -137,12 +141,13 @@ class CutlassRunnerCore(MoeRunnerCore):
                 a1_scale=quant_info.w13_input_scale,
                 a2_scale=quant_info.w2_input_scale,
                 masked_m=runner_input.masked_m,
+                deepep_ll_or_deepep_normal=deepep_ll_or_deepep_normal,
             )
-            if moe_type in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal]:
+            if deepep_ll_or_deepep_normal in [CutlassMoEType.DeepEP_LL, CutlassMoEType.DeepEP_Normal]:
                 return CutlassRunnerOutput(hidden_states=down_output)
             # Post-processing will be done in post_permute_cutlass_to_standard
 
-        elif moe_type == CutlassMoEType.BlockscaledFP8:
+        elif quant_type == CutlassMoEQuantType.BlockscaledFP8:
             if not cutlass_fp8_supported():
                 raise RuntimeError(
                     "CUTLASS FP8 kernels are not available on this system."
@@ -162,7 +167,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 enable_es=quant_info.enable_es,
             )
 
-        elif moe_type == CutlassMoEType.BlockscaledFP4:
+        elif quant_type == CutlassMoEQuantType.BlockscaledFP4:
             down_output = self.cutlass_moe_fp4(
                 a=runner_input.gate_up_input,  # Use preprocessed input
                 rep_aux=runner_input.rep_aux,
@@ -215,6 +220,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
         masked_m: Optional[torch.Tensor] = None,
+        deepep_ll_or_deepep_normal: Optional[CutlassMoEType] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked_post_per_tensor_quant_fwd,
@@ -261,7 +267,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer (pre-reordered for W4A8, otherwise fully processed).
         """
-        moe_type = params.cutlass_moe_type
         gateup_input = a
         k = w1_q.size(2) * 2  # w1_q is transposed and packed
         n = w2_q.size(2) * 2  # w2_q is transposed and packed
@@ -269,7 +274,7 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         device = a.device
 
-        if moe_type == CutlassMoEType.DeepEP_LL:
+        if deepep_ll_or_deepep_normal == CutlassMoEType.DeepEP_LL:
             num_experts = w1_q.size(0)
             m = a.size(1)
             c1_shape = (num_experts, m, n * 2)
@@ -280,7 +285,7 @@ class CutlassRunnerCore(MoeRunnerCore):
             c2_shape = (m_tokens * topk, k)
 
         c1 = torch.empty(c1_shape, device=device, dtype=torch.bfloat16)
-        if moe_type == CutlassMoEType.DeepEP_Normal:
+        if deepep_ll_or_deepep_normal == CutlassMoEType.DeepEP_Normal:
             c2 = torch.zeros(c2_shape, device=device, dtype=torch.bfloat16)
         else:
             c2 = torch.empty(c2_shape, device=device, dtype=torch.bfloat16)
@@ -301,27 +306,36 @@ class CutlassRunnerCore(MoeRunnerCore):
             topk,
         )
 
-        if moe_type == CutlassMoEType.DeepEP_LL:
+        if deepep_ll_or_deepep_normal == CutlassMoEType.DeepEP_LL:
             intermediate_q = torch.empty(
                 (num_experts, m, n), dtype=torch.float8_e4m3fn, device=device
             )
             silu_and_mul_masked_post_per_tensor_quant_fwd(
                 c1, intermediate_q, masked_m, a2_scale
             )
-        elif moe_type == CutlassMoEType.DeepEP_Normal:
-            intermediate = torch.empty(c1_shape[0], n, device=device, dtype=torch.bfloat16)
+        elif deepep_ll_or_deepep_normal == CutlassMoEType.DeepEP_Normal:
+            intermediate = torch.empty(
+                c1_shape[0], n, device=device, dtype=torch.bfloat16
+            )
             silu_and_mul(c1, intermediate)
 
             intermediate_q = torch.empty(
                 intermediate.shape, dtype=torch.float8_e4m3fn, device=device
             )
-            sgl_per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+            sgl_per_tensor_quant_fp8(
+                intermediate, intermediate_q, a2_scale.float(), True
+            )
         else:
             intermediate_q = torch.empty(
                 (c1_shape[0], n), dtype=torch.float8_e4m3fn, device=device
             )
             silu_mul_static_tensorwise_quant_for_cutlass_moe(
-                c1, intermediate_q, a2_scale.float(), params.expert_offsets[-1:], c1_shape[0], n
+                c1,
+                intermediate_q,
+                a2_scale.float(),
+                params.expert_offsets[-1:],
+                c1_shape[0],
+                n,
             )
 
         cutlass_w4a8_moe_mm(
@@ -360,7 +374,6 @@ class CutlassRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
-
         )
 
         """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
@@ -489,7 +502,9 @@ class CutlassRunnerCore(MoeRunnerCore):
                 a2_scale,
             )
         else:
-            intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+            intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(
+                intermediate, 128
+            )
 
         if is_sm90_supported() and es_down:
             es_fp8_blockwise_scaled_grouped_mm(
@@ -661,7 +676,7 @@ def pre_permute_standard_to_cutlass(
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
 
-    if quant_info.moe_type == CutlassMoEType.BlockscaledFP8:
+    if quant_info.params.quant_type == CutlassMoEQuantType.BlockscaledFP8:
         # Extract variables from quant_info
         a = hidden_states
         w1_q = quant_info.w13_weight
@@ -671,7 +686,6 @@ def pre_permute_standard_to_cutlass(
         expert_offsets = quant_info.params.expert_offsets
         problem_sizes1 = quant_info.params.problem_sizes1
         problem_sizes2 = quant_info.params.problem_sizes2
-
 
         enable_es = quant_info.enable_es
         use_mxfp8 = enable_es[0]
@@ -700,7 +714,6 @@ def pre_permute_standard_to_cutlass(
 
         topk = topk_ids.size(1)
         device = a.device
-
 
         if use_mxfp8:
             assert (
@@ -776,7 +789,6 @@ def pre_permute_standard_to_cutlass(
             rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
             rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-
         # ----------------------------------------------------------
         # Return the prepared input data
         gateup_input = rep_a_q  # The quantized and shuffled input
@@ -793,7 +805,7 @@ def pre_permute_standard_to_cutlass(
             rep_aux=rep_aux,
         )
 
-    elif quant_info.moe_type == CutlassMoEType.BlockscaledFP4:
+    elif quant_info.params.quant_type == CutlassMoEQuantType.BlockscaledFP4:
         params = quant_info.params
 
         # Store state for post_permute
@@ -854,7 +866,7 @@ def pre_permute_standard_to_cutlass(
 
         rep_aux = rep_a_blockscale
 
-    elif quant_info.moe_type == CutlassMoEType.W4A8:
+    elif quant_info.params.quant_type == CutlassMoEQuantType.W4A8:
         from sglang.srt.distributed.parallel_state import (
             get_moe_expert_parallel_world_size,
         )
@@ -902,7 +914,6 @@ def pre_permute_standard_to_cutlass(
         if get_moe_expert_parallel_world_size() > 1:
             topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-
         src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
         running_state["src2dst"] = src2dst
         running_state["topk_ids"] = topk_ids
@@ -913,7 +924,6 @@ def pre_permute_standard_to_cutlass(
             device=device,
             dtype=torch.float8_e4m3fn,
         )
-
 
         pre_reorder_for_cutlass_moe(
             hidden_states,
@@ -930,7 +940,6 @@ def pre_permute_standard_to_cutlass(
         # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
         # they are kept to allow for a quick switch of the permutation logic
         # from the current triton kernel implementation to the cutlass-based one if needed.
-
 
         get_cutlass_w4a8_moe_mm_data(
             topk_ids,
@@ -966,9 +975,9 @@ def post_permute_cutlass_to_standard(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     down_output = runner_output.hidden_states
-    moe_type = quant_info.moe_type
+    quant_type = quant_info.params.quant_type
 
-    if moe_type == CutlassMoEType.BlockscaledFP8:
+    if quant_type == CutlassMoEQuantType.BlockscaledFP8:
         num_tokens, hidden_size = running_state["original_hidden_states_shape"]
         result = torch.empty(
             (num_tokens, hidden_size),
@@ -985,7 +994,7 @@ def post_permute_cutlass_to_standard(
 
         if runner_config.routed_scaling_factor is not None:
             hidden_states.mul_(runner_config.routed_scaling_factor)
-    elif moe_type == CutlassMoEType.BlockscaledFP4:
+    elif quant_type == CutlassMoEQuantType.BlockscaledFP4:
         num_tokens = running_state["original_hidden_states_shape"][0]
         topk = running_state["c_map"].shape[0] // num_tokens
         hidden_size = down_output.shape[1]
@@ -1006,7 +1015,7 @@ def post_permute_cutlass_to_standard(
 
         if runner_config.routed_scaling_factor is not None:
             hidden_states.mul_(runner_config.routed_scaling_factor)
-    elif moe_type == CutlassMoEType.W4A8:
+    elif quant_type == CutlassMoEQuantType.W4A8:
         from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_for_cutlass_moe
 
         num_tokens = running_state["original_hidden_states_shape"][0]
@@ -1018,7 +1027,6 @@ def post_permute_cutlass_to_standard(
             device=down_output.device,
             dtype=down_output.dtype,
         )
-
 
         post_reorder_for_cutlass_moe(
             down_output,
@@ -1035,7 +1043,7 @@ def post_permute_cutlass_to_standard(
 
         hidden_states = result
     else:
-        raise NotImplementedError(f"Unsupported CUTLASS MoE type: {moe_type}")
+        raise NotImplementedError(f"Unsupported CUTLASS MoE quant_type: {quant_type}")
 
     return StandardCombineInput(hidden_states=hidden_states)
 
@@ -1093,13 +1101,15 @@ def pre_permute_deepep_ll_to_cutlass(
 
     device = hidden_states.device
 
-    quant_info.params.problem_sizes1, quant_info.params.problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
-        masked_m,
-        quant_info.params.problem_sizes1,
-        quant_info.params.problem_sizes2,
-        num_experts,
-        n,
-        k,
+    quant_info.params.problem_sizes1, quant_info.params.problem_sizes2 = (
+        deepep_ll_get_cutlass_w4a8_moe_mm_data(
+            masked_m,
+            quant_info.params.problem_sizes1,
+            quant_info.params.problem_sizes2,
+            num_experts,
+            n,
+            k,
+        )
     )
 
     gateup_input = torch.empty(
@@ -1108,7 +1118,6 @@ def pre_permute_deepep_ll_to_cutlass(
     sgl_per_tensor_quant_fp8(
         hidden_states, gateup_input, quant_info.w13_input_scale.float(), True
     )
-
 
     return CutlassRunnerInput(
         gate_up_input=gateup_input,  # Preprocessed and quantized input
@@ -1189,7 +1198,6 @@ def pre_permute_deepep_normal_to_cutlass(
     topk = topk_ids_.size(1)
     device = hidden_states.device
 
-
     reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
         topk_ids_, num_experts
     )
@@ -1199,7 +1207,6 @@ def pre_permute_deepep_normal_to_cutlass(
         device=device,
         dtype=hidden_states.dtype,
     )
-
 
     deepep_permute_triton_kernel[(hidden_states.shape[0],)](
         hidden_states,
@@ -1225,7 +1232,6 @@ def pre_permute_deepep_normal_to_cutlass(
 
     a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
-
 
     quant_info.params.problem_sizes1.zero_()
     quant_info.params.problem_sizes2.zero_()
@@ -1281,7 +1287,6 @@ def post_permute_cutlass_to_deepep_normal(
         device=c2.device,
         dtype=torch.bfloat16,
     )
-
 
     deepep_post_reorder_triton_kernel[(num_tokens,)](
         c2,
