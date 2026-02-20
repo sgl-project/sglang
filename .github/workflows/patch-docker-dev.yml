@@ -3,8 +3,8 @@ name: Patch Docker Image
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: "PR number to patch (leave empty to patch with latest main)"
+      pr_numbers:
+        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
         required: false
         default: ""
       image_tag:
@@ -37,26 +37,30 @@ jobs:
           echo "Image built from commit: ${BASE_SHA}"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
-      - name: Generate patch
+      - name: Generate patches
         run: |
-          # Fetch the exact commit the image was built from (branch-agnostic)
           git fetch origin "${BASE_SHA}"
+          mkdir -p /tmp/patch-ctx
 
-          if [ -n "${{ inputs.pr_number }}" ]; then
-            echo "Generating diff: image ${BASE_SHA} → PR #${{ inputs.pr_number }}"
-            git fetch origin "pull/${{ inputs.pr_number }}/head:pr-${{ inputs.pr_number }}"
-            git diff "${BASE_SHA}..pr-${{ inputs.pr_number }}" > /tmp/sglang.patch
+          if [ -n "${{ inputs.pr_numbers }}" ]; then
+            IFS=',' read -ra PRS <<< "${{ inputs.pr_numbers }}"
+            for pr in "${PRS[@]}"; do
+              pr=$(echo "${pr}" | xargs)
+              echo "Fetching PR #${pr}"
+              git fetch origin "pull/${pr}/head:pr-${pr}"
+              git diff "${BASE_SHA}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
+              echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
+            done
           else
             echo "Generating diff: image ${BASE_SHA} → latest main"
             git fetch origin main
-            git diff "${BASE_SHA}..origin/main" > /tmp/sglang.patch
+            git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
+            echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           fi
 
-          LINES=$(wc -l < /tmp/sglang.patch)
-          echo "Patch: ${LINES} lines"
-
-          if [ "${LINES}" -eq 0 ]; then
-            echo "::warning::Patch is empty — image is already up to date"
+          TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
+          if [ "${TOTAL}" -eq 0 ]; then
+            echo "::warning::All patches are empty — image is already up to date"
             echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
           fi
 
@@ -65,17 +69,17 @@ jobs:
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
 
-          mkdir -p /tmp/patch-ctx
-          cp /tmp/sglang.patch /tmp/patch-ctx/
-
           cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
-          COPY sglang.patch /tmp/sglang.patch
+          COPY *.patch /tmp/patches/
           RUN cd /sgl-workspace/sglang \
-              && git apply --verbose --stat /tmp/sglang.patch \
-              && git apply /tmp/sglang.patch \
-              && rm /tmp/sglang.patch
+              && for p in /tmp/patches/*.patch; do \
+                   echo "Applying ${p}..." \
+                   && git apply --stat "${p}" \
+                   && git apply "${p}"; \
+                 done \
+              && rm -rf /tmp/patches
           DOCKERFILE
 
           docker build \
@@ -90,6 +94,6 @@ jobs:
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
           docker push "${IMAGE}"
 
-          echo "### Patched Docker Image" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Image:** \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Source:** ${{ inputs.pr_number && format('PR #{0}', inputs.pr_number) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base commit:** \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
