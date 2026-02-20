@@ -508,8 +508,10 @@ class _NonIntrusiveDumper:
         cls, module_name: str, module: "torch.nn.Module"
     ) -> Optional[dict]:
         if cls._LAYER_NAME_RE.fullmatch(module_name):
+            # Megatron
             if hasattr(module, "layer_number"):
                 return {"layer_id": module.layer_number - 1}
+            # SGLang
             if hasattr(module, "layer_id"):
                 return {"layer_id": module.layer_id}
         return None
