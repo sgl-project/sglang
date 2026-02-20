@@ -75,6 +75,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    "auto-round-int8": W8A8Int8Config,
 }
 
 
