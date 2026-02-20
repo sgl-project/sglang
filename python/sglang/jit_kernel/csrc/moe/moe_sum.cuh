@@ -87,10 +87,10 @@ void moe_sum(TensorView input, TensorView output) {
   dim3 grid(static_cast<unsigned>(num_tokens) * static_cast<unsigned>(hidden_blocks));
   dim3 block(static_cast<unsigned>(std::min(hidden_size, block_size)));
 
-  cudaStream_t stream = LaunchKernel::resolve_device(input.device());
+  LaunchKernel launcher(grid, block, input.device());
 
 #define LAUNCH(TOPK) \
-  moe_sum_kernel<T, TOPK><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, hidden_blocks)
+  launcher(moe_sum_kernel<T, TOPK>, out_ptr, in_ptr, hidden_size, hidden_blocks)
 
   switch (topk) {
     case 1: LAUNCH(1); break;
@@ -103,7 +103,7 @@ void moe_sum(TensorView input, TensorView output) {
     case 8: LAUNCH(8); break;
     case 9: LAUNCH(9); break;
     default:
-      moe_sum_kernel_general<T><<<grid, block, 0, stream>>>(out_ptr, in_ptr, hidden_size, topk, hidden_blocks);
+      launcher(moe_sum_kernel_general<T>, out_ptr, in_ptr, hidden_size, topk, hidden_blocks);
   }
 
 #undef LAUNCH
