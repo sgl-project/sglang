@@ -199,7 +199,7 @@ class _Dumper:
             self._rpc_broadcast = rpc_broadcast
 
             if http_port == "reuse":
-                print("[Dumper] Standalone HTTP server disabled")
+                print("[Dumper] Standalone HTTP server disabled, reusing existing ports")
             else:
                 _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
                 print(f"[Dumper] HTTP server started on port {http_port}")
