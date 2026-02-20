@@ -39,10 +39,12 @@ class _DumperConfig:
 
     @classmethod
     def from_env(cls) -> "_DumperConfig":
-        return cls(**{
-            f.name: _parse_env_field(_env_name(f.name), f.default)
-            for f in fields(cls)
-        })
+        return cls(
+            **{
+                f.name: _parse_env_field(_env_name(f.name), f.default)
+                for f in fields(cls)
+            }
+        )
 
     def with_defaults(self, **kwargs) -> "_DumperConfig":
         actual = {
@@ -159,9 +161,7 @@ class _Dumper:
 
     def _ensure_partial_name(self):
         if self._config.partial_name is None:
-            name = _get_partial_name(
-                timeout_seconds=self._config.collective_timeout
-            )
+            name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
             self.configure(partial_name=name)
             print(f"[Dumper] Choose partial_name={name}")
 
@@ -250,7 +250,9 @@ class _Dumper:
             return
 
         tags = dict(name=name, **extra_kwargs, **self._global_ctx)
-        if (f := self._config.filter) is not None and re.search(f, _format_tags(tags)) is None:
+        if (f := self._config.filter) is not None and re.search(
+            f, _format_tags(tags)
+        ) is None:
             return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
@@ -290,7 +292,12 @@ class _Dumper:
             )
 
     def _register_dump_grad_hook(
-        self, *, name: str, tensor, extra_kwargs: dict, save: bool,
+        self,
+        *,
+        name: str,
+        tensor,
+        extra_kwargs: dict,
+        save: bool,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
@@ -335,7 +342,11 @@ class _Dumper:
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
-        path = Path(self._config.dir) / f"sglang_dump_{self._config.partial_name}" / full_filename
+        path = (
+            Path(self._config.dir)
+            / f"sglang_dump_{self._config.partial_name}"
+            / full_filename
+        )
 
         if self._config.enable_output_console:
             print(

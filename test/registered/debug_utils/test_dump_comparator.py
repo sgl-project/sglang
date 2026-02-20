@@ -97,9 +97,13 @@ class TestEndToEnd(CustomTestCase):
 
             dump_dirs = []
             for d, tensor in [(d1, baseline_tensor), (d2, target_tensor)]:
-                dumper = _Dumper(config=_DumperConfig(
-                    enable=True, dir=d, enable_http_server=False,
-                ))
+                dumper = _Dumper(
+                    config=_DumperConfig(
+                        enable=True,
+                        dir=d,
+                        enable_http_server=False,
+                    )
+                )
                 dumper.on_forward_pass_start()
                 dumper.dump("tensor_a", tensor)
                 dumper.on_forward_pass_start()

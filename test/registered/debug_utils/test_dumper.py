@@ -74,7 +74,9 @@ class TestDumperConfig:
     def test_type_validation(self):
         with pytest.raises(TypeError, match="enable.*expected bool.*got str"):
             _DumperConfig(enable="yes")
-        with pytest.raises(TypeError, match="collective_timeout.*expected int.*got str"):
+        with pytest.raises(
+            TypeError, match="collective_timeout.*expected int.*got str"
+        ):
             _DumperConfig(collective_timeout="abc")
         with pytest.raises(TypeError, match="filter.*expected str.*got int"):
             _DumperConfig(filter=123)
@@ -227,7 +229,9 @@ class TestDumperDistributed:
     def _test_collective_timeout_func(rank):
         dumper = _Dumper(
             config=_DumperConfig(
-                enable=True, collective_timeout=3, enable_http_server=False,
+                enable=True,
+                collective_timeout=3,
+                enable_http_server=False,
             ),
         )
 
@@ -457,8 +461,11 @@ class TestDumpDictFormat:
 def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
     config = _DumperConfig(
-        enable=True, dir=str(tmp_path), partial_name="test",
-        enable_http_server=False, **overrides,
+        enable=True,
+        dir=str(tmp_path),
+        partial_name="test",
+        enable_http_server=False,
+        **overrides,
     )
     d = _Dumper(config=config)
     d.on_forward_pass_start()
