@@ -623,15 +623,15 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     )
 
     if _get_rank() == 0:
-        handler_class = _make_rpc_http_handler(prefix="/dumper/", rpc_target=rpc_broadcast)
+        handler_class = _make_http_handler(prefix="/dumper/", target=rpc_broadcast)
         server = HTTPServer(("0.0.0.0", http_port), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"[Dumper] HTTP server started on port {http_port}")
 
 
-def _make_rpc_http_handler(*, prefix: str, rpc_target):
-    class _RpcHTTPHandler(BaseHTTPRequestHandler):
+def _make_http_handler(*, prefix: str, target):
+    class _HTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             if not self.path.startswith(prefix):
                 self.send_error(404)
@@ -640,7 +640,7 @@ def _make_rpc_http_handler(*, prefix: str, rpc_target):
             try:
                 kwargs = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                getattr(rpc_target, method)(**kwargs)
+                getattr(target, method)(**kwargs)
                 self.send_response(200)
                 self.end_headers()
             except Exception as e:
@@ -652,7 +652,7 @@ def _make_rpc_http_handler(*, prefix: str, rpc_target):
                 return {}
             return json.loads(self.rfile.read(content_length))
 
-    return _RpcHTTPHandler
+    return _HTTPHandler
 
 
 # -------------------------------------- zmq rpc ------------------------------------------
