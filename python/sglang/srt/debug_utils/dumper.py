@@ -22,7 +22,7 @@ import torch.distributed as dist
 class _DumperConfig:
     enable: bool = False
     filter: Optional[str] = None
-    base_dir: Path = Path("/tmp")
+    dir: Path = Path("/tmp")
     enable_output_file: bool = True
     enable_output_console: bool = True
     enable_value: bool = True
@@ -39,10 +39,10 @@ class _DumperConfig:
         return cls(
             enable=get_bool_env_var("SGLANG_DUMPER_ENABLE", "0"),
             filter=_get_str_env_var("SGLANG_DUMPER_FILTER"),
-            base_dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
-            enable_output_file=get_bool_env_var("SGLANG_DUMPER_OUTPUT_FILE", "1"),
+            dir=Path(_get_str_env_var("SGLANG_DUMPER_DIR", "/tmp")),
+            enable_output_file=get_bool_env_var("SGLANG_DUMPER_ENABLE_OUTPUT_FILE", "1"),
             enable_output_console=get_bool_env_var(
-                "SGLANG_DUMPER_OUTPUT_CONSOLE", "1"
+                "SGLANG_DUMPER_ENABLE_OUTPUT_CONSOLE", "1"
             ),
             enable_value=get_bool_env_var("SGLANG_DUMPER_ENABLE_VALUE", "1"),
             enable_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_GRAD", "0"),
@@ -52,7 +52,7 @@ class _DumperConfig:
             enable_model_grad=get_bool_env_var("SGLANG_DUMPER_ENABLE_MODEL_GRAD", "1"),
             partial_name=_get_str_env_var("SGLANG_DUMPER_PARTIAL_NAME"),
             enable_http_server=get_bool_env_var(
-                "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
+                "SGLANG_DUMPER_ENABLE_HTTP_SERVER", "1"
             ),
             cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
             collective_timeout=60,
@@ -300,7 +300,7 @@ class _Dumper:
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
-        path = self._config.base_dir / f"sglang_dump_{self._config.partial_name}" / full_filename
+        path = self._config.dir / f"sglang_dump_{self._config.partial_name}" / full_filename
 
         if self._config.enable_output_console:
             print(
@@ -326,7 +326,7 @@ class _Dumper:
             else:
                 if not self._cleanup_previous_handled:
                     self._cleanup_previous_handled = True
-                    _cleanup_old_dumps(self._config.base_dir)
+                    _cleanup_old_dumps(self._config.dir)
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))

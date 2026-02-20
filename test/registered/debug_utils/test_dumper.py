@@ -413,7 +413,7 @@ class TestDumpDictFormat:
 def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
     config = _DumperConfig(
-        enable=True, base_dir=tmp_path, partial_name="test",
+        enable=True, dir=tmp_path, partial_name="test",
         enable_http_server=False, **overrides,
     )
     d = _Dumper(config=config)
