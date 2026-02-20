@@ -618,19 +618,19 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
     if http_port <= 0:
         return
 
-    rpc_handles = _create_zmq_rpc_handles(
+    rpc_broadcast = _create_zmq_rpc_broadcast(
         dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
     )
 
     if _get_rank() == 0:
-        handler_class = _make_rpc_http_handler(prefix="/dumper/", rpc_handles=rpc_handles)
+        handler_class = _make_rpc_http_handler(prefix="/dumper/", rpc_target=rpc_broadcast)
         server = HTTPServer(("0.0.0.0", http_port), handler_class)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"[Dumper] HTTP server started on port {http_port}")
 
 
-def _make_rpc_http_handler(*, prefix: str, rpc_handles):
+def _make_rpc_http_handler(*, prefix: str, rpc_target):
     class _RpcHTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             if not self.path.startswith(prefix):
@@ -640,8 +640,7 @@ def _make_rpc_http_handler(*, prefix: str, rpc_handles):
             try:
                 kwargs = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                for rpc_handle in rpc_handles:
-                    getattr(rpc_handle, method)(**kwargs)
+                getattr(rpc_target, method)(**kwargs)
                 self.send_response(200)
                 self.end_headers()
             except Exception as e:
@@ -659,9 +658,9 @@ def _make_rpc_http_handler(*, prefix: str, rpc_handles):
 # -------------------------------------- zmq rpc ------------------------------------------
 
 
-def _create_zmq_rpc_handles(
+def _create_zmq_rpc_broadcast(
     handler, base_port: int, timeout_seconds: int = 60
-) -> Optional[List["_ZmqRpcHandle"]]:
+) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
@@ -693,7 +692,7 @@ def _create_zmq_rpc_handles(
         all_addresses = [None] * world_size
         _collective_with_timeout(
             lambda: dist.all_gather_object(all_addresses, local_addr),
-            operation_name="all_gather_object in _create_zmq_rpc_handles",
+            operation_name="all_gather_object in _create_zmq_rpc_broadcast",
             timeout_seconds=timeout_seconds,
         )
     else:
@@ -706,7 +705,7 @@ def _create_zmq_rpc_handles(
             req_socket = ctx.socket(zmq.REQ)
             req_socket.connect(addr)
             handles.append(_ZmqRpcHandle(req_socket, debug_name=f"rank-{i}"))
-        return handles
+        return _ZmqRpcBroadcast(handles)
     else:
         return None
 
@@ -714,7 +713,7 @@ def _create_zmq_rpc_handles(
 class _ZmqRpcHandle:
     """Proxy object to call remote handler methods via ZMQ."""
 
-    def __init__(self, socket, debug_name):
+    def __init__(self, socket, debug_name: str):
         self._socket = socket
         self._debug_name = debug_name
 
@@ -733,6 +732,20 @@ class _ZmqRpcHandle:
                     f"RPC error on {self._debug_name}: {response['error']}"
                 )
             return response["result"]
+
+        return call
+
+
+class _ZmqRpcBroadcast:
+    """Broadcasts method calls to all ZMQ RPC handles."""
+
+    def __init__(self, handles: List[_ZmqRpcHandle]):
+        self._handles = handles
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            for handle in self._handles:
+                getattr(handle, method_name)(*args, **kwargs)
 
         return call
 
