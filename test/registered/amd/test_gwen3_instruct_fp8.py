@@ -18,18 +18,18 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd")
 
-GWEN3_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+GWEN3_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
-class TestQwen3Instruct2507(CustomTestCase):
+class TestQwen3Instruct2507FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = GWEN3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp",
-            "8",
+            "4",
             "--trust-remote-code",
             "--attention-backend",
             "aiter",
@@ -83,9 +83,9 @@ class TestQwen3Instruct2507(CustomTestCase):
                 f"### test_bs_1_speed (self.model)\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 50)
+                self.assertGreater(speed, 40)
             else:
-                self.assertGreater(speed, 75)
+                self.assertGreater(speed, 60)
 
 
 if __name__ == "__main__":
