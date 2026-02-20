@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -411,7 +412,18 @@ class ServerArgs:
             )
 
     def _adjust_offload(self):
-        if self.pipeline_config.task_type.is_image_gen():
+        # TODO: to be handled by each platform
+        if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
+            logger.info("Enabling all offloading for GPU with low device memory")
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
+        elif self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
             )
@@ -1086,7 +1098,7 @@ class ServerArgs:
                 )
                 self.use_fsdp_inference = False
 
-            if self.dit_cpu_offload:
+            if self.dit_cpu_offload is None:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
