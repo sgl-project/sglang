@@ -105,6 +105,7 @@ class _DumperConfig(_FrozenConfig):
 
     @classmethod
     def _env_prefix(cls) -> str:
+        # NOTE: should not be `SGLANG_DUMPER_`, otherwise it is weird when dumping Megatron in Miles
         return "DUMPER_"
 
     @property
