@@ -757,13 +757,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         ids = rid if isinstance(rid, list) else [rid]
         if len(ids) != len(set(ids)):
             obj.regenerate_rid()  # Regenerate rid to avoid background abort task killing the running request.
-            raise ValueError(f"Duplicate request IDs detected within the request: {ids}")
-        
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {ids}"
+            )
+
         for i in ids:
             if i in self.rid_to_state:
                 obj.regenerate_rid()  # Regenerate rid to avoid background abort task killing the running request.
-                raise ValueError(f"Duplicate request ID detected: {i}")           
-    
+                raise ValueError(f"Duplicate request ID detected: {i}")
+
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
