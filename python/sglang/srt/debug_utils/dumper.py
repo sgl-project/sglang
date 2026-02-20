@@ -244,21 +244,18 @@ class _Dumper:
             "forward_pass_id": self._forward_pass_id,
         }
 
-    def _handle_control_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request(
-            method=method, **body
-        )
+    def _handle_http_control_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(method=method, body=body)
 
-    def _handle_http_control_request(self, *, method: str, **kwargs) -> dict:
+    def _handle_http_control_request_inner(self, *, method: str, body: dict[str, Any]) -> dict:
         if method == "get_state":
-            pass
+            return self.get_state()
         elif method == "configure":
-            self.configure(**kwargs)
+            self.configure(**body)
         elif method == "reset":
             self.reset()
         else:
             raise ValueError(f"Unknown dumper control method: {method!r}")
-        return self.get_state()
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
@@ -686,7 +683,7 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 req_body = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
-                result = target._handle_control_request(method=method, body=req_body)
+                result = target._handle_http_control_request(method=method, body=req_body)
                 resp_body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
