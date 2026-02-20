@@ -405,7 +405,7 @@ class _Dumper:
         full_filename = _format_tags(full_kwargs) + ".pt"
         path = (
             Path(self._config.dir)
-            / f"sglang_dump_{self._config.partial_name}"
+            / f"dump_{self._config.partial_name}"
             / full_filename
         )
 
@@ -626,7 +626,7 @@ def _cleanup_old_dumps(base_dir: Path) -> None:
     import shutil
 
     if _get_rank() == 0:
-        for entry in base_dir.glob("sglang_dump_*"):
+        for entry in base_dir.glob("dump_*"):
             if entry.is_dir():
                 shutil.rmtree(entry)
                 print(f"[Dumper] Cleaned up {entry}")

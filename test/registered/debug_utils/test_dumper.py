@@ -463,7 +463,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
 
 
 def _get_filenames(tmpdir):
-    return {f.name for f in Path(tmpdir).glob("sglang_dump_*/*.pt")}
+    return {f.name for f in Path(tmpdir).glob("dump_*/*.pt")}
 
 
 def _assert_files(filenames, *, exist=(), not_exist=()):
@@ -483,7 +483,7 @@ def _load_dump(path: Path) -> dict:
 def _find_dump_file(tmpdir, *, rank: int = 0, name: str) -> Path:
     matches = [
         f
-        for f in Path(tmpdir).glob("sglang_dump_*/*.pt")
+        for f in Path(tmpdir).glob("dump_*/*.pt")
         if f"rank={rank}" in f.name and name in f.name
     ]
     assert (
@@ -785,7 +785,7 @@ class TestDumpModel:
 
 class TestCleanup:
     def test_cleanup_removes_old_dumps(self, tmp_path):
-        old_dir = tmp_path / "sglang_dump_old"
+        old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
         (old_dir / "dummy.pt").touch()
 
@@ -796,7 +796,7 @@ class TestCleanup:
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
     def test_no_cleanup_by_default(self, tmp_path):
-        old_dir = tmp_path / "sglang_dump_old"
+        old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
         (old_dir / "dummy.pt").touch()
 
@@ -1590,7 +1590,7 @@ class TestDumperE2E:
                 f"entries({len(all_entries)})={[str(e) for e in all_entries[:30]]}"
             )
 
-            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
+            dump_files = list(Path(dump_dir).glob("dump_*/*.pt"))
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 
