@@ -33,6 +33,9 @@ class _Dumper:
     Then run the program:
     `SGLANG_DUMPER_ENABLE=1 python ...`
 
+    Auto-cleanup old dumps before first write:
+    `SGLANG_DUMPER_CLEANUP_PREVIOUS=1 python ...`
+
     Alternatively, disable at startup and enable via HTTP:
     1. `python ...`
     2. `curl -X POST http://localhost:40000/dumper -d '{"enable": true}'`
@@ -53,6 +56,7 @@ class _Dumper:
         enable_model_grad: bool = True,
         partial_name: Optional[str] = None,
         enable_http_server: bool = True,
+        cleanup_previous: bool = False,
     ):
         # Config
         self._enable = enable
@@ -72,6 +76,7 @@ class _Dumper:
         self._global_ctx = {}
         self._override_enable = None
         self._http_server_handled = not enable_http_server
+        self._pending_cleanup = cleanup_previous
 
     @classmethod
     def from_env(cls) -> "_Dumper":
@@ -90,6 +95,7 @@ class _Dumper:
             enable_http_server=get_bool_env_var(
                 "SGLANG_ENABLE_DUMPER_HTTP_SERVER", "1"
             ),
+            cleanup_previous=get_bool_env_var("SGLANG_DUMPER_CLEANUP_PREVIOUS", "0"),
         )
 
     def on_forward_pass_start(self):
@@ -294,6 +300,10 @@ class _Dumper:
         )
 
         if self._enable_write_file and save:
+            if self._pending_cleanup:
+                self._pending_cleanup = False
+                _cleanup_old_dumps(self._base_dir)
+
             path.parent.mkdir(parents=True, exist_ok=True)
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
@@ -327,6 +337,19 @@ def _get_partial_name():
     if dist.is_initialized():
         dist.broadcast_object_list(object_list, device="cuda")
     return object_list[0]
+
+
+def _cleanup_old_dumps(base_dir: Path) -> None:
+    import shutil
+
+    if _get_rank() == 0:
+        for entry in base_dir.glob("sglang_dump_*"):
+            if entry.is_dir():
+                shutil.rmtree(entry)
+                print(f"[Dumper] Cleaned up {entry}")
+
+    if dist.is_initialized():
+        dist.barrier()
 
 
 def _get_rank():
