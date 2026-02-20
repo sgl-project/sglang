@@ -161,7 +161,7 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
-        self._rpc_broadcast: Optional["_ZmqRpcBroadcast"] = None
+        self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -196,6 +196,7 @@ class _Dumper:
         )
 
         if _get_rank() == 0:
+            assert rpc_broadcast is not None
             self._rpc_broadcast = rpc_broadcast
 
             if http_port == "reuse":
@@ -249,11 +250,9 @@ class _Dumper:
     def _handle_http_control_request(
         self, *, method: str, body: dict[str, Any]
     ) -> list[dict]:
-        if self._rpc_broadcast is not None:
-            return self._rpc_broadcast._handle_http_control_request_inner(
-                method=method, body=body
-            )
-        return [self._handle_http_control_request_inner(method=method, body=body)]
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
 
     def _handle_http_control_request_inner(
         self, *, method: str, body: dict[str, Any]
@@ -721,7 +720,7 @@ def _make_http_handler(*, prefix: str, target):
 
 def _create_zmq_rpc_broadcast(
     handler, base_port: int, timeout_seconds: int = 60
-) -> Optional["_ZmqRpcBroadcast"]:
+) -> Optional[_ZmqRpcBroadcast]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
@@ -797,7 +796,27 @@ class _ZmqRpcHandle:
         return call
 
 
-class _ZmqRpcBroadcast:
+class _RpcBroadcastBase:
+    """Base for broadcasting method calls to dumper instance(s)."""
+
+    def __getattr__(self, method_name: str):
+        raise NotImplementedError
+
+
+class _LocalOnlyBroadcast(_RpcBroadcastBase):
+    """Calls methods directly on the local dumper, wrapping the result in a list."""
+
+    def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            return [getattr(self._dumper, method_name)(*args, **kwargs)]
+
+        return call
+
+
+class _ZmqRpcBroadcast(_RpcBroadcastBase):
     """Broadcasts method calls to all ZMQ RPC handles.
 
     Returns a list of results, one per rank (ordered by rank).
