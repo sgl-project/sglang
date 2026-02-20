@@ -715,15 +715,7 @@ def triton_mxfp8_blockscaled_linear(
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
     b_scale_packed = _pack_mxfp8_scales(weight_scale)
 
-    # Auto-select num_stages based on GPU architecture
-    # SM120 needs fewer stages due to shared memory constraints
-    if is_sm120_supported():
-        num_stages = 1
-    elif is_sm100_supported():
-        num_stages = 4
-    else:
-        num_stages = 1  # Default to conservative value
-    
+    num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
     output = mxfp8_block_scaled_matmul_triton(
         q_input,
         a_scale_packed,

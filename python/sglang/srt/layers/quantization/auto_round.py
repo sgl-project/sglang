@@ -97,20 +97,12 @@ class AutoRoundConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        """
-        Detect MXFP8 format in AutoRound checkpoints.
-        AutoRound can produce MXFP8 format checkpoints (data_type="mx_fp")
-        even though quant_method says "auto-round".
-        """
+        """Detect MXFP8 format in AutoRound checkpoints."""
         if hf_quant_cfg is None:
             return None
-
-        # Check if this is actually MXFP8 format
         data_type = hf_quant_cfg.get("data_type", "").lower()
         if data_type in ("mx_fp", "mxfp", "mxfp8"):
-            # This is MXFP8 format, not AutoRound INT format
             return "mxfp8"
-
         return None
 
     @classmethod

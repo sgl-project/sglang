@@ -1291,20 +1291,13 @@ def mxfp8_block_scaled_matmul_triton(
     num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Block-scaled matmul for MXFP8 using Triton dot_scaled.
-    
+
     Args:
-        num_stages: Number of pipeline stages. If None, automatically selects based on GPU:
-            - SM120 (RTX 5070 Ti): 1 (to avoid shared memory limits)
-            - SM100 (B200/H200): 4 (better performance with more shared memory)
+        num_stages: Number of pipeline stages. If None, auto-selects based on GPU:
+            SM120: 1, SM100: 4.
     """
-    # Auto-select num_stages based on GPU architecture if not provided
     if num_stages is None:
-        if is_sm120_supported():
-            num_stages = 1  # SM120 has less shared memory
-        elif is_sm100_supported():
-            num_stages = 4  # SM100 can handle more stages
-        else:
-            num_stages = 1  # Default to conservative value
+        num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b

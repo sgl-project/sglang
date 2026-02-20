@@ -167,11 +167,11 @@ class Fp8Config(QuantizationConfig):
         # Handle both flat and nested config formats
         quant_method = ""
         data_type = ""
-        
+
         # Try flat format first
         quant_method = cls.get_from_keys_or(config, ["quant_method"], "").lower()
         data_type = cls.get_from_keys_or(config, ["data_type"], "").lower()
-        
+
         # Fall back to nested format if not found
         if not quant_method and not data_type:
             try:
@@ -180,14 +180,25 @@ class Fp8Config(QuantizationConfig):
                 data_type = quantization_section.get("data_type", "").lower()
             except ValueError:
                 pass  # No nested structure, use flat format
-        
+
         use_mxfp8 = "mxfp8" in quant_method
-        # Also detect MXFP8 from data_type (for AutoRound-converted MXFP8 checkpoints)
         if not use_mxfp8 and data_type in ("mx_fp", "mxfp", "mxfp8"):
             use_mxfp8 = True
+        if not use_mxfp8:
+            try:
+                for group_config in config.get("config_groups", {}).values():
+                    if group_config.get("weights", {}).get("block_structure") == [
+                        1,
+                        32,
+                    ]:
+                        use_mxfp8 = True
+                        break
+            except (KeyError, TypeError, AttributeError):
+                pass
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
-        # activation_scheme is optional for AutoRound-converted MXFP8 checkpoints
-        activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
+        activation_scheme = cls.get_from_keys_or(
+            config, ["activation_scheme"], "dynamic"
+        )
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
@@ -200,9 +211,7 @@ class Fp8Config(QuantizationConfig):
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8:
             if weight_block_size is not None:
-                logger.warning(
-                    "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
-                )
+                logger.warning("MXFP8 ignoring weight_block_size; fixed to [1, 32]")
             weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -369,10 +378,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     assert self.quant_config.activation_scheme == "dynamic"
                 elif hasattr(self.quant_config, "linear_activation_scheme"):
                     assert self.quant_config.linear_activation_scheme == "dynamic"
-                if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
-                    raise ValueError(
-                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
-                    )
                 scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 scale = BlockQuantScaleParameter(
@@ -413,6 +418,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("input_scale", scale)
             else:
+                layer.register_parameter("input_scale", None)
+        elif self.use_mxfp8 and self.block_quant:
+            # For online MXFP8 quantization from BF16/FP16 checkpoints,
+            # create weight_scale_inv parameter to be populated during quantization
+            if hasattr(self.quant_config, "activation_scheme"):
+                assert self.quant_config.activation_scheme == "dynamic"
+            elif hasattr(self.quant_config, "linear_activation_scheme"):
+                assert self.quant_config.linear_activation_scheme == "dynamic"
+            block_n, block_k = self.quant_config.weight_block_size
+            scale = BlockQuantScaleParameter(
+                data=torch.zeros(
+                    (output_size_per_partition + block_n - 1) // block_n,
+                    (input_size_per_partition + block_k - 1) // block_k,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            scale.format_ue8m0 = True
+            layer.register_parameter("weight_scale_inv", scale)
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
