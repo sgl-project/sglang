@@ -422,7 +422,7 @@ class TestDumpDictFormat:
         meta = raw["meta"]
         assert meta["name"] == "fmt_test"
         assert meta["custom_key"] == "hello"
-        assert "curr_step" in meta
+        assert "step" in meta
         assert "rank" in meta
         assert "dump_index" in meta
 
@@ -582,18 +582,18 @@ class TestDumpGrad:
             not_exist=["grad__"],
         )
 
-    def test_dump_grad_captures_curr_step(self, tmp_path):
+    def test_dump_grad_captures_step(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
-        d._curr_step = 42
+        d._step = 42
         x = torch.randn(3, 3, requires_grad=True)
         y = (x * 2).sum()
 
         d.dump("id_test", x)
-        d._curr_step = 999
+        d._step = 999
         y.backward()
 
         grad_file = _find_dump_file(tmp_path, name="grad__id_test")
-        assert "curr_step=42" in grad_file.name
+        assert "step=42" in grad_file.name
 
     def test_dump_grad_file_content(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
@@ -805,7 +805,7 @@ class TestReset:
         d.reset()
 
         assert d._dump_index == 0
-        assert d._curr_step == 0
+        assert d._step == 0
         assert d._global_ctx == {}
 
     def test_dump_works_after_reset(self, tmp_path):
@@ -924,7 +924,7 @@ class TestDumperHttp:
         self._post(dumper_http_url, "reset")
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "dump_index", 0)
-        self._assert_all_ranks(states, "curr_step", 0)
+        self._assert_all_ranks(states, "step", 0)
 
     def test_get_state(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
@@ -933,7 +933,7 @@ class TestDumperHttp:
         self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
         for state in states:
             assert "dump_index" in state
-            assert "curr_step" in state
+            assert "step" in state
 
     def test_all_ranks_consistent(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, dir="/tmp/multi")

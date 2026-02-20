@@ -158,7 +158,7 @@ class _Dumper:
         self._cleanup_previous_handled = not config.cleanup_previous
 
         self._dump_index = 0
-        self._curr_step = 0
+        self._step = 0
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
@@ -176,8 +176,8 @@ class _Dumper:
         # Users may want to `dump` only on some ranks, thus determine name here
         self._ensure_partial_name()
 
-        self._curr_step += 1
-        print(f"[Dumper] [{time.time()}] step curr_step={self._curr_step}")
+        self._step += 1
+        print(f"[Dumper] [{time.time()}] step={self._step}")
 
     def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
         self._dump_inner(
@@ -240,7 +240,7 @@ class _Dumper:
 
     def reset(self) -> None:
         self._dump_index = 0
-        self._curr_step = 0
+        self._step = 0
         self._global_ctx = {}
 
     @contextmanager
@@ -256,7 +256,7 @@ class _Dumper:
         return {
             "config": asdict(self._config),
             "dump_index": self._dump_index,
-            "curr_step": self._curr_step,
+            "step": self._step,
         }
 
     # ------------------------- public :: only used internally -----------------------------
@@ -354,7 +354,7 @@ class _Dumper:
         if not tensor.requires_grad:
             return
 
-        captured_curr_step = self._curr_step
+        captured_step = self._step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -363,7 +363,7 @@ class _Dumper:
                 tags=captured_tags,
                 value=grad,
                 save=save,
-                curr_step=captured_curr_step,
+                step=captured_step,
             )
 
         tensor.register_hook(grad_hook)
@@ -375,18 +375,14 @@ class _Dumper:
         tags: dict,
         value,
         save: bool,
-        curr_step: Optional[int] = None,
+        step: Optional[int] = None,
     ) -> None:
         self._ensure_partial_name()
         self._dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            curr_step=(
-                curr_step
-                if curr_step is not None
-                else self._curr_step
-            ),
+            step=(step if step is not None else self._step),
             rank=rank,
             dump_index=self._dump_index,
             **tags,
