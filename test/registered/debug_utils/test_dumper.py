@@ -1526,5 +1526,50 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
 
 
+class TestDumperE2E:
+    """End-to-end test: real sglang server (tp=2) with dumper integration."""
+
+    def test_step_and_non_intrusive_hooks(self, tmp_path):
+        base_url = DEFAULT_URL_FOR_TEST
+        dump_dir = str(tmp_path)
+        env = {
+            **os.environ,
+            "DUMPER_ENABLE": "1",
+            "DUMPER_SERVER_PORT": "reuse",
+            "DUMPER_DIR": dump_dir,
+            "DUMPER_NON_INTRUSIVE_MODE": "core",
+        }
+        proc = popen_launch_server(
+            "Qwen/Qwen3-0.6B",
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--tp", "2", "--max-total-tokens", "128"],
+            env=env,
+        )
+        try:
+            resp = requests.post(
+                f"{base_url}/generate",
+                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
+            )
+            assert resp.status_code == 200, f"Generate failed: {resp.text}"
+
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            assert isinstance(states, list) and len(states) >= 1
+            for rank, state in enumerate(states):
+                assert (
+                    state["step"] > 0
+                ), f"rank {rank}: step should be > 0, got {state['step']}"
+
+            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
+            assert len(dump_files) > 0, f"Expected dump files in {dump_dir}, found none"
+            has_input_ids = any("name=input_ids" in f.name for f in dump_files)
+            assert has_input_ids, (
+                f"Expected input_ids dump from non-intrusive hooks, "
+                f"got: {[f.name for f in dump_files[:10]]}"
+            )
+        finally:
+            kill_process_tree(proc.pid)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
