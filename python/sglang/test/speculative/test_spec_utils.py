@@ -4,7 +4,11 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
-from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
+from sglang.srt.speculative.spec_utils import (
+    _SPEC_MAX_NUM_LOOPS,
+    _SPEC_STEP_SIZE,
+    assign_draft_cache_locs,
+)
 from sglang.srt.utils import next_power_of_2
 
 BYTES_PER_TILE = 128
@@ -87,7 +91,8 @@ class TestSpecUtils(unittest.TestCase):
             topk,
             speculative_num_steps,
             page_size,
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(speculative_num_steps + page_size),
         )
 
@@ -167,7 +172,8 @@ class TestSpecUtils(unittest.TestCase):
             topk,
             speculative_num_steps,
             page_size,
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(speculative_num_steps + page_size),
         )
         out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
@@ -271,7 +277,8 @@ class TestSpecUtils(unittest.TestCase):
             topk,
             speculative_num_steps,
             page_size,
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(speculative_num_steps + page_size),
         )
         out_cache_loc = out_cache_loc[: num_seqs * topk * speculative_num_steps]
@@ -330,7 +337,8 @@ class TestSpecUtils(unittest.TestCase):
             topk,
             speculative_num_steps,
             page_size,
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(speculative_num_steps + page_size),
         )
         trimmed = out_cache_loc[: num_seqs * topk * speculative_num_steps]

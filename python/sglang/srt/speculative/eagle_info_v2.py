@@ -397,13 +397,35 @@ def fill_accepted_out_cache_loc(
     accept_index,
     out_cache_loc,
     accepted_out_cache_loc,
-    size_upper: tl.constexpr,
+    step_size: tl.constexpr,
+    max_num_loops: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    offset = tl.arange(0, size_upper)
+    """Fill accepted_out_cache_loc based on valid accept_index entries.
 
-    masks = (tl.load(accept_index + offset, offset < pid, other=-1) != -1).to(tl.int64)
-    dst = tl.sum(masks)
+    This kernel computes dst by counting valid entries (value != -1) before pid,
+    then stores the corresponding out_cache_loc value if current entry is valid.
+
+    The step_size parameter controls the loop step size for accumulation,
+    allowing the kernel to handle arbitrary sizes without recompilation.
+    max_num_loops should be set to ceil(max_size / step_size).
+    """
+    pid = tl.program_id(axis=0)
+
+    # Loop to count valid entries before pid
+    dst = 0
+    dst = dst.to(tl.int64)
+
+    num_loops = (pid + step_size - 1) // step_size
+    for i in range(max_num_loops):
+        if i < num_loops:
+            loop_start = i * step_size
+            offset = tl.arange(0, step_size)
+            mask = (loop_start + offset) < pid
+
+            values = tl.load(accept_index + loop_start + offset, mask=mask, other=-1)
+            valid_mask = (values != -1).to(tl.int64)
+            dst += tl.sum(valid_mask)
+
     src = tl.load(accept_index + pid)
     if src > -1:
         value = tl.load(out_cache_loc + src)
@@ -418,18 +440,38 @@ def assign_extend_cache_locs(
     end_offset,
     out_cache_loc,
     pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
+    step_size_bs: tl.constexpr,
+    max_num_loops_bs: tl.constexpr,
 ):
+    """Assign cache locations for extend phase.
+
+    This kernel computes out_offset by accumulating (end - start) for all
+    requests before pid, then copies data from token_pool to out_cache_loc.
+
+    The step_size_bs parameter controls the loop step size for accumulation,
+    allowing the kernel to handle arbitrary batch sizes without recompilation.
+    max_num_loops_bs should be set to ceil(max_batch_size / step_size_bs).
+    """
     BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
     kv_start = tl.load(start_offset + pid)
     kv_end = tl.load(end_offset + pid)
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
+    # Loop to accumulate out_offset up to pid (exclusive)
+    out_offset = 0
+    out_offset = out_offset.to(tl.int64)
+
+    num_loops_bs = (pid + step_size_bs - 1) // step_size_bs
+    for i in range(max_num_loops_bs):
+        if i < num_loops_bs:
+            loop_start = i * step_size_bs
+            offset = tl.arange(0, step_size_bs)
+            mask = (loop_start + offset) < pid
+
+            s = tl.load(start_offset + loop_start + offset, mask=mask, other=0)
+            e = tl.load(end_offset + loop_start + offset, mask=mask, other=0)
+            out_offset += tl.sum(e - s)
 
     out_cache_ptr = out_cache_loc + out_offset
 
@@ -443,6 +485,17 @@ def assign_extend_cache_locs(
         tl.store(out_cache_ptr + save_offset, data, mask=mask)
         load_offset += BLOCK_SIZE
         save_offset += BLOCK_SIZE
+
+
+# Fixed step size for assign_extend_cache_locs kernel to avoid recompilation
+_ASSIGN_EXTEND_CACHE_LOCS_STEP_SIZE_BS = next_power_of_2(512)
+# Max loops = ceil(max_batch_size / step_size_bs), support up to 4096 batch size
+_ASSIGN_EXTEND_CACHE_LOCS_MAX_NUM_LOOPS_BS = 8
+
+# Fixed step size for fill_accepted_out_cache_loc kernel to avoid recompilation
+_FILL_ACCEPTED_CACHE_LOC_STEP_SIZE = next_power_of_2(512)
+# Max loops = ceil(max_size / step_size), support up to 4096 size
+_FILL_ACCEPTED_CACHE_LOC_MAX_NUM_LOOPS = 8
 
 
 def assign_extend_cache_locs_func(
@@ -467,7 +520,8 @@ def assign_extend_cache_locs_func(
             end_offset,
             out_cache_loc,
             req_to_token.shape[1],
-            next_power_of_2(batch_size),
+            _ASSIGN_EXTEND_CACHE_LOCS_STEP_SIZE_BS,
+            _ASSIGN_EXTEND_CACHE_LOCS_MAX_NUM_LOOPS_BS,
         )
 
         return out_cache_loc

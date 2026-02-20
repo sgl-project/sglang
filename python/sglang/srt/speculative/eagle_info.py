@@ -28,6 +28,8 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
+    _SPEC_MAX_NUM_LOOPS,
+    _SPEC_STEP_SIZE,
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
@@ -492,7 +494,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     batch.out_cache_loc,
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
+                    _SPEC_STEP_SIZE,
+                    _SPEC_MAX_NUM_LOOPS,
                 )
 
                 # Free the kv cache
@@ -577,7 +580,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         tgt_cache_loc,
                         accept_length,
                         accept_length_filter,
-                        next_power_of_2(bs),
+                        _SPEC_STEP_SIZE,
+                        _SPEC_MAX_NUM_LOOPS,
                         next_power_of_2(self.draft_token_num),
                     )
 
@@ -719,7 +723,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.accept_length,
             self.positions,
             self.verified_id,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
+            next_power_of_2(speculative_num_steps + 1),
         )
 
     def generate_attn_arg_prefill(

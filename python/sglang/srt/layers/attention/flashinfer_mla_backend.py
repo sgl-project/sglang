@@ -907,7 +907,11 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import (
+            _SPEC_MAX_NUM_LOOPS,
+            _SPEC_STEP_SIZE,
+            generate_draft_decode_kv_indices,
+        )
 
         if topk > 1:
             raise ValueError(
@@ -916,6 +920,8 @@ class FlashInferMLAMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+        self._spec_step_size = _SPEC_STEP_SIZE
+        self._spec_max_num_loops = _SPEC_MAX_NUM_LOOPS
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -969,9 +975,11 @@ class FlashInferMLAMultiStepDraftBackend:
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            next_power_of_2(num_seqs),
+            self._spec_step_size,
+            self._spec_max_num_loops,
             next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
+            self._spec_step_size,
+            self._spec_max_num_loops,
             self.page_size,
         )
 
