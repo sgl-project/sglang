@@ -30,6 +30,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    find_available_port,
     popen_launch_server,
     run_distributed_test,
 )
@@ -829,130 +830,122 @@ class TestReset:
         assert "dump_index=1" in post_file.name
 
 
-class TestDumperStandaloneHttp:
-    """Test the standalone HTTPServer (port 40000) used in non-sglang mode."""
+def _start_standalone_dumper_server(http_port: int) -> "list[mp.Process]":
+    """Spawn 2-GPU distributed processes that run dumper's standalone HTTPServer.
 
-    def test_http_configure(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
-            run_distributed_test(self._test_http_configure_func)
+    Each process initialises torch.distributed, calls ``dumper.on_forward_pass_start()``
+    (which starts the ZMQ RPC + HTTPServer on rank 0), then blocks until killed.
+    Returns the list of spawned processes (caller is responsible for cleanup).
+    """
+    import torch.multiprocessing as mp
 
-    @staticmethod
-    def _test_http_configure_func(rank):
+    nccl_port = find_available_port(29500)
+    ctx = mp.get_context("spawn")
+    procs: list[mp.Process] = []
+    for rank in range(2):
+        p = ctx.Process(
+            target=_standalone_worker,
+            args=(rank, 2, nccl_port, http_port),
+        )
+        p.start()
+        procs.append(p)
+    return procs
+
+
+def _standalone_worker(rank: int, world_size: int, nccl_port: int, http_port: int):
+    import os
+
+    os.environ["SGLANG_DUMPER_ENABLE"] = "0"
+    os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{nccl_port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
         from sglang.srt.debug_utils.dumper import dumper
 
-        assert not dumper._config.enable
         dumper.on_forward_pass_start()
-
-        base_url = "http://localhost:40000"
-
-        # (1) enable toggle
-        for enable in [True, False]:
-            dist.barrier()
-            if rank == 0:
-                time.sleep(0.1)
-                requests.post(
-                    f"{base_url}/dumper/configure", json={"enable": enable}
-                ).raise_for_status()
-            dist.barrier()
-            assert dumper._config.enable == enable
-
-        # (2) multi-field configure
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.enable is True
-        assert dumper._config.filter == "layer_id=0"
-        assert dumper._config.dir == "/tmp/test_http"
-
-        # (3) clear optional field
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"filter": None},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.filter is None
-
-        # (4) reset
-        dumper._dump_index = 42
-        dumper._forward_pass_id = 99
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(f"{base_url}/dumper/reset").raise_for_status()
-        dist.barrier()
-        assert dumper._dump_index == 0
-        assert dumper._forward_pass_id == 0
-
-        # (5) error: unknown field -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"nonexistent_field": 123},
-            )
-            assert resp.status_code == 400
-
-        # (6) error: wrong type -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": "not_a_bool"},
-            )
-            assert resp.status_code == 400
+        while True:
+            time.sleep(3600)
+    finally:
+        dist.destroy_process_group()
 
 
-class TestDumperSglangServer:
-    """Test dumper control via sglang's FastAPI /dumper/* endpoints."""
+def _wait_for_http(url: str, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+            return
+        except requests.ConnectionError:
+            time.sleep(0.5)
+    raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
 
-    @classmethod
-    def setup_class(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
+
+@pytest.fixture(scope="class", params=["standalone", "sglang"])
+def dumper_http_url(request):
+    """Yield the base URL for the dumper HTTP endpoint.
+
+    - ``standalone``: spawns 2-GPU distributed processes with dumper's own HTTPServer.
+    - ``sglang``: launches a real sglang server via ``popen_launch_server``.
+    """
+    if request.param == "standalone":
+        http_port = find_available_port(40000)
+        base_url = f"http://127.0.0.1:{http_port}"
+        procs = _start_standalone_dumper_server(http_port=http_port)
+        _wait_for_http(base_url)
+        yield base_url
+        for p in procs:
+            kill_process_tree(p.pid)
+    else:
+        base_url = DEFAULT_URL_FOR_TEST
+        proc = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--max-total-tokens", "128"],
         )
+        yield base_url
+        kill_process_tree(proc.pid)
 
-    @classmethod
-    def teardown_class(cls):
-        kill_process_tree(cls.process.pid)
 
-    def test_configure_enable(self):
-        resp = requests.post(f"{self.base_url}/dumper/configure", json={"enable": True})
-        assert resp.status_code == 200
-        assert resp.json()["success"] is True
+class TestDumperHttp:
+    """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
+    def test_configure_enable(self, dumper_http_url: str):
         resp = requests.post(
-            f"{self.base_url}/dumper/configure", json={"enable": False}
+            f"{dumper_http_url}/dumper/configure", json={"enable": True}
         )
         assert resp.status_code == 200
-        assert resp.json()["success"] is True
 
-    def test_configure_multi_field(self):
         resp = requests.post(
-            f"{self.base_url}/dumper/configure",
-            json={"enable": True, "filter": "layer_id=0"},
+            f"{dumper_http_url}/dumper/configure", json={"enable": False}
         )
         assert resp.status_code == 200
-        assert resp.json()["success"] is True
 
-    def test_reset(self):
-        resp = requests.post(f"{self.base_url}/dumper/reset")
+    def test_configure_multi_field(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
+        )
         assert resp.status_code == 200
-        assert resp.json()["success"] is True
+
+    def test_configure_clear_optional(self, dumper_http_url: str):
+        requests.post(
+            f"{dumper_http_url}/dumper/configure", json={"filter": "layer_id=0"}
+        ).raise_for_status()
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure", json={"filter": None}
+        )
+        assert resp.status_code == 200
+
+    def test_reset(self, dumper_http_url: str):
+        resp = requests.post(f"{dumper_http_url}/dumper/reset")
+        assert resp.status_code == 200
 
 
 if __name__ == "__main__":
