@@ -80,9 +80,9 @@ def test_moe_sum_vs_ref(num_tokens, topk, hidden_dim, dtype):
     # Allow wider tolerance for fp16/bf16.
     atol = 0.05 if dtype != torch.float32 else 1e-5
     rtol = 1e-2 if dtype != torch.float32 else 1e-4
-    assert torch.allclose(out, ref, atol=atol, rtol=rtol), (
-        f"Mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
-    )
+    assert torch.allclose(
+        out, ref, atol=atol, rtol=rtol
+    ), f"Mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,9 @@ def test_general_fallback(topk):
     out = torch.empty((num_tokens, hidden_dim), dtype=torch.float32, device="cuda")
     moe_sum(x, out)
     ref = moe_sum_ref(x)
-    assert torch.allclose(out, ref, atol=1e-5), f"General fallback mismatch (topk={topk})"
+    assert torch.allclose(
+        out, ref, atol=1e-5
+    ), f"General fallback mismatch (topk={topk})"
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +137,9 @@ def test_moe_sum_vs_aot(num_tokens, topk, hidden_dim, dtype):
     moe_sum(x, out_jit)
     moe_sum_aot(x, out_aot)
 
-    assert torch.allclose(out_jit, out_aot, atol=1e-5, rtol=1e-5), (
-        f"JIT vs AOT mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
-    )
+    assert torch.allclose(
+        out_jit, out_aot, atol=1e-5, rtol=1e-5
+    ), f"JIT vs AOT mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
 
 
 if __name__ == "__main__":

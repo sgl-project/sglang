@@ -19,8 +19,8 @@ namespace {
 // ---------------------------------------------------------------------------
 template <typename T, int TOPK>
 __global__ void moe_sum_kernel(
-    T* __restrict__ out,           // [num_tokens, hidden_size]
-    const T* __restrict__ input,   // [num_tokens, topk, hidden_size]
+    T* __restrict__ out,          // [num_tokens, hidden_size]
+    const T* __restrict__ input,  // [num_tokens, topk, hidden_size]
     const int hidden_size) {
   const int64_t token_idx = blockIdx.x;
   for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
@@ -35,11 +35,8 @@ __global__ void moe_sum_kernel(
 
 // General fallback for topk not covered by static dispatch
 template <typename T>
-__global__ void moe_sum_kernel_general(
-    T* __restrict__ out,
-    const T* __restrict__ input,
-    const int hidden_size,
-    const int topk) {
+__global__ void
+moe_sum_kernel_general(T* __restrict__ out, const T* __restrict__ input, const int hidden_size, const int topk) {
   const int64_t token_idx = blockIdx.x;
   for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
     T x = static_cast<T>(0);
