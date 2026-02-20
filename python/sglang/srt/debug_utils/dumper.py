@@ -493,8 +493,7 @@ class _NonIntrusiveDumper:
         self._mode = mode
 
         for module_name, module in model.named_modules():
-            ctx = self._detect_module_ctx(module_name, module)
-            if ctx:
+            if ctx := self._detect_module_ctx(module_name, module):
                 self._register_ctx_hooks(module, ctx=ctx)
 
             module.register_forward_hook(
