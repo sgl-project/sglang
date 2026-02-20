@@ -504,47 +504,57 @@ class _HookDumper:
         assert top_found, f"model should have a module named {top_level_module_name}"
 
     def _make_forward_hook(self, name: str, is_top_level: bool):
-        def _hook(_module, input, output):
+        def _hook(_module, _input, output):
             if is_top_level:
-                for item in input:
-                    self._dump_converted(name, item)
+                for item in _input:
+                    self._dump_converted(name, item, role="inputs")
 
             if output is not None:
-                self._dump_converted(name, output)
+                self._dump_converted(name, output, role="output")
 
         return _hook
 
-    def _dump_converted(self, name: str, value) -> None:
-        for key, tensor in self._convert_hook_output(name, value).items():
-            self._dumper.dump(key, tensor)
+    def _dump_converted(self, name: str, value, role: str) -> None:
+        for key, tensor in self._convert_hook_output(value).items():
+            full_name = f"{name}.{role}.{key}" if key else f"{name}.{role}"
+            self._dumper.dump(full_name, tensor)
 
-    def _convert_hook_output(self, name: str, value) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _convert_hook_output(value) -> dict[str, torch.Tensor]:
         if isinstance(value, torch.Tensor):
-            return {name: value}
+            return {"": value}
 
         if isinstance(value, (tuple, list)):
             tensors = [t for t in value if isinstance(t, torch.Tensor)]
             if len(tensors) == 1:
-                return {name: tensors[0]}
-            return {f"{name}.{i}": t for i, t in enumerate(tensors)}
+                return {"": tensors[0]}
+            return {str(i): t for i, t in enumerate(tensors)}
 
         try:
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
             if isinstance(value, LogitsProcessorOutput):
-                return {name: value.next_token_logits}
+                return {"": value.next_token_logits}
+        except ImportError:
+            pass
+
+        try:
+            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
             if isinstance(value, ForwardBatch):
                 return {
-                    f"{name}.input_ids": value.input_ids,
-                    f"{name}.seq_lens": value.seq_lens,
-                    f"{name}.positions": value.positions,
+                    "input_ids": value.input_ids,
+                    "seq_lens": value.seq_lens,
+                    "positions": value.positions,
                 }
+        except ImportError:
+            pass
+
+        try:
+            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
             if isinstance(value, PPProxyTensors):
-                return {
-                    f"{name}.pp_proxy_tensors.{k}": v
-                    for k, v in value.tensors.items()
-                }
+                return {k: v for k, v in value.tensors.items()}
         except ImportError:
             pass
 
