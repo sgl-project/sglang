@@ -619,16 +619,18 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def _dumper_control_handler(method: str, request: Request):
-    body_bytes = await request.body()
-    body = await request.json() if body_bytes else {}
-    obj = DumperControlReqInput(kwargs={"_method": method, **body})
-    results = await _global_state.tokenizer_manager.dumper_control(obj)
-    response: list = []
-    for r in results:
-        response.extend(r.response)
-    return response
+if TODO:
+    @app.api_route("/dumper/{method}", methods=["POST"])
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def _dumper_control_handler(method: str, request: Request):
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
+        obj = DumperControlReqInput(kwargs={"_method": method, **body})
+        results = await _global_state.tokenizer_manager.dumper_control(obj)
+        response: list = []
+        for r in results:
+            response.extend(r.response)
+        return response
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
