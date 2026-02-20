@@ -492,20 +492,20 @@ class _HookDumper:
     def _make_forward_hook(self, module_name: str):
         def _hook(_module, input, output):
             for i, item in enumerate(input):
-                self._dump_module_input_output(module_name, item, role=f"inputs.{i}")
+                self._dump_value(module_name, item, role=f"inputs.{i}")
 
             if output is not None:
-                self._dump_module_input_output(module_name, output, role="output")
+                self._dump_value(module_name, output, role="output")
 
         return _hook
 
-    def _dump_module_input_output(self, module_name: str, value, role: str) -> None:
-        for key, tensor in self._convert_hook_output(value).items():
+    def _dump_value(self, module_name: str, value, role: str) -> None:
+        for key, tensor in self._convert_value(value).items():
             parts = [p for p in (module_name, role, key) if p]
             self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
     @staticmethod
-    def _convert_hook_output(value) -> dict[str, torch.Tensor]:
+    def _convert_value(value) -> dict[str, torch.Tensor]:
         if isinstance(value, torch.Tensor):
             return {"": value}
 
