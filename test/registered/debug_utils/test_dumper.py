@@ -1297,16 +1297,16 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
-            def forward(self, fb):
-                return self.linear(fb.input_ids.float().unsqueeze(-1).expand(-1, 4))
+            def forward(self, forward_batch):
+                return self.linear(forward_batch.input_ids.float().unsqueeze(-1).expand(-1, 4))
 
         class Root(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.layer = SubLayer()
 
-            def forward(self, fb):
-                return self.layer(fb)
+            def forward(self, forward_batch):
+                return self.layer(forward_batch)
 
         return Root()
 
@@ -1317,14 +1317,14 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
         assert result is None
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([1, 2]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([3, 4]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert len(captured) == 0
 
@@ -1333,19 +1333,19 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert "input_ids" in captured
         assert "positions" in captured
-        assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
-        assert torch.equal(captured["positions"]["value"], fb.positions)
+        assert torch.equal(captured["input_ids"]["value"], forward_batch.input_ids)
+        assert torch.equal(captured["positions"]["value"], forward_batch.positions)
 
         assert not any(k.startswith("non_intrusive__") for k in captured)
 
@@ -1354,14 +1354,14 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([1]),
             positions=torch.tensor([0]),
             seq_lens=torch.tensor([2]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert "seq_lens" not in captured
         assert not any("seq_lens" in k for k in captured)
@@ -1371,37 +1371,37 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert "input_ids" in captured
         assert "positions" in captured
-        assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
-        assert torch.equal(captured["positions"]["value"], fb.positions)
+        assert torch.equal(captured["input_ids"]["value"], forward_batch.input_ids)
+        assert torch.equal(captured["positions"]["value"], forward_batch.positions)
 
     def test_all_mode_non_core_fields_with_prefix(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert "non_intrusive__inputs.0.seq_lens" in captured
         assert torch.equal(
-            captured["non_intrusive__inputs.0.seq_lens"]["value"], fb.seq_lens
+            captured["non_intrusive__inputs.0.seq_lens"]["value"], forward_batch.seq_lens
         )
 
     def test_all_mode_no_core_fields_with_prefix(self, tmp_path):
@@ -1409,14 +1409,14 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert not any(
             k.startswith("non_intrusive__") and k.endswith("input_ids")
@@ -1432,14 +1432,14 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert not any(
             k.startswith("non_intrusive__layer.inputs.") and "seq_lens" in k
@@ -1451,14 +1451,14 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
-        fb = _make_forward_batch(
+        forward_batch = _make_forward_batch(
             input_ids=torch.tensor([10, 20]),
             positions=torch.tensor([0, 1]),
             seq_lens=torch.tensor([5, 6]),
         )
 
         with d.capture_output() as captured:
-            model(fb)
+            model(forward_batch)
 
         assert "non_intrusive__layer.linear.output" in captured
         assert "non_intrusive__layer.output" in captured
