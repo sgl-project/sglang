@@ -609,6 +609,12 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     according to config.
     """
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "proj": ["o_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"]
+    }
+
     MULTIMODAL_PROJECTOR_TYPE = LlavaMultiModalProjector
 
     @property
