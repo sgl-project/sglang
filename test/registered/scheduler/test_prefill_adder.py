@@ -236,6 +236,49 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertFalse(success_by_capacity_check)
 
+    def test_preempt_skip_already_preempted_request(self):
+        params = [
+            ("req_prio_0", 0, 50),
+            ("req_prio_1", 1, 75),
+            ("req_prio_2", 2, 100),
+        ]
+        running_reqs = [
+            self.create_mock_req(rid, priority, max_new_tokens)
+            for rid, priority, max_new_tokens in params
+        ]
+        mock_server_args = self.create_server_args(
+            schedule_low_priority_values_first=False
+        )
+        running_batch = self.create_running_batch(running_reqs)
+        adder = self.create_adder(running_batch)
+
+        self.assertEqual(adder.rem_total_token_offset, 225)
+
+        self.mock_token_allocator.full_available_size.return_value = 225
+        self.mock_token_allocator.available_size.return_value = 225
+
+        # New request preempts req_prio_0
+        first_req = self.create_mock_req(
+            "new_req_prio_1", priority=1, max_new_tokens=49
+        )
+        first_success = adder.preempt_to_schedule(first_req, mock_server_args)
+        self.assertTrue(first_success)
+        self.assertIn(running_reqs[0], adder.preempt_list)
+        self.assertEqual(adder.rem_total_token_offset, 175)
+        running_batch.release_req.assert_called_once()
+
+        # Second call needs more tokens than currently free, so it would need to
+        # preempt req_prio_0 again if already-preempted requests were not filtered out.
+        second_req = self.create_mock_req(
+            "second_new_req_prio_1", priority=1, max_new_tokens=76
+        )
+        second_success = adder.preempt_to_schedule(second_req, mock_server_args)
+
+        self.assertFalse(second_success)
+        self.assertEqual(adder.rem_total_token_offset, 175)
+        self.assertEqual(adder.preempt_list.count(running_reqs[0]), 1)
+        running_batch.release_req.assert_called_once()
+
     def test_preempt_success_low_priority_values_first_exact_once(self):
         params = [
             ("run1", 0, 50),
