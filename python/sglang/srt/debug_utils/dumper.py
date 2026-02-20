@@ -520,6 +520,7 @@ class _HookDumper:
                 return {"": tensors[0]}
             return {str(i): t for i, t in enumerate(tensors)}
 
+        # SGLang specific
         try:
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
             from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -537,6 +538,9 @@ class _HookDumper:
                 return {k: v for k, v in value.tensors.items()}
         except ImportError:
             pass
+
+        # Megatron specific
+        # TODO
 
         return {}
 
