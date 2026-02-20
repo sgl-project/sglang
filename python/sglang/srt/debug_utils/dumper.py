@@ -517,9 +517,8 @@ class _NonIntrusiveDumper:
         for key, tensor in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
-            if self._mode == "core":
-                if key in self._CORE_FIELDS:
-                    self._dumper.dump(key, tensor)
+            if key in self._CORE_FIELDS:
+                self._dumper.dump(key, tensor)
             elif self._mode == "all":
                 parts = [p for p in (module_name, role, key) if p]
                 self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
