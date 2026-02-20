@@ -484,13 +484,12 @@ class _HookDumper:
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
-        self._top_level_module_name = dumper._config.top_level_module_name
         self._special_types = _HookDumper._load_special_types()
 
         matched, _ = self._add_hooks_recursive(model=model, prefix="")
         assert (
             matched
-        ), f"model should have a module named {self._top_level_module_name}"
+        ), f"model should have a module named {self._dumper._config.top_level_module_name}"
 
     def _add_hooks_recursive(
         self, model: "torch.nn.Module", prefix: str
@@ -501,7 +500,7 @@ class _HookDumper:
             is_top_level = False
             if len(prefix) == 0:
                 cur_name = name
-                if cur_name == self._top_level_module_name:
+                if cur_name == self._dumper._config.top_level_module_name:
                     top_level_matched = True
                     is_top_level = True
             else:
