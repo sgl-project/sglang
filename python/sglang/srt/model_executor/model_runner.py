@@ -2686,3 +2686,26 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+def unwrap_ipc_tensors(
+    named_tensors: List[Tuple[str, torch.Tensor]], tp_rank: int, device: torch.device
+) -> List[Tuple[str, torch.Tensor]]:
+    """Unwrap LocalSerializedTensor objects to detach from IPC memory.
+
+    This function should be called only once after deserialization to avoid
+    opening multiple CUDA IPC handles for the same tensor.
+    """
+
+    result = []
+    for name, tensor in named_tensors:
+        if isinstance(tensor, LocalSerializedTensor):
+            ipc_tensor = tensor.get(tp_rank)
+            tensor_on_device = ipc_tensor.to(device)
+            # Explicitly delete the tensor created from the IPC handle to trigger
+            # garbage collection and release the handle.
+            del ipc_tensor
+        else:
+            tensor_on_device = tensor.to(device)
+        result.append((name, tensor_on_device))
+    return result

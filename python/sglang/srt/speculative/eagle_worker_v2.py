@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.model_runner import unwrap_ipc_tensors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -864,15 +865,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
+        # Unwrap LocalSerializedTensor to detach from IPC memory
+        # This is done only once here, before passing to both workers
+        unwrapped_tensors = unwrap_ipc_tensors(
+            named_tensors, self.tp_rank, torch.device(self.device)
+        )
+
         success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=unwrapped_tensors,
             load_format=recv_req.load_format,
         )
         if not success:
             return success, message
 
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=unwrapped_tensors,
             load_format=recv_req.load_format,
         )
         return success, message
