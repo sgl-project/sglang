@@ -217,7 +217,7 @@ class _Dumper:
             return
 
         tags = dict(name=name, **extra_kwargs, **self._global_ctx)
-        if (f := self._filter) is not None and re.search(f, _format_kwargs(tags)) is None:
+        if (f := self._filter) is not None and re.search(f, _format_tags(tags)) is None:
             return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
@@ -301,7 +301,7 @@ class _Dumper:
             dump_index=self._dump_index,
             **tags,
         )
-        full_filename = _format_kwargs(full_kwargs) + ".pt"
+        full_filename = _format_tags(full_kwargs) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
 
         if self._enable_output_console:
@@ -437,7 +437,7 @@ def _materialize_value(value):
     return value
 
 
-def _format_kwargs(kwargs: dict) -> str:
+def _format_tags(kwargs: dict) -> str:
     return "___".join(f"{k}={v}" for k, v in kwargs.items())
 
 

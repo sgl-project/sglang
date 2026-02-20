@@ -15,7 +15,7 @@ from sglang.srt.debug_utils.dumper import (
     _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
-    _format_kwargs,
+    _format_tags,
     _materialize_value,
     _obj_to_dict,
     _torch_save,
@@ -605,9 +605,9 @@ class TestDumpGrad:
 
 
 class TestKvFilter:
-    def test_format_kwargs(self):
-        assert _format_kwargs({"a": 1, "b": "hello"}) == "a=1___b=hello"
-        assert _format_kwargs({}) == ""
+    def test_format_tags(self):
+        assert _format_tags({"a": 1, "b": "hello"}) == "a=1___b=hello"
+        assert _format_tags({}) == ""
 
     def test_filter_matches_extra_kwargs(self, tmp_path):
         d = _make_test_dumper(tmp_path, filter="layer_id=0")
