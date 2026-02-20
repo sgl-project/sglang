@@ -1971,12 +1971,12 @@ class LazyDumpTensorsReqOutput(BaseReq):
 
 
 @dataclass
-class DumperConfigureReqInput(BaseReq):
+class DumperControlReqInput(BaseReq):
     kwargs: Dict[str, Any]
 
 
 @dataclass
-class DumperConfigureReqOutput(BaseReq):
+class DumperControlReqOutput(BaseReq):
     success: bool
 
 

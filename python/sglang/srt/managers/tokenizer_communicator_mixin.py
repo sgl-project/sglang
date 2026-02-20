@@ -33,8 +33,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
-    DumperConfigureReqInput,
-    DumperConfigureReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -235,7 +235,7 @@ class TokenizerCommunicatorMixin:
         self.get_loads_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.dumper_configure_communicator = _Communicator(
+        self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -337,8 +337,8 @@ class TokenizerCommunicatorMixin:
                     self.get_loads_communicator.handle_recv,
                 ),
                 (
-                    DumperConfigureReqOutput,
-                    self.dumper_configure_communicator.handle_recv,
+                    DumperControlReqOutput,
+                    self.dumper_control_communicator.handle_recv,
                 ),
             ]
         )
@@ -870,10 +870,10 @@ class TokenizerCommunicatorMixin:
         )
         return [res.updated for res in responses]
 
-    async def dumper_configure(
-        self: TokenizerManager, obj: DumperConfigureReqInput
-    ) -> List[DumperConfigureReqOutput]:
-        return await self.dumper_configure_communicator(obj)
+    async def dumper_control(
+        self: TokenizerManager, obj: DumperControlReqInput
+    ) -> List[DumperControlReqOutput]:
+        return await self.dumper_control_communicator(obj)
 
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()

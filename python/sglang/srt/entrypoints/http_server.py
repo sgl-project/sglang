@@ -99,7 +99,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
-    DumperConfigureReqInput,
+    DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -627,8 +627,8 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 async def dumper_control(method: str, request: Request):
     body_bytes = await request.body()
     body = await request.json() if body_bytes else {}
-    obj = DumperConfigureReqInput(kwargs={"_method": method, **body})
-    results = await _global_state.tokenizer_manager.dumper_configure(obj)
+    obj = DumperControlReqInput(kwargs={"_method": method, **body})
+    results = await _global_state.tokenizer_manager.dumper_control(obj)
     return {"success": all(r.success for r in results)}
 
 

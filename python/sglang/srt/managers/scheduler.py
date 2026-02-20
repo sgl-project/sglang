@@ -90,8 +90,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
-    DumperConfigureReqInput,
-    DumperConfigureReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1084,7 +1084,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
-                (DumperConfigureReqInput, self.handle_dumper_configure),
+                (DumperControlReqInput, self.handle_dumper_control),
             ]
         )
 
@@ -2963,7 +2963,7 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
-    def handle_dumper_configure(self, recv_req: DumperConfigureReqInput):
+    def handle_dumper_control(self, recv_req: DumperControlReqInput):
         if self.tp_rank == 0:
             from sglang.srt.debug_utils.dumper import dumper
 
@@ -2976,7 +2976,7 @@ class Scheduler(
                 getattr(dumper, method)(**kwargs)
 
         self.send_to_tokenizer.send_output(
-            DumperConfigureReqOutput(success=True), recv_req
+            DumperControlReqOutput(success=True), recv_req
         )
 
     # placeholder for override
