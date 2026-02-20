@@ -36,7 +36,11 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Init the metadata for a forward pass for capturing a cuda graph.
+
+        Note: Backends that support separate LoRA graphs (FlashAttention, FlashInfer)
+        accept an additional is_lora parameter to key metadata by (bs, is_lora).
+        """
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
@@ -50,12 +54,28 @@ class AttentionBackend(ABC):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph.
+
+        Note: Backends that support separate LoRA graphs (FlashAttention, FlashInfer)
+        accept an additional is_lora parameter to retrieve the correct metadata tensors.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
+
+    def supports_separate_lora_graphs(self) -> bool:
+        """Whether this backend supports separate CUDA graphs for LoRA and non-LoRA batches.
+
+        Backends that key decode metadata by (bs, is_lora) can return True to enable
+        capturing both LoRA and non-LoRA graphs for the same batch size without
+        metadata overwrites.
+
+        Returns False by default - backends without this support will only capture
+        the LoRA graph and use it for all batches.
+        """
+        return False
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
