@@ -76,10 +76,10 @@ def test_moe_sum_vs_ref(num_tokens, topk, hidden_dim, dtype):
     moe_sum(x, out)
     ref = moe_sum_ref(x)
 
-    # Kernel accumulates in native dtype; PyTorch ref upcasts to float.
-    # Allow wider tolerance for fp16/bf16.
-    atol = 0.05 if dtype != torch.float32 else 1e-5
-    rtol = 1e-2 if dtype != torch.float32 else 1e-4
+    # Kernel accumulates in float32; PyTorch ref also upcasts to float.
+    # Small tolerance for rounding at the final bf16/fp16 conversion.
+    atol = 1e-3 if dtype != torch.float32 else 1e-5
+    rtol = 1e-3 if dtype != torch.float32 else 1e-4
     assert torch.allclose(
         out, ref, atol=atol, rtol=rtol
     ), f"Mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
@@ -124,10 +124,37 @@ def test_general_fallback(topk):
 @pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel not available")
 @pytest.mark.parametrize(
     "num_tokens, topk, hidden_dim",
-    list(itertools.product([1, 128, 1024], [2, 3, 4], [256, 4096])),
+    # topk=2,3,4: AOT uses bf16 accumulation; only float32 is bit-identical to JIT fp32.
+    # topk=8: AOT falls through to at::sum_out (fp32), matches JIT fp32 exactly.
+    list(itertools.product([1, 128, 1024], [2, 3, 4], [256, 4096]))
+    + list(itertools.product([1, 128, 1024], [8], [256, 4096])),
 )
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_moe_sum_vs_aot(num_tokens, topk, hidden_dim, dtype):
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_moe_sum_vs_aot_fp32(num_tokens, topk, hidden_dim, dtype):
+    """float32 inputs are bit-identical between JIT (fp32 accum) and AOT for all topk."""
+    torch.manual_seed(42)
+    x = torch.randn((num_tokens, topk, hidden_dim), dtype=dtype, device="cuda")
+
+    out_jit = torch.empty((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+    out_aot = torch.empty((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+
+    moe_sum(x, out_jit)
+    moe_sum_aot(x, out_aot)
+
+    assert torch.allclose(
+        out_jit, out_aot, atol=1e-5, rtol=1e-5
+    ), f"JIT vs AOT mismatch (dtype={dtype}, tokens={num_tokens}, topk={topk}, hidden={hidden_dim})"
+
+
+@pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel not available")
+@pytest.mark.parametrize(
+    "num_tokens, topk, hidden_dim",
+    # topk > 4: AOT uses at::sum_out (fp32 accumulation), matches JIT fp32 exactly.
+    list(itertools.product([1, 128, 1024], [8], [256, 4096])),
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_moe_sum_vs_aot_large_topk(num_tokens, topk, hidden_dim, dtype):
+    """For topk > 4, AOT uses at::sum_out (fp32); JIT also uses fp32 — bit-identical."""
     torch.manual_seed(42)
     x = torch.randn((num_tokens, topk, hidden_dim), dtype=dtype, device="cuda")
 

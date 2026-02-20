@@ -94,11 +94,10 @@ def benchmark(num_tokens: int, hidden_dim: int, topk: int, provider: str):
 
 
 def calculate_diff():
-    if not AOT_AVAILABLE:
-        print("sgl_kernel not available — skipping AOT diff check")
-        return
-
-    print("Correctness diff (JIT vs AOT):")
+    # JIT uses float32 accumulation; compare against float32 reference.
+    # AOT accumulates in bf16 for topk<=4 and uses at::sum_out (fp32) for topk>4,
+    # so JIT vs AOT would show false mismatches for small topk in bf16.
+    print("Correctness diff (JIT vs float32 reference):")
     for num_tokens, hidden_dim, topk in [
         (64, 4096, 2),
         (512, 4096, 4),
@@ -110,14 +109,11 @@ def calculate_diff():
         out_jit = torch.empty(
             (num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda"
         )
-        out_aot = torch.empty(
-            (num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda"
-        )
+        ref = x.float().sum(dim=1).bfloat16()
 
         moe_sum_jit(x, out_jit)
-        moe_sum_aot(x, out_aot)
 
-        match = torch.allclose(out_jit, out_aot, atol=1e-2, rtol=1e-3)
+        match = torch.allclose(out_jit, ref, atol=1e-3, rtol=1e-3)
         status = "OK" if match else "MISMATCH"
         print(
             f"  tokens={num_tokens:5d}  hidden={hidden_dim:5d}  topk={topk}  "

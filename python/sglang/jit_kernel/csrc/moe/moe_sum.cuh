@@ -24,12 +24,12 @@ __global__ void moe_sum_kernel(
     const int hidden_size) {
   const int64_t token_idx = blockIdx.x;
   for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    T x = static_cast<T>(0);
+    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
-      x += __ldg(&input[token_idx * TOPK * hidden_size + k * hidden_size + idx]);
+      x += static_cast<float>(__ldg(&input[token_idx * TOPK * hidden_size + k * hidden_size + idx]));
     }
-    out[token_idx * hidden_size + idx] = x;
+    out[token_idx * hidden_size + idx] = static_cast<T>(x);
   }
 }
 
@@ -39,12 +39,12 @@ __global__ void
 moe_sum_kernel_general(T* __restrict__ out, const T* __restrict__ input, const int hidden_size, const int topk) {
   const int64_t token_idx = blockIdx.x;
   for (int64_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    T x = static_cast<T>(0);
+    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll 1
     for (int k = 0; k < topk; ++k) {
-      x += __ldg(&input[token_idx * topk * hidden_size + k * hidden_size + idx]);
+      x += static_cast<float>(__ldg(&input[token_idx * topk * hidden_size + k * hidden_size + idx]));
     }
-    out[token_idx * hidden_size + idx] = x;
+    out[token_idx * hidden_size + idx] = static_cast<T>(x);
   }
 }
 
