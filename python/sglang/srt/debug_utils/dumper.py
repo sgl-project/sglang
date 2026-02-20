@@ -802,6 +802,8 @@ class _RpcBroadcastBase:
     def __getattr__(self, method_name: str):
         raise NotImplementedError
 
+    def __init__(self, handles: List[_ZmqRpcHandle]):
+        self._handles = handles
 
 class _LocalOnlyBroadcast(_RpcBroadcastBase):
     """Calls methods directly on the local dumper, wrapping the result in a list."""

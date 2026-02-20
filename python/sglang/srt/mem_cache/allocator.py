@@ -411,7 +411,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.seen_max_num_extend_tokens_next_power_of_2 = max(
             self.seen_max_num_extend_tokens_next_power_of_2,
-            next_power_of_2(extend_num_tokens),
+            min(tl.core.TRITON_MAX_TENSOR_NUMEL, next_power_of_2(extend_num_tokens)),
         )
 
         bs = len(prefix_lens)
@@ -423,16 +423,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-            self.seen_max_num_extend_tokens_next_power_of_2,
-        )
+
+        if extend_num_tokens < tl.core.TRITON_MAX_TENSOR_NUMEL:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+                self.seen_max_num_extend_tokens_next_power_of_2,
+            )
+        else:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
