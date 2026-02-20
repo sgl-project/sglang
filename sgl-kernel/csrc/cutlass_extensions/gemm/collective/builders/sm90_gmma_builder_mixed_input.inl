@@ -22,6 +22,7 @@
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
+#include "cutlass_extensions/gemm/collective/builders/sm90_gmma_builder_.inl"
 
 // SM90 Collective Builders should be used only starting CUDA 12.0
 #if (__CUDACC_VER_MAJOR__ >= 12)
@@ -69,7 +70,7 @@ struct CollectiveBuilderMixedInput<
          cute::is_same_v<KernelScheduleType, KernelPtrArrayTmaWarpSpecializedPingpong>) &&
         (detail::is_use_rmem_A<ElementA_, GmemLayoutATag_, ElementB_, GmemLayoutBTag_>() ||
          // ConvertAndScale and ConvertAndScaleWithZero
-         cute::is_tuple<ElementA_>::value || cute::is_tuple<ElementB_>::value ||
+         cute::is_tuple<ElementA_>::value && cute::is_tuple<ElementB_>::value ||
          // DirectConvert
          sizeof_bits<ElementA_>::value != sizeof_bits<ElementB_>::value)>> {
  private:
@@ -77,7 +78,6 @@ struct CollectiveBuilderMixedInput<
   using ScaleB = detail::deduce_mixed_width_dtype_t<1, ElementB_>;
   using ZeroA = detail::deduce_mixed_width_dtype_t<2, ElementA_>;
   using ZeroB = detail::deduce_mixed_width_dtype_t<2, ElementB_>;
-  static constexpr bool NeitherIsTuple = !cute::is_tuple<ElementA_>::value && !cute::is_tuple<ElementB_>::value;
   // Determine if mixed input types.
   static constexpr bool IsMixedInput = cute::sizeof_bits_v<detail::deduce_mixed_width_dtype_t<0, ElementA_>> !=
                                        cute::sizeof_bits_v<detail::deduce_mixed_width_dtype_t<0, ElementB_>>;
@@ -90,13 +90,6 @@ struct CollectiveBuilderMixedInput<
  public:
   using ElementA = detail::deduce_mixed_width_dtype_t<0, ElementA_>;
   using ElementB = detail::deduce_mixed_width_dtype_t<0, ElementB_>;
-
-  static_assert(
-      !IsMixedInput || (cute::is_tuple<ElementA_>::value ^ cute::is_tuple<ElementB_>::value ||
-                        (NeitherIsTuple && (sizeof_bits<ElementA>::value != sizeof_bits<ElementB>::value))),
-      "Either A OR B must be a tuple or the widths of A and B must be different.");
-
-  static constexpr bool IsANarrow = sizeof_bits<ElementA>::value < sizeof_bits<ElementB>::value;
 
   template <class T>
   static auto get_stride(T const& t) {
@@ -114,13 +107,7 @@ struct CollectiveBuilderMixedInput<
   using GmemLayoutATag = decltype(get_stride(GmemLayoutATag_{}));
   using GmemLayoutBTag = decltype(get_stride(GmemLayoutBTag_{}));
 
-  using ElementPairA =
-      cute::conditional_t<IsMixedInput && IsANarrow && NeitherIsTuple, cute::tuple<ElementA>, ElementA_>;
-  using ElementPairB =
-      cute::conditional_t<IsMixedInput && !IsANarrow && NeitherIsTuple, cute::tuple<ElementB>, ElementB_>;
-
-  static constexpr bool IsATransformed = cute::is_tuple<ElementPairA>::value;
-  using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
+  static constexpr bool IsATransformed = cutlass::sizeof_bits<ElementA>::value == 4;  // cutlass::int4b_t
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
 
   static_assert(is_static<TileShape_MNK>::value);
@@ -137,6 +124,9 @@ struct CollectiveBuilderMixedInput<
   // operands.
   static constexpr bool SwapAB =
       IsMixedInput ? !IsATransformed : detail::is_swapAB<ElementA, GmemLayoutATag, ElementB, GmemLayoutBTag>();
+
+  static_assert(!SwapAB, "Mixed input GEMM, SwapAB must be false.");
+
   static constexpr bool IsWarpSpecializedTransposeB =
       detail::is_warpspecialized_transpose_B<ElementA, GmemLayoutATag, ElementB, GmemLayoutBTag, KernelScheduleType>();
   static_assert(!IsMixedInput || !IsWarpSpecializedTransposeB, "Mixed input GEMM does not support WS transpose B.");
@@ -198,25 +188,27 @@ struct CollectiveBuilderMixedInput<
   static constexpr int SmemAlignment = static_cast<int>(cute::max(SmemAlignmentA, SmemAlignmentB));
 
   // Handle mixed dtype array GEMM's size of tensor map storage.
-  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 4;
+  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 5;
   static constexpr int KernelSmemCarveout = static_cast<int>(TensorMapStorage);
   static constexpr int Sm90ReducedSmemCapacityBytes = detail::sm90_smem_capacity_bytes - KernelSmemCarveout;
 
   static constexpr int PipelineStages =
-      IsMixedInput ? (IsArrayOfPointersGemm ? detail::compute_stage_count_or_override_single_affine_transformed_input<
+      IsMixedInput ? (IsArrayOfPointersGemm ? detail::compute_stage_count_or_override_single_affine_transformed_input_<
                                                   Sm90ReducedSmemCapacityBytes,
                                                   RealElementA,
                                                   RealElementB,
-                                                  ElementScale,
+                                                  ScaleA,
+                                                  ScaleB,
                                                   ElementZero,
                                                   TileShape_MNK,
                                                   StageCountType::bytes,
                                                   SmemAlignment>(StageCountType{})
-                                            : detail::compute_stage_count_or_override_single_affine_transformed_input<
+                                            : detail::compute_stage_count_or_override_single_affine_transformed_input_<
                                                   detail::sm90_smem_capacity_bytes,
                                                   RealElementA,
                                                   RealElementB,
-                                                  ElementScale,
+                                                  ScaleA,
+                                                  ScaleB,
                                                   ElementZero,
                                                   TileShape_MNK,
                                                   StageCountType::bytes,
@@ -237,8 +229,8 @@ struct CollectiveBuilderMixedInput<
           MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>>,
       MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
 
-  using SmemCopyAtomA = cute::conditional_t<SwapAB, void, Copy_Atom<cute::AutoVectorizingCopy, ElementA>>;
-  using SmemCopyAtomB = cute::conditional_t<SwapAB, Copy_Atom<cute::AutoVectorizingCopy, ElementB>, void>;
+  using SmemCopyAtomA = Copy_Atom<cute::AutoVectorizingCopy, ElementA>;
+  using SmemCopyAtomB = void;
 
   // We pack the scale data with the operand that will be optionally scaled and converted before MMA.
   using StrideA = cute::conditional_t<
@@ -253,9 +245,9 @@ struct CollectiveBuilderMixedInput<
   using CollectiveOp = CollectiveMmaArrayMixedInput<
       DispatchPolicy,
       TileShape_MNK,
-      ElementPairA,
+      ElementA_,
       StrideA,
-      ElementPairB,
+      ElementB_,
       StrideB,
       TiledMma,
       GmemTiledCopyA,

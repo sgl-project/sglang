@@ -73,13 +73,16 @@ def _get_launch_config_2d(device, m, n):
 @triton.jit
 def deepep_permute_triton_kernel(
     input_ptr,
+    a_scale_ptr,
     gateup_input_ptr,
+    gateup_a_scale_ptr,
     src2dst_ptr,
     topk_ids_ptr,
     a1_scales_ptr,
     topk,
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE_SCALE: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
@@ -92,14 +95,25 @@ def deepep_permute_triton_kernel(
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
         mask = offset < hidden_size
-        in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+        in_data = tl.load(src_ptr + offset, mask=mask)
 
         for idx in range(topk):
             dst_idx = tl.load(src2dst_ptr + idx)
             if dst_idx >= 0:
                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
                 tl.store(dst_ptr + offset, in_data, mask=mask)
+    scale_size = hidden_size // 128
+    scale_src_ptr = a_scale_ptr + src_idx * scale_size
+    for start_offset_s in tl.range(0, scale_size, BLOCK_SIZE_SCALE):
+        off_s = start_offset_s + tl.arange(0, BLOCK_SIZE_SCALE)
+        mask_s = off_s < scale_size
+        sdata = tl.load(scale_src_ptr + off_s, mask=mask_s)
 
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx)
+            if dst_idx >= 0:
+                scale_dst_ptr = gateup_a_scale_ptr + dst_idx * scale_size
+                tl.store(scale_dst_ptr + off_s, sdata, mask=mask_s)
 
 @triton.jit
 def deepep_post_reorder_triton_kernel(

@@ -238,9 +238,21 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             dtype=torch.int64,
         )
         self.b_strides1 = self.a_strides1
-        self.s_strides13 = self.c_strides1
+        self.sb_strides13 = self.c_strides1
+        self.sa_strides13 = torch.full(
+            (num_experts, 3),
+            hidden_size // self.quant_config.group_size,
+            device=device,
+            dtype=torch.int64,
+        )
         self.b_strides2 = self.a_strides2
-        self.s_strides2 = self.c_strides2
+        self.sb_strides2 = self.c_strides2
+        self.sa_strides2 = torch.full(
+            (num_experts, 3),
+            intermediate_size_per_partition // self.quant_config.group_size,
+            device=device,
+            dtype=torch.int64,
+        )
 
         self.expert_offsets = torch.empty(
             (num_experts + 1), dtype=torch.int32, device=device
@@ -315,8 +327,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.a_strides2,
             self.b_strides2,
             self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
+            self.sa_strides13,
+            self.sb_strides13,
+            self.sa_strides2,
+            self.sb_strides2,
             self.expert_offsets,
             self.problem_sizes1,
             self.problem_sizes2,
@@ -334,7 +348,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
 
-        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
+        hidden_states, hidden_states_scale, topk_ids, _, masked_m, _ = dispatch_output
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
@@ -350,13 +364,14 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.a_strides2,
             layer.quant_method.b_strides2,
             layer.quant_method.c_strides2,
-            layer.quant_method.s_strides13,
-            layer.quant_method.s_strides2,
+            layer.quant_method.sa_strides13,
+            layer.quant_method.sb_strides13,
+            layer.quant_method.sa_strides2,
+            layer.quant_method.sb_strides2,
             layer.quant_method.expert_offsets,
             layer.quant_method.problem_sizes1,
             layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+            hidden_states_scale,
         )
 
         return output
@@ -370,8 +385,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             cutlass_w4a8_moe_deepep_normal,
         )
 
-        hidden_states, topk_idx, topk_weights = (
+        hidden_states, hidden_states_scale, topk_idx, topk_weights = (
             dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,    
             dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
@@ -394,13 +410,14 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 self.a_strides2,
                 self.b_strides2,
                 self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
+                self.sa_strides13,
+                self.sb_strides13,
+                self.sa_strides2,
+                self.sb_strides2,
                 self.expert_offsets,
                 self.problem_sizes1,
                 self.problem_sizes2,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
+                hidden_states_scale,
             )
         else:
-            return hidden_states
+            return torch.empty_like(hidden_states, device=hidden_states.device, dtype=torch.bfloat16)
