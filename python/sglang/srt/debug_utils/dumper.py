@@ -649,7 +649,7 @@ def _start_maybe_http_server(dumper: _Dumper):
         dumper, base_port=zmq_base_port, timeout_seconds=dumper._config.collective_timeout
     )
 
-    if _get_rank() == 0 and rpc_broadcast is not None:
+    if _get_rank() == 0:
         dumper._rpc_broadcast = rpc_broadcast
 
         if http_port > 0:
