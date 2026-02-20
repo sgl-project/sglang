@@ -476,25 +476,32 @@ class _Dumper:
 
 
 class _HookDumper:
+    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
+
     def __init__(
         self,
         dumper: _Dumper,
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
+        self._top_level_module_name = dumper._config.top_level_module_name
         self._special_types = _HookDumper._load_special_types()
 
         matched, _ = self._add_hooks_recursive(model=model, prefix="")
-        assert matched, f"model should have a module named {self._dumper._config.top_level_module_name}"
+        assert (
+            matched
+        ), f"model should have a module named {self._top_level_module_name}"
 
-    def _add_hooks_recursive(self, model: "torch.nn.Module", prefix: str) -> tuple:
+    def _add_hooks_recursive(
+        self, model: "torch.nn.Module", prefix: str
+    ) -> tuple[bool, int]:
         top_level_matched = False
 
         for name, module in model._modules.items():
             is_top_level = False
             if len(prefix) == 0:
                 cur_name = name
-                if cur_name == self._dumper._config.top_level_module_name:
+                if cur_name == self._top_level_module_name:
                     top_level_matched = True
                     is_top_level = True
             else:
@@ -504,7 +511,6 @@ class _HookDumper:
                 _, sub_count = self._add_hooks_recursive(
                     model=module,
                     prefix=cur_name,
-                    top_level_module_name=(self._dumper._config.top_level_module_name),
                 )
                 if sub_count == 0 or is_top_level:
                     module.register_forward_hook(self._make_forward_hook(cur_name))
