@@ -664,6 +664,7 @@ def _make_dumper_http_handler(rpc_handles):
 def _create_zmq_rpc_handles(
     handler, base_port: int, timeout_seconds: int = 60
 ) -> Optional[List["_ZmqRpcHandle"]]:
+    """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
     rank = _get_rank()
