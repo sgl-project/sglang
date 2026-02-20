@@ -9,6 +9,8 @@
 
 #include <dlpack/dlpack.h>
 
+#include <numeric>
+
 namespace {
 
 struct FusedRopeParams {
@@ -36,17 +38,25 @@ struct FusedRopeStoreParams {
 
 constexpr uint32_t kBlockSize = 128;
 
+[[maybe_unused]]
+constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
+  uint32_t power = 1;
+  while (power * factor < target)
+    power *= 2;
+  return power;
+}
+
 template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
 __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
-  constexpr int64_t kLocalSize = kRopeDim / (kWorkThreads * (1 + kIsNeox));
-  constexpr int64_t kVecSize = kLocalSize / 2;
+  constexpr int64_t kVecSize = next_pow2(kRopeDim, (2 * kWorkThreads * (1 + kIsNeox)));
   using DType2 = packed_t<DType>;
   using InputStorage = AlignedVector<DType2, kVecSize>;
-  static_assert(kLocalSize % 2 == 0);
-  static_assert(kRopeDim == kLocalSize * kWorkThreads * (1 + kIsNeox));
+  constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
+  constexpr uint32_t kLaneCount = kRopeDim / kDimPerThread;
+  static_assert(kRopeDim % kDimPerThread == 0 && kLaneCount <= kWorkThreads);
 
   const auto &[
     q, k, cos_sin_cache_ptr, positions, // pointers
@@ -60,9 +70,13 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
   const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
   const auto num_works = num_q_and_k_heads * num_tokens;
   const auto start_worker_id = (blockIdx.x * kBlockSize + threadIdx.x) / kWorkThreads;
-  const auto lane_id = threadIdx.x % kWorkThreads;
   const auto cos_cache_ptr = cos_sin_cache_ptr;
   const auto sin_cache_ptr = pointer::offset(cos_sin_cache_ptr, kCosSinStrideBytes / 2);
+
+  uint32_t lane_id = threadIdx.x % kWorkThreads;
+  if constexpr (kLaneCount < kWorkThreads) {
+    if (lane_id >= kLaneCount) return;
+  }
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -125,12 +139,11 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
-  constexpr int64_t kLocalSize = kRopeDim / (kWorkThreads * (1 + kIsNeox));
-  constexpr int64_t kVecSize = kLocalSize / 2;
+  constexpr int64_t kVecSize = kRopeDim / (2 * kWorkThreads * (1 + kIsNeox));
   using DType2 = packed_t<DType>;
   using InputStorage = AlignedVector<DType2, kVecSize>;
-  static_assert(kLocalSize % 2 == 0);
-  static_assert(kRopeDim == kLocalSize * kWorkThreads * (1 + kIsNeox));
+  constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
+  static_assert(kRopeDim == kDimPerThread * kWorkThreads);
 
   const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
   const auto &[
@@ -230,7 +243,12 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
 
 template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType>
 struct FusedRopeKernel {
-  static constexpr uint32_t kWorkThreads = kRopeDim / (16 / sizeof(DType));
+  static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
+  static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
+  static constexpr bool kSupportFused = kWorkThreads * kDimPerThread == kRopeDim;
+  static_assert(kRopeDim % kDimPerThread == 0);
+  static_assert(kBlockSize % kWorkThreads == 0);
+
   template <typename IdType>
   static constexpr auto _kernel_0 = fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
   template <typename IdType>
@@ -315,6 +333,22 @@ struct FusedRopeKernel {
   }
 
   static void run_fused(
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView v,
+      const tvm::ffi::TensorView k_cache,
+      const tvm::ffi::TensorView v_cache,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc) {
+    if constexpr (kSupportFused) {
+      return _run_fused_impl(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc);
+    } else {
+      host::Panic("Fused rope + store is not supported for rope_dim ", kRopeDim);
+    }
+  }
+
+  static void _run_fused_impl(
       const tvm::ffi::TensorView q,
       const tvm::ffi::TensorView k,
       const tvm::ffi::TensorView v,

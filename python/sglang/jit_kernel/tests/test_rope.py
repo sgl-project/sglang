@@ -151,10 +151,12 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("rope_dim", [64, 80, 96, 128])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
-def test_rope_slicing(batch_size: int, is_neox: bool, head_dim: int) -> None:
-    """Ensure both int32 and int64 position tensors work correctly."""
-    num_qo_heads, num_kv_heads, rope_dim = 8, 2, 64
+def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
+    if head_dim < rope_dim:
+        pytest.skip("Invalid config: head_dim must be >= rope_dim.")
+    num_qo_heads, num_kv_heads = 8, 2
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
     k = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=DTYPE)
