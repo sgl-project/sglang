@@ -217,7 +217,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        if (
+            layer.is_cross_attention
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+            or layer.attn_type == AttentionType.PREFIX_LM
+        ):
             causal = False
 
         self._run_sdpa_forward_extend(
