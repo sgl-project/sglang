@@ -271,6 +271,11 @@ class MambaPool:
                 and get_global_server_args().gdn_backend == "flashinfer"
             )
             if _use_flashinfer_gdn:
+                if ssm_dtype != torch.float32:
+                    raise RuntimeError(
+                        f"gdn_backend=flashinfer requires float32 SSM state "
+                        f"(--mamba-ssm-dtype float32), got {ssm_dtype}"
+                    )
                 temporal_state = (
                     temporal_state.transpose(-2, -1).contiguous().transpose(-2, -1)
                 )

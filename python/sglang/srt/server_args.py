@@ -2089,6 +2089,17 @@ class ServerArgs:
         if self.gdn_backend == "triton" and envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
             self.gdn_backend = "cutedsl"
 
+        # FlashInfer GDN kernel converts state to float32 internally; using a
+        # non-float32 pool would incur extra conversion overhead on every decode step.
+        if self.gdn_backend == "flashinfer" and self.mamba_ssm_dtype not in (
+            None,
+            "float32",
+        ):
+            raise ValueError(
+                f"--gdn-backend flashinfer requires --mamba-ssm-dtype float32, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
+
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
