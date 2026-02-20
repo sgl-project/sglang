@@ -130,6 +130,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.hyper_connection import HyperConnectionModule
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _device_sm,
@@ -2288,7 +2289,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
+        self.enable_hyper_connections = getattr(config, "enable_hyper_connections", False)
+        if self.enable_hyper_connections:
+            self.num_residual_streams = getattr(config, "num_residual_streams", 4)
+            self.self_attention_hyper_connection = HyperConnectionModule(config)
+            self.mlp_hyper_connection = HyperConnectionModule(config)
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
+        self.is_last_layer = is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
 
@@ -2395,6 +2402,147 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
+
+        if self.enable_hyper_connections:
+            # === mHC Attention Block ===
+            
+            # 0. Handle input scattered (for Extend optimization)
+            if get_attn_tp_context().input_scattered:
+                # If input is scattered, we must ensure residual is also scattered.
+                # Re-use layer_communicator logic to scatter hidden_states (if needed) and residual.
+                # Note: hidden_states might be replicated (e.g. layer 0 output) or already scattered (if handled externally, but here we assume we need to handle it).
+                # _tp_reduce_scatter will reduce-scatter hidden_states and split residual.
+                hidden_states, residual = self.layer_communicator._tp_reduce_scatter(
+                    hidden_states, residual
+                )
+
+            if residual is None:
+                residual = self.self_attention_hyper_connection.input_expand(hidden_states, self.num_residual_streams)
+
+            # 1. Aggregate input
+            x_in, attn_h_post, attn_h_res = self.self_attention_hyper_connection.forward_in(residual)
+            
+            # 2. Norm & Quant (Re-using prepare_attn logic)
+            # We temporarily disable input_scattered because we've already handled it above,
+            # and x_in matches the current scatter state.
+            old_scattered = get_attn_tp_context().input_scattered_
+            get_attn_tp_context().input_scattered_ = False
+            
+            x_norm, _ = self.layer_communicator.prepare_attn(
+                x_in, None, forward_batch, quant_format
+            )
+            
+            get_attn_tp_context().input_scattered_ = old_scattered
+            
+            # 3. Attn
+            attn_out = self.self_attn(
+                positions=positions,
+                hidden_states=x_norm,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+            )
+            
+            should_reduce = (
+                (not self.self_attn.o_proj.reduce_results)
+                and (get_attention_tp_size() > 1)  # Use attn_tp_size instead of global tp_size
+                and (not self.nsa_enable_prefill_cp)
+            )
+            
+            if should_reduce:
+                if get_attn_tp_context().input_scattered:
+                    # DP Attention / SP mode: input is scattered, so we must reduce-scatter to keep output scattered
+                    # matching the shape of residual.
+                    attn_out, _ = self.layer_communicator._tp_reduce_scatter(attn_out, None)
+                else:
+                    # Pure TP mode (within attn_tp_group): input is replicated, so we all-reduce to keep output replicated.
+                    attn_out = tensor_model_parallel_all_reduce(attn_out)
+                
+            # 4. Update residual
+            residual = self.self_attention_hyper_connection.forward_out(residual, attn_out, attn_h_post, attn_h_res)
+            
+            # === mHC FFN Block ===
+            # 1. Aggregate input
+            x_in, mlp_h_post, mlp_h_res = self.mlp_hyper_connection.forward_in(residual)
+            
+            # 2. Handle DP Attention: gather tokens before MoE, scatter after
+            # In DP Attention mode, MoE needs all tokens from all DP ranks.
+            # We need to mimic what prepare_mlp and postprocess_layer do.
+            _dp_attention_enabled = is_dp_attention_enabled()
+            
+            if _dp_attention_enabled:
+                from sglang.srt.layers.dp_attention import (
+                    dp_gather_partial,
+                    dp_scatter,
+                    get_global_dp_buffer,
+                    get_local_dp_buffer,
+                    get_attention_dp_size,
+                )
+                _attn_dp_size = get_attention_dp_size()
+            else:
+                _attn_dp_size = 1
+            
+            if _dp_attention_enabled and _attn_dp_size > 1:
+                # Save x_in for residual computation after MoE
+                x_in_local = x_in
+                
+                # Gather tokens from all DP ranks
+                global_x_in = get_global_dp_buffer()
+                dp_gather_partial(global_x_in, x_in, forward_batch)
+                
+                # Apply LayerNorm on gathered data
+                x_norm = self.post_attention_layernorm(global_x_in)
+                
+                if isinstance(self.mlp, DeepseekV2MLP):
+                    gemm_output_zero_allocator = None
+                
+                # 3. FFN on global data
+                mlp_out = self.mlp(
+                    x_norm,
+                    forward_batch=forward_batch,
+                    should_allreduce_fusion=False,
+                    use_reduce_scatter=False,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                )
+                
+                # Scatter back to local
+                local_mlp_out = get_local_dp_buffer()
+                dp_scatter(local_mlp_out, mlp_out, forward_batch)
+                mlp_out = local_mlp_out[:x_in_local.shape[0]]
+            else:
+                # Non-DP or DP with dp_size=1: standard path
+                # 2. Norm
+                x_norm = self.post_attention_layernorm(x_in)
+                
+                if isinstance(self.mlp, DeepseekV2MLP):
+                    gemm_output_zero_allocator = None
+                
+                # 3. FFN
+                mlp_out = self.mlp(
+                    x_norm,
+                    forward_batch=forward_batch,
+                    should_allreduce_fusion=False,
+                    use_reduce_scatter=False,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                )
+            
+            # 4. Update residual
+            residual = self.mlp_hyper_connection.forward_out(residual, mlp_out, mlp_h_post, mlp_h_res)
+            
+            if self.is_last_layer:
+                residual = self.self_attention_hyper_connection.output_contract(residual, self.num_residual_streams)
+                # sglang Model forward expects (hidden_states, residual)
+                # and later calls norm(hidden_states, residual) which does hidden_states + residual
+                # Since contract merges everything into residual, we can return (zeros, residual) or (residual, None)
+                # If we return (residual, None), Model forward:
+                # if residual is None: hidden_states = norm(hidden_states)
+                # So we can return (residual, None)
+                return residual, None
+
+            # Return dummy hidden_states and updated residual
+            # Note: x_in is just a placeholder here, the real state is carried in residual
+            return x_in, residual
+
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
