@@ -1979,7 +1979,8 @@ class DumperControlReqInput(BaseReq):
 @dataclass
 class DumperControlReqOutput(BaseReq):
     success: bool
-    response: List[Dict[str, Any]]
+    response: List[Dict[str, Any]] = field(default_factory=list)
+    error: str = ""
 
 
 def _check_all_req_types():

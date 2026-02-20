@@ -2965,15 +2965,22 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
-        response: list = []
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            response = dumper._handle_http_control_request(
-                method=recv_req.method, body=recv_req.body
+        try:
+            response: list = []
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                response = dumper._handle_http_control_request(
+                    method=recv_req.method, body=recv_req.body
+                )
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=True, response=response), recv_req
             )
-
-        self.send_to_tokenizer.send_output(
-            DumperControlReqOutput(success=True, response=response), recv_req
-        )
+        except Exception as e:
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=False, error=str(e)), recv_req
+            )
 
     # placeholder for override
     def update_cache_from_scheduler(
