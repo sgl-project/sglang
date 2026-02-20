@@ -10,7 +10,8 @@ from dataclasses import dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import ClassVar, List, Optional, Self, get_args, get_type_hints
+from abc import ABC, abstractmethod
+from typing import List, Optional, Self, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
@@ -19,15 +20,17 @@ import torch.distributed as dist
 
 
 @dataclass(frozen=True)
-class _FrozenConfig:
-    _env_prefix: ClassVar[str] = ""
-
+class _FrozenConfig(ABC):
     def __post_init__(self) -> None:
         _verify_dataclass_types(self)
 
     @classmethod
+    @abstractmethod
+    def _env_prefix(cls) -> str: ...
+
+    @classmethod
     def _env_name(cls, field_name: str) -> str:
-        return f"{cls._env_prefix}{field_name.upper()}"
+        return f"{cls._env_prefix()}{field_name.upper()}"
 
     @classmethod
     def from_env(cls) -> Self:
@@ -50,7 +53,9 @@ class _FrozenConfig:
 
 @dataclass(frozen=True)
 class _DumperConfig(_FrozenConfig):
-    _env_prefix: ClassVar[str] = "SGLANG_DUMPER_"
+    @classmethod
+    def _env_prefix(cls) -> str:
+        return "SGLANG_DUMPER_"
 
     enable: bool = False
     filter: Optional[str] = None
