@@ -182,7 +182,7 @@ class _Dumper:
             return
         self._http_server_handled = True
 
-        http_port = int(self._config.server_port)
+        http_port = self._config.server_port_parsed
         zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
