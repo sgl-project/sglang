@@ -15,14 +15,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-# isort: off
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ImageEncodingStage,
-    ImageVAEEncodingStage,
-    InputValidationStage,
-)
-
-# isort: on
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
@@ -49,36 +41,7 @@ class WanImageToVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stages(
-            [
-                InputValidationStage(),
-            ]
-        )
-
-        self.add_standard_text_encoding_stage()
-
-        self.add_stage_if(
-            self.get_module("image_encoder") is not None
-            and self.get_module("image_processor") is not None,
-            ImageEncodingStage(
-                image_encoder=self.get_module("image_encoder"),
-                image_processor=self.get_module("image_processor"),
-            ),
-        )
-
-        self.add_stages(
-            [
-                ImageVAEEncodingStage(vae=self.get_module("vae")),
-            ]
-        )
-
-
-
-        self.add_standard_timestep_preparation_stage()
-        self.add_standard_latent_preparation_stage()
-
-        self.add_standard_denoising_stage()
-        self.add_standard_decoding_stage()
+        self.add_standard_ti2v_stages(prompt_stage_name=None)
 
 
 EntryClass = WanImageToVideoPipeline

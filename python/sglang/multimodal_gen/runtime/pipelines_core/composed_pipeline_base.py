@@ -10,7 +10,7 @@ This module defines the base class for pipelines that are composed of multiple s
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -25,6 +25,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     DecodingStage,
     DenoisingStage,
+    ImageEncodingStage,
+    ImageVAEEncodingStage,
     InputValidationStage,
     LatentPreparationStage,
     PipelineStage,
@@ -472,7 +474,6 @@ class ComposedPipelineBase(ABC):
 
         self.add_standard_text_encoding_stage()
 
-
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
@@ -480,6 +481,132 @@ class ComposedPipelineBase(ABC):
         self.add_standard_denoising_stage()
         self.add_standard_decoding_stage()
 
+        return self
+
+    def add_standard_ti2i_stages(
+        self,
+        *,
+        include_input_validation: bool = True,
+        vae_image_processor: Any | None = None,
+        prompt_encoding: Literal["text", "image_encoding"] = "text",
+        prompt_stage_name: str | None = "prompt_encoding_stage_primary",
+        text_encoder_key: str = "text_encoder",
+        tokenizer_key: str = "tokenizer",
+        image_processor_key: str = "processor",
+        prompt_text_encoder_key: str = "text_encoder",
+        image_vae_key: str = "vae",
+        image_vae_stage_name: str | None = "image_encoding_stage_primary",
+        image_vae_stage_kwargs: dict[str, Any] | None = None,
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+    ) -> "ComposedPipelineBase":
+        if include_input_validation:
+            self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
+
+        if prompt_encoding == "text":
+            self.add_standard_text_encoding_stage(
+                stage_name=prompt_stage_name,
+                text_encoder_key=text_encoder_key,
+                tokenizer_key=tokenizer_key,
+            )
+        elif prompt_encoding == "image_encoding":
+            self.add_stage(
+                ImageEncodingStage(
+                    image_processor=self.get_module(image_processor_key),
+                    text_encoder=self.get_module(prompt_text_encoder_key),
+                ),
+                prompt_stage_name,
+            )
+        else:
+            raise ValueError(f"Unknown prompt_encoding: {prompt_encoding}")
+
+        self.add_stage(
+            ImageVAEEncodingStage(
+                vae=self.get_module(image_vae_key),
+                **(image_vae_stage_kwargs or {}),
+            ),
+            image_vae_stage_name,
+        )
+
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=prepare_extra_timestep_kwargs
+        )
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_denoising_stage()
+        self.add_standard_decoding_stage()
+        return self
+
+    def add_standard_ti2v_stages(
+        self,
+        *,
+        include_input_validation: bool = True,
+        vae_image_processor: Any | None = None,
+        prompt_stage_name: str | None = "prompt_encoding_stage_primary",
+        text_encoder_key: str = "text_encoder",
+        tokenizer_key: str = "tokenizer",
+        image_encoder_key: str = "image_encoder",
+        image_processor_key: str = "image_processor",
+        image_encoding_stage_name: str | None = None,
+        image_vae_key: str = "vae",
+        image_vae_stage_name: str | None = None,
+        image_vae_stage_kwargs: dict[str, Any] | None = None,
+        image_vae_encoding_position: Literal["before_timestep", "after_latent"] = "before_timestep",
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        denoising_stage_factory: Callable[[], PipelineStage] | None = None,
+        denoising_stage_name: str | None = None,
+    ) -> "ComposedPipelineBase":
+        if include_input_validation:
+            self.add_stage(InputValidationStage(vae_image_processor=vae_image_processor))
+
+        self.add_standard_text_encoding_stage(
+            stage_name=prompt_stage_name,
+            text_encoder_key=text_encoder_key,
+            tokenizer_key=tokenizer_key,
+        )
+
+        image_encoder = self.get_module(image_encoder_key, None)
+        image_processor = self.get_module(image_processor_key, None)
+        self.add_stage_if(
+            image_encoder is not None and image_processor is not None,
+            ImageEncodingStage(
+                image_encoder=image_encoder,
+                image_processor=image_processor,
+            ),
+            stage_name=image_encoding_stage_name,
+        )
+
+        if image_vae_encoding_position == "before_timestep":
+            self.add_stage(
+                ImageVAEEncodingStage(
+                    vae=self.get_module(image_vae_key),
+                    **(image_vae_stage_kwargs or {}),
+                ),
+                image_vae_stage_name,
+            )
+
+        self.add_standard_timestep_preparation_stage(
+            prepare_extra_kwargs=prepare_extra_timestep_kwargs
+        )
+        self.add_standard_latent_preparation_stage()
+
+        if image_vae_encoding_position == "after_latent":
+            self.add_stage(
+                ImageVAEEncodingStage(
+                    vae=self.get_module(image_vae_key),
+                    **(image_vae_stage_kwargs or {}),
+                ),
+                image_vae_stage_name,
+            )
+        elif image_vae_encoding_position != "before_timestep":
+            raise ValueError(
+                f"Unknown image_vae_encoding_position: {image_vae_encoding_position}"
+            )
+
+        if denoising_stage_factory is None:
+            self.add_standard_denoising_stage(stage_name=denoising_stage_name)
+        else:
+            self.add_stage(denoising_stage_factory(), denoising_stage_name)
+
+        self.add_standard_decoding_stage()
         return self
 
     # TODO(will): don't hardcode no_grad
