@@ -102,7 +102,6 @@ class _DumperConfig(_FrozenConfig):
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
-    top_level_module_name: str = "model"
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -476,36 +475,27 @@ class _Dumper:
 
 
 class _HookDumper:
+    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
+
     def __init__(
         self,
         dumper: _Dumper,
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
-        self._add_hooks(model=model)
-
-    def _add_hooks(self, model: "torch.nn.Module"):
-        top_level_module_name = self._dumper._config.top_level_module_name
-        top_found = False
 
         for name, module in model.named_modules():
-            if not name:
-                continue
-
-            is_top_level = name == top_level_module_name
-            top_found |= is_top_level
-
+            is_root = name == ""
             is_leaf = next(module.children(), None) is None
-            if is_leaf or is_top_level:
+
+            if is_leaf or is_root:
                 module.register_forward_hook(
-                    self._make_forward_hook(name=name, is_top_level=is_top_level)
+                    self._make_forward_hook(name=name, is_root=is_root)
                 )
 
-        assert top_found, f"model should have a module named {top_level_module_name}"
-
-    def _make_forward_hook(self, name: str, is_top_level: bool):
+    def _make_forward_hook(self, name: str, is_root: bool):
         def _hook(_module, _input, output):
-            if is_top_level:
+            if is_root:
                 for item in _input:
                     self._dump_converted(name, item, role="inputs")
 
@@ -516,8 +506,8 @@ class _HookDumper:
 
     def _dump_converted(self, name: str, value, role: str) -> None:
         for key, tensor in self._convert_hook_output(value).items():
-            full_name = f"{name}.{role}.{key}" if key else f"{name}.{role}"
-            self._dumper.dump(full_name, tensor)
+            parts = [p for p in (name, role, key) if p]
+            self._dumper.dump(".".join(parts), tensor)
 
     @staticmethod
     def _convert_hook_output(value) -> dict[str, torch.Tensor]:

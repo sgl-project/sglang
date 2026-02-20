@@ -983,8 +983,8 @@ class TestHookDumper:
 
         assert "model.linear.output" in captured
         assert "model.relu.output" in captured
-        assert "model.output" in captured
-        assert torch.allclose(captured["model.output"]["value"], output)
+        assert "output" in captured
+        assert torch.allclose(captured["output"]["value"], output)
 
     def test_skips_intermediate_containers(self, tmp_path):
         class Attention(torch.nn.Module):
@@ -1036,11 +1036,12 @@ class TestHookDumper:
         assert "model.layers.0.self_attn.qkv_proj.output" in captured
         assert "model.layers.0.self_attn.o_proj.output" in captured
         assert "model.layers.0.mlp.output" in captured
-        assert "model.output" in captured
+        assert "output" in captured
 
         assert not any(k.startswith("model.layers.0.self_attn.output") for k in captured)
         assert not any(k.startswith("model.layers.0.output") for k in captured)
         assert not any(k.startswith("model.layers.output") for k in captured)
+        assert not any(k.startswith("model.output") for k in captured)
 
     def test_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):
