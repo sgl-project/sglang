@@ -66,7 +66,9 @@ def check_correctness():
 
     num_experts = 4
     size_k = 1024
-    b_q_weight, perm = make_moe_weights(num_experts, size_k, SIZE_N, NUM_BITS, GROUP_SIZE)
+    b_q_weight, perm = make_moe_weights(
+        num_experts, size_k, SIZE_N, NUM_BITS, GROUP_SIZE
+    )
 
     out_jit = jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, SIZE_N, NUM_BITS)
     out_aot = aot_awq_marlin_moe_repack(b_q_weight, perm, size_k, SIZE_N, NUM_BITS)
@@ -105,14 +107,20 @@ else:
 )
 def benchmark(num_experts, size_k, size_n, num_bits, provider):
     group_size = min(GROUP_SIZE, size_k)
-    b_q_weight, perm = make_moe_weights(num_experts, size_k, size_n, num_bits, group_size)
+    b_q_weight, perm = make_moe_weights(
+        num_experts, size_k, size_n, num_bits, group_size
+    )
 
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "jit":
-        fn = lambda: jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
+        fn = lambda: jit_awq_marlin_moe_repack(
+            b_q_weight, perm, size_k, size_n, num_bits
+        )
     elif provider == "aot":
-        fn = lambda: aot_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
+        fn = lambda: aot_awq_marlin_moe_repack(
+            b_q_weight, perm, size_k, size_n, num_bits
+        )
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

@@ -80,7 +80,9 @@ def test_awq_marlin_moe_repack_jit_vs_aot(
 @pytest.mark.parametrize("num_experts", [2, 4])
 @pytest.mark.parametrize("k_tiles,n_tiles", [(1, 1), (2, 2)])
 @pytest.mark.parametrize("group_size", [16, 32])
-def test_awq_marlin_moe_repack_shape(num_bits, num_experts, k_tiles, n_tiles, group_size):
+def test_awq_marlin_moe_repack_shape(
+    num_bits, num_experts, k_tiles, n_tiles, group_size
+):
     tile_k, tile_n = 16, 64
     size_k = k_tiles * tile_k
     size_n = n_tiles * tile_n

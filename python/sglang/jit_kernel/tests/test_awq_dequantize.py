@@ -41,9 +41,9 @@ def awq_dequantize_torch(
     bits = 4
     shifts = torch.arange(0, 32, bits, device=qzeros.device)
 
-    iweights = torch.bitwise_right_shift(
-        qweight[:, :, None], shifts[None, None, :]
-    ).to(torch.int8)
+    iweights = torch.bitwise_right_shift(qweight[:, :, None], shifts[None, None, :]).to(
+        torch.int8
+    )
 
     iweights = iweights.view(iweights.shape[0], -1)
 
