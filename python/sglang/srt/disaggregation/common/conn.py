@@ -21,7 +21,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    compute_routing_key_dp_rank,
+)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -249,9 +252,11 @@ class CommonKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        routing_key: Optional[str] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.routing_key = routing_key
         self.kv_mgr = mgr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -371,10 +376,26 @@ class CommonKVReceiver(BaseKVReceiver):
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
         if prefill_dp_rank is not None:
-            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
+            logger.info(
+                f"Decode DP routing: room={bootstrap_room} → "
+                f"rank {prefill_dp_rank} via explicit prefill_dp_rank"
+            )
             self.prefill_dp_rank = prefill_dp_rank
+        elif self.routing_key:
+            # Session-aware routing: hash routing_key to match prefill side.
+            self.prefill_dp_rank = compute_routing_key_dp_rank(
+                self.routing_key, self.prefill_dp_size
+            )
+            logger.info(
+                f"Decode DP routing: room={bootstrap_room} → "
+                f"rank {self.prefill_dp_rank} via routing_key='{self.routing_key}'"
+            )
         else:
             self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
+            logger.info(
+                f"Decode DP routing: room={bootstrap_room} → "
+                f"rank {self.prefill_dp_rank} via bootstrap_room"
+            )
 
         self.target_dp_group = self.prefill_dp_rank
 

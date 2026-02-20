@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from collections import deque
@@ -27,6 +28,27 @@ class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+
+
+#########################
+# Session-aware DP routing
+#########################
+
+
+def compute_routing_key_dp_rank(routing_key: str, dp_size: int) -> int:
+    """Hash a routing key (e.g. session ID) to deterministically select DP rank.
+
+    All requests with the same routing_key land on the same DP rank, maximizing
+    radix cache hits for multi-turn conversations while distributing different
+    sessions evenly across DP ranks.
+
+    Uses MD5 for fast, deterministic, cross-process hashing (not for security).
+    Must produce identical results on both prefill and decode sides.
+    """
+    if dp_size <= 1 or not routing_key:
+        return 0
+    h = int.from_bytes(hashlib.md5(routing_key.encode("utf-8")).digest()[:8], "little")
+    return h % dp_size
 
 
 #########################

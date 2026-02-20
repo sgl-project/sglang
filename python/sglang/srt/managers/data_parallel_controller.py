@@ -26,6 +26,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.utils import compute_routing_key_dp_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -516,7 +517,23 @@ class DataParallelController:
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
-        target_rank = req.bootstrap_room % len(self.workers)
+        # Session-aware DP routing: hash the routing_key (session ID) so all
+        # turns of the same conversation hit the same DP rank / radix cache.
+        # Falls back to bootstrap_room % dp_size when no routing_key is set.
+        if req.routing_key:
+            target_rank = compute_routing_key_dp_rank(
+                req.routing_key, len(self.workers)
+            )
+            logger.info(
+                f"DP routing: rid={req.rid} → rank {target_rank} "
+                f"via routing_key='{req.routing_key}'"
+            )
+        else:
+            target_rank = req.bootstrap_room % len(self.workers)
+            logger.info(
+                f"DP routing: rid={req.rid} → rank {target_rank} "
+                f"via bootstrap_room={req.bootstrap_room}"
+            )
         self.workers[target_rank].send_pyobj(req)
 
     def total_requests_scheduler(self, req: Req):

@@ -359,6 +359,7 @@ class DecodePreallocQueue:
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 prefill_dp_rank=req.data_parallel_rank,
+                routing_key=req.routing_key,
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)

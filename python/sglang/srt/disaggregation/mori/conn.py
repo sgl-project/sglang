@@ -1006,8 +1006,15 @@ class MoriKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        routing_key=None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            prefill_dp_rank,
+            routing_key=routing_key,
+        )
         self.conclude_state: Optional[KVPoll] = None
         self.init_time: Optional[float] = None
         if self.bootstrap_room is None or self.bootstrap_infos is None:
