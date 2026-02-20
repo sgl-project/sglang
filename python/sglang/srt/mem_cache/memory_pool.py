@@ -102,12 +102,12 @@ def _set_kv_buffer_impl(
     row_bytes = row_dim * store_dtype.itemsize
     if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
-            k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
+            k,
+            v,
+            k_cache,
+            v_cache,
             indices,
-            row_bytes=row_bytes,
+            row_dim=row_dim,
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode

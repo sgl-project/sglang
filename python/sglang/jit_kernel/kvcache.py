@@ -53,7 +53,7 @@ def store_cache(
     v_cache: torch.Tensor,
     indices: torch.Tensor,
     *,
-    row_bytes: int = 0,
+    row_dim: int = 0,
     num_split: int = 0,  # can be tuned for performance
 ) -> None:
     """Store key and value tensors into KV cache at specified indices.
@@ -65,7 +65,8 @@ def store_cache(
         v_cache (torch.Tensor): Value cache tensor of shape (num_pages, H * D).
         indices (torch.Tensor): Indices tensor of shape (batch_size,).
     """
-    row_bytes = row_bytes or k.shape[-1] * k.element_size()
+    row_dim = row_dim or k.shape[-1]
+    row_bytes = row_dim * k.element_size()
     module = _jit_kvcache_module(row_bytes)
     if num_split <= 0:
         if row_bytes % 2048 == 0:
@@ -75,10 +76,10 @@ def store_cache(
         else:
             num_split = 1
     module.store_cache(
-        k,
-        v,
-        k_cache,
-        v_cache,
+        k.view(-1, row_dim),
+        v.view(-1, row_dim),
+        k_cache.view(-1, row_dim),
+        v_cache.view(-1, row_dim),
         indices,
         num_split,
     )
