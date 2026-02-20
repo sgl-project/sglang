@@ -8,12 +8,16 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+_is_hip = is_hip_runtime()
 
 
 @cache_once

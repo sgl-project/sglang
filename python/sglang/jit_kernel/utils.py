@@ -78,6 +78,12 @@ CPP_DTYPE_MAP = {
 }
 
 
+# AMD/ROCm note:
+@cache_once
+def is_hip_runtime() -> bool:
+    return bool(torch.version.hip)
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -157,6 +163,13 @@ def load_jit(
     # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     env_existed = env_key in os.environ
+    base_cuda_cflags = DEFAULT_CUDA_CFLAGS
+    if is_hip_runtime():
+        # HIP clang does not support this nvcc-only flag.
+        base_cuda_cflags = [
+            flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+        ]
+        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:
@@ -165,7 +178,7 @@ def load_jit(
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
+            extra_cuda_cflags=base_cuda_cflags + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,
