@@ -137,7 +137,7 @@ class _Dumper:
             name = _get_partial_name(
                 timeout_seconds=self._config.collective_timeout
             )
-            self._config = replace(self._config, partial_name=name)
+            self.configure(partial_name=name)
             print(f"[Dumper] Choose partial_name={name}")
 
     def set_ctx(self, **kwargs):
