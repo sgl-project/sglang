@@ -352,7 +352,8 @@ static void launch_apply_shuffle_mul_sum(
   dim3 grid(static_cast<unsigned>(m));
   dim3 block(block_threads > 0 ? block_threads : 1u);
 
-  apply_shuffle_mul_sum_kernel<scalar_t><<<grid, block, 0, stream>>>(
+  LaunchKernel(grid, block, input.device())(
+      apply_shuffle_mul_sum_kernel<scalar_t>,
       static_cast<const scalar_t*>(input.data_ptr()),
       static_cast<scalar_t*>(output.data_ptr()),
       static_cast<const int32_t*>(permutation.data_ptr()),
