@@ -3850,7 +3850,7 @@ class ServerArgs:
                 "triton_attn",
                 "ascend_attn",
                 "aiter_attn",
-                "fi",
+                "flashinfer_cudnn",
             ],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
