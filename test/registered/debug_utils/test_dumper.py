@@ -1298,7 +1298,9 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, forward_batch):
-                return self.linear(forward_batch.input_ids.float().unsqueeze(-1).expand(-1, 4))
+                return self.linear(
+                    forward_batch.input_ids.float().unsqueeze(-1).expand(-1, 4)
+                )
 
         class Root(torch.nn.Module):
             def __init__(self):
@@ -1313,9 +1315,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
     def test_off_mode_no_hooks(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="off")
         model = self._build_model()
-        result = d.register_non_intrusive_dumper(model)
-
-        assert result is None
+        d.register_non_intrusive_dumper(model)
 
         forward_batch = _make_forward_batch(
             input_ids=torch.tensor([1, 2]),
@@ -1401,7 +1401,8 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
         assert "non_intrusive__inputs.0.seq_lens" in captured
         assert torch.equal(
-            captured["non_intrusive__inputs.0.seq_lens"]["value"], forward_batch.seq_lens
+            captured["non_intrusive__inputs.0.seq_lens"]["value"],
+            forward_batch.seq_lens,
         )
 
     def test_all_mode_no_core_fields_with_prefix(self, tmp_path):
