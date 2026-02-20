@@ -953,7 +953,7 @@ class TestDumperHttp:
         assert resp.status_code == 400
 
 
-class TestNonIntrusiveDumper:
+class _NonIntrusiveTestBase:
     _PREFIX = "non_intrusive__"
 
     @staticmethod
@@ -978,6 +978,14 @@ class TestNonIntrusiveDumper:
 
         return OuterModel()
 
+    @staticmethod
+    def _make_dumper(tmp_path, **overrides) -> "_Dumper":
+        return _make_test_dumper(tmp_path, non_intrusive_mode="all", **overrides)
+
+
+class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
+    """Tests for mode='all' — hooks on every module, non_intrusive__ prefix."""
+
     def test_basic_inputs_and_outputs(self, tmp_path):
         class Inner(torch.nn.Module):
             def __init__(self):
@@ -988,7 +996,7 @@ class TestNonIntrusiveDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1043,7 +1051,7 @@ class TestNonIntrusiveDumper:
                     x = layer(x)
                 return x
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1084,7 +1092,7 @@ class TestNonIntrusiveDumper:
                 a, b = self.split(x)
                 return self.linear(a + b)
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1111,7 +1119,7 @@ class TestNonIntrusiveDumper:
             def forward(self, x):
                 return self.wrap(x)[0]
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1136,7 +1144,7 @@ class TestNonIntrusiveDumper:
                 mask = torch.ones_like(x)
                 return self.mul(x, mask)
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1161,7 +1169,7 @@ class TestNonIntrusiveDumper:
                 self.sink(x)
                 return x
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1188,7 +1196,7 @@ class TestNonIntrusiveDumper:
                 self.const(x)
                 return x
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
 
@@ -1202,7 +1210,7 @@ class TestNonIntrusiveDumper:
         )
 
     def test_root_module_name_no_malformed_dots(self, tmp_path):
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         model = torch.nn.Linear(4, 4)
         d.register_non_intrusive_dumper(model)
 
@@ -1227,7 +1235,7 @@ class TestNonIntrusiveDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = _make_test_dumper(
+        d = self._make_dumper(
             tmp_path, filter="name=non_intrusive__model.linear.output"
         )
         model = self._wrap_as_outer(Inner)
@@ -1250,7 +1258,7 @@ class TestNonIntrusiveDumper:
             def forward(self, x):
                 return self.linear(x)
 
-        d = _make_test_dumper(tmp_path)
+        d = self._make_dumper(tmp_path)
         d.configure(enable=False)
         model = self._wrap_as_outer(Inner)
         d.register_non_intrusive_dumper(model)
@@ -1260,6 +1268,202 @@ class TestNonIntrusiveDumper:
             model(x)
 
         assert len(captured) == 0
+
+
+def _make_forward_batch(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> "ForwardBatch":
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+    return ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=input_ids.shape[0],
+        input_ids=input_ids,
+        req_pool_indices=torch.zeros(input_ids.shape[0], dtype=torch.long),
+        seq_lens=seq_lens,
+        out_cache_loc=torch.zeros(input_ids.shape[0], dtype=torch.long),
+        seq_lens_sum=int(seq_lens.sum().item()),
+        positions=positions,
+    )
+
+
+class TestNonIntrusiveMode(_NonIntrusiveTestBase):
+    """Tests for non_intrusive_mode: off / core / all with ForwardBatch."""
+
+    @staticmethod
+    def _build_fb_model() -> torch.nn.Module:
+        class SubLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, fb):
+                return self.linear(fb.input_ids.float().unsqueeze(-1).expand(-1, 4))
+
+        class Root(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = SubLayer()
+
+            def forward(self, fb):
+                return self.layer(fb)
+
+        return Root()
+
+    def test_off_mode_no_hooks(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="off")
+        model = self._build_fb_model()
+        result = d.register_non_intrusive_dumper(model)
+
+        assert result is None
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([1, 2]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([3, 4]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert len(captured) == 0
+
+    def test_core_mode_dumps_input_ids_and_positions(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert "input_ids" in captured
+        assert "positions" in captured
+        assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
+        assert torch.equal(captured["positions"]["value"], fb.positions)
+
+        assert not any(k.startswith("non_intrusive__") for k in captured)
+
+    def test_core_mode_no_seq_lens(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            seq_lens=torch.tensor([2]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert "seq_lens" not in captured
+        assert not any("seq_lens" in k for k in captured)
+
+    def test_all_mode_core_fields_without_prefix(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert "input_ids" in captured
+        assert "positions" in captured
+        assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
+        assert torch.equal(captured["positions"]["value"], fb.positions)
+
+    def test_all_mode_non_core_fields_with_prefix(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert "non_intrusive__inputs.0.seq_lens" in captured
+        assert torch.equal(
+            captured["non_intrusive__inputs.0.seq_lens"]["value"], fb.seq_lens
+        )
+
+    def test_all_mode_no_core_fields_with_prefix(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert not any(
+            k.startswith("non_intrusive__") and k.endswith("input_ids")
+            for k in captured
+        )
+        assert not any(
+            k.startswith("non_intrusive__") and k.endswith("positions")
+            for k in captured
+        )
+
+    def test_all_mode_forward_batch_skipped_on_submodule(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert not any(
+            k.startswith("non_intrusive__layer.inputs.") and "seq_lens" in k
+            for k in captured
+        ), f"ForwardBatch should be skipped on sub-module 'layer', got keys: {list(captured.keys())}"
+
+    def test_all_mode_sub_tensor_outputs_still_dumped(self, tmp_path):
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        model = self._build_fb_model()
+        d.register_non_intrusive_dumper(model)
+
+        fb = _make_forward_batch(
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([5, 6]),
+        )
+
+        with d.capture_output() as captured:
+            model(fb)
+
+        assert "non_intrusive__layer.linear.output" in captured
+        assert "non_intrusive__layer.output" in captured
 
 
 if __name__ == "__main__":
