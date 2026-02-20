@@ -106,7 +106,6 @@ class _Dumper:
         self._dump_index = 0
         self._forward_pass_id = 0
         self._global_ctx: dict = {}
-        self._override_enable: Optional[bool] = None
         self._captured_output_data: Optional[dict] = None
 
     @classmethod
@@ -148,7 +147,7 @@ class _Dumper:
         """
         Example:
 
-        dumper.override_enable(self.layer_id <= 3)
+        dumper.configure_default(filter='layer_id=[0-3]')
         dumper.set_ctx(layer_id=self.layer_id)
         ...
         dumper.set_ctx(layer_id=None)
@@ -171,9 +170,6 @@ class _Dumper:
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
-
-    def override_enable(self, value: bool):
-        self._override_enable = value
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
         data = _obj_to_dict(data)
@@ -228,7 +224,7 @@ class _Dumper:
     ) -> None:
         self._ensure_http_server()
 
-        if not (self._config.enable and (self._override_enable is not False)):
+        if not self._config.enable:
             return
 
         tags = dict(name=name, **extra_kwargs, **self._global_ctx)

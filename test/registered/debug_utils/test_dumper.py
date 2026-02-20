@@ -196,9 +196,9 @@ class TestDumperDistributed:
         dumper.set_ctx(ctx_arg=None)
 
         dumper.on_forward_pass_start()
-        dumper.override_enable(False)
+        dumper.configure(filter=r"^$")
         dumper.dump("tensor_skip", tensor)
-        dumper.override_enable(True)
+        dumper.configure(filter=None)
 
         dumper.on_forward_pass_start()
         dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
