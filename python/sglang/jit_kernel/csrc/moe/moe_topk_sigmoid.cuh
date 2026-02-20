@@ -7,11 +7,10 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/optional.h>
-
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/optional.h>
 
 // CUDA 12.9+ deprecated cub::Max/Min in favour of cuda::maximum/minimum
 #if CUDA_VERSION >= 12090
@@ -67,11 +66,7 @@ __device__ float convert_to_float(T x) {
 // ---------------------------------------------------------------------------
 template <typename T, int TPB>
 __launch_bounds__(TPB) __global__ void moeSigmoid(
-    const T* input,
-    const bool* finished,
-    float* output,
-    const int num_cols,
-    const float* correction_bias) {
+    const T* input, const bool* finished, float* output, const int num_cols, const float* correction_bias) {
   const int thread_row_offset = blockIdx.x * num_cols;
 
   if ((finished != nullptr) && finished[blockIdx.x]) {
@@ -233,8 +228,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
     if (correction_bias != nullptr) {
       const int group_id = ii / ELTS_PER_LDG;
       const int local_id = ii % ELTS_PER_LDG;
-      const int expert_idx =
-          first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
+      const int expert_idx = first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
       val = val + correction_bias[expert_idx];
     }
     row_chunk[ii] = val;
@@ -310,8 +304,7 @@ namespace detail {
 template <typename T, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants {
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
-  static_assert(
-      EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
+  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
   static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
   static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
   static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
@@ -344,27 +337,25 @@ void topkGatingSigmoidLauncherHelper(
   const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
   dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
-  topkGatingSigmoid<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>
-      <<<num_blocks, block_dim, 0, stream>>>(
-          input, finished, output, num_rows, indices, k, start_expert, end_expert,
-          renormalize, correction_bias);
+  topkGatingSigmoid<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
+      input, finished, output, num_rows, indices, k, start_expert, end_expert, renormalize, correction_bias);
 }
 
 // ---------------------------------------------------------------------------
 // Dispatch macro — used inside topkGatingSigmoidKernelLauncher
 // ---------------------------------------------------------------------------
-#define LAUNCH_SIGMOID(TYPE, NUM_EXPERTS, WARPS_PER_TB)       \
+#define LAUNCH_SIGMOID(TYPE, NUM_EXPERTS, WARPS_PER_TB)             \
   topkGatingSigmoidLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
-      gating_output,                                          \
-      nullptr,                                                \
-      topk_weights,                                           \
-      topk_indices,                                           \
-      num_tokens,                                             \
-      topk,                                                   \
-      0,                                                      \
-      num_experts,                                            \
-      renormalize,                                            \
-      correction_bias,                                        \
+      gating_output,                                                \
+      nullptr,                                                      \
+      topk_weights,                                                 \
+      topk_indices,                                                 \
+      num_tokens,                                                   \
+      topk,                                                         \
+      0,                                                            \
+      num_experts,                                                  \
+      renormalize,                                                  \
+      correction_bias,                                              \
       stream)
 
 // ---------------------------------------------------------------------------
@@ -415,8 +406,7 @@ void topkGatingSigmoidKernelLauncher(
       // Fallback: non-power-of-2 or >256 experts
       using namespace host;
       RuntimeCheck(
-          sigmoid_workspace != nullptr,
-          "sigmoid_workspace must be provided for num_experts that are not a power of 2");
+          sigmoid_workspace != nullptr, "sigmoid_workspace must be provided for num_experts that are not a power of 2");
       static constexpr int TPB = 256;
       moeSigmoid<T, TPB>
           <<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, sigmoid_workspace, num_experts, correction_bias);
@@ -473,8 +463,7 @@ void topk_sigmoid(
     RuntimeCheck(bias.dim() == 1, "correction_bias must be 1-D");
     RuntimeCheck(bias.shape()[0] == num_experts, "correction_bias size must equal num_experts");
     RuntimeCheck(
-        bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32,
-        "correction_bias must be float32");
+        bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32, "correction_bias must be float32");
   }
 
   const T* gating_ptr = static_cast<const T*>(gating_output.data_ptr());
@@ -482,9 +471,7 @@ void topk_sigmoid(
   int* indices_ptr = static_cast<int*>(topk_ids.data_ptr());
   float* workspace_ptr = static_cast<float*>(workspace.data_ptr());
   const float* bias_ptr =
-      correction_bias.has_value()
-          ? static_cast<const float*>(correction_bias.value().data_ptr())
-          : nullptr;
+      correction_bias.has_value() ? static_cast<const float*>(correction_bias.value().data_ptr()) : nullptr;
 
   cudaStream_t stream = LaunchKernel::resolve_device(gating_output.device());
 

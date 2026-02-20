@@ -81,7 +81,9 @@ def topk_sigmoid(
     is_pow2 = num_experts != 0 and (num_experts & (num_experts - 1)) == 0
     needs_workspace = not is_pow2 or num_experts > 256
     workspace_size = num_tokens * num_experts if needs_workspace else 1
-    workspace = torch.empty(workspace_size, dtype=torch.float32, device=gating_output.device)
+    workspace = torch.empty(
+        workspace_size, dtype=torch.float32, device=gating_output.device
+    )
 
     moe_topk_sigmoid_out(
         gating_output,
