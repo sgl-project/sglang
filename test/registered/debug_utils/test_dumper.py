@@ -47,21 +47,21 @@ class TestDumperConfig:
         assert _DumperConfig.from_env() == _DumperConfig()
 
     def test_from_env_bool(self):
-        with temp_set_env(SGLANG_DUMPER_ENABLE="1"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
             assert _DumperConfig.from_env().enable is True
-        with temp_set_env(SGLANG_DUMPER_ENABLE="false"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="false"):
             assert _DumperConfig.from_env().enable is False
 
     def test_from_env_str(self):
-        with temp_set_env(SGLANG_DUMPER_FILTER="layer_id=0"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="layer_id=0"):
             assert _DumperConfig.from_env().filter == "layer_id=0"
 
     def test_from_env_path(self):
-        with temp_set_env(SGLANG_DUMPER_DIR="/my/dir"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_DIR="/my/dir"):
             assert _DumperConfig.from_env().dir == Path("/my/dir")
 
     def test_from_env_int(self):
-        with temp_set_env(SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
             assert _DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
@@ -72,7 +72,7 @@ class TestDumperConfig:
         assert d._config.enable is True
 
     def test_configure_default_skips_when_env_set(self):
-        with temp_set_env(SGLANG_DUMPER_FILTER="from_env"):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="from_env"):
             d = _Dumper(config=_DumperConfig.from_env())
             d.configure_default(filter="from_code")
             assert d._config.filter == "from_env"
