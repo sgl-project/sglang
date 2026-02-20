@@ -26,6 +26,7 @@ def _jit_eagle_utils_module() -> Module:
 @register_custom_op(
     op_name="build_tree_kernel_efficient_out",
     mutates_args=[
+        "tree_mask",
         "positions",
         "retrive_index",
         "retrive_next_token",
