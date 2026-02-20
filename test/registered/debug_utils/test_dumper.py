@@ -1,18 +1,16 @@
 import io
+import multiprocessing
+import os
 import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-import multiprocessing
-
 import pytest
 import requests
 import torch
 import torch.distributed as dist
-import os
-
 
 from sglang.srt.debug_utils.dumper import (
     _collect_megatron_parallel_info,
