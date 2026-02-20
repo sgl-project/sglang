@@ -877,6 +877,11 @@ class ModelConfig:
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "mxfp8": [
+                "auto-round",  # Allow MXFP8 with auto-round checkpoints that have data_type="mx_fp"
+                "compressed-tensors",  # Allow MXFP8 with compressed-tensors checkpoints that have block_structure=[1, 32]
+                "compressed_tensors",
+            ],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()

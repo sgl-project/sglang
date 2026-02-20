@@ -324,6 +324,34 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return []
 
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        """
+        Detect MXFP8 format in compressed-tensors checkpoints.
+        Compressed-tensors can store MXFP8 format checkpoints with block_structure=[1, 32]
+        and U8 scales, even though quant_method says "compressed-tensors".
+        """
+        if hf_quant_cfg is None:
+            return None
+
+        # Check if this is actually MXFP8 format by looking at block_structure
+        # MXFP8 uses block_structure=[1, 32] and U8 scales
+        try:
+            config_groups = hf_quant_cfg.get("config_groups", {})
+            for group_name, group_config in config_groups.items():
+                weights_config = group_config.get("weights", {})
+                block_structure = weights_config.get("block_structure")
+                
+                # MXFP8 uses block_structure=[1, 32]
+                if block_structure == [1, 32]:
+                    # Also check if scales are U8 (uint8) format
+                    # This is a strong indicator of MXFP8
+                    return "mxfp8"
+        except (KeyError, TypeError, AttributeError):
+            pass
+
+        return None
+
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 

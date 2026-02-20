@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -163,10 +164,30 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
-        quant_method = cls.get_from_keys(config, ["quant_method"])
+        # Handle both flat and nested config formats
+        quant_method = ""
+        data_type = ""
+        
+        # Try flat format first
+        quant_method = cls.get_from_keys_or(config, ["quant_method"], "").lower()
+        data_type = cls.get_from_keys_or(config, ["data_type"], "").lower()
+        
+        # Fall back to nested format if not found
+        if not quant_method and not data_type:
+            try:
+                quantization_section = cls.get_from_keys(config, ["quantization"])
+                quant_method = quantization_section.get("quant_method", "").lower()
+                data_type = quantization_section.get("data_type", "").lower()
+            except ValueError:
+                pass  # No nested structure, use flat format
+        
         use_mxfp8 = "mxfp8" in quant_method
+        # Also detect MXFP8 from data_type (for AutoRound-converted MXFP8 checkpoints)
+        if not use_mxfp8 and data_type in ("mx_fp", "mxfp", "mxfp8"):
+            use_mxfp8 = True
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        # activation_scheme is optional for AutoRound-converted MXFP8 checkpoints
+        activation_scheme = cls.get_from_keys_or(config, ["activation_scheme"], "dynamic")
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
@@ -177,10 +198,11 @@ class Fp8Config(QuantizationConfig):
                     layer.replace("model.", "") for layer in ignored_layers
                 ]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        if use_mxfp8 and weight_block_size is not None:
-            logger.warning(
-                "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
-            )
+        if use_mxfp8:
+            if weight_block_size is not None:
+                logger.warning(
+                    "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
+                )
             weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -683,7 +705,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
-            assert is_sm100_supported() or is_sm90_supported()
+            assert (
+                is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
+            ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
