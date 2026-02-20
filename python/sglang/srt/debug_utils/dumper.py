@@ -512,48 +512,57 @@ class _HookDumper:
                     prefix=cur_name,
                 )
                 if sub_count == 0 or is_top_level:
-                    module.register_forward_hook(self._make_forward_hook(cur_name))
+                    module.register_forward_hook(
+                        self._make_forward_hook(
+                            name=cur_name, is_top_level=is_top_level
+                        )
+                    )
 
         return top_level_matched, len(model._modules)
 
-    def _make_forward_hook(self, name: str):
+    def _make_forward_hook(self, name: str, is_top_level: bool):
         def _hook(_module, _input, output):
+            if is_top_level:
+                for item in _input:
+                    self._dump_converted(name, item)
+
             if output is not None:
-                self._dump_hook_output(name, output)
+                self._dump_converted(name, output)
 
         return _hook
 
-    def _dump_hook_output(self, name: str, output) -> None:
-        if isinstance(output, torch.Tensor):
-            self._dumper.dump(name, output)
-            return
+    def _dump_converted(self, name: str, value) -> None:
+        for key, tensor in self._convert_hook_output(name, value).items():
+            self._dumper.dump(key, tensor)
 
-        if isinstance(output, (tuple, list)):
-            tensors = [t for t in output if isinstance(t, torch.Tensor)]
+    def _convert_hook_output(self, name: str, value) -> dict[str, torch.Tensor]:
+        if isinstance(value, torch.Tensor):
+            return {name: value}
+
+        if isinstance(value, (tuple, list)):
+            tensors = [t for t in value if isinstance(t, torch.Tensor)]
             if len(tensors) == 1:
-                self._dumper.dump(name, tensors[0])
-            else:
-                for index, tensor in enumerate(tensors):
-                    self._dumper.dump(f"{name}.{index}", tensor)
-            return
+                return {name: tensors[0]}
+            return {f"{name}.{i}": t for i, t in enumerate(tensors)}
 
         st = self._special_types
-        if (cls := st.get("LogitsProcessorOutput")) and isinstance(output, cls):
-            self._dumper.dump(name, output.next_token_logits)
-            return
+        if (cls := st.get("LogitsProcessorOutput")) and isinstance(value, cls):
+            return {name: value.next_token_logits}
 
-        if (cls := st.get("ForwardBatch")) and isinstance(output, cls):
-            self._dumper.dump(f"{name}.forward_batch_info.input_ids", output.input_ids)
-            self._dumper.dump(f"{name}.forward_batch_info.seq_lens", output.seq_lens)
-            self._dumper.dump(f"{name}.forward_batch_info.positions", output.positions)
-            return
+        if (cls := st.get("ForwardBatch")) and isinstance(value, cls):
+            return {
+                f"{name}.forward_batch_info.input_ids": value.input_ids,
+                f"{name}.forward_batch_info.seq_lens": value.seq_lens,
+                f"{name}.forward_batch_info.positions": value.positions,
+            }
 
-        if (cls := st.get("PPProxyTensors")) and isinstance(output, cls):
-            for tensor_name, tensor_value in output.tensors.items():
-                self._dumper.dump(
-                    f"{name}.pp_proxy_tensors.{tensor_name}", tensor_value
-                )
-            return
+        if (cls := st.get("PPProxyTensors")) and isinstance(value, cls):
+            return {
+                f"{name}.pp_proxy_tensors.{k}": v
+                for k, v in value.tensors.items()
+            }
+
+        return {}
 
     @staticmethod
     def _load_special_types() -> dict:
