@@ -285,6 +285,13 @@ MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     ],
     direct_url_test=True,
 )
+MULTI_IMAGE_TI2I_UPLOAD_sampling_params = DiffusionSamplingParams(
+    prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
+    image_path=[
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_1.jpg",
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/edit2509/edit2509_2.jpg",
+    ],
+)
 MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     prompt="a high quality, cute halloween themed illustration, consistent style and lighting",
     image_path=[
@@ -528,6 +535,21 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         TI2V_sampling_params,
     ),
 ]
+
+# Flux2 multi-image edit with cache-dit, regression test
+if not current_platform.is_hip():
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "flux_2_ti2i_multi_image_cache_dit",
+            DiffusionServerArgs(
+                model_path="black-forest-labs/FLUX.2-dev",
+                modality="image",
+                enable_cache_dit=True,
+                warmup=0,
+            ),
+            MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+        )
+    )
 
 # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
