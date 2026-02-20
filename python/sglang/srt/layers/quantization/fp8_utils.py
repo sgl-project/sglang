@@ -61,6 +61,7 @@ if _use_aiter:
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
+
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
