@@ -109,13 +109,13 @@ class _DumperConfig(_FrozenConfig):
 
     @property
     def server_port_parsed(self) -> Optional[Union[int, Literal["reuse"]]]:
-        x = self.server_port
-        if x == "reuse":
+        raw = self.server_port
+        if raw == "reuse":
             return "reuse"
-        x = self._parse_env_value(x, _DumperConfig.server_port)
-        if x <= 0:
+        port = int(raw)
+        if port <= 0:
             return None
-        return x
+        return port
 
 
 # -------------------------------------- dumper core ------------------------------------------
