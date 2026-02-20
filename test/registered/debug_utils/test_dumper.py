@@ -1291,7 +1291,7 @@ def _make_forward_batch(
 
 class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
     @staticmethod
-    def _build_fb_model() -> torch.nn.Module:
+    def _build_model() -> torch.nn.Module:
         class SubLayer(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1312,7 +1312,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_off_mode_no_hooks(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="off")
-        model = self._build_fb_model()
+        model = self._build_model()
         result = d.register_non_intrusive_dumper(model)
 
         assert result is None
@@ -1330,7 +1330,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_core_mode_dumps_input_ids_and_positions(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1351,7 +1351,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_core_mode_no_seq_lens(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1368,7 +1368,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_all_mode_core_fields_without_prefix(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1387,7 +1387,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_all_mode_non_core_fields_with_prefix(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1406,7 +1406,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_all_mode_no_core_fields_with_prefix(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1429,7 +1429,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_all_mode_forward_batch_skipped_on_submodule(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
@@ -1448,7 +1448,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
 
     def test_all_mode_sub_tensor_outputs_still_dumped(self, tmp_path):
         d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
-        model = self._build_fb_model()
+        model = self._build_model()
         d.register_non_intrusive_dumper(model)
 
         fb = _make_forward_batch(
