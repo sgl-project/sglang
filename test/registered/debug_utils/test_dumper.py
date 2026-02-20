@@ -1542,35 +1542,70 @@ class TestDumperE2E:
             env=env,
         )
         try:
+            # Verify dumper starts disabled
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
                 assert state["config"]["enable"] is False
+                assert state["step"] == 0
 
+            # Enable dumper via HTTP
             requests.post(
                 f"{base_url}/dumper/configure",
                 json={"enable": True, "dir": dump_dir},
             ).raise_for_status()
 
+            # Verify config propagated to all ranks
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            for rank, state in enumerate(states):
+                assert state["config"]["enable"] is True, (
+                    f"rank {rank}: enable should be True after configure"
+                )
+                assert state["config"]["dir"] == dump_dir
+
+            # Send inference request
             resp = requests.post(
                 f"{base_url}/generate",
                 json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
             )
             assert resp.status_code == 200, f"Generate failed: {resp.text}"
 
+            # Verify step counter advanced on all ranks
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
-            assert isinstance(states, list) and len(states) >= 1
-            for rank, state in enumerate(states):
-                assert (
-                    state["step"] > 0
-                ), f"rank {rank}: step should be > 0, got {state['step']}"
-
-            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
-            assert len(dump_files) > 0, f"Expected dump files in {dump_dir}, found none"
-            has_input_ids = any("name=input_ids" in f.name for f in dump_files)
-            assert has_input_ids, (
-                f"Expected input_ids dump from non-intrusive hooks, "
-                f"got: {[f.name for f in dump_files[:10]]}"
+            assert len(states) == 2
+            steps = [s["step"] for s in states]
+            for rank, step in enumerate(steps):
+                assert step > 0, f"rank {rank}: step should be > 0, got {step}"
+            assert steps[0] == steps[1], (
+                f"step mismatch across ranks: {steps}"
             )
+
+            # Verify dump files exist for both ranks with core fields
+            dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
+            assert len(dump_files) > 0, f"No dump files in {dump_dir}"
+            filenames = {f.name for f in dump_files}
+
+            for field in ("input_ids", "positions"):
+                assert any(f"name={field}" in f for f in filenames), (
+                    f"Missing {field} dump from non-intrusive hooks, "
+                    f"got: {sorted(filenames)[:10]}"
+                )
+
+            for rank in range(2):
+                assert any(f"rank={rank}" in f for f in filenames), (
+                    f"No dump files for rank {rank}"
+                )
+
+            # Verify dump file structure is loadable
+            sample_file = dump_files[0]
+            loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
+            assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
+            assert "value" in loaded and "meta" in loaded, (
+                f"Missing value/meta keys: {loaded.keys()}"
+            )
+            assert "name" in loaded["meta"]
+            assert "rank" in loaded["meta"]
+            assert "step" in loaded["meta"]
         finally:
             kill_process_tree(proc.pid)
 
