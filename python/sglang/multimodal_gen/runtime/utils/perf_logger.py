@@ -18,9 +18,11 @@ import sglang
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    CYAN,
+    RESET,
     _SGLDiffusionLogger,
     get_is_main_process,
-    init_logger, CYAN, RESET,
+    init_logger,
 )
 
 logger = init_logger(__name__)
