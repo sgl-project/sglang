@@ -22,7 +22,21 @@ import torch.distributed as dist
 @dataclass(frozen=True)
 class _FrozenConfig(ABC):
     def __post_init__(self) -> None:
-        _verify_dataclass_types(self)
+        self._verify_types()
+
+    def _verify_types(self) -> None:
+        hints = get_type_hints(type(self))
+        cls_name = type(self).__name__
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is None:
+                continue
+            expected = self._unwrap_type(hints[f.name])
+            if not isinstance(value, expected):
+                raise TypeError(
+                    f"{cls_name}.{f.name}: expected {expected.__name__}, "
+                    f"got {type(value).__name__}"
+                )
 
     @classmethod
     @abstractmethod
@@ -36,7 +50,7 @@ class _FrozenConfig(ABC):
     def from_env(cls) -> Self:
         return cls(
             **{
-                f.name: _parse_env_field(cls._env_name(f.name), f.default)
+                f.name: cls._parse_env_field(cls._env_name(f.name), f.default)
                 for f in fields(cls)
             }
         )
@@ -49,6 +63,24 @@ class _FrozenConfig(ABC):
             if os.getenv(cls._env_name(key)) is None
         }
         return replace(self, **actual) if actual else self
+
+    @staticmethod
+    def _unwrap_type(hint) -> type:
+        args = get_args(hint)
+        if args:
+            return next(a for a in args if a is not type(None))
+        return hint
+
+    @staticmethod
+    def _parse_env_field(env_name: str, default):
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            return default
+        if isinstance(default, bool):
+            return raw.lower() in ("true", "1")
+        if isinstance(default, int):
+            return int(raw)
+        return raw
 
 
 @dataclass(frozen=True)
@@ -70,39 +102,6 @@ class _DumperConfig(_FrozenConfig):
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
-
-
-def _verify_dataclass_types(instance) -> None:
-    hints = get_type_hints(type(instance))
-    cls_name = type(instance).__name__
-    for f in fields(instance):
-        value = getattr(instance, f.name)
-        if value is None:
-            continue
-        expected = _unwrap_type(hints[f.name])
-        if not isinstance(value, expected):
-            raise TypeError(
-                f"{cls_name}.{f.name}: expected {expected.__name__}, "
-                f"got {type(value).__name__}"
-            )
-
-
-def _unwrap_type(hint) -> type:
-    args = get_args(hint)
-    if args:
-        return next(a for a in args if a is not type(None))
-    return hint
-
-
-def _parse_env_field(env_name: str, default):
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default
-    if isinstance(default, bool):
-        return raw.lower() in ("true", "1")
-    if isinstance(default, int):
-        return int(raw)
-    return raw
 
 
 # -------------------------------------- dumper core ------------------------------------------
