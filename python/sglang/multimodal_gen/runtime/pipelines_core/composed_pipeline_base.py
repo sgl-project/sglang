@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -330,9 +331,8 @@ class ComposedPipelineBase(ABC):
 
     @staticmethod
     def _infer_stage_name(stage: PipelineStage) -> str:
-
         class_name = stage.__class__.__name__
-        # convert CamelCase to snake_case
+        # snake_case
         name = re.sub(r"(?<!^)(?=[A-Z])", "_", class_name).lower()
         if not name.endswith("_stage"):
             name += "_stage"
@@ -384,7 +384,6 @@ class ComposedPipelineBase(ABC):
         text_encoder_key: str = "text_encoder",
         tokenizer_key: str = "tokenizer",
     ) -> "ComposedPipelineBase":
-
         return self.add_stage(
             TextEncodingStage(
                 text_encoders=[self.get_module(text_encoder_key)],
