@@ -134,22 +134,21 @@ class MagCacheMixin:
             self.reset(is_cfg_negative)
             return False
 
-    def calibrate(self, hidden_states, original_hidden_states, current_timestep, do_cfg, is_cfg_negative=False):
+    def calibrate_magcache(self, ctx, hidden_states, original_hidden_states):
 
-        prev_residual = self.previous_residual_negative if is_cfg_negative else self.previous_residual
+        prev_residual = self.previous_residual_negative if ctx.is_cfg_negative else self.previous_residual
         if prev_residual is None:
-            # Step 0 has no previous residual to compare against — write placeholder 1.0
-            with open(self.calibration_path, "a") as f:
-                f.write(json.dumps({"cnt": cnt, "mag_ratio": 1.0, "mag_std": 0.0, "cos_dis": 0.0, "negative": is_cfg_negative}) + "\n")
-            return None
-
-        curr_residual = hidden_states.squeeze(0) - original_hidden_states
-        mag_ratio = ((curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).mean()).item()
-        mag_std = (curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).std().item()
-        cos_dis = (1-F.cosine_similarity(curr_residual, prev_residual, dim=-1, eps=1e-8)).mean().item()
+            mag_ratio = 1.0
+            mag_std = 0.0
+            cos_dis = 0.0
+        else:
+            curr_residual = hidden_states.squeeze(0) - original_hidden_states
+            mag_ratio = ((curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).mean()).item()
+            mag_std = (curr_residual.norm(dim=-1)/prev_residual.norm(dim=-1)).std().item()
+            cos_dis = (1-F.cosine_similarity(curr_residual, prev_residual, dim=-1, eps=1e-8)).mean().item()
 
         with open(self.calibration_path, "a") as f:
-            f.write(json.dumps({"cnt": cnt, "mag_ratio": mag_ratio, "mag_std": mag_std, "cos_dis": cos_dis, "negative": is_cfg_negative}) + "\n")
+            f.write(json.dumps({"cnt": ctx.cnt, "mag_ratio": mag_ratio, "mag_std": mag_std, "cos_dis": cos_dis, "negative": ctx.is_cfg_negative}) + "\n")
 
     def _get_magcache_context(self) -> MagCacheContext | None:
         from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context

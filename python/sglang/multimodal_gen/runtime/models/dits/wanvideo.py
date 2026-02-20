@@ -828,6 +828,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.enable_magcache = (
             forward_batch is not None and forward_batch.enable_magcache
         )
+        self.is_cfg_negative=forward_batch.is_cfg_negative
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -940,6 +941,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
+        should_skip_forward = False
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
@@ -954,18 +956,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 )
             # Cache states
             if self.cache_type is not None:
-                forward_context = get_forward_context()
-                forward_batch = forward_context.forward_batch
-                if forward_batch is None:
-                    return None
-                self.is_cfg_negative = forward_batch.is_cfg_negative
-                current_timestep = forward_context.current_timestep # current denoising timestep, same for both cond and uncond passes
-                do_cfg = forward_batch.do_classifier_free_guidance
-
-                # self.calibrate(hidden_states, original_hidden_states, current_timestep, do_cfg, self.is_cfg_negative)
+                self.calibrate(hidden_states=hidden_states, original_hidden_states=original_hidden_states)
                 self.maybe_cache_states(hidden_states, original_hidden_states)
 
-        self.cnt += 1
+        self.cnt += 1 # todo: use this cnt in calibrate, maybe_skip_forward_for_cached_states
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()
@@ -1009,7 +1003,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         """Cache residual with CFG positive/negative separation."""
         ic("caching states")
         residual = hidden_states.squeeze(0) - original_hidden_states
-        ic(residual.shape)
         if not self.is_cfg_negative:
             self.previous_residual = residual
         else:
@@ -1072,6 +1065,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         return False
 
-
+    def calibrate(self, **kwargs):
+        if self.enable_magcache:
+            ctx = self._get_magcache_context()
+            assert ctx is not None, "MagCache context should not be None when calibrating MagCache"
+            self.calibrate_magcache(ctx, **kwargs)
+        if self.enable_teacache:
+            self.calibrate_teacache(**kwargs)
 
 EntryClass = WanTransformer3DModel
