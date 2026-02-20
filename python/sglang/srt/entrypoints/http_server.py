@@ -625,7 +625,7 @@ if TODO:
     async def _dumper_control_handler(method: str, request: Request):
         body_bytes = await request.body()
         body = await request.json() if body_bytes else {}
-        obj = DumperControlReqInput(kwargs={"_method": method, **body})
+        obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         response: list = []
         for r in results:

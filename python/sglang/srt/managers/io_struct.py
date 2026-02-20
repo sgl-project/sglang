@@ -1972,7 +1972,8 @@ class LazyDumpTensorsReqOutput(BaseReq):
 
 @dataclass
 class DumperControlReqInput(BaseReq):
-    kwargs: Dict[str, Any]
+    method: str
+    body: Dict[str, Any]
 
 
 @dataclass
