@@ -1979,7 +1979,7 @@ class DumperControlReqInput(BaseReq):
 @dataclass
 class DumperControlReqOutput(BaseReq):
     success: bool
-    response: List[Dict[str, Any]] = field(default_factory=list)
+    response: List[Dict[str, Any]]
     error: str = ""
 
 

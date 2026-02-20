@@ -629,9 +629,9 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
         body = await request.json() if body_bytes else {}
         obj = DumperControlReqInput(method=method, body=body)
         results = await _global_state.tokenizer_manager.dumper_control(obj)
-        for result in results:
-            if not result.success:
-                return ORJSONResponse(status_code=400, content={"error": result.error})
+        if any(not r.success for r in results):
+            errors = [r.error for r in results if not r.success]
+            return ORJSONResponse(status_code=400, content={"error": errors})
         return [x for result in results for x in result.response]
 
 
