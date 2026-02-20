@@ -550,9 +550,9 @@ class _HookDumper:
                 return {name: value.next_token_logits}
             if isinstance(value, ForwardBatch):
                 return {
-                    f"{name}.forward_batch_info.input_ids": value.input_ids,
-                    f"{name}.forward_batch_info.seq_lens": value.seq_lens,
-                    f"{name}.forward_batch_info.positions": value.positions,
+                    f"{name}.input_ids": value.input_ids,
+                    f"{name}.seq_lens": value.seq_lens,
+                    f"{name}.positions": value.positions,
                 }
             if isinstance(value, PPProxyTensors):
                 return {
