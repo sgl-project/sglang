@@ -24,20 +24,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ConditioningStage,
-    InputValidationStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages import DecodingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    DecodingStage,
     DenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    InputValidationStage,
     LatentPreparationStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    PipelineStage,
     TextEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -266,8 +258,8 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
