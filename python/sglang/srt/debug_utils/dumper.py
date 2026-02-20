@@ -1002,7 +1002,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 class _MegatronPlugin(_FrameworkPlugin):
     _available = True
     try:
-        from megatron.core import parallel_state as _parallel_state
+        from megatron.core import parallel_state as _mpu
     except ImportError:
         _available = False
 
