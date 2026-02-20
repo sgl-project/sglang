@@ -292,6 +292,30 @@ def calculate_diff():
             f"vocab={vocab_size:6d}  [{status}]"
         )
 
+    print()
+    print("Correctness diff — build_tree_kernel_efficient (JIT vs AOT):")
+    for bs, topk, depth, tree_mask_mode in [
+        (1, 4, 5, QLEN_ONLY),
+        (2, 4, 5, QLEN_ONLY_BITPACKING),
+        (4, 8, 4, QLEN_ONLY),
+    ]:
+        inp_jit = make_build_tree_inputs(bs, topk, depth, tree_mask_mode)
+        inp_aot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inp_jit.items()}
+
+        build_tree_jit(**inp_jit)
+        build_tree_aot(**inp_aot)
+
+        match_positions = torch.equal(inp_jit["positions"], inp_aot["positions"])
+        match_retrive_index = torch.equal(inp_jit["retrive_index"], inp_aot["retrive_index"])
+        match_next_token = torch.equal(inp_jit["retrive_next_token"], inp_aot["retrive_next_token"])
+        match_sibling = torch.equal(inp_jit["retrive_next_sibling"], inp_aot["retrive_next_sibling"])
+        status = "OK" if all([match_positions, match_retrive_index, match_next_token, match_sibling]) else "MISMATCH"
+        draft_token_num = topk * (depth - 1) + 1
+        print(
+            f"  bs={bs:2d} topk={topk:2d} depth={depth:2d} draft_tokens={draft_token_num:2d} "
+            f"mode={tree_mask_mode}  [{status}]"
+        )
+
 
 if __name__ == "__main__":
     calculate_diff()
