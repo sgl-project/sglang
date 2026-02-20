@@ -172,7 +172,14 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
+    from flashinfer import block_scale_interleave as flashinfer_block_scale_interleave
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise
+else:
+    flashinfer_block_scale_interleave = None
+    flashinfer_mm_mxfp8 = None
+    flashinfer_mxfp8_quantize = None
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
@@ -195,6 +202,23 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
     # Auto mode: Select based purely on hardware/backend availability
     return _dispatch_auto_backend()
+
+
+def dispatch_w8a8_mxfp8_linear() -> Callable:
+    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
+
+    For MXFP8, Triton remains the default path. We only route to FlashInfer
+    when backend is explicitly set to flashinfer_trtllm.
+    """
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_flashinfer_trtllm():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "MXFP8 FlashInfer GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
+                "but FlashInfer is unavailable or unsupported on this hardware."
+            )
+        return flashinfer_mxfp8_blockscaled_linear
+    return triton_mxfp8_blockscaled_linear
 
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
@@ -627,6 +651,23 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+def mxfp8_scale_linear_to_swizzled(scale_u8: torch.Tensor) -> torch.Tensor:
+    """Convert MXFP8 2D linear scale layout [rows, cols] to swizzled 1D layout."""
+    if scale_u8.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 scale tensor, got {scale_u8.dtype}.")
+    if scale_u8.ndim != 2:
+        raise ValueError(
+            f"Expected 2D scale tensor, got shape {tuple(scale_u8.shape)}."
+        )
+
+    scale_u8 = scale_u8.contiguous()
+    if flashinfer_block_scale_interleave is None:
+        raise RuntimeError(
+            "mxfp8_scale_linear_to_swizzled requires FlashInfer block_scale_interleave."
+        )
+    return flashinfer_block_scale_interleave(scale_u8).contiguous()
+
+
 def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     # Pack (M, K//32) UE8M0 scales into the layout expected by tl.dot_scaled.
     assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
@@ -725,6 +766,112 @@ def triton_mxfp8_blockscaled_linear(
         block_k=block_k,
     )
     output = output[:m, :]
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _validate_mxfp8_scale_tensor(
+    scale: torch.Tensor, *, rows: int, k_scales: int, name: str
+) -> None:
+    if scale.dtype != torch.uint8:
+        raise TypeError(f"{name} must be UE8M0 uint8.")
+
+    if scale.ndim == 2:
+        expected_shape = (rows, k_scales)
+        if scale.shape != expected_shape:
+            raise ValueError(
+                f"Expected {name} shape {expected_shape}, got {scale.shape}."
+            )
+        return
+
+    if scale.ndim == 1:
+        expected_len = ceil_div(rows, 128) * 128 * ceil_div(k_scales, 4) * 4
+        if scale.numel() != expected_len:
+            raise ValueError(
+                f"Expected swizzled {name} length {expected_len}, got {scale.numel()}."
+            )
+        return
+
+    raise ValueError(f"Expected {name} to be 1D or 2D, got {scale.ndim}D.")
+
+
+def flashinfer_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear via FlashInfer mm_mxfp8."""
+    if flashinfer_mm_mxfp8 is None:
+        raise RuntimeError(
+            "MXFP8 FlashInfer GEMM requested, but flashinfer.mm_mxfp8 is unavailable."
+        )
+
+    if not (_is_cuda and is_sm100_supported()):
+        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    m, k = input_2d.shape
+    n, k_w = weight.shape
+    if k != k_w:
+        raise ValueError(f"Input K={k} does not match weight K={k_w}.")
+    if k % 32 != 0:
+        raise ValueError(f"K={k} must be divisible by 32 for MXFP8.")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError("MXFP8 weight must be FP8 E4M3.")
+    k_scales = k // 32
+    _validate_mxfp8_scale_tensor(
+        weight_scale, rows=n, k_scales=k_scales, name="weight_scale"
+    )
+
+    if input_scale is None:
+        if flashinfer_mxfp8_quantize is not None:
+            q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
+                input_2d, is_sf_swizzled_layout=True, alignment=32
+            )
+            q_input = q_input[:, :k].contiguous()
+            x_scale_u8 = x_scale_u8.contiguous()
+        else:
+            q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
+    else:
+        q_input = input_2d
+        x_scale_u8 = input_scale
+        if q_input.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "When input_scale is provided, input must be MXFP8 tensor "
+                "(torch.float8_e4m3fn)."
+            )
+        _validate_mxfp8_scale_tensor(
+            x_scale_u8, rows=m, k_scales=k_scales, name="input_scale"
+        )
+
+    if output_dtype is None:
+        if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            output_dtype = input_2d.dtype
+        else:
+            output_dtype = torch.bfloat16
+
+    # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
+    weight_t = weight.contiguous().t()
+    weight_scale_t = (
+        weight_scale.contiguous().t()
+        if weight_scale.ndim == 2
+        else weight_scale.contiguous()
+    )
+    output = flashinfer_mm_mxfp8(
+        q_input,
+        weight_t,
+        x_scale_u8,
+        weight_scale_t,
+        out_dtype=output_dtype,
+        backend="auto",
+    )
+
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
