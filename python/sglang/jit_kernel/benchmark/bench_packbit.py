@@ -8,7 +8,6 @@ Run:
 """
 
 import itertools
-import random
 
 import torch
 import triton
@@ -51,7 +50,7 @@ SEG_LEN_RANGE = get_benchmark_range(
 
 
 def make_inputs(bs, seg_len):
-    random.seed(42)
+    torch.manual_seed(42)
     input_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
     output_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
     for i in range(bs):
