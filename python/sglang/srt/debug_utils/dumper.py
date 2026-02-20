@@ -521,9 +521,9 @@ class _HookDumper:
         return top_level_matched, len(model._modules)
 
     def _make_forward_hook(self, name: str, is_top_level: bool):
-        def _hook(_module, _input, output):
+        def _hook(_module, input, output):
             if is_top_level:
-                for item in _input:
+                for item in input:
                     self._dump_converted(name, item)
 
             if output is not None:
