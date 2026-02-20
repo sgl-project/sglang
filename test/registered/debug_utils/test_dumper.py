@@ -1289,7 +1289,7 @@ def _make_forward_batch(
     )
 
 
-class TestNonIntrusiveDumperMode(_NonIntrusiveTestBase):
+class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
     @staticmethod
     def _build_fb_model() -> torch.nn.Module:
         class SubLayer(torch.nn.Module):
