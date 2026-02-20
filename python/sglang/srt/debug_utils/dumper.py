@@ -257,13 +257,14 @@ class _Dumper:
         self, *, method: str, body: dict[str, Any]
     ) -> dict:
         if method == "get_state":
-            return self.get_state()
+            pass
         elif method == "configure":
             self.configure(**body)
         elif method == "reset":
             self.reset()
         else:
             raise ValueError(f"Unknown dumper control method: {method!r}")
+        return self.get_state()
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
