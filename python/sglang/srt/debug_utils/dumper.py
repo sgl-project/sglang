@@ -492,18 +492,13 @@ class _NonIntrusiveDumper:
         self._dumper = dumper
         self._mode = mode
 
-        if mode == "core":
-            model.register_forward_hook(
-                self._make_forward_hook(module_name="", is_root=True)
-            )
-        elif mode == "all":
-            for module_name, module in model.named_modules():
-                module.register_forward_hook(
-                    self._make_forward_hook(
-                        module_name=module_name,
-                        is_root=(module_name == ""),
-                    )
+        for module_name, module in model.named_modules():
+            module.register_forward_hook(
+                self._make_forward_hook(
+                    module_name=module_name,
+                    is_root=(module_name == ""),
                 )
+            )
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
