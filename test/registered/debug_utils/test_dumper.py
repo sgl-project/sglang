@@ -24,8 +24,15 @@ from sglang.srt.debug_utils.dumper import (
     get_truncated_value,
 )
 from sglang.srt.environ import temp_set_env
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import run_distributed_test
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    popen_launch_server,
+    run_distributed_test,
+)
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
@@ -246,132 +253,6 @@ class TestDumperDistributed:
         if rank == 0:
             assert "WARNING" in output, f"Expected WARNING in rank 0 output: {output}"
             assert "has not completed after 3s" in output
-
-    def test_http_configure(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
-            run_distributed_test(self._test_http_configure_func)
-
-    @staticmethod
-    def _test_http_configure_func(rank):
-        from sglang.srt.debug_utils.dumper import dumper
-
-        assert not dumper._config.enable
-        dumper.on_forward_pass_start()
-
-        base_url = "http://localhost:40000"
-
-        # (1) enable toggle
-        for enable in [True, False]:
-            dist.barrier()
-            if rank == 0:
-                time.sleep(0.1)
-                requests.post(
-                    f"{base_url}/dumper/configure", json={"enable": enable}
-                ).raise_for_status()
-            dist.barrier()
-            assert dumper._config.enable == enable
-
-        # (2) multi-field configure
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.enable is True
-        assert dumper._config.filter == "layer_id=0"
-        assert dumper._config.dir == "/tmp/test_http"
-
-        # (3) clear optional field
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"filter": None},
-            ).raise_for_status()
-        dist.barrier()
-        assert dumper._config.filter is None
-
-        # (4) reset
-        dumper._dump_index = 42
-        dumper._forward_pass_id = 99
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            requests.post(f"{base_url}/dumper/reset").raise_for_status()
-        dist.barrier()
-        assert dumper._dump_index == 0
-        assert dumper._forward_pass_id == 0
-
-        # (5) error: unknown field -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"nonexistent_field": 123},
-            )
-            assert resp.status_code == 400
-
-        # (6) error: wrong type -> 400
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            resp = requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": "not_a_bool"},
-            )
-            assert resp.status_code == 400
-
-    def test_sglang_mode_rpc_broadcast(self):
-        """When SGLANG_DUMPER_SERVER_PORT=0, ZMQ RPC still starts and
-        _rpc_broadcast is available on rank 0 for the scheduler handler."""
-        with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="0",
-            SGLANG_DUMPER_SERVER_PORT="0",
-        ):
-            run_distributed_test(self._test_sglang_mode_rpc_broadcast_func)
-
-    @staticmethod
-    def _test_sglang_mode_rpc_broadcast_func(rank):
-        from sglang.srt.debug_utils.dumper import dumper
-
-        assert not dumper._config.enable
-        dumper.on_forward_pass_start()
-
-        if rank == 0:
-            assert hasattr(
-                dumper, "_rpc_broadcast"
-            ), "rank 0 should have _rpc_broadcast when SGLANG_DUMPER_SERVER_PORT=0"
-
-        # Simulate what the scheduler handler does on rank 0
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            dumper._rpc_broadcast.configure(enable=True)
-        dist.barrier()
-        assert dumper._config.enable is True
-
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            dumper._rpc_broadcast.configure(enable=False, filter="layer_id=0")
-        dist.barrier()
-        assert dumper._config.enable is False
-        assert dumper._config.filter == "layer_id=0"
-
-        # Test reset via rpc_broadcast
-        dumper._dump_index = 42
-        dist.barrier()
-        if rank == 0:
-            time.sleep(0.1)
-            dumper._rpc_broadcast.reset()
-        dist.barrier()
-        assert dumper._dump_index == 0
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
@@ -946,6 +827,134 @@ class TestReset:
         _assert_files(filenames, exist=["pre", "post"])
         post_file = _find_dump_file(tmp_path, name="post")
         assert "dump_index=1" in post_file.name
+
+
+class TestDumperStandaloneHttp:
+    """Test the standalone HTTPServer (port 40000) used in non-sglang mode."""
+
+    def test_http_configure(self):
+        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="0"):
+            run_distributed_test(self._test_http_configure_func)
+
+    @staticmethod
+    def _test_http_configure_func(rank):
+        from sglang.srt.debug_utils.dumper import dumper
+
+        assert not dumper._config.enable
+        dumper.on_forward_pass_start()
+
+        base_url = "http://localhost:40000"
+
+        # (1) enable toggle
+        for enable in [True, False]:
+            dist.barrier()
+            if rank == 0:
+                time.sleep(0.1)
+                requests.post(
+                    f"{base_url}/dumper/configure", json={"enable": enable}
+                ).raise_for_status()
+            dist.barrier()
+            assert dumper._config.enable == enable
+
+        # (2) multi-field configure
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(
+                f"{base_url}/dumper/configure",
+                json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
+            ).raise_for_status()
+        dist.barrier()
+        assert dumper._config.enable is True
+        assert dumper._config.filter == "layer_id=0"
+        assert dumper._config.dir == "/tmp/test_http"
+
+        # (3) clear optional field
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(
+                f"{base_url}/dumper/configure",
+                json={"filter": None},
+            ).raise_for_status()
+        dist.barrier()
+        assert dumper._config.filter is None
+
+        # (4) reset
+        dumper._dump_index = 42
+        dumper._forward_pass_id = 99
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            requests.post(f"{base_url}/dumper/reset").raise_for_status()
+        dist.barrier()
+        assert dumper._dump_index == 0
+        assert dumper._forward_pass_id == 0
+
+        # (5) error: unknown field -> 400
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            resp = requests.post(
+                f"{base_url}/dumper/configure",
+                json={"nonexistent_field": 123},
+            )
+            assert resp.status_code == 400
+
+        # (6) error: wrong type -> 400
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            resp = requests.post(
+                f"{base_url}/dumper/configure",
+                json={"enable": "not_a_bool"},
+            )
+            assert resp.status_code == 400
+
+
+class TestDumperSglangServer:
+    """Test dumper control via sglang's FastAPI /dumper/* endpoints."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--max-total-tokens", "128"],
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_configure_enable(self):
+        resp = requests.post(
+            f"{self.base_url}/dumper/configure", json={"enable": True}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+        resp = requests.post(
+            f"{self.base_url}/dumper/configure", json={"enable": False}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+    def test_configure_multi_field(self):
+        resp = requests.post(
+            f"{self.base_url}/dumper/configure",
+            json={"enable": True, "filter": "layer_id=0"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+    def test_reset(self):
+        resp = requests.post(f"{self.base_url}/dumper/reset")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
 
 
 if __name__ == "__main__":
