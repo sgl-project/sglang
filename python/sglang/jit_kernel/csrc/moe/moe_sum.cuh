@@ -15,11 +15,13 @@ using tvm::ffi::TensorView;
 namespace {
 
 // ---------------------------------------------------------------------------
-// moe_sum_kernel — one CTA per token, sums over topk expert outputs
+// moe_sum_kernel — one CTA per token-slice, sums over topk expert outputs
 // ---------------------------------------------------------------------------
-// Grid is (num_tokens * hidden_blocks,) where hidden_blocks = ceil(hidden_size / blockDim.x).
-// Each block handles one (token, hidden-slice) pair, giving one element per thread and
-// maximizing parallelism for small token counts (e.g. tokens=1 with large hidden_size).
+// Grid is (num_tokens * hidden_blocks,).  hidden_blocks is chosen adaptively:
+//   hidden_blocks = min(ceil(hidden_size/blockDim.x), max(1, TARGET_MAX_BLOCKS/num_tokens))
+// This keeps the total grid size near TARGET_MAX_BLOCKS, giving 2-D parallelism
+// for small token counts (e.g. tokens=1) while avoiding over-decomposition for
+// large counts.  Each thread strides over its slice so no work is dropped.
 template <typename T, int TOPK>
 __global__ void moe_sum_kernel(
     T* __restrict__ out,          // [num_tokens, hidden_size]
@@ -28,15 +30,19 @@ __global__ void moe_sum_kernel(
     const int hidden_blocks) {
   const int h_block = blockIdx.x % hidden_blocks;
   const int64_t token_idx = blockIdx.x / hidden_blocks;
-  const int idx = h_block * blockDim.x + threadIdx.x;
-  if (idx >= hidden_size) return;
+  const int64_t token_base = token_idx * TOPK * hidden_size;
+  const int64_t out_base = token_idx * hidden_size;
+  const int stride = hidden_blocks * static_cast<int>(blockDim.x);
 
-  float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
+  for (int idx = h_block * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+       idx < hidden_size; idx += stride) {
+    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll
-  for (int k = 0; k < TOPK; ++k) {
-    x += static_cast<float>(__ldg(&input[token_idx * TOPK * hidden_size + k * hidden_size + idx]));
+    for (int k = 0; k < TOPK; ++k) {
+      x += static_cast<float>(__ldg(&input[token_base + k * hidden_size + idx]));
+    }
+    out[out_base + idx] = static_cast<T>(x);
   }
-  out[token_idx * hidden_size + idx] = static_cast<T>(x);
 }
 
 // General fallback for topk not covered by static dispatch
@@ -49,15 +55,19 @@ __global__ void moe_sum_kernel_general(
     const int hidden_blocks) {
   const int h_block = blockIdx.x % hidden_blocks;
   const int64_t token_idx = blockIdx.x / hidden_blocks;
-  const int idx = h_block * blockDim.x + threadIdx.x;
-  if (idx >= hidden_size) return;
+  const int64_t token_base = token_idx * topk * hidden_size;
+  const int64_t out_base = token_idx * hidden_size;
+  const int stride = hidden_blocks * static_cast<int>(blockDim.x);
 
-  float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
+  for (int idx = h_block * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+       idx < hidden_size; idx += stride) {
+    float x = 0.0f;  // accumulate in float32 to match at::sum_out precision
 #pragma unroll 1
-  for (int k = 0; k < topk; ++k) {
-    x += static_cast<float>(__ldg(&input[token_idx * topk * hidden_size + k * hidden_size + idx]));
+    for (int k = 0; k < topk; ++k) {
+      x += static_cast<float>(__ldg(&input[token_base + k * hidden_size + idx]));
+    }
+    out[out_base + idx] = static_cast<T>(x);
   }
-  out[token_idx * hidden_size + idx] = static_cast<T>(x);
 }
 
 }  // namespace
@@ -83,7 +93,14 @@ void moe_sum(TensorView input, TensorView output) {
   T* out_ptr = static_cast<T*>(output.data_ptr());
 
   constexpr int block_size = 1024;
-  const int hidden_blocks = (hidden_size + block_size - 1) / block_size;
+  const int hidden_blocks_full = (hidden_size + block_size - 1) / block_size;
+  // Cap hidden_blocks so total grid stays near TARGET_MAX_BLOCKS.  For large token
+  // counts this forces hidden_blocks→1 and each thread strides over the full slice,
+  // providing the same occupancy as the original 1-D kernel.  For small token counts
+  // (e.g. tokens=1) we keep full decomposition for maximum parallelism.
+  constexpr int TARGET_MAX_BLOCKS = 256;
+  const int hidden_blocks =
+      std::min(hidden_blocks_full, std::max(1, TARGET_MAX_BLOCKS / static_cast<int>(num_tokens)));
   dim3 grid(static_cast<unsigned>(num_tokens) * static_cast<unsigned>(hidden_blocks));
   dim3 block(static_cast<unsigned>(std::min(hidden_size, block_size)));
 
