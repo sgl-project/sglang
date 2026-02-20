@@ -109,10 +109,6 @@ class _Dumper:
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
 
-    @classmethod
-    def from_env(cls) -> "_Dumper":
-        return cls(config=_DumperConfig.from_env())
-
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
 
@@ -743,7 +739,7 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper.from_env()
+dumper = _Dumper(config=_DumperConfig.from_env())
 
 
 # -------------------------------------- other utility functions ------------------------------------------
