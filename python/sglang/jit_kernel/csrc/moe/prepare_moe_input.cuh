@@ -32,7 +32,7 @@ __global__ void compute_problem_sizes_kernel(
     const int64_t k) {
   int expert_id = blockIdx.x;
   int occurrences = 0;
-  for (int64_t i = threadIdx.x; i < topk_length; i += kThreadsPerExpert) {
+  for (int64_t i = threadIdx.x; i < topk_length; i += blockDim.x) {
     occurrences += (topk_ids[i] == expert_id);
   }
   atomicAdd(&atomic_buffer[expert_id], occurrences);
@@ -92,7 +92,7 @@ __global__ void compute_arg_sorts_kernel(
     const int64_t topk_length,
     const int64_t topk) {
   int expert_id = blockIdx.x;
-  for (int64_t i = threadIdx.x; i < topk_length; i += kThreadsPerExpert) {
+  for (int64_t i = threadIdx.x; i < topk_length; i += blockDim.x) {
     if (topk_ids[i] == expert_id) {
       int start = atomicAdd(&atomic_buffer[expert_id], 1);
       input_permutation[start] = i / topk;
