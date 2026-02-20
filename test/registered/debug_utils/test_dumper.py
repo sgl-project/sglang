@@ -990,7 +990,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1045,7 +1045,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1086,7 +1086,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1113,7 +1113,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1138,7 +1138,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1163,7 +1163,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1190,7 +1190,7 @@ class TestNonIntrusiveDumper:
 
         d = _make_test_dumper(tmp_path)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1204,7 +1204,7 @@ class TestNonIntrusiveDumper:
     def test_root_module_name_no_malformed_dots(self, tmp_path):
         d = _make_test_dumper(tmp_path)
         model = torch.nn.Linear(4, 4)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1231,7 +1231,7 @@ class TestNonIntrusiveDumper:
             tmp_path, filter="name=non_intrusive__model.linear.output"
         )
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
@@ -1253,7 +1253,7 @@ class TestNonIntrusiveDumper:
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
         model = self._wrap_as_outer(Inner)
-        d.register_model_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
