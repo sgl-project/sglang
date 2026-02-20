@@ -631,9 +631,7 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         for result in results:
             if not result.success:
-                return ORJSONResponse(
-                    status_code=400, content={"error": result.error}
-                )
+                return ORJSONResponse(status_code=400, content={"error": result.error})
         return [x for result in results for x in result.response]
 
 
