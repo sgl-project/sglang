@@ -137,23 +137,24 @@ def bench_speculative_sampling(
         deterministic=True,
     )
 
+    # Only these tensors are mutated by the kernel; pre-allocate backups and
+    # restore with copy_() to avoid per-iteration allocation overhead.
+    mutated_keys = {"predicts", "accept_index", "accept_token_num", "draft_probs"}
+    backups = {k: inputs[k].clone() for k in mutated_keys}
+
     if provider == "jit":
 
         def fn():
-            inp = {
-                k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in inputs.items()
-            }
-            tree_spec_sampling_jit(**inp, **common_kwargs)
+            for k in mutated_keys:
+                inputs[k].copy_(backups[k])
+            tree_spec_sampling_jit(**inputs, **common_kwargs)
 
     elif provider == "aot":
 
         def fn():
-            inp = {
-                k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in inputs.items()
-            }
-            tree_spec_sampling_aot(**inp, **common_kwargs)
+            for k in mutated_keys:
+                inputs[k].copy_(backups[k])
+            tree_spec_sampling_aot(**inputs, **common_kwargs)
 
     else:
         raise ValueError(f"Unknown provider: {provider}")

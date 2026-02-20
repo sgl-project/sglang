@@ -26,6 +26,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <assert.h>
+#include <numeric>
 
 namespace flashinfer {
 
