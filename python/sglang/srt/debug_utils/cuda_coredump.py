@@ -8,17 +8,15 @@ with cuda-gdb.
 The injection happens at module import time via _inject_env() on a
 best-effort basis.  If any CUDA_* variable is already present in the
 environment (e.g. set by the user in the shell), injection is skipped for
-that variable and a warning is logged.  For strict guarantees, set the
+that variable and a warning is printed.  For strict guarantees, set the
 CUDA_* env vars in the shell before launching Python.
 """
 
 import glob
-import logging
 import os
+import warnings
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 _CUDA_COREDUMP_FLAGS = (
     "skip_nonrelocated_elf_images,skip_global_memory,"
@@ -48,12 +46,10 @@ def _inject_env():
     }
     for key, value in env_vars.items():
         if key in os.environ:
-            logger.warning(
-                "CUDA coredump env var %s is already set to '%s', "
-                "skipping injection of '%s'.",
-                key,
-                os.environ[key],
-                value,
+            warnings.warn(
+                f"CUDA coredump env var {key} is already set to "
+                f"'{os.environ[key]}', skipping injection of '{value}'.",
+                stacklevel=2,
             )
         else:
             os.environ[key] = value
@@ -73,21 +69,27 @@ def report():
     if not coredump_files:
         return
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"CUDA coredump(s) detected ({len(coredump_files)} file(s)):")
+    print(f"\n{'='*60}")
+    print(f"CUDA coredump(s) detected ({len(coredump_files)} file(s)):")
     for f in coredump_files:
         size_mb = os.path.getsize(f) / (1024 * 1024)
-        logger.info(f"  {f} ({size_mb:.1f} MB)")
-    logger.info("Use cuda-gdb to analyze: cuda-gdb -c <coredump_file>")
+        print(f"  {f} ({size_mb:.1f} MB)")
+    print("Use cuda-gdb to analyze: cuda-gdb -c <coredump_file>")
 
     run_id = os.environ.get("GITHUB_RUN_ID")
     if run_id:
         repo = os.environ.get("GITHUB_REPOSITORY", "sgl-project/sglang")
-        logger.info(f"Download from CI: gh run download {run_id} --repo {repo}")
+        print(f"Download from CI: gh run download {run_id} --repo {repo}")
 
-    logger.info(f"{'='*60}\n")
+    print(f"{'='*60}\n")
 
 
 # Auto-inject CUDA coredump env vars at import time.
-if is_enabled():
+# The sentinel env var is inherited by child processes, so injection only
+# happens once in the top-level process.
+_SENTINEL = "_SGLANG_CUDA_COREDUMP_INJECTED"
+
+if is_enabled() and _SENTINEL not in os.environ:
+    os.environ[_SENTINEL] = "1"
+    print(f"Injecting CUDA coredump env vars (pid={os.getpid()})")
     _inject_env()
