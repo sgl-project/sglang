@@ -15,7 +15,7 @@
 
 import dataclasses
 import logging
-from enum import auto
+from enum import Enum, auto
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 completion_template_name = None
 
 
-class FimPosition:
+class FimPosition(Enum):
     """Position of fim middle token."""
 
     MIDDLE = auto()
@@ -66,6 +66,12 @@ def register_completion_template(template: CompletionTemplate, override: bool = 
 
 def completion_template_exists(template_name: str) -> bool:
     return template_name in completion_templates
+
+
+def set_completion_template(template_name: str) -> None:
+    global completion_template_name
+    if completion_template_name is None:
+        completion_template_name = template_name
 
 
 def is_completion_template_defined() -> bool:
