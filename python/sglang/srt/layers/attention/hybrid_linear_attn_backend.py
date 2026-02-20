@@ -1106,19 +1106,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             else:
                 # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
-                # FlashInfer/NPU/CPU: gather active entries (implicit K→V contiguous
-                # conversion for flashinfer's K-contiguous pool), run FLA, then scatter
-                # last_recurrent_state back (implicit V→K conversion).
+                # FlashInfer/NPU/CPU: gather active entries (fancy indexing creates a
+                # V-contiguous copy, converting from K-contiguous for flashinfer),
+                # pass sequential indices so the FLA kernel can index into the dense copy,
+                # then scatter the in-place updated copy back to the pool.
+                # Note: chunk_gated_delta_rule always returns (o, None, h); the final
+                # state is written in-place into initial_state by the kernel.
                 use_gather_scatter = (
                     self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
                 )
                 if use_gather_scatter:
                     recurrent_state = ssm_states[cache_indices]
-                    recurrent_state_indices_args = {}
+                    n_seqs_extend = recurrent_state.shape[0]
+                    seq_indices = torch.arange(
+                        n_seqs_extend,
+                        device=recurrent_state.device,
+                        dtype=cache_indices.dtype,
+                    )
+                    recurrent_state_indices_args = {"initial_state_indices": seq_indices}
                 else:
                     recurrent_state = ssm_states
                     recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
+                core_attn_out, _, h = chunk_gated_delta_rule(
                     q=query,
                     k=key,
                     v=value,
@@ -1131,7 +1140,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     **recurrent_state_indices_args,
                 )
                 if use_gather_scatter:
-                    ssm_states[cache_indices] = last_recurrent_state.to(
+                    # kernel updated recurrent_state in-place; scatter back to pool
+                    ssm_states[cache_indices] = recurrent_state.to(
                         ssm_states.dtype, copy=False
                     )
 
