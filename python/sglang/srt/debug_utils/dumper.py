@@ -171,7 +171,7 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self, timeout_seconds=self._config.collective_timeout)
+        _start_maybe_http_server(self)
 
     def _ensure_partial_name(self):
         if self._config.partial_name is None:
@@ -641,12 +641,12 @@ def _collect_megatron_parallel_info():
 # -------------------------------------- http control server ------------------------------------------
 
 
-def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
+def _start_maybe_http_server(dumper: _Dumper):
     http_port = dumper._config.server_port
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
 
     rpc_broadcast = _create_zmq_rpc_broadcast(
-        dumper, base_port=zmq_base_port, timeout_seconds=timeout_seconds
+        dumper, base_port=zmq_base_port, timeout_seconds=dumper._config.timeout_seconds
     )
 
     if _get_rank() == 0 and rpc_broadcast is not None:
