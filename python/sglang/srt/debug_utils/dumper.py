@@ -927,16 +927,12 @@ class _FrameworkPlugin(ABC):
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
     try:
-        import sglang.srt.distributed as _dist
-        import sglang.srt.layers.dp_attention as _dp_attn
-        from sglang.srt.layers.logits_processor import (
-            LogitsProcessorOutput as _LogitsProcessorOutput,
-        )
+        from sglang.srt import distributed as _dist
+        from sglang.srt.layers import dp_attention as _dp_attn
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch as _ForwardBatch,
-        )
-        from sglang.srt.model_executor.forward_batch_info import (
-            PPProxyTensors as _PPProxyTensors,
+            ForwardBatch,
+            PPProxyTensors,
         )
     except ImportError:
         _available = False
@@ -982,9 +978,9 @@ class _SGLangPlugin(_FrameworkPlugin):
         if not self._available:
             return None
 
-        if isinstance(value, self._LogitsProcessorOutput):
+        if isinstance(value, self.LogitsProcessorOutput):
             return {"next_token_logits": value.next_token_logits}
-        if isinstance(value, self._ForwardBatch):
+        if isinstance(value, self.ForwardBatch):
             if skip_forward_batch:
                 return {}
             return {
@@ -992,7 +988,7 @@ class _SGLangPlugin(_FrameworkPlugin):
                 "seq_lens": value.seq_lens,
                 "positions": value.positions,
             }
-        if isinstance(value, self._PPProxyTensors):
+        if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
 
         return None
@@ -1006,7 +1002,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 class _MegatronPlugin(_FrameworkPlugin):
     _available = True
     try:
-        from megatron.core import parallel_state as _mpu
+        from megatron.core import parallel_state as _parallel_state
     except ImportError:
         _available = False
 
@@ -1029,7 +1025,9 @@ class _MegatronPlugin(_FrameworkPlugin):
             info["cp_rank"] = self._mpu.get_context_parallel_rank()
             info["cp_size"] = self._mpu.get_context_parallel_world_size()
             info["vpp_rank"] = self._mpu.get_virtual_pipeline_model_parallel_rank()
-            info["vpp_size"] = self._mpu.get_virtual_pipeline_model_parallel_world_size()
+            info["vpp_size"] = (
+                self._mpu.get_virtual_pipeline_model_parallel_world_size()
+            )
             info["ep_rank"] = self._mpu.get_expert_model_parallel_rank()
             info["ep_size"] = self._mpu.get_expert_model_parallel_world_size()
             info["etp_rank"] = self._mpu.get_expert_tensor_parallel_rank()
@@ -1039,7 +1037,9 @@ class _MegatronPlugin(_FrameworkPlugin):
             info["tcp_rank"] = self._mpu.get_tensor_and_context_parallel_rank()
             info["tcp_size"] = self._mpu.get_tensor_and_context_parallel_world_size()
             info["etmp_rank"] = self._mpu.get_expert_tensor_and_model_parallel_rank()
-            info["etmp_size"] = self._mpu.get_expert_tensor_and_model_parallel_world_size()
+            info["etmp_size"] = (
+                self._mpu.get_expert_tensor_and_model_parallel_world_size()
+            )
             info["tp_src_rank"] = self._mpu.get_tensor_model_parallel_src_rank()
             info["mp_src_rank"] = self._mpu.get_model_parallel_src_rank()
             info["dp_src_rank"] = self._mpu.get_data_parallel_src_rank()
