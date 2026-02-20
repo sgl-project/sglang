@@ -261,28 +261,7 @@ class _Dumper:
             "forward_pass_id": self._forward_pass_id,
         }
 
-    # ------------------------------- private ---------------------------------
-
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
-
-    def _handle_http_control_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self.get_state()
-        elif method == "configure":
-            self.configure(**body)
-            return {}
-        elif method == "reset":
-            self.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
+    # ------------------------- private :: related to dump -----------------------------
 
     def _dump_inner(
         self,
@@ -429,6 +408,29 @@ class _Dumper:
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
+
+    # ------------------------------- private :: misc ---------------------------------
+
+    def _handle_http_control_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
+
+    def _handle_http_control_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self.get_state()
+        elif method == "configure":
+            self.configure(**body)
+            return {}
+        elif method == "reset":
+            self.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     @cached_property
     def _static_meta(self) -> dict:
