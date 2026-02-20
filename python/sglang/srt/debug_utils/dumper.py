@@ -237,9 +237,7 @@ class _Dumper:
         dump_layers: Optional[List[int]] = None,
         **kwargs,
     ) -> "_HookDumper":
-        return _HookDumper(
-            dumper=self, model=model, dump_layers=dump_layers, **kwargs
-        )
+        return _HookDumper(dumper=self, model=model, dump_layers=dump_layers, **kwargs)
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -892,24 +890,10 @@ def _get_local_ip_by_remote() -> Optional[str]:
     return None
 
 
-# -------------------------------------- hook-based (non-invasive) dumper ------------------------------------------
+# -------------------------------------- hook-based (non-intrusive) dumper ------------------------------------------
 
 
 class _HookDumper:
-    """Registers forward hooks on model modules to non-invasively dump tensor outputs.
-
-    Instead of manually inserting ``dumper.dump()`` calls into model code, this class
-    attaches PyTorch forward hooks from the outside.  All captured outputs are delegated
-    to a ``_Dumper`` instance, so filtering, HTTP control, console logging, and metadata
-    work exactly as with manual dumps.
-
-    Typical model layout assumed::
-
-        XxxForCausalLM
-            (model): XxxModel          <-- top_level_module_name
-                (layers): ModuleList   <-- layers_module_name
-    """
-
     def __init__(
         self,
         dumper: _Dumper,
@@ -1009,9 +993,7 @@ class _HookDumper:
         if (cls := st.get("ForwardBatch")) and isinstance(output, cls):
             self._dumper.dump(f"{name}.forward_batch_info.input_ids", output.input_ids)
             self._dumper.dump(f"{name}.forward_batch_info.seq_lens", output.seq_lens)
-            self._dumper.dump(
-                f"{name}.forward_batch_info.positions", output.positions
-            )
+            self._dumper.dump(f"{name}.forward_batch_info.positions", output.positions)
             return
 
         if (cls := st.get("PPProxyTensors")) and isinstance(output, cls):
