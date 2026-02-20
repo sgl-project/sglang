@@ -223,6 +223,11 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+            if (
+                "Glm4MoeLiteForCausalLM"
+                in model_runner.model_config.hf_config.architectures
+            ):
+                self.prefill_use_mha_fia = True
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
             if (
@@ -756,8 +761,8 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
             )
-
-        if not self.use_mla:
+        forward_mha = not self.use_mla or getattr(self, "prefill_use_mha_fia", False)
+        if forward_mha:
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention
@@ -787,7 +792,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-            if self.use_fia:
+            if self.use_fia or getattr(self, "prefill_use_mha_fia", False):
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 attn_output = torch.empty(
