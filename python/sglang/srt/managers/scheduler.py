@@ -35,7 +35,6 @@ from torch.distributed import barrier
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.grammar_manager import GrammarManager
-from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -2965,6 +2964,8 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        from sglang.srt.debug_utils.dumper import dumper
+
         try:
             response: list = []
             if (
