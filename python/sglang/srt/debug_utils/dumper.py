@@ -202,6 +202,7 @@ class _Dumper:
                 print("[Dumper] Standalone HTTP server disabled")
             else:
                 _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
+                print(f"[Dumper] HTTP server started on port {http_port}")
 
     def _ensure_partial_name(self):
         if self._config.partial_name is None:
