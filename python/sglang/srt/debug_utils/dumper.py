@@ -653,13 +653,17 @@ def _start_maybe_http_server(dumper: _Dumper):
         dumper._rpc_broadcast = rpc_broadcast
 
         if http_port > 0:
-            handler_class = _make_http_handler(prefix="/dumper/", target=dumper)
-            server = HTTPServer(("0.0.0.0", http_port), handler_class)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            _start_http_server(prefix="/dumper/", target=dumper, http_port=http_port)
             print(f"[Dumper] HTTP server started on port {http_port}")
         else:
             print("[Dumper] Standalone HTTP server disabled")
+
+
+def _start_http_server(*, prefix: str, target: object, http_port: int):
+    handler_class = _make_http_handler(prefix=prefix, target=target)
+    server = HTTPServer(("0.0.0.0", http_port), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
 
 
 def _make_http_handler(*, prefix: str, target):
