@@ -103,7 +103,6 @@ class _DumperConfig(_FrozenConfig):
     collective_timeout: int = 60
     server_port: str = "-1"
     top_level_module_name: str = "model"
-    layers_module_name: str = "layers"
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -485,32 +484,17 @@ class _HookDumper:
         self._dumper = dumper
         self._special_types = _HookDumper._load_special_types()
 
-        config = dumper._config
-        top_level_module_name = config.top_level_module_name
-        layers_module_name = config.layers_module_name
-
-        matched, _ = self._add_hooks_recursive(
-            model=model,
-            prefix="",
-            top_level_module_name=top_level_module_name,
-            layers_module_name=layers_module_name,
-        )
+        matched, _ = self._add_hooks_recursive(model=model, prefix="")
         assert matched, f"model should have a module named {top_level_module_name}"
 
-    def _add_hooks_recursive(
-        self,
-        model: "torch.nn.Module",
-        prefix: str,
-        top_level_module_name: str,
-        layers_module_name: str,
-    ) -> tuple:
+    def _add_hooks_recursive(self, model: "torch.nn.Module", prefix: str) -> tuple:
         top_level_matched = False
 
         for name, module in model._modules.items():
             is_top_level = False
             if len(prefix) == 0:
                 cur_name = name
-                if cur_name == top_level_module_name:
+                if cur_name == dumper._config.top_level_module_name:
                     top_level_matched = True
                     is_top_level = True
             else:
@@ -520,8 +504,7 @@ class _HookDumper:
                 _, sub_count = self._add_hooks_recursive(
                     model=module,
                     prefix=cur_name,
-                    top_level_module_name=top_level_module_name,
-                    layers_module_name=layers_module_name,
+                    top_level_module_name=(dumper._config.top_level_module_name),
                 )
                 if sub_count == 0 or is_top_level:
                     module.register_forward_hook(self._make_forward_hook(cur_name))
@@ -555,13 +538,9 @@ class _HookDumper:
             return
 
         if (cls := st.get("ForwardBatch")) and isinstance(output, cls):
-            self._dumper.dump(
-                f"{name}.forward_batch_info.input_ids", output.input_ids
-            )
+            self._dumper.dump(f"{name}.forward_batch_info.input_ids", output.input_ids)
             self._dumper.dump(f"{name}.forward_batch_info.seq_lens", output.seq_lens)
-            self._dumper.dump(
-                f"{name}.forward_batch_info.positions", output.positions
-            )
+            self._dumper.dump(f"{name}.forward_batch_info.positions", output.positions)
             return
 
         if (cls := st.get("PPProxyTensors")) and isinstance(output, cls):
