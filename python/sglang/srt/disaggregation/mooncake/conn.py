@@ -420,10 +420,8 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
-        # Use total (un-sharded) KV head count for correct head distribution.
-        # With GQA replication (num_kv_heads < tp_size), per-rank kv_head_num
-        # is max(1, total//tp) and multiple ranks share the same head.
-        # Back-computing total as kv_head_num * tp_size overestimates in this case.
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
@@ -434,14 +432,12 @@ class MooncakeKVManager(CommonKVManager):
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
 
-        # Replication factor: how many prefill ranks share the same KV head
+        # GQA replication: how many prefill ranks share the same KV head
         src_replication = max(1, self.attn_tp_size // total_kv_heads)
 
         # Determine slicing parameters based on TP configuration
         if self.attn_tp_size > dst_attn_tp_size:
-            # Send KVCache from multiple prefill instances to 1 decode instance.
-            # With replication, multiple prefill ranks hold the same head.
-            # Use (rank // replication) to map to the correct unique head index.
+            # Send KVCache from multiple prefill instances to 1 decode instance
             src_head_start_offset = 0
             num_heads_to_send = src_heads_per_rank
             unique_head_idx = local_tp_rank_in_group // src_replication
