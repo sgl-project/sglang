@@ -482,40 +482,24 @@ class _HookDumper:
         model: "torch.nn.Module",
     ):
         self._dumper = dumper
+        top = dumper._config.top_level_module_name
+        top_found = False
 
-        matched, _ = self._add_hooks_recursive(model=model, prefix="")
-        assert (
-            matched
-        ), f"model should have a module named {self._dumper._config.top_level_module_name}"
+        for name, module in model.named_modules():
+            if not name:
+                continue
 
-    def _add_hooks_recursive(
-        self, model: "torch.nn.Module", prefix: str
-    ) -> tuple[bool, int]:
-        top_level_matched = False
+            is_top = name == top
+            if is_top:
+                top_found = True
 
-        for name, module in model._modules.items():
-            is_top_level = False
-            if len(prefix) == 0:
-                cur_name = name
-                if cur_name == self._dumper._config.top_level_module_name:
-                    top_level_matched = True
-                    is_top_level = True
-            else:
-                cur_name = prefix + "." + name
-
-            if module is not None:
-                _, sub_count = self._add_hooks_recursive(
-                    model=module,
-                    prefix=cur_name,
+            is_leaf = next(module.children(), None) is None
+            if is_leaf or is_top:
+                module.register_forward_hook(
+                    self._make_forward_hook(name=name, is_top_level=is_top)
                 )
-                if sub_count == 0 or is_top_level:
-                    module.register_forward_hook(
-                        self._make_forward_hook(
-                            name=cur_name, is_top_level=is_top_level
-                        )
-                    )
 
-        return top_level_matched, len(model._modules)
+        assert top_found, f"model should have a module named {top}"
 
     def _make_forward_hook(self, name: str, is_top_level: bool):
         def _hook(_module, input, output):
