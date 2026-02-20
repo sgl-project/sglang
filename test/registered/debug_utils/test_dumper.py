@@ -19,7 +19,6 @@ from sglang.srt.debug_utils.dumper import (
     _Dumper,
     _DumperConfig,
     _format_tags,
-    _HookDumper,
     _materialize_value,
     _obj_to_dict,
     _torch_save,

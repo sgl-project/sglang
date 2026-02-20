@@ -487,7 +487,9 @@ class _HookDumper:
         self._dumper = dumper
 
         for module_name, module in model.named_modules():
-            module.register_forward_hook(self._make_forward_hook(module_name=module_name))
+            module.register_forward_hook(
+                self._make_forward_hook(module_name=module_name)
+            )
 
     def _make_forward_hook(self, module_name: str):
         def _hook(_module, input, output):
@@ -518,8 +520,10 @@ class _HookDumper:
         # SGLang specific
         try:
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                PPProxyTensors,
+            )
 
             if isinstance(value, LogitsProcessorOutput):
                 return {"next_token_logits": value.next_token_logits}
