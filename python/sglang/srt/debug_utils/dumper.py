@@ -265,12 +265,12 @@ class _Dumper:
             return
 
         captured_forward_pass_id = self._forward_pass_id
-        captured_extra = deepcopy(extra_kwargs)
+        captured_user_kwargs = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
             self._dump_single(
                 tag="Dumper.Grad",
-                user_kwargs=dict(name=f"grad__{name}", **captured_extra),
+                user_kwargs=captured_user_kwargs,
                 value=grad,
                 save=save,
                 forward_pass_id=captured_forward_pass_id,
