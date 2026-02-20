@@ -7,6 +7,8 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
+import os
+
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -63,6 +65,42 @@ class ImageEncodingStage(PipelineStage):
         self.image_processor = image_processor
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
+
+        # Apply torch.compile to text encoder if enabled and not using FSDP
+        self._maybe_compile_text_encoder()
+
+    def _maybe_compile_text_encoder(self):
+        """Compile text encoder with torch.compile if enabled."""
+        if not self.server_args.enable_torch_compile:
+            return
+
+        if self.text_encoder is None:
+            return
+
+        try:
+            from torch.distributed.fsdp import FSDPModule
+
+            is_fsdp = isinstance(self.text_encoder, FSDPModule) or any(
+                isinstance(m, FSDPModule) for m in self.text_encoder.modules()
+            )
+        except ImportError:
+            is_fsdp = False
+
+        if is_fsdp:
+            logger.info(
+                f"Text encoder ({self.text_encoder.__class__.__name__}) is sharded with FSDP. "
+                "Skipping torch.compile."
+            )
+            return
+
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        logger.info(f"Compiling text encoder with mode: {mode}")
+        try:
+            self.text_encoder.forward = torch.compile(
+                self.text_encoder.forward, mode=mode
+            )
+        except Exception as e:
+            logger.error(f"Failed to compile text encoder: {e}")
 
     def load_model(self):
         if self.server_args.image_encoder_cpu_offload:
