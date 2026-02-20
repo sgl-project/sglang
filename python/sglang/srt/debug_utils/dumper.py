@@ -10,16 +10,48 @@ from dataclasses import dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional, get_args, get_type_hints
+from typing import ClassVar, List, Optional, Self, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
 
-# -------------------------------------- dumper config ------------------------------------------
+# -------------------------------------- frozen config base ------------------------------------------
 
 
 @dataclass(frozen=True)
-class _DumperConfig:
+class _FrozenConfig:
+    _env_prefix: ClassVar[str] = ""
+
+    def __post_init__(self) -> None:
+        _verify_dataclass_types(self)
+
+    @classmethod
+    def _env_name(cls, field_name: str) -> str:
+        return f"{cls._env_prefix}{field_name.upper()}"
+
+    @classmethod
+    def from_env(cls) -> Self:
+        return cls(
+            **{
+                f.name: _parse_env_field(cls._env_name(f.name), f.default)
+                for f in fields(cls)
+            }
+        )
+
+    def with_defaults(self, **kwargs) -> Self:
+        cls = type(self)
+        actual = {
+            key: value
+            for key, value in kwargs.items()
+            if os.getenv(cls._env_name(key)) is None
+        }
+        return replace(self, **actual) if actual else self
+
+
+@dataclass(frozen=True)
+class _DumperConfig(_FrozenConfig):
+    _env_prefix: ClassVar[str] = "SGLANG_DUMPER_"
+
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp"
@@ -33,26 +65,6 @@ class _DumperConfig:
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
-
-    def __post_init__(self):
-        _verify_dataclass_types(self)
-
-    @classmethod
-    def from_env(cls) -> "_DumperConfig":
-        return cls(
-            **{
-                f.name: _parse_env_field(_env_name(f.name), f.default)
-                for f in fields(cls)
-            }
-        )
-
-    def with_defaults(self, **kwargs) -> "_DumperConfig":
-        actual = {
-            key: value
-            for key, value in kwargs.items()
-            if os.getenv(_env_name(key)) is None
-        }
-        return replace(self, **actual) if actual else self
 
 
 def _verify_dataclass_types(instance) -> None:
@@ -75,13 +87,6 @@ def _unwrap_type(hint) -> type:
     if args:
         return next(a for a in args if a is not type(None))
     return hint
-
-
-_ENV_PREFIX = "SGLANG_DUMPER_"
-
-
-def _env_name(field_name: str) -> str:
-    return f"{_ENV_PREFIX}{field_name.upper()}"
 
 
 def _parse_env_field(env_name: str, default):
