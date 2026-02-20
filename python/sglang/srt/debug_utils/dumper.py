@@ -98,6 +98,7 @@ class _DumperConfig(_FrozenConfig):
     enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
+    server_port: int = 40000
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -641,7 +642,7 @@ def _collect_megatron_parallel_info():
 
 
 def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
-    http_port = get_int_env_var("SGLANG_DUMPER_SERVER_PORT", 40000)
+    http_port = dumper._config.server_port
     zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
 
     rpc_broadcast = _create_zmq_rpc_broadcast(

@@ -1877,8 +1877,9 @@ def launch_server(
         )
     )
 
-    dumper_http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
-    if dumper_http_port <= 0:
+    from sglang.srt.debug_utils.dumper import _DumperConfig
+
+    if _DumperConfig.from_env().server_port <= 0:
         app.add_api_route(
             "/dumper/{method}", _dumper_control_handler, methods=["POST"]
         )
