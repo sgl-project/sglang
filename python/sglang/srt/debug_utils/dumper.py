@@ -491,8 +491,8 @@ class _HookDumper:
 
     def _make_forward_hook(self, name: str):
         def _hook(_module, _input, output):
-            for item in _input:
-                self._dump_converted(name, item, role="inputs")
+            for i, item in enumerate(_input):
+                self._dump_converted(name, item, role=f"inputs.{i}")
 
             if output is not None:
                 self._dump_converted(name, output, role="output")
