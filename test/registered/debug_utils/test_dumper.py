@@ -833,43 +833,16 @@ class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
     @staticmethod
-    def _standalone_worker(rank: int, world_size: int, nccl_port: int, http_port: int):
+    def _standalone_func(rank, http_port: int, stop_event):
         import os
 
         os.environ["SGLANG_DUMPER_ENABLE"] = "0"
         os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
 
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://127.0.0.1:{nccl_port}",
-            world_size=world_size,
-            rank=rank,
-        )
-        try:
-            from sglang.srt.debug_utils.dumper import dumper
+        from sglang.srt.debug_utils.dumper import dumper
 
-            dumper.on_forward_pass_start()
-            while True:
-                time.sleep(3600)
-        finally:
-            dist.destroy_process_group()
-
-    @staticmethod
-    def _start_standalone_server(http_port: int) -> "list[mp.Process]":
-        import torch.multiprocessing as mp
-
-        nccl_port = find_available_port(29500)
-        ctx = mp.get_context("spawn")
-        procs: list[mp.Process] = []
-        for rank in range(2):
-            p = ctx.Process(
-                target=TestDumperHttp._standalone_worker,
-                args=(rank, 2, nccl_port, http_port),
-            )
-            p.start()
-            procs.append(p)
-        return procs
+        dumper.on_forward_pass_start()
+        stop_event.wait()
 
     @staticmethod
     def _wait_for_http(url: str, timeout: float = 30) -> None:
@@ -884,14 +857,24 @@ class TestDumperHttp:
 
     @pytest.fixture(scope="class", params=["standalone", "sglang"])
     def dumper_http_url(self, request):
+        import multiprocessing
+
         if request.param == "standalone":
             http_port = find_available_port(40000)
             base_url = f"http://127.0.0.1:{http_port}"
-            procs = TestDumperHttp._start_standalone_server(http_port=http_port)
-            TestDumperHttp._wait_for_http(base_url)
-            yield base_url
-            for p in procs:
-                kill_process_tree(p.pid)
+            stop_event = multiprocessing.Event()
+            thread = threading.Thread(
+                target=run_distributed_test,
+                args=(TestDumperHttp._standalone_func,),
+                kwargs={"http_port": http_port, "stop_event": stop_event},
+            )
+            thread.start()
+            try:
+                TestDumperHttp._wait_for_http(base_url)
+                yield base_url
+            finally:
+                stop_event.set()
+                thread.join(timeout=10)
         else:
             base_url = DEFAULT_URL_FOR_TEST
             proc = popen_launch_server(
@@ -900,8 +883,10 @@ class TestDumperHttp:
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=["--max-total-tokens", "128"],
             )
-            yield base_url
-            kill_process_tree(proc.pid)
+            try:
+                yield base_url
+            finally:
+                kill_process_tree(proc.pid)
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
