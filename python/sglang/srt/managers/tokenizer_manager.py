@@ -748,6 +748,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
+    def _validate_rid(self, obj: Union[GenerateReqInput, EmbeddingReqInput]) -> None:
+        """Validate the request ID (rid) uniqueness."""
+        rid = obj.rid
+        if rid is None:
+            # This shouldn't happen, as the request is already normalized.
+            return
+        ids = rid if isinstance(rid, list) else [rid]
+        if len(ids) != len(set(ids)):
+            obj.regenerate_rid()  # Regenerate rid to avoid background abort task killing the running request.
+            raise ValueError(f"Duplicate request IDs detected within the request: {ids}")
+        
+        for i in ids:
+            if i in self.rid_to_state:
+                obj.regenerate_rid()  # Regenerate rid to avoid background abort task killing the running request.
+                raise ValueError(f"Duplicate request ID detected: {i}")           
+    
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
@@ -1063,6 +1079,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        self._validate_rid(obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = self.req_state_class(
             [], False, asyncio.Event(), obj, created_time=created_time
@@ -1088,6 +1105,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        self._validate_rid(obj)
         self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
