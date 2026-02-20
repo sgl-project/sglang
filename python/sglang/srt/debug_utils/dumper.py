@@ -181,24 +181,6 @@ class _Dumper:
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
         )
 
-    def set_ctx(self, **kwargs):
-        """
-        Example:
-
-        dumper.configure_default(filter='layer_id=[0-3]')
-        dumper.set_ctx(layer_id=self.layer_id)
-        ...
-        dumper.set_ctx(layer_id=None)
-        """
-        self._global_ctx = {
-            k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
-        }
-
-    def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
-        data = _obj_to_dict(data)
-        for name, value in data.items():
-            self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
-
     def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
         self._dump_inner(
             name=name,
@@ -231,6 +213,24 @@ class _Dumper:
                 value_tag="Dumper.ParamValue",
                 grad_tag="Dumper.ParamGrad",
             )
+
+    def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
+        data = _obj_to_dict(data)
+        for name, value in data.items():
+            self.dump(f"{name_prefix}_{name}", value, save=save, **kwargs)
+
+    def set_ctx(self, **kwargs):
+        """
+        Example:
+
+        dumper.configure_default(filter='layer_id=[0-3]')
+        dumper.set_ctx(layer_id=self.layer_id)
+        ...
+        dumper.set_ctx(layer_id=None)
+        """
+        self._global_ctx = {
+            k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
+        }
 
     # ------------------------------- public secondary API ---------------------------------
 
