@@ -27,7 +27,6 @@ from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     find_available_port,
@@ -904,7 +903,7 @@ def dumper_http_url(request):
     else:
         base_url = DEFAULT_URL_FOR_TEST
         proc = popen_launch_server(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            "Qwen/Qwen3-0.6B",
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--max-total-tokens", "128"],
