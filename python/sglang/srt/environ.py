@@ -205,7 +205,6 @@ class Envs:
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
-    SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
@@ -495,12 +494,17 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def _print_deprecated_env(new_name: str, old_name: str):
+def _print_deprecated_env(
+    new_name: str, old_name: str, *, invert: bool = False
+):
     if old_name in os.environ:
         warnings.warn(
             f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
         )
-        os.environ[new_name] = os.environ[old_name]
+        value = os.environ[old_name]
+        if invert:
+            value = str(not EnvBool(False).parse(value))
+        os.environ[new_name] = value
 
 
 def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
@@ -523,6 +527,12 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env(
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        invert=True,
+    )
+    _print_deprecated_env(
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        invert=True,
     )
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
