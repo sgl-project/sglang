@@ -283,6 +283,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
   /*
+   * From csrc/ngram_embedding
+   */
+  m.def(
+    "compute_n_gram_ids(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, Tensor exclusive_ne_embeder_size_sums, Tensor tokens, "
+    "Tensor exclusive_req_len_sums, Tensor ne_token_table, Tensor row_indices, Tensor column_starts, Tensor! n_gram_ids, int cuda_stream) -> ()");
+  m.impl("compute_n_gram_ids", torch::kCUDA, &compute_n_gram_ids);
+
+  m.def(
+    "update_token_table(Tensor tokens, Tensor ne_token_table, Tensor row_indices, Tensor column_starts, Tensor req_lens, Tensor ignore_tokens, int cuda_stream) -> ()");
+  m.impl("update_token_table", torch::kCUDA, &update_token_table);
+
+  /*
    * From csrc/moe/cutlass_moe/w4a8
    */
   m.def(

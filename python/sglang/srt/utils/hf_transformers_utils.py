@@ -342,6 +342,8 @@ def get_config(
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
+    if config.architectures in [["LongcatCausalLM"], ["LongcatFlashForCausalLM"], ["LongcatFlashNgramForCausalLM"]]:
+        config.model_type = "longcat_flash"
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
@@ -389,6 +391,8 @@ def get_config(
     if config.model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
 
+    if config.model_type == "longcat_flash":
+        config.update({"architectures": ["LongcatFlashForCausalLM"]})
     if model_override_args:
         config.update(model_override_args)
 

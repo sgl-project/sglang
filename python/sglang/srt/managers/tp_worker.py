@@ -40,7 +40,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -448,6 +448,13 @@ class TpModelWorker(BaseTpWorker):
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+        if self.model_runner.use_ngram_embedding:
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                forward_batch.ne_column_starts[:forward_batch.batch_size] = forward_batch.extend_prefix_lens
+                forward_batch.ne_req_lens[:forward_batch.batch_size] = forward_batch.extend_seq_lens
+            elif forward_batch.forward_mode == ForwardMode.DECODE:
+                forward_batch.ne_column_starts[:forward_batch.batch_size] = forward_batch.seq_lens - 1
+                forward_batch.ne_req_lens[:forward_batch.batch_size] = 1
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
