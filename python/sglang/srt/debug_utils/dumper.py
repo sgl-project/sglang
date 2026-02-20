@@ -492,13 +492,13 @@ class _HookDumper:
             if not name:
                 continue
 
-            is_top = name == top_level_module_name
-            top_found |= is_top
+            is_top_level = name == top_level_module_name
+            top_found |= is_top_level
 
             is_leaf = next(module.children(), None) is None
-            if is_leaf or is_top:
+            if is_leaf or is_top_level:
                 module.register_forward_hook(
-                    self._make_forward_hook(name=name, is_top_level=is_top)
+                    self._make_forward_hook(name=name, is_top_level=is_top_level)
                 )
 
         assert top_found, f"model should have a module named {top_level_module_name}"
