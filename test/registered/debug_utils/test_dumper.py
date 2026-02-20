@@ -1527,19 +1527,12 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
 
 
 class TestDumperE2E:
-    """End-to-end test: real sglang server (tp=2) with dumper integration.
-
-    Server starts with dumper disabled; a warm-up request triggers ZMQ RPC
-    setup across ranks via step(), then HTTP configure reaches all ranks.
-    """
-
     def test_step_and_non_intrusive_hooks(self, tmp_path):
         base_url = DEFAULT_URL_FOR_TEST
         dump_dir = str(tmp_path)
         env = {
             **os.environ,
             "DUMPER_SERVER_PORT": "reuse",
-            "DUMPER_NON_INTRUSIVE_MODE": "core",
         }
         proc = popen_launch_server(
             "Qwen/Qwen3-0.6B",
@@ -1549,7 +1542,7 @@ class TestDumperE2E:
             env=env,
         )
         try:
-            # Warm-up: trigger forward pass so step() runs _ensure_http_server()
+            # Warm-up: trigger forward pass so step() calls _ensure_http_server()
             # and sets up ZMQ RPC broadcast across all TP ranks.
             resp = requests.post(
                 f"{base_url}/generate",
@@ -1557,8 +1550,6 @@ class TestDumperE2E:
             )
             assert resp.status_code == 200, f"Warm-up generate failed: {resp.text}"
 
-            # Verify dumper is still disabled, step==0 on all ranks.
-            # (ZMQ is now up, so get_state reaches all ranks.)
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
@@ -1571,7 +1562,6 @@ class TestDumperE2E:
                 json={"enable": True, "dir": dump_dir},
             ).raise_for_status()
 
-            # Verify config propagated to all ranks
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2
             for rank, state in enumerate(states):
@@ -1580,14 +1570,12 @@ class TestDumperE2E:
                 ), f"rank {rank}: enable should be True after configure"
                 assert state["config"]["dir"] == dump_dir
 
-            # Send inference request — hooks fire and dump data
             resp = requests.post(
                 f"{base_url}/generate",
                 json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
             )
             assert resp.status_code == 200, f"Generate failed: {resp.text}"
 
-            # Verify step counter advanced on all ranks
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2
             steps = [s["step"] for s in states]
@@ -1595,7 +1583,13 @@ class TestDumperE2E:
                 assert step > 0, f"rank {rank}: step should be > 0, got {step}"
             assert steps[0] == steps[1], f"step mismatch across ranks: {steps}"
 
-            # Verify dump files exist for both ranks with core fields
+            # Diagnostic: list dump_dir contents
+            all_entries = sorted(Path(dump_dir).rglob("*"))
+            print(
+                f"[diag] dump_dir={dump_dir} "
+                f"entries({len(all_entries)})={[str(e) for e in all_entries[:30]]}"
+            )
+
             dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
@@ -1611,7 +1605,6 @@ class TestDumperE2E:
                     f"rank={rank}" in f for f in filenames
                 ), f"No dump files for rank {rank}"
 
-            # Verify dump file structure is loadable
             sample_file = dump_files[0]
             loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
             assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
