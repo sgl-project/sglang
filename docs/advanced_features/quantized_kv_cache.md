@@ -31,6 +31,27 @@ FP4 quantization is currently experimental.
 
 - **E2M1** (1 sign bit, 2 exponent bits, 1 mantissa bit): Uses block-based microscaling where tensors are divided into blocks of consecutive elements, with each block sharing a single 8-bit exponential scaling factor. While OCP specifies blocks of 32 elements, SGLang's current implementation uses blocks of 16 elements for KV cache quantization.
 
+### int8 Format
+
+```{warning}
+int8 quantization is currently experimental.
+It doesn't support MLA backend, speculative decoding;
+It only compatible with fa3 prefill attention backend and triton decode backend
+```
+
+int8 quantization uses 8-bit signed integers to store the KV cache, providing memory savings compared to BF16. The quantization uses per-token, per-head scaling factors (scale and zero point) to map floating-point values to the 8-bit integer range [0, 255].
+
+
+### int4 Format
+
+```{warning}
+int4 quantization is currently experimental.
+It doesn't support MLA backend, speculative decoding;
+It only compatible with fa3 prefill attention backend and triton decode backend
+```
+
+int4 quantization uses 4-bit signed integers to store the KV cache, providing memory savings compared to BF16. Values are packed (two 4-bit values per byte) and use per-token, per-head scaling factors (scale and zero point) to map floating-point values to the 4-bit integer range [0, 15].
+
 ## Usage
 
 ### Enabling Quantized KV Cache
@@ -52,6 +73,16 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
     --model-path nvidia/DeepSeek-R1-0528-NVFP4 \
     --kv-cache-dtype fp4_e2m1 \
+
+# Enable int8 KV cache
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-32B \
+    --kv-cache-dtype int8 \
+
+# Enable int4 KV cache
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen-32B \
+    --kv-cache-dtype int4 \
 ```
 
 ### Scaling Factors
@@ -91,6 +122,8 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 
 ```{tip}
 **FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
+
+**int8/int4**: Unlike FP8/FP4, int8 and int4 quantization compute scale and zero point parameters automatically during quantization. No pre-quantized models or external parameter files are required—the per-token, per-head scale and zero point values are computed dynamically as needed.
 ```
 
 ## Performance Considerations
@@ -99,9 +132,13 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 
 Quantized KV cache provides significant memory savings:
 - **BF16 → FP4**: Supports approximately 3.56× more tokens than BF16 (accounting for scaling factor overhead)
+- **BF16 → int8**: Stores quantized values as 1 byte per value (vs 2 bytes for BF16), with overhead of two float32 values (8 bytes) per head_dim per token for scale and zero point. Supports `(head_dim × 2) / (head_dim + 4)`× more tokens than BF16
+- **BF16 → int4**: Stores quantized values as 0.5 bytes per value (packed, vs 2 bytes for BF16), with overhead of two float32 values (8 bytes) per head_dim per token for scale and zero point. Supports `(head_dim × 2)/(head_dim / 2 + 4)`× more tokens than BF16
 
 ```{note}
 FP4 and FP8 quantization require additional memory for block-based scaling factors, which reduces the effective memory savings compared to the raw bit-width reduction. FP4 with block size 16 supports approximately 1.78× more tokens than FP8, and approximately 3.56× more tokens than BF16. The relative token capacity between FP8 and BF16 can be derived from these ratios.
+
+int8 and int4 quantization require additional memory for per-token, per-head scale and zero point parameters (two float32 values, 8 bytes total, per head_dim per token), which reduces the effective memory savings. The overhead becomes less significant for larger head dimensions.
 ```
 
 This enables longer context lengths or more concurrent requests within the same memory budget.
@@ -144,6 +181,30 @@ On smaller models, FP4 shows more pronounced accuracy drops, particularly on cha
 - **Simple datasets (e.g., gsm8k)**: FP4 maintains accuracy close to FP8/BF16 across model sizes
 - **Model size matters**: Large models (200B+ parameters) generally tolerate FP4 quantization better than smaller models
 - **Context length**: Accuracy degradation may be more pronounced in long-context scenarios, as the accumulation of the quantization error may become significant.
+
+#### int8/int4 Accuracy
+
+int8 and int4 quantization provide different trade-offs between memory savings and accuracy:
+
+**int8 Accuracy**
+
+int8 quantization typically introduces minimal accuracy degradation compared to non-quantized baselines.
+
+**int4 Accuracy**
+
+int4 quantization provides more memory savings but introduces more significant accuracy degradation (20% relative error) compared to non-quantized baselines.
+
+**Test Results (Qwen/Qwen3-32B on GPQA)**
+
+Preliminary test results show the accuracy impact of int8 and int4 quantization:
+
+| Model | Dataset | BF16 | INT8 | INT4 |
+|-------|---------|------|------|------|
+| Qwen/Qwen3-32B | gpqa | 0.6232 | 0.6252 | 0.473 |
+
+```{tip}
+Evaluate int8/int4 accuracy on your specific model and workload. For applications requiring high accuracy, int8 is recommended. For applications where memory is critical and some accuracy degradation is acceptable, int4 can provide significant benefits.
+```
 
 ```{tip}
 Evaluate FP4 accuracy on your specific model and workload. Large models on simpler tasks typically show minimal degradation, while smaller models or complex reasoning tasks may require FP8 or BF16 for acceptable accuracy.

@@ -45,8 +45,18 @@ _is_npu = is_npu()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        if self.kv_cache_dtype not in ("int4", "int8"):
+            kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        elif self.kv_cache_dtype == "int4":
+            kv_size = 0.5
+        elif self.kv_cache_dtype == "int8":
+            kv_size = 1
+
         if self.use_mla_backend:
+            assert self.kv_cache_dtype not in (
+                "int4",
+                "int8",
+            ), "MLA backend does not support int4 and int8"
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -80,6 +90,10 @@ class ModelRunnerKVCacheMixin:
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
             if self.model_config.is_hybrid_swa:
+                assert self.kv_cache_dtype not in (
+                    "int4",
+                    "int8",
+                ), "Hybrid SWA model does not support int4 and int8"
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
                 swa_layers_num = len(self.model_config.swa_attention_layer_ids)
 
@@ -95,12 +109,48 @@ class ModelRunnerKVCacheMixin:
                     full_per_token * full_layers_num + swa_per_token * swa_layers_num
                 ) * kv_size
             else:
-                cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * (self.model_config.head_dim + self.model_config.v_head_dim)
-                    * num_layers
-                    * kv_size
-                )
+                if self.kv_cache_dtype == "int4":
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        # two neighbour dims are packed into one byte, equal to ceil(head_dim/2) + ceil(v_head_dim/2)
+                        * (
+                            (self.model_config.head_dim + 1) // 2
+                            + (self.model_config.v_head_dim + 1) // 2
+                        )
+                        * num_layers
+                    )
+                    cell_size = cell_size + (
+                        (
+                            self.model_config.get_num_kv_heads(get_attention_tp_size())
+                            * num_layers
+                            * 2  # key and value
+                            * 2  # scale and zero
+                        )
+                        * torch._utils._element_size(torch.float32)
+                    )
+                elif self.kv_cache_dtype == "int8":
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * (self.model_config.head_dim + self.model_config.v_head_dim)
+                        * num_layers
+                        * 1
+                    )
+                    cell_size = cell_size + (
+                        (
+                            self.model_config.get_num_kv_heads(get_attention_tp_size())
+                            * num_layers
+                            * 2  # key and value
+                            * 2  # scale and zero
+                        )
+                        * torch._utils._element_size(torch.float32)
+                    )
+                else:
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * (self.model_config.head_dim + self.model_config.v_head_dim)
+                        * num_layers
+                        * kv_size
+                    )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -679,6 +729,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        model_dtype=self.dtype,
                     )
 
         # Initialize token_to_kv_pool_allocator
