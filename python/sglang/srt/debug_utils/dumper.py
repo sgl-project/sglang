@@ -216,8 +216,8 @@ class _Dumper:
         if not (self._enable and (self._override_enable is not False)):
             return
 
-        user_kwargs = dict(name=name, **extra_kwargs, **self._global_ctx)
-        if (f := self._filter) is not None and re.search(f, _format_kwargs(user_kwargs)) is None:
+        tags = dict(name=name, **extra_kwargs, **self._global_ctx)
+        if (f := self._filter) is not None and re.search(f, _format_kwargs(tags)) is None:
             return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
@@ -231,7 +231,7 @@ class _Dumper:
         if enable_value:
             self._dump_single(
                 tag=value_tag,
-                user_kwargs=user_kwargs,
+                tags=tags,
                 value=value,
                 save=save,
             )
@@ -243,7 +243,7 @@ class _Dumper:
         ):
             self._dump_single(
                 tag=grad_tag,
-                user_kwargs={**user_kwargs, "name": f"grad__{name}"},
+                tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
             )
@@ -265,12 +265,12 @@ class _Dumper:
             return
 
         captured_forward_pass_id = self._forward_pass_id
-        captured_user_kwargs = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
+        captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
             self._dump_single(
                 tag="Dumper.Grad",
-                user_kwargs=captured_user_kwargs,
+                tags=captured_tags,
                 value=grad,
                 save=save,
                 forward_pass_id=captured_forward_pass_id,
@@ -282,7 +282,7 @@ class _Dumper:
         self,
         *,
         tag: str,
-        user_kwargs: dict,
+        tags: dict,
         value,
         save: bool,
         forward_pass_id: Optional[int] = None,
@@ -299,7 +299,7 @@ class _Dumper:
             ),
             rank=rank,
             dump_index=self._dump_index,
-            **user_kwargs,
+            **tags,
         )
         full_filename = _format_kwargs(full_kwargs) + ".pt"
         path = self._base_dir / f"sglang_dump_{self._partial_name}" / full_filename
@@ -324,7 +324,7 @@ class _Dumper:
 
             if capturing:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
-                self._captured_output_data[user_kwargs["name"]] = output_data
+                self._captured_output_data[tags["name"]] = output_data
             else:
                 if self._pending_cleanup:
                     self._pending_cleanup = False
