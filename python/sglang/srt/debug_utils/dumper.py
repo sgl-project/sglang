@@ -231,11 +231,11 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
-    def register_model_forward_hook(
+    def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
-    ) -> "_HookDumper":
-        return _HookDumper(dumper=self, model=model)
+    ) -> "_NonIntrusiveDumper":
+        return _NonIntrusiveDumper(dumper=self, model=model)
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -474,10 +474,10 @@ class _Dumper:
 # -------------------------------------- hook dumper ------------------------------------------
 
 
-class _HookDumper:
+class _NonIntrusiveDumper:
     """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
 
-    _NAME_PREFIX = "hook__"
+    _NAME_PREFIX = "non_intrusive__"
 
     def __init__(
         self,

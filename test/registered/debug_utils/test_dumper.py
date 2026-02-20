@@ -967,7 +967,7 @@ def _make_hook_model(inner_cls):
     return OuterModel()
 
 
-class TestHookDumper:
+class TestNonIntrusiveDumper:
     def test_basic_inputs_and_outputs(self, tmp_path):
         class Inner(torch.nn.Module):
             def __init__(self):
@@ -980,21 +980,21 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             output = model(x)
 
-        assert "hook__output" in captured
-        assert torch.allclose(captured["hook__output"]["value"], output)
-        assert "hook__inputs.0" in captured
-        assert "hook__model.output" in captured
-        assert "hook__model.inputs.0" in captured
-        assert "hook__model.linear.output" in captured
-        assert "hook__model.linear.inputs.0" in captured
-        assert "hook__model.relu.output" in captured
-        assert "hook__model.relu.inputs.0" in captured
+        assert "non_intrusive__output" in captured
+        assert torch.allclose(captured["non_intrusive__output"]["value"], output)
+        assert "non_intrusive__inputs.0" in captured
+        assert "non_intrusive__model.output" in captured
+        assert "non_intrusive__model.inputs.0" in captured
+        assert "non_intrusive__model.linear.output" in captured
+        assert "non_intrusive__model.linear.inputs.0" in captured
+        assert "non_intrusive__model.relu.output" in captured
+        assert "non_intrusive__model.relu.inputs.0" in captured
 
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
@@ -1029,13 +1029,13 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        P = "hook__"
+        P = "non_intrusive__"
         for suffix in [
             "output",
             "model.output",
@@ -1068,15 +1068,15 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.split.output.0" in captured
-        assert "hook__model.split.output.1" in captured
-        assert torch.allclose(captured["hook__model.split.output.0"]["value"], x)
+        assert "non_intrusive__model.split.output.0" in captured
+        assert "non_intrusive__model.split.output.1" in captured
+        assert torch.allclose(captured["non_intrusive__model.split.output.0"]["value"], x)
 
     def test_single_tensor_tuple_collapses(self, tmp_path):
         class SingleTupleModule(torch.nn.Module):
@@ -1093,14 +1093,14 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.wrap.output" in captured
-        assert "hook__model.wrap.output.0" not in captured
+        assert "non_intrusive__model.wrap.output" in captured
+        assert "non_intrusive__model.wrap.output.0" not in captured
 
     def test_multiple_forward_inputs(self, tmp_path):
         class TwoInputModule(torch.nn.Module):
@@ -1118,14 +1118,14 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.mul.inputs.0" in captured
-        assert "hook__model.mul.inputs.1" in captured
+        assert "non_intrusive__model.mul.inputs.0" in captured
+        assert "non_intrusive__model.mul.inputs.1" in captured
 
     def test_none_output_only_dumps_inputs(self, tmp_path):
         class NoneModule(torch.nn.Module):
@@ -1143,14 +1143,14 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.sink.inputs.0" in captured
-        assert not any(k.startswith("hook__model.sink.output") for k in captured)
+        assert "non_intrusive__model.sink.inputs.0" in captured
+        assert not any(k.startswith("non_intrusive__model.sink.output") for k in captured)
 
     def test_non_tensor_value_silently_skipped(self, tmp_path):
         class IntModule(torch.nn.Module):
@@ -1168,30 +1168,30 @@ class TestHookDumper:
 
         d = _make_test_dumper(tmp_path)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.const.inputs.0" in captured
-        assert not any(k.startswith("hook__model.const.output") for k in captured)
+        assert "non_intrusive__model.const.inputs.0" in captured
+        assert not any(k.startswith("non_intrusive__model.const.output") for k in captured)
 
     def test_root_module_name_no_malformed_dots(self, tmp_path):
         d = _make_test_dumper(tmp_path)
         model = torch.nn.Linear(4, 4)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
         for key in captured:
-            assert not key.startswith("hook__."), f"malformed key: {key}"
+            assert not key.startswith("non_intrusive__."), f"malformed key: {key}"
             assert ".." not in key, f"double dot in key: {key}"
 
-        assert "hook__output" in captured
-        assert "hook__inputs.0" in captured
+        assert "non_intrusive__output" in captured
+        assert "non_intrusive__inputs.0" in captured
 
     def test_respects_dumper_filter(self, tmp_path):
         class Inner(torch.nn.Module):
@@ -1203,17 +1203,17 @@ class TestHookDumper:
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = _make_test_dumper(tmp_path, filter="name=hook__model.linear.output")
+        d = _make_test_dumper(tmp_path, filter="name=non_intrusive__model.linear.output")
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
             model(x)
 
-        assert "hook__model.linear.output" in captured
-        assert "hook__model.relu.output" not in captured
-        assert "hook__model.linear.inputs.0" not in captured
+        assert "non_intrusive__model.linear.output" in captured
+        assert "non_intrusive__model.relu.output" not in captured
+        assert "non_intrusive__model.linear.inputs.0" not in captured
 
     def test_disabled_dumper_no_output(self, tmp_path):
         class Inner(torch.nn.Module):
@@ -1227,7 +1227,7 @@ class TestHookDumper:
         d = _make_test_dumper(tmp_path)
         d.configure(enable=False)
         model = _make_hook_model(Inner)
-        d.register_model_forward_hook(model)
+        d.register_non_intrusive_dumper(model)
 
         x = torch.randn(2, 4)
         with d.capture_output() as captured:
