@@ -481,7 +481,6 @@ class _Dumper:
 class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
     _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
-
     _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
 
     def __init__(
