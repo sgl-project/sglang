@@ -1558,9 +1558,9 @@ class TestDumperE2E:
             # Verify config propagated to all ranks
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             for rank, state in enumerate(states):
-                assert state["config"]["enable"] is True, (
-                    f"rank {rank}: enable should be True after configure"
-                )
+                assert (
+                    state["config"]["enable"] is True
+                ), f"rank {rank}: enable should be True after configure"
                 assert state["config"]["dir"] == dump_dir
 
             # Send inference request
@@ -1576,9 +1576,7 @@ class TestDumperE2E:
             steps = [s["step"] for s in states]
             for rank, step in enumerate(steps):
                 assert step > 0, f"rank {rank}: step should be > 0, got {step}"
-            assert steps[0] == steps[1], (
-                f"step mismatch across ranks: {steps}"
-            )
+            assert steps[0] == steps[1], f"step mismatch across ranks: {steps}"
 
             # Verify dump files exist for both ranks with core fields
             dump_files = list(Path(dump_dir).glob("sglang_dump_*/*.pt"))
@@ -1592,17 +1590,17 @@ class TestDumperE2E:
                 )
 
             for rank in range(2):
-                assert any(f"rank={rank}" in f for f in filenames), (
-                    f"No dump files for rank {rank}"
-                )
+                assert any(
+                    f"rank={rank}" in f for f in filenames
+                ), f"No dump files for rank {rank}"
 
             # Verify dump file structure is loadable
             sample_file = dump_files[0]
             loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
             assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
-            assert "value" in loaded and "meta" in loaded, (
-                f"Missing value/meta keys: {loaded.keys()}"
-            )
+            assert (
+                "value" in loaded and "meta" in loaded
+            ), f"Missing value/meta keys: {loaded.keys()}"
             assert "name" in loaded["meta"]
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
