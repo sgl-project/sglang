@@ -198,7 +198,6 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         # Store combination info for post_permute function
         running_state["topk_weights"] = runner_input.topk_weights
-        running_state["original_hidden_states_shape"] = runner_input.gate_up_input.shape
 
         return CutlassRunnerOutput(hidden_states=down_output)
 
@@ -807,8 +806,6 @@ def pre_permute_standard_to_cutlass(
     elif quant_info.params.quant_type == CutlassMoEQuantType.BlockscaledFP4:
         params = quant_info.params
 
-        # Store state for post_permute
-        running_state["original_hidden_states_shape"] = hidden_states.shape
 
         # Pre-permutation validation logic
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -874,8 +871,7 @@ def pre_permute_standard_to_cutlass(
             pre_reorder_for_cutlass_moe,
         )
 
-        # Store state for post_permute
-        running_state["original_hidden_states_shape"] = hidden_states.shape
+
 
         # Pre-permutation validation logic for W4A8
         assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -978,7 +974,8 @@ def post_permute_cutlass_to_standard(
     quant_type = quant_info.params.quant_type
 
     if quant_type == CutlassMoEQuantType.BlockscaledFP8:
-        num_tokens, hidden_size = running_state["original_hidden_states_shape"]
+        num_tokens = running_state["topk_ids"].shape[0]
+        hidden_size = down_output.shape[1]
         result = torch.empty(
             (num_tokens, hidden_size),
             device=down_output.device,
@@ -995,7 +992,7 @@ def post_permute_cutlass_to_standard(
         if runner_config.routed_scaling_factor is not None:
             hidden_states.mul_(runner_config.routed_scaling_factor)
     elif quant_type == CutlassMoEQuantType.BlockscaledFP4:
-        num_tokens = running_state["original_hidden_states_shape"][0]
+        num_tokens = running_state["topk_ids"].shape[0]
         topk = running_state["c_map"].shape[0] // num_tokens
         hidden_size = down_output.shape[1]
 
@@ -1018,8 +1015,8 @@ def post_permute_cutlass_to_standard(
     elif quant_type == CutlassMoEQuantType.W4A8:
         from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_for_cutlass_moe
 
-        num_tokens = running_state["original_hidden_states_shape"][0]
-        hidden_size = running_state["original_hidden_states_shape"][1]
+        num_tokens = running_state["topk_ids"].shape[0]
+        hidden_size = down_output.shape[1]
         topk = running_state["topk_ids"].size(1)
 
         result = torch.empty(
