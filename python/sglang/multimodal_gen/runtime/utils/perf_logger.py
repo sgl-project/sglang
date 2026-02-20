@@ -132,10 +132,10 @@ def capture_memory_snapshot() -> MemorySnapshot:
     peak_reserved = torch.cuda.max_memory_reserved()
 
     return MemorySnapshot(
-        allocated_mb=allocated / (1024**2),
-        reserved_mb=reserved / (1024**2),
-        peak_allocated_mb=peak_allocated / (1024**2),
-        peak_reserved_mb=peak_reserved / (1024**2),
+        allocated_mb=allocated / (1024 ** 2),
+        reserved_mb=reserved / (1024 ** 2),
+        peak_allocated_mb=peak_allocated / (1024 ** 2),
+        peak_reserved_mb=peak_reserved / (1024 ** 2),
     )
 
 
@@ -246,7 +246,7 @@ class StageProfiler:
 
         if self.log_timing and self.timings:
             if "denoising_step_" in self.stage_name:
-                index = int(self.stage_name[len("denoising_step_") :])
+                index = int(self.stage_name[len("denoising_step_"):])
                 self.timings.record_steps(index, execution_time_s)
             else:
                 self.timings.record_stage(self.stage_name, execution_time_s)
@@ -271,38 +271,33 @@ class PerformanceLogger:
     """
 
     @classmethod
-    def dump_benchmark_report(
-        cls,
-        file_path: str,
-        timings: "RequestMetrics",
-        meta: Optional[Dict[str, Any]] = None,
-        tag: str = "benchmark_dump",
-    ):
+    def dump_benchmark_report(cls, file_path: str, metrics: "RequestMetrics", meta: Optional[Dict[str, Any]] = None,
+                              tag: str = "benchmark_dump"):
         """
         Static method to dump a standardized benchmark report to a file.
         Eliminates duplicate logic in CLI/Client code.
         """
         formatted_steps = [
             {"name": name, "duration_ms": duration_ms}
-            for name, duration_ms in timings.stages.items()
+            for name, duration_ms in metrics.stages.items()
         ]
 
         denoise_steps_ms = [
             {"step": idx, "duration_ms": duration_ms}
-            for idx, duration_ms in enumerate(timings.steps)
+            for idx, duration_ms in enumerate(metrics.steps)
         ]
 
         memory_checkpoints = {
             name: snapshot.to_dict()
-            for name, snapshot in timings.memory_snapshots.items()
+            for name, snapshot in metrics.memory_snapshots.items()
         }
 
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "request_id": timings.request_id,
+            "request_id": metrics.request_id,
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
-            "total_duration_ms": timings.total_duration_ms,
+            "total_duration_ms": metrics.total_duration_ms,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,

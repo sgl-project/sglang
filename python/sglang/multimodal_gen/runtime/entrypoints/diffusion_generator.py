@@ -297,7 +297,7 @@ class DiffGenerator:
         if not results:
             return
         if self.server_args.warmup:
-            total_duration_ms = results[0].timings.get("total_duration_ms", 0)
+            total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
                 total_duration_ms / 1000.0,
