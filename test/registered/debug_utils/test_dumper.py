@@ -56,16 +56,16 @@ class TestDumperConfig:
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="layer_id=0"):
             assert _DumperConfig.from_env().filter == "layer_id=0"
 
-    def test_from_env_path(self):
+    def test_from_env_dir(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_DIR="/my/dir"):
-            assert _DumperConfig.from_env().dir == Path("/my/dir")
+            assert _DumperConfig.from_env().dir == "/my/dir"
 
     def test_from_env_int(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
             assert _DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
-        d = _make_test_dumper(Path("/tmp"))
+        d = _make_test_dumper("/tmp")
         d.configure(enable=False)
         assert d._config.enable is False
         d.configure(enable=True)
@@ -446,10 +446,10 @@ class TestDumpDictFormat:
         assert torch.equal(raw["value"], tensor)
 
 
-def _make_test_dumper(tmp_path: Path, **overrides) -> _Dumper:
+def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
     config = _DumperConfig(
-        enable=True, dir=tmp_path, partial_name="test",
+        enable=True, dir=str(tmp_path), partial_name="test",
         enable_http_server=False, **overrides,
     )
     d = _Dumper(config=config)
@@ -525,7 +525,7 @@ class TestSaveValue:
 
 class TestStaticMetadata:
     def test_static_meta_contains_world_info(self):
-        dumper = _make_test_dumper(Path("/tmp"))
+        dumper = _make_test_dumper("/tmp")
         meta = dumper._static_meta
         assert "world_rank" in meta
         assert "world_size" in meta
@@ -533,7 +533,7 @@ class TestStaticMetadata:
         assert meta["world_size"] == 1
 
     def test_static_meta_caching(self):
-        dumper = _make_test_dumper(Path("/tmp"))
+        dumper = _make_test_dumper("/tmp")
         meta1 = dumper._static_meta
         meta2 = dumper._static_meta
         assert meta1 is meta2

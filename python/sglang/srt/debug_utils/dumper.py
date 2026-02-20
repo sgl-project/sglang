@@ -15,14 +15,14 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-# -------------------------------------- dumper core ------------------------------------------
+# -------------------------------------- dumper config ------------------------------------------
 
 
 @dataclass(frozen=True)
 class _DumperConfig:
     enable: bool = False
     filter: Optional[str] = None
-    dir: Path = Path("/tmp")
+    dir: str = "/tmp"
     enable_output_file: bool = True
     enable_output_console: bool = True
     enable_value: bool = True
@@ -65,9 +65,10 @@ def _parse_env_field(env_name: str, default):
         return raw.lower() in ("true", "1")
     if isinstance(default, int):
         return int(raw)
-    if isinstance(default, Path):
-        return Path(raw)
     return raw
+
+
+# -------------------------------------- dumper core ------------------------------------------
 
 
 class _Dumper:
@@ -313,7 +314,7 @@ class _Dumper:
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
-        path = self._config.dir / f"sglang_dump_{self._config.partial_name}" / full_filename
+        path = Path(self._config.dir) / f"sglang_dump_{self._config.partial_name}" / full_filename
 
         if self._config.enable_output_console:
             print(
@@ -339,7 +340,7 @@ class _Dumper:
             else:
                 if not self._cleanup_previous_handled:
                     self._cleanup_previous_handled = True
-                    _cleanup_old_dumps(self._config.dir)
+                    _cleanup_old_dumps(Path(self._config.dir))
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
