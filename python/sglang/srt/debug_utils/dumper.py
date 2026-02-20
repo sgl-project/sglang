@@ -522,7 +522,7 @@ class _HookDumper:
             from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
             if isinstance(value, LogitsProcessorOutput):
-                return {"": value.next_token_logits}
+                return {"next_token_logits": value.next_token_logits}
             if isinstance(value, ForwardBatch):
                 return {
                     "input_ids": value.input_ids,
