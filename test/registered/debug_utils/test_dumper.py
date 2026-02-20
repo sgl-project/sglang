@@ -1274,7 +1274,7 @@ def _make_forward_batch(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     seq_lens: torch.Tensor,
-) -> "ForwardBatch":
+):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
     return ForwardBatch(
@@ -1289,9 +1289,7 @@ def _make_forward_batch(
     )
 
 
-class TestNonIntrusiveMode(_NonIntrusiveTestBase):
-    """Tests for non_intrusive_mode: off / core / all with ForwardBatch."""
-
+class TestNonIntrusiveDumperMode(_NonIntrusiveTestBase):
     @staticmethod
     def _build_fb_model() -> torch.nn.Module:
         class SubLayer(torch.nn.Module):

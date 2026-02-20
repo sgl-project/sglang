@@ -502,18 +502,14 @@ class _NonIntrusiveDumper:
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
             for i, item in enumerate(input):
-                self._dump_value(
-                    module_name, item, role=f"inputs.{i}", is_root=is_root
-                )
+                self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
 
             if output is not None:
                 self._dump_value(module_name, output, role="output", is_root=False)
 
         return _hook
 
-    def _dump_value(
-        self, module_name: str, value, role: str, *, is_root: bool
-    ) -> None:
+    def _dump_value(self, module_name: str, value, role: str, *, is_root: bool) -> None:
         for key, tensor in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
