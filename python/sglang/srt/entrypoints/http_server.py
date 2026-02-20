@@ -619,7 +619,8 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
-if TODO:
+# Do not import `dumper.py` to avoid dependency
+if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
     @app.api_route("/dumper/{method}", methods=["POST"])
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def _dumper_control_handler(method: str, request: Request):
