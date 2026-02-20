@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
+import torch.nn as nn
 
 from sglang.srt.batch_overlap.operations import (
     execute_operations,
@@ -31,6 +32,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -827,9 +829,16 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+
+    def filter_real_layers(layers: nn.ModuleList) -> List[nn.Module]:
+        return [l for l in layers if not isinstance(l, PPMissingLayer)]
+
+    real_layers = filter_real_layers(layers)
+    if not real_layers:
+        return inputs["hidden_states"], inputs["residual"]
+    layer_input_scatter_mode = real_layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        real_layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
         return _model_forward_tbo(
