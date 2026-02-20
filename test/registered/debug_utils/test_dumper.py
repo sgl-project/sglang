@@ -827,25 +827,6 @@ class TestReset:
 class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
-    @staticmethod
-    def _standalone_mode_worker(rank, http_port: int, stop_event):
-        os.environ["SGLANG_DUMPER_ENABLE"] = "0"
-        os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
-
-        dumper.on_forward_pass_start()
-        stop_event.wait()
-
-    @staticmethod
-    def _wait_for_http(url: str, timeout: float = 30) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                requests.post(f"{url}/dumper/configure", json={}, timeout=2)
-                return
-            except requests.ConnectionError:
-                time.sleep(0.5)
-        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
-
     @pytest.fixture(scope="class", params=["standalone", "sglang"])
     def dumper_http_url(self, request):
         if request.param == "standalone":
@@ -876,6 +857,25 @@ class TestDumperHttp:
                 yield base_url
             finally:
                 kill_process_tree(proc.pid)
+
+    @staticmethod
+    def _standalone_mode_worker(rank, http_port: int, stop_event):
+        os.environ["SGLANG_DUMPER_ENABLE"] = "0"
+        os.environ["SGLANG_DUMPER_SERVER_PORT"] = str(http_port)
+
+        dumper.on_forward_pass_start()
+        stop_event.wait()
+
+    @staticmethod
+    def _wait_for_http(url: str, timeout: float = 30) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+                return
+            except requests.ConnectionError:
+                time.sleep(0.5)
+        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
