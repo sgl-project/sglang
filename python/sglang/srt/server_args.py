@@ -742,6 +742,7 @@ class ServerArgs:
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_gdn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -2081,6 +2082,12 @@ class ServerArgs:
                 raise ValueError(
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
+
+    def _handle_gdn_backend(self):
+        # Backward compat: env var SGLANG_USE_CUTEDSL_GDN_DECODE=1 overrides the
+        # default "triton" selection with "cutedsl".
+        if self.gdn_backend == "triton" and envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
+            self.gdn_backend = "cutedsl"
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:

@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -843,9 +842,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         gdn_backend = get_global_server_args().gdn_backend
-        # Backward compat: env var overrides the default "triton" selection
-        if gdn_backend == "triton" and Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
-            gdn_backend = "cutedsl"
 
         if gdn_backend == "flashinfer":
             try:
