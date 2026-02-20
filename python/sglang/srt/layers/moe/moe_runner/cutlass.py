@@ -56,7 +56,6 @@ class CutlassRunnerInput(RunnerInput):
     # Standard mode fields
     topk_weights: Optional[torch.Tensor] = None
     a_map: Optional[torch.Tensor] = None
-    c_map: Optional[torch.Tensor] = None
     rep_aux: Optional[torch.Tensor] = None
     # DeepEP mode fields
     masked_m: Optional[torch.Tensor] = None
@@ -186,7 +185,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             reordered = shuffle_rows(
                 down_output,
-                runner_input.c_map,
+                running_state["c_map"],
                 (num_tokens * topk, hidden_size),
             ).view(num_tokens, topk, hidden_size)
             if not self.config.apply_router_weight_on_input:
@@ -198,7 +197,6 @@ class CutlassRunnerCore(MoeRunnerCore):
             return CutlassRunnerOutput(hidden_states=reordered)
 
         # Store combination info for post_permute function
-        running_state["c_map"] = runner_input.c_map
         running_state["topk_weights"] = runner_input.topk_weights
         running_state["original_hidden_states_shape"] = runner_input.gate_up_input.shape
 
@@ -796,12 +794,13 @@ def pre_permute_standard_to_cutlass(
 
         running_state["blockscale_offsets"] = blockscale_offsets
 
+        running_state["c_map"] = c_map
+
         return CutlassRunnerInput(
             gate_up_input=rep_a_q,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             a_map=a_map,
-            c_map=c_map,
             rep_aux=rep_aux,
         )
 
@@ -955,12 +954,13 @@ def pre_permute_standard_to_cutlass(
 
         rep_aux = None
 
+        running_state["c_map"] = c_map
+
     return CutlassRunnerInput(
         gate_up_input=gateup_input,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         a_map=a_map,
-        c_map=c_map,
         rep_aux=rep_aux,
     )
 
@@ -1252,7 +1252,6 @@ def pre_permute_deepep_normal_to_cutlass(
 
     # Store additional state for the main function
     running_state["src2dst"] = src2dst
-    running_state["a_map"] = a_map
     running_state["c_map"] = c_map
 
     return CutlassRunnerInput(
@@ -1260,7 +1259,6 @@ def pre_permute_deepep_normal_to_cutlass(
         topk_ids=topk_ids_,
         topk_weights=topk_weights,
         a_map=a_map,
-        c_map=c_map,
     )
 
 
