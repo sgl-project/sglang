@@ -171,7 +171,22 @@ class _Dumper:
         if self._http_server_handled:
             return
         self._http_server_handled = True
-        _start_maybe_http_server(self)
+
+        http_port = int(self._config.server_port)
+        zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            self, base_port=zmq_base_port, timeout_seconds=self._config.collective_timeout
+        )
+
+        if _get_rank() == 0:
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port > 0:
+                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
+                print(f"[Dumper] HTTP server started on port {http_port}")
+            else:
+                print("[Dumper] Standalone HTTP server disabled")
 
     def _ensure_partial_name(self):
         if self._config.partial_name is None:
@@ -639,24 +654,6 @@ def _collect_megatron_parallel_info():
 
 
 # -------------------------------------- http control server ------------------------------------------
-
-
-def _start_maybe_http_server(dumper: _Dumper):
-    http_port = int(dumper._config.server_port)
-    zmq_base_port = get_int_env_var("SGLANG_DUMPER_ZMQ_BASE_PORT", 16800)
-
-    rpc_broadcast = _create_zmq_rpc_broadcast(
-        dumper, base_port=zmq_base_port, timeout_seconds=dumper._config.collective_timeout
-    )
-
-    if _get_rank() == 0:
-        dumper._rpc_broadcast = rpc_broadcast
-
-        if http_port > 0:
-            _start_http_server(prefix="/dumper/", target=dumper, http_port=http_port)
-            print(f"[Dumper] HTTP server started on port {http_port}")
-        else:
-            print("[Dumper] Standalone HTTP server disabled")
 
 
 def _start_http_server(*, prefix: str, target: object, http_port: int):
