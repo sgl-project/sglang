@@ -148,13 +148,15 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+BYTES_PER_GB = 1024**3
+
+
 def get_memory_usage_of_component(module) -> float | None:
     """
     returned value is in GB, rounded to 2 decimal digits
     """
     if not isinstance(module, nn.Module):
         return None
-    BYTES_PER_GB = 1024**3
     if hasattr(module, "get_memory_footprint"):
         usage = module.get_memory_footprint() / BYTES_PER_GB
     else:
