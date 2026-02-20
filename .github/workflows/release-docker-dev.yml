@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-x86-my-test, dev-cu13-my-test, etc."
+        description: "Custom tag: creates '{tag}' (cu12.9) and 'cu13-{tag}' (cu13) multi-arch images"
         required: false
         default: ""
   schedule:
@@ -144,9 +144,21 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          TAG="${{ matrix.variant.base }}${SUFFIX}"
           X86_TAG="dev-${{ matrix.variant.x86 }}${SUFFIX}"
           ARM64_TAG="dev-${{ matrix.variant.arm64 }}${SUFFIX}"
+
+          # Custom tag mode: clean tags like '{tag}' and 'cu13-{tag}'
+          # Normal mode: 'dev{suffix}' and 'dev-cu13{suffix}'
+          if [ -n "${{ inputs.tag }}" ]; then
+            if [ "${{ matrix.variant.base }}" = "dev" ]; then
+              TAG="${{ inputs.tag }}"
+            else
+              # dev-cu13 -> cu13-{tag}
+              TAG="cu13-${{ inputs.tag }}"
+            fi
+          else
+            TAG="${{ matrix.variant.base }}${SUFFIX}"
+          fi
 
           # For nightly (no suffix), also stamp a dated tag
           EXTRA_TAG=""
