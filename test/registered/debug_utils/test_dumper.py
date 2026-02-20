@@ -833,9 +833,7 @@ class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
     @staticmethod
-    def _standalone_worker(
-        rank: int, world_size: int, nccl_port: int, http_port: int
-    ):
+    def _standalone_worker(rank: int, world_size: int, nccl_port: int, http_port: int):
         import os
 
         os.environ["SGLANG_DUMPER_ENABLE"] = "0"
@@ -882,9 +880,7 @@ class TestDumperHttp:
                 return
             except requests.ConnectionError:
                 time.sleep(0.5)
-        raise TimeoutError(
-            f"Standalone dumper HTTP server not reachable at {url}"
-        )
+        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
 
     @pytest.fixture(scope="class", params=["standalone", "sglang"])
     def dumper_http_url(self, request):
@@ -923,9 +919,9 @@ class TestDumperHttp:
             val = state
             for k in keys:
                 val = val[k]
-            assert val == expected, (
-                f"rank {rank}: {path}={val!r}, expected {expected!r}"
-            )
+            assert (
+                val == expected
+            ), f"rank {rank}: {path}={val!r}, expected {expected!r}"
 
     def test_configure_enable_toggle(self, dumper_http_url: str):
         for enable in [True, False]:
@@ -956,9 +952,7 @@ class TestDumperHttp:
         self._assert_all_ranks(states, "forward_pass_id", 0)
 
     def test_get_state(self, dumper_http_url: str):
-        self._post(
-            dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]"
-        )
+        self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.enable", True)
         self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
@@ -971,9 +965,7 @@ class TestDumperHttp:
         states = self._post(dumper_http_url, "get_state")
         configs = [s["config"] for s in states]
         for rank_config in configs[1:]:
-            assert rank_config == configs[0], (
-                f"rank configs diverged: {configs}"
-            )
+            assert rank_config == configs[0], f"rank configs diverged: {configs}"
 
     def test_error_unknown_field(self, dumper_http_url: str):
         resp = requests.post(

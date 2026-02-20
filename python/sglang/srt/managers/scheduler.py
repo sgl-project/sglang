@@ -2968,7 +2968,7 @@ class Scheduler(
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             from sglang.srt.debug_utils.dumper import dumper
 
-            response = dumper.handle_control_request(**recv_req.kwargs)
+            response = dumper._handle_control_request(method=recv_req.method, body=recv_req.body)
 
         self.send_to_tokenizer.send_output(
             DumperControlReqOutput(success=True, response=response), recv_req

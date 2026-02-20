@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional, Self, get_args, get_type_hints, Union, Literal
+from typing import List, Literal, Optional, Self, Union, get_args, get_type_hints, Any
 
 import torch
 import torch.distributed as dist
@@ -244,23 +244,20 @@ class _Dumper:
             "forward_pass_id": self._forward_pass_id,
         }
 
-    def handle_control_request(self, *, _method: str, **kwargs) -> list[dict]:
-        """Entry point for HTTP control. Broadcasts to all ranks if distributed."""
-        if self._rpc_broadcast is not None:
-            return self._rpc_broadcast._handle_http_control_request(
-                _method=_method, **kwargs
-            )
-        return [self._handle_http_control_request(_method=_method, **kwargs)]
+    def _handle_control_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request(
+            method=method, **body
+        )
 
-    def _handle_http_control_request(self, *, _method: str, **kwargs) -> dict:
-        if _method == "get_state":
+    def _handle_http_control_request(self, *, method: str, **kwargs) -> dict:
+        if method == "get_state":
             pass
-        elif _method == "configure":
+        elif method == "configure":
             self.configure(**kwargs)
-        elif _method == "reset":
+        elif method == "reset":
             self.reset()
         else:
-            raise ValueError(f"Unknown dumper control method: {_method!r}")
+            raise ValueError(f"Unknown dumper control method: {method!r}")
         return self.get_state()
 
     def configure(self, **kwargs) -> None:
@@ -687,17 +684,15 @@ def _make_http_handler(*, prefix: str, target):
                 return
             method = self.path[len(prefix) :]
             try:
-                kwargs = self._get_request_body()
-                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                result = target.handle_control_request(
-                    _method=method, **kwargs
-                )
-                body = json.dumps(result).encode()
+                req_body = self._get_request_body()
+                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
+                result = target._handle_control_request(method=method, body=req_body)
+                resp_body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(len(resp_body)))
                 self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(resp_body)
             except Exception as e:
                 self.send_error(400, str(e))
 
