@@ -2980,7 +2980,8 @@ class Scheduler(
         except Exception as e:
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
             self.send_to_tokenizer.send_output(
-                DumperControlReqOutput(success=False, response=[], error=str(e)), recv_req
+                DumperControlReqOutput(success=False, response=[], error=str(e)),
+                recv_req,
             )
 
     # placeholder for override
