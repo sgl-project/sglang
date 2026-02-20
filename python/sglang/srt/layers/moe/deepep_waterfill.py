@@ -35,7 +35,6 @@ Key Design:
    - Avoids fragmented computation across ranks
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -48,10 +47,6 @@ LOCAL_SHARED_MARKER = -1
 # Local preference factor used by waterfill assignment.
 # Set to 1.0 to disable the bias and use pure argmin over routed_counts.
 LOCAL_PREFERENCE_FACTOR = 1.1
-
-
-def is_waterfill_v2_enabled() -> bool:
-    return os.environ.get("SGLANG_WATERFILL_V2", "") not in ("", "0", "false", "False")
 
 
 # Try to import Triton for GPU-optimized kernels

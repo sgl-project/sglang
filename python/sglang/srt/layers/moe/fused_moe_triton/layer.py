@@ -532,13 +532,9 @@ class FusedMoE(torch.nn.Module):
         # ORIGINAL experts_per_rank (old_epr), not the expanded one.
         # Shared expert (expert_id >= old_num_global_routed_experts) maps to the last slot
         # (old_epr) on EVERY rank.
-        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
-
-        _waterfill_v2 = is_waterfill_v2_enabled()
         if (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
-            and not _waterfill_v2
         ):
             # Compute original (pre-expansion) routed expert counts.
             # With num_fused_shared_experts passed through from model level, the
@@ -617,13 +613,9 @@ class FusedMoE(torch.nn.Module):
         # Waterfill expands num_experts by moe_ep_size (272 = 256 + 16) with
         # num_fused_shared_experts=0, so shared expert 256 must be detected via
         # old_num_global_routed_experts = num_experts - moe_ep_size, not num_experts.
-        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
-
-        _waterfill_v2 = is_waterfill_v2_enabled()
         _is_waterfill = (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
-            and not _waterfill_v2
         )
         num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
         if _is_waterfill:

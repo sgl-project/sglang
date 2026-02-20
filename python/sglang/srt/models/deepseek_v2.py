@@ -647,26 +647,7 @@ class DeepseekV2MoE(nn.Module):
                 "DeepEP Waterfill currently supports exactly 1 shared expert "
                 f"(got n_shared_experts={n_shared_experts})."
             )
-        # Waterfill V2 mode: preserve baseline MoE structure (no 9th expert slot,
-        # shared expert on alt_stream) and only apply lightweight routed-expert
-        # rebalancing after TopK.  This avoids the ~2% structural overhead of
-        # serializing the shared expert into the dispatch pipeline.
-        # V2 can be activated EITHER via --enable-deepep-waterfill + SGLANG_WATERFILL_V2=1,
-        # OR via just SGLANG_WATERFILL_V2=1 with DeepEP backend and shared experts.
-        from sglang.srt.layers.moe.deepep_waterfill import is_waterfill_v2_enabled
-
-        _v2_env = is_waterfill_v2_enabled()
-        waterfill_v2 = _v2_env and (
-            will_enable_deepep_waterfill
-            or (get_moe_a2a_backend().is_deepep() and n_shared_experts > 0)
-        )
-        if waterfill_v2:
-            # V2: standard MoE init (no extra expert slot), shared on alt_stream.
-            # Force num_fused_shared_experts=0 so shared expert is a separate module.
-            will_enable_deepep_waterfill = False
-            self.num_fused_shared_experts = 0
-        elif will_enable_deepep_waterfill:
-            # V1 (original): fuse shared expert into MoE dispatch/compute/combine path.
+        if will_enable_deepep_waterfill:
             self.num_fused_shared_experts = n_shared_experts
         else:
             self.num_fused_shared_experts = (
@@ -674,7 +655,6 @@ class DeepseekV2MoE(nn.Module):
                 if get_global_server_args().disable_shared_experts_fusion
                 else n_shared_experts
             )
-        self._waterfill_v2 = waterfill_v2
         # Kernel-level fusion flag: controls TopK append + MoE kernel shared expert
         # handling. Waterfill uses 0 (handles shared expert in its own dispatch path).
         num_fused_shared_experts_in_moe_impl = (
@@ -866,18 +846,12 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        # Initialize DeepEP Waterfill balancer if enabled
         self._enable_deepep_waterfill = self._will_enable_deepep_waterfill
         self.deepep_waterfill_balancer = None
-        # Waterfill V2: lightweight routed rebalance (no 9th slot, shared on alt_stream)
-        self._enable_routed_rebalance = False
         if self._enable_deepep_waterfill:
             from sglang.srt.distributed import get_moe_expert_parallel_rank
             from sglang.srt.layers.moe.deepep_waterfill import DeepEPWaterfillBalancer
 
-            # In EPLB mode, we may have redundant physical experts (replicas). Waterfill operates
-            # on the *physical* expert-id space used by DeepEP dispatch (after EPLB mapping),
-            # so we must include `ep_num_redundant_experts` in the expert count.
             num_physical_routed_experts = (
                 config.n_routed_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -889,38 +863,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
             )
 
-            # Store the number of local *physical* routed experts (without the shared slot) for
-            # weight copying and EPLB weight updates later.
             self._old_experts_per_rank = num_physical_routed_experts // self.moe_ep_size
-        elif self._waterfill_v2:
-            # V2 mode: no 9th expert slot, no shared expert weight copy.
-            # Just set up the rebalance parameters for post-topk adjustment.
-            from sglang.srt.distributed import get_moe_expert_parallel_rank
-
-            self._enable_routed_rebalance = True
-            num_physical_routed_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
-            )
-            self._rebalance_ep_rank = get_moe_expert_parallel_rank()
-            self._rebalance_ep_size = self.moe_ep_size
-            self._rebalance_experts_per_rank = (
-                num_physical_routed_experts // self.moe_ep_size
-            )
-            # Max number of expert swaps per token (1 = swap weakest expert if overloaded)
-            self._rebalance_max_swaps = 1
-            # Overload threshold: only rebalance if max_rank_load / mean_rank_load > this
-            self._rebalance_imbalance_threshold = float(
-                os.environ.get("SGLANG_WATERFILL_V2_THRESHOLD", "1.05")
-            )
-            logger.info(
-                "Waterfill V2 routed rebalance enabled: ep_rank=%d ep_size=%d "
-                "experts_per_rank=%d imbalance_threshold=%.2f",
-                self._rebalance_ep_rank,
-                self._rebalance_ep_size,
-                self._rebalance_experts_per_rank,
-                self._rebalance_imbalance_threshold,
-            )
 
     def _maybe_init_static_waterfill_weights(self):
         """Compute / refresh static EPLB-derived per-rank weights if needed.
@@ -1004,29 +947,26 @@ class DeepseekV2MoE(nn.Module):
                 self._static_wf_init_done = True
 
     def get_moe_weights(self):
-        # EPLB only manages routed experts. In DeepEP Waterfill mode, we add one extra
-        # local expert slot per rank for the shared expert. Exclude that shared slot
-        # from the returned tensors so expert-location updates operate on the routed
-        # expert weights only.
-        maybe_exclude_shared_slot = getattr(
-            self, "_enable_deepep_waterfill", False
-        ) and hasattr(self, "_old_experts_per_rank")
-        routed_local_experts = getattr(self, "_old_experts_per_rank", None)
+        # EPLB only manages routed experts.
+        # In DeepEP Waterfill mode, each rank has (routed + 1) local experts
+        # (the extra slot is for the shared expert). We use _old_experts_per_rank
+        # as the effective num_local_experts so the shape filter excludes the
+        # shared-expert slot automatically.
+        if getattr(self, "_enable_deepep_waterfill", False) and hasattr(
+            self, "_old_experts_per_rank"
+        ):
+            num_local = self._old_experts_per_rank
+        else:
+            num_local = self.experts.num_local_experts
 
-        weights = []
-        for name, x in self.experts.named_parameters():
-            if name in ["correction_bias"]:
-                continue
-            w = x.data
-            if (
-                maybe_exclude_shared_slot
-                and routed_local_experts is not None
-                and w.dim() >= 1
-                and w.shape[0] == routed_local_experts + 1
-            ):
-                w = w[:routed_local_experts]
-            weights.append(w)
-        return weights
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and not getattr(x, "_sglang_require_global_experts", False)
+            and x.data.ndim > 0
+            and x.data.shape[0] == num_local
+        ]
 
     def forward(
         self,
@@ -1233,176 +1173,36 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def _rebalance_routed_topk(
-        self,
-        topk_output,
-        router_logits: torch.Tensor,
-        dispatch_info,
-    ):
-        """Waterfill V2: lightweight post-topk routed expert rebalance.
+    def _should_debug_eplb_load(self) -> bool:
+        """Check if SGLANG_DEBUG_WATERFILL_EPLB logging is enabled for this layer.
 
-        For each token, compute per-rank routed load from topk_ids (local only,
-        no AllReduce).  If the load is imbalanced beyond the threshold, swap the
-        weakest expert of each token on the most-overloaded rank with the best
-        alternative from a less-loaded rank (using router logits to find the
-        most relevant alternative).
-
-        This preserves the baseline forward_deepep structure (shared expert on
-        alt_stream, 8-column dispatch) with zero structural overhead.
+        The result must NOT depend on num_tokens (which differs across ranks)
+        to avoid collective mismatches.
         """
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        topk_ids = topk_output.topk_ids  # [N, K] int32, physical expert IDs
-        topk_weights = topk_output.topk_weights  # [N, K] float32
-
-        num_tokens, topk = topk_ids.shape
-        device = topk_ids.device
-        ep_size = self._rebalance_ep_size
-        epr = self._rebalance_experts_per_rank  # physical experts per rank
-
-        # ---- 1. Per-rank routed load from local topk_ids (no AllReduce) ----
-        valid_mask = topk_ids >= 0  # [N, K]
-        rank_ids = topk_ids.to(torch.int64) // epr  # [N, K]
-        rank_ids = rank_ids.clamp(0, ep_size - 1)
-
-        flat_valid = valid_mask.reshape(-1)
-        flat_ranks = rank_ids.reshape(-1)
-        valid_flat_ranks = flat_ranks[flat_valid]
-        rank_load = torch.zeros(ep_size, dtype=torch.int64, device=device)
-        rank_load.scatter_add_(0, valid_flat_ranks, torch.ones_like(valid_flat_ranks))
-
-        # ---- 2. Check imbalance ----
-        max_load = rank_load.max()
-        mean_load = rank_load.float().mean()
-        if mean_load <= 0:
-            return topk_output
-        imbalance = float(max_load.float() / mean_load)
-        if imbalance < self._rebalance_imbalance_threshold:
-            return topk_output  # Already balanced enough
-
-        # ---- 3. Identify overloaded ranks ----
-        overloaded_mask = rank_load > mean_load * 1.02  # [ep_size] bool
-
-        if not overloaded_mask.any():
-            return topk_output
-
-        # ---- 4. Build logical-expert → physical-rank mapping ----
-        # This lets us find which rank a candidate expert would go to
-        num_logical_experts = router_logits.shape[1]
-        has_eplb = (
-            dispatch_info is not None
-            and dispatch_info.partial_logical_to_rank_dispatch_physical_map is not None
+        flag = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
         )
-        if has_eplb:
-            # Static EPLB: logical_id → physical_id mapping is available
-            logical_to_physical = (
-                dispatch_info.partial_logical_to_rank_dispatch_physical_map
-            )
-            # [num_logical_experts] → physical_id; physical_rank = physical_id // epr
-            logical_to_rank = (logical_to_physical.to(torch.int64) // epr).clamp(
-                0, ep_size - 1
-            )
+        if flag and not torch.cuda.is_current_stream_capturing():
+            layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
+            if layer_filter and layer_filter not in ("all", "-1"):
+                try:
+                    flag = int(layer_filter) == int(self.layer_id)
+                except Exception:
+                    flag = False
+            elif not layer_filter:
+                flag = int(self.layer_id) == 0
         else:
-            # No EPLB: logical == physical, rank = logical_id // epr
-            logical_to_rank = (
-                torch.arange(num_logical_experts, device=device) // epr
-            ).clamp(0, ep_size - 1)
-
-        # Mask of logical experts that go to underloaded ranks (candidates for swap)
-        # underloaded = NOT overloaded
-        logical_on_underloaded = ~overloaded_mask[
-            logical_to_rank
-        ]  # [num_logical_experts]
-
-        # ---- 5. For tokens with experts on overloaded ranks, find swap candidates ----
-        token_expert_overloaded = overloaded_mask[rank_ids] & valid_mask  # [N, K]
-        has_overloaded = token_expert_overloaded.any(dim=-1)  # [N]
-
-        if not has_overloaded.any():
-            return topk_output
-
-        # Find the weakest expert on an overloaded rank per token
-        weights_for_argmin = topk_weights.clone()
-        weights_for_argmin[~token_expert_overloaded] = float("inf")
-        weakest_col = weights_for_argmin.argmin(dim=-1)  # [N]
-
-        # Work on affected tokens only
-        affected_idx = has_overloaded.nonzero(as_tuple=True)[0]  # [M]
-        if affected_idx.numel() == 0:
-            return topk_output
-
-        sub_topk_ids = topk_ids[affected_idx]  # [M, K] physical
-        sub_weakest_col = weakest_col[affected_idx]  # [M]
-        sub_logits = router_logits[affected_idx]  # [M, E_logical]
-
-        # Mask out already-selected logical experts in logits.
-        # We need to reverse-map physical → logical. For static EPLB, build reverse map.
-        if has_eplb:
-            # Build physical→logical reverse map (may be many-to-one; take first)
-            physical_to_logical = torch.full(
-                (dispatch_info.num_physical_experts,),
-                -1,
-                dtype=torch.int64,
-                device=device,
+            flag = False
+        if flag:
+            max_prints = int(
+                os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
             )
-            logical_ids_all = torch.arange(num_logical_experts, device=device)
-            physical_ids_all = logical_to_physical[logical_ids_all].to(torch.int64)
-            physical_to_logical[physical_ids_all] = logical_ids_all
-
-            # For each token's topk (physical), get logical IDs
-            sub_topk_logical = physical_to_logical[
-                sub_topk_ids.to(torch.int64).clamp(0)
-            ]  # [M, K]
-        else:
-            sub_topk_logical = sub_topk_ids.to(torch.int64)  # [M, K]
-
-        # Create masked logits: -inf for already-selected and overloaded-rank experts
-        masked_logits = sub_logits.clone()
-        # Mask already-selected experts
-        for k in range(topk):
-            logical_col = sub_topk_logical[:, k]  # [M]
-            valid_col = logical_col >= 0
-            masked_logits[
-                torch.arange(affected_idx.numel(), device=device)[valid_col],
-                logical_col[valid_col],
-            ] = float("-inf")
-        # Mask experts on overloaded ranks (we only want underloaded alternatives)
-        masked_logits[:, ~logical_on_underloaded] = float("-inf")
-
-        # Find the best alternative (highest logit on an underloaded rank)
-        best_alt_logical = masked_logits.argmax(dim=-1)  # [M] logical expert IDs
-        best_alt_logit = masked_logits[
-            torch.arange(affected_idx.numel(), device=device), best_alt_logical
-        ]  # [M]
-
-        # Only swap if the alternative has a reasonable logit (not -inf)
-        valid_alt = best_alt_logit > float("-inf")
-
-        if not valid_alt.any():
-            return topk_output
-
-        # Convert alternative logical → physical
-        if has_eplb:
-            alt_physical = logical_to_physical[best_alt_logical].to(topk_ids.dtype)
-        else:
-            alt_physical = best_alt_logical.to(topk_ids.dtype)
-
-        # Apply swaps
-        topk_ids_new = topk_ids.clone()
-        swap_idx = affected_idx[valid_alt]
-        swap_cols = sub_weakest_col[valid_alt]
-        swap_experts = alt_physical[valid_alt]
-
-        topk_ids_new[swap_idx, swap_cols] = swap_experts
-        # Recompute weights for swapped experts using softmax-normalized logits
-        # For simplicity, keep the original weight (the weight difference is small
-        # for close alternatives, and the router weight is renormalized downstream)
-
-        return StandardTopKOutput(
-            topk_weights=topk_output.topk_weights,  # Keep original weights
-            topk_ids=topk_ids_new,
-            router_logits=topk_output.router_logits,
-        )
+            printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
+            flag = printed < max_prints
+        return flag
 
     def forward_deepep(
         self,
@@ -1443,63 +1243,15 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
 
-            # -------------- Waterfill V2: lightweight routed rebalance ---------------
-            # After TopK selects 8 routed experts, check per-rank load distribution.
-            # If imbalanced, swap the weakest expert of a token on the most-overloaded
-            # rank with an alternative from a less-loaded rank.  This is a purely local
-            # operation (no AllReduce, no extra expert slot, no dispatch change).
-            if self._enable_routed_rebalance:
-                topk_output = self._rebalance_routed_topk(
-                    topk_output, router_logits, dispatch_info
-                )
-
-            # ---------------- Debug-only: per-rank (shared+routed) totals before/after EPLB ----------------
-            # Enable via env var:
-            #   SGLANG_DEBUG_WATERFILL_EPLB=1
-            #
-            # Optional:
-            #   SGLANG_DEBUG_WATERFILL_EPLB_LAYER=<layer_id|all|-1>   (default: only layer 0)
-            #   SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS=<N>            (default: 1)
-            #   SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS=<N>            (default: MIN_BATCH_FOR_BALANCE)
-            #
-            # This baseline path prints:
-            # - stage=pre_eplb:  (routed pre-EPLB + shared local)
-            # - stage=post_eplb: (routed post-EPLB + shared local)
-            debug_waterfill_eplb = os.environ.get(
-                "SGLANG_DEBUG_WATERFILL_EPLB", ""
-            ) not in (
-                "",
-                "0",
-                "false",
-                "False",
-            )
-            if debug_waterfill_eplb and not torch.cuda.is_current_stream_capturing():
-                layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
-                if layer_filter and layer_filter not in ("all", "-1"):
-                    try:
-                        debug_waterfill_eplb = int(layer_filter) == int(self.layer_id)
-                    except Exception:
-                        debug_waterfill_eplb = False
-                else:
-                    # Default: only layer 0 to avoid log spam.
-                    if not layer_filter:
-                        debug_waterfill_eplb = int(self.layer_id) == 0
-            else:
-                debug_waterfill_eplb = False
+            # Debug-only: per-rank (shared+routed) totals before/after EPLB.
+            # Enable via SGLANG_DEBUG_WATERFILL_EPLB=1.
+            debug_waterfill_eplb = self._should_debug_eplb_load()
 
             if debug_waterfill_eplb:
-                max_prints = int(
-                    os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
-                )
-                printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
-                debug_waterfill_eplb = printed < max_prints
-
-            if debug_waterfill_eplb:
-                # Avoid printing on tiny warmups / decode-only steps by default.
+                # Further gate by min-tokens to skip tiny warmups / decode-only steps.
                 min_tokens_to_print = int(
                     os.environ.get(
                         "SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS",
-                        # Keep default aligned with waterfill balancer when available.
                         str(
                             getattr(
                                 getattr(self, "deepep_waterfill_balancer", None),
@@ -1615,7 +1367,9 @@ class DeepseekV2MoE(nn.Module):
 
                 _print_total("pre_eplb", total_pre_eplb)
                 _print_total("post_eplb", total_post_eplb)
-                self._debug_waterfill_eplb_print_count = printed + 1
+                self._debug_waterfill_eplb_print_count = (
+                    getattr(self, "_debug_waterfill_eplb_print_count", 0) + 1
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
@@ -1749,10 +1503,9 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            output = self.shared_experts(
+            return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
-            return output
         else:
             return None
 
@@ -1776,37 +1529,9 @@ class DeepseekV2MoE(nn.Module):
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
 
-        # Compute debug flag BEFORE the 0-token early return so that all ranks
-        # agree on whether debug collectives will be issued.  The flag must NOT
-        # depend on num_tokens because that differs across ranks and would cause
-        # a collective mismatch (deadlock).
-        debug_waterfill_eplb = os.environ.get(
-            "SGLANG_DEBUG_WATERFILL_EPLB", ""
-        ) not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
-        if debug_waterfill_eplb and not torch.cuda.is_current_stream_capturing():
-            layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
-            if layer_filter and layer_filter not in ("all", "-1"):
-                try:
-                    debug_waterfill_eplb = int(layer_filter) == int(self.layer_id)
-                except Exception:
-                    debug_waterfill_eplb = False
-            else:
-                if not layer_filter:
-                    debug_waterfill_eplb = int(self.layer_id) == 0
-        else:
-            debug_waterfill_eplb = False
-
-        if debug_waterfill_eplb:
-            max_prints = int(
-                os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
-            )
-            printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
-            debug_waterfill_eplb = printed < max_prints
+        # Debug flag BEFORE the 0-token early return so all ranks agree on
+        # whether debug collectives will be issued (avoids deadlock).
+        debug_waterfill_eplb = self._should_debug_eplb_load()
 
         # Whether EPLB dispatch_info is active (same on all ranks).
         _has_eplb = (
@@ -2175,7 +1900,9 @@ class DeepseekV2MoE(nn.Module):
                 extra=f"bad_tokens={bad_count}/{n_check}",
             )
 
-            self._debug_waterfill_eplb_print_count = printed + 1
+            self._debug_waterfill_eplb_print_count = (
+                getattr(self, "_debug_waterfill_eplb_print_count", 0) + 1
+            )
 
         expanded_topk_output = StandardTopKOutput(
             topk_weights=expanded_topk_weights,
