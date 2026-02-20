@@ -16,16 +16,12 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.jit_kernel.eagle_utils import (
-    build_tree_kernel_efficient as build_tree_jit,
-    verify_tree_greedy as verify_tree_greedy_jit,
-)
+from sglang.jit_kernel.eagle_utils import build_tree_kernel_efficient as build_tree_jit
+from sglang.jit_kernel.eagle_utils import verify_tree_greedy as verify_tree_greedy_jit
 
 try:
-    from sgl_kernel import (
-        build_tree_kernel_efficient as build_tree_aot,
-        verify_tree_greedy as verify_tree_greedy_aot,
-    )
+    from sgl_kernel import build_tree_kernel_efficient as build_tree_aot
+    from sgl_kernel import verify_tree_greedy as verify_tree_greedy_aot
 
     AOT_AVAILABLE = True
 except ImportError:
@@ -55,9 +51,9 @@ BATCH_SIZE_RANGE = get_benchmark_range(
 # (topk, depth) → draft_token_num = topk * (depth - 1) + 1
 TREE_CONFIGS = get_benchmark_range(
     full_range=[
-        (4, 5),   # typical EAGLE: 17 draft tokens
-        (8, 4),   # wider: 25 draft tokens
-        (4, 8),   # deeper: 29 draft tokens
+        (4, 5),  # typical EAGLE: 17 draft tokens
+        (8, 4),  # wider: 25 draft tokens
+        (4, 8),  # deeper: 29 draft tokens
     ],
     ci_range=[(4, 5)],
 )
@@ -97,14 +93,22 @@ def make_build_tree_inputs(bs, topk, depth, tree_mask_mode):
 
     if tree_mask_mode == QLEN_ONLY_BITPACKING:
         num_bytes = 4 if draft_token_num > 16 else (2 if draft_token_num > 8 else 1)
-        tree_mask = torch.zeros(bs * draft_token_num * num_bytes, dtype=torch.uint8, device=DEVICE)
+        tree_mask = torch.zeros(
+            bs * draft_token_num * num_bytes, dtype=torch.uint8, device=DEVICE
+        )
     else:
-        tree_mask = torch.zeros(bs * draft_token_num * draft_token_num, dtype=torch.bool, device=DEVICE)
+        tree_mask = torch.zeros(
+            bs * draft_token_num * draft_token_num, dtype=torch.bool, device=DEVICE
+        )
 
     positions = torch.zeros(bs, draft_token_num, dtype=torch.int64, device=DEVICE)
     retrive_index = torch.zeros(bs, draft_token_num, dtype=torch.int64, device=DEVICE)
-    retrive_next_token = torch.full((bs, draft_token_num), -1, dtype=torch.int64, device=DEVICE)
-    retrive_next_sibling = torch.full((bs, draft_token_num), -1, dtype=torch.int64, device=DEVICE)
+    retrive_next_token = torch.full(
+        (bs, draft_token_num), -1, dtype=torch.int64, device=DEVICE
+    )
+    retrive_next_sibling = torch.full(
+        (bs, draft_token_num), -1, dtype=torch.int64, device=DEVICE
+    )
 
     return dict(
         parent_list=parent_list,
@@ -140,7 +144,9 @@ def make_verify_inputs(bs, num_draft_tokens, num_spec_step, vocab_size):
     next_token = torch.arange(1, num_draft_tokens + 1, dtype=torch.int64, device=DEVICE)
     next_token[-1] = -1
     retrive_next_token = next_token.unsqueeze(0).expand(bs, -1).contiguous()
-    retrive_next_sibling = torch.full((bs, num_draft_tokens), -1, dtype=torch.int64, device=DEVICE)
+    retrive_next_sibling = torch.full(
+        (bs, num_draft_tokens), -1, dtype=torch.int64, device=DEVICE
+    )
     candidates = (
         (torch.arange(num_draft_tokens, dtype=torch.int64, device=DEVICE) % vocab_size)
         .unsqueeze(0)
@@ -182,11 +188,19 @@ def make_verify_inputs(bs, num_draft_tokens, num_spec_step, vocab_size):
         args={},
     )
 )
-def bench_build_tree(bs: int, topk: int, depth: int, tree_mask_mode: int, provider: str):
+def bench_build_tree(
+    bs: int, topk: int, depth: int, tree_mask_mode: int, provider: str
+):
     draft_token_num = topk * (depth - 1) + 1
     inputs = make_build_tree_inputs(bs, topk, depth, tree_mask_mode)
 
-    mutated_keys = {"positions", "retrive_index", "retrive_next_token", "retrive_next_sibling", "tree_mask"}
+    mutated_keys = {
+        "positions",
+        "retrive_index",
+        "retrive_next_token",
+        "retrive_next_sibling",
+        "tree_mask",
+    }
     backups = {k: inputs[k].clone() for k in mutated_keys}
 
     if provider == "jit":
@@ -219,7 +233,9 @@ def bench_build_tree(bs: int, topk: int, depth: int, tree_mask_mode: int, provid
         x_names=["bs", "num_draft_tokens", "num_spec_step", "vocab_size"],
         x_vals=[
             (bs, ndt, nss, vs)
-            for bs, (ndt, nss, vs) in itertools.product(BATCH_SIZE_RANGE, VERIFY_CONFIGS)
+            for bs, (ndt, nss, vs) in itertools.product(
+                BATCH_SIZE_RANGE, VERIFY_CONFIGS
+            )
         ],
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -279,13 +295,18 @@ def calculate_diff():
         (4, 16, 8, 128000),
     ]:
         inp_jit = make_verify_inputs(bs, num_draft_tokens, num_spec_step, vocab_size)
-        inp_aot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inp_jit.items()}
+        inp_aot = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in inp_jit.items()
+        }
 
         verify_tree_greedy_jit(**inp_jit)
         verify_tree_greedy_aot(**inp_aot)
 
         match_predicts = torch.equal(inp_jit["predicts"], inp_aot["predicts"])
-        match_accept_num = torch.equal(inp_jit["accept_token_num"], inp_aot["accept_token_num"])
+        match_accept_num = torch.equal(
+            inp_jit["accept_token_num"], inp_aot["accept_token_num"]
+        )
         status = "OK" if (match_predicts and match_accept_num) else "MISMATCH"
         print(
             f"  bs={bs:2d} num_draft={num_draft_tokens:2d} num_spec={num_spec_step:2d} "
@@ -300,16 +321,31 @@ def calculate_diff():
         (4, 8, 4, QLEN_ONLY),
     ]:
         inp_jit = make_build_tree_inputs(bs, topk, depth, tree_mask_mode)
-        inp_aot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inp_jit.items()}
+        inp_aot = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in inp_jit.items()
+        }
 
         build_tree_jit(**inp_jit)
         build_tree_aot(**inp_aot)
 
         match_positions = torch.equal(inp_jit["positions"], inp_aot["positions"])
-        match_retrive_index = torch.equal(inp_jit["retrive_index"], inp_aot["retrive_index"])
-        match_next_token = torch.equal(inp_jit["retrive_next_token"], inp_aot["retrive_next_token"])
-        match_sibling = torch.equal(inp_jit["retrive_next_sibling"], inp_aot["retrive_next_sibling"])
-        status = "OK" if all([match_positions, match_retrive_index, match_next_token, match_sibling]) else "MISMATCH"
+        match_retrive_index = torch.equal(
+            inp_jit["retrive_index"], inp_aot["retrive_index"]
+        )
+        match_next_token = torch.equal(
+            inp_jit["retrive_next_token"], inp_aot["retrive_next_token"]
+        )
+        match_sibling = torch.equal(
+            inp_jit["retrive_next_sibling"], inp_aot["retrive_next_sibling"]
+        )
+        status = (
+            "OK"
+            if all(
+                [match_positions, match_retrive_index, match_next_token, match_sibling]
+            )
+            else "MISMATCH"
+        )
         draft_token_num = topk * (depth - 1) + 1
         print(
             f"  bs={bs:2d} topk={topk:2d} depth={depth:2d} draft_tokens={draft_token_num:2d} "

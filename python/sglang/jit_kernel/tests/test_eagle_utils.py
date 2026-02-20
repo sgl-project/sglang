@@ -24,7 +24,9 @@ QLEN_ONLY_BITPACKING = 2
 # ---------------------------------------------------------------------------
 
 
-def make_build_tree_inputs(bs, topk, depth, draft_token_num, seq_len, tree_mask_mode, device=DEVICE):
+def make_build_tree_inputs(
+    bs, topk, depth, draft_token_num, seq_len, tree_mask_mode, device=DEVICE
+):
     """
     Create a minimal set of tensors for build_tree_kernel_efficient.
 
@@ -49,17 +51,28 @@ def make_build_tree_inputs(bs, topk, depth, draft_token_num, seq_len, tree_mask_
             num_bytes = 2
         else:
             num_bytes = 1
-        tree_mask = torch.zeros(bs * draft_token_num * num_bytes, dtype=torch.uint8, device=device)
+        tree_mask = torch.zeros(
+            bs * draft_token_num * num_bytes, dtype=torch.uint8, device=device
+        )
     elif tree_mask_mode == QLEN_ONLY:
-        tree_mask = torch.zeros(bs * draft_token_num * draft_token_num, dtype=torch.bool, device=device)
+        tree_mask = torch.zeros(
+            bs * draft_token_num * draft_token_num, dtype=torch.bool, device=device
+        )
     else:  # FULL_MASK
-        total_mask_size = sum([seq_len] * bs) * draft_token_num + bs * draft_token_num * draft_token_num
+        total_mask_size = (
+            sum([seq_len] * bs) * draft_token_num
+            + bs * draft_token_num * draft_token_num
+        )
         tree_mask = torch.zeros(total_mask_size, dtype=torch.bool, device=device)
 
     positions = torch.zeros(bs, draft_token_num, dtype=torch.int64, device=device)
     retrive_index = torch.zeros(bs, draft_token_num, dtype=torch.int64, device=device)
-    retrive_next_token = torch.full((bs, draft_token_num), -1, dtype=torch.int64, device=device)
-    retrive_next_sibling = torch.full((bs, draft_token_num), -1, dtype=torch.int64, device=device)
+    retrive_next_token = torch.full(
+        (bs, draft_token_num), -1, dtype=torch.int64, device=device
+    )
+    retrive_next_sibling = torch.full(
+        (bs, draft_token_num), -1, dtype=torch.int64, device=device
+    )
 
     return dict(
         parent_list=parent_list,
@@ -78,7 +91,9 @@ def make_build_tree_inputs(bs, topk, depth, draft_token_num, seq_len, tree_mask_
 # ---------------------------------------------------------------------------
 
 
-def make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_size, seed=42, device=DEVICE):
+def make_verify_tree_greedy_inputs(
+    bs, num_draft_tokens, num_spec_step, vocab_size, seed=42, device=DEVICE
+):
     """Create tensors for verify_tree_greedy with a linear-chain tree.
 
     retrive_index uses **absolute** flat indices (as produced by build_tree_efficient):
@@ -96,7 +111,10 @@ def make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_si
     retrive_index = torch.zeros(bs, num_draft_tokens, dtype=torch.int64, device=device)
     for b in range(bs):
         retrive_index[b] = torch.arange(
-            b * num_draft_tokens, (b + 1) * num_draft_tokens, dtype=torch.int64, device=device
+            b * num_draft_tokens,
+            (b + 1) * num_draft_tokens,
+            dtype=torch.int64,
+            device=device,
         )
 
     # retrive_next_token[b, i] = i+1 (linear chain, last = -1)
@@ -104,11 +122,16 @@ def make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_si
     next_token[-1] = -1
     retrive_next_token = next_token.unsqueeze(0).expand(bs, -1).contiguous()
 
-    retrive_next_sibling = torch.full((bs, num_draft_tokens), -1, dtype=torch.int64, device=device)
+    retrive_next_sibling = torch.full(
+        (bs, num_draft_tokens), -1, dtype=torch.int64, device=device
+    )
 
     candidates = (
-        torch.arange(num_draft_tokens, dtype=torch.int64, device=device) % vocab_size
-    ).unsqueeze(0).expand(bs, -1).contiguous()
+        (torch.arange(num_draft_tokens, dtype=torch.int64, device=device) % vocab_size)
+        .unsqueeze(0)
+        .expand(bs, -1)
+        .contiguous()
+    )
 
     # target_predict[b, i] = what target predicts after accepting slot i.
     # For a neutral baseline set it equal to candidates (greedy accepts all but last slot).
@@ -141,7 +164,9 @@ def test_build_tree_smoke(bs, tree_mask_mode):
     draft_token_num = topk * (depth - 1) + 1
     seq_len = 10
 
-    inputs = make_build_tree_inputs(bs, topk, depth, draft_token_num, seq_len, tree_mask_mode)
+    inputs = make_build_tree_inputs(
+        bs, topk, depth, draft_token_num, seq_len, tree_mask_mode
+    )
     build_tree_kernel_efficient(
         **inputs,
         topk=topk,
@@ -151,7 +176,9 @@ def test_build_tree_smoke(bs, tree_mask_mode):
     )
 
     # positions[b, 0] should equal seq_len (root position)
-    assert (inputs["positions"][:, 0] == seq_len).all(), "Root position should equal seq_len"
+    assert (
+        inputs["positions"][:, 0] == seq_len
+    ).all(), "Root position should equal seq_len"
     # retrive_index[b, 0] should equal b * draft_token_num
     for b in range(bs):
         assert inputs["retrive_index"][b, 0].item() == b * draft_token_num
@@ -174,7 +201,9 @@ def test_build_tree_smoke(bs, tree_mask_mode):
 def test_verify_tree_greedy_smoke(bs, num_draft_tokens, num_spec_step, vocab_size):
     from sglang.jit_kernel.eagle_utils import verify_tree_greedy
 
-    inputs = make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_size)
+    inputs = make_verify_tree_greedy_inputs(
+        bs, num_draft_tokens, num_spec_step, vocab_size
+    )
     verify_tree_greedy(**inputs)
 
     # accept_token_num should be non-negative and < num_spec_step
@@ -191,7 +220,9 @@ def test_verify_tree_greedy_accept_all():
     num_spec_step = 4
     vocab_size = 32
 
-    inputs = make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_size)
+    inputs = make_verify_tree_greedy_inputs(
+        bs, num_draft_tokens, num_spec_step, vocab_size
+    )
     # The kernel accepts slot i+1 if target_predict[b, i] == candidates[b, i+1].
     # Set target_predict[b, i] = candidates[b, i+1] to accept every step.
     target_predict = inputs["candidates"].clone()
@@ -213,7 +244,9 @@ def test_verify_tree_greedy_accept_none():
     num_spec_step = 4
     vocab_size = 32
 
-    inputs = make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_size)
+    inputs = make_verify_tree_greedy_inputs(
+        bs, num_draft_tokens, num_spec_step, vocab_size
+    )
     # candidates[b, i] = i % vocab_size, so candidates[b, 1] = 1.
     # Set target_predict to all zeros: target_predict[b, 0] = 0 != 1 = candidates[b, 1].
     # The first candidate is rejected, sibling is -1, so the loop breaks immediately.
@@ -244,16 +277,27 @@ def test_verify_tree_greedy_vs_aot(bs, num_draft_tokens, num_spec_step, vocab_si
     except ImportError:
         pytest.skip("sgl_kernel not available")
 
-    from sglang.jit_kernel.eagle_utils import verify_tree_greedy as verify_tree_greedy_jit
+    from sglang.jit_kernel.eagle_utils import (
+        verify_tree_greedy as verify_tree_greedy_jit,
+    )
 
-    inputs_jit = make_verify_tree_greedy_inputs(bs, num_draft_tokens, num_spec_step, vocab_size, seed=0)
-    inputs_aot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs_jit.items()}
+    inputs_jit = make_verify_tree_greedy_inputs(
+        bs, num_draft_tokens, num_spec_step, vocab_size, seed=0
+    )
+    inputs_aot = {
+        k: v.clone() if isinstance(v, torch.Tensor) else v
+        for k, v in inputs_jit.items()
+    }
 
     verify_tree_greedy_jit(**inputs_jit)
     verify_tree_greedy_aot(**inputs_aot)
 
-    assert torch.equal(inputs_jit["predicts"], inputs_aot["predicts"]), "predicts mismatch"
-    assert torch.equal(inputs_jit["accept_index"], inputs_aot["accept_index"]), "accept_index mismatch"
+    assert torch.equal(
+        inputs_jit["predicts"], inputs_aot["predicts"]
+    ), "predicts mismatch"
+    assert torch.equal(
+        inputs_jit["accept_index"], inputs_aot["accept_index"]
+    ), "accept_index mismatch"
     assert torch.equal(
         inputs_jit["accept_token_num"], inputs_aot["accept_token_num"]
     ), "accept_token_num mismatch"
@@ -272,21 +316,44 @@ def test_build_tree_vs_aot(bs, tree_mask_mode):
     except ImportError:
         pytest.skip("sgl_kernel not available")
 
-    from sglang.jit_kernel.eagle_utils import build_tree_kernel_efficient as build_tree_jit
+    from sglang.jit_kernel.eagle_utils import (
+        build_tree_kernel_efficient as build_tree_jit,
+    )
 
     topk = 4
     depth = 5
     draft_token_num = topk * (depth - 1) + 1
     seq_len = 8
 
-    inputs_jit = make_build_tree_inputs(bs, topk, depth, draft_token_num, seq_len, tree_mask_mode)
-    inputs_aot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs_jit.items()}
+    inputs_jit = make_build_tree_inputs(
+        bs, topk, depth, draft_token_num, seq_len, tree_mask_mode
+    )
+    inputs_aot = {
+        k: v.clone() if isinstance(v, torch.Tensor) else v
+        for k, v in inputs_jit.items()
+    }
 
-    build_tree_jit(**inputs_jit, topk=topk, depth=depth, draft_token_num=draft_token_num, tree_mask_mode=tree_mask_mode)
-    build_tree_aot(**inputs_aot, topk=topk, depth=depth, draft_token_num=draft_token_num, tree_mask_mode=tree_mask_mode)
+    build_tree_jit(
+        **inputs_jit,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=tree_mask_mode,
+    )
+    build_tree_aot(
+        **inputs_aot,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=tree_mask_mode,
+    )
 
-    assert torch.equal(inputs_jit["positions"], inputs_aot["positions"]), "positions mismatch"
-    assert torch.equal(inputs_jit["retrive_index"], inputs_aot["retrive_index"]), "retrive_index mismatch"
+    assert torch.equal(
+        inputs_jit["positions"], inputs_aot["positions"]
+    ), "positions mismatch"
+    assert torch.equal(
+        inputs_jit["retrive_index"], inputs_aot["retrive_index"]
+    ), "retrive_index mismatch"
     assert torch.equal(
         inputs_jit["retrive_next_token"], inputs_aot["retrive_next_token"]
     ), "retrive_next_token mismatch"

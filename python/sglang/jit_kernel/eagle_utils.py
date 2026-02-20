@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pathlib
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,7 +25,12 @@ def _jit_eagle_utils_module() -> Module:
 
 @register_custom_op(
     op_name="build_tree_kernel_efficient_out",
-    mutates_args=["positions", "retrive_index", "retrive_next_token", "retrive_next_sibling"],
+    mutates_args=[
+        "positions",
+        "retrive_index",
+        "retrive_next_token",
+        "retrive_next_sibling",
+    ],
 )
 def build_tree_kernel_efficient(
     parent_list: torch.Tensor,
