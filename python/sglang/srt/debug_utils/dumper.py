@@ -631,16 +631,19 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
 
 
 def _make_dumper_http_handler(rpc_handles):
+    prefix = "/dumper/"
+
     class _DumperHTTPHandler(BaseHTTPRequestHandler):
         def do_POST(self):
+            if not self.path.startswith(prefix):
+                self.send_error(404)
+                return
+            method = self.path[len(prefix):]
             try:
-                if self.path == "/dumper/configure":
-                    self._handle_configure()
-                elif self.path == "/dumper/reset":
-                    self._handle_reset()
-                else:
-                    self.send_error(404)
-                    return
+                kwargs = self._get_request_body()
+                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
+                for rpc_handle in rpc_handles:
+                    getattr(rpc_handle, method)(**kwargs)
                 self.send_response(200)
                 self.end_headers()
             except Exception as e:
@@ -651,17 +654,6 @@ def _make_dumper_http_handler(rpc_handles):
             if content_length == 0:
                 return {}
             return json.loads(self.rfile.read(content_length))
-
-        def _handle_configure(self):
-            data = self._get_request_body()
-            print(f"[Dumper#{_get_rank()}] HTTP /dumper/configure {data=}")
-            for rpc_handle in rpc_handles:
-                rpc_handle.configure(**data)
-
-        def _handle_reset(self):
-            print(f"[Dumper#{_get_rank()}] HTTP /dumper/reset")
-            for rpc_handle in rpc_handles:
-                rpc_handle.reset()
 
     return _DumperHTTPHandler
 
