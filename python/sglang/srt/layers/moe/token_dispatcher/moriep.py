@@ -14,7 +14,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    is_tbo_enabled,
+)
 from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -154,7 +157,7 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
             block_num=64,
             rdma_block_num=32,
         ),
-        # TODO(billishyahao): may need to set different configs for intra node async
+        # TODO(billishyahao): need to tune different configs for intra node async
         EpMode.LOW_LATENCY: EpDispatchConfig(
             kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL,
             warp_num_per_block=8,
@@ -175,6 +178,7 @@ def init_mori_op(
     hidden_size,
     params_dtype,
     num_max_dispatch_tokens_per_rank,
+    deepep_mode,
 ):
 
     import mori
@@ -187,7 +191,7 @@ def init_mori_op(
     mori.shmem.shmem_torch_process_group_init("mori")
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    async_mode = get_bool_env_var("SGLANG_MORI_ASYNC_MODE", "false")
+    async_mode = deepep_mode.enable_low_latency()
     if async_mode:
         mode = EpMode.LOW_LATENCY
 
@@ -285,7 +289,8 @@ class _MoriEPDispatcherImplBase:
             self.num_local_experts,
             self.hidden_size,
             self.params_dtype,
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            self.num_max_dispatch_tokens_per_rank,
+            self.deepep_mode,
         )
 
         self.quant_config: Optional[dict] = None
@@ -336,7 +341,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.quant_config = {}
         # [kk TODO] need to support mxfp4 type
         self.quant_func = get_hip_quant(QuantType.per_1x128)
-        self.enable_dual_stream = get_bool_env_var("SGLANG_MORI_DUAL_STREAM", "false")
+        self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
             self._comm_stream = CommStreamPool.getStreamFromPool(self.group)
