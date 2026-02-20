@@ -22,8 +22,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
-    RequestMetrics, MemorySnapshot,
+    RequestMetrics,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -59,8 +60,12 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str,
-                           results: GenerationResult | list[GenerationResult] | None):
+def maybe_dump_performance(
+    args: argparse.Namespace,
+    server_args,
+    prompt: str,
+    results: GenerationResult | list[GenerationResult] | None,
+):
     """dump performance if necessary"""
     if not (args.perf_dump_path and results):
         return
@@ -90,10 +95,15 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str,
         )
         metrics.memory_snapshots[checkpoint_name] = snapshot
 
-    PerformanceLogger.dump_benchmark_report(file_path=args.perf_dump_path, metrics=metrics, meta={
-        "prompt": prompt,
-        "model": server_args.model_path,
-    }, tag="cli_generate")
+    PerformanceLogger.dump_benchmark_report(
+        file_path=args.perf_dump_path,
+        metrics=metrics,
+        meta={
+            "prompt": prompt,
+            "model": server_args.model_path,
+        },
+        tag="cli_generate",
+    )
 
 
 def generate_cmd(args: argparse.Namespace):
