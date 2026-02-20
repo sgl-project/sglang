@@ -469,6 +469,27 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ZImageDitConfig().arch_config.reverse_param_names_mapping
     )
 
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attention.to_qkv",
+                "attention.to_out",
+                "img_mlp",
+                "txt_mlp",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
+
     def __init__(
         self,
         config: ZImageDitConfig,

@@ -95,6 +95,8 @@ class TransformerLoader(ComponentLoader):
 
         nunchaku_config = server_args.nunchaku_config
         if nunchaku_config is not None:
+            nunchaku_config.model_cls = model_cls
+
             # respect dtype from checkpoint
             # TODO: improve the condition
             param_dtype = None
