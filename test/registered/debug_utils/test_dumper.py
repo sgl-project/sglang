@@ -990,7 +990,7 @@ class TestHookDumper:
         assert "hook__model.relu.inputs.0" in captured
         assert "hook__inputs.0" in captured
 
-    def test_skips_intermediate_containers(self, tmp_path):
+    def test_hooks_all_modules(self, tmp_path):
         class Attention(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1043,10 +1043,9 @@ class TestHookDumper:
         assert f"{P}model.layers.0.mlp.output" in captured
         assert f"{P}output" in captured
 
-        assert not any(k == f"{P}model.layers.0.self_attn.output" for k in captured)
-        assert not any(k == f"{P}model.layers.0.output" for k in captured)
-        assert not any(k == f"{P}model.layers.output" for k in captured)
-        assert not any(k == f"{P}model.output" for k in captured)
+        assert f"{P}model.layers.0.self_attn.output" in captured
+        assert f"{P}model.layers.0.output" in captured
+        assert f"{P}model.output" in captured
 
     def test_tuple_output(self, tmp_path):
         class TupleModule(torch.nn.Module):

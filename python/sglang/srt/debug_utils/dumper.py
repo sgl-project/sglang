@@ -487,13 +487,7 @@ class _HookDumper:
         self._dumper = dumper
 
         for name, module in model.named_modules():
-            is_root = name == ""
-            is_leaf = next(module.children(), None) is None
-
-            if is_leaf or is_root:
-                module.register_forward_hook(
-                    self._make_forward_hook(name=name)
-                )
+            module.register_forward_hook(self._make_forward_hook(name=name))
 
     def _make_forward_hook(self, name: str):
         def _hook(_module, _input, output):
