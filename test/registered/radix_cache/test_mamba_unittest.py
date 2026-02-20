@@ -12,11 +12,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
@@ -39,7 +41,7 @@ class TestMamba(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [
             i for i in range(global_interval - 1, num_layers, global_interval)
         ]
@@ -67,7 +69,7 @@ class TestMamba(unittest.TestCase):
         max_num_reqs = 10
         mamba_cache_size = 20
         max_context_len = 128
-        device = "cuda"
+        device = get_device()
         global_interval = 4
         num_layers = 48
         full_attention_layer_ids = [
@@ -116,24 +118,25 @@ class TestMamba(unittest.TestCase):
         )
 
         # alloc req
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # free req
-        req_to_token_pool.free(req_index)
+        req_to_token_pool.free_mamba_cache(req)
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
-        req_index = req_to_token_pool.alloc(1, [req])
-        req_to_token_pool.free(req_index, free_mamba_cache=False)
+        req_to_token_pool.alloc([req])
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # alloc again
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
@@ -151,7 +154,7 @@ class TestMamba(unittest.TestCase):
         max_num_reqs = 10
         mamba_cache_size = 20
         max_context_len = 128
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [
             i for i in range(global_interval - 1, num_layers, global_interval)
         ]
@@ -225,7 +228,7 @@ class TestMamba(unittest.TestCase):
                 origin_input_ids=[],
                 sampling_params=sampling_params,
             )
-            req_to_token_pool.alloc(1, reqs=[req])
+            req_to_token_pool.alloc([req])
             return req
 
         mamba_pool = req_to_token_pool.mamba_pool
@@ -378,6 +381,10 @@ class TestMamba(unittest.TestCase):
             mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
             == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
+
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+        tree.sanity_check()
 
 
 if __name__ == "__main__":

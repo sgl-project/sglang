@@ -25,15 +25,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+
 import functools
 from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

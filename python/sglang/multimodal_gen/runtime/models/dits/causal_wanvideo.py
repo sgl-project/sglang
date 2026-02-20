@@ -296,24 +296,23 @@ class CausalWanTransformerBlock(nn.Module):
             raise Exception
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim,
-            norm_type="layer",
-            eps=eps,
-            elementwise_affine=True,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
         )
 
         # 2. Cross-attention
         # Only T2V for now
-        self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
+        self.attn2 = WanT2VCrossAttention(
             dim,
-            norm_type="layer",
+            num_heads,
+            qk_norm=qk_norm,
             eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-            compute_dtype=torch.float32,
+            supported_attention_backends=cross_attn_backends,
+        )
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
 
         # 3. Feed-forward
@@ -484,11 +483,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)
