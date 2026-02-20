@@ -55,9 +55,13 @@ def biased_grouped_topk_ref(
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
 
     group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        scores_for_choice.view(num_token, num_expert_group, -1)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
     )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]  # [n, topk_group]
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+        1
+    ]  # [n, topk_group]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
     score_mask = (
@@ -68,13 +72,21 @@ def biased_grouped_topk_ref(
     tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_excluding_shared = topk - num_fused_shared_experts
-    _, routed_topk_ids = torch.topk(tmp_scores, k=topk_excluding_shared, dim=-1, sorted=False)
+    _, routed_topk_ids = torch.topk(
+        tmp_scores, k=topk_excluding_shared, dim=-1, sorted=False
+    )
     routed_topk_weights = scores.gather(1, routed_topk_ids)
 
     if num_fused_shared_experts > 0:
-        topk_ids = torch.empty((num_token, topk), dtype=routed_topk_ids.dtype, device=routed_topk_ids.device)
+        topk_ids = torch.empty(
+            (num_token, topk),
+            dtype=routed_topk_ids.dtype,
+            device=routed_topk_ids.device,
+        )
         topk_weights = torch.empty(
-            (num_token, topk), dtype=routed_topk_weights.dtype, device=routed_topk_weights.device
+            (num_token, topk),
+            dtype=routed_topk_weights.dtype,
+            device=routed_topk_weights.device,
         )
         topk_ids[:, :topk_excluding_shared] = routed_topk_ids
         topk_weights[:, :topk_excluding_shared] = routed_topk_weights
@@ -90,7 +102,9 @@ def biased_grouped_topk_ref(
 
     # renormalize (moe_fused_gate always renormalizes)
     if num_fused_shared_experts > 0:
-        topk_weights_sum = topk_weights[:, :topk_excluding_shared].sum(dim=-1, keepdim=True)
+        topk_weights_sum = topk_weights[:, :topk_excluding_shared].sum(
+            dim=-1, keepdim=True
+        )
     else:
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights / topk_weights_sum
@@ -124,20 +138,24 @@ def _check_outputs(
     if num_fused_shared_experts > 0:
         shared_jit = jit_ids[:, topk_excluding_shared:]
         assert torch.all(
-            (shared_jit >= num_experts) & (shared_jit < num_experts + num_fused_shared_experts)
+            (shared_jit >= num_experts)
+            & (shared_jit < num_experts + num_fused_shared_experts)
         ), f"[{label}] Shared expert indices out of range"
 
         if ref_ids is not None:
             shared_ref = ref_ids[:, topk_excluding_shared:]
             assert torch.all(
-                (shared_ref >= num_experts) & (shared_ref < num_experts + num_fused_shared_experts)
+                (shared_ref >= num_experts)
+                & (shared_ref < num_experts + num_fused_shared_experts)
             ), f"[{label}] Reference shared expert indices out of range"
 
         # Compare only the routed (non-shared) slots
         jit_ids = jit_ids[:, :topk_excluding_shared]
         ref_ids = ref_ids[:, :topk_excluding_shared] if ref_ids is not None else None
         jit_weights = jit_weights[:, :topk_excluding_shared]
-        ref_weights = ref_weights[:, :topk_excluding_shared] if ref_weights is not None else None
+        ref_weights = (
+            ref_weights[:, :topk_excluding_shared] if ref_weights is not None else None
+        )
 
     if ref_ids is not None:
         idx_ok = torch.allclose(
@@ -163,23 +181,37 @@ def _check_outputs(
 # ---------------------------------------------------------------------------
 
 # seq_lengths: small edge cases + typical production sizes
-SEQ_LENGTHS_FULL = list(range(1, 10)) + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+SEQ_LENGTHS_FULL = list(range(1, 10)) + [
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+]
 SEQ_LENGTHS_CI = [1, 3, 7, 64, 512, 2048]
 
 import os
 
-_is_ci = os.getenv("CI", "false").lower() == "true" or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+_is_ci = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 SEQ_LENGTHS = SEQ_LENGTHS_CI if _is_ci else SEQ_LENGTHS_FULL
 
 # (num_experts, num_expert_group, topk_group, topk_routed)
 # Static dispatch configs: (256,8), (256,16), (128,4), (128,8)
 # Dynamic fallback config: (512,16) — VPT=32, outside the static switch
 EXPERT_CONFIGS = [
-    (128, 4, 2, 4),   # static: VPT=32
-    (128, 8, 4, 4),   # static: VPT=16
-    (256, 8, 4, 8),   # static: VPT=32 — DeepSeek V3
+    (128, 4, 2, 4),  # static: VPT=32
+    (128, 8, 4, 4),  # static: VPT=16
+    (256, 8, 4, 8),  # static: VPT=32 — DeepSeek V3
     (256, 16, 8, 8),  # static: VPT=16
-    (512, 16, 8, 16), # dynamic fallback: VPT=32
+    (512, 16, 8, 16),  # dynamic fallback: VPT=32
 ]
 EXPERT_CONFIGS_CI = [
     (128, 4, 2, 4),
@@ -257,8 +289,8 @@ def test_moe_fused_gate_vs_ref(
     "expert_cfg",
     [
         (128, 4, 2, 4),
-        (256, 8, 4, 8),   # DeepSeek V3 — most critical
-        (512, 16, 8, 16), # dynamic fallback
+        (256, 8, 4, 8),  # DeepSeek V3 — most critical
+        (512, 16, 8, 16),  # dynamic fallback
     ],
 )
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
@@ -333,7 +365,9 @@ def test_output_dtypes_always_float32_int32():
         inp = torch.rand((16, 128), dtype=dtype, device="cuda")
         bias = torch.rand(128, dtype=dtype, device="cuda")
         w, ids = moe_fused_gate(inp, bias, num_expert_group=4, topk_group=2, topk=4)
-        assert w.dtype == torch.float32, f"weights dtype should be float32, got {w.dtype}"
+        assert (
+            w.dtype == torch.float32
+        ), f"weights dtype should be float32, got {w.dtype}"
         assert ids.dtype == torch.int32, f"ids dtype should be int32, got {ids.dtype}"
 
 
@@ -347,7 +381,9 @@ def test_weights_sum_to_one_after_renorm():
         inp, bias, num_expert_group=num_expert_group, topk_group=topk_group, topk=topk
     )
     row_sums = w.sum(dim=-1)
-    torch.testing.assert_close(row_sums, torch.ones(seq, device="cuda"), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        row_sums, torch.ones(seq, device="cuda"), rtol=1e-4, atol=1e-4
+    )
 
 
 def test_fused_shared_expert_indices_in_range():
@@ -358,12 +394,18 @@ def test_fused_shared_expert_indices_in_range():
     inp = torch.rand((seq, num_experts), dtype=torch.float32, device="cuda")
     bias = torch.rand(num_experts, dtype=torch.float32, device="cuda")
     _, ids = moe_fused_gate(
-        inp, bias,
-        num_expert_group=8, topk_group=4, topk=topk,
-        num_fused_shared_experts=n_shared, routed_scaling_factor=2.5,
+        inp,
+        bias,
+        num_expert_group=8,
+        topk_group=4,
+        topk=topk,
+        num_fused_shared_experts=n_shared,
+        routed_scaling_factor=2.5,
     )
     shared_slots = ids[:, topk_routed:]
-    assert torch.all((shared_slots >= num_experts) & (shared_slots < num_experts + n_shared))
+    assert torch.all(
+        (shared_slots >= num_experts) & (shared_slots < num_experts + n_shared)
+    )
 
 
 def test_invalid_num_experts_not_power_of_two():

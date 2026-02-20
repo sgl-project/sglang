@@ -88,7 +88,9 @@ def moe_fused_gate(
         topk_ids:     [num_rows, topk] int32
     """
     num_rows = input.shape[0]
-    topk_weights = torch.empty((num_rows, topk), dtype=torch.float32, device=input.device)
+    topk_weights = torch.empty(
+        (num_rows, topk), dtype=torch.float32, device=input.device
+    )
     topk_ids = torch.empty((num_rows, topk), dtype=torch.int32, device=input.device)
     moe_fused_gate_out(
         input,

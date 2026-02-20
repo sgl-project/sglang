@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -18,8 +19,12 @@ namespace {
 template <typename T, int N>
 struct alignas(16) AlignedArray {
   T data[N];
-  __device__ __host__ T& operator[](int i) { return data[i]; }
-  __device__ __host__ const T& operator[](int i) const { return data[i]; }
+  __device__ __host__ T& operator[](int i) {
+    return data[i];
+  }
+  __device__ __host__ const T& operator[](int i) const {
+    return data[i];
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -311,27 +316,27 @@ __global__ void moe_fused_gate_kernel(
 // Macro: compute compile-time constants and launch the static kernel.
 // T is the dtype template parameter inherited from the enclosing host function.
 // stream is a cudaStream_t resolved in the host launcher before this macro.
-#define LAUNCH_MOE_GATE_CONFIG(EXPERTS, EXPERT_GROUP)                                                        \
-  do {                                                                                                       \
-    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                          \
-    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;          \
-    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                             \
-    host::LaunchKernel(                                                                                      \
-        {static_cast<uint32_t>(num_blocks), 1u, 1u},                                                        \
-        {static_cast<uint32_t>(WARP_SIZE), static_cast<uint32_t>(WARPS_PER_CTA), 1u},                       \
-        stream)(                                                                                             \
+#define LAUNCH_MOE_GATE_CONFIG(EXPERTS, EXPERT_GROUP)                                                         \
+  do {                                                                                                        \
+    constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                                           \
+    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;           \
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                                               \
+    host::LaunchKernel(                                                                                       \
+        {static_cast<uint32_t>(num_blocks), 1u, 1u},                                                          \
+        {static_cast<uint32_t>(WARP_SIZE), static_cast<uint32_t>(WARPS_PER_CTA), 1u},                         \
+        stream)(                                                                                              \
         moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP), ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA>, \
-        input.data_ptr(),                                                                                    \
-        bias.data_ptr(),                                                                                     \
-        static_cast<float*>(output.data_ptr()),                                                              \
-        static_cast<int32_t*>(indices.data_ptr()),                                                           \
-        num_rows,                                                                                            \
-        topk_group,                                                                                          \
-        topk,                                                                                                \
-        num_fused_shared_experts,                                                                            \
-        routed_scaling_factor,                                                                               \
-        apply_routed_scaling_factor_on_output);                                                              \
-    dispatched = true;                                                                                       \
+        input.data_ptr(),                                                                                     \
+        bias.data_ptr(),                                                                                      \
+        static_cast<float*>(output.data_ptr()),                                                               \
+        static_cast<int32_t*>(indices.data_ptr()),                                                            \
+        num_rows,                                                                                             \
+        topk_group,                                                                                           \
+        topk,                                                                                                 \
+        num_fused_shared_experts,                                                                             \
+        routed_scaling_factor,                                                                                \
+        apply_routed_scaling_factor_on_output);                                                               \
+    dispatched = true;                                                                                        \
   } while (0)
 
 // ---------------------------------------------------------------------------
@@ -413,21 +418,24 @@ void moe_fused_gate(
   const int64_t num_experts = input.shape()[1];
 
   RuntimeCheck(bias.shape()[0] == num_experts, "bias size must match num_experts");
-  RuntimeCheck(output.dim() == 2 && output.shape()[0] == num_rows && output.shape()[1] == topk,
-               "output must be [num_rows, topk]");
-  RuntimeCheck(indices.dim() == 2 && indices.shape()[0] == num_rows && indices.shape()[1] == topk,
-               "indices must be [num_rows, topk]");
-
   RuntimeCheck(
-      (num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, got ", num_experts);
+      output.dim() == 2 && output.shape()[0] == num_rows && output.shape()[1] == topk,
+      "output must be [num_rows, topk]");
+  RuntimeCheck(
+      indices.dim() == 2 && indices.shape()[0] == num_rows && indices.shape()[1] == topk,
+      "indices must be [num_rows, topk]");
+
+  RuntimeCheck((num_experts & (num_experts - 1)) == 0, "num_experts must be a power of 2, got ", num_experts);
   RuntimeCheck(
       num_experts % num_expert_group == 0,
-      "num_experts must be divisible by num_expert_group, got ", num_experts, " / ", num_expert_group);
+      "num_experts must be divisible by num_expert_group, got ",
+      num_experts,
+      " / ",
+      num_expert_group);
 
   const int64_t computed_vpt = num_experts / num_expert_group;
   RuntimeCheck(
-      computed_vpt <= MAX_VPT,
-      "num_experts / num_expert_group = ", computed_vpt, " exceeds MAX_VPT=", MAX_VPT);
+      computed_vpt <= MAX_VPT, "num_experts / num_expert_group = ", computed_vpt, " exceeds MAX_VPT=", MAX_VPT);
 
   // --- Grid dimensions (same formula as AOT version) ---
   const int64_t rows_per_warp = max((int64_t)1, (int64_t)(WARP_SIZE / num_expert_group));

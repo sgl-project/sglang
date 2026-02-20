@@ -41,8 +41,8 @@ NUM_ROWS_RANGE = get_benchmark_range(
 # Covers: two static-dispatch configs + one dynamic fallback
 EXPERT_CONFIGS = get_benchmark_range(
     full_range=[
-        (128, 4, 2, 4),    # static: VPT=32
-        (256, 8, 4, 8),    # static: VPT=32 — DeepSeek V3 (most important)
+        (128, 4, 2, 4),  # static: VPT=32
+        (256, 8, 4, 8),  # static: VPT=32 — DeepSeek V3 (most important)
         (512, 16, 8, 16),  # dynamic fallback: VPT=32, outside static switch
     ],
     ci_range=[
@@ -66,7 +66,13 @@ STYLES = [("blue", "--"), ("orange", "-")] if AOT_AVAILABLE else [("blue", "--")
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_rows", "num_experts", "num_expert_group", "topk_group", "topk_routed"],
+        x_names=[
+            "num_rows",
+            "num_experts",
+            "num_expert_group",
+            "topk_group",
+            "topk_routed",
+        ],
         x_vals=CONFIGS,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -136,8 +142,10 @@ def calculate_diff():
         ids_match = torch.equal(i_jit, i_aot)
         weights_match = torch.allclose(w_jit, w_aot, rtol=1e-4, atol=1e-4)
         status = "OK" if (ids_match and weights_match) else "MISMATCH"
-        print(f"  rows={num_rows:5d}  experts={ne}  group={neg}  "
-              f"ids={'✓' if ids_match else '✗'}  weights={'✓' if weights_match else '✗'}  [{status}]")
+        print(
+            f"  rows={num_rows:5d}  experts={ne}  group={neg}  "
+            f"ids={'✓' if ids_match else '✗'}  weights={'✓' if weights_match else '✗'}  [{status}]"
+        )
 
 
 if __name__ == "__main__":
