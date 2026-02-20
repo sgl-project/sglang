@@ -486,22 +486,22 @@ class _HookDumper:
     ):
         self._dumper = dumper
 
-        for name, module in model.named_modules():
-            module.register_forward_hook(self._make_forward_hook(name=name))
+        for module_name, module in model.named_modules():
+            module.register_forward_hook(self._make_forward_hook(module_name=module_name))
 
-    def _make_forward_hook(self, name: str):
+    def _make_forward_hook(self, module_name: str):
         def _hook(_module, input, output):
             for i, item in enumerate(input):
-                self._dump_converted(name, item, role=f"inputs.{i}")
+                self._dump_converted(module_name, item, role=f"inputs.{i}")
 
             if output is not None:
-                self._dump_converted(name, output, role="output")
+                self._dump_converted(module_name, output, role="output")
 
         return _hook
 
-    def _dump_converted(self, name: str, value, role: str) -> None:
+    def _dump_converted(self, module_name: str, value, role: str) -> None:
         for key, tensor in self._convert_hook_output(value).items():
-            parts = [p for p in (name, role, key) if p]
+            parts = [p for p in (module_name, role, key) if p]
             self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
     @staticmethod
