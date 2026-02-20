@@ -231,7 +231,7 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
-    def register_forward_hook_for_model(
+    def register_model_forward_hook(
         self,
         model: "torch.nn.Module",
         dump_layers: Optional[List[int]] = None,
