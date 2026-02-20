@@ -2964,19 +2964,16 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        state: dict = {}
         if self.tp_rank == 0:
             from sglang.srt.debug_utils.dumper import dumper
 
             rpc_broadcast = getattr(dumper, "_rpc_broadcast", None)
-            kwargs = dict(recv_req.kwargs)
-            method = kwargs.pop("_method", "configure")
-            if rpc_broadcast is not None:
-                getattr(rpc_broadcast, method)(**kwargs)
-            else:
-                getattr(dumper, method)(**kwargs)
+            target = rpc_broadcast if rpc_broadcast is not None else dumper
+            state = target._handle_http_control_request(**recv_req.kwargs)
 
         self.send_to_tokenizer.send_output(
-            DumperControlReqOutput(success=True), recv_req
+            DumperControlReqOutput(success=True, state=state), recv_req
         )
 
     # placeholder for override

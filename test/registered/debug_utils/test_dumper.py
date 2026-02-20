@@ -907,16 +907,20 @@ class TestDumperHttp:
             yield base_url
             kill_process_tree(proc.pid)
 
-    def test_configure_enable(self, dumper_http_url: str):
-        resp = requests.post(
-            f"{dumper_http_url}/dumper/configure", json={"enable": True}
-        )
-        assert resp.status_code == 200
+    @staticmethod
+    def _get_state(base_url: str) -> dict:
+        resp = requests.post(f"{base_url}/dumper/get_state")
+        resp.raise_for_status()
+        return resp.json()
 
-        resp = requests.post(
-            f"{dumper_http_url}/dumper/configure", json={"enable": False}
-        )
-        assert resp.status_code == 200
+    def test_configure_enable_toggle(self, dumper_http_url: str):
+        for enable in [True, False]:
+            resp = requests.post(
+                f"{dumper_http_url}/dumper/configure", json={"enable": enable}
+            )
+            assert resp.status_code == 200
+            state = resp.json()
+            assert state["config"]["enable"] is enable
 
     def test_configure_multi_field(self, dumper_http_url: str):
         resp = requests.post(
@@ -924,19 +928,58 @@ class TestDumperHttp:
             json={"enable": True, "filter": "layer_id=0", "dir": "/tmp/test_http"},
         )
         assert resp.status_code == 200
+        config = resp.json()["config"]
+        assert config["enable"] is True
+        assert config["filter"] == "layer_id=0"
+        assert config["dir"] == "/tmp/test_http"
 
     def test_configure_clear_optional(self, dumper_http_url: str):
         requests.post(
             f"{dumper_http_url}/dumper/configure", json={"filter": "layer_id=0"}
         ).raise_for_status()
+
         resp = requests.post(
             f"{dumper_http_url}/dumper/configure", json={"filter": None}
         )
         assert resp.status_code == 200
+        assert resp.json()["config"]["filter"] is None
 
     def test_reset(self, dumper_http_url: str):
+        requests.post(
+            f"{dumper_http_url}/dumper/configure", json={"enable": True}
+        ).raise_for_status()
+
         resp = requests.post(f"{dumper_http_url}/dumper/reset")
         assert resp.status_code == 200
+        state = resp.json()
+        assert state["dump_index"] == 0
+        assert state["forward_pass_id"] == 0
+
+    def test_get_state(self, dumper_http_url: str):
+        requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"enable": True, "filter": "layer_id=[0-3]"},
+        ).raise_for_status()
+
+        state = self._get_state(dumper_http_url)
+        assert state["config"]["enable"] is True
+        assert state["config"]["filter"] == "layer_id=[0-3]"
+        assert "dump_index" in state
+        assert "forward_pass_id" in state
+
+    def test_error_unknown_field(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"nonexistent_field": 123},
+        )
+        assert resp.status_code == 400
+
+    def test_error_wrong_type(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/configure",
+            json={"enable": "not_a_bool"},
+        )
+        assert resp.status_code == 400
 
 
 if __name__ == "__main__":
