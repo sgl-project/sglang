@@ -10,7 +10,7 @@ from dataclasses import dataclass, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, get_args, get_type_hints
 
 import torch
 import torch.distributed as dist
@@ -34,6 +34,19 @@ class _DumperConfig:
     cleanup_previous: bool = False
     collective_timeout: int = 60
 
+    def __post_init__(self):
+        hints = get_type_hints(type(self))
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is None:
+                continue
+            expected = _unwrap_type(hints[f.name])
+            if not isinstance(value, expected):
+                raise TypeError(
+                    f"_DumperConfig.{f.name}: expected {expected.__name__}, "
+                    f"got {type(value).__name__}"
+                )
+
     @classmethod
     def from_env(cls) -> "_DumperConfig":
         return cls(**{
@@ -48,6 +61,13 @@ class _DumperConfig:
             if os.getenv(_env_name(key)) is None
         }
         return replace(self, **actual) if actual else self
+
+
+def _unwrap_type(hint) -> type:
+    args = get_args(hint)
+    if args:
+        return next(a for a in args if a is not type(None))
+    return hint
 
 
 _ENV_PREFIX = "SGLANG_DUMPER_"

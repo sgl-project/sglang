@@ -71,6 +71,14 @@ class TestDumperConfig:
         d.configure(enable=True)
         assert d._config.enable is True
 
+    def test_type_validation(self):
+        with pytest.raises(TypeError, match="enable.*expected bool.*got str"):
+            _DumperConfig(enable="yes")
+        with pytest.raises(TypeError, match="collective_timeout.*expected int.*got str"):
+            _DumperConfig(collective_timeout="abc")
+        with pytest.raises(TypeError, match="filter.*expected str.*got int"):
+            _DumperConfig(filter=123)
+
     def test_configure_default_skips_when_env_set(self):
         with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="from_env"):
             d = _Dumper(config=_DumperConfig.from_env())
