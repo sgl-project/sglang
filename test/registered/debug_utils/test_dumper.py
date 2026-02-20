@@ -326,6 +326,53 @@ class TestDumperDistributed:
             )
             assert resp.status_code == 400
 
+    def test_sglang_mode_rpc_broadcast(self):
+        """When SGLANG_DUMPER_SERVER_PORT=0, ZMQ RPC still starts and
+        _rpc_broadcast is available on rank 0 for the scheduler handler."""
+        with temp_set_env(
+            allow_sglang=True,
+            SGLANG_DUMPER_ENABLE="0",
+            SGLANG_DUMPER_SERVER_PORT="0",
+        ):
+            run_distributed_test(self._test_sglang_mode_rpc_broadcast_func)
+
+    @staticmethod
+    def _test_sglang_mode_rpc_broadcast_func(rank):
+        from sglang.srt.debug_utils.dumper import dumper
+
+        assert not dumper._config.enable
+        dumper.on_forward_pass_start()
+
+        if rank == 0:
+            assert hasattr(dumper, "_rpc_broadcast"), (
+                "rank 0 should have _rpc_broadcast when SGLANG_DUMPER_SERVER_PORT=0"
+            )
+
+        # Simulate what the scheduler handler does on rank 0
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            dumper._rpc_broadcast.configure(enable=True)
+        dist.barrier()
+        assert dumper._config.enable is True
+
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            dumper._rpc_broadcast.configure(enable=False, filter="layer_id=0")
+        dist.barrier()
+        assert dumper._config.enable is False
+        assert dumper._config.filter == "layer_id=0"
+
+        # Test reset via rpc_broadcast
+        dumper._dump_index = 42
+        dist.barrier()
+        if rank == 0:
+            time.sleep(0.1)
+            dumper._rpc_broadcast.reset()
+        dist.barrier()
+        assert dumper._dump_index == 0
+
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
             allow_sglang=True,
