@@ -31,7 +31,7 @@ class Timer(StageProfiler):
 
     def __init__(self, name="Stage"):
         super().__init__(
-            stage_name=name, timings=None, log_stage_start_end=True, logger=logger
+            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
         )
 
 
