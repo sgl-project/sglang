@@ -397,7 +397,6 @@ class ComposedPipelineBase(ABC):
         scheduler_key: str = "scheduler",
         prepare_extra_kwargs: list[Callable] | None = [],
     ) -> "ComposedPipelineBase":
-
         return self.add_stage(
             TimestepPreparationStage(
                 scheduler=self.get_module(scheduler_key),
@@ -455,7 +454,7 @@ class ComposedPipelineBase(ABC):
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
-        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        prepare_extra_timestep_kwargs: list[Callable] | None = [],
     ) -> "ComposedPipelineBase":
 
         if include_input_validation:
@@ -484,7 +483,7 @@ class ComposedPipelineBase(ABC):
         prompt_text_encoder_key: str = "text_encoder",
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
-        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        prepare_extra_timestep_kwargs: list[Callable] | None = [],
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -536,7 +535,7 @@ class ComposedPipelineBase(ABC):
         image_vae_encoding_position: Literal[
             "before_timestep", "after_latent"
         ] = "before_timestep",
-        prepare_extra_timestep_kwargs: list[Callable] | None = None,
+        prepare_extra_timestep_kwargs: list[Callable] | None = [],
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:

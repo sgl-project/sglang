@@ -47,7 +47,9 @@ class TimestepPreparationStage(PipelineStage):
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = prepare_extra_set_timesteps_kwargs
+        self.prepare_extra_set_timesteps_kwargs = (
+            prepare_extra_set_timesteps_kwargs or []
+        )
 
     @property
     def parallelism_type(self) -> StageParallelismType:
