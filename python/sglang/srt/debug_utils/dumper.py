@@ -925,6 +925,31 @@ class _FrameworkPlugin(ABC):
 
 
 class _SGLangPlugin(_FrameworkPlugin):
+    try:
+        import sglang.srt.distributed as _dist
+    except ImportError:
+        _dist = None
+
+    try:
+        import sglang.srt.layers.dp_attention as _dp_attn
+    except ImportError:
+        _dp_attn = None
+
+    try:
+        from sglang.srt.layers.logits_processor import (
+            LogitsProcessorOutput as _LogitsProcessorOutput,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch as _ForwardBatch,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            PPProxyTensors as _PPProxyTensors,
+        )
+    except ImportError:
+        _LogitsProcessorOutput = None
+        _ForwardBatch = None
+        _PPProxyTensors = None
+
     @property
     def name(self) -> str:
         return "sglang"
@@ -932,48 +957,33 @@ class _SGLangPlugin(_FrameworkPlugin):
     def collect_parallel_info(self) -> dict:
         info = {}
 
-        try:
-            from sglang.srt.distributed import (
-                get_moe_expert_parallel_rank,
-                get_moe_expert_parallel_world_size,
-                get_moe_tensor_parallel_rank,
-                get_moe_tensor_parallel_world_size,
-                get_pipeline_model_parallel_rank,
-                get_pipeline_model_parallel_world_size,
-                get_tensor_model_parallel_rank,
-                get_tensor_model_parallel_world_size,
-            )
-
-            info["tp_rank"] = get_tensor_model_parallel_rank()
-            info["tp_size"] = get_tensor_model_parallel_world_size()
-            info["pp_rank"] = get_pipeline_model_parallel_rank()
-            info["pp_size"] = get_pipeline_model_parallel_world_size()
-            info["moe_ep_rank"] = get_moe_expert_parallel_rank()
-            info["moe_ep_size"] = get_moe_expert_parallel_world_size()
-            info["moe_tp_rank"] = get_moe_tensor_parallel_rank()
-            info["moe_tp_size"] = get_moe_tensor_parallel_world_size()
-        except (ImportError, AttributeError, AssertionError):
+        if self._dist is not None:
+            try:
+                info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
+                info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
+                info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
+                info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
+                info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
+                info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
+                info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
+                info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
+            except (AttributeError, AssertionError):
+                info["distributed_error"] = True
+        else:
             info["distributed_error"] = True
 
-        try:
-            from sglang.srt.layers.dp_attention import (
-                get_attention_dp_rank,
-                get_attention_dp_size,
-                get_attention_tp_rank,
-                get_attention_tp_size,
-                get_local_attention_dp_rank,
-                get_local_attention_dp_size,
-                is_dp_attention_enabled,
-            )
-
-            info["enable_dp_attention"] = is_dp_attention_enabled()
-            info["attn_tp_rank"] = get_attention_tp_rank()
-            info["attn_tp_size"] = get_attention_tp_size()
-            info["attn_dp_rank"] = get_attention_dp_rank()
-            info["attn_dp_size"] = get_attention_dp_size()
-            info["local_attn_dp_rank"] = get_local_attention_dp_rank()
-            info["local_attn_dp_size"] = get_local_attention_dp_size()
-        except (ImportError, AttributeError, AssertionError):
+        if self._dp_attn is not None:
+            try:
+                info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+                info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
+                info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
+                info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
+                info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
+                info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
+                info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
+            except (AttributeError, AssertionError):
+                info["dp_attention_error"] = True
+        else:
             info["dp_attention_error"] = True
 
         return info
@@ -981,27 +991,21 @@ class _SGLangPlugin(_FrameworkPlugin):
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
     ) -> Optional[dict[str, "torch.Tensor"]]:
-        try:
-            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            from sglang.srt.model_executor.forward_batch_info import (
-                ForwardBatch,
-                PPProxyTensors,
-            )
+        if self._LogitsProcessorOutput is None:
+            return None
 
-            if isinstance(value, LogitsProcessorOutput):
-                return {"next_token_logits": value.next_token_logits}
-            if isinstance(value, ForwardBatch):
-                if skip_forward_batch:
-                    return {}
-                return {
-                    "input_ids": value.input_ids,
-                    "seq_lens": value.seq_lens,
-                    "positions": value.positions,
-                }
-            if isinstance(value, PPProxyTensors):
-                return {k: v for k, v in value.tensors.items()}
-        except ImportError:
-            pass
+        if isinstance(value, self._LogitsProcessorOutput):
+            return {"next_token_logits": value.next_token_logits}
+        if isinstance(value, self._ForwardBatch):
+            if skip_forward_batch:
+                return {}
+            return {
+                "input_ids": value.input_ids,
+                "seq_lens": value.seq_lens,
+                "positions": value.positions,
+            }
+        if isinstance(value, self._PPProxyTensors):
+            return {k: v for k, v in value.tensors.items()}
 
         return None
 
@@ -1012,40 +1016,45 @@ class _SGLangPlugin(_FrameworkPlugin):
 
 
 class _MegatronPlugin(_FrameworkPlugin):
+    try:
+        from megatron.core import parallel_state as _mpu
+    except ImportError:
+        _mpu = None
+
     @property
     def name(self) -> str:
         return "megatron"
 
     def collect_parallel_info(self) -> dict:
+        if self._mpu is None:
+            return {"megatron_error": True}
+
         info = {}
-
         try:
-            from megatron.core import parallel_state as mpu
-
-            info["tp_rank"] = mpu.get_tensor_model_parallel_rank()
-            info["tp_size"] = mpu.get_tensor_model_parallel_world_size()
-            info["pp_rank"] = mpu.get_pipeline_model_parallel_rank()
-            info["pp_size"] = mpu.get_pipeline_model_parallel_world_size()
-            info["dp_rank"] = mpu.get_data_parallel_rank()
-            info["dp_size"] = mpu.get_data_parallel_world_size()
-            info["cp_rank"] = mpu.get_context_parallel_rank()
-            info["cp_size"] = mpu.get_context_parallel_world_size()
-            info["vpp_rank"] = mpu.get_virtual_pipeline_model_parallel_rank()
-            info["vpp_size"] = mpu.get_virtual_pipeline_model_parallel_world_size()
-            info["ep_rank"] = mpu.get_expert_model_parallel_rank()
-            info["ep_size"] = mpu.get_expert_model_parallel_world_size()
-            info["etp_rank"] = mpu.get_expert_tensor_parallel_rank()
-            info["etp_size"] = mpu.get_expert_tensor_parallel_world_size()
-            info["edp_rank"] = mpu.get_expert_data_parallel_rank()
-            info["edp_size"] = mpu.get_expert_data_parallel_world_size()
-            info["tcp_rank"] = mpu.get_tensor_and_context_parallel_rank()
-            info["tcp_size"] = mpu.get_tensor_and_context_parallel_world_size()
-            info["etmp_rank"] = mpu.get_expert_tensor_and_model_parallel_rank()
-            info["etmp_size"] = mpu.get_expert_tensor_and_model_parallel_world_size()
-            info["tp_src_rank"] = mpu.get_tensor_model_parallel_src_rank()
-            info["mp_src_rank"] = mpu.get_model_parallel_src_rank()
-            info["dp_src_rank"] = mpu.get_data_parallel_src_rank()
-        except (ImportError, AttributeError, AssertionError):
+            info["tp_rank"] = self._mpu.get_tensor_model_parallel_rank()
+            info["tp_size"] = self._mpu.get_tensor_model_parallel_world_size()
+            info["pp_rank"] = self._mpu.get_pipeline_model_parallel_rank()
+            info["pp_size"] = self._mpu.get_pipeline_model_parallel_world_size()
+            info["dp_rank"] = self._mpu.get_data_parallel_rank()
+            info["dp_size"] = self._mpu.get_data_parallel_world_size()
+            info["cp_rank"] = self._mpu.get_context_parallel_rank()
+            info["cp_size"] = self._mpu.get_context_parallel_world_size()
+            info["vpp_rank"] = self._mpu.get_virtual_pipeline_model_parallel_rank()
+            info["vpp_size"] = self._mpu.get_virtual_pipeline_model_parallel_world_size()
+            info["ep_rank"] = self._mpu.get_expert_model_parallel_rank()
+            info["ep_size"] = self._mpu.get_expert_model_parallel_world_size()
+            info["etp_rank"] = self._mpu.get_expert_tensor_parallel_rank()
+            info["etp_size"] = self._mpu.get_expert_tensor_parallel_world_size()
+            info["edp_rank"] = self._mpu.get_expert_data_parallel_rank()
+            info["edp_size"] = self._mpu.get_expert_data_parallel_world_size()
+            info["tcp_rank"] = self._mpu.get_tensor_and_context_parallel_rank()
+            info["tcp_size"] = self._mpu.get_tensor_and_context_parallel_world_size()
+            info["etmp_rank"] = self._mpu.get_expert_tensor_and_model_parallel_rank()
+            info["etmp_size"] = self._mpu.get_expert_tensor_and_model_parallel_world_size()
+            info["tp_src_rank"] = self._mpu.get_tensor_model_parallel_src_rank()
+            info["mp_src_rank"] = self._mpu.get_model_parallel_src_rank()
+            info["dp_src_rank"] = self._mpu.get_data_parallel_src_rank()
+        except (AttributeError, AssertionError):
             info["megatron_error"] = True
 
         return info
