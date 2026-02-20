@@ -236,8 +236,8 @@ class _Dumper:
         model: "torch.nn.Module",
         dump_layers: Optional[List[int]] = None,
         **kwargs,
-    ) -> "_HookDumper":
-        return _HookDumper(dumper=self, model=model, dump_layers=dump_layers, **kwargs)
+    ):
+        _HookDumper(dumper=self, model=model, dump_layers=dump_layers, **kwargs)
 
     # ------------------------------- public :: secondary ---------------------------------
 
