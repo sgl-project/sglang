@@ -482,6 +482,8 @@ class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
     _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
 
+    _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
+
     def __init__(
         self,
         dumper: _Dumper,
@@ -492,12 +494,37 @@ class _NonIntrusiveDumper:
         self._mode = mode
 
         for module_name, module in model.named_modules():
+            if self._LAYER_NAME_RE.fullmatch(module_name):
+                layer_id = self._detect_layer_id(module)
+                if layer_id is not None:
+                    self._register_layer_ctx_hooks(module, layer_id=layer_id)
+
             module.register_forward_hook(
                 self._make_forward_hook(
                     module_name=module_name,
                     is_root=(module_name == ""),
                 )
             )
+
+    @staticmethod
+    def _detect_layer_id(module: "torch.nn.Module") -> Optional[int]:
+        if hasattr(module, "layer_number"):
+            return module.layer_number - 1
+        if hasattr(module, "layer_id"):
+            return module.layer_id
+        return None
+
+    def _register_layer_ctx_hooks(
+        self, module: "torch.nn.Module", *, layer_id: int
+    ) -> None:
+        module.register_forward_pre_hook(
+            lambda _mod, _input, _lid=layer_id: self._dumper.set_ctx(
+                layer_id=_lid
+            )
+        )
+        module.register_forward_hook(
+            lambda _mod, _input, _output: self._dumper.set_ctx(layer_id=None)
+        )
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
