@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.dumper import (
     _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
+    _format_kwargs,
     _materialize_value,
     _obj_to_dict,
     _torch_save,
@@ -248,7 +249,7 @@ class TestDumperFileWriteControl:
             allow_sglang=True,
             SGLANG_DUMPER_ENABLE="1",
             SGLANG_DUMPER_DIR=str(tmp_path),
-            SGLANG_DUMPER_FILTER="^keep",
+            SGLANG_DUMPER_FILTER="name=keep",
         ):
             run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
 
@@ -360,7 +361,7 @@ class TestOutputControl:
         assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
 
     def test_capture_output_respects_filter(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter="^keep")
+        d = _make_test_dumper(tmp_path, filter="name=keep")
 
         with d.capture_output() as captured:
             d.dump("keep_this", torch.randn(3, 3))
@@ -601,6 +602,55 @@ class TestDumpGrad:
             exist=["name=grad_disabled"],
             not_exist=["grad__"],
         )
+
+
+class TestKvFilter:
+    def test_format_kwargs(self):
+        assert _format_kwargs({"a": 1, "b": "hello"}) == "a=1___b=hello"
+        assert _format_kwargs({}) == ""
+
+    def test_filter_matches_extra_kwargs(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="layer_id=0")
+        d.dump("tensor_a", torch.randn(3), layer_id=0)
+        d.dump("tensor_b", torch.randn(3), layer_id=1)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["tensor_a"], not_exist=["tensor_b"])
+
+    def test_filter_matches_global_ctx(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="ctx_arg=200")
+        d.set_ctx(ctx_arg=200)
+        d.dump("tensor_a", torch.randn(3))
+        d.set_ctx(ctx_arg=None)
+        d.dump("tensor_b", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["tensor_a"], not_exist=["tensor_b"])
+
+    def test_filter_matches_name(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="name=keep")
+        d.dump("keep_this", torch.randn(3))
+        d.dump("skip_this", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["keep_this"], not_exist=["skip_this"])
+
+    def test_filter_regex(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter=r"layer_id=[0-2]")
+        d.dump("t0", torch.randn(3), layer_id=0)
+        d.dump("t1", torch.randn(3), layer_id=1)
+        d.dump("t5", torch.randn(3), layer_id=5)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["name=t0", "name=t1"], not_exist=["name=t5"])
+
+    def test_no_filter_dumps_all(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        d.dump("a", torch.randn(3))
+        d.dump("b", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["name=a", "name=b"])
 
 
 class TestDumpModel:
