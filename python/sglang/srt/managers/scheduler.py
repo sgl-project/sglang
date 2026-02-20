@@ -2964,20 +2964,14 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
-        states: list = []
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        response: list = []
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             from sglang.srt.debug_utils.dumper import dumper
 
-            rpc_broadcast = getattr(dumper, "_rpc_broadcast", None)
-            if rpc_broadcast is not None:
-                states = rpc_broadcast._handle_http_control_request(
-                    **recv_req.kwargs
-                )
-            else:
-                states = [dumper._handle_http_control_request(**recv_req.kwargs)]
+            response = dumper.handle_control_request(**recv_req.kwargs)
 
         self.send_to_tokenizer.send_output(
-            DumperControlReqOutput(success=True, state=states), recv_req
+            DumperControlReqOutput(success=True, response=response), recv_req
         )
 
     # placeholder for override

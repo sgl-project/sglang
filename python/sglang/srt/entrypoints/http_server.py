@@ -619,20 +619,16 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
-# example usage:
-# curl -X POST http://localhost:30000/dumper/configure -d '{"enable": true}'
-# curl -X POST http://localhost:30000/dumper/reset
-@app.api_route("/dumper/{method}", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def dumper_control(method: str, request: Request):
+async def _dumper_control_handler(method: str, request: Request):
     body_bytes = await request.body()
     body = await request.json() if body_bytes else {}
     obj = DumperControlReqInput(kwargs={"_method": method, **body})
     results = await _global_state.tokenizer_manager.dumper_control(obj)
-    all_states: list = []
+    response: list = []
     for r in results:
-        all_states.extend(r.state)
-    return all_states
+        response.extend(r.response)
+    return response
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -1880,6 +1876,12 @@ def launch_server(
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
+
+    dumper_http_port = int(os.environ.get("SGLANG_DUMPER_SERVER_PORT", "40000"))
+    if dumper_http_port <= 0:
+        app.add_api_route(
+            "/dumper/{method}", _dumper_control_handler, methods=["POST"]
+        )
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)

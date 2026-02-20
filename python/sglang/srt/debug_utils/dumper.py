@@ -147,6 +147,7 @@ class _Dumper:
         self._forward_pass_id = 0
         self._global_ctx: dict = {}
         self._captured_output_data: Optional[dict] = None
+        self._rpc_broadcast: Optional["_ZmqRpcBroadcast"] = None
 
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
@@ -210,6 +211,14 @@ class _Dumper:
             "dump_index": self._dump_index,
             "forward_pass_id": self._forward_pass_id,
         }
+
+    def handle_control_request(self, *, _method: str, **kwargs) -> list[dict]:
+        """Entry point for HTTP control. Broadcasts to all ranks if distributed."""
+        if self._rpc_broadcast is not None:
+            return self._rpc_broadcast._handle_http_control_request(
+                _method=_method, **kwargs
+            )
+        return [self._handle_http_control_request(_method=_method, **kwargs)]
 
     def _handle_http_control_request(self, *, _method: str, **kwargs) -> dict:
         if _method == "get_state":
@@ -643,7 +652,7 @@ def _start_maybe_http_server(dumper, timeout_seconds: int = 60):
         dumper._rpc_broadcast = rpc_broadcast
 
         if http_port > 0:
-            handler_class = _make_http_handler(prefix="/dumper/", target=rpc_broadcast)
+            handler_class = _make_http_handler(prefix="/dumper/", target=dumper)
             server = HTTPServer(("0.0.0.0", http_port), handler_class)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -662,10 +671,9 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 kwargs = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
-                raw = target._handle_http_control_request(
+                result = target.handle_control_request(
                     _method=method, **kwargs
                 )
-                result = raw if isinstance(raw, list) else [raw]
                 body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
