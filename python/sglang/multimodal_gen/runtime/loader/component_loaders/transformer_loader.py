@@ -94,8 +94,9 @@ class TransformerLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
-
         if nunchaku_config is not None:
+            nunchaku_config.model_cls = model_cls
+
             # respect dtype from checkpoint
             # TODO: improve the condition
             param_dtype = None
@@ -158,7 +159,7 @@ class TransformerLoader(ComponentLoader):
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
-        if next(model.parameters()).dtype != param_dtype:
+        if next(model.parameters()).dtype != param_dtype and param_dtype:
             logger.warning(
                 f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
             )
