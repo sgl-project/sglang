@@ -400,7 +400,7 @@ class ComposedPipelineBase(ABC):
         self,
         stage_name: str | None = None,
         scheduler_key: str = "scheduler",
-        prepare_extra_kwargs: list[Callable] | None = None,
+        prepare_extra_kwargs: list[Callable] | [] = [],
     ) -> "ComposedPipelineBase":
 
         return self.add_stage(
