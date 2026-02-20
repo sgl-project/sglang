@@ -1099,7 +1099,8 @@ class TestHookDumper:
             def forward(self, x):
                 return self.model(x)
 
-        d = _make_test_dumper(tmp_path, enable=False)
+        d = _make_test_dumper(tmp_path)
+        d.configure(enable=False)
         model = OuterModel()
         d.register_forward_hook_for_model(model)
 
