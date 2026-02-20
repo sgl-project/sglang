@@ -636,7 +636,7 @@ def _make_http_handler(*, prefix: str, target):
             if not self.path.startswith(prefix):
                 self.send_error(404)
                 return
-            method = self.path[len(prefix):]
+            method = self.path[len(prefix) :]
             try:
                 kwargs = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {kwargs=}")
