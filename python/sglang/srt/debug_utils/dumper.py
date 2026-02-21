@@ -628,7 +628,6 @@ def _torch_save(value, path: str):
 def _map_tensor(
     value, fn: Callable[[torch.Tensor], torch.Tensor]
 ):
-    """Apply *fn* to every tensor in *value*, recursing into dicts."""
     if isinstance(value, dict):
         result = value
         for k, v in value.items():
@@ -644,25 +643,21 @@ def _map_tensor(
 
 
 def _clone_if_view(value):
-    """Clone tensors whose underlying storage is larger than their data to avoid bloated saves."""
-
-    def _maybe_clone(t: torch.Tensor) -> torch.Tensor:
+    def _fn(t: torch.Tensor) -> torch.Tensor:
         if t.untyped_storage().nbytes() > t.nelement() * t.element_size():
             return t.clone()
         return t
 
-    return _map_tensor(value, _maybe_clone)
+    return _map_tensor(value, _fn)
 
 
 def _strip_parameter(value):
-    """Strip nn.Parameter to plain Tensor so it can be pickled."""
-
-    def _maybe_strip(t: torch.Tensor) -> torch.Tensor:
+    def _fn(t: torch.Tensor) -> torch.Tensor:
         if isinstance(t, torch.nn.Parameter):
             return t.data
         return t
 
-    return _map_tensor(value, _maybe_strip)
+    return _map_tensor(value, _fn)
 
 
 def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
