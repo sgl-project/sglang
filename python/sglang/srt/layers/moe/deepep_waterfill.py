@@ -305,64 +305,6 @@ def _waterfill_expand_with_histogram_kernel(
             tl.atomic_add(dest_counts_ptr + r, rank_count)
 
 
-@triton.jit
-def _sparse_redirect_kernel(
-    expanded_ids_ptr,  # [num_tokens, topk+1] - in/out
-    local_mask_ptr,  # [num_tokens] - in/out
-    dest_counts_ptr,  # [world_size] - destination counts
-    num_tokens,
-    topk_plus_one,
-    old_experts_per_rank,  # Original experts per rank (e.g., 32)
-    new_experts_per_rank,  # New experts per rank (e.g., 33)
-    world_size,
-    source_rank,
-    min_tokens_per_rank,
-    local_marker,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Redirect sparse remote destinations to local.
-
-    In new layout, shared expert ID = rank * new_experts_per_rank + old_experts_per_rank
-    So dest_rank = (shared_id - old_experts_per_rank) // new_experts_per_rank
-                 = shared_id // new_experts_per_rank (since shared_id % new_epr == old_epr)
-    """
-    pid = tl.program_id(0)
-    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = token_idx < num_tokens
-
-    shared_expert_id = tl.load(
-        expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
-        mask=mask,
-        other=-1,
-    ).to(tl.int64)
-    is_local = tl.load(local_mask_ptr + token_idx, mask=mask, other=True)
-
-    # Use tl.full to create int64 constants (Python int doesn't have .to())
-    src_rank_vec = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
-    # For shared expert: dest_rank = shared_expert_id // new_experts_per_rank
-    dest_rank = tl.where(
-        is_local, src_rank_vec, shared_expert_id // new_experts_per_rank
-    )
-    dest_rank = tl.minimum(tl.maximum(dest_rank, 0), world_size - 1)
-
-    dest_count = tl.load(dest_counts_ptr + dest_rank, mask=mask, other=0)
-    is_sparse_remote = (dest_count < min_tokens_per_rank) & ~is_local
-
-    # Redirect sparse remote destinations to local shared expert ID.
-    local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
-    local_shared_id_vec = tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64)
-    new_shared_id = tl.where(is_sparse_remote, local_shared_id_vec, shared_expert_id)
-    new_is_local = is_local | is_sparse_remote
-
-    tl.store(
-        expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
-        new_shared_id,
-        mask=mask,
-    )
-    tl.store(local_mask_ptr + token_idx, new_is_local, mask=mask)
-
-
 def waterfill_prepare_dispatch_fused(
     topk_ids: Tensor,
     topk_weights: Tensor,
@@ -373,21 +315,15 @@ def waterfill_prepare_dispatch_fused(
     shared_weight: float,
     allow_all_ranks: bool = False,
     target_total: int = 0,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """
-    Fully fused waterfill using Triton with integrated histogram and expert ID remapping.
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Fused waterfill + expand + ID remapping using a single Triton kernel.
 
-    Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank)
-    This maps original expert IDs to new layout where each rank has one extra expert slot
-    for the shared expert.
-
-    Single kernel does: waterfill + expand + histogram counting + ID remapping.
+    Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank).
 
     Returns:
-        expanded_topk_ids: [N, 9] with remapped expert IDs
-        expanded_topk_weights: [N, 9]
+        expanded_topk_ids: [N, topk+1] with remapped expert IDs
+        expanded_topk_weights: [N, topk+1]
         local_shared_mask: [N] boolean
-        dest_counts: [world_size] histogram of shared expert destinations (local to this rank)
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -400,7 +336,6 @@ def waterfill_prepare_dispatch_fused(
             torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
             torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
             torch.empty(0, dtype=torch.bool, device=device),
-            torch.zeros(world_size, dtype=torch.int32, device=device),
         )
 
     # Pre-allocate outputs
@@ -418,8 +353,7 @@ def waterfill_prepare_dispatch_fused(
     local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
     local_pref_denom = 5
 
-    # Always use fused kernel with histogram; sparse redirect is applied outside
-    # (after global reduction of dest_counts) in DeepEPWaterfillBalancer.prepare_dispatch.
+    # dest_counts buffer is required by the kernel but not used after dispatch.
     dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
     _waterfill_expand_with_histogram_kernel[grid](
         topk_ids,
@@ -444,7 +378,7 @@ def waterfill_prepare_dispatch_fused(
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    return expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts
+    return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
 def expand_topk_with_shared_expert(
@@ -538,31 +472,14 @@ def compute_static_rank_load(
 ) -> Tensor:
     """Compute per-layer static rank load from EPLB historical statistics.
 
-    Given historical ``logical_count`` (average expert utilisation from the EPLB
-    recorder) and the current ``physical_to_logical_map``, this function produces
-    a ``[num_layers, world_size]`` float tensor where entry ``[l, r]`` estimates
-    the *relative* workload that EP rank ``r`` will carry in MoE layer ``l``.
-
-    The returned tensor is suitable for :pymethod:`DeepEPWaterfillBalancer.set_static_weights`.
-    It allows the forward path to **skip the runtime all_reduce** and use these
-    pre-computed weights for waterfill sampling instead.
-
-    **Expert replication handling** (critical for correctness):
-    Multiple physical experts may map to the same logical expert (EPLB
-    replication).  We divide each logical expert's historical count by its
-    replica count so that load is split evenly across all physical copies.
+    Produces a ``[num_layers, world_size]`` float tensor of per-rank workload
+    estimates suitable for ``DeepEPWaterfillBalancer.set_static_weights``.
+    Replicated experts have their load divided by replica count.
 
     Args:
-        logical_count: ``[num_layers, num_logical_experts]`` float/int tensor.
-            Average token count per logical expert across recent history.
-            If the raw recording has shape ``[num_samples, num_layers, num_logical_experts]``,
-            caller should average over samples first.
-        physical_to_logical_map: ``[num_layers, num_physical_experts]`` int tensor.
-            Maps each physical expert slot to its logical expert id.
+        logical_count: ``[num_layers, num_logical_experts]`` average token counts.
+        physical_to_logical_map: ``[num_layers, num_physical_experts]`` int mapping.
         world_size: Number of EP ranks.
-
-    Returns:
-        ``[num_layers, world_size]`` float64 tensor with per-rank workload estimates.
     """
     num_layers, num_physical_experts = physical_to_logical_map.shape
     num_logical_experts = logical_count.shape[-1]
@@ -609,36 +526,16 @@ def compute_static_rank_load(
 
 
 class DeepEPWaterfillBalancer:
-    """
-    Waterfill load balancer for DeepEP-based shared expert dispatch.
+    """Waterfill load balancer: assigns shared expert to least-loaded rank.
 
-    This class implements the waterfill algorithm that assigns each token's
-    shared expert computation to the least loaded rank among:
-    1. Ranks it already routes to (no extra communication)
-    2. Source rank (local computation)
-
-    KEY DESIGN: Shared expert is fused as a real routed expert (not virtual ID).
-    - num_experts is expanded: original + world_size (one shared per rank)
-    - experts_per_rank = (num_routed_experts + world_size) // world_size
-    - Each rank has: 32 routed experts + 1 shared expert = 33 experts
-    - Expert IDs are remapped: old_id -> old_id + (old_id // old_experts_per_rank)
-    - Shared expert ID for rank i = i * new_experts_per_rank + old_experts_per_rank
-
-    This ensures num_recv_tokens_per_expert correctly counts shared expert tokens,
-    and DeepGEMM processes the correct number of tokens without garbage data.
+    Shared expert is fused as a real routed expert (topk 8→9).
+    Each rank has old_experts_per_rank + 1 slots; expert IDs are remapped
+    via old_id -> old_id + (old_id // old_experts_per_rank).
     """
 
     # Minimum batch size to enable waterfill balancing
     # Below this threshold, all shared experts are computed locally
     MIN_BATCH_FOR_BALANCE = 64
-
-    # Minimum global shared tokens for a rank to accept *remote* shared-expert dispatch.
-    # If after aggregating destinations across all ranks a destination rank would get
-    # < this many shared tokens, we redirect those remote shared tokens back to their
-    # source ranks (i.e., that rank does not receive remote shared expert work).
-    #
-    # Note: shared expert compute uses 128-token blocks; <64 tokens would waste >50% padding.
-    MIN_TOKENS_PER_RANK = 0
 
     def __init__(
         self,
@@ -648,21 +545,12 @@ class DeepEPWaterfillBalancer:
         routed_scaling_factor: float = 1.0,
         static_rank_load: Optional[Tensor] = None,
     ):
-        # Store original routed expert count
         self.num_routed_experts = num_routed_experts
         self.world_size = world_size
         self.rank = rank
-
-        # Original experts per rank (before adding shared experts)
         self.old_experts_per_rank = num_routed_experts // world_size
-
-        # New layout: each rank has old_experts_per_rank + 1 (shared) experts
         self.new_experts_per_rank = self.old_experts_per_rank + 1
-
-        # Total experts including fused shared experts
         self.num_experts = self.new_experts_per_rank * world_size
-
-        # For backward compatibility
         self.experts_per_rank = self.new_experts_per_rank
 
         self.routed_scaling_factor = routed_scaling_factor
@@ -670,21 +558,13 @@ class DeepEPWaterfillBalancer:
             1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
         )
 
-        # Shared expert ID for this rank
-        # Layout: [routed_0, routed_1, ..., routed_31, shared] for each rank
-        # So shared expert ID = rank * new_experts_per_rank + old_experts_per_rank
         self.my_shared_expert_id = (
             self.rank * self.new_experts_per_rank + self.old_experts_per_rank
         )
 
-        # Static per-rank load derived from EPLB historical statistics.
-        # Shape: [world_size], dtype float64/int64. When set, forward_deepep_waterfill
-        # can skip the runtime all_reduce and use these weights directly.
+        # When set, forward path skips runtime all_reduce (static mode).
         self.static_rank_load: Optional[Tensor] = static_rank_load
 
-        # Pre-allocated buffers to avoid per-layer tensor allocations in the
-        # hot path.  Lazily initialised on first use (device may not be known
-        # at __init__ time).
         self._counts_buf: Optional[Tensor] = None  # [world_size], int64
 
     # -------- Static weight helpers --------
@@ -702,41 +582,6 @@ class DeepEPWaterfillBalancer:
         w = self.static_rank_load
         w_sum = w.sum().clamp(min=1.0)
         self._static_rank_load_normalized = w / w_sum
-
-    def estimate_global_counts(
-        self,
-        local_routed_counts: Tensor,
-        topk: int,
-    ) -> Tuple[Tensor, Tensor]:
-        """Estimate global routed counts and local_tokens_per_rank without all_reduce.
-
-        Uses ``self.static_rank_load`` to scale the locally-observed total into
-        per-rank estimates, removing the need for the runtime ``all_reduce``.
-        All operations stay on GPU — no ``.item()`` or GPU→CPU sync.
-
-        Args:
-            local_routed_counts: ``[world_size]`` int64 – routed counts from this rank.
-            topk: Number of routed experts per token (e.g. 8).
-
-        Returns:
-            estimated_global_routed: ``[world_size]`` int64.
-            estimated_local_tokens: ``[world_size]`` int64 (uniform assumption).
-        """
-        assert self.static_rank_load is not None
-        device = local_routed_counts.device
-
-        local_total_routed = local_routed_counts.sum()
-        estimated_global_total = local_total_routed * self.world_size
-
-        w = self._static_rank_load_normalized
-        estimated_global_routed = (w * estimated_global_total.double()).to(torch.int64)
-
-        local_num_tokens = local_total_routed // max(topk, 1)
-        estimated_local_tokens = local_num_tokens.expand(self.world_size).to(
-            torch.int64
-        )
-
-        return estimated_global_routed, estimated_local_tokens
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank from local topk_ids.
@@ -778,32 +623,17 @@ class DeepEPWaterfillBalancer:
         routed_counts: Tensor,
         local_tokens_per_rank: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Prepare expanded topk for dispatch with shared expert as 9th expert.
-
-        Uses fused Triton kernel on GPU for maximum performance.
+        """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert.
 
         Args:
-            topk_ids: [N, topk] routed expert IDs
-            topk_weights: [N, topk] routed expert weights
-            routed_counts: [world_size] global routed token count per rank
-            local_tokens_per_rank: [world_size] number of tokens each EP rank
-                processes from DP attention.  When provided, waterfill uses
-                ``routed_counts + local_tokens_per_rank`` as the effective load
-                per rank so that shared expert tokens are steered away from
-                ranks that already carry a heavy DP-attention load.
-
-        Optimizations:
-        1. Fused kernel: waterfill + expand + per-rank histogram in single GPU pass
-        2. If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
-        3. Global sparse redirect: if a destination rank would get < MIN_TOKENS_PER_RANK
-           shared tokens (after aggregating across all ranks), redirect those remote shared
-           tokens back to their source ranks to avoid tiny shards / padding waste.
+            topk_ids: [N, topk] routed expert IDs.
+            topk_weights: [N, topk] routed expert weights.
+            routed_counts: [world_size] global routed token count per rank.
+            local_tokens_per_rank: [world_size] per-rank DP-attention token counts.
+                Added to routed_counts as effective load when provided.
 
         Returns:
-            expanded_topk_ids: [N, 9] with remapped expert IDs (shared expert as 9th)
-            expanded_topk_weights: [N, 9] with shared_weight in 9th column
-            local_shared_mask: [N] boolean mask for tokens with local shared expert
+            expanded_topk_ids, expanded_topk_weights, local_shared_mask
         """
         num_tokens = topk_ids.shape[0]
         topk = topk_ids.shape[1]
@@ -834,30 +664,18 @@ class DeepEPWaterfillBalancer:
                 self.shared_weight,
             )
 
-        # Effective per-rank load for waterfill weighting.
-        # When local_tokens_per_rank is provided (DP-attention aware mode),
-        # we add it to routed_counts so that shared expert tokens are steered
-        # away from ranks that already carry heavy DP-attention load.
         routed_counts_i64 = routed_counts.to(torch.int64)
         if local_tokens_per_rank is not None:
             effective_load = routed_counts_i64 + local_tokens_per_rank.to(torch.int64)
         else:
             effective_load = routed_counts_i64
 
-        # Compute target_total and allow_all_ranks WITHOUT GPU→CPU sync.
-        # When using static weights, always allow dispatch to any rank (EPLB
-        # already balances routed load, so the mild-imbalance condition is
-        # almost always satisfied).  For the dynamic path, keep the original
-        # logic but compute target_total entirely on GPU (single .item() at
-        # the very end, reducing 3 syncs to 1).
         if self.has_static_weights():
             # Static path: zero GPU→CPU syncs.
-            # Pass target_total=0 so the kernel derives it from routed_counts.
-            # allow_all_ranks=True since EPLB keeps routed load balanced.
             allow_all_ranks = True
             target_total = 0
         else:
-            # Dynamic path: keep original logic (3 → 1 sync).
+            # Dynamic path: single .item() sync.
             total_routed_t = routed_counts_i64.sum()
             total_tokens_global_t = total_routed_t // topk
             total_effective_t = effective_load.sum()
@@ -870,7 +688,7 @@ class DeepEPWaterfillBalancer:
             )
             allow_all_ranks = bool((max_effective_t <= target_total).item())
 
-        expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts = (
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
             waterfill_prepare_dispatch_fused(
                 topk_ids,
                 topk_weights,
@@ -883,39 +701,5 @@ class DeepEPWaterfillBalancer:
                 target_total=target_total,
             )
         )
-
-        if self.MIN_TOKENS_PER_RANK > 0:
-            # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
-            try:
-                import torch.distributed as dist
-
-                if dist.is_initialized() and self.world_size > 1:
-                    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-                    dist.all_reduce(
-                        dest_counts,
-                        op=dist.ReduceOp.SUM,
-                        group=get_moe_ep_group().device_group,
-                    )
-            except Exception:
-                # If distributed is not available/initialized, fall back to local counts.
-                pass
-
-            BLOCK_SIZE = 256
-            grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-            _sparse_redirect_kernel[grid](
-                expanded_topk_ids,
-                local_shared_mask,
-                dest_counts,
-                num_tokens,
-                topk + 1,
-                self.old_experts_per_rank,
-                self.new_experts_per_rank,
-                self.world_size,
-                self.rank,
-                self.MIN_TOKENS_PER_RANK,
-                LOCAL_SHARED_MARKER,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
 
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask
