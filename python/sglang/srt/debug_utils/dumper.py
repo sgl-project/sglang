@@ -625,7 +625,7 @@ def _torch_save(value, path: str):
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
-def _map_tensor_in_value(
+def _map_tensor(
     value, fn: Callable[[torch.Tensor], torch.Tensor]
 ):
     """Apply *fn* to the tensor inside *value* (bare tensor or ``{"value": tensor, ...}`` dict)."""
@@ -647,7 +647,7 @@ def _clone_if_view(value):
             return t.clone()
         return t
 
-    return _map_tensor_in_value(value, _maybe_clone)
+    return _map_tensor(value, _maybe_clone)
 
 
 def _strip_parameter(value):
@@ -658,7 +658,7 @@ def _strip_parameter(value):
             return t.data
         return t
 
-    return _map_tensor_in_value(value, _maybe_strip)
+    return _map_tensor(value, _maybe_strip)
 
 
 def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
