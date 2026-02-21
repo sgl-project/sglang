@@ -832,6 +832,63 @@ class TestReset:
         assert "dump_index=1" in post_file.name
 
 
+class TestZmqPortIsolation:
+    """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
+
+    NUM_INSTANCES = 3
+
+    @staticmethod
+    def _worker(rank, http_port: int, stop_event):
+        dumper.configure(enable=False, server_port=str(http_port))
+        dumper.step()
+        stop_event.wait()
+
+    def test_concurrent_instances_no_port_conflict(self):
+        ports = [find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)]
+        stop_events = []
+        threads = []
+        ctx = multiprocessing.get_context("spawn")
+
+        for port in ports:
+            stop_event = ctx.Event()
+            stop_events.append(stop_event)
+            thread = threading.Thread(
+                target=run_distributed_test,
+                args=(self._worker,),
+                kwargs={"http_port": port, "stop_event": stop_event},
+            )
+            thread.start()
+            threads.append(thread)
+
+        try:
+            for port in ports:
+                base_url = f"http://127.0.0.1:{port}"
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    try:
+                        requests.post(f"{base_url}/dumper/configure", json={}, timeout=2)
+                        break
+                    except requests.ConnectionError:
+                        time.sleep(0.5)
+                else:
+                    raise TimeoutError(f"Dumper HTTP not reachable at {base_url}")
+
+            for i, port in enumerate(ports):
+                resp = requests.post(
+                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                )
+                resp.raise_for_status()
+                states = resp.json()
+                assert len(states) == 2, (
+                    f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+                )
+        finally:
+            for event in stop_events:
+                event.set()
+            for thread in threads:
+                thread.join(timeout=10)
+
+
 class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
