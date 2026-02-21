@@ -2089,14 +2089,11 @@ class ServerArgs:
         if self.gdn_backend == "triton" and envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
             self.gdn_backend = "cutedsl"
 
-        # FlashInfer GDN kernel converts state to float32 internally; using a
-        # non-float32 pool would incur extra conversion overhead on every decode step.
-        if self.gdn_backend == "flashinfer" and self.mamba_ssm_dtype not in (
-            None,
-            "float32",
-        ):
+        # The flashinfer GDN decode path (gated_delta_rule_decode_pretranspose)
+        # uses a bf16 state kernel; non-bf16 pools are not supported.
+        if self.gdn_backend == "flashinfer" and self.mamba_ssm_dtype != "bfloat16":
             raise ValueError(
-                f"--gdn-backend flashinfer requires --mamba-ssm-dtype float32, "
+                f"--gdn-backend flashinfer requires --mamba-ssm-dtype bfloat16, "
                 f"got {self.mamba_ssm_dtype!r}"
             )
 

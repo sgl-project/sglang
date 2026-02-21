@@ -845,19 +845,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if gdn_backend == "flashinfer":
             try:
-                from flashinfer.gdn_decode import gated_delta_rule_mtp
+                from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
-                self._flashinfer_mtp = gated_delta_rule_mtp
-                rank0_log("FlashInfer GDN decode/MTP enabled.")
+                self._flashinfer_pretranspose = gated_delta_rule_decode_pretranspose
+                rank0_log("FlashInfer GDN decode enabled (bf16 pretranspose).")
             except ImportError:
                 rank0_log(
                     "FlashInfer GDN backend requested but not available "
                     "(missing flashinfer.gdn_decode). Falling back to FLA decode kernel."
                 )
                 gdn_backend = "triton"
-                self._flashinfer_mtp = None
+                self._flashinfer_pretranspose = None
         else:
-            self._flashinfer_mtp = None
+            self._flashinfer_pretranspose = None
 
         self._gdn_backend = gdn_backend
 
@@ -915,21 +915,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # a, b: [B, HV] → [B, 1, HV]
             a_fi = a.unsqueeze(1)
             b_fi = b.unsqueeze(1)
-            # K-contiguous pool: .transpose(-2,-1) gives standard C-contiguous
-            # [pool_size, HV, V, K] view expected by gated_delta_rule_mtp.
-            core_attn_out, _ = self._flashinfer_mtp(
+            # FI-VK-BF16: gated_delta_rule_decode_pretranspose has no pool
+            # support → gather [B, HV, V, K] before call, scatter after.
+            state = ssm_states[cache_indices].contiguous()
+            core_attn_out, state = self._flashinfer_pretranspose(
                 q=query,
                 k=key,
                 v=value,
-                initial_state=ssm_states.transpose(-2, -1),
-                initial_state_indices=cache_indices.to(torch.int32),
+                state=state,
                 A_log=layer.A_log.detach().float(),
                 a=a_fi,
                 dt_bias=layer.dt_bias.detach(),
                 b=b_fi,
-                disable_state_update=False,
                 use_qk_l2norm=True,
             )
+            ssm_states[cache_indices] = state
         else:
             # Reshape from [bs, h*d] to [1, bs, h, d]
             query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
@@ -1054,100 +1054,73 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = query.shape[0]
 
-        if is_target_verify and self._gdn_backend == "flashinfer":
-            # FlashInfer MTP verify: reshape to [N, T, H, D] and call gated_delta_rule_mtp
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            n_seqs = actual_seq_len // draft_token_num
-            query = query.view(n_seqs, draft_token_num, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(n_seqs, draft_token_num, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(n_seqs, draft_token_num, layer.num_v_heads, layer.head_v_dim)
-            # a, b: [N*T, HV] → [N, T, HV]
-            a_fi = a.view(n_seqs, draft_token_num, -1)
-            b_fi = b.view(n_seqs, draft_token_num, -1)
-            # K-contiguous pool: .transpose(-2,-1) gives standard C-contiguous
-            # VK views expected by gated_delta_rule_mtp (PRETRANSPOSE convention).
-            core_attn_out, _ = self._flashinfer_mtp(
+        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+        if is_target_verify:
+            core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
                 v=value,
-                initial_state=ssm_states.transpose(-2, -1),
-                initial_state_indices=cache_indices[:n_seqs].to(torch.int32),
-                A_log=layer.A_log.detach().float(),
-                a=a_fi,
-                dt_bias=layer.dt_bias.detach(),
-                b=b_fi,
-                intermediate_states_buffer=intermediate_state_cache.transpose(-2, -1),
+                g=g,
+                beta=beta,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
-                use_qk_l2norm=True,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
-
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-
-            if is_target_verify:
-                core_attn_out = fused_recurrent_gated_delta_rule_update(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=cache_indices,
-                    cu_seqlens=query_start_loc,
-                    use_qk_l2norm_in_kernel=True,
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
+            # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
+            # FlashInfer/NPU/CPU: gather → FLA kernel (in-place) → scatter back.
+            use_gather_scatter = (
+                self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
+            )
+            if use_gather_scatter:
+                # The flashinfer pool is K-contiguous; advanced indexing
+                # preserves that layout, so .contiguous() is needed to get
+                # a V-contiguous copy whose storage the FLA kernel can
+                # update in-place (the @input_guard decorator would
+                # otherwise make its own anonymous copy).
+                recurrent_state = ssm_states[cache_indices].contiguous()
+                n_seqs_extend = recurrent_state.shape[0]
+                seq_indices = torch.arange(
+                    n_seqs_extend,
+                    device=recurrent_state.device,
+                    dtype=cache_indices.dtype,
                 )
+                recurrent_state_indices_args = {"initial_state_indices": seq_indices}
             else:
-                # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
-                # FlashInfer/NPU/CPU: gather → FLA kernel (in-place) → scatter back.
-                use_gather_scatter = (
-                    self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
+                recurrent_state = ssm_states
+                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+            core_attn_out, _, h = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                **recurrent_state_indices_args,
+            )
+            if use_gather_scatter:
+                # kernel updated recurrent_state in-place; scatter back to pool
+                ssm_states[cache_indices] = recurrent_state.to(
+                    ssm_states.dtype, copy=False
                 )
-                if use_gather_scatter:
-                    # The flashinfer pool is K-contiguous; advanced indexing
-                    # preserves that layout, so .contiguous() is needed to get
-                    # a V-contiguous copy whose storage the FLA kernel can
-                    # update in-place (the @input_guard decorator would
-                    # otherwise make its own anonymous copy).
-                    recurrent_state = ssm_states[cache_indices].contiguous()
-                    n_seqs_extend = recurrent_state.shape[0]
-                    seq_indices = torch.arange(
-                        n_seqs_extend,
-                        device=recurrent_state.device,
-                        dtype=cache_indices.dtype,
-                    )
-                    recurrent_state_indices_args = {"initial_state_indices": seq_indices}
-                else:
-                    recurrent_state = ssm_states
-                    recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-                core_attn_out, _, h = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                    **recurrent_state_indices_args,
-                )
-                if use_gather_scatter:
-                    # kernel updated recurrent_state in-place; scatter back to pool
-                    ssm_states[cache_indices] = recurrent_state.to(
-                        ssm_states.dtype, copy=False
-                    )
 
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out
 
