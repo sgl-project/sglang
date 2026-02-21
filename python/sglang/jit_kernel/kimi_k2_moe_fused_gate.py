@@ -17,6 +17,7 @@ def _jit_kimi_k2_moe_fused_gate_module() -> Module:
         "kimi_k2_moe_fused_gate",
         cuda_files=["moe/kimi_k2_moe_fused_gate.cuh"],
         cuda_wrappers=[("kimi_k2_moe_fused_gate", "kimi_k2_moe_fused_gate")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
