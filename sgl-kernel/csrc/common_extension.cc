@@ -426,12 +426,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From FlashInfer
    */
   m.def(
-      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
-      "int cublas_handle) -> ()",
-      {at::Tag::needs_fixed_stride_order});
-  m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
-
-  m.def(
       "min_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_min_p_arr, float "
       "min_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);

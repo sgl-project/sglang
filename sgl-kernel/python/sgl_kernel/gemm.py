@@ -1,8 +1,8 @@
 from typing import Optional, Tuple
 
+import flashinfer
 import torch
 from sgl_kernel.scalar_type import ScalarType
-from sgl_kernel.utils import _get_cache_buf
 
 
 def awq_dequantize(
@@ -43,26 +43,6 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
-def _bmm_fp8_internal(
-    workspace_buffer: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-) -> None:
-    cublas_handle = torch.cuda.current_blas_handle()
-    torch.ops.sgl_kernel.bmm_fp8.default(
-        A,
-        B,
-        D,
-        A_scale,
-        B_scale,
-        workspace_buffer,
-        cublas_handle,
-    )
-
-
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -71,15 +51,7 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if out is None:
-        out = torch.empty(
-            (A.shape[0], A.shape[1], B.shape[2]),
-            device=A.device,
-            dtype=dtype,
-        )
-    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
-    _bmm_fp8_internal(workspace_buffer, A, B, out, A_scale, B_scale)
-    return out
+    return flashinfer.bmm_fp8(A, B, A_scale, B_scale, dtype, out=out)
 
 
 def dsv3_fused_a_gemm(
