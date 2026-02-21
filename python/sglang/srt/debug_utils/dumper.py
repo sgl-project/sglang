@@ -482,6 +482,35 @@ class _Dumper:
 # -------------------------------------- hook dumper ------------------------------------------
 
 
+def _register_forward_hook_or_replace_fn(
+    module: "torch.nn.Module",
+    hook,
+    *,
+    mode: str,
+) -> None:
+    """Attach a forward hook to *module*.
+
+    mode="hook"       — standard ``register_forward_hook`` (fires only via ``__call__``).
+    mode="replace_fn" — monkey-patch ``module.forward`` so the hook fires even when
+                        callers invoke ``.forward()`` directly (as sglang does for the
+                        root model).
+    """
+    if mode == "hook":
+        module.register_forward_hook(hook)
+    elif mode == "replace_fn":
+        original_forward = module.forward
+
+        @functools.wraps(original_forward)
+        def _wrapped(*args, **kwargs):
+            output = original_forward(*args, **kwargs)
+            hook(module, args, output)
+            return output
+
+        module.forward = _wrapped
+    else:
+        raise ValueError(f"Unknown mode {mode!r}")
+
+
 class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
     _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
@@ -501,32 +530,14 @@ class _NonIntrusiveDumper:
                 self._register_ctx_hooks(module, ctx=ctx)
 
             is_root = module_name == ""
-            if is_root:
-                self._wrap_root_forward(module)
-            else:
-                module.register_forward_hook(
-                    self._make_forward_hook(
-                        module_name=module_name,
-                        is_root=False,
-                    )
-                )
-
-    def _wrap_root_forward(self, module: "torch.nn.Module") -> None:
-        """Wrap the root module's forward() so hooks fire even with direct .forward() calls.
-
-        sglang calls model.forward() directly (not model()), which bypasses
-        register_forward_hook. Wrapping forward ensures we capture root inputs/outputs.
-        """
-        hook = self._make_forward_hook(module_name="", is_root=True)
-        original_forward = module.forward
-
-        @functools.wraps(original_forward)
-        def wrapped_forward(*args, **kwargs):
-            output = original_forward(*args, **kwargs)
-            hook(module, args, output)
-            return output
-
-        module.forward = wrapped_forward
+            hook = self._make_forward_hook(
+                module_name=module_name, is_root=is_root
+            )
+            _register_forward_hook_or_replace_fn(
+                module,
+                hook,
+                mode="replace_fn" if is_root else "hook",
+            )
 
     @classmethod
     def _detect_module_ctx(
