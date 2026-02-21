@@ -1037,8 +1037,6 @@ class ServerArgs:
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
-            elif attr == "component_paths":
-                continue
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
