@@ -245,8 +245,8 @@ sglang serve \
   --model-path=black-forest-labs/FLUX.2-dev \
   # with a Huggingface Repo ID
   --vae-path=fal/FLUX.2-Tiny-AutoEncoder
-  # Or using a local path
- --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
+  # or use a local path
+  --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
 ```
 
 ## Diffusers Backend
