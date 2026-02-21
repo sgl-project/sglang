@@ -310,7 +310,7 @@ class _Dumper:
         }
 
     @cached_property
-    def _http_manager(self) -> Optional[_DumperHttpManager]:
+    def _http_manager(self) -> Optional["_DumperHttpManager"]:
         if self._config.server_port_parsed is None:
             return None
         return _DumperHttpManager(self)
