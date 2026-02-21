@@ -167,6 +167,43 @@ class _DumperState:
     cleanup_previous_handled: bool = False
 
 
+class _DumperHttpManager:
+    def __init__(self, dumper: "_Dumper"):
+        config = dumper._config
+        http_port = config.server_port_parsed
+        if http_port is None:
+            self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(dumper)
+            return
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            dumper,
+            timeout_seconds=config.collective_timeout,
+        )
+
+        if _get_rank() == 0:
+            assert rpc_broadcast is not None
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port == "reuse":
+                print(
+                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
+                )
+            else:
+                _start_http_server(
+                    prefix="/dumper/", target=self, http_port=http_port
+                )
+                print(f"[Dumper] HTTP server started on port {http_port}")
+        else:
+            self._rpc_broadcast = _LocalOnlyBroadcast(dumper)
+
+    def handle_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_http_control_request_inner(
+            method=method, body=body
+        )
+
+
 class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
 
@@ -201,9 +238,6 @@ class _Dumper:
         self._config = config
         self._state = _DumperState()
 
-        self._http_server_handled = not config.enable_http_server
-        self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
-
     # ------------------------------- public :: core ---------------------------------
 
     @property
@@ -213,7 +247,7 @@ class _Dumper:
     def step(self):
         """This should be called on all ranks at the end of each iteration."""
 
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
 
         if not self._config.enable:
             return
@@ -279,7 +313,7 @@ class _Dumper:
         self,
         model: "torch.nn.Module",
     ) -> Optional["_NonIntrusiveDumper"]:
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
@@ -312,14 +346,11 @@ class _Dumper:
             "step": self._state.step,
         }
 
-    # ------------------------- public :: only used internally -----------------------------
+    @cached_property
+    def _http_manager(self) -> _DumperHttpManager:
+        return _DumperHttpManager(self)
 
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
+    # ------------------------- public :: only used internally -----------------------------
 
     def _handle_http_control_request_inner(
         self, *, method: str, body: dict[str, Any]
@@ -350,7 +381,7 @@ class _Dumper:
         value_tag: str,
         grad_tag: str,
     ) -> None:
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
 
         if not self._config.enable:
             return
@@ -479,33 +510,6 @@ class _Dumper:
     @cached_property
     def _static_meta(self) -> dict:
         return _compute_static_meta()
-
-    # Even if DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
-    def _ensure_http_server(self):
-        if self._http_server_handled:
-            return
-        self._http_server_handled = True
-
-        http_port = self._config.server_port_parsed
-        if http_port is None:
-            return
-
-        rpc_broadcast = _create_zmq_rpc_broadcast(
-            self,
-            timeout_seconds=self._config.collective_timeout,
-        )
-
-        if _get_rank() == 0:
-            assert rpc_broadcast is not None
-            self._rpc_broadcast = rpc_broadcast
-
-            if http_port == "reuse":
-                print(
-                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
-                )
-            else:
-                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
-                print(f"[Dumper] HTTP server started on port {http_port}")
 
     def _ensure_exp_name(self):
         if self._config.exp_name is None:
@@ -814,7 +818,7 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 req_body = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
-                result = target._handle_http_control_request(
+                result = target.handle_request(
                     method=method, body=req_body
                 )
                 resp_body = json.dumps(result).encode()
