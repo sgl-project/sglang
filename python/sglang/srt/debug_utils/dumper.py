@@ -158,6 +158,15 @@ class _DumperConfig(_BaseConfig):
 # -------------------------------------- dumper core ------------------------------------------
 
 
+@dataclass
+class _DumperState:
+    dump_index: int = 0
+    step: int = 0
+    global_ctx: dict = field(default_factory=dict)
+    captured_output_data: Optional[dict] = None
+    cleanup_previous_handled: bool = True
+
+
 class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
 
@@ -188,14 +197,6 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    @dataclass
-    class _State:
-        dump_index: int = 0
-        step: int = 0
-        global_ctx: dict = field(default_factory=dict)
-        captured_output_data: Optional[dict] = None
-        cleanup_previous_handled: bool = True
-
     def __init__(self, *, config: _DumperConfig):
         self._config = config
         self._state = self._fresh_state()
@@ -203,8 +204,8 @@ class _Dumper:
         self._http_server_handled = not config.enable_http_server
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
-    def _fresh_state(self) -> "_Dumper._State":
-        return self._State(
+    def _fresh_state(self) -> _DumperState:
+        return _DumperState(
             cleanup_previous_handled=not self._config.cleanup_previous,
         )
 

@@ -950,6 +950,46 @@ class TestReset:
         post_file = _find_dump_file(tmp_path, name="post")
         assert "dump_index=1" in post_file.name
 
+    def test_cleanup_previous_re_triggers_after_reset(self, tmp_path):
+        """Miles pattern: reset() + configure(cleanup_previous=True) should re-clean."""
+        d = _make_test_dumper(tmp_path, cleanup_previous=True)
+        d.dump("phase1", torch.randn(2, 2))
+        assert d._state.cleanup_previous_handled is True
+
+        d.reset()
+        assert d._state.cleanup_previous_handled is False
+
+        d.dump("phase2", torch.randn(2, 2))
+        assert d._state.cleanup_previous_handled is True
+
+    def test_configure_cleanup_previous_resets_flag(self, tmp_path):
+        d = _make_test_dumper(tmp_path, cleanup_previous=False)
+        assert d._state.cleanup_previous_handled is True
+
+        d.configure(cleanup_previous=True)
+        assert d._state.cleanup_previous_handled is False
+
+    def test_multi_phase_switch(self, tmp_path):
+        """Simulate Miles multi-phase: configure → dump → reset → configure new phase → dump."""
+        d = _make_test_dumper(tmp_path, cleanup_previous=True)
+
+        d.configure(exp_name="fwd_only")
+        d.dump("weight", torch.randn(2, 2))
+        d.step()
+        d.configure(enable=False)
+
+        d.reset()
+        d.configure(exp_name="fwd_bwd", enable=True, cleanup_previous=True)
+        d.dump("weight", torch.randn(2, 2))
+        d.step()
+
+        fwd_only_files = list(Path(tmp_path).glob("fwd_only/*.pt"))
+        fwd_bwd_files = list(Path(tmp_path).glob("fwd_bwd/*.pt"))
+        assert len(fwd_only_files) > 0
+        assert len(fwd_bwd_files) > 0
+        assert d._state.step == 1
+        assert d._state.dump_index == 1
+
 
 def _dumper_worker(rank, http_port: int, stop_event):
     """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
