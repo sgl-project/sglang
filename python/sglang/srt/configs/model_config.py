@@ -308,6 +308,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
+            "BailingMoeV2_5ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
         if (
@@ -482,6 +483,25 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+        elif (
+            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
+            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.head_dim = self.hf_text_config.head_dim
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            # Handle rope scaling with yarn
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -626,6 +646,17 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        if quant_cfg is not None:
+            # Identify modelopt quantization
+            if "quant_method" not in quant_cfg:
+                parsed_cfg = self._parse_modelopt_quant_config(
+                    {"quantization": quant_cfg}
+                )
+                if parsed_cfg:
+                    quant_cfg.update(parsed_cfg)
+
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
@@ -736,6 +767,12 @@ class ModelConfig:
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
+        # Check for quantization in hf_config (config.json)
+        if getattr(self.hf_config, "quantization_config", None) or getattr(
+            self.hf_config, "compression_config", None
+        ):
+            return True
+
         # Check for HuggingFace quantization config
         from sglang.srt.utils import has_hf_quant_config
 
@@ -1155,6 +1192,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
@@ -1163,6 +1201,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:

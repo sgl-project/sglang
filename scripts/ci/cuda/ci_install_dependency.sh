@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.2
+FLASHINFER_VERSION=0.6.3
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -23,16 +23,15 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
-# Clear torch compilation cache
-python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
-
-# Install apt packages
+# Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
-apt-get install -y --no-install-recommends git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+# Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
+apt-get update || true
+apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
-    for pkg in git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+    for pkg in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
             echo "ERROR: Required package $pkg is not installed and apt-get failed"
             exit 1
@@ -40,6 +39,9 @@ apt-get install -y --no-install-recommends git libnuma-dev libssl-dev pkg-config
     done
     echo "All required packages are already installed, continuing..."
 }
+
+# Clear torch compilation cache
+python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Check if protoc of correct architecture is already installed
 if command -v protoc >/dev/null 2>&1; then
@@ -93,8 +95,8 @@ else
     echo "protoc already installed: $(protoc --version)"
 fi
 
-# Install uv
-pip install --upgrade pip
+# Install uv (use python3 -m pip for robustness since some runners only have pip3)
+python3 -m pip install --upgrade pip
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
@@ -127,6 +129,22 @@ fi
 echo "Installing python extras: [${EXTRAS}]"
 
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+
+# Fix CUDA version mismatch between torch and torchaudio.
+# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
+# This mismatch causes torchaudio's C extension to fail loading, producing:
+#   "partially initialized module 'torchaudio' has no attribute 'lib'"
+# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
+# torchaudio/torchvision from an index matching torch's CUDA version.
+TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
+echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
+    # Pin versions to match what was installed by pyproject.toml (strip +cuXYZ suffix)
+    TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
+    $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+fi
 
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
@@ -270,6 +288,9 @@ if [ "$FLASHINFER_INSTALLED" = false ]; then
     echo "ERROR: Failed to install flashinfer-jit-cache after 5 attempts"
     exit 1
 fi
+
+# Download flashinfer cubins if the local set is incomplete
+bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
 # Show current packages
 $PIP_CMD list

@@ -52,6 +52,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
     _launch_subprocesses,
     init_tokenizer_manager,
@@ -99,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -296,6 +302,11 @@ async def lifespan(fast_api_app: FastAPI):
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
 
+    # Initialize Anthropic-compatible serving handler
+    fast_api_app.state.anthropic_serving = AnthropicServing(
+        fast_api_app.state.openai_serving_chat
+    )
+
     # Launch tool server
     tool_server = None
     if server_args.tool_server == "demo":
@@ -489,7 +500,7 @@ async def health_generate(request: Request) -> Response:
         )
         if (
             _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL
+            != DisaggregationMode.NULL.value
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
@@ -616,6 +627,22 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+# Do not import `dumper.py` to avoid dependency
+if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
+
+    @app.api_route("/dumper/{method}", methods=["POST"])
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def _dumper_control_handler(method: str, request: Request):
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
+        obj = DumperControlReqInput(method=method, body=body)
+        results = await _global_state.tokenizer_manager.dumper_control(obj)
+        if any(not r.success for r in results):
+            errors = [r.error for r in results if not r.success]
+            return ORJSONResponse(status_code=400, content={"error": errors})
+        return [x for result in results for x in result.response]
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -1536,6 +1563,29 @@ async def ollama_tags(raw_request: Request):
 async def ollama_show(request: OllamaShowRequest, raw_request: Request):
     """Ollama-compatible show model info endpoint."""
     return raw_request.app.state.ollama_serving.get_show(request.model)
+
+
+##### Anthropic-compatible API endpoints #####
+
+
+@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_messages(
+    request: AnthropicMessagesRequest, raw_request: Request
+):
+    """Anthropic-compatible Messages API endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_messages(
+        request, raw_request
+    )
+
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_count_tokens(
+    request: AnthropicCountTokensRequest, raw_request: Request
+):
+    """Anthropic-compatible token counting endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+        request, raw_request
+    )
 
 
 ## SageMaker API
