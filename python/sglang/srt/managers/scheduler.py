@@ -278,6 +278,7 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        self.gracefully_exit = False
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -722,6 +723,15 @@ class Scheduler(
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
+                )
+            elif server_args.enable_pegaflow:
+                from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
+
+                self.tree_cache = PeagflowRadixCache(
+                    params=params,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
                 )
             else:
                 self.tree_cache = RadixCache(params)
@@ -3158,6 +3168,12 @@ def run_scheduler_process(
 
         pipe_writer.send(result_dict)
 
+        # Set up signal handlers for graceful shutdown
+        signal_handler = SchedulerSignalHandler(scheduler)
+        signal.signal(signal.SIGTERM, signal_handler.sigterm_handler)
+        signal.signal(signal.SIGINT, signal_handler.sigterm_handler)
+        signal.signal(signal.SIGQUIT, signal_handler.sigquit_handler)
+
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
@@ -3185,7 +3201,65 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal_disagg_decode()
 
+    except KeyboardInterrupt:
+        logger.info(
+            "Scheduler received KeyboardInterrupt, initiating graceful shutdown..."
+        )
+        _execute_graceful_exit(scheduler)
+
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error("Scheduler hit an exception: %s", traceback)
+
+        # Execute graceful exit before notifying parent process
+        _execute_graceful_exit(scheduler)
+
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def _execute_graceful_exit(scheduler: Scheduler) -> None:
+    """Execute graceful exit cleanup for the scheduler.
+
+    This function handles cleanup operations before shutdown, including:
+    - Setting the gracefully_exit flag
+    - Unregistering PegaFlow CUDA IPC contexts if enabled
+    """
+    try:
+        scheduler.gracefully_exit = True
+        # Unregister PegaFlow server CUDA IPC if enabled
+        try:
+            from pegaflow.sglang.peagflow_radix_cache import PeagflowRadixCache
+
+            if hasattr(scheduler, "tree_cache") and isinstance(
+                scheduler.tree_cache, PeagflowRadixCache
+            ):
+                scheduler.tree_cache.shutdown()
+        except ImportError:
+            logger.debug("PegaFlow not installed, skipping CUDA IPC cleanup")
+    except Exception as e:
+        logger.warning("Failed to execute graceful exit: %s", e)
+
+
+class SchedulerSignalHandler:
+    """Signal handler for graceful shutdown of the scheduler process."""
+
+    def __init__(self, scheduler: Scheduler):
+        self.scheduler: Scheduler = scheduler
+
+    def sigterm_handler(self, signum=None, frame=None):
+        """Handle SIGTERM signal for graceful shutdown."""
+        logger.warning(
+            "SIGTERM received in scheduler. signum=%s frame=%s. Initiating graceful shutdown...",
+            signum,
+            frame,
+        )
+        _execute_graceful_exit(self.scheduler)
+
+    def sigquit_handler(self, signum=None, frame=None):
+        """Handle SIGQUIT signal, typically indicating a child process failure."""
+        logger.error(
+            "SIGQUIT received in scheduler. signum=%s, frame=%s. A child process may have failed.",
+            signum,
+            frame,
+        )
+        _execute_graceful_exit(self.scheduler)
