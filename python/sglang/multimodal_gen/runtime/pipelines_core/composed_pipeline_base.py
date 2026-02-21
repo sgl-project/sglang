@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
     maybe_download_model,
     verify_model_config_and_directory,
 )
@@ -290,13 +291,12 @@ class ComposedPipelineBase(ABC):
             if override_path is None and module_name == "vae":
                 override_path = server_args.vae_path
             if override_path is not None:
+                _ = get_diffusers_component_config(override_path)
                 component_model_path = override_path
-                if not os.path.exists(component_model_path):
-                    component_model_path = maybe_download_model(component_model_path)
                 logger.info(
                     "Using custom path for component %s: %s (default: %s)",
                     module_name,
-                    component_model_path,
+                    override_path,
                     os.path.join(self.model_path, load_module_name),
                 )
             else:

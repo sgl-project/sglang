@@ -630,7 +630,10 @@ class ServerArgs:
             "--vae-path",
             type=str,
             default=ServerArgs.vae_path,
-            help="Custom path to VAE (e.g., distilled autoencoder). You can also use --<component>-path for any component key in model_index.json (e.g., --video-vae-path, --audio-vae-path).",
+            help="Custom path to VAE model (e.g., for distilled autoencoder). "
+            "This is a shorthand for the dynamic --<component>-path convention. "
+            "Any unrecognized --<component>-path argument (e.g. --transformer-path, "
+            "--video-vae-path) is automatically captured as a component override.",
         )
 
         # attention
@@ -966,39 +969,69 @@ class ServerArgs:
             f"(started from port {original_port})"
         )
 
+    @staticmethod
+    def _extract_component_paths(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+
+        E.g. ``--transformer-path /foo`` → ``{"transformer": "/foo"}``
+             ``--video-vae-path=/bar``    → ``{"video_vae": "/bar"}``
+
+        Returns ``(component_paths, remaining_unknown_args)``.
+        """
+        component_paths: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            if key_part.startswith("--") and key_part.endswith("-path"):
+                component = key_part[2:-5].replace("-", "_")
+                if "=" in arg:
+                    component_paths[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_paths[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+
+        for component, path in component_paths.items():
+            path = os.path.expanduser(path)
+            component_paths[component] = path
+        return component_paths, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
+
+        # extract dynamic --<component>-path from unknown args
+        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        if remaining:
+            raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
+
         provided_args = cls.get_provided_args(args, unknown_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
-            # Provided args override config file args
             provided_args = {**config_args, **provided_args}
 
-        # extract dynamic component paths from --<component>-path args
-        known_path_args = {
-            "model_path",
-            "lora_path",
-            "prompt_file_path",
-            "mask_strategy_file_path",
-            "output_path",
-            "vae_path",
-        }
-        component_paths: dict[str, str] = {}
-        for key, value in list(provided_args.items()):
-            if key.endswith("_path") and key not in known_path_args:
-                # e.g. video_vae_path -> component key "video_vae"
-                component_key = key[:-5]  # strip "_path"
-                component_paths[component_key] = value
-                provided_args.pop(key)
-        if component_paths:
-            provided_args.setdefault("component_paths", {}).update(component_paths)
+        if dynamic_paths:
+            existing = dict(provided_args.get("component_paths") or {})
+            existing.update(dynamic_paths)
+            provided_args["component_paths"] = existing
 
         return cls.from_dict(provided_args)
 
@@ -1008,13 +1041,13 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 
-        # merge vae_path into component_paths (backward compat)
-        if "component_paths" in kwargs or "vae_path" in kwargs:
-            component_paths = dict(kwargs.get("component_paths") or {})
-            if "vae_path" in kwargs and kwargs["vae_path"]:
-                component_paths["vae"] = kwargs["vae_path"]
-            if component_paths:
-                server_args_kwargs["component_paths"] = component_paths
+        # merge vae_path into component_paths
+        component_paths = dict(kwargs.get("component_paths") or {})
+        vae_path = kwargs.get("vae_path")
+        if vae_path:
+            component_paths.setdefault("vae", vae_path)
+        if component_paths:
+            server_args_kwargs["component_paths"] = component_paths
 
         for attr in attrs:
             if attr == "pipeline_config":
@@ -1025,7 +1058,6 @@ class ServerArgs:
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr == "component_paths":
-                # already set above
                 continue
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
@@ -1268,8 +1300,8 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
+    raw_args, unknown_args = parser.parse_known_args(argv)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
 
 
