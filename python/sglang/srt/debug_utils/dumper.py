@@ -662,12 +662,14 @@ def _get_default_exp_name(timeout_seconds: int = 60):
     rand_suffix = random.randint(0, 999)
     object_list = [
         (
-            f"{_DEFAULT_EXP_NAME_PREFIX}"
-            f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime(now))}"
-            f"_{ms:03d}{rand_suffix:03d}"
+            (
+                f"{_DEFAULT_EXP_NAME_PREFIX}"
+                f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime(now))}"
+                f"_{ms:03d}{rand_suffix:03d}"
+            )
+            if rank == 0
+            else None
         )
-        if rank == 0
-        else None
     ]
 
     if dist.is_initialized():
