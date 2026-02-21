@@ -69,15 +69,15 @@ def _check_index_files_for_missing_shards(
     missing_files = []
     checked_subdirs = []
 
-    # Check the root directory and all subdirectories that might contain model weights
-    dirs_to_check = [model_path]
-
     # Add common subdirectories for diffusers models
     try:
         subdirs = os.listdir(model_path)
     except OSError as e:
         logger.warning("Failed to list model directory %s: %s", model_path, e)
         return True, [], []  # Assume valid if we can't check
+
+    # Check the root directory and all subdirectories that might contain model weights
+    dirs_to_check = [model_path]
 
     for subdir in subdirs:
         subdir_path = os.path.join(model_path, subdir)
@@ -176,7 +176,6 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     """
     if not is_in_ci():
         return True, False
-
     is_valid, missing_files, checked_subdirs = _check_index_files_for_missing_shards(
         model_path
     )
@@ -295,24 +294,23 @@ def load_dict(file_path):
 
 
 def get_diffusers_component_config(
-    model_path: str,
+    component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
-
     # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(model_path):
-        model_path = maybe_download_model(model_path)
+    if not os.path.exists(component_path):
+        component_path = maybe_download_model(component_path)
 
     # tokenizer
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in model_path:
+    if "scheduler" in component_path:
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
 
     config_file_paths = [
-        os.path.join(model_path, config_name) for config_name in config_names
+        os.path.join(component_path, config_name) for config_name in config_names
     ]
 
     combined_config = reduce(
@@ -544,6 +542,7 @@ def maybe_download_model(
     download: bool = True,
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
+    force_diffusers_model: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -553,13 +552,13 @@ def maybe_download_model(
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
-
+        force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
     Returns:
         Local path to the model
     """
 
-    def _verify_model_complete(path: str) -> bool:
-        """Check if model directory has required subdirectories."""
+    def _verify_diffusers_model_complete(path: str) -> bool:
+        """Check if model directory (of a diffusers model, not a component) has required subdirectories."""
         config_path = os.path.join(path, "model_index.json")
         if not os.path.exists(config_path):
             return False
@@ -592,7 +591,10 @@ def maybe_download_model(
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        if is_lora or _verify_model_complete(model_name_or_path):
+        # TODO: lots of duplication here
+        if not force_diffusers_model:
+            return model_name_or_path
+        elif is_lora or _verify_diffusers_model_complete(model_name_or_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
@@ -640,7 +642,9 @@ def maybe_download_model(
             local_files_only=True,
             max_workers=8,
         )
-        if is_lora or _verify_model_complete(local_path):
+        if not force_diffusers_model:
+            return str(local_path)
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
@@ -710,8 +714,10 @@ def maybe_download_model(
                     max_workers=8,
                 )
 
+            if not force_diffusers_model:
+                return str(local_path)
             # Verify downloaded model is complete (skip for LoRA)
-            if not is_lora and not _verify_model_complete(local_path):
+            elif not is_lora and not _verify_diffusers_model_complete(local_path):
                 logger.warning(
                     "Downloaded model at %s is incomplete, retrying with force_download=True",
                     local_path,
@@ -724,7 +730,7 @@ def maybe_download_model(
                         max_workers=8,
                         force_download=True,
                     )
-                if not _verify_model_complete(local_path):
+                if not _verify_diffusers_model_complete(local_path):
                     raise ValueError(
                         f"Downloaded model at {local_path} is still incomplete after forced re-download. "
                         "The model repository may be missing required components (model_index.json, transformer/, or vae/)."

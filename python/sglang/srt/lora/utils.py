@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 
@@ -98,12 +98,22 @@ def get_hidden_dim(
 
 
 def get_normalized_target_modules(
-    target_modules: Iterable[str],
+    target_modules: Union[str, Iterable[str]],
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+
+    Also handles PEFT shorthand strings like "all-linear" or "all" by returning
+    {"all"} as a sentinel value (the caller should check for "all" and fall
+    back to the CLI --lora-target-modules to determine the concrete module set).
     """
+    # Handle PEFT shorthand strings — these cannot be resolved to concrete
+    # module names without inspecting the base model, so we return {"all"}
+    # and let the caller fall back to the CLI --lora-target-modules.
+    if isinstance(target_modules, str):
+        return {"all"}
+
     params_mapping = {
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
@@ -116,6 +126,7 @@ def get_normalized_target_modules(
         "word_embeddings": "embed_tokens",
         "lm_head": "lm_head",
         "output": "lm_head",
+        "unembed_tokens": "lm_head",
     }
 
     result = set()

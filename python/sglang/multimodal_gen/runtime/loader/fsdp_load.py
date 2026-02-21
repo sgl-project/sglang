@@ -238,7 +238,8 @@ def load_model_from_full_model_state_dict(
     """
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
-    sharded_sd = {}
+
+    # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
@@ -250,7 +251,7 @@ def load_model_from_full_model_state_dict(
     # sort parameter names to ensure all ranks process parameters in the same order
     sorted_param_names = sorted(custom_param_sd.keys())
 
-    requires_grad = False
+    sharded_sd = {}
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
