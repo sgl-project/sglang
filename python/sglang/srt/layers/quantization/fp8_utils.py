@@ -654,6 +654,129 @@ def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     return packed.view(1, scale_m, scale_k, 2, 256)
 
 
+def _interleave_mxfp8_scales_for_cublas(
+    scale_u8: torch.Tensor, m_padded: int, k: int
+) -> torch.Tensor:
+    """Convert natural (M, K//32) uint8 scales to cuBLAS interleaved float8_e8m0fnu.
+
+    This performs the same permutation as _pack_mxfp8_scales but outputs the 2D
+    (M, K//32) layout that torch._scaled_mm expects, skipping the intermediate
+    5D shape used by the Triton tl.dot_scaled kernel.
+    """
+    k_groups = k // 32
+    return (
+        scale_u8.view(m_padded // 128, 4, 32, k // 128, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(m_padded, k_groups)
+        .view(torch.float8_e8m0fnu)
+    )
+
+
+def prepare_mxfp8_weight_for_cublas(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pre-compute weight transpose and interleaved scales for cuBLAS MXFP8.
+
+    Called once at model load time.  Returns (weight_t, weight_scale_cublas).
+    """
+    n, k = weight.shape
+    assert n % 128 == 0, f"N={n} must be divisible by 128 for MXFP8"
+    assert k % 128 == 0, f"K={k} must be divisible by 128 for MXFP8"
+    # cuBLAS needs column-major b: weight.t() is a (K, N) view of (N, K) storage
+    # Do NOT call .contiguous() — that would make it row-major which cuBLAS rejects
+    weight_t = weight.t()
+    weight_scale_cublas = _interleave_mxfp8_scales_for_cublas(weight_scale, n, k)
+    return weight_t, weight_scale_cublas
+
+
+def cublas_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight_t: torch.Tensor,
+    weight_scale_cublas: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear using cuBLAS via torch._scaled_mm.
+
+    Expects pre-computed weight_t (K, N) and weight_scale_cublas (N, K//32)
+    in float8_e8m0fnu format (from prepare_mxfp8_weight_for_cublas).
+    """
+    if not (_is_cuda and is_sm100_supported()):
+        raise RuntimeError("MXFP8 cuBLAS linear requires Blackwell GPUs (SM100+).")
+
+    if not hasattr(cublas_mxfp8_blockscaled_linear, "_logged"):
+        logger.info("Using cuBLAS MXFP8 dense linear (torch._scaled_mm)")
+        cublas_mxfp8_blockscaled_linear._logged = True
+
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    k, n = weight_t.shape
+    output_shape = [*input.shape[:-1], n]
+
+    m = input_2d.shape[0]
+    assert input_2d.shape[1] == k, f"K mismatch: input {input_2d.shape[1]} vs weight {k}"
+
+    if input_scale is None:
+        q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
+    else:
+        q_input = input_2d
+        x_scale_u8 = input_scale
+        assert x_scale_u8.dtype == torch.uint8, "MXFP8 input_scale must be UE8M0 uint8."
+        assert x_scale_u8.shape == (m, k // 32)
+
+    if output_dtype is None:
+        if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            output_dtype = input_2d.dtype
+        else:
+            output_dtype = torch.bfloat16
+
+    # Pad M to multiple of 128 (required for scale interleaving)
+    if m % 128 != 0:
+        m_padded = ceil_div(m, 128) * 128
+        pad_rows = m_padded - m
+        q_input = torch.cat(
+            [
+                q_input,
+                torch.zeros(
+                    (pad_rows, k), device=q_input.device, dtype=q_input.dtype
+                ),
+            ],
+            dim=0,
+        )
+        x_scale_u8 = torch.cat(
+            [
+                x_scale_u8,
+                torch.full(
+                    (pad_rows, k // 32),
+                    127,
+                    device=x_scale_u8.device,
+                    dtype=x_scale_u8.dtype,
+                ),
+            ],
+            dim=0,
+        )
+    else:
+        m_padded = m
+
+    # Direct interleave input scales for cuBLAS (no intermediate 5D packed format)
+    sa = _interleave_mxfp8_scales_for_cublas(x_scale_u8, m_padded, k)
+
+    output = torch._scaled_mm(
+        q_input,
+        weight_t,
+        scale_a=sa,
+        scale_b=weight_scale_cublas,
+        out_dtype=output_dtype,
+    )
+
+    output = output[:m, :]
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
+
+
 def triton_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
