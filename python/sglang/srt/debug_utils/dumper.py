@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import random
 import re
 import socket
 import threading
@@ -656,10 +657,14 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
 
 def _get_default_exp_name(timeout_seconds: int = 60):
     rank = _get_rank()
+    now = time.time()
+    ms = int((now % 1) * 1000)
+    rand_suffix = random.randint(0, 999)
     object_list = [
         (
             f"{_DEFAULT_EXP_NAME_PREFIX}"
-            f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+            f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime(now))}"
+            f"{ms:03d}_{rand_suffix:03d}"
         )
         if rank == 0
         else None
