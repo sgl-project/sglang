@@ -8,11 +8,6 @@ Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -41,7 +36,9 @@ INVALID = -9999999
 
 # Model path configuration for MI35x DeepSeek-R1-MXFP4
 # Priority: 1) env var, 2) local path, 3) HuggingFace model ID
-DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
+DEEPSEEK_R1_MXFP4_LOCAL_PATH = os.environ.get(
+    "DEEPSEEK_R1_MXFP4_MODEL_PATH", "/sgl-data/models/amd-DeepSeek-R1-MXFP4-Preview"
+)
 DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
 
 
