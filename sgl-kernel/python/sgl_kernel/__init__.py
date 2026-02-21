@@ -23,7 +23,6 @@ from sgl_kernel.elementwise import (
     concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
-    downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
