@@ -107,8 +107,8 @@ def calculate_diff():
             routed_scaling_factor=2.872,
             apply_routed_scaling_factor_on_output=False,
         )
-        w_jit, _ = kimi_k2_jit(inp, bias, **kwargs)
-        w_aot, _ = kimi_k2_aot(inp, bias, **kwargs)
+        w_jit, i_jit = kimi_k2_jit(inp, bias, **kwargs)
+        w_aot, i_aot = kimi_k2_aot(inp, bias, **kwargs)
         weights_match = torch.allclose(
             w_jit.sort(dim=-1)[0], w_aot.sort(dim=-1)[0].float(), rtol=1e-3, atol=1e-4
         )
