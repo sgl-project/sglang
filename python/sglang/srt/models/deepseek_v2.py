@@ -1173,102 +1173,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def _should_debug_eplb_load(self) -> bool:
-        """Check if SGLANG_DEBUG_WATERFILL_EPLB logging is enabled for this layer.
-
-        The result must NOT depend on num_tokens (which differs across ranks)
-        to avoid collective mismatches.
-        """
-        flag = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB", "") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
-        if flag and not torch.cuda.is_current_stream_capturing():
-            layer_filter = os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_LAYER", "")
-            if layer_filter and layer_filter not in ("all", "-1"):
-                try:
-                    flag = int(layer_filter) == int(self.layer_id)
-                except Exception:
-                    flag = False
-            elif not layer_filter:
-                flag = int(self.layer_id) == 0
-        else:
-            flag = False
-        if flag:
-            max_prints = int(
-                os.environ.get("SGLANG_DEBUG_WATERFILL_EPLB_MAX_PRINTS", "1")
-            )
-            printed = getattr(self, "_debug_waterfill_eplb_print_count", 0)
-            flag = printed < max_prints
-        return flag
-
-    def _should_profile_waterfill(self, num_tokens: int):
-        """Check if waterfill profiling is enabled; return (enabled, ep_rank, printed).
-
-        Collapses the cascading env-var / layer / rank / max-prints / min-tokens
-        checks into a single call.  Returns a tuple so the caller can use
-        ``enabled`` as a bool and pass ``printed`` to the counter update.
-        """
-        flag = os.environ.get("SGLANG_PROFILE_WATERFILL_TIMING", "") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        )
-        if not flag or torch.cuda.is_current_stream_capturing():
-            return False, None, 0
-        layer_filter = os.environ.get("SGLANG_PROFILE_WATERFILL_LAYER", "")
-        if layer_filter and layer_filter not in ("all", "-1"):
-            try:
-                if int(layer_filter) != int(self.layer_id):
-                    return False, None, 0
-            except Exception:
-                return False, None, 0
-        elif not layer_filter:
-            if int(self.layer_id) != 0:
-                return False, None, 0
-        from sglang.srt.distributed import get_moe_ep_group
-
-        ep_rank = torch.distributed.get_rank(group=get_moe_ep_group().device_group)
-        if ep_rank != 0:
-            return False, None, 0
-        max_prints = int(os.environ.get("SGLANG_PROFILE_WATERFILL_MAX_PRINTS", "1"))
-        printed = getattr(self, "_profile_waterfill_print_count", 0)
-        if printed >= max_prints:
-            return False, None, 0
-        min_tokens = int(os.environ.get("SGLANG_PROFILE_WATERFILL_MIN_TOKENS", "64"))
-        if num_tokens < min_tokens:
-            return False, None, 0
-        return True, ep_rank, printed
-
-    @staticmethod
-    def _make_prof_events():
-        """Create CUDA timing events dict for waterfill profiling."""
-        names = [
-            "total",
-            "topk",
-            "allreduce",
-            "prepare",
-            "dispatch",
-            "moe",
-            "combine",
-        ]
-        return {
-            n: (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            for n in names
-        }
-
     def _waterfill_zero_token_return(
         self,
         hidden_states: torch.Tensor,
         device: torch.device,
-        debug_eplb: bool,
-        has_eplb: bool,
         use_static_weights: bool,
     ) -> torch.Tensor:
         """Handle the 0-token edge case in forward_deepep_waterfill.
@@ -1290,25 +1198,6 @@ class DeepseekV2MoE(nn.Module):
                 op=torch.distributed.ReduceOp.SUM,
                 group=_ep_group,
             )
-        if debug_eplb:
-            group = get_moe_ep_group().device_group
-            ep_world = torch.distributed.get_world_size(group=group)
-            dummy_one = torch.zeros(1, dtype=torch.int64, device=device)
-            gather_list = [torch.empty_like(dummy_one) for _ in range(ep_world)]
-            torch.distributed.all_gather(gather_list, dummy_one, group=group)
-            if has_eplb:
-                dummy_ep = torch.zeros(ep_world, dtype=torch.int64, device=device)
-                torch.distributed.all_reduce(
-                    dummy_ep,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=group,
-                )
-            dummy_ep2 = torch.zeros(ep_world, dtype=torch.int64, device=device)
-            torch.distributed.all_reduce(
-                dummy_ep2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=group,
-            )
         expanded_top_k = self.experts.top_k
         topk_weights = torch.empty(
             (0, expanded_top_k), dtype=torch.float32, device=device
@@ -1317,38 +1206,6 @@ class DeepseekV2MoE(nn.Module):
         router_logits = torch.empty(
             (0, expanded_top_k), dtype=torch.float32, device=device
         )
-        return self.experts(
-            hidden_states=hidden_states,
-            topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
-        )
-        if debug_eplb:
-            group = get_moe_ep_group().device_group
-            ep_world = torch.distributed.get_world_size(group=group)
-            dummy_one = torch.zeros(1, dtype=torch.int64, device=device)
-            gather_list = [torch.empty_like(dummy_one) for _ in range(ep_world)]
-            torch.distributed.all_gather(gather_list, dummy_one, group=group)
-            if has_eplb:
-                dummy_ep = torch.zeros(ep_world, dtype=torch.int64, device=device)
-                torch.distributed.all_reduce(
-                    dummy_ep,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=group,
-                )
-            dummy_ep2 = torch.zeros(ep_world, dtype=torch.int64, device=device)
-            torch.distributed.all_reduce(
-                dummy_ep2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=group,
-            )
-        expanded_top_k = self.experts.top_k
-        topk_weights = torch.empty(
-            (0, expanded_top_k), dtype=torch.float32, device=device
-        )
-        topk_ids = torch.full((0, expanded_top_k), -1, dtype=torch.int32, device=device)
-        router_logits = torch.empty(
-            (0, expanded_top_k), dtype=torch.float32, device=device
-        )
-        hidden_states = torch.empty(0, 0, device=device)
         return self.experts(
             hidden_states=hidden_states,
             topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
@@ -1392,134 +1249,6 @@ class DeepseekV2MoE(nn.Module):
                     )
                 ),
             )
-
-            # Debug-only: per-rank (shared+routed) totals before/after EPLB.
-            # Enable via SGLANG_DEBUG_WATERFILL_EPLB=1.
-            debug_waterfill_eplb = self._should_debug_eplb_load()
-
-            if debug_waterfill_eplb:
-                # Further gate by min-tokens to skip tiny warmups / decode-only steps.
-                min_tokens_to_print = int(
-                    os.environ.get(
-                        "SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS",
-                        str(
-                            getattr(
-                                getattr(self, "deepep_waterfill_balancer", None),
-                                "MIN_BATCH_FOR_BALANCE",
-                                0,
-                            )
-                        ),
-                    )
-                )
-                debug_waterfill_eplb = hidden_states.shape[0] >= min_tokens_to_print
-
-            if debug_waterfill_eplb:
-                from sglang.srt.distributed import get_moe_ep_group
-
-                group = get_moe_ep_group().device_group
-                ep_rank = torch.distributed.get_rank(group=group)
-                ep_world = torch.distributed.get_world_size(group=group)
-                device = hidden_states.device
-
-                # Shared expert tokens are local before waterfill (1 per valid token).
-                num_tokens_local = hidden_states.shape[0]
-                num_token_non_padded_cpu = getattr(
-                    forward_batch, "num_token_non_padded_cpu", None
-                )
-                num_tokens_for_count = (
-                    int(num_token_non_padded_cpu)
-                    if (
-                        num_token_non_padded_cpu is not None
-                        and isinstance(num_token_non_padded_cpu, int)
-                        and num_token_non_padded_cpu < num_tokens_local
-                    )
-                    else int(num_tokens_local)
-                )
-                local_num_tokens = torch.tensor(
-                    [num_tokens_for_count], device=device, dtype=torch.int64
-                )
-                gather_list = [
-                    torch.empty_like(local_num_tokens) for _ in range(ep_world)
-                ]
-                torch.distributed.all_gather(gather_list, local_num_tokens, group=group)
-                local_tokens_per_rank = torch.cat(gather_list).to(
-                    torch.int64
-                )  # (ep_world,)
-
-                # Routed tokens post-EPLB (physical expert-id space)
-                topk_ids = topk_output.topk_ids.to(torch.int64)
-                valid_topk = topk_ids >= 0
-                num_physical_experts = (
-                    int(dispatch_info.num_physical_experts)
-                    if dispatch_info is not None
-                    else int(self.config.n_routed_experts)
-                )
-                phys_epr = max(num_physical_experts // ep_world, 1)
-                routed_rank = torch.div(topk_ids, phys_epr, rounding_mode="floor")
-                routed_rank_valid = routed_rank[valid_topk].to(torch.int64)
-                local_routed_counts_post = torch.bincount(
-                    routed_rank_valid, minlength=ep_world
-                ).to(torch.int64)
-                routed_counts_post = local_routed_counts_post.clone()
-                torch.distributed.all_reduce(
-                    routed_counts_post,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=group,
-                )
-
-                # Routed tokens pre-EPLB (logical expert-id space)
-                if dispatch_info is not None:
-                    topk_output_logical = self.topk(
-                        hidden_states,
-                        router_logits,
-                        num_token_non_padded=forward_batch.num_token_non_padded,
-                        expert_location_dispatch_info=None,
-                    )
-                    logical_ids = topk_output_logical.topk_ids.to(torch.int64)
-                    valid_logical = logical_ids >= 0
-                    num_logical_experts = int(self.config.n_routed_experts)
-                    logical_epr = max(
-                        (num_logical_experts + ep_world - 1) // ep_world, 1
-                    )
-                    logical_rank = torch.div(
-                        logical_ids, logical_epr, rounding_mode="floor"
-                    )
-                    logical_rank_valid = logical_rank[valid_logical].to(torch.int64)
-                    local_routed_counts_pre = torch.bincount(
-                        logical_rank_valid, minlength=ep_world
-                    ).to(torch.int64)
-                    routed_counts_pre = local_routed_counts_pre.clone()
-                    torch.distributed.all_reduce(
-                        routed_counts_pre,
-                        op=torch.distributed.ReduceOp.SUM,
-                        group=group,
-                    )
-                else:
-                    routed_counts_pre = routed_counts_post
-
-                total_pre_eplb = routed_counts_pre + local_tokens_per_rank
-                total_post_eplb = routed_counts_post + local_tokens_per_rank
-
-                def _print_total(stage: str, total: torch.Tensor) -> None:
-                    t_this = int(total[ep_rank].item())
-                    t_max = int(total.max().item())
-                    t_avg = float(total.float().mean().item())
-                    imbal = (float(t_max) / t_avg) if t_avg > 0 else 0.0
-                    print(
-                        (
-                            f"[deepep_eplb_load] mode=baseline layer={self.layer_id} "
-                            f"ep_rank={ep_rank}/{ep_world} stage={stage} "
-                            f"total={t_this} max={t_max} avg={t_avg:.2f} "
-                            f"imbal={imbal:.3f}x"
-                        ),
-                        flush=True,
-                    )
-
-                _print_total("pre_eplb", total_pre_eplb)
-                _print_total("post_eplb", total_post_eplb)
-                self._debug_waterfill_eplb_print_count = (
-                    getattr(self, "_debug_waterfill_eplb_print_count", 0) + 1
-                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
@@ -1679,15 +1408,6 @@ class DeepseekV2MoE(nn.Module):
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
 
-        # Debug flag BEFORE the 0-token early return so all ranks agree on
-        # whether debug collectives will be issued (avoids deadlock).
-        debug_waterfill_eplb = self._should_debug_eplb_load()
-
-        # Whether EPLB dispatch_info is active (same on all ranks).
-        _has_eplb = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id) is not None
-        )
-
         _use_static_weights = (
             self.deepep_waterfill_balancer is not None
             and self.deepep_waterfill_balancer.has_static_weights()
@@ -1697,17 +1417,8 @@ class DeepseekV2MoE(nn.Module):
             return self._waterfill_zero_token_return(
                 hidden_states,
                 device,
-                debug_waterfill_eplb,
-                _has_eplb,
                 _use_static_weights,
             )
-
-        profile_waterfill_timing, _wf_prof_ep_rank, _wf_prof_printed = (
-            self._should_profile_waterfill(num_tokens)
-        )
-        _pev = self._make_prof_events() if profile_waterfill_timing else None
-        if _pev:
-            _pev["total"][0].record()
 
         router_logits = self.gate(hidden_states, forward_batch=forward_batch)
 
@@ -1723,8 +1434,6 @@ class DeepseekV2MoE(nn.Module):
             and num_token_non_padded_cpu < num_tokens
         ):
             num_token_non_padded = forward_batch.num_token_non_padded
-        if _pev:
-            _pev["topk"][0].record()
         topk_output = self.topk(
             hidden_states,
             router_logits,
@@ -1733,8 +1442,6 @@ class DeepseekV2MoE(nn.Module):
                 layer_id=self.layer_id,
             ),
         )
-        if _pev:
-            _pev["topk"][1].record()
         topk_ids = topk_output.topk_ids  # [N, 8]
         topk_weights = topk_output.topk_weights  # [N, 8]
 
@@ -1753,12 +1460,8 @@ class DeepseekV2MoE(nn.Module):
             # Skip local_tokens_per_rank: it's uniform across ranks (same value
             # for all r), so adding it to routed_counts shifts all gaps equally
             # without changing the argmin or proportional weights.
-            if _pev:
-                _pev["allreduce"][0].record()
             global_routed_counts = local_routed_counts
             local_tokens_per_rank = None
-            if _pev:
-                _pev["allreduce"][1].record()
         else:
             _ep_group = get_moe_ep_group().device_group
             _ep_world = torch.distributed.get_world_size(group=_ep_group)
@@ -1767,8 +1470,6 @@ class DeepseekV2MoE(nn.Module):
             _fused_buf[:_ep_world] = local_routed_counts
             if not torch.cuda.is_current_stream_capturing():
                 _fused_buf[_ep_world + _ep_rank] = num_tokens
-            if _pev:
-                _pev["allreduce"][0].record()
             torch.distributed.all_reduce(
                 _fused_buf,
                 op=torch.distributed.ReduceOp.SUM,
@@ -1779,12 +1480,8 @@ class DeepseekV2MoE(nn.Module):
                 local_tokens_per_rank = _fused_buf[_ep_world:]
             else:
                 local_tokens_per_rank = None
-            if _pev:
-                _pev["allreduce"][1].record()
 
         # Waterfill assignment and expand topk to 9 columns
-        if _pev:
-            _pev["prepare"][0].record()
         expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
             self.deepep_waterfill_balancer.prepare_dispatch(
                 topk_ids,
@@ -1793,167 +1490,6 @@ class DeepseekV2MoE(nn.Module):
                 local_tokens_per_rank=local_tokens_per_rank,
             )
         )
-        if _pev:
-            _pev["prepare"][1].record()
-
-        # ---------------- Debug-only: EPLB load logs + validate Waterfill shared destination ----------------
-        # The debug_waterfill_eplb flag was computed before the 0-token check
-        # above so that all ranks agree.  Collectives here MUST be executed by
-        # every rank (including 0-token ranks via dummy participation above).
-        # Printing is further gated by a min-tokens threshold.
-        debug_should_print = debug_waterfill_eplb
-        if debug_should_print:
-            min_tokens_to_print = int(
-                os.environ.get(
-                    "SGLANG_DEBUG_WATERFILL_EPLB_MIN_TOKENS",
-                    str(self.deepep_waterfill_balancer.MIN_BATCH_FOR_BALANCE),
-                )
-            )
-            debug_should_print = num_tokens >= min_tokens_to_print
-
-        if debug_waterfill_eplb:
-            group = get_moe_ep_group().device_group
-            ep_rank = torch.distributed.get_rank(group=group)
-            ep_world = torch.distributed.get_world_size(group=group)
-
-            # (1) Per-rank local token counts (shared expert local BEFORE waterfill)
-            num_tokens_for_count = (
-                int(num_token_non_padded_cpu)
-                if (
-                    num_token_non_padded_cpu is not None
-                    and isinstance(num_token_non_padded_cpu, int)
-                    and num_token_non_padded_cpu < num_tokens
-                )
-                else int(num_tokens)
-            )
-            local_num_tokens = torch.tensor(
-                [num_tokens_for_count], device=device, dtype=torch.int64
-            )
-            gather_list = [torch.empty_like(local_num_tokens) for _ in range(ep_world)]
-            torch.distributed.all_gather(gather_list, local_num_tokens, group=group)
-            local_tokens_per_rank = torch.cat(gather_list).to(
-                torch.int64
-            )  # (ep_world,)
-
-            # (1.5) Routed tokens per rank BEFORE EPLB (logical expert-id space)
-            dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if dispatch_info is not None:
-                topk_output_logical = self.topk(
-                    hidden_states,
-                    router_logits,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=None,
-                )
-                logical_ids = topk_output_logical.topk_ids.to(torch.int64)
-                valid_logical = logical_ids >= 0
-                num_logical_experts = int(self.config.n_routed_experts)
-                logical_epr = max((num_logical_experts + ep_world - 1) // ep_world, 1)
-                logical_rank = torch.div(
-                    logical_ids, logical_epr, rounding_mode="floor"
-                )
-                logical_rank_valid = logical_rank[valid_logical].to(torch.int64)
-                local_routed_counts_pre = torch.bincount(
-                    logical_rank_valid,
-                    minlength=ep_world,
-                ).to(torch.int64)
-                routed_counts_pre = local_routed_counts_pre.clone()
-                torch.distributed.all_reduce(
-                    routed_counts_pre,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=group,
-                )
-            else:
-                routed_counts_pre = global_routed_counts.to(torch.int64)
-
-            # (2) Shared expert tokens assigned per rank AFTER waterfill
-            shared_ids = expanded_topk_ids[:, -1].to(torch.int64)
-            valid_shared = shared_ids >= 0
-            new_epr = int(self.deepep_waterfill_balancer.new_experts_per_rank)
-            old_epr = int(self.deepep_waterfill_balancer.old_experts_per_rank)
-
-            # dest_rank extracted from the real shared expert id
-            dest_rank = torch.div(shared_ids, new_epr, rounding_mode="floor")
-            dest_rank_valid = dest_rank[valid_shared].to(torch.int64)
-            local_shared_counts_after = torch.bincount(
-                dest_rank_valid,
-                minlength=ep_world,
-            ).to(torch.int64)
-            shared_counts_after = local_shared_counts_after.clone()
-            torch.distributed.all_reduce(
-                shared_counts_after,
-                op=torch.distributed.ReduceOp.SUM,
-                group=group,
-            )
-
-            routed_counts_post = global_routed_counts.to(torch.int64)
-            total_pre_eplb = routed_counts_pre + local_tokens_per_rank
-            total_post_eplb = routed_counts_post + local_tokens_per_rank
-            total_post_waterfill = (
-                routed_counts_post + shared_counts_after + local_tokens_per_rank
-            )
-
-            # (3) Validation: shared id encoding + dest membership (local tokens only)
-            validate_max_tokens = int(
-                os.environ.get(
-                    "SGLANG_DEBUG_WATERFILL_EPLB_VALIDATE_MAX_TOKENS", "4096"
-                )
-            )
-            n_check = min(num_tokens, validate_max_tokens)
-            if n_check > 0:
-                shared_ids_c = shared_ids[:n_check]
-                valid_shared_c = valid_shared[:n_check]
-                dest_rank_c = dest_rank[:n_check].to(torch.int64)
-                topk_ids_c = topk_ids[:n_check].to(torch.int64)
-                valid_topk = topk_ids_c >= 0
-
-                # shared_id should always point to the shared slot: id % new_epr == old_epr
-                mod_ok = (~valid_shared_c) | (
-                    torch.remainder(shared_ids_c, new_epr) == old_epr
-                )
-                # dest rank should be within [0, ep_world-1]
-                range_ok = (~valid_shared_c) | (
-                    (dest_rank_c >= 0) & (dest_rank_c < ep_world)
-                )
-                # dest rank is either local EP rank, or among routed ranks of this token
-                routed_rank = torch.div(topk_ids_c, old_epr, rounding_mode="floor")
-                in_routed = (
-                    (routed_rank == dest_rank_c.unsqueeze(1)) & valid_topk
-                ).any(dim=1)
-                membership_ok = (~valid_shared_c) | (dest_rank_c == ep_rank) | in_routed
-
-                bad = valid_shared_c & (~(mod_ok & range_ok & membership_ok))
-                bad_count = int(bad.sum().item())
-            else:
-                bad_count = 0
-
-            def _print_total(stage: str, total: torch.Tensor, extra: str = "") -> None:
-                t_this = int(total[ep_rank].item())
-                t_max = int(total.max().item())
-                t_avg = float(total.float().mean().item())
-                imbal = (float(t_max) / t_avg) if t_avg > 0 else 0.0
-                msg = (
-                    f"[deepep_eplb_load] mode=waterfill layer={self.layer_id} "
-                    f"ep_rank={ep_rank}/{ep_world} stage={stage} "
-                    f"static_wf={int(_use_static_weights)} "
-                    f"total={t_this} max={t_max} avg={t_avg:.2f} "
-                    f"imbal={imbal:.3f}x"
-                )
-                if extra:
-                    msg = f"{msg} {extra}"
-                if debug_should_print:
-                    print(msg, flush=True)
-
-            _print_total("pre_eplb", total_pre_eplb)
-            _print_total("post_eplb", total_post_eplb)
-            _print_total(
-                "post_waterfill",
-                total_post_waterfill,
-                extra=f"bad_tokens={bad_count}/{n_check}",
-            )
-
-            self._debug_waterfill_eplb_print_count = (
-                getattr(self, "_debug_waterfill_eplb_print_count", 0) + 1
-            )
 
         expanded_topk_output = StandardTopKOutput(
             topk_weights=expanded_topk_weights,
@@ -1962,24 +1498,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
         dispatcher = self.experts.dispatcher
-        if _pev:
-            _pev["dispatch"][0].record()
         dispatcher.dispatch_a(
             hidden_states=hidden_states, topk_output=expanded_topk_output
         )
         dispatch_output = dispatcher.dispatch_b()
-        if _pev:
-            _pev["dispatch"][1].record()
 
-        if _pev:
-            _pev["moe"][0].record()
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
-        if _pev:
-            _pev["moe"][1].record()
-            _pev["combine"][0].record()
         combined_hidden_states = dispatcher.combine(combine_input=combine_input)
-        if _pev:
-            _pev["combine"][1].record()
 
         # Apply routed scaling factor
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -1993,35 +1518,6 @@ class DeepseekV2MoE(nn.Module):
             combined_hidden_states = tensor_model_parallel_all_reduce(
                 combined_hidden_states
             )
-
-        if _pev:
-            _pev["total"][1].record()
-            # Ensure all recorded events are completed before reading timings.
-            torch.cuda.synchronize()
-            init_loc = getattr(
-                get_global_server_args(), "init_expert_location", "trivial"
-            )
-            static_eplb = bool(init_loc) and (init_loc != "trivial")
-            # local_shared_mask is True when shared expert stays on source rank.
-            local_frac = float(local_shared_mask.float().mean().item())
-            remote_frac = 1.0 - local_frac
-            _t = {n: _pev[n][0].elapsed_time(_pev[n][1]) for n in _pev}
-            print(
-                (
-                    f"[wf_profile] layer={self.layer_id} ep_rank={_wf_prof_ep_rank} "
-                    f"static_eplb={int(static_eplb)} N={num_tokens} "
-                    f"remote_shared={remote_frac*100:.2f}% "
-                    f"topk_ms={_t['topk']:.3f} "
-                    f"allreduce_ms={_t['allreduce']:.3f} "
-                    f"prepare_ms={_t['prepare']:.3f} "
-                    f"dispatch_ms={_t['dispatch']:.3f} "
-                    f"moe_ms={_t['moe']:.3f} "
-                    f"combine_ms={_t['combine']:.3f} "
-                    f"total_ms={_t['total']:.3f}"
-                ),
-                flush=True,
-            )
-            self._profile_waterfill_print_count = _wf_prof_printed + 1
 
         return combined_hidden_states
 
