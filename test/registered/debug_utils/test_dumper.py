@@ -795,6 +795,35 @@ class TestCleanup:
         assert not old_dir.exists()
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
+    def test_cleanup_removes_exp_name_dir(self, tmp_path):
+        exp_name = "my_custom_exp"
+        old_exp_dir = tmp_path / exp_name
+        old_exp_dir.mkdir()
+        (old_exp_dir / "old_data.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not (tmp_path / exp_name / "old_data.pt").exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+    def test_cleanup_removes_both_dump_prefix_and_exp_name(self, tmp_path):
+        old_dump = tmp_path / "dump_old"
+        old_dump.mkdir()
+        (old_dump / "dummy.pt").touch()
+
+        exp_name = "custom_run"
+        old_exp = tmp_path / exp_name
+        old_exp.mkdir()
+        (old_exp / "stale.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not old_dump.exists()
+        assert not (tmp_path / exp_name / "stale.pt").exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
     def test_no_cleanup_by_default(self, tmp_path):
         old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
@@ -844,7 +873,9 @@ class TestZmqPortIsolation:
         stop_event.wait()
 
     def test_concurrent_instances_no_port_conflict(self):
-        ports = [find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)]
+        ports = [
+            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
+        ]
         stop_events = []
         threads = []
         ctx = multiprocessing.get_context("spawn")
@@ -866,7 +897,9 @@ class TestZmqPortIsolation:
                 deadline = time.time() + 30
                 while time.time() < deadline:
                     try:
-                        requests.post(f"{base_url}/dumper/configure", json={}, timeout=2)
+                        requests.post(
+                            f"{base_url}/dumper/configure", json={}, timeout=2
+                        )
                         break
                     except requests.ConnectionError:
                         time.sleep(0.5)
@@ -879,9 +912,9 @@ class TestZmqPortIsolation:
                 )
                 resp.raise_for_status()
                 states = resp.json()
-                assert len(states) == 2, (
-                    f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
-                )
+                assert (
+                    len(states) == 2
+                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
         finally:
             for event in stop_events:
                 event.set()

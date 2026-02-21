@@ -87,6 +87,9 @@ class _FrozenConfig(ABC):
         return raw
 
 
+_DEFAULT_EXP_NAME_PREFIX = "dump_"
+
+
 @dataclass(frozen=True)
 class _DumperConfig(_FrozenConfig):
     enable: bool = False
@@ -431,7 +434,9 @@ class _Dumper:
             else:
                 if not self._cleanup_previous_handled:
                     self._cleanup_previous_handled = True
-                    _cleanup_old_dumps(Path(self._config.dir))
+                    _cleanup_old_dumps(
+                        Path(self._config.dir), exp_name=self._config.exp_name
+                    )
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
@@ -651,7 +656,7 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
 
 def _get_default_exp_name(timeout_seconds: int = 60):
     rank = _get_rank()
-    object_list = [f"dump_{time.time()}" if rank == 0 else None]
+    object_list = [f"{_DEFAULT_EXP_NAME_PREFIX}{time.time()}" if rank == 0 else None]
 
     if dist.is_initialized():
         _collective_with_timeout(
@@ -663,14 +668,18 @@ def _get_default_exp_name(timeout_seconds: int = 60):
     return object_list[0]
 
 
-def _cleanup_old_dumps(base_dir: Path) -> None:
+def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
     import shutil
 
     if _get_rank() == 0:
-        for entry in base_dir.glob("dump_*"):
-            if entry.is_dir():
-                shutil.rmtree(entry)
-                print(f"[Dumper] Cleaned up {entry}")
+        targets = {entry for entry in base_dir.glob(f"{_DEFAULT_EXP_NAME_PREFIX}*")}
+        if exp_name:
+            targets.add(base_dir / exp_name)
+        targets = {d for d in targets if d.is_dir()}
+
+        for entry in targets:
+            shutil.rmtree(entry)
+            print(f"[Dumper] Cleaned up {entry}")
 
     if dist.is_initialized():
         dist.barrier()
