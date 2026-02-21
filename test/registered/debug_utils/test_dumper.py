@@ -1072,6 +1072,15 @@ class _NonIntrusiveTestBase:
     def _make_dumper(tmp_path, **overrides) -> "_Dumper":
         return _make_test_dumper(tmp_path, non_intrusive_mode="all", **overrides)
 
+    def _run(self, tmp_path, inner_cls, **dumper_overrides):
+        d = self._make_dumper(tmp_path, **dumper_overrides)
+        model = self._wrap_as_outer(inner_cls)
+        d.register_non_intrusive_dumper(model)
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            output = model(x)
+        return captured, x, output
+
 
 class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
     """Tests for mode='all' — hooks on every module, non_intrusive__ prefix."""
@@ -1086,13 +1095,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            output = model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         self._assert_captured_contains(
             captured,
@@ -1178,13 +1181,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         self._assert_captured_contains(
             captured,
@@ -1219,13 +1216,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 a, b = self.split(x)
                 return self.linear(a + b)
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.split.output.0" in captured
         assert "non_intrusive__model.split.output.1" in captured
@@ -1246,13 +1237,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.wrap(x)[0]
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.wrap.output" in captured
         assert "non_intrusive__model.wrap.output.0" not in captured
@@ -1271,13 +1256,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 mask = torch.ones_like(x)
                 return self.mul(x, mask)
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.mul.inputs.0" in captured
         assert "non_intrusive__model.mul.inputs.1" in captured
@@ -1296,13 +1275,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 self.sink(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.sink.inputs.0" in captured
         assert not any(
@@ -1323,13 +1296,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 self.const(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.const.inputs.0" in captured
         assert not any(
@@ -1362,15 +1329,9 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = self._make_dumper(
-            tmp_path, filter="name=non_intrusive__model.linear.output"
+        captured, x, output = self._run(
+            tmp_path, Inner, filter="name=non_intrusive__model.linear.output"
         )
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
 
         assert "non_intrusive__model.linear.output" in captured
         assert "non_intrusive__model.relu.output" not in captured
@@ -1522,13 +1483,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         layer0_key = "non_intrusive__model.layers.0.linear.output"
         layer1_key = "non_intrusive__model.layers.1.linear.output"
@@ -1563,13 +1518,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         layer_key = "non_intrusive__model.layers.0.linear.output"
         assert layer_key in captured
@@ -1590,13 +1539,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert len(captured) > 0
         for key, entry in captured.items():
@@ -1624,13 +1567,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path, filter="layer_id=0")
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner, filter="layer_id=0")
 
         layer0_keys = [k for k in captured if "layers.0" in k]
         layer1_keys = [k for k in captured if "layers.1" in k]
