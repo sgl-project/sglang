@@ -226,6 +226,7 @@ class DiffusionTestCase:
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
+    run_perf_check: bool = True  # whether to run performance checks
 
 
 def sample_step_indices(
@@ -507,6 +508,15 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         TI2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_2_t2i_customized_vae_path",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev", modality="image",
+            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"]
+        ),
+        T2I_sampling_params,
+    ),
+
     DiffusionTestCase(
         "fast_hunyuan_video",
         DiffusionServerArgs(

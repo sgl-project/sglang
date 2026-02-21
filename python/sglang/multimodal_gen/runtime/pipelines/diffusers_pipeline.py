@@ -391,7 +391,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
 
         original_model_path = model_path  # Keep original for custom_pipeline
-        model_path = maybe_download_model(model_path)
+        model_path = maybe_download_model(model_path, force_diffusers_model=True)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)

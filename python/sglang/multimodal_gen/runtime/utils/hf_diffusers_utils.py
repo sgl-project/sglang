@@ -178,7 +178,6 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     """
     if not is_in_ci():
         return True, False
-    print(f"{model_path=}")
     is_valid, missing_files, checked_subdirs = _check_index_files_for_missing_shards(
         model_path
     )
@@ -300,7 +299,6 @@ def get_diffusers_component_config(
     component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
-    component_path = os.path.expanduser(component_path)
     # Download from HuggingFace Hub if path doesn't exist locally
     if not os.path.exists(component_path):
         component_path = maybe_download_model(component_path)
@@ -546,6 +544,7 @@ def maybe_download_model(
     download: bool = True,
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
+    force_diffusers_model: bool = False
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -555,7 +554,7 @@ def maybe_download_model(
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
-
+        force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
     Returns:
         Local path to the model
     """
@@ -595,7 +594,10 @@ def maybe_download_model(
     model_name_or_path = os.path.expanduser(model_name_or_path)
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        if is_lora or _verify_diffusers_model_complete(model_name_or_path):
+        # TODO: lots of duplication here
+        if not force_diffusers_model:
+            pass
+        elif is_lora or _verify_diffusers_model_complete(model_name_or_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
@@ -643,7 +645,9 @@ def maybe_download_model(
             local_files_only=True,
             max_workers=8,
         )
-        if is_lora or _verify_diffusers_model_complete(local_path):
+        if not force_diffusers_model:
+            pass
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
@@ -713,8 +717,10 @@ def maybe_download_model(
                     max_workers=8,
                 )
 
+            if not force_diffusers_model:
+                pass
             # Verify downloaded model is complete (skip for LoRA)
-            if not is_lora and not _verify_diffusers_model_complete(local_path):
+            elif not is_lora and not _verify_diffusers_model_complete(local_path):
                 logger.warning(
                     "Downloaded model at %s is incomplete, retrying with force_download=True",
                     local_path,

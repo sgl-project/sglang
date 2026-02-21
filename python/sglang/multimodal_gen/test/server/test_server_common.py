@@ -251,12 +251,16 @@ Consider updating perf_baselines.json with the snippets below:
 
         self._check_for_improvement(case, summary, scenario)
 
-        try:
-            validator.validate(perf_record, case.sampling_params.num_frames)
-        except AssertionError as e:
-            logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            raise
+        # only run performance validation if run_perf_check is True
+        if case.run_perf_check:
+            try:
+                validator.validate(perf_record, case.sampling_params.num_frames)
+            except AssertionError as e:
+                logger.error(f"Performance validation failed for {case.id}:\n{e}")
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                raise
+        else:
+            logger.info(f"Skipping performance validation for {case.id} (run_perf_check=False)")
 
         result = {
             "test_name": case.id,

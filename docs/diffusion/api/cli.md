@@ -12,7 +12,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
-- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
+- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path. See [Component Path Overrides](#component-path-overrides) for more flexible component replacement.
 - `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
 - `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
@@ -217,6 +217,79 @@ Once the generation task has finished, the server will shut down automatically.
 
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
+
+## Component Path Overrides
+
+SGLang diffusion allows you to override any pipeline component (e.g., `vae`, `transformer`, `text_encoder`) by specifying a custom checkpoint path. This is useful for:
+
+- Using distilled or optimized component versions (e.g., tiny VAE for faster decoding)
+- Mixing components from different model versions
+- Testing custom fine-tuned components
+
+### Dynamic `--<component>-path` Convention
+
+You can override **any** component by using `--<component>-path`, where `<component>` matches the key in the model's `model_index.json`:
+
+```bash
+# Override VAE (shorthand: --vae-path)
+--vae-path=/path/to/custom/vae
+
+# Override transformer (FLUX, SD3, etc.)
+--transformer-path=/path/to/custom/transformer
+
+# Override video-specific VAE (Wan, MOVA, etc.)
+--video-vae-path=/path/to/custom/video_vae
+
+# Override text encoders
+--text-encoder-path=/path/to/custom/text_encoder
+--text-encoder-2-path=/path/to/custom/text_encoder_2
+```
+
+**Important:**
+- The component key must match the one in your model's `model_index.json` (e.g., `vae`, `video_vae`, `transformer`).
+- The path must point to a **complete component folder** (not a single weight file), containing `config.json` and safetensors files.
+- Supports both local paths and HuggingFace Hub model IDs.
+
+### Example: FLUX.2-dev with Tiny AutoEncoder
+
+Replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
+
+```bash
+sglang generate \
+  --model-path=black-forest-labs/FLUX.2-dev \
+  --vae-path=fal/FLUX.2-Tiny-AutoEncoder \
+  --prompt='A curious raccoon' \
+  --width=720 \
+  --height=720 \
+  --output-path=outputs \
+  --save-output \
+  --output-file-name=FLUX.2-dev \
+  --log-level=debug
+```
+
+Or using a local path:
+
+```bash
+--vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
+```
+
+### Configuration File
+
+You can also specify component overrides in a config file:
+
+```yaml
+model_path: black-forest-labs/FLUX.2-dev
+component_paths:
+  vae: fal/FLUX.2-Tiny-AutoEncoder
+  transformer: /path/to/custom/transformer
+prompt: A curious raccoon
+width: 720
+height: 720
+```
+
+```bash
+sglang generate --config config.yaml
+```
 
 ## Diffusers Backend
 
