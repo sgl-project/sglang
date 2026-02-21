@@ -138,6 +138,18 @@ class TestServerPortParsed:
         assert _DumperConfig(server_port="reuse").server_port_parsed == "reuse"
 
 
+class TestDefaultExpName:
+    def test_starts_with_prefix(self):
+        name = _get_default_exp_name(timeout_seconds=5)
+        assert name.startswith("dump_")
+
+    def test_suffix_format(self):
+        name = _get_default_exp_name(timeout_seconds=5)
+        suffix = name[len("dump_"):]
+        assert len(suffix) == 22
+        assert suffix[8] == "_"
+
+
 class TestKvPairsParsing:
     def test_from_kv_pairs_none_returns_defaults(self):
         assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
