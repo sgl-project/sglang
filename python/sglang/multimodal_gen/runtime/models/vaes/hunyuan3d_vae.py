@@ -515,9 +515,6 @@ class CrossAttentionDecoder(nn.Module):
     def set_cross_attention_processor(self, processor):
         self.cross_attn_decoder.attn.attention.attn_processor = processor
 
-    def set_default_cross_attention_processor(self):
-        self.cross_attn_decoder.attn.attention.attn_processor = CrossAttentionProcessor
-
     def forward(self, queries=None, query_embeddings=None, latents=None):
         if query_embeddings is None:
             fourier_out = self.fourier_embedder(queries)
