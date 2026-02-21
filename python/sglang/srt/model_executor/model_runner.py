@@ -1204,6 +1204,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         success = False
         message = ""
+        device_id = None
+        if torch.cuda.is_available():
+            device_id = torch.device("cuda", self.gpu_id)
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            device_id = torch.device("npu", self.gpu_id)
+            backend = "hccl"
+        else:
+            logger.error("Only support gpu or npu.")
+            raise ValueError("Only support gpu or npu.")
         try:
             self._weights_send_group[group_name] = init_custom_process_group(
                 backend=backend,
@@ -1211,7 +1220,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
+                device_id=device_id,
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
