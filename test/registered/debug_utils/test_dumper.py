@@ -685,12 +685,12 @@ class TestDumpGrad:
 
     def test_dump_grad_captures_step(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
-        d._step = 42
+        d._state.step = 42
         x = torch.randn(3, 3, requires_grad=True)
         y = (x * 2).sum()
 
         d.dump("id_test", x)
-        d._step = 999
+        d._state.step = 999
         y.backward()
 
         grad_file = _find_dump_file(tmp_path, name="grad__id_test")
@@ -934,9 +934,9 @@ class TestReset:
 
         d.reset()
 
-        assert d._dump_index == 0
-        assert d._step == 0
-        assert d._global_ctx == {}
+        assert d._state.dump_index == 0
+        assert d._state.step == 0
+        assert d._state.global_ctx == {}
 
     def test_dump_works_after_reset(self, tmp_path):
         d = _make_test_dumper(tmp_path)

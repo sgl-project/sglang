@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -188,17 +188,25 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
+    @dataclass
+    class _State:
+        dump_index: int = 0
+        step: int = 0
+        global_ctx: dict = field(default_factory=dict)
+        captured_output_data: Optional[dict] = None
+        cleanup_previous_handled: bool = True
+
     def __init__(self, *, config: _DumperConfig):
         self._config = config
+        self._state = self._fresh_state()
 
         self._http_server_handled = not config.enable_http_server
-        self._cleanup_previous_handled = not config.cleanup_previous
-
-        self._dump_index = 0
-        self._step = 0
-        self._global_ctx: dict = {}
-        self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
+
+    def _fresh_state(self) -> "_Dumper._State":
+        return self._State(
+            cleanup_previous_handled=not self._config.cleanup_previous,
+        )
 
     # ------------------------------- public :: core ---------------------------------
 
@@ -217,8 +225,8 @@ class _Dumper:
         # Users may want to `dump` only on some ranks, thus determine name here
         self._ensure_exp_name()
 
-        self._step += 1
-        print(f"[Dumper] [{time.time()}] step={self._step}")
+        self._state.step += 1
+        print(f"[Dumper] [{time.time()}] step={self._state.step}")
 
     def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
         self._dump_inner(
@@ -267,8 +275,8 @@ class _Dumper:
         ...
         dumper.set_ctx(layer_id=None)
         """
-        self._global_ctx = {
-            k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
+        self._state.global_ctx = {
+            k: v for k, v in (self._state.global_ctx | kwargs).items() if v is not None
         }
 
     def register_non_intrusive_dumper(
@@ -285,29 +293,29 @@ class _Dumper:
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
+        if "cleanup_previous" in kwargs:
+            self._state.cleanup_previous_handled = not self._config.cleanup_previous
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
 
     def reset(self) -> None:
-        self._dump_index = 0
-        self._step = 0
-        self._global_ctx = {}
+        self._state = self._fresh_state()
 
     @contextmanager
     def capture_output(self):
-        assert self._captured_output_data is None
-        self._captured_output_data = {}
+        assert self._state.captured_output_data is None
+        self._state.captured_output_data = {}
         try:
-            yield self._captured_output_data
+            yield self._state.captured_output_data
         finally:
-            self._captured_output_data = None
+            self._state.captured_output_data = None
 
     def get_state(self) -> dict:
         return {
             "config": asdict(self._config),
-            "dump_index": self._dump_index,
-            "step": self._step,
+            "dump_index": self._state.dump_index,
+            "step": self._state.step,
         }
 
     # ------------------------- public :: only used internally -----------------------------
@@ -353,7 +361,7 @@ class _Dumper:
         if not self._config.enable:
             return
 
-        tags = dict(name=name, **extra_kwargs, **self._global_ctx)
+        tags = dict(name=name, **extra_kwargs, **self._state.global_ctx)
         if (f := self._config.filter) is not None and re.search(
             f, _format_tags(tags)
         ) is None:
@@ -405,7 +413,7 @@ class _Dumper:
         if not tensor.requires_grad:
             return
 
-        captured_step = self._step
+        captured_step = self._state.step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -429,13 +437,13 @@ class _Dumper:
         step: Optional[int] = None,
     ) -> None:
         self._ensure_exp_name()
-        self._dump_index += 1
+        self._state.dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            step=(step if step is not None else self._step),
+            step=(step if step is not None else self._state.step),
             rank=rank,
-            dump_index=self._dump_index,
+            dump_index=self._state.dump_index,
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
@@ -452,7 +460,7 @@ class _Dumper:
                 f"sample_value={get_truncated_value(value)}"
             )
 
-        capturing = self._captured_output_data is not None
+        capturing = self._state.captured_output_data is not None
         if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value.data if isinstance(value, torch.nn.Parameter) else value,
@@ -461,10 +469,10 @@ class _Dumper:
 
             if capturing:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
-                self._captured_output_data[tags["name"]] = output_data
+                self._state.captured_output_data[tags["name"]] = output_data
             else:
-                if not self._cleanup_previous_handled:
-                    self._cleanup_previous_handled = True
+                if not self._state.cleanup_previous_handled:
+                    self._state.cleanup_previous_handled = True
                     _cleanup_old_dumps(
                         Path(self._config.dir), exp_name=self._config.exp_name
                     )
