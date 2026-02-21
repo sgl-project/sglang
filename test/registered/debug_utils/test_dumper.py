@@ -454,6 +454,13 @@ class TestDumperFileWriteControl:
         assert len(_get_filenames(tmpdir)) == 0
 
 
+class TestDumpEnableFlags:
+    def test_all_enables_false_no_output(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_value=False, enable_grad=False)
+        d.dump("should_skip", torch.randn(3, 3))
+        assert len(_get_filenames(tmp_path)) == 0
+
+
 class TestOutputControl:
     def test_file_enabled_by_default(self, tmp_path):
         d = _make_test_dumper(tmp_path)
