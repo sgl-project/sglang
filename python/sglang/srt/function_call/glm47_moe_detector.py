@@ -786,3 +786,10 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()

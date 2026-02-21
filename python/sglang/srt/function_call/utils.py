@@ -205,12 +205,14 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
 
     Args:
+        tools: List of available tools
         tool_choice: The tool choice specification
 
     Returns:
