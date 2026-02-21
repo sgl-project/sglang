@@ -250,7 +250,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
     def _do_uv_unwrap(self, batch: Req, server_args: ServerArgs) -> Req:
         import time
 
-        from sglang.multimodal_gen.runtime.models.mesh3d_utils import mesh_uv_wrap
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_uv_wrap
 
         mesh = batch.extra["shape_meshes"]
         if isinstance(mesh, list):
@@ -371,7 +371,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
     def _do_delight(self, batch: Req, server_args: ServerArgs) -> Req:
         from PIL import Image
 
-        from sglang.multimodal_gen.runtime.models.mesh3d_utils import recenter_image
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import recenter_image
 
         image = Image.open(batch.image_path)
         image = recenter_image(image)
@@ -398,7 +398,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         if self._renderer_loaded:
             return
 
-        from sglang.multimodal_gen.runtime.models.mesh3d_utils import MeshRender
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import MeshRender
 
         self._renderer = MeshRender(
             default_resolution=self.config.paint_render_size,

@@ -86,7 +86,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         except Exception:
             pass
 
-        from sglang.multimodal_gen.runtime.models.mesh3d_utils import (
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
             resolve_hunyuan3d_tool,
         )
 
