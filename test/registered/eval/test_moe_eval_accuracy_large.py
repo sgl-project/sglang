@@ -3,23 +3,26 @@ Usage:
 python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=500, suite="stage-b-test-large-2-gpu-accuracy")
+register_cuda_ci(est_time=500, suite="stage-b-test-large-2-gpu")
+register_amd_ci(est_time=500, suite="stage-b-test-large-2-gpu-amd")
 
 
 class TestMoEEvalAccuracyLarge(CustomTestCase):
@@ -27,6 +30,15 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MOE_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # Disable AITER for AMD CI to ensure consistent results
+        env = None
+        if is_in_amd_ci():
+            env = os.environ.copy()
+            env["SGLANG_USE_AITER"] = "0"
+            env["SGLANG_USE_AITER_AR"] = "0"
+            env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -37,6 +49,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
                 "--tp",
                 "2",
             ],
+            env=env,
         )
 
     @classmethod

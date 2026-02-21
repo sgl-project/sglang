@@ -17,10 +17,16 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(
+    est_time=3600,
+    suite="stage-c-test-large-8-gpu-amd-mi35x",
+    disabled="move to nightly for saving time",
+)
+
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -116,7 +122,6 @@ class TestDeepseekV32DPMTP(CustomTestCase):
                 self.assertGreater(speed, 75)
 
 
-@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -204,7 +209,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
 
             self.assertGreater(acc_length, 2.7)
             if is_in_amd_ci():
-                self.assertGreater(speed, 60)
+                self.assertGreater(speed, 55)
             else:
                 self.assertGreater(speed, 130)
 

@@ -18,6 +18,8 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.utils import get_device
+from sglang.test.test_utils import empty_gpu_cache
 
 
 def causal_conv1d_ref(
@@ -154,10 +156,8 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
 
-    device = "cuda"
+    device = get_device()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -193,10 +193,8 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 def test_causal_conv1d_update_with_batch_gather(
     batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
 
-    device = "cuda"
+    device = get_device()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -273,11 +271,9 @@ def test_causal_conv1d_update_with_batch_gather(
 def test_causal_conv1d_varlen(
     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
 
-    device = "cuda"
-    torch.cuda.empty_cache()
+    device = get_device()
+    empty_gpu_cache()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -336,7 +332,7 @@ def test_causal_conv1d_varlen(
         weight,
         bias=bias,
         conv_states=final_states,
-        query_start_loc=cumsum.cuda(),
+        query_start_loc=cumsum.to(get_device()),
         seq_lens_cpu=torch.tensor(seqlens[0]),
         cache_indices=padded_state_indices,
         has_initial_state=has_initial_states,

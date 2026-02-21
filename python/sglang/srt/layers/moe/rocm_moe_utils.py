@@ -5,6 +5,8 @@ from enum import IntEnum
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -114,3 +116,74 @@ def rocm_fused_experts_tkw1(
         )
     else:
         assert False, "This should not be called."
+
+
+@triton.jit
+def upscale_kernel(
+    A_ptr,  # *fp16 / *fp32
+    scale_ptr,  # *fp16 / *fp32
+    Out_ptr,  # *fp16 / *fp32
+    M,
+    N,
+    recv_token_num,
+    stride_am,
+    stride_an,
+    stride_sm,
+    stride_sn,
+    stride_om,
+    stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)  # row id
+    pid_n = tl.program_id(1)  # block id along N
+
+    recv_token_num_val = tl.load(recv_token_num)
+
+    if pid_m >= recv_token_num_val:
+        return
+
+    # column offsets
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs_n < N
+
+    # A[m, n]
+    a_ptrs = A_ptr + pid_m * stride_am + offs_n * stride_an
+    a = tl.load(a_ptrs, mask=mask, other=0.0)
+
+    # scale index: n // 128
+    scale_idx = offs_n // 128
+    s_ptrs = scale_ptr + pid_m * stride_sm + scale_idx * stride_sn
+    s = tl.load(s_ptrs, mask=mask, other=1.0)
+
+    out = a * s
+
+    out_ptrs = Out_ptr + pid_m * stride_om + offs_n * stride_on
+    tl.store(out_ptrs, out, mask=mask)
+
+
+def upscale(hidden_state, hidden_state_scale, recv_token_num, output_dtype):
+    M, N = hidden_state.shape
+
+    Out = torch.empty_like(hidden_state, dtype=output_dtype)
+
+    BLOCK_N = 256
+
+    grid = (M, triton.cdiv(N, BLOCK_N))
+
+    upscale_kernel[grid](
+        hidden_state,
+        hidden_state_scale,
+        Out,
+        M,
+        N,
+        recv_token_num,
+        hidden_state.stride(0),
+        hidden_state.stride(1),
+        hidden_state_scale.stride(0),
+        hidden_state_scale.stride(1),
+        Out.stride(0),
+        Out.stride(1),
+        BLOCK_N=BLOCK_N,
+    )
+
+    return Out

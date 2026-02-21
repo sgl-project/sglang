@@ -9,6 +9,10 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -54,13 +58,16 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
+    def insert(self, params: InsertParams) -> InsertResult:
+        # ChunkCache does not support prefix caching, so insert is a no-op
+        return InsertResult(prefix_len=0)
+
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -70,8 +77,8 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-    def evict(self, num_tokens: int):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()
 
     def inc_lock_ref(self, node: Any):
         return 0
@@ -90,11 +97,11 @@ class ChunkCache(BasePrefixCache):
 class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
-    def __init__(self, params: CacheInitParams, sliding_window_size: int):
+    def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
 
-        self.sliding_window_size = sliding_window_size
+        self.sliding_window_size = params.sliding_window_size
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:
@@ -103,5 +110,5 @@ class SWAChunkCache(ChunkCache):
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
 
-    def evict(self, num_tokens: int):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()
