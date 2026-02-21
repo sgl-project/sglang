@@ -1337,22 +1337,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        )
         self._cache_permute_indices = {}
 
     @property
-    def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
+    def enable_flashinfer_trtllm_moe(self) -> bool:
+        """For FP4, auto resolves to flashinfer_trtllm."""
+        backend = get_moe_runner_backend()
+        return backend.is_flashinfer_trtllm() or backend.is_auto()
 
+    @property
+    def enable_flashinfer_cutlass_moe(self) -> bool:
         """Access the global enable_flashinfer_cutlass_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
@@ -1583,7 +1582,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if self.enable_flashinfer_trtllm_moe:
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -1684,7 +1683,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        if moe_runner_backend.is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
