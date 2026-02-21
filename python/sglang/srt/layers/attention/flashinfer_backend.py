@@ -812,7 +812,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
