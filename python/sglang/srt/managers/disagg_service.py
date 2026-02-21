@@ -16,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 def start_disagg_service(
     server_args: ServerArgs,
 ):
-    # Start kv boostrap server on prefill
+    # Start kv bootstrap server on prefill
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 

@@ -39,6 +39,8 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -80,7 +82,23 @@ if _use_aiter and _is_gfx95_supported:
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
+
+# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+def apply_flashinfer_allreduce_fusion(batch_size: int):
+    return (
+        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
+        # Ref: https://github.com/sgl-project/sglang/issues/17237
+        (_is_sm90_supported or _is_sm100_supported)
+        and _is_flashinfer_available
+        and batch_size > 0
+        and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        and not is_dp_attention_enabled()
+        and get_global_server_args().enable_flashinfer_allreduce_fusion
+    )
 
 
 class ScatterMode(Enum):
@@ -371,10 +389,13 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
-        **kwargs,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ):
         hidden_states, residual = self.prepare_attn(
-            hidden_states, residual, forward_batch, **kwargs
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -394,7 +415,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
-        **kwargs,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -444,7 +465,7 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(hidden_states, **kwargs)
+                        hidden_states = self.input_layernorm(hidden_states)
                 else:
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
@@ -478,7 +499,7 @@ class LayerCommunicator:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
                             residual,
-                            **kwargs,
+                            post_residual_addition,
                         )
 
         hidden_states = self._communicate_simple_fn(
@@ -578,24 +599,11 @@ class LayerCommunicator:
             if hasattr(forward_batch, "input_ids")
             else 0
         )
-        if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
-            return False
-
-        static_conditions_met = (
-            (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-            and not is_dp_attention_enabled()
-            and get_global_server_args().enable_flashinfer_allreduce_fusion
-            and _is_flashinfer_available
-        )
-
-        if not static_conditions_met:
-            return False
 
         return (
-            batch_size > 0
-            and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+            apply_flashinfer_allreduce_fusion(batch_size)
             and (not self.is_last_layer)
+            and (self._context.tp_size > 1)
         )
 
 
@@ -605,6 +613,8 @@ class CommunicateContext:
     attn_tp_rank: int
     attn_tp_size: int
     attn_dp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     tp_size: int
     cache = None
     tp_rank: int
@@ -617,6 +627,8 @@ class CommunicateContext:
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
+        attn_cp_size = get_attention_cp_size()
+        attn_cp_rank = get_attention_cp_rank()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         process_group_sizes = {
@@ -630,6 +642,8 @@ class CommunicateContext:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
@@ -793,14 +807,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
-            # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-            # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-            if (
-                (_is_sm100_supported or _is_sm90_supported)
-                and _is_flashinfer_available
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and get_global_server_args().enable_flashinfer_allreduce_fusion
-                and hidden_states.shape[0] <= 2048
+            if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
+                layernorm, "forward_with_allreduce_fusion"
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual

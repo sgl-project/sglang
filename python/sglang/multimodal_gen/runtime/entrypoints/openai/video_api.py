@@ -27,10 +27,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
+    DEFAULT_FPS,
+    DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
+    build_sampling_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -44,63 +47,32 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 
-# NOTE(mick): the sampling params needs to be further adjusted
-# FIXME: duplicated with the one in `image_api.py`
-def _build_sampling_params_from_request(
-    request_id: str, request: VideoGenerationsRequest
-) -> SamplingParams:
-    if request.size is None:
-        width, height = None, None
-    else:
-        width, height = _parse_size(request.size)
-    seconds = request.seconds if request.seconds is not None else 4
-    fps_default = 24
-    fps = request.fps if request.fps is not None else fps_default
-    derived_num_frames = fps * seconds
-    num_frames = (
-        request.num_frames if request.num_frames is not None else derived_num_frames
+def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
+    """Resolve video-specific defaults (fps, seconds → num_frames) then
+    delegate to the shared build_sampling_params."""
+    seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
+    fps = request.fps if request.fps is not None else DEFAULT_FPS
+    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+
+    return build_sampling_params(
+        request_id,
+        prompt=request.prompt,
+        size=request.size,
+        num_frames=num_frames,
+        fps=fps,
+        image_path=request.input_reference,
+        output_file_name=request_id,
+        seed=request.seed,
+        generator_device=request.generator_device,
+        num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        guidance_scale_2=request.guidance_scale_2,
+        negative_prompt=request.negative_prompt,
+        enable_teacache=request.enable_teacache,
+        output_path=request.output_path,
+        output_compression=request.output_compression,
+        output_quality=request.output_quality,
     )
-
-    server_args = get_global_server_args()
-    sampling_kwargs = {
-        "request_id": request_id,
-        "prompt": request.prompt,
-        "num_frames": num_frames,
-        "fps": fps,
-        "width": width,
-        "height": height,
-        "image_path": request.input_reference,
-        "save_output": True,
-        "output_file_name": request_id,
-        "seed": request.seed,
-        "generator_device": request.generator_device,
-    }
-    if request.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = request.guidance_scale
-    if request.guidance_scale_2 is not None:
-        sampling_kwargs["guidance_scale_2"] = request.guidance_scale_2
-    if request.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = request.negative_prompt
-    if request.enable_teacache is not None:
-        sampling_kwargs["enable_teacache"] = request.enable_teacache
-    if request.output_path is not None:
-        sampling_kwargs["output_path"] = request.output_path
-    sampling_params = SamplingParams.from_user_sampling_params_args(
-        model_path=server_args.model_path,
-        server_args=server_args,
-        **sampling_kwargs,
-    )
-
-    if request.num_inference_steps is not None:
-        sampling_params.num_inference_steps = request.num_inference_steps
-    if request.guidance_scale is not None:
-        sampling_params.guidance_scale = request.guidance_scale
-    if request.seed is not None:
-        sampling_params.seed = request.seed
-
-    return sampling_params
 
 
 # extract metadata which http_server needs to know
@@ -123,15 +95,38 @@ def _video_job_from_sampling(
     }
 
 
+async def _save_first_input_image(image_sources, request_id: str) -> str | None:
+    """Save the first input image from a list of sources and return its path."""
+    image_list = merge_image_input_list(image_sources)
+    if not image_list:
+        return None
+    image = image_list[0]
+
+    uploads_dir = os.path.join("inputs", "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    filename = image.filename if hasattr(image, "filename") else "url_image"
+    target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+    return await save_image_to_path(image, target_path)
+
+
 async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        _, result = await process_generation_batch(async_scheduler_client, batch)
+        save_file_path_list, result = await process_generation_batch(
+            async_scheduler_client, batch
+        )
+        save_file_path = save_file_path_list[0]
+
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
+            "url": cloud_url,
+            "file_path": save_file_path if not cloud_url else None,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -164,28 +159,28 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    output_quality: Optional[str] = Form("default"),
+    output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
 
+    server_args = get_global_server_args()
+    task_type = server_args.pipeline_config.task_type
+
     if "multipart/form-data" in content_type:
         if not prompt:
             raise HTTPException(status_code=400, detail="prompt is required")
-        if input_reference is None and reference_url is None:
+        # Validate image input based on model task type
+        image_sources = merge_image_input_list(input_reference, reference_url)
+        if task_type.requires_image_input() and not image_sources:
             raise HTTPException(
                 status_code=400,
-                detail="input_reference file or reference_url is required",
+                detail="input_reference or reference_url is required for image-to-video generation",
             )
-        image_list = merge_image_input_list(input_reference, reference_url)
-        # Save first input image
-        image = image_list[0]
-        uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
-        filename = image.filename if hasattr(image, "filename") else f"url_image"
-        input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
         try:
-            input_path = await save_image_to_path(image, input_path)
+            input_path = await _save_first_input_image(image_sources, request_id)
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Failed to process image source: {str(e)}"
@@ -217,6 +212,8 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            output_compression=output_compression,
+            output_quality=output_quality,
             **(
                 {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
             ),
@@ -237,19 +234,21 @@ async def create_video(
             extra_json = payload.pop("extra_json", None)
             if isinstance(extra_json, dict):
                 payload.update(extra_json)
-            # for not multipart/form-data type
-            if payload.get("reference_url"):
-                image_list = merge_image_input_list(payload.get("reference_url"))
-                # Save first input image
-                image = image_list[0]
-                uploads_dir = os.path.join("outputs", "uploads")
-                os.makedirs(uploads_dir, exist_ok=True)
-                filename = (
-                    image.filename if hasattr(image, "filename") else f"url_image"
+            # Validate image input based on model task type
+            has_image_input = payload.get("reference_url") or payload.get(
+                "input_reference"
+            )
+            if task_type.requires_image_input() and not has_image_input:
+                raise HTTPException(
+                    status_code=400,
+                    detail="input_reference or reference_url is required for image-to-video generation",
                 )
-                input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
+            # for non-multipart/form-data type
+            if payload.get("reference_url"):
                 try:
-                    input_path = await save_image_to_path(image, input_path)
+                    input_path = await _save_first_input_image(
+                        payload.get("reference_url"), request_id
+                    )
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,
@@ -262,13 +261,13 @@ async def create_video(
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
-    sampling_params = _build_sampling_params_from_request(request_id, req)
+    sampling_params = _build_video_sampling_params(request_id, req)
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
     batch = prepare_request(
-        server_args=get_global_server_args(),
+        server_args=server_args,
         sampling_params=sampling_params,
     )
     # Add diffusers_kwargs if provided
@@ -333,6 +332,12 @@ async def download_video_content(
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if job.get("url"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+        )
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):

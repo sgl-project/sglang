@@ -8,7 +8,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=1, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=6, suite="stage-b-test-small-1-gpu-5090")
 register_amd_ci(est_time=2, suite="stage-b-test-small-1-gpu-amd")
 
 
@@ -77,6 +76,7 @@ class TestPrefillAdder(CustomTestCase):
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.finished.return_value = False
         return req
 
     def create_adder(self, running_batch):

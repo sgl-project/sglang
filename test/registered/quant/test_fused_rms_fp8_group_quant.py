@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-a-test-1")
+register_amd_ci(est_time=10, suite="stage-a-test-1-amd")
 
 
 def _fp8_available() -> bool:

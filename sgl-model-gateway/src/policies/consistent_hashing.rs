@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rand::Rng as _;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
@@ -167,8 +168,13 @@ impl ConsistentHashingPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for ConsistentHashingPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         Metrics::record_worker_consistent_hashing_policy_branch(branch.as_str());
         result
@@ -214,8 +220,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_consistent_routing() {
+    #[tokio::test]
+    async fn test_consistent_routing() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -236,8 +242,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_different_keys_distribute() {
+    #[tokio::test]
+    async fn test_different_keys_distribute() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -255,8 +261,8 @@ mod tests {
         assert!(distribution.len() > 1, "Should distribute across workers");
     }
 
-    #[test]
-    fn test_target_worker_hit() {
+    #[tokio::test]
+    async fn test_target_worker_hit() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -271,8 +277,8 @@ mod tests {
         assert_eq!(branch, Branch::TargetWorkerHit);
     }
 
-    #[test]
-    fn test_target_worker_miss_out_of_bounds() {
+    #[tokio::test]
+    async fn test_target_worker_miss_out_of_bounds() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -287,8 +293,8 @@ mod tests {
         assert_eq!(branch, Branch::TargetWorkerMiss);
     }
 
-    #[test]
-    fn test_target_worker_miss_unhealthy() {
+    #[tokio::test]
+    async fn test_target_worker_miss_unhealthy() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         workers[1].set_healthy(false);
@@ -304,8 +310,8 @@ mod tests {
         assert_eq!(branch, Branch::TargetWorkerMiss);
     }
 
-    #[test]
-    fn test_target_worker_priority_over_routing_key() {
+    #[tokio::test]
+    async fn test_target_worker_priority_over_routing_key() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -323,8 +329,8 @@ mod tests {
         assert_eq!(branch, Branch::TargetWorkerHit);
     }
 
-    #[test]
-    fn test_fallback_random_distribution() {
+    #[tokio::test]
+    async fn test_fallback_random_distribution() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
@@ -345,8 +351,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_no_healthy_workers() {
+    #[tokio::test]
+    async fn test_no_healthy_workers() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000"]);
         workers[0].set_healthy(false);
@@ -362,8 +368,8 @@ mod tests {
         assert_eq!(branch, Branch::NoHealthyWorkers);
     }
 
-    #[test]
-    fn test_empty_workers() {
+    #[tokio::test]
+    async fn test_empty_workers() {
         let policy = ConsistentHashingPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![];
 
@@ -373,8 +379,8 @@ mod tests {
         assert_eq!(branch, Branch::NoHealthyWorkers);
     }
 
-    #[test]
-    fn test_consistent_hash_minimal_redistribution() {
+    #[tokio::test]
+    async fn test_consistent_hash_minimal_redistribution() {
         // Test that consistent hashing moves fewer keys than random redistribution
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&[
@@ -439,8 +445,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_routing_key_failover_and_recovery() {
+    #[tokio::test]
+    async fn test_routing_key_failover_and_recovery() {
         // Test that when a worker fails, keys move to another worker,
         // and when it recovers, keys return to the original worker
         let policy = ConsistentHashingPolicy::new();
@@ -491,8 +497,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_empty_routing_key_uses_fallback() {
+    #[tokio::test]
+    async fn test_empty_routing_key_uses_fallback() {
         let policy = ConsistentHashingPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
@@ -507,8 +513,8 @@ mod tests {
         assert_eq!(branch, Branch::RandomFallback);
     }
 
-    #[test]
-    fn test_policy_name() {
+    #[tokio::test]
+    async fn test_policy_name() {
         let policy = ConsistentHashingPolicy::new();
         assert_eq!(policy.name(), "consistent_hashing");
     }

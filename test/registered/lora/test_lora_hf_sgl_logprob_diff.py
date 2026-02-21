@@ -34,20 +34,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(
     est_time=150,
     suite="stage-b-test-small-1-gpu",
 )
-register_cuda_ci(
-    est_time=76,
-    suite="stage-b-test-small-1-gpu-5090",
+register_amd_ci(
+    est_time=250,
+    suite="stage-b-test-small-1-gpu-amd",
 )
-
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
-
 # Test configuration constants
 LORA_BACKEND = "triton"
 DISABLE_CUDA_GRAPH = False

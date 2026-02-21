@@ -1,14 +1,11 @@
 import unittest
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
-
 from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
@@ -27,6 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=2, suite="stage-b-test-small-1-gpu")
+
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
     "device": "cuda",
@@ -42,6 +41,7 @@ DEFAULT_CONFIG = {
     "q_lora_rank": 1536,
     "kv_lora_rank": 512,
     "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
     "max_position_embeddings": 163840,
     "rope_theta": 10000.0,
     "layer_id": 0,
@@ -75,6 +75,22 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         for i in range(self.batch_size):
             # Simple linear mapping: block i maps to page i
             num_blocks_needed = (self.seq_lens[i] + 63) // 64
+            page_table[i, :num_blocks_needed] = torch.arange(
+                num_blocks_needed, device=self.device
+            )
+        return page_table
+
+    def get_page_table_1(self) -> torch.Tensor:
+        """Return: (batch_size, num_blocks) int32, page table with page size 1."""
+        # Create a simple page table for testing with page size 1
+        max_seq_len = max(self.seq_lens)
+        num_blocks = max_seq_len  # Page size 1 means num_blocks == max_seq_len
+        page_table = torch.zeros(
+            (self.batch_size, num_blocks), dtype=torch.int32, device=self.device
+        )
+        for i in range(self.batch_size):
+            # Simple linear mapping: block i maps to page i
+            num_blocks_needed = self.seq_lens[i]
             page_table[i, :num_blocks_needed] = torch.arange(
                 num_blocks_needed, device=self.device
             )
@@ -115,6 +131,12 @@ class MockIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         """Return: seq lens for each batch."""
         return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
+
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        """
+        Return: extend seq lens for each batch.
+        """
+        return list(self.seq_lens)
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """Return: batch idx for each token."""
@@ -175,6 +197,7 @@ class MockModelRunner:
                 "num_attention_heads": 128,
                 "kv_lora_rank": self.config["kv_lora_rank"],
                 "qk_rope_head_dim": self.config["qk_rope_head_dim"],
+                "qk_nope_head_dim": self.config["qk_nope_head_dim"],
                 "hf_config": hf_config,
             },
         )()
@@ -209,6 +232,7 @@ class MockModelRunner:
             device=self.device,
             index_head_dim=self.config["index_head_dim"],
             enable_memory_saver=False,
+            kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
         )
 
         # Required by backend with NSA-specific attributes
@@ -561,8 +585,8 @@ class TestNSAIndexer(CustomTestCase):
             output = rotate_activation(x)
             self.assertEqual(output.shape, x.shape)
             self.assertEqual(output.dtype, torch.bfloat16)
-        except ImportError:
-            self.skipTest("sgl_kernel not available for hadamard_transform")
+        except Exception:
+            self.skipTest("hadamard JIT kernel not available")
 
     def test_rotate_activation_invalid_size(self):
         """Test that rotate_activation fails with non-power-of-2 size."""

@@ -115,6 +115,8 @@ class LoRAMemoryPool:
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
             target_module_names = get_normalized_target_modules(config.target_modules)
+            if "all" in target_module_names:
+                return True
             return target_module_names.issubset(self.target_modules)
 
         if isinstance(config, LoRAConfig):
@@ -391,7 +393,7 @@ class LoRAMemoryPool:
                 assert (
                     buffer_view.shape == weight.shape
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
-                buffer_view.copy_(weight)
+                buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
             for i in range(self.num_layer):

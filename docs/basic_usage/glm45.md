@@ -6,11 +6,6 @@ To serve GLM-4.5 / GLM-4.6 FP8 models on 8xH100/H200 GPUs:
 python3 -m sglang.launch_server --model zai-org/GLM-4.6-FP8 --tp 8
 ```
 
-### Configuration Tips
-
-- `--max-mamba-cache-size`: Adjust `--max-mamba-cache-size` to increase mamba cache space and max running requests
-  capability. It will decrease KV cache space as a trade-off. You can adjust it according to workload.
-
 ### EAGLE Speculative Decoding
 
 **Description**: SGLang has supported GLM-4.5 / GLM-4.6 models
@@ -35,9 +30,12 @@ python3 -m sglang.launch_server \
   --enable-custom-logit-processor
 ```
 
-**Note**: For GLM-4.7, `--tool-call-parser` should be set to `glm47`, for GLM-4.5 and GLM-4.6, it should be set to `glm45`.
+```{tip}
+To enable the experimental overlap scheduler for EAGLE speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+```
 
-### Thinking Budget
+### Thinking Budget for GLM-4.5 / GLM-4.6
+**Note**: For GLM-4.7, `--tool-call-parser` should be set to `glm47`, for GLM-4.5 and GLM-4.6, it should be set to `glm45`.
 
 In SGLang, we can implement thinking budget with `CustomLogitProcessor`.
 

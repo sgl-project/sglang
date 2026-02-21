@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
+
 from __future__ import annotations
 
 import asyncio
@@ -530,7 +531,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
