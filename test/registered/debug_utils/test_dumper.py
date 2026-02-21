@@ -310,16 +310,10 @@ class TestMapTensor:
         assert result["b"] is not t2
         assert result["meta"] == "not a tensor"
 
-    def test_dict_no_change_returns_same_object(self):
-        t = torch.randn(3)
-        value = {"value": t, "meta": {}}
-        result = _map_tensor(value, lambda x: x)
-        assert result is value
-
     def test_dict_no_tensors(self):
         value = {"a": 1, "b": "hello"}
         result = _map_tensor(value, lambda x: x.clone())
-        assert result is value
+        assert result == value
 
     def test_nested_dict(self):
         inner_t = torch.randn(3)

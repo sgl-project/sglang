@@ -628,15 +628,9 @@ def _torch_save(value, path: str):
 def _map_tensor(
     value, fn: Callable[[torch.Tensor], torch.Tensor]
 ):
+    """Apply *fn* to every tensor in *value*, recursing into dicts."""
     if isinstance(value, dict):
-        result = value
-        for k, v in value.items():
-            mapped = _map_tensor(v, fn)
-            if mapped is not v:
-                if result is value:
-                    result = {**value}
-                result[k] = mapped
-        return result
+        return {k: _map_tensor(v, fn) for k, v in value.items()}
     if isinstance(value, torch.Tensor):
         return fn(value)
     return value
