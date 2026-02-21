@@ -199,13 +199,10 @@ class _Dumper:
 
     def __init__(self, *, config: _DumperConfig):
         self._config = config
-        self._state = self._fresh_state()
+        self._state = _DumperState()
 
         self._http_server_handled = not config.enable_http_server
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
-
-    def _fresh_state(self) -> _DumperState:
-        return _DumperState()
 
     # ------------------------------- public :: core ---------------------------------
 
@@ -297,7 +294,7 @@ class _Dumper:
         self._config = self._config.with_defaults(**kwargs)
 
     def reset(self) -> None:
-        self._state = self._fresh_state()
+        self._state = _DumperState()
 
     @contextmanager
     def capture_output(self):
