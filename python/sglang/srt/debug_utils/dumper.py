@@ -167,57 +167,6 @@ class _DumperState:
     cleanup_previous_handled: bool = False
 
 
-class _DumperHttpManager:
-    def __init__(self, dumper: "_Dumper"):
-        self._dumper = dumper
-        config = dumper._config
-        http_port = config.server_port_parsed
-
-        rpc_broadcast = _create_zmq_rpc_broadcast(
-            self,
-            timeout_seconds=config.collective_timeout,
-        )
-
-        if _get_rank() == 0:
-            assert rpc_broadcast is not None
-            self._rpc_broadcast = rpc_broadcast
-
-            if http_port == "reuse":
-                print(
-                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
-                )
-            else:
-                _start_http_server(
-                    prefix="/dumper/", target=self, http_port=http_port
-                )
-                print(f"[Dumper] HTTP server started on port {http_port}")
-
-    # ------------------------------- public ---------------------------------
-
-    def handle_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_request_inner(
-            method=method, body=body
-        )
-
-    # ------------------------------- private ---------------------------------
-
-    def _handle_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self._dumper.get_state()
-        elif method == "configure":
-            self._dumper.configure(**body)
-            return {}
-        elif method == "reset":
-            self._dumper.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
-
-
 class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
 
@@ -796,6 +745,60 @@ def _compute_static_meta():
             result[f"{plugin.name}_parallel_info"] = info
 
     return result
+
+
+# -------------------------------------- http manager ------------------------------------------
+
+
+class _DumperHttpManager:
+    def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
+        config = dumper._config
+        http_port = config.server_port_parsed
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            self,
+            timeout_seconds=config.collective_timeout,
+        )
+
+        if _get_rank() == 0:
+            assert rpc_broadcast is not None
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port == "reuse":
+                print(
+                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
+                )
+            else:
+                _start_http_server(
+                    prefix="/dumper/", target=self, http_port=http_port
+                )
+                print(f"[Dumper] HTTP server started on port {http_port}")
+
+    # ------------------------------- public ---------------------------------
+
+    def handle_request(
+        self, *, method: str, body: dict[str, Any]
+    ) -> list[dict]:
+        return self._rpc_broadcast._handle_request_inner(
+            method=method, body=body
+        )
+
+    # ------------------------------- private ---------------------------------
+
+    def _handle_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self._dumper.get_state()
+        elif method == "configure":
+            self._dumper.configure(**body)
+            return {}
+        elif method == "reset":
+            self._dumper.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
 
 # -------------------------------------- http control server ------------------------------------------
