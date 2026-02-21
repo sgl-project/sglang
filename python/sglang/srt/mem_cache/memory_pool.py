@@ -262,8 +262,8 @@ class MambaPool:
                 device=device,
             )
             # For FlashInfer GDN backend, make the pool K-contiguous so that
-            # .transpose(-2,-1) yields a standard C-contiguous VK view directly
-            # compatible with gated_delta_rule_mtp (PRETRANSPOSE convention).
+            # gather + .transpose(-2,-1) yields a C-contiguous [B, HV, V, K]
+            # view directly compatible with gated_delta_rule_decode_pretranspose.
             from sglang.srt.server_args import get_global_server_args
 
             _use_flashinfer_gdn = (
@@ -271,11 +271,6 @@ class MambaPool:
                 and get_global_server_args().gdn_backend == "flashinfer"
             )
             if _use_flashinfer_gdn:
-                if ssm_dtype != torch.float32:
-                    raise RuntimeError(
-                        f"gdn_backend=flashinfer requires float32 SSM state "
-                        f"(--mamba-ssm-dtype float32), got {ssm_dtype}"
-                    )
                 temporal_state = (
                     temporal_state.transpose(-2, -1).contiguous().transpose(-2, -1)
                 )

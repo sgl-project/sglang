@@ -915,9 +915,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # a, b: [B, HV] → [B, 1, HV]
             a_fi = a.unsqueeze(1)
             b_fi = b.unsqueeze(1)
-            # FI-VK-BF16: gated_delta_rule_decode_pretranspose has no pool
-            # support → gather [B, HV, V, K] before call, scatter after.
-            state = ssm_states[cache_indices].contiguous()
+            # Pool layout: [pool, HV, K, V] K-contiguous (K stride=1).
+            # gated_delta_rule_decode_pretranspose expects [B, HV, V, K] K-last,
+            # so gather then transpose to get the right layout.  Scatter back
+            # via transpose so the pool stays K-contiguous.
+            state = ssm_states[cache_indices].transpose(-2, -1)
             core_attn_out, state = self._flashinfer_pretranspose(
                 q=query,
                 k=key,
@@ -929,7 +931,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b_fi,
                 use_qk_l2norm=True,
             )
-            ssm_states[cache_indices] = state
+            ssm_states[cache_indices] = state.transpose(-2, -1)
         else:
             # Reshape from [bs, h*d] to [1, bs, h, d]
             query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
