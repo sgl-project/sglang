@@ -168,10 +168,6 @@ class _Dumper:
 
     # ------------------------------- public :: core ---------------------------------
 
-    @property
-    def may_enable(self) -> bool:
-        return self._config.enable or self._config.server_port_parsed is not None
-
     def step(self):
         """This should be called on all ranks at the end of each iteration."""
 
@@ -241,7 +237,6 @@ class _Dumper:
         self,
         model: "torch.nn.Module",
     ) -> Optional["_NonIntrusiveDumper"]:
-        self._ensure_http_server()
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None

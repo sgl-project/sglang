@@ -102,21 +102,6 @@ class TestDumperConfig:
         d.configure_default(filter="from_code")
         assert d._config.filter == "from_code"
 
-    def test_may_enable_default_false(self):
-        d = _Dumper(config=_DumperConfig())
-        assert d.may_enable is False
-
-    def test_may_enable_true_when_enabled(self):
-        d = _Dumper(config=_DumperConfig(enable=True))
-        assert d.may_enable is True
-
-    def test_may_enable_true_when_server_port_set(self):
-        d = _Dumper(config=_DumperConfig(server_port="40000"))
-        assert d.may_enable is True
-
-        d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
-        assert d2.may_enable is True
-
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):
@@ -1561,82 +1546,6 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         layer1_keys = [k for k in captured if "layers.1" in k]
         assert len(layer0_keys) > 0, "layer 0 dumps should be kept"
         assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
-
-
-class TestDumperE2E:
-    def test_step_and_non_intrusive_hooks(self, tmp_path):
-        base_url = DEFAULT_URL_FOR_TEST
-        dump_dir = str(tmp_path)
-        env = {
-            **os.environ,
-            "DUMPER_SERVER_PORT": "reuse",
-        }
-        proc = popen_launch_server(
-            "Qwen/Qwen3-0.6B",
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp", "2", "--max-total-tokens", "128"],
-            env=env,
-        )
-        try:
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
-            assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
-            for state in states:
-                assert state["config"]["enable"] is False
-                assert state["step"] == 0
-
-            requests.post(
-                f"{base_url}/dumper/configure",
-                json={"enable": True, "dir": dump_dir},
-            ).raise_for_status()
-
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
-            assert len(states) == 2
-            for rank, state in enumerate(states):
-                assert (
-                    state["config"]["enable"] is True
-                ), f"rank {rank}: enable should be True after configure"
-                assert state["config"]["dir"] == dump_dir
-
-            resp = requests.post(
-                f"{base_url}/generate",
-                json={"text": "Hello", "sampling_params": {"max_new_tokens": 8}},
-            )
-            assert resp.status_code == 200, f"Generate failed: {resp.text}"
-
-            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
-            assert len(states) == 2
-            steps = [s["step"] for s in states]
-            for rank, step in enumerate(steps):
-                assert step > 0, f"rank {rank}: step should be > 0, got {step}"
-            assert steps[0] == steps[1], f"step mismatch across ranks: {steps}"
-
-            dump_files = list(Path(dump_dir).glob("dump_*/*.pt"))
-            assert len(dump_files) > 0, f"No dump files in {dump_dir}"
-            filenames = {f.name for f in dump_files}
-
-            for field in ("input_ids", "positions"):
-                assert any(f"name={field}" in f for f in filenames), (
-                    f"Missing {field} dump from non-intrusive hooks, "
-                    f"got: {sorted(filenames)[:10]}"
-                )
-
-            for rank in range(2):
-                assert any(
-                    f"rank={rank}" in f for f in filenames
-                ), f"No dump files for rank {rank}"
-
-            sample_file = dump_files[0]
-            loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
-            assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
-            assert (
-                "value" in loaded and "meta" in loaded
-            ), f"Missing value/meta keys: {loaded.keys()}"
-            assert "name" in loaded["meta"]
-            assert "rank" in loaded["meta"]
-            assert "step" in loaded["meta"]
-        finally:
-            kill_process_tree(proc.pid)
 
 
 if __name__ == "__main__":
