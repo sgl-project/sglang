@@ -321,6 +321,16 @@ class TestMapTensor:
         result = _map_tensor(value, lambda x: x.clone())
         assert result is value
 
+    def test_nested_dict(self):
+        inner_t = torch.randn(3)
+        value = {"outer": {"inner": inner_t, "label": "ok"}, "top": torch.randn(2)}
+        result = _map_tensor(value, lambda x: x.clone())
+        assert torch.equal(result["outer"]["inner"], inner_t)
+        assert result["outer"]["inner"] is not inner_t
+        assert result["outer"]["label"] == "ok"
+        assert result is not value
+        assert result["outer"] is not value["outer"]
+
     def test_non_tensor_non_dict(self):
         result = _map_tensor(42, lambda x: x.clone())
         assert result == 42
