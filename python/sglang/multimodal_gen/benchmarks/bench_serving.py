@@ -7,6 +7,9 @@ Usage:
 
     # T2V or T2I or any other multimodal generation model
     sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    # With profiling:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task image-to-image --num-prompts 5 --profile
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -50,6 +53,8 @@ class RequestFuncInput:
     height: Optional[int] = None
     num_frames: Optional[int] = None
     fps: Optional[int] = None
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     extra_body: Dict[str, Any] = field(default_factory=dict)
     image_paths: Optional[List[str]] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -309,6 +314,8 @@ class VBenchDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
+            num_inference_steps=self.args.num_inference_steps,
+            guidance_scale=self.args.guidance_scale,
             image_paths=image_paths,
         )
 
@@ -360,8 +367,17 @@ async def async_request_image_sglang(
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
 
-        # Merge extra parameters
-        for key, value in input.extra_body.items():
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
+        if input.guidance_scale is not None:
+            data.add_field("guidance_scale", str(input.guidance_scale))
+
+        # Add profiling and other extra parameters
+        extra_params = input.extra_body.copy()
+        if extra_params.pop("profile", None):
+            data.add_field("profile", "true")
+        for key, value in extra_params.items():
             data.add_field(key, str(value))
 
         # Add image file(s)
@@ -405,6 +421,12 @@ async def async_request_image_sglang(
 
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
+
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            payload["num_inference_steps"] = input.num_inference_steps
+        if input.guidance_scale is not None:
+            payload["guidance_scale"] = input.guidance_scale
 
         # Merge extra parameters
         payload.update(input.extra_body)
@@ -630,6 +652,46 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
         time.sleep(1)
 
 
+@dataclass
+class ProfileReqOutput:
+    """Output for profile request."""
+
+    success: bool = False
+    message: str = ""
+    error: str = ""
+
+
+async def async_request_profile(
+    api_url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> ProfileReqOutput:
+    """Send a profile start/stop request to the server."""
+    output = ProfileReqOutput()
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(api_url) as response:
+            response_text = await response.text()
+            if response.status == 200:
+                output.success = True
+                output.message = response_text.strip()
+            else:
+                output.success = False
+                output.error = f"HTTP {response.status}: {response_text}"
+    except Exception as e:
+        output.success = False
+        output.error = str(e)
+    finally:
+        if close_session:
+            await session.close()
+
+    return output
+
+
 async def benchmark(args):
     from huggingface_hub import model_info
 
@@ -720,6 +782,47 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
+    # Warmup: run a few requests before profiling to stabilize performance
+    warmup_requests = args.warmup_requests
+    if warmup_requests > 0:
+        logger.info(f"Starting warmup with {warmup_requests} request(s)...")
+        warmup_reqs = requests_list[:warmup_requests]
+        warmup_pbar = tqdm(
+            total=len(warmup_reqs),
+            desc="Warmup",
+            disable=args.disable_tqdm,
+        )
+        async with aiohttp.ClientSession() as warmup_session:
+            warmup_tasks = [
+                asyncio.create_task(
+                    limited_request_func(req, warmup_session, warmup_pbar)
+                )
+                for req in warmup_reqs
+            ]
+            warmup_outputs = await asyncio.gather(*warmup_tasks)
+        warmup_pbar.close()
+
+        # Verify at least one warmup request succeeded
+        if not any(out.success for out in warmup_outputs):
+            raise ValueError(
+                "Warmup failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {warmup_outputs[0].error}"
+            )
+        logger.info(
+            f"Warmup completed with {len(warmup_reqs)} request(s). "
+            "Starting main benchmark run..."
+        )
+
+    # Start profiler if --profile is enabled (after warmup)
+    if args.profile:
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/start_profile"
+        )
+        if profile_output.success:
+            logger.info(f"Profiler started: {profile_output.message}")
+        else:
+            logger.warning(f"Failed to start profiler: {profile_output.error}")
+
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
@@ -739,6 +842,17 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
     pbar.close()
+
+    # Stop profiler if it was started
+    if args.profile:
+        logger.info("Stopping profiler and saving traces...")
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/stop_profile"
+        )
+        if profile_output.success:
+            logger.info(f"Profiler stopped: {profile_output.message}")
+        else:
+            logger.warning(f"Failed to stop profiler: {profile_output.error}")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration)
@@ -879,10 +993,35 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of denoising steps",
+    )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale",
+    )
+    parser.add_argument(
         "--output-file", type=str, default=None, help="Output JSON file for metrics."
     )
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before the benchmark. "
+        "Default is 1 (warmup request).",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable full pipeline profiling. "
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
     )
     parser.add_argument(
         "--log-level",

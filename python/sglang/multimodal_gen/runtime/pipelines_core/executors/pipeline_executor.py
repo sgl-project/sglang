@@ -52,8 +52,8 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-
-        with self.profile_execution(batch, dump_rank=0):
+        # dump_rank=None means all ranks will save their own trace files
+        with self.profile_execution(batch, dump_rank=None):
             batch = self.execute(stages, batch, server_args)
 
         return batch
