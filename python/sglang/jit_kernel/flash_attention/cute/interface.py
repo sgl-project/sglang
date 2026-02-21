@@ -378,7 +378,7 @@ def _flash_attn_fwd(
         cu_seqlens_k is None,
         seqused_q is None,
         seqused_k is None,
-        page_table is not None,
+        page_table is not None, page_size,
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
@@ -428,7 +428,7 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
         if compute_capability == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
+            assert page_size is None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
@@ -450,6 +450,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
+                page_size=page_size,
             )
         elif compute_capability in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
