@@ -9,16 +9,9 @@ from sglang.benchmark.datasets.common import (
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
     DatasetRow,
+    compute_random_lens,
 )
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
-
-
-def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
-    return np.random.randint(
-        max(int(full_len * range_ratio), 1),
-        full_len + 1,
-        size=num,
-    ).tolist()
 
 
 def sample_random_requests(

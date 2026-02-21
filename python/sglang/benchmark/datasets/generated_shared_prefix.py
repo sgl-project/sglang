@@ -3,7 +3,6 @@ import pickle
 import random
 import uuid
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import List
 
@@ -11,30 +10,7 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import DatasetRow
-from sglang.benchmark.datasets.random import compute_random_lens
-
-
-@lru_cache(maxsize=1)
-def get_available_tokens(tokenizer):
-    """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
-
-
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = get_available_tokens(tokenizer)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def gen_mm_prompt(tokenizer, image_pad_id, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
+from sglang.benchmark.datasets.common import DatasetRow, compute_random_lens, gen_prompt
 
 
 def get_gen_prefix_cache_path(args, tokenizer):

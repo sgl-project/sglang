@@ -1,5 +1,9 @@
+import random
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 ASSISTANT_SUFFIX = "Assistant:"
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -31,3 +35,33 @@ class DatasetRow:
             self.vision_prompt_len = 0
         if self.extra_request_body is None:
             self.extra_request_body = {}
+
+
+def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
+    return np.random.randint(
+        max(int(full_len * range_ratio), 1),
+        full_len + 1,
+        size=num,
+    ).tolist()
+
+
+@lru_cache(maxsize=1)
+def get_available_tokens(tokenizer):
+    """Get all available token ids from the tokenizer vocabulary."""
+    return list(tokenizer.get_vocab().values())
+
+
+def gen_prompt(tokenizer, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)

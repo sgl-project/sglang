@@ -7,12 +7,13 @@ from sglang.benchmark.datasets.common import (
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
     DatasetRow,
-)
-from sglang.benchmark.datasets.custom import sample_custom_requests
-from sglang.benchmark.datasets.generated_shared_prefix import (
+    compute_random_lens,
     gen_mm_prompt,
     gen_prompt,
     get_available_tokens,
+)
+from sglang.benchmark.datasets.custom import sample_custom_requests
+from sglang.benchmark.datasets.generated_shared_prefix import (
     get_gen_prefix_cache_path,
     sample_generated_shared_prefix_requests,
 )
@@ -24,7 +25,7 @@ from sglang.benchmark.datasets.image import (
 from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
-from sglang.benchmark.datasets.random import compute_random_lens, sample_random_requests
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.benchmark.utils import download_and_cache_file, get_processor
 
