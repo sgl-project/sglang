@@ -20,6 +20,7 @@ if _is_cuda:
         scaled_fp4_experts_quant,
         shuffle_rows,
         silu_and_mul,
+        silu_and_mul_scaled_fp4_experts_quant_packed,
     )
 
 
@@ -465,19 +466,15 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
-    intermediate = torch.empty(
-        (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
-    )
-    silu_and_mul(c1, intermediate)
-
-    int_fp4, int_blockscale = scaled_fp4_experts_quant(
-        intermediate,
+    # fused: SiLU + mul then FP4 quant (expert-packed)
+    int_fp4, int_blockscale = silu_and_mul_scaled_fp4_experts_quant_packed(
+        c1,
         a2_gscale,
         params.expert_offsets,
         params.blockscale_offsets,
         num_topk,
     )
+
     c2 = cutlass_fp4_group_mm(
         int_fp4,
         w2_fp4,

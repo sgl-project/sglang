@@ -62,6 +62,7 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
     shuffle_rows,
+    silu_and_mul_scaled_fp4_experts_quant_packed,
     silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
