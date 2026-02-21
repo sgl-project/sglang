@@ -1218,6 +1218,13 @@ class TestDumperHttp:
         )
         assert resp.status_code == 400
 
+    def test_error_unknown_method(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/nonexistent",
+            json={},
+        )
+        assert resp.status_code == 400
+
     def test_error_wrong_type(self, dumper_http_url: str):
         resp = requests.post(
             f"{dumper_http_url}/dumper/configure",
