@@ -11,6 +11,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "param.h"
@@ -18,40 +19,59 @@
 
 namespace ngram {
 
-struct TrieNode {
-  std::unordered_map<int32_t, TrieNode*> child;
-  std::list<TrieNode*>::const_iterator global_lru_pos;
-  std::list<TrieNode*>::const_iterator parent_lru_pos;
-  int32_t token;
-  TrieNode* parent;
-  std::list<TrieNode*> lru;
-  int32_t freq = 0;
+struct SAMNode;
 
-  struct CompareByFreq {
-    bool operator()(TrieNode* a, TrieNode* b) const {
-      return std::tie(b->freq, a->token, a) < std::tie(a->freq, b->token, b);
+struct Transition {
+  SAMNode* target;
+  int32_t freq;
+  std::list<int32_t>::iterator lru_it;
+};
+
+struct SAMNode {
+  struct PairComparator {
+    bool operator()(const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) const {
+      if (a.first != b.first) return a.first > b.first;
+      return a.second < b.second;
     }
   };
-  std::multiset<TrieNode*, CompareByFreq> sorted_children;
+
+  std::unordered_map<int32_t, Transition> next;
+  int32_t token;
+  std::list<int32_t> lru;
+
+  SAMNode* fail = nullptr;
+  int32_t len = 0;
+
+  std::set<std::pair<int32_t, int32_t>, PairComparator> sorted_children;
+
+  SAMNode() : sorted_children(PairComparator()) {}
+
+  void update_freq(int32_t t, int32_t delta) {
+    auto it = next.find(t);
+    if (it != next.end()) {
+      sorted_children.erase({it->second.freq, t});
+      it->second.freq += delta;
+      sorted_children.insert({it->second.freq, t});
+      lru.splice(lru.begin(), lru, it->second.lru_it);
+    }
+  }
 };
 
 class Ngram {
-  std::vector<TrieNode> nodes_;
-  std::vector<TrieNode*> node_pool_;
+  std::vector<SAMNode> nodes_;
+  std::vector<SAMNode*> node_pool_;
   size_t free_node_count_;
-  std::list<TrieNode*> global_lru_;
-  TrieNode* root_;
-  std::vector<TrieNode*> path_;
+  SAMNode* root_;
   Param param_;
 
-  std::vector<std::pair<TrieNode*, int32_t>> match(const std::vector<int32_t>& tokens, size_t batch_size) const;
+  std::vector<std::pair<SAMNode*, int32_t>> match(const std::vector<int32_t>& tokens, size_t batch_size) const;
 
   void squeeze(size_t count);
 
-  TrieNode* getNode() {
+  SAMNode* getNode() {
     auto node = node_pool_[--free_node_count_];
-    node->~TrieNode();
-    new (node) TrieNode();
+    node->~SAMNode();
+    new (node) SAMNode();
     return node;
   }
 
@@ -59,7 +79,6 @@ class Ngram {
   bool quit_flag_;
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;
-  std::vector<std::tuple<int32_t, int32_t, int32_t, int32_t>> match_tmp_data_;
 
  public:
   Ngram(size_t capacity, const Param& param);
@@ -87,14 +106,14 @@ class Ngram {
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
 
-    global_lru_.clear();
-    path_.clear();
     node_pool_.clear();
     for (auto& node : nodes_) {
       node_pool_.emplace_back(&node);
     }
     free_node_count_ = node_pool_.size();
     root_ = getNode();
+    root_->len = 0;
+    root_->fail = nullptr;
   }
 
   const Param& param() const {
@@ -106,6 +125,7 @@ class Ngram {
   Result matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const;
 
   void insert();
+  void extend(int32_t token, SAMNode*& last);
 };
 
 }  // namespace ngram
