@@ -117,8 +117,8 @@ class TestDumperConfig:
         d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
         assert d2.may_enable is True
 
-    # --- from_kv_pairs / _kv_pairs_to_dict ---
 
+class TestKvPairsParsing:
     def test_from_kv_pairs_none_returns_defaults(self):
         assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
 
@@ -128,7 +128,7 @@ class TestDumperConfig:
     def test_from_kv_pairs_bool_field(self):
         cfg = _DumperConfig.from_kv_pairs(["enable=true"])
         assert cfg.enable is True
-        assert cfg.dir == "/tmp/dumper"  # other fields untouched
+        assert cfg.dir == "/tmp/dumper"
 
     def test_from_kv_pairs_bool_numeric(self):
         assert _DumperConfig.from_kv_pairs(["enable=1"]).enable is True
