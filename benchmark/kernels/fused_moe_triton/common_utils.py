@@ -74,7 +74,9 @@ def get_model_config(
     elif architecture in [
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -83,7 +85,9 @@ def get_model_config(
             or architecture
             not in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
             else 1
