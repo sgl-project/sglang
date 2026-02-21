@@ -25,8 +25,5 @@ class Hunyuan3DSamplingParams(SamplingParams):
         if self.num_inference_steps is None:
             self.num_inference_steps = self.shape_num_inference_steps
 
-        if self.guidance_scale is None:
-            self.guidance_scale = self.guidance_scale
-
         self.guidance_scale = max(5.0, min(self.guidance_scale, 6.5))
         super().__post_init__()
