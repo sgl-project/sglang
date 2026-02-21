@@ -628,12 +628,17 @@ def _torch_save(value, path: str):
 def _map_tensor(
     value, fn: Callable[[torch.Tensor], torch.Tensor]
 ):
-    """Apply *fn* to the tensor inside *value* (bare tensor or ``{"value": tensor, ...}`` dict)."""
-    if isinstance(value, dict) and isinstance(value.get("value"), torch.Tensor):
-        mapped = fn(value["value"])
-        if mapped is not value["value"]:
-            return {**value, "value": mapped}
-        return value
+    """Apply *fn* to every tensor in *value* (bare tensor, or dict with tensor values)."""
+    if isinstance(value, dict):
+        result = value
+        for k, v in value.items():
+            if isinstance(v, torch.Tensor):
+                mapped = fn(v)
+                if mapped is not v:
+                    if result is value:
+                        result = {**value}
+                    result[k] = mapped
+        return result
     if isinstance(value, torch.Tensor):
         return fn(value)
     return value

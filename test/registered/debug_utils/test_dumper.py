@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.dumper import (
     _materialize_value,
     _MegatronPlugin,
     _obj_to_dict,
+    _map_tensor,
     _register_forward_hook_or_replace_fn,
     _SGLangPlugin,
     _torch_save,
@@ -285,6 +286,44 @@ class TestDumperPureFunctions:
 
         assert "value=42" in get_tensor_info(42)
         assert "min=None" in get_tensor_info(torch.tensor([]))
+
+
+class TestMapTensor:
+    def test_bare_tensor(self):
+        t = torch.randn(4)
+        result = _map_tensor(t, lambda x: x * 2)
+        assert torch.equal(result, t * 2)
+
+    def test_bare_tensor_no_change(self):
+        t = torch.randn(4)
+        result = _map_tensor(t, lambda x: x)
+        assert result is t
+
+    def test_dict_with_tensor_values(self):
+        t1 = torch.randn(3)
+        t2 = torch.randn(5)
+        value = {"a": t1, "b": t2, "meta": "not a tensor"}
+        result = _map_tensor(value, lambda x: x.clone())
+        assert torch.equal(result["a"], t1)
+        assert torch.equal(result["b"], t2)
+        assert result["a"] is not t1
+        assert result["b"] is not t2
+        assert result["meta"] == "not a tensor"
+
+    def test_dict_no_change_returns_same_object(self):
+        t = torch.randn(3)
+        value = {"value": t, "meta": {}}
+        result = _map_tensor(value, lambda x: x)
+        assert result is value
+
+    def test_dict_no_tensors(self):
+        value = {"a": 1, "b": "hello"}
+        result = _map_tensor(value, lambda x: x.clone())
+        assert result is value
+
+    def test_non_tensor_non_dict(self):
+        result = _map_tensor(42, lambda x: x.clone())
+        assert result == 42
 
 
 class TestTorchSave:
