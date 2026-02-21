@@ -160,7 +160,6 @@ def gemma_fused_add_rmsnorm(
     )
 
 
-
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return flashinfer.silu_and_mul(input, out)
 

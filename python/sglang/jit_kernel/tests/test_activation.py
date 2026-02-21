@@ -2,9 +2,8 @@
 
 import flashinfer
 import pytest
-import torch
-
 import sgl_kernel
+import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

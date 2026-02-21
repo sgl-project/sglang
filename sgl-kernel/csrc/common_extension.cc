@@ -75,7 +75,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
-
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, bool enable_pdl, "
