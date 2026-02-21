@@ -269,7 +269,6 @@ set(SOURCES
     "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
-    "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
@@ -330,7 +329,6 @@ set(SOURCES
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
-    "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
 
