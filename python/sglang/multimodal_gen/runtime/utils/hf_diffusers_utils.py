@@ -544,7 +544,7 @@ def maybe_download_model(
     download: bool = True,
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
-    force_diffusers_model: bool = False
+    force_diffusers_model: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.

@@ -511,12 +511,12 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_2_t2i_customized_vae_path",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev", modality="image",
-            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"]
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
         ),
         T2I_sampling_params,
     ),
-
     DiffusionTestCase(
         "fast_hunyuan_video",
         DiffusionServerArgs(

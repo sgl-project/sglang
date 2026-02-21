@@ -36,7 +36,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
     maybe_download_model,
     verify_model_config_and_directory,
 )
@@ -172,6 +171,29 @@ class ComposedPipelineBase(ABC):
         """
         return
 
+    def _resolve_component_path(
+        self, server_args: ServerArgs, module_name: str, load_module_name: str
+    ) -> str:
+        # use component_paths override (key = model_index component name) or default
+        override_path = server_args.component_paths.get(module_name)
+        if override_path is None and module_name == "vae":
+            override_path = server_args.vae_path
+        if override_path is not None:
+            component_model_path = maybe_download_model(
+                override_path,
+            )
+            logger.info(
+                "Using custom path for component %s: %s (default: %s)",
+                module_name,
+                override_path,
+                os.path.join(self.model_path, load_module_name),
+            )
+        else:
+            component_model_path = os.path.join(self.model_path, load_module_name)
+
+        logger.debug("Resolved component path: %s", component_model_path)
+        return component_model_path
+
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -286,21 +308,9 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            # use component_paths override (key = model_index component name) or default
-            override_path = server_args.component_paths.get(module_name)
-            if override_path is None and module_name == "vae":
-                override_path = server_args.vae_path
-            if override_path is not None:
-                _ = get_diffusers_component_config(override_path)
-                component_model_path = override_path
-                logger.info(
-                    "Using custom path for component %s: %s (default: %s)",
-                    module_name,
-                    override_path,
-                    os.path.join(self.model_path, load_module_name),
-                )
-            else:
-                component_model_path = os.path.join(self.model_path, load_module_name)
+            component_model_path = self._resolve_component_path(
+                server_args, module_name, load_module_name
+            )
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
