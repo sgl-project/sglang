@@ -589,12 +589,11 @@ def maybe_download_model(
         vae_dir = os.path.join(path, "vae")
         return os.path.exists(transformer_dir) and os.path.exists(vae_dir)
 
-    model_name_or_path = os.path.expanduser(model_name_or_path)
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
         # TODO: lots of duplication here
         if not force_diffusers_model:
-            pass
+            return model_name_or_path
         elif is_lora or _verify_diffusers_model_complete(model_name_or_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
@@ -644,7 +643,7 @@ def maybe_download_model(
             max_workers=8,
         )
         if not force_diffusers_model:
-            pass
+            return str(local_path)
         elif is_lora or _verify_diffusers_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
@@ -716,7 +715,7 @@ def maybe_download_model(
                 )
 
             if not force_diffusers_model:
-                pass
+                return str(local_path)
             # Verify downloaded model is complete (skip for LoRA)
             elif not is_lora and not _verify_diffusers_model_complete(local_path):
                 logger.warning(

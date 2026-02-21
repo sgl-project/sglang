@@ -177,9 +177,7 @@ class ComposedPipelineBase(ABC):
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
             # overridden with args like --vae-path
-            component_model_path = maybe_download_model(
-                override_path,
-            )
+            component_model_path = maybe_download_model(override_path)
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
@@ -275,8 +273,8 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         for module_name, (
-            transformers_or_diffusers,
-            architecture,
+                transformers_or_diffusers,
+                architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
