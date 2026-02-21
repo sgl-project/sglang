@@ -656,7 +656,14 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
 
 def _get_default_exp_name(timeout_seconds: int = 60):
     rank = _get_rank()
-    object_list = [f"{_DEFAULT_EXP_NAME_PREFIX}{time.time()}" if rank == 0 else None]
+    object_list = [
+        (
+            f"{_DEFAULT_EXP_NAME_PREFIX}"
+            f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+        )
+        if rank == 0
+        else None
+    ]
 
     if dist.is_initialized():
         _collective_with_timeout(
