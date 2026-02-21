@@ -1035,6 +1035,43 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         P = self._PREFIX
         assert torch.allclose(captured[f"{P}output"]["value"], output)
 
+    def test_inputs_dumped_before_forward(self, tmp_path):
+        """Inputs are captured *before* forward(); in-place mutation must not affect them."""
+
+        class Mutator(torch.nn.Module):
+            def forward(self, x):
+                x.fill_(999.0)
+                return x
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mutator = Mutator()
+
+            def forward(self, x):
+                return self.mutator(x)
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        original_x = x.clone()
+        with d.capture_output() as captured:
+            model(x)
+
+        P = self._PREFIX
+        dumped_input = captured[f"{P}model.mutator.inputs.0"]["value"]
+        assert torch.allclose(dumped_input, original_x), (
+            f"pre-hook should capture inputs before forward mutates them; "
+            f"got {dumped_input} but expected {original_x}"
+        )
+
+        dumped_output = captured[f"{P}model.mutator.output"]["value"]
+        assert (dumped_output == 999.0).all(), (
+            "post-hook should capture outputs after forward"
+        )
+
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):
             def __init__(self):

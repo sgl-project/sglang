@@ -501,12 +501,16 @@ class _NonIntrusiveDumper:
                 self._register_ctx_hooks(module, ctx=ctx)
 
             is_root = module_name == ""
+            pre_hook = self._make_forward_pre_hook(
+                module_name=module_name, is_root=is_root
+            )
             hook = self._make_forward_hook(
                 module_name=module_name, is_root=is_root
             )
             _register_forward_hook_or_replace_fn(
                 module,
-                hook,
+                pre_hook=pre_hook,
+                hook=hook,
                 mode="replace_fn" if is_root else "hook",
             )
 
@@ -532,11 +536,15 @@ class _NonIntrusiveDumper:
             )
         )
 
-    def _make_forward_hook(self, *, module_name: str, is_root: bool):
-        def _hook(_module, input, output):
+    def _make_forward_pre_hook(self, *, module_name: str, is_root: bool):
+        def _hook(_module, input):
             for i, item in enumerate(input):
                 self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
 
+        return _hook
+
+    def _make_forward_hook(self, *, module_name: str, is_root: bool):
+        def _hook(_module, input, output):
             if output is not None:
                 self._dump_value(module_name, output, role="output", is_root=False)
 
@@ -575,24 +583,28 @@ class _NonIntrusiveDumper:
 
 def _register_forward_hook_or_replace_fn(
     module: "torch.nn.Module",
-    hook,
     *,
+    pre_hook,
+    hook,
     mode: str,
 ) -> None:
-    """Attach a forward hook to *module*.
+    """Attach pre/post forward hooks to *module*.
 
-    mode="hook"       — standard ``register_forward_hook`` (fires only via ``__call__``).
-    mode="replace_fn" — monkey-patch ``module.forward`` so the hook fires even when
+    mode="hook"       — standard ``register_forward_pre_hook`` / ``register_forward_hook``
+                        (fires only via ``__call__``).
+    mode="replace_fn" — monkey-patch ``module.forward`` so hooks fire even when
                         callers invoke ``.forward()`` directly (as sglang does for the
                         root model).
     """
     if mode == "hook":
+        module.register_forward_pre_hook(pre_hook)
         module.register_forward_hook(hook)
     elif mode == "replace_fn":
         original_forward = module.forward
 
         @functools.wraps(original_forward)
         def _wrapped(*args, **kwargs):
+            pre_hook(module, args)
             output = original_forward(*args, **kwargs)
             hook(module, args, output)
             return output
