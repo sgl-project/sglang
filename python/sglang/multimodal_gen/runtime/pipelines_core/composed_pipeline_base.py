@@ -7,6 +7,7 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
+import concurrent.futures
 import os
 import re
 from abc import ABC, abstractmethod
@@ -270,11 +271,15 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
-        loaded_components = {}
+        loaded_components: dict[str, Any] = {}
+
+        # Pre-pass: handle null/pre-loaded modules and resolve all paths sequentially.
+        # This must be sequential to safely mutate self.required_config_modules for null entries.
+        to_load: dict[str, tuple[str, str, str]] = {}  # name -> (lib, load_name, path)
         for module_name, (
             transformers_or_diffusers,
             architecture,
-        ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+        ) in model_index.items():
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -300,18 +305,78 @@ class ComposedPipelineBase(ABC):
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
+
+            to_load[module_name] = (
+                transformers_or_diffusers,
+                load_module_name,
+                component_model_path,
+            )
+
+        def _load_one(module_name: str) -> tuple[str, str, Any, float]:
+            transformers_or_diffusers, load_module_name, component_model_path = to_load[
+                module_name
+            ]
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+            return module_name, load_module_name, module, memory_usage
 
-            self.memory_usages[load_module_name] = memory_usage
+        # Load components. When parallel_loading is enabled and there are multiple
+        # components to load, use a ThreadPoolExecutor to load them concurrently.
+        # This is particularly beneficial when large components (text encoder, transformer)
+        # are disk-I/O bound and can be loaded simultaneously, reducing startup time from
+        # O(sum of load times) to O(max single load time).
+        #
+        # Thread-safety: torch.set_default_dtype() is process-global state. Each loader
+        # uses a set_default_torch_dtype context manager that saves the old dtype on entry
+        # and restores it on exit. With concurrent threads, one thread's __exit__ can
+        # restore the dtype to float32 while another thread is mid-initialization, causing
+        # that thread to see the wrong dtype (e.g. SDPA fallback instead of FlashAttention).
+        # Fix: pre-set the global dtype to the pipeline's target dtype before spawning
+        # threads. Each loader's context manager then saves/restores the same value, making
+        # it a no-op and eliminating the race. Use --no-parallel-loading if components
+        # require different dtypes.
+        use_parallel = server_args.parallel_loading and len(to_load) > 1
 
-            if module_name in loaded_components:
-                logger.warning("Overwriting module %s", module_name)
-            loaded_components[module_name] = module
+        if use_parallel:
+            from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+            _prior_dtype = torch.get_default_dtype()
+            _target_dtype = PRECISION_TO_TYPE.get(
+                getattr(server_args.pipeline_config, "dit_precision", "bf16"),
+                torch.bfloat16,
+            )
+            torch.set_default_dtype(_target_dtype)
+            logger.info(
+                "Loading %d pipeline components in parallel: %s",
+                len(to_load),
+                list(to_load.keys()),
+            )
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(to_load)
+                ) as executor:
+                    futures = {
+                        executor.submit(_load_one, name): name for name in to_load
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        mod_name, load_mod_name, module, memory_usage = future.result()
+                        self.memory_usages[load_mod_name] = memory_usage
+                        if mod_name in loaded_components:
+                            logger.warning("Overwriting module %s", mod_name)
+                        loaded_components[mod_name] = module
+            finally:
+                torch.set_default_dtype(_prior_dtype)
+        else:
+            for module_name in tqdm(to_load, desc="Loading required modules"):
+                _, load_mod_name, module, memory_usage = _load_one(module_name)
+                self.memory_usages[load_mod_name] = memory_usage
+                if module_name in loaded_components:
+                    logger.warning("Overwriting module %s", module_name)
+                loaded_components[module_name] = module
 
         # Check if all required modules were loaded
         for module_name in required_modules:
