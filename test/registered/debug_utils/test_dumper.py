@@ -117,6 +117,95 @@ class TestDumperConfig:
         d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
         assert d2.may_enable is True
 
+    # --- from_kv_pairs / _kv_pairs_to_dict ---
+
+    def test_from_kv_pairs_none_returns_defaults(self):
+        assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
+
+    def test_from_kv_pairs_empty_returns_defaults(self):
+        assert _DumperConfig.from_kv_pairs([]) == _DumperConfig()
+
+    def test_from_kv_pairs_bool_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["enable=true"])
+        assert cfg.enable is True
+        assert cfg.dir == "/tmp/dumper"  # other fields untouched
+
+    def test_from_kv_pairs_bool_numeric(self):
+        assert _DumperConfig.from_kv_pairs(["enable=1"]).enable is True
+        assert _DumperConfig.from_kv_pairs(["enable=0"]).enable is False
+
+    def test_from_kv_pairs_int_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=120"])
+        assert cfg.collective_timeout == 120
+        assert type(cfg.collective_timeout) is int
+
+    def test_from_kv_pairs_int_field_zero_stays_int(self):
+        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=0"])
+        assert cfg.collective_timeout == 0
+        assert type(cfg.collective_timeout) is int
+
+    def test_from_kv_pairs_str_field_not_coerced(self):
+        cfg = _DumperConfig.from_kv_pairs(["server_port=0"])
+        assert cfg.server_port == "0"
+        assert type(cfg.server_port) is str
+
+    def test_from_kv_pairs_str_field_one_stays_str(self):
+        cfg = _DumperConfig.from_kv_pairs(["server_port=1"])
+        assert cfg.server_port == "1"
+        assert type(cfg.server_port) is str
+
+    def test_from_kv_pairs_optional_str_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
+        assert cfg.filter == "layer_id=[0-3]"
+
+    def test_from_kv_pairs_optional_str_exp_name(self):
+        cfg = _DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
+        assert cfg.exp_name == "my_experiment"
+
+    def test_from_kv_pairs_multiple_fields(self):
+        cfg = _DumperConfig.from_kv_pairs(
+            [
+                "enable=true",
+                "dir=/my/dir",
+                "filter=name=foo",
+                "collective_timeout=30",
+                "enable_grad=1",
+            ]
+        )
+        assert cfg.enable is True
+        assert cfg.dir == "/my/dir"
+        assert cfg.filter == "name=foo"
+        assert cfg.collective_timeout == 30
+        assert cfg.enable_grad is True
+
+    def test_from_kv_pairs_missing_equals_raises(self):
+        with pytest.raises(ValueError, match="missing '='"):
+            _DumperConfig.from_kv_pairs(["enable"])
+
+    def test_from_kv_pairs_unknown_key_raises(self):
+        with pytest.raises(ValueError, match="Unknown config key"):
+            _DumperConfig.from_kv_pairs(["nonexistent=true"])
+
+    def test_kv_pairs_to_dict_returns_only_explicit(self):
+        d = _DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
+        assert d == {"enable": True, "dir": "/x"}
+        assert "filter" not in d
+        assert "collective_timeout" not in d
+
+    def test_kv_pairs_to_dict_none_returns_empty(self):
+        assert _DumperConfig._kv_pairs_to_dict(None) == {}
+
+    def test_kv_pairs_to_dict_empty_returns_empty(self):
+        assert _DumperConfig._kv_pairs_to_dict([]) == {}
+
+    def test_from_kv_pairs_value_with_equals_in_value(self):
+        cfg = _DumperConfig.from_kv_pairs(["filter=name=foo"])
+        assert cfg.filter == "name=foo"
+
+    def test_from_kv_pairs_type_validation_still_works(self):
+        with pytest.raises(TypeError, match="collective_timeout.*expected int"):
+            _DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
+
 
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):
@@ -1458,25 +1547,30 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         assert "non_intrusive__layer.output" in captured
 
 
+class _LayerWithNumber(torch.nn.Module):
+    """Test helper: module with a ``layer_number`` attribute (Megatron style)."""
+
+    def __init__(self, layer_number: int):
+        super().__init__()
+        self.layer_number = layer_number
+        self.linear = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
     """Tests for automatic layer_id context injection via set_ctx."""
 
     def test_layer_id_from_layer_number(self, tmp_path):
         """Megatron PP: layer_number (1-based global) -> layer_id = layer_number - 1."""
 
-        class Layer(torch.nn.Module):
-            def __init__(self, layer_number: int):
-                super().__init__()
-                self.layer_number = layer_number
-                self.linear = torch.nn.Linear(4, 4)
-
-            def forward(self, x):
-                return self.linear(x)
-
         class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = torch.nn.ModuleList([Layer(10), Layer(11)])
+                self.layers = torch.nn.ModuleList(
+                    [_LayerWithNumber(10), _LayerWithNumber(11)]
+                )
 
             def forward(self, x):
                 for layer in self.layers:
@@ -1548,19 +1642,12 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
     def test_filter_by_layer_id(self, tmp_path):
         """filter='layer_id=0' keeps only layer 0 dumps."""
 
-        class Layer(torch.nn.Module):
-            def __init__(self, layer_number: int):
-                super().__init__()
-                self.layer_number = layer_number
-                self.linear = torch.nn.Linear(4, 4)
-
-            def forward(self, x):
-                return self.linear(x)
-
         class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = torch.nn.ModuleList([Layer(1), Layer(2)])
+                self.layers = torch.nn.ModuleList(
+                    [_LayerWithNumber(1), _LayerWithNumber(2)]
+                )
 
             def forward(self, x):
                 for layer in self.layers:
