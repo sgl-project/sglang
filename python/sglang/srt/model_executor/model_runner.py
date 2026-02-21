@@ -68,6 +68,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -482,6 +483,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if self.server_args.enable_elastic_expert_backup
+            else None
+        )
 
         (
             ElasticEPStateManager.init(self.server_args)
@@ -1094,6 +1100,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
+                self.expert_backup_client.update_weights()
+                return
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
