@@ -273,8 +273,8 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         for module_name, (
-                transformers_or_diffusers,
-                architecture,
+            transformers_or_diffusers,
+            architecture,
         ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
             if transformers_or_diffusers is None:
                 logger.warning(
