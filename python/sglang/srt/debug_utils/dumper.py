@@ -753,12 +753,11 @@ def _compute_static_meta():
 class _DumperHttpManager:
     def __init__(self, dumper: "_Dumper"):
         self._dumper = dumper
-        config = dumper._config
-        http_port = config.server_port_parsed
+        http_port = self._dumper._config.server_port_parsed
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
             self,
-            timeout_seconds=config.collective_timeout,
+            timeout_seconds=self._dumper._config.collective_timeout,
         )
 
         if _get_rank() == 0:
