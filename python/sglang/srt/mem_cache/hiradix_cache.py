@@ -491,6 +491,9 @@ class HiRadixCache(RadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
+                # Synchronize CUDA before freeing memory to prevent use-after-free
+                # when storage backend is still using the memory in background threads.
+                torch.cuda.synchronize()
                 cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
@@ -983,8 +986,13 @@ class HiRadixCache(RadixCache):
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
+            # Use gloo prefetch_tp_group instead of NCCL tp_group for CPU-level synchronization.
+            # This avoids NCCL thread-safety issues when called from the main scheduler thread
+            # and provides lower latency for small CPU tensors.
             torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                qsizes,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.cache_controller.prefetch_tp_group,
             )
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
