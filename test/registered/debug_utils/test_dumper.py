@@ -14,15 +14,19 @@ import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
     _collective_with_timeout,
+    _deepcopy_or_clone,
     _Dumper,
     _DumperConfig,
     _format_tags,
+    _get_default_exp_name,
     _materialize_value,
     _MegatronPlugin,
     _obj_to_dict,
+    _register_forward_hook_or_replace_fn,
     _SGLangPlugin,
     _torch_save,
     dumper,
+    get_int_env_var,
     get_tensor_info,
     get_truncated_value,
 )
@@ -116,6 +120,22 @@ class TestDumperConfig:
 
         d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
         assert d2.may_enable is True
+
+
+class TestServerPortParsed:
+    def test_negative_returns_none(self):
+        assert _DumperConfig(server_port="-1").server_port_parsed is None
+
+    def test_zero_returns_none(self):
+        assert _DumperConfig(server_port="0").server_port_parsed is None
+
+    def test_positive_returns_int(self):
+        result = _DumperConfig(server_port="40000").server_port_parsed
+        assert result == 40000
+        assert isinstance(result, int)
+
+    def test_reuse_returns_string(self):
+        assert _DumperConfig(server_port="reuse").server_port_parsed == "reuse"
 
 
 class TestKvPairsParsing:
