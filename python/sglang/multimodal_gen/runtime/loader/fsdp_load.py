@@ -86,7 +86,9 @@ def maybe_load_fsdp_model(
         default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
     )
 
-    with _model_construction_lock:  # serialize construction; weight loading runs outside
+    with (
+        _model_construction_lock
+    ):  # serialize construction; weight loading runs outside
         set_mixed_precision_policy(
             param_dtype=default_torch_dtype,
             reduce_dtype=reduce_dtype,

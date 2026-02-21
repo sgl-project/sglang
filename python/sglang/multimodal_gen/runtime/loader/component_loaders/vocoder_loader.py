@@ -57,7 +57,9 @@ class VocoderLoader(ComponentLoader):
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
 
-        with _model_construction_lock, set_default_torch_dtype(vocoder_dtype), skip_init_modules():
+        with _model_construction_lock, set_default_torch_dtype(
+            vocoder_dtype
+        ), skip_init_modules():
             vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)
             vocoder = vocoder_cls(vocoder_config).to(target_device)
 

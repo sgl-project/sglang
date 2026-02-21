@@ -53,7 +53,9 @@ class AdapterLoader(ComponentLoader):
 
         from types import SimpleNamespace
 
-        with _model_construction_lock, set_default_torch_dtype(default_dtype), skip_init_modules():
+        with _model_construction_lock, set_default_torch_dtype(
+            default_dtype
+        ), skip_init_modules():
             connector_cfg = SimpleNamespace(**config)
             model = model_cls(connector_cfg).to(
                 device=target_device, dtype=default_dtype

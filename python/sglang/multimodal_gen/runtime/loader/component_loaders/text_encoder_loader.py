@@ -230,7 +230,9 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        with _model_construction_lock:  # serialize construction; weight loading runs outside
+        with (
+            _model_construction_lock
+        ):  # serialize construction; weight loading runs outside
             with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
                 with model_device, skip_init_modules():
                     architectures = getattr(model_config, "architectures", [])
