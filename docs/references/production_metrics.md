@@ -125,6 +125,22 @@ sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177
 sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
 ```
 
+## HiCache Storage Metrics
+
+These metrics are emitted when HiCache storage is enabled and metrics are turned on:
+
+- `sglang:prefetch_requests_total`: Number of prefetch requests by status (`ok`, `failed`, `timeout`).
+- `sglang:prefetch_request_latency_seconds`: End-to-end prefetch latency per request (seconds).
+- `sglang:prefetch_page_latency_seconds`: End-to-end per-page prefetch latency (request latency divided by delivered pages).
+- `sglang:prefetch_page_io_latency_seconds`: L3 -> L2 prefetch I/O latency per page (transport/service time).
+- `sglang:prefetch_queue_wait_seconds`: Time spent waiting in the prefetch I/O queue before I/O starts.
+- `sglang:prefetch_io_queue_size`: Current size of the prefetch I/O queue.
+- `sglang:prefetch_inflight`: Number of in-flight prefetch I/O operations.
+- `sglang:prefetch_pages_per_request`: Pages delivered per prefetch request.
+- `sglang:prefetched_tokens_total`: Number of prefetched prompt tokens.
+- `sglang:prefetch_pgs`: Histogram of prefetch batch sizes (pages).
+- `sglang:prefetch_bandwidth`: Histogram of prefetch bandwidth in GB/s.
+
 ## Setup Guide
 
 This section describes how to set up the monitoring stack (Prometheus + Grafana) provided in the `examples/monitoring` directory.

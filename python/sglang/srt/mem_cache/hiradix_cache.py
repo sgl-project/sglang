@@ -473,6 +473,8 @@ class HiRadixCache(RadixCache):
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
+                    if log_metrics and self.enable_storage_metrics:
+                        self.storage_metrics_collector.log_prefetch_request("failed")
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -963,6 +965,12 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
+            self.storage_metrics_collector.set_prefetch_io_queue_size(
+                self.cache_controller.get_prefetch_io_queue_size()
+            )
+            self.storage_metrics_collector.set_prefetch_inflight(
+                self.cache_controller.get_prefetch_inflight()
+            )
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
@@ -1043,6 +1051,18 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
+    def _is_prefetch_timeout_distributed(self, operation: PrefetchOperation) -> bool:
+        timed_out = self.is_prefetch_timeout(operation)
+        if self.tp_world_size > 1:
+            timeout_tensor = torch.tensor(int(timed_out), dtype=torch.int)
+            torch.distributed.all_reduce(
+                timeout_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+            timed_out = timeout_tensor.item() == 1
+        return timed_out
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
@@ -1060,6 +1080,16 @@ class HiRadixCache(RadixCache):
 
         if not self.can_terminate_prefetch(operation):
             return False
+
+        expected_tokens = len(operation.hash_value) * self.page_size
+        completed = (
+            expected_tokens > 0 and operation.completed_tokens == expected_tokens
+        )
+        timeout_terminated = (
+            self.prefetch_stop_policy == "timeout"
+            and not completed
+            and self._is_prefetch_timeout_distributed(operation)
+        )
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
@@ -1103,6 +1133,35 @@ class HiRadixCache(RadixCache):
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            for page_latency_seconds, count in operation.get_page_latency_samples():
+                self.storage_metrics_collector.log_prefetch_page_io_latency(
+                    page_latency_seconds, count
+                )
+            delivered_pages = min_completed_tokens // self.page_size
+            e2e_request_latency_seconds = time.monotonic() - operation.start_time
+            self.storage_metrics_collector.log_prefetch_request_latency(
+                e2e_request_latency_seconds
+            )
+            self.storage_metrics_collector.log_prefetch_pages_per_request(
+                delivered_pages
+            )
+            if delivered_pages > 0:
+                e2e_page_latency_seconds = e2e_request_latency_seconds / delivered_pages
+                self.storage_metrics_collector.log_prefetch_page_latency(
+                    e2e_page_latency_seconds, delivered_pages
+                )
+            queue_wait_seconds = operation.get_prefetch_queue_wait_seconds()
+            if queue_wait_seconds is not None:
+                self.storage_metrics_collector.log_prefetch_queue_wait_seconds(
+                    queue_wait_seconds
+                )
+            if timeout_terminated:
+                status = "timeout"
+            elif min_completed_tokens == expected_tokens:
+                status = "ok"
+            else:
+                status = "failed"
+            self.storage_metrics_collector.log_prefetch_request(status)
 
         return True
 
@@ -1392,3 +1451,5 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetch_request("failed")

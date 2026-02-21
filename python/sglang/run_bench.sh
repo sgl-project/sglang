@@ -1,0 +1,11 @@
+python3 bench_serving.py \
+    --backend vllm-chat \
+    --model deepseek-ai/DeepSeek-V3.2 \
+    --base-url https://dsv32.ml-models.cloud.yandex.net:443 \
+    --dataset-name random \
+    --seed 1 \
+    --random-input-len 2560 \
+    --random-output-len 1024 \
+    --random-range-ratio 1.0 \
+    --request-rate 40 \
+    --num-prompts 10000
