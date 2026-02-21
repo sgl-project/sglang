@@ -164,7 +164,7 @@ class _DumperState:
     step: int = 0
     global_ctx: dict = field(default_factory=dict)
     captured_output_data: Optional[dict] = None
-    cleanup_previous_handled: bool = True
+    cleanup_previous_handled: bool = False
 
 
 class _Dumper:
@@ -205,9 +205,7 @@ class _Dumper:
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
     def _fresh_state(self) -> _DumperState:
-        return _DumperState(
-            cleanup_previous_handled=not self._config.cleanup_previous,
-        )
+        return _DumperState()
 
     # ------------------------------- public :: core ---------------------------------
 
@@ -294,8 +292,6 @@ class _Dumper:
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
-        if "cleanup_previous" in kwargs:
-            self._state.cleanup_previous_handled = not self._config.cleanup_previous
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
@@ -472,7 +468,7 @@ class _Dumper:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
                 self._state.captured_output_data[tags["name"]] = output_data
             else:
-                if not self._state.cleanup_previous_handled:
+                if not self._state.cleanup_previous_handled and self._config.cleanup_previous:
                     self._state.cleanup_previous_handled = True
                     _cleanup_old_dumps(
                         Path(self._config.dir), exp_name=self._config.exp_name

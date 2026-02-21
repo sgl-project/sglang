@@ -962,11 +962,16 @@ class TestReset:
         d.dump("phase2", torch.randn(2, 2))
         assert d._state.cleanup_previous_handled is True
 
-    def test_configure_cleanup_previous_resets_flag(self, tmp_path):
-        d = _make_test_dumper(tmp_path, cleanup_previous=False)
-        assert d._state.cleanup_previous_handled is True
+    def test_no_cleanup_when_config_false(self, tmp_path):
+        """cleanup_previous=False: handled stays False but no cleanup runs."""
+        old_dir = tmp_path / "dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
 
-        d.configure(cleanup_previous=True)
+        d = _make_test_dumper(tmp_path, cleanup_previous=False)
+        d.dump("tensor", torch.randn(2, 2))
+
+        assert old_dir.exists()
         assert d._state.cleanup_previous_handled is False
 
     def test_multi_phase_switch(self, tmp_path):
