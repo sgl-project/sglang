@@ -8,10 +8,6 @@ Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-mtp suite
 
 import os
 
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from types import SimpleNamespace
 

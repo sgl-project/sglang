@@ -7,14 +7,10 @@ The model path can be configured via DEEPSEEK_R1_MXFP4_MODEL_PATH environment va
 Registry: nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4 suite
 
 Example usage:
-    DEEPSEEK_R1_MXFP4_MODEL_PATH=/data2/models/amd-DeepSeek-R1-MXFP4-Preview python -m pytest test_deepseek_r1_mxfp4_perf_mi35x.py -v
+    python -m pytest test_deepseek_r1_mxfp4_perf_mi35x.py -v
 """
 
 import os
-
-# Set HF cache to /data2/models/ for MI35x so HF models download there
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
 from typing import List
 
@@ -62,7 +58,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 # Model path configuration for MI35x DeepSeek-R1-MXFP4
 # Priority: 1) env var, 2) local path, 3) HuggingFace model ID
-DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/data2/models/amd-DeepSeek-R1-MXFP4-Preview"
+DEEPSEEK_R1_MXFP4_LOCAL_PATH = "/sgl-data/models/amd-DeepSeek-R1-MXFP4-Preview"
 DEEPSEEK_R1_MXFP4_HF_MODEL_ID = "amd/DeepSeek-R1-MXFP4-Preview"
 PROFILE_DIR = "performance_profiles_deepseek_r1_mxfp4_mi35x"
 
