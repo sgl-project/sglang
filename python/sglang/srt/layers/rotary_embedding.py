@@ -131,8 +131,10 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
-            if _is_cuda or _is_hip:
+            if _is_cuda:
                 from sglang.jit_kernel.pos_enc import rotary_embedding
+            elif _is_hip:
+                from sgl_kernel import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -3409,7 +3411,9 @@ def get_rope(
         elif "type" in rope_scaling:
             scaling_type = rope_scaling["type"]
         else:
-            raise ValueError("Unknown RoPE scaling type")
+            raise ValueError(
+                f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}"
+            )
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]

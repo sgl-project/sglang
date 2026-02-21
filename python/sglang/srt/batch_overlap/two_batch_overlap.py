@@ -30,6 +30,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    MoriEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -440,18 +441,23 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        forward_modes_excluding_idle = [
-            x for x in forward_modes if x != ForwardMode.IDLE.value
+        forward_modes_excluding_idle_and_prebuilt = [
+            x
+            for x in forward_modes
+            if x != ForwardMode.IDLE.value and x != ForwardMode.PREBUILT.value
         ]
 
-        if not forward_modes_excluding_idle:
+        if not forward_modes_excluding_idle_and_prebuilt:
             return ForwardMode.IDLE, False
 
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            forward_modes_excluding_idle
+            forward_modes_excluding_idle_and_prebuilt
         )
+
         global_forward_mode = (
-            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+            ForwardMode(forward_modes_excluding_idle_and_prebuilt[0])
+            if forward_mode_agree
+            else None
         )
         return global_forward_mode, forward_mode_agree
 
@@ -1021,6 +1027,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_mori():
+            self._inners = [
+                MoriEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

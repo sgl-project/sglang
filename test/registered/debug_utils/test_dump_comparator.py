@@ -89,7 +89,7 @@ class TestEndToEnd(CustomTestCase):
         from argparse import Namespace
 
         from sglang.srt.debug_utils.dump_comparator import main
-        from sglang.srt.debug_utils.dumper import _Dumper
+        from sglang.srt.debug_utils.dumper import _Dumper, _DumperConfig
 
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             baseline_tensor = torch.randn(10, 10)
@@ -97,15 +97,18 @@ class TestEndToEnd(CustomTestCase):
 
             dump_dirs = []
             for d, tensor in [(d1, baseline_tensor), (d2, target_tensor)]:
-                with _with_env("SGLANG_DUMPER_DIR", d), _with_env(
-                    "SGLANG_DUMPER_SERVER_PORT", "-1"
-                ):
-                    dumper = _Dumper()
-                    dumper.on_forward_pass_start()
-                    dumper.dump("tensor_a", tensor)
-                    dumper.on_forward_pass_start()
-                    dumper.dump("tensor_b", tensor * 2)
-                    dump_dirs.append(Path(d) / f"sglang_dump_{dumper._partial_name}")
+                dumper = _Dumper(
+                    config=_DumperConfig(
+                        enable=True,
+                        dir=d,
+                        enable_http_server=False,
+                    )
+                )
+                dumper.on_forward_pass_start()
+                dumper.dump("tensor_a", tensor)
+                dumper.on_forward_pass_start()
+                dumper.dump("tensor_b", tensor * 2)
+                dump_dirs.append(Path(d) / f"sglang_dump_{dumper._config.partial_name}")
 
             args = Namespace(
                 baseline_path=str(dump_dirs[0]),
