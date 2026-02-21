@@ -286,6 +286,11 @@ class _Dumper:
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
+        if self._config.cleanup_previous and not self._state.cleanup_previous_handled:
+            self._state.cleanup_previous_handled = True
+            _cleanup_old_dumps(
+                Path(self._config.dir), exp_name=self._config.exp_name
+            )
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
@@ -445,15 +450,6 @@ class _Dumper:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
                 self._state.captured_output_data[tags["name"]] = output_data
             else:
-                if (
-                    not self._state.cleanup_previous_handled
-                    and self._config.cleanup_previous
-                ):
-                    self._state.cleanup_previous_handled = True
-                    _cleanup_old_dumps(
-                        Path(self._config.dir), exp_name=self._config.exp_name
-                    )
-
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
 
