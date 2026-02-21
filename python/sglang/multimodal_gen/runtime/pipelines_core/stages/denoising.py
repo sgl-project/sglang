@@ -145,9 +145,40 @@ class DenoisingStage(PipelineStage):
         except ImportError:
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info(f"Compiling transformer with mode: {mode}")
-        # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(mode=mode, fullgraph=False, dynamic=None)
+        fullgraph = False
+        dynamic = None
+        regional = self.server_args.regional_compile
+        logger.info(
+            f"Compiling transformer with mode: {mode}, fullgraph: {fullgraph}, dynamic: {dynamic}, regional: {regional}"
+        )
+        if regional:
+            self.regionally_compile(
+                module, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+            )
+        else:
+            # TODO(triple-mu): support customized fullgraph and dynamic in the future
+            module.compile(mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+
+    def regionally_compile(self, module, *args, **kwargs):
+        repeated_blocks = getattr(module, "_repeated_blocks", None)
+
+        if not repeated_blocks:
+            logger.warning(
+                "`_repeated_blocks` attribute is empty. "
+                f"Set `_repeated_blocks` for the class `{module.__class__.__name__}` to benefit from faster compilation. "
+            )
+            return
+
+        has_compiled_region = False
+        for submod in module.modules():
+            if submod.__class__.__name__ in repeated_blocks:
+                submod.compile(*args, **kwargs)
+                has_compiled_region = True
+
+        if not has_compiled_region:
+            logger.warning(
+                f"Regional compilation failed because {repeated_blocks} classes are not found in the model."
+            )
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req

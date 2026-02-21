@@ -697,6 +697,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.patch_size = config.patch_size
         self.text_len = config.text_len
 
+        # Could have been class attribute, but the type of block is decide based on
+        # attn_backend, therefore we put it here.
+        self._repeated_blocks = []
+
         # 1. Patch & position embedding
         self.patch_embedding = PatchEmbed(
             in_chans=config.in_channels,
@@ -720,6 +724,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if (attn_backend and attn_backend.lower() == "video_sparse_attn")
             else WanTransformerBlock
         )
+        self._repeated_blocks.append(transformer_block.__class__.__name__)
         self.blocks = nn.ModuleList(
             [
                 transformer_block(
