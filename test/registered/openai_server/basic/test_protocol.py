@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    SglExt,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -178,6 +179,15 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_return_token_ids(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            return_token_ids=True,
+        )
+        self.assertTrue(request.return_token_ids)
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -311,6 +321,17 @@ class TestModelSerialization(unittest.TestCase):
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+    def test_sglext_token_ids_serialization(self):
+        sglext = SglExt(
+            prompt_token_ids=[1, 2, 3],
+            completion_token_ids=[[4, 5], [6]],
+            tokenizer_info={"model": "m", "weight_version": "v1"},
+        )
+        data = sglext.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["completion_token_ids"], [[4, 5], [6]])
+        self.assertEqual(data["tokenizer_info"]["model"], "m")
 
 
 class TestValidationEdgeCases(unittest.TestCase):
