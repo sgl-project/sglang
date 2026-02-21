@@ -1247,6 +1247,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
@@ -1285,11 +1286,18 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    models = [
+        "MllamaForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_local_attention_model(model_architectures: List[str]):
