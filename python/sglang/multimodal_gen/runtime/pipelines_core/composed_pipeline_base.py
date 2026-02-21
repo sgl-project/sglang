@@ -324,21 +324,10 @@ class ComposedPipelineBase(ABC):
             )
             return module_name, load_module_name, module, memory_usage
 
-        # Load components. When parallel_loading is enabled and there are multiple
-        # components to load, use a ThreadPoolExecutor to load them concurrently.
-        # This is particularly beneficial when large components (text encoder, transformer)
-        # are disk-I/O bound and can be loaded simultaneously, reducing startup time from
-        # O(sum of load times) to O(max single load time).
-        #
-        # Thread-safety: torch.set_default_dtype() is process-global state. Each loader
-        # uses a set_default_torch_dtype context manager that saves the old dtype on entry
-        # and restores it on exit. With concurrent threads, one thread's __exit__ can
-        # restore the dtype to float32 while another thread is mid-initialization, causing
-        # that thread to see the wrong dtype (e.g. SDPA fallback instead of FlashAttention).
-        # Fix: pre-set the global dtype to the pipeline's target dtype before spawning
-        # threads. Each loader's context manager then saves/restores the same value, making
-        # it a no-op and eliminating the race. Use --no-parallel-loading if components
-        # require different dtypes.
+        # Load components concurrently. Each loader serializes its model construction
+        # internally via _model_construction_lock; weight loading (the slow I/O part)
+        # runs in parallel. Pre-set the global dtype so context-manager save/restore
+        # is a no-op across threads. Use --no-parallel-loading if needed.
         use_parallel = server_args.parallel_loading and len(to_load) > 1
 
         if use_parallel:

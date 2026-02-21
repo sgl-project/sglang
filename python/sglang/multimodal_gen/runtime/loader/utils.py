@@ -7,6 +7,7 @@ import contextlib
 import glob
 import os
 import re
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
@@ -17,6 +18,11 @@ from torch import nn
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# Serializes model construction to prevent races on process-global state
+# (torch.set_default_dtype, skip_init_modules class patches). Weight loading
+# runs outside this lock so the parallel startup speedup is preserved.
+_model_construction_lock = threading.Lock()
 
 
 @contextlib.contextmanager
