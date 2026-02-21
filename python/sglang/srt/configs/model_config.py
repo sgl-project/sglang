@@ -1248,6 +1248,7 @@ multimodal_model_archs = [
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
     "Step3VLForConditionalGeneration",
+    "POINTSGUIModel",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",

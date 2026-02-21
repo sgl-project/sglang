@@ -2,12 +2,13 @@
 
 from typing import List, Union
 
+from sglang.srt.models.points_gui import POINTSGUIModel
 from sglang.srt.models.points_v15_chat import POINTSV15ChatModel
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
 
 class POINTSV15ChatProcessor(QwenVLImageProcessor):
-    models = [POINTSV15ChatModel]
+    models = [POINTSV15ChatModel, POINTSGUIModel]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # Compatible with POINTSV15Chat
