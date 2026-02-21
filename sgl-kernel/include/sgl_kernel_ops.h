@@ -168,7 +168,6 @@ void downcast_fp8(
     int64_t mult,
     int64_t offset);
 
-void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 

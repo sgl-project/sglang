@@ -101,8 +101,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int mult, int offset) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
 
-  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
-  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
   m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
   m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
 
