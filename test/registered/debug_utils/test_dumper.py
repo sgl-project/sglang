@@ -106,6 +106,10 @@ class TestDumperConfig:
         d.configure_default(filter="from_code")
         assert d._config.filter == "from_code"
 
+    def test_from_env_whitespace_treated_as_unset(self):
+        with temp_set_env(DUMPER_FILTER="   "):
+            assert _DumperConfig.from_env().filter is None
+
     def test_may_enable_default_false(self):
         d = _Dumper(config=_DumperConfig())
         assert d.may_enable is False
