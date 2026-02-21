@@ -595,17 +595,25 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
-
+        server_args = get_global_server_args()
+        dispatch_info = None
+        if getattr(server_args, "enable_eplb", False):
+            dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            )
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=dispatch_info,
+            )
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
@@ -632,7 +640,12 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
-
+        server_args = get_global_server_args()
+        dispatch_info = None
+        if getattr(server_args, "enable_eplb", False):
+            dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            )
         if hidden_states.shape[0] > 0:
             if (
                 not self._fuse_shared_experts_inside_sbo
@@ -642,7 +655,11 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=dispatch_info,
+            )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
