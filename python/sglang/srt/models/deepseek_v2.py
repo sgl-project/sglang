@@ -683,13 +683,9 @@ class DeepseekV2MoE(nn.Module):
 
         # Waterfill: expand num_experts to include shared expert per rank
         self._will_enable_deepep_waterfill = will_enable_deepep_waterfill
-
-        # Waterfill: expand num_experts to include shared expert per rank
-        # New layout: each rank has (n_routed_experts // ep_size) + 1 experts
         if self._will_enable_deepep_waterfill:
-            # Each rank gets one extra expert slot for shared expert
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
-            top_k_for_moe = config.num_experts_per_tok + 1  # +1 for shared expert
+            top_k_for_moe = config.num_experts_per_tok + 1
         else:
             num_experts_for_moe = (
                 config.n_routed_experts + num_fused_shared_experts_in_moe_impl
@@ -714,8 +710,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # Note: For DeepEP Waterfill mode, TopK selects only routed experts.
-        # The shared expert slot is added by the Waterfill balancer during dispatch preparation.
+        # TopK selects routed experts only; waterfill balancer adds shared expert slot.
         self.topk = TopK(
             top_k=config.num_experts_per_tok + num_fused_shared_experts_in_moe_impl,
             layer_id=self.layer_id,
@@ -852,11 +847,7 @@ class DeepseekV2MoE(nn.Module):
             self._old_experts_per_rank = num_physical_routed_experts // self.moe_ep_size
 
     def _maybe_init_static_waterfill_weights(self):
-        """Compute / refresh static EPLB-derived per-rank weights if needed.
-
-        Detects EPLB rebalance via physical_to_logical_map data pointer change.
-        Set SGLANG_DISABLE_STATIC_WATERFILL=1 to force dynamic (all_reduce) path.
-        """
+        """Compute static EPLB-derived per-rank weights; detects rebalance via data pointer."""
         if not self._enable_deepep_waterfill:
             return
         if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
@@ -932,11 +923,7 @@ class DeepseekV2MoE(nn.Module):
                 self._static_wf_init_done = True
 
     def get_moe_weights(self):
-        # EPLB only manages routed experts.
-        # In DeepEP Waterfill mode, each rank has (routed + 1) local experts
-        # (the extra slot is for the shared expert). We use _old_experts_per_rank
-        # as the effective num_local_experts so the shape filter excludes the
-        # shared-expert slot automatically.
+        # In waterfill mode, use _old_experts_per_rank to exclude shared expert slot.
         if getattr(self, "_enable_deepep_waterfill", False) and hasattr(
             self, "_old_experts_per_rank"
         ):
@@ -1164,11 +1151,7 @@ class DeepseekV2MoE(nn.Module):
         device: torch.device,
         use_static_weights: bool,
     ) -> torch.Tensor:
-        """Handle the 0-token edge case in forward_deepep_waterfill.
-
-        Must participate in the same collectives as non-zero ranks to avoid
-        deadlocks, then return the empty MoE result.
-        """
+        """Zero-token edge case: participate in collectives to avoid deadlock."""
         from sglang.srt.distributed import get_moe_ep_group
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -1407,8 +1390,6 @@ class DeepseekV2MoE(nn.Module):
 
         router_logits = self.gate(hidden_states, forward_batch=forward_batch)
 
-        # If this forward uses padded tokens (e.g. CUDA-graph padding), pass num_token_non_padded
-        # so TopK masks padded region to -1. Otherwise, keep it as None to avoid extra overhead.
         num_token_non_padded = None
         num_token_non_padded_cpu = getattr(
             forward_batch, "num_token_non_padded_cpu", None
@@ -1427,15 +1408,14 @@ class DeepseekV2MoE(nn.Module):
                 layer_id=self.layer_id,
             ),
         )
-        topk_ids = topk_output.topk_ids  # [N, 8]
-        topk_weights = topk_output.topk_weights  # [N, 8]
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
 
         local_routed_counts = self.deepep_waterfill_balancer.count_local_routed(
             topk_ids
         )
 
         if _use_static_weights:
-            # Static path: use local counts directly (no all_reduce needed).
             global_routed_counts = local_routed_counts
             local_tokens_per_rank = None
         else:
@@ -1457,7 +1437,6 @@ class DeepseekV2MoE(nn.Module):
             else:
                 local_tokens_per_rank = None
 
-        # Waterfill assignment and expand topk to 9 columns
         expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
             self.deepep_waterfill_balancer.prepare_dispatch(
                 topk_ids,
@@ -1482,11 +1461,9 @@ class DeepseekV2MoE(nn.Module):
         combine_input = self.experts.run_moe_core(dispatch_output=dispatch_output)
         combined_hidden_states = dispatcher.combine(combine_input=combine_input)
 
-        # Apply routed scaling factor
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             combined_hidden_states *= self.routed_scaling_factor
 
-        # Match FusedMoE.forward_impl tail (optional TP/EP all-reduce)
         if getattr(self.experts, "reduce_results", False) and (
             getattr(self.experts, "moe_tp_size", 1) > 1
             or getattr(self.experts, "moe_ep_size", 1) > 1
