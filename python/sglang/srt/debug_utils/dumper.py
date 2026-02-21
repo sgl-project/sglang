@@ -96,7 +96,7 @@ class _BaseConfig(ABC):
         if not pairs:
             return {}
 
-        _missing = object()
+        missing = object()
         defaults = {f.name: f.default for f in fields(cls)}
         result: dict = {}
 
@@ -104,8 +104,8 @@ class _BaseConfig(ABC):
             key, sep, value = pair.partition("=")
             if not sep:
                 raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
-            default = defaults.get(key, _missing)
-            if default is _missing:
+            default = defaults.get(key, missing)
+            if default is missing:
                 raise ValueError(
                     f"Unknown config key {key!r}. Valid keys: {sorted(defaults)}"
                 )
