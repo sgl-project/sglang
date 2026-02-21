@@ -38,7 +38,6 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     return x, residual
 
 
-
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
@@ -56,7 +55,6 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
         y = sgl_kernel.rmsnorm(x, w, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
-
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

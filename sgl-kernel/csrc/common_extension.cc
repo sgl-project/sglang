@@ -66,7 +66,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
-
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
 
