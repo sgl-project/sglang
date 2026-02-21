@@ -385,7 +385,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -402,7 +402,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.max_seq_len_k = seq_lens.max().item()
 
@@ -509,6 +508,62 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+            )
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+            ]
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+        elif forward_mode.is_draft_extend_v2():
+            metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens)
+
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+
+            extend_seq_lens_tensor: Optional[torch.Tensor] = getattr(
+                spec_info, "extend_seq_lens_tensor", None
+            )
+            extend_seq_lens_cpu: Optional[list[int]] = getattr(
+                spec_info, "extend_seq_lens_cpu", None
+            )
+            if extend_seq_lens_tensor is not None:
+                extend_seq_lens = extend_seq_lens_tensor.to(torch.int32)
+            elif extend_seq_lens_cpu is not None:
+                extend_seq_lens = torch.as_tensor(
+                    extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+            else:
+                default_extend: int = getattr(
+                    spec_info,
+                    "num_tokens_per_req",
+                    self.speculative_num_draft_tokens or 1,
+                )
+                extend_seq_lens = torch.full(
+                    (bs,), default_extend, dtype=torch.int32, device=seq_lens.device
+                )
+                extend_seq_lens_cpu = [default_extend] * bs
+
+            if extend_seq_lens_cpu:
+                metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
+            else:
+                metadata.max_seq_len_q = getattr(
+                    spec_info,
+                    "num_tokens_per_req",
+                    self.speculative_num_draft_tokens or 1,
+                )
+
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
