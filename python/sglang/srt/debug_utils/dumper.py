@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 
 import torch
@@ -624,28 +625,40 @@ def _torch_save(value, path: str):
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
+def _map_tensor_in_value(
+    value, fn: Callable[[torch.Tensor], torch.Tensor]
+):
+    """Apply *fn* to the tensor inside *value* (bare tensor or ``{"value": tensor, ...}`` dict)."""
+    if isinstance(value, dict) and isinstance(value.get("value"), torch.Tensor):
+        mapped = fn(value["value"])
+        if mapped is not value["value"]:
+            return {**value, "value": mapped}
+        return value
+    if isinstance(value, torch.Tensor):
+        return fn(value)
+    return value
+
+
 def _clone_if_view(value):
+    """Clone tensors whose underlying storage is larger than their data to avoid bloated saves."""
+
     def _maybe_clone(t: torch.Tensor) -> torch.Tensor:
         if t.untyped_storage().nbytes() > t.nelement() * t.element_size():
             return t.clone()
         return t
 
-    if isinstance(value, dict) and isinstance(value.get("value"), torch.Tensor):
-        cloned = _maybe_clone(value["value"])
-        if cloned is not value["value"]:
-            return {**value, "value": cloned}
-    elif isinstance(value, torch.Tensor):
-        return _maybe_clone(value)
-    return value
+    return _map_tensor_in_value(value, _maybe_clone)
 
 
 def _strip_parameter(value):
     """Strip nn.Parameter to plain Tensor so it can be pickled."""
-    if isinstance(value, torch.nn.Parameter):
-        return value.data
-    if isinstance(value, dict) and isinstance(value.get("value"), torch.nn.Parameter):
-        return {**value, "value": value["value"].data}
-    return value
+
+    def _maybe_strip(t: torch.Tensor) -> torch.Tensor:
+        if isinstance(t, torch.nn.Parameter):
+            return t.data
+        return t
+
+    return _map_tensor_in_value(value, _maybe_strip)
 
 
 def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
