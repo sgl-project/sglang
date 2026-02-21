@@ -4523,8 +4523,8 @@ class ServerArgs:
             action="store_true",
             help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
             "When enabled, graph breaks are inserted so every operation runs eagerly "
-            "while still going through the CUDA graph capture/replay path. "
-            "Useful for debugging CUDA graph capture issues.",
+            "while still going through the CUDA graph capture / replay path. "
+            "Useful for debugging CUDA graph capture / replay issues.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",

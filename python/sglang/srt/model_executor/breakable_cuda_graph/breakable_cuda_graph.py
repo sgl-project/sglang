@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,7 +16,11 @@ from contextvars import ContextVar
 from typing import Any, Callable, NamedTuple, Self
 
 import torch
-from cuda.bindings import runtime as rt
+
+try:
+    from cuda.bindings import runtime as rt
+except ImportError:
+    rt = None
 
 from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
 
@@ -55,7 +59,7 @@ def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
     return stream
 
 
-def _capture_status(stream_ptr: int) -> rt.cudaStreamCaptureStatus:
+def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
     status, *_ = checkCudaErrors(rt.cudaStreamGetCaptureInfo(stream_ptr))
     return status
 

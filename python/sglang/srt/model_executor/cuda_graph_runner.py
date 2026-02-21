@@ -549,14 +549,17 @@ class CudaGraphRunner:
             assert (
                 envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
             ), "Breakable CUDA graph is not enabled in debug mode"
+        
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
 
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+            if memory_saver_adapter.enabled:
+                raise NotImplementedError()
             graph_ctx = BreakableCUDAGraphContext
         else:
-            memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=self.model_runner.server_args.enable_memory_saver
-                and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
-            )
             graph_ctx = (
                 partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
                 if memory_saver_adapter.enabled
