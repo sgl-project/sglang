@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "context_len": 2048,
     "max_bs": 64,
     "hidden_size": 5120,
-    "index_n_heads": 1,
+    "index_n_heads": 32,
     "index_head_dim": 128,
     "rope_head_dim": 64,
     "index_topk": 64,
