@@ -942,7 +942,7 @@ class TestDumpModel:
         filenames = _get_filenames(tmp_path)
         assert all("grad" not in f for f in filenames)
 
-    def test_parameter_saved_as_data(self, tmp_path):
+    def test_parameter_saved_as_parameter(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_model_grad=False)
         model = torch.nn.Linear(4, 2, bias=False)
 
@@ -950,8 +950,25 @@ class TestDumpModel:
 
         path = _find_dump_file(tmp_path, name="p__weight")
         loaded = _load_dump(path)
+        assert isinstance(loaded["value"], torch.nn.Parameter)
+        assert torch.equal(loaded["value"], model.weight)
+
+    def test_unpicklable_parameter_falls_back_to_data(self, tmp_path):
+        class BadParam(torch.nn.Parameter):
+            def __reduce_ex__(self, protocol):
+                raise RuntimeError("not pickleable")
+
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+        model.weight = BadParam(model.weight.data)
+
+        d.dump_model(model, name_prefix="p")
+
+        path = _find_dump_file(tmp_path, name="p__weight")
+        loaded = _load_dump(path)
         assert isinstance(loaded["value"], torch.Tensor)
         assert not isinstance(loaded["value"], torch.nn.Parameter)
+        assert torch.equal(loaded["value"], model.weight.data)
 
     def test_disable_model_value(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_model_value=False)

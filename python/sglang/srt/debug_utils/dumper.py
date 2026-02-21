@@ -437,7 +437,7 @@ class _Dumper:
         capturing = self._state.captured_output_data is not None
         if save and (self._config.enable_output_file or capturing):
             output_data = {
-                "value": value.data if isinstance(value, torch.nn.Parameter) else value,
+                "value": value,
                 "meta": dict(**full_kwargs, **self._static_meta),
             }
 
@@ -618,6 +618,13 @@ def _torch_save(value, path: str):
                 if isinstance(value, torch.nn.Parameter):
                     print(f"[Dumper] Observe error={e} and try pickling value.data")
                     return _torch_save(value.data, path)
+                if isinstance(value, dict) and isinstance(
+                    value.get("value"), torch.nn.Parameter
+                ):
+                    print(f"[Dumper] Observe error={e} and try pickling value.data")
+                    return _torch_save(
+                        {**value, "value": value["value"].data}, path
+                    )
             raise
     except Exception as e:
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
