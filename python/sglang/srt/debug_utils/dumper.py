@@ -684,7 +684,10 @@ def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
             print(f"[Dumper] Cleaned up {entry}")
 
     if dist.is_initialized():
-        dist.barrier()
+        _collective_with_timeout(
+            dist.barrier,
+            operation_name="barrier in _cleanup_old_dumps",
+        )
 
 
 def _get_rank():
