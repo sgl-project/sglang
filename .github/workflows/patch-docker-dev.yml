@@ -33,7 +33,7 @@ jobs:
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
           docker pull "${IMAGE}"
-          BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD)
+          BASE_SHA=$(docker run --rm --entrypoint git "${IMAGE}" -C /sgl-workspace/sglang rev-parse HEAD)
           echo "Image built from commit: ${BASE_SHA}"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
