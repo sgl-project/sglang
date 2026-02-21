@@ -221,24 +221,11 @@ Once the generation task has finished, the server will shut down automatically.
 
 SGLang diffusion allows you to override any pipeline component (e.g., `vae`, `transformer`, `text_encoder`) by specifying a custom checkpoint path. This is useful for:
 
-### Dynamic `--<component>-path` Convention
+### Example: FLUX.2-dev with Tiny AutoEncoder
 
 You can override **any** component by using `--<component>-path`, where `<component>` matches the key in the model's `model_index.json`:
 
-```bash
-# Override VAE (shorthand: --vae-path)
---vae-path=/path/to/custom/vae
-```
-
-**Important:**
-- The component key must match the one in your model's `model_index.json` (e.g., `vae`).
-- The path must:
-  - either be a Huggingface Repo ID (e.g., fal/FLUX.2-Tiny-AutoEncoder)
-  - or point to a **complete component folder**, containing `config.json` and safetensors files
-
-### Example: FLUX.2-dev with Tiny AutoEncoder
-
-Replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
+For example, replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
 
 ```bash
 sglang serve \
@@ -248,6 +235,13 @@ sglang serve \
   # or use a local path
   --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
 ```
+
+**Important:**
+- The component key must match the one in your model's `model_index.json` (e.g., `vae`).
+- The path must:
+    - either be a Huggingface Repo ID (e.g., fal/FLUX.2-Tiny-AutoEncoder)
+    - or point to a **complete component folder**, containing `config.json` and safetensors files
+
 
 ## Diffusers Backend
 
