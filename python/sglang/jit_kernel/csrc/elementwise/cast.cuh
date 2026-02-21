@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicDevice, SymbolicSize
+#include <sgl_kernel/type.cuh>  // For ConvertToFP8, ConvertFromFloat
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
@@ -11,48 +12,6 @@
 #include <cstdint>
 
 namespace {
-
-template <typename T>
-struct ConvertToFP8 {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(T value) {
-    return 0;
-  }
-};
-
-template <>
-struct ConvertToFP8<__nv_bfloat16> {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(__nv_bfloat16 value) {
-    return __nv_cvt_bfloat16raw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
-  }
-};
-
-template <>
-struct ConvertToFP8<__half> {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(__half value) {
-    return __nv_cvt_halfraw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
-  }
-};
-
-template <typename T>
-struct ConvertFromFloat {
-  static __device__ T convert_from_float(float value) {
-    return 0;
-  }
-};
-
-template <>
-struct ConvertFromFloat<__nv_bfloat16> {
-  static __device__ __nv_bfloat16 convert_from_float(float value) {
-    return __float2bfloat16(value);
-  }
-};
-
-template <>
-struct ConvertFromFloat<__half> {
-  static __device__ __half convert_from_float(float value) {
-    return __float2half(value);
-  }
-};
 
 template <typename T>
 __global__ void fused_downcast_kernel(
