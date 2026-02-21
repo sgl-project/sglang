@@ -862,16 +862,17 @@ class TestReset:
         assert "dump_index=1" in post_file.name
 
 
+def _dumper_worker(rank, http_port: int, stop_event):
+    """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
+    dumper.configure(enable=False, server_port=str(http_port))
+    dumper.step()
+    stop_event.wait()
+
+
 class TestZmqPortIsolation:
     """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
 
     NUM_INSTANCES = 3
-
-    @staticmethod
-    def _worker(rank, http_port: int, stop_event):
-        dumper.configure(enable=False, server_port=str(http_port))
-        dumper.step()
-        stop_event.wait()
 
     def test_concurrent_instances_no_port_conflict(self):
         ports = [
@@ -886,7 +887,7 @@ class TestZmqPortIsolation:
             stop_events.append(stop_event)
             thread = threading.Thread(
                 target=run_distributed_test,
-                args=(self._worker,),
+                args=(_dumper_worker,),
                 kwargs={"http_port": port, "stop_event": stop_event},
             )
             thread.start()
@@ -934,7 +935,7 @@ class TestDumperHttp:
             stop_event = multiprocessing.get_context("spawn").Event()
             thread = threading.Thread(
                 target=run_distributed_test,
-                args=(TestDumperHttp._standalone_mode_worker,),
+                args=(_dumper_worker,),
                 kwargs={"http_port": http_port, "stop_event": stop_event},
             )
             thread.start()
@@ -958,12 +959,6 @@ class TestDumperHttp:
                 yield base_url
             finally:
                 kill_process_tree(proc.pid)
-
-    @staticmethod
-    def _standalone_mode_worker(rank, http_port: int, stop_event):
-        dumper.configure(enable=False, server_port=str(http_port))
-        dumper.step()
-        stop_event.wait()
 
     @staticmethod
     def _wait_for_http(url: str, timeout: float = 30) -> None:
