@@ -1,9 +1,9 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicDevice, SymbolicSize
-#include <sgl_kernel/type.cuh>  // For ConvertToFP8, ConvertFromFloat
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
+#include <sgl_kernel/type.cuh>   // For ConvertToFP8, ConvertFromFloat
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 
 #include <dlpack/dlpack.h>
