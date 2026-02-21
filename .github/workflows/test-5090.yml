@@ -1,0 +1,56 @@
+name: 5090 GPU Test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/test-5090.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: 5090-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUNNER_LABELS: 1-gpu-5090
+  SGLANG_IS_IN_CI: "true"
+
+jobs:
+  # Run stage-a-test-1-5090 suite on 5090 GPUs (32GB memory compatible)
+  stage-a-test-1-5090:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-5090
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        env:
+          IS_BLACKWELL: "1"
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run stage-a-test-1-5090
+        timeout-minutes: 30
+        run: |
+          source /etc/profile.d/sglang-ci.sh
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-a-test-1-5090 --continue-on-error
+
+  summary:
+    needs: [stage-a-test-1-5090]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## 5090 GPU Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Running stage-a-test-1-5090 suite on RTX 5090 GPUs (32GB)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| stage-a-test-1-5090 | ${{ needs.stage-a-test-1-5090.result }} |" >> $GITHUB_STEP_SUMMARY
