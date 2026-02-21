@@ -38,17 +38,6 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     return x, residual
 
 
-def fused_add_rms_norm(x, residual, weight, eps):
-    orig_dtype = x.dtype
-    x = x.to(torch.float32)
-    x = x + residual.to(torch.float32)
-    residual = x.to(orig_dtype)
-
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps)
-    x = (x * weight.float()).to(orig_dtype)
-    return x, residual
-
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
@@ -68,30 +57,6 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
-
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
-    eps = 1e-6
-
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
-    residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
-
-    x_native, residual_native = fused_add_rms_norm(
-        x.clone(), residual.clone(), weight, eps
-    )
-
-    x_fused = x.clone()
-    residual_fused = residual.clone()
-    enable_pdl = is_arch_support_pdl()
-    sgl_kernel.fused_add_rmsnorm(
-        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
-    )
-
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

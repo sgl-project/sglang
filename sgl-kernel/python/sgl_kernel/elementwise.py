@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
+import flashinfer
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
 
@@ -76,11 +77,7 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_arch_support_pdl()
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    flashinfer.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
 
 def gemma_rmsnorm(
