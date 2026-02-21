@@ -96,16 +96,6 @@ class AutoRoundConfig(QuantizationConfig):
         return ["quantization_config.json"]
 
     @classmethod
-    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        """Detect MXFP8 format in AutoRound checkpoints."""
-        if hf_quant_cfg is None:
-            return None
-        data_type = hf_quant_cfg.get("data_type", "").lower()
-        if data_type in ("mx_fp", "mxfp", "mxfp8"):
-            return "mxfp8"
-        return None
-
-    @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AutoRoundConfig":
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
