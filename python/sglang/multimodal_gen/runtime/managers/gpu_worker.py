@@ -164,12 +164,12 @@ class GPUWorker:
         peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
         peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
 
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024 ** 2)
-        peak_reserved_gb = peak_reserved_bytes / (1024 ** 3)
-        peak_allocated_gb = peak_allocated_bytes / (1024 ** 3)
+        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_gb = peak_reserved_bytes / (1024**3)
+        peak_allocated_gb = peak_allocated_bytes / (1024**3)
 
         remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024 ** 3) - peak_reserved_gb
+            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
         suggested_args = set()
@@ -299,7 +299,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-                           or self.server_args.dit_layerwise_offload,
+            or self.server_args.dit_layerwise_offload,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
