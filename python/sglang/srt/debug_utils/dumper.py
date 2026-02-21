@@ -18,11 +18,11 @@ from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 import torch
 import torch.distributed as dist
 
-# -------------------------------------- frozen config base ------------------------------------------
+# -------------------------------------- config base ------------------------------------------
 
 
 @dataclass(frozen=True)
-class _FrozenConfig(ABC):
+class _BaseConfig(ABC):
     def __post_init__(self) -> None:
         self._verify_types()
 
@@ -49,7 +49,7 @@ class _FrozenConfig(ABC):
         return f"{cls._env_prefix()}{field_name.upper()}"
 
     @classmethod
-    def from_env(cls) -> "_FrozenConfig":
+    def from_env(cls) -> "_BaseConfig":
         return cls(
             **{
                 f.name: cls._parse_env_field(cls._env_name(f.name), f.default)
@@ -57,7 +57,7 @@ class _FrozenConfig(ABC):
             }
         )
 
-    def with_defaults(self, **kwargs) -> "_FrozenConfig":
+    def with_defaults(self, **kwargs) -> "_BaseConfig":
         cls = type(self)
         actual = {
             key: value
@@ -75,7 +75,7 @@ class _FrozenConfig(ABC):
 
     @staticmethod
     def _parse_env_field(env_name: str, default):
-        return _FrozenConfig._parse_env_value(os.getenv(env_name), default)
+        return _BaseConfig._parse_env_value(os.getenv(env_name), default)
 
     @staticmethod
     def _parse_env_value(raw, default):
@@ -87,12 +87,49 @@ class _FrozenConfig(ABC):
             return int(raw)
         return raw
 
+    @classmethod
+    def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_BaseConfig":
+        """Parse ``key=value`` CLI pairs into a fully-populated config.
+
+        Values are coerced based on the target field's type
+        (bool fields: ``true``/``1`` → True; int fields: parsed as int;
+        str fields: kept as-is).  Unspecified fields use their defaults.
+        """
+        return cls(**cls._kv_pairs_to_dict(pairs))
+
+    @classmethod
+    def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
+        """Parse ``key=value`` pairs into a validated, typed override dict.
+
+        Only keys that appear in *pairs* are included in the returned dict,
+        which makes it suitable for ``replace()`` / ``configure()`` merges
+        where unset fields should keep their previous value.
+        """
+        if not pairs:
+            return {}
+
+        valid_fields = {f.name: f for f in fields(cls)}
+        result: dict = {}
+
+        for pair in pairs:
+            key, sep, value = pair.partition("=")
+            if not sep:
+                raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
+            if key not in valid_fields:
+                raise ValueError(
+                    f"Unknown config key {key!r}. "
+                    f"Valid keys: {sorted(valid_fields)}"
+                )
+            result[key] = _BaseConfig._parse_env_value(value, valid_fields[key].default)
+
+        return result
+
 
 _DEFAULT_EXP_NAME_PREFIX = "dump_"
 
 
 @dataclass(frozen=True)
-class _DumperConfig(_FrozenConfig):
+class _DumperConfig(_BaseConfig):
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp/dumper"
@@ -123,33 +160,6 @@ class _DumperConfig(_FrozenConfig):
         if port <= 0:
             return None
         return port
-
-    @classmethod
-    def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_DumperConfig":
-        return cls(**cls._kv_pairs_to_dict(pairs))
-
-    @classmethod
-    def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
-        if not pairs:
-            return {}
-
-        valid_fields = {f.name: f for f in fields(cls)}
-        result: dict = {}
-
-        for pair in pairs:
-            key, sep, value = pair.partition("=")
-            if not sep:
-                raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
-            if key not in valid_fields:
-                raise ValueError(
-                    f"Unknown config key {key!r}. "
-                    f"Valid keys: {sorted(valid_fields)}"
-                )
-            result[key] = _FrozenConfig._parse_env_value(
-                value, valid_fields[key].default
-            )
-
-        return result
 
 
 # -------------------------------------- dumper core ------------------------------------------
