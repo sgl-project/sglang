@@ -69,6 +69,20 @@ class ShutdownReq:
     pass
 
 
+@dataclass
+class ReleaseMemoryOccupationReq:
+    """Request to release GPU memory (sleep). Offloads model weights to CPU."""
+
+    tags: Optional[List[str]] = None
+
+
+@dataclass
+class ResumeMemoryOccupationReq:
+    """Request to resume GPU memory (wake up). Loads model weights back to GPU."""
+
+    tags: Optional[List[str]] = None
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],

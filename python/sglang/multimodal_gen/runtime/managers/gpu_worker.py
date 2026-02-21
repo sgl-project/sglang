@@ -402,6 +402,137 @@ class GPUWorker:
             self.pipeline.model_path = model_path
         return success, message
 
+    # Module names that may have layerwise offload managers (DiT variants).
+    _DIT_MODULE_NAMES = frozenset(
+        {"transformer", "transformer_2", "video_dit", "video_dit_2", "audio_dit"}
+    )
+
+    def release_memory_occupation(self, tags: list[str] | None = None) -> dict:
+        """Offload all pipeline module weights from GPU to CPU (sleep).
+
+        Args:
+            tags: Which memory regions to release.  Currently only ``"weights"``
+                  is meaningful for diffusion.  ``None`` means release all.
+
+        Notes on layerwise offload (--dit-layerwise-offload):
+            When a DiT uses LayerwiseOffloadManager, the real weights already
+            live in pinned CPU buffers; GPU tensors are replaced by small
+            placeholder tensors after each forward pass.  Calling
+            ``module.to("cpu")`` would only move those placeholders and would
+            leave the CPU buffers intact but the module pointers broken.
+            Instead we call ``manager.release_all()`` which collapses all GPU
+            tensors back to (1,) placeholders while keeping the CPU buffers
+            and forward hooks fully intact.  The next forward pass will work
+            correctly once ``prepare_for_next_req`` is called on wake-up.
+
+        Notes on multi-GPU (TP / SP / CFG parallelism):
+            Each rank runs its own GPUWorker.  This method is called on every
+            rank because ``Scheduler.recv_reqs()`` already broadcasts all
+            incoming requests to every participating rank via
+            ``broadcast_pyobj``.  No extra broadcast is needed here.
+        """
+        if not self.pipeline:
+            return {"success": False, "message": "Pipeline is not initialized"}
+
+        # tags=None → release all; tags without "weights" → nothing to do.
+        if tags is not None and "weights" not in tags:
+            return {
+                "success": True,
+                "message": "No applicable tags for diffusion (only 'weights' is supported)",
+            }
+
+        offloaded_modules: list[str] = []
+
+        for name, module in self.pipeline.modules.items():
+            if not isinstance(module, torch.nn.Module):
+                continue
+            try:
+                if (
+                    name in self._DIT_MODULE_NAMES
+                    and self.server_args.dit_layerwise_offload
+                    and isinstance(module, OffloadableDiTMixin)
+                    and module.layerwise_offload_managers
+                ):
+                    # Layerwise-offload path: release GPU tensors via the
+                    # managers; hooks and CPU buffers remain intact.
+                    for manager in module.layerwise_offload_managers:
+                        manager.release_all()
+                    offloaded_modules.append(f"{name}(layerwise)")
+                else:
+                    # Standard path: move the entire module to CPU.
+                    module.to(torch.device("cpu"))
+                    offloaded_modules.append(name)
+            except Exception as e:
+                logger.warning(f"Failed to offload module '{name}' to CPU: {e}")
+
+        # Release the GPU memory pool that was holding the now-offloaded tensors.
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        logger.info(f"Released GPU memory. Offloaded modules: {offloaded_modules}")
+        return {
+            "success": True,
+            "message": f"Released memory for modules: {offloaded_modules}",
+        }
+
+    def resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
+        """Load all pipeline module weights back to GPU (wake up).
+
+        Args:
+            tags: Which memory regions to resume.  Currently only ``"weights"``
+                  is meaningful for diffusion.  ``None`` means resume all.
+
+        Notes on layerwise offload (--dit-layerwise-offload):
+            After ``release_all()`` the forward hooks are still registered, so
+            we only need to reload the first ``prefetch_size`` layers via
+            ``prepare_for_next_req(non_blocking=False)``.  The hooks will
+            automatically prefetch/release the remaining layers during forward.
+            We do **not** call ``load_all_layers()`` here; that would be wasteful
+            since the forward hooks are designed to do exactly that on-demand.
+
+        Notes on multi-GPU: see ``release_memory_occupation``.
+        """
+        if not self.pipeline:
+            return {"success": False, "message": "Pipeline is not initialized"}
+
+        if tags is not None and "weights" not in tags:
+            return {
+                "success": True,
+                "message": "No applicable tags for diffusion (only 'weights' is supported)",
+            }
+
+        device = torch.device(f"cuda:{self.local_rank}")
+        resumed_modules: list[str] = []
+
+        for name, module in self.pipeline.modules.items():
+            if not isinstance(module, torch.nn.Module):
+                continue
+            try:
+                if (
+                    name in self._DIT_MODULE_NAMES
+                    and self.server_args.dit_layerwise_offload
+                    and isinstance(module, OffloadableDiTMixin)
+                    and module.layerwise_offload_managers
+                ):
+                    # Layerwise-offload path: prefetch the initial layers so
+                    # the first denoising step is ready; hooks handle the rest.
+                    for manager in module.layerwise_offload_managers:
+                        manager.prepare_for_next_req(non_blocking=False)
+                    resumed_modules.append(f"{name}(layerwise)")
+                else:
+                    # Standard path: move the entire module back to GPU.
+                    module.to(device)
+                    resumed_modules.append(name)
+            except Exception as e:
+                logger.warning(f"Failed to resume module '{name}' to GPU: {e}")
+
+        logger.info(f"Resumed GPU memory. Restored modules: {resumed_modules}")
+        return {
+            "success": True,
+            "message": f"Resumed memory for modules: {resumed_modules}",
+        }
+
     def get_weights_checksum(
         self, module_names: list[str] | None = None
     ) -> dict[str, str]:

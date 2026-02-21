@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseMemoryOccupationReq,
+    ResumeMemoryOccupationReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -97,7 +99,12 @@ class Scheduler:
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReq: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReq: self._handle_resume_memory_occupation,
         }
+
+        # Sleep/wake state: when True, generation requests are rejected
+        self.is_sleeping = False
 
         # FIFO, new reqs are appended
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
@@ -156,7 +163,61 @@ class Scheduler:
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
         return OutputBatch(output=checksums)
 
+    def _handle_release_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        """Handle sleep request: offload model weights to CPU.
+
+        Notes on multi-GPU (TP / SP / CFG parallelism):
+            ``recv_reqs()`` already broadcasts every incoming request to all
+            participating ranks via ``broadcast_pyobj``.  Therefore this handler
+            is executed on *every* rank, each rank offloads its own GPU, and only
+            rank 0 (``self.receiver is not None``) sends back the ZMQ reply.
+            No additional inter-rank coordination is required here.
+        """
+        if self.is_sleeping:
+            return OutputBatch(
+                output={"success": True, "message": "Already sleeping"},
+            )
+        # Refuse while generation requests are queued to avoid mid-inference offload.
+        has_pending_generation = any(
+            isinstance(item[1], Req) for item in self.waiting_queue
+        )
+        if has_pending_generation:
+            return OutputBatch(
+                error="Cannot release memory while generation requests are pending. "
+                "Wait for all requests to finish first.",
+            )
+        req = reqs[0]
+        result = self.worker.release_memory_occupation(tags=req.tags)
+        if result.get("success"):
+            self.is_sleeping = True
+        return OutputBatch(
+            output=result,
+            error=None if result.get("success") else result.get("message"),
+        )
+
+    def _handle_resume_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        """Handle wake up request: load model weights back to GPU.
+
+        Notes on multi-GPU: see ``_handle_release_memory_occupation``.
+        """
+        if not self.is_sleeping:
+            return OutputBatch(
+                output={"success": True, "message": "Already awake"},
+            )
+        req = reqs[0]
+        result = self.worker.resume_memory_occupation(tags=req.tags)
+        if result.get("success"):
+            self.is_sleeping = False
+        return OutputBatch(
+            output=result,
+            error=None if result.get("success") else result.get("message"),
+        )
+
     def _handle_generation(self, reqs: List[Req]):
+        if self.is_sleeping:
+            return OutputBatch(
+                error="Server is sleeping. Call /resume_memory_occupation to wake up before sending generation requests."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
