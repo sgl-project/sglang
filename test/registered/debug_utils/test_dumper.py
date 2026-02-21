@@ -1542,21 +1542,12 @@ class TestDumperE2E:
             env=env,
         )
         try:
-            # Warm-up: trigger forward pass so step() calls _ensure_http_server()
-            # and sets up ZMQ RPC broadcast across all TP ranks.
-            resp = requests.post(
-                f"{base_url}/generate",
-                json={"text": "Hi", "sampling_params": {"max_new_tokens": 1}},
-            )
-            assert resp.status_code == 200, f"Warm-up generate failed: {resp.text}"
-
             states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
                 assert state["config"]["enable"] is False
                 assert state["step"] == 0
 
-            # Enable dumper via HTTP — ZMQ broadcasts to all ranks
             requests.post(
                 f"{base_url}/dumper/configure",
                 json={"enable": True, "dir": dump_dir},

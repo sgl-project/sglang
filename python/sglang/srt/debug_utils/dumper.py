@@ -241,6 +241,7 @@ class _Dumper:
         self,
         model: "torch.nn.Module",
     ) -> Optional["_NonIntrusiveDumper"]:
+        self._ensure_http_server()
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
