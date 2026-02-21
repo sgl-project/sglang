@@ -845,6 +845,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if gdn_backend == "flashinfer":
             try:
+                # gated_delta_rule_decode_pretranspose requires flashinfer >= 0.6.4
                 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
                 self._flashinfer_pretranspose = gated_delta_rule_decode_pretranspose
@@ -852,7 +853,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             except ImportError:
                 rank0_log(
                     "FlashInfer GDN backend requested but not available "
-                    "(missing flashinfer.gdn_decode). Falling back to FLA decode kernel."
+                    "(missing flashinfer.gdn_decode; requires flashinfer >= 0.6.4). "
+                    "Falling back to FLA decode kernel."
                 )
                 gdn_backend = "triton"
                 self._flashinfer_pretranspose = None
