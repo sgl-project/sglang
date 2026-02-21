@@ -120,7 +120,15 @@ class _BaseConfig(ABC):
                     f"Unknown config key {key!r}. "
                     f"Valid keys: {sorted(valid_fields)}"
                 )
-            result[key] = _BaseConfig._parse_env_value(value, valid_fields[key].default)
+            try:
+                result[key] = _BaseConfig._parse_env_value(
+                    value, valid_fields[key].default
+                )
+            except (ValueError, TypeError) as exc:
+                field_type = type(valid_fields[key].default).__name__
+                raise TypeError(
+                    f"{key}: expected {field_type}, got {value!r}"
+                ) from exc
 
         return result
 
