@@ -1,19 +1,15 @@
 import inspect
 import re
 import time
-from math import sqrt
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import numpy as np
-import PIL
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -87,22 +83,6 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
-    sample_mode: str = "sample",
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-
 class GlmImageBeforeDenoisingStage(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
@@ -119,8 +99,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             Tokenizer for the text encoder.
         processor (`AutoProcessor`):
             Processor for the AR model to handle chat templates and tokenization.
-        vision_language_encoder ([`GlmImageForConditionalGeneration`]):
-            The AR model that generates image tokens from text prompts.
+        vision_language_encoder:
+            SGLang Engine instance for the AR model that generates image tokens from text prompts.
         transformer ([`GlmImageTransformer2DModel`]):
             A text conditioned transformer to denoise the encoded image latents (DiT).
         scheduler ([`SchedulerMixin`]):
@@ -142,7 +122,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.processor = processor
         self.text_encoder = text_encoder
-        self.vision_language_encoder = vision_language_encoder
+        self.ar_engine = vision_language_encoder
         self.vae = vae
         self.transformer = transformer
         self.scheduler = scheduler
@@ -161,136 +141,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             and hasattr(self.transformer.config, "sample_size")
             else 128
         )
-
-    def _parse_and_expand_shape_info(
-        self, prompt: str
-    ) -> Tuple[str, int, int, int, int]:
-        """
-        Parse the shape info from prompt and expand it for AR model.
-
-        Args:
-            prompt: The prompt containing <sop>H W<eop> shape specification
-
-        Returns:
-            Tuple of (expanded_prompt, token_h, token_w, prev_token_h, prev_token_w)
-        """
-        match = re.search(r"<sop>(\d+)\s+(\d+)<eop>", prompt)
-        if match is None:
-            raise ValueError(
-                f"Prompt must contain shape info in format '<sop>H W<eop>', got: {prompt}"
-            )
-
-        token_h, token_w = int(match.group(1)), int(match.group(2))
-        ratio = token_h / token_w
-        prev_token_h = int(sqrt(ratio) * 16)
-        prev_token_w = int(sqrt(1 / ratio) * 16)
-
-        old_shape = f"<sop>{token_h} {token_w}<eop>"
-        new_shape = (
-            f"<sop>{token_h} {token_w}<eop><sop>{prev_token_h} {prev_token_w}<eop>"
-        )
-        expanded_prompt = prompt.replace(old_shape, new_shape)
-
-        return expanded_prompt, token_h, token_w, prev_token_h, prev_token_w
-
-    def _build_image_grid_thw(
-        self,
-        token_h: int,
-        token_w: int,
-        prev_token_h: int,
-        prev_token_w: int,
-        existing_grid: Optional[torch.Tensor] = None,
-        device: Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        """
-        Build image grid tensor for AR model.
-
-        For text-to-image: creates grid for large image + small image For image-to-image: appends new image to existing
-        grid
-        """
-        if existing_grid is None or existing_grid.numel() == 0:
-            # Text-to-image: large image + small image
-            return torch.tensor(
-                [
-                    [1, token_h, token_w],
-                    [1, prev_token_h, prev_token_w],
-                ],
-                device=device,
-            )
-        else:
-            # Image-to-image: append to existing
-            return torch.cat(
-                [existing_grid, torch.tensor([[1, token_h, token_w]], device=device)],
-                dim=0,
-            )
-
-    def _calculate_ar_generation_params(
-        self,
-        token_h: int,
-        token_w: int,
-        prev_token_h: int,
-        prev_token_w: int,
-        is_text_to_image: bool,
-    ) -> Tuple[int, int]:
-        """
-        Calculate max_new_tokens and large_image_start_offset for AR generation.
-        """
-        large_image_tokens = token_h * token_w
-        small_image_tokens = prev_token_h * prev_token_w
-
-        if is_text_to_image:
-            max_new_tokens = small_image_tokens + large_image_tokens + 1
-            large_image_start_offset = small_image_tokens
-        else:
-            max_new_tokens = large_image_tokens + 1
-            large_image_start_offset = 0
-
-        return max_new_tokens, large_image_start_offset
-
-    def _extract_large_image_tokens(
-        self,
-        outputs: torch.Tensor,
-        input_length: int,
-        large_image_start_offset: int,
-        large_image_tokens: int,
-    ) -> torch.Tensor:
-        """
-        Extract the large image tokens from AR model output.
-        """
-        generated_tokens = outputs[0][input_length:]
-        large_image_start = large_image_start_offset
-        large_image_end = large_image_start + large_image_tokens
-        return generated_tokens[large_image_start:large_image_end]
-
-    def _upsample_d32_to_d16(
-        self, token_ids: torch.Tensor, token_h: int, token_w: int
-    ) -> torch.Tensor:
-        """
-        Upsample token IDs from d32 format to d16 format.
-
-        AR model generates tokens at d32 resolution (each token = 32x32 pixels). DiT expects tokens at d16 resolution
-        (each token = 16x16 pixels). This function performs 2x nearest-neighbor upsampling.
-
-        Args:
-            token_ids: Token IDs of shape [N] where N = token_h * token_w
-            token_h: Height in d32 token units
-            token_w: Width in d32 token units
-
-        Returns:
-            Upsampled token IDs of shape [1, N*4] where N*4 = (token_h*2) * (token_w*2)
-        """
-        # Reshape to spatial format: [1, 1, H, W]
-        token_ids = token_ids.view(1, 1, token_h, token_w)
-
-        # 2x nearest-neighbor upsampling
-        token_ids = torch.nn.functional.interpolate(
-            token_ids.float(), scale_factor=2, mode="nearest"
-        ).to(dtype=torch.long)
-
-        # Flatten back to [1, H*W*4]
-        token_ids = token_ids.view(1, -1)
-
-        return token_ids
 
     @staticmethod
     def _compute_generation_params(
@@ -332,33 +182,31 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prompt: str,
         height: int,
         width: int,
-        image: Optional[List[PIL.Image.Image]] = None,
+        image=None,
         factor: int = 32,
-    ) -> Tuple[torch.Tensor, int, int]:
+    ):
         """
-        Generate prior tokens using the AR (vision_language_encoder) model.
+        Generate prior tokens using the AR model via SGLang Engine.
+
+        Only text-to-image is supported.
 
         Args:
-            prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
-            condition_images: Optional list of condition images for i2i
+            prompt: The text prompt
+            height: Target image height in pixels
+            width: Target image width in pixels
+            image: Unused, kept for API compatibility
+            factor: Rounding factor for height/width
 
         Returns:
-            Tuple of (prior_token_ids, pixel_height, pixel_width)
+            Tuple of (prior_token_ids, None)
             - prior_token_ids: Upsampled to d16 format, shape [1, token_h*token_w*4]
-            - pixel_height: Image height in pixels
-            - pixel_width: Image width in pixels
         """
-        device = self.vision_language_encoder.device
+        device = get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
 
-        is_text_to_image = image is None or len(image) == 0
-        # Build messages for processor
-        content = []
-        if image is not None:
-            for img in image:
-                content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": prompt})
+        # Build chat template inputs via HF processor
+        content = [{"type": "text", "text": prompt}]
         messages = [{"role": "user", "content": content}]
 
         inputs = self.processor.apply_chat_template(
@@ -368,44 +216,33 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             target_w=width,
             return_dict=True,
             return_tensors="pt",
-        ).to(device)
+        )
 
         image_grid_thw = inputs.get("image_grid_thw")
         max_new_tokens, large_image_offset, token_h, token_w = (
             self._compute_generation_params(
-                image_grid_thw=image_grid_thw, is_text_to_image=is_text_to_image
+                image_grid_thw=image_grid_thw, is_text_to_image=True
             )
         )
 
-        prior_token_image_ids = None
-        if image is not None:
-            prior_token_image_embed = self.vision_language_encoder.get_image_features(
-                inputs["pixel_values"], image_grid_thw[:-1]
-            )
-            prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
-            prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
-                prior_token_image_embed, image_grid_thw[:-1]
-            )
-
-        # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
-        # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
-        outputs = self.vision_language_encoder.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
+        # SGLang Engine call
+        output = self.ar_engine.generate(
+            input_ids=inputs["input_ids"][0].tolist(),
+            image_data=[{"image_grid_thw": image_grid_thw}],
+            sampling_params={"temperature": 1.0, "max_new_tokens": max_new_tokens},
         )
+        generated_ids = output["output_ids"]
 
-        prior_token_ids_d32 = self._extract_large_image_tokens(
-            outputs,
-            inputs["input_ids"].shape[-1],
-            large_image_offset,
-            token_h * token_w,
+        # Extract large image tokens + upsample D32→D16
+        prior_token_ids_d32 = torch.tensor(
+            generated_ids[large_image_offset : large_image_offset + token_h * token_w],
+            device=device,
         )
         prior_token_ids = self._upsample_token_ids(
             prior_token_ids_d32, token_h, token_w
         )
 
-        return prior_token_ids, prior_token_image_ids
+        return prior_token_ids, None
 
     def get_glyph_texts(self, prompt):
         prompt = prompt[0] if isinstance(prompt, list) else prompt
@@ -635,12 +472,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         guidance_scale = batch.guidance_scale
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
-        if batch.image_path is not None:
-            ar_condition_images = [
-                load_image(img_path) for img_path in batch.image_path
-            ]
-        else:
-            ar_condition_images = None
 
         height = batch.height
         width = batch.width
@@ -661,13 +492,9 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         device = get_local_torch_device()
 
-        if ar_condition_images is not None:
-            height = height or ar_condition_images[0].height
-            width = width or ar_condition_images[0].width
         time_start = time.time()
-        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
+        prior_token_id, _ = self.generate_prior_tokens(
             prompt=prompt,
-            image=ar_condition_images,
             height=height,
             width=width,
         )
@@ -685,25 +512,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             dtype=dtype,
         )
 
-        # 4. process images
-        if ar_condition_images is not None:
-            preprocessed_condition_images = []
-            for img in ar_condition_images:
-                image_height, image_width = (
-                    img.size[::-1]
-                    if isinstance(img, PIL.Image.Image)
-                    else img.shape[:2]
-                )
-                multiple_of = self.vae_scale_factor * self.transformer.config.patch_size
-                image_height = (image_height // multiple_of) * multiple_of
-                image_width = (image_width // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(
-                    img, height=image_height, width=image_width
-                )
-                preprocessed_condition_images.append(img)
-            ar_condition_images = preprocessed_condition_images
-
-        # 5. Prepare latents and (optional) condition_images kv cache
+        # 4. Prepare latents
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
             batch_size=1,
@@ -717,55 +526,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
 
-        if ar_condition_images is not None:
-            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
-                1, self.vae.config.latent_channels, 1, 1
-            )
-            latents_std = torch.tensor(self.vae.config.latents_std).view(
-                1, self.vae.config.latent_channels, 1, 1
-            )
-
-            latents_mean = latents_mean.to(device=device, dtype=prompt_embeds.dtype)
-            latents_std = latents_std.to(device=device, dtype=prompt_embeds.dtype)
-
-            for condition_image, condition_image_prior_token_id in zip(
-                ar_condition_images, prior_token_image_ids
-            ):
-                condition_image = condition_image.to(
-                    device=device, dtype=prompt_embeds.dtype
-                )
-
-                condition_latent = retrieve_latents(
-                    self.vae.encode(condition_image),
-                    generator=generator,
-                    sample_mode="argmax",
-                )
-                condition_latent = (condition_latent - latents_mean) / latents_std
-
-                # Do not remove.
-                # It would be use to run the reference image through a
-                # forward pass at timestep 0 and keep the KV cache.
-                with set_forward_context(current_timestep=1, attn_metadata=None):
-                    _ = self.transformer(
-                        hidden_states=condition_latent,
-                        encoder_hidden_states=torch.zeros_like(prompt_embeds)[
-                            :1, :0, ...
-                        ],
-                        prior_token_id=condition_image_prior_token_id,
-                        prior_token_drop=torch.full_like(
-                            condition_image_prior_token_id, False, dtype=torch.bool
-                        ),
-                        timestep=torch.zeros((1,), device=device),
-                        target_size=torch.tensor(
-                            [condition_image.shape[-2:]], device=device
-                        ),
-                        crop_coords=torch.zeros((1, 2), device=device),
-                        attention_kwargs=attention_kwargs,
-                        kv_caches=kv_caches,
-                        kv_caches_mode="write",
-                    )
-
-        # 6. Prepare additional timestep conditions
+        # 5. Prepare additional timestep conditions
         target_size = (height, width)
         target_size = torch.tensor(
             [target_size], dtype=prompt_embeds.dtype, device=device
@@ -794,7 +555,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
         self._num_timesteps = len(timesteps)
 
-        # 7. Prepare for denoising loop
+        # 6. Prepare for denoising loop
 
         batch.prompt_embeds = [prompt_embeds]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
