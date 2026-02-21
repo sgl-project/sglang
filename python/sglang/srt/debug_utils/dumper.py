@@ -663,8 +663,8 @@ def _get_default_exp_name(timeout_seconds: int = 60):
     object_list = [
         (
             f"{_DEFAULT_EXP_NAME_PREFIX}"
-            f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime(now))}"
-            f"{ms:03d}_{rand_suffix:03d}"
+            f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime(now))}"
+            f"_{ms:03d}{rand_suffix:03d}"
         )
         if rank == 0
         else None
