@@ -353,6 +353,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
+    enable_force_include_usage: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -3353,6 +3354,12 @@ class ServerArgs:
             "--stream-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--enable-force-include-usage",
+            action="store_true",
+            help="If set to True, include usage on every request "
+            "(even when stream_options is not specified)",
         )
         parser.add_argument(
             "--random-seed",
