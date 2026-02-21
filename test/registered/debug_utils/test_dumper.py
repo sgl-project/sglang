@@ -525,6 +525,13 @@ class TestOutputControl:
         tensor.fill_(999.0)
         assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
 
+    def test_capture_output_nested_raises(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        with d.capture_output():
+            with pytest.raises(AssertionError):
+                with d.capture_output():
+                    pass
+
     def test_capture_output_respects_filter(self, tmp_path):
         d = _make_test_dumper(tmp_path, filter="name=keep")
 
