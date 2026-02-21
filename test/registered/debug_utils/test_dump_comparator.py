@@ -89,7 +89,7 @@ class TestEndToEnd(CustomTestCase):
         from argparse import Namespace
 
         from sglang.srt.debug_utils.dump_comparator import main
-        from sglang.srt.debug_utils.dumper import _Dumper, DumperConfig
+        from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
             baseline_tensor = torch.randn(10, 10)

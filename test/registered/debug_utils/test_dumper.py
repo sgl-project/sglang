@@ -13,10 +13,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
+    DumperConfig,
     _collective_with_timeout,
     _deepcopy_or_clone,
     _Dumper,
-    DumperConfig,
     _format_tags,
     _get_default_exp_name,
     _materialize_value,
@@ -307,6 +307,22 @@ class TestTorchSave:
         _torch_save(param, path)
 
         assert torch.equal(torch.load(path, weights_only=True), param.data)
+
+    def test_shared_storage_not_bloated(self, tmp_path):
+        big = torch.randn(1000, 1000)
+        view = big[0]
+        path = str(tmp_path / "view.pt")
+
+        _torch_save({"value": view, "meta": {}}, path)
+
+        file_size = Path(path).stat().st_size
+        expected_max = view.nelement() * view.element_size() * 10
+        assert file_size < expected_max, (
+            f"File {file_size} bytes but view is only "
+            f"{view.nelement() * view.element_size()} bytes — "
+            f"torch.save likely serialized the full "
+            f"{big.nelement() * big.element_size()} byte storage"
+        )
 
     def test_silent_skip(self, tmp_path, capsys):
         path = str(tmp_path / "c.pt")
