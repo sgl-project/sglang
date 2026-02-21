@@ -14,7 +14,9 @@ namespace {
 
 template <typename T>
 struct ConvertToFP8 {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(T value) { return 0; }
+  static __device__ __nv_fp8_storage_t convert_to_fp8(T value) {
+    return 0;
+  }
 };
 
 template <>
@@ -33,17 +35,23 @@ struct ConvertToFP8<__half> {
 
 template <typename T>
 struct ConvertFromFloat {
-  static __device__ T convert_from_float(float value) { return 0; }
+  static __device__ T convert_from_float(float value) {
+    return 0;
+  }
 };
 
 template <>
 struct ConvertFromFloat<__nv_bfloat16> {
-  static __device__ __nv_bfloat16 convert_from_float(float value) { return __float2bfloat16(value); }
+  static __device__ __nv_bfloat16 convert_from_float(float value) {
+    return __float2bfloat16(value);
+  }
 };
 
 template <>
 struct ConvertFromFloat<__half> {
-  static __device__ __half convert_from_float(float value) { return __float2half(value); }
+  static __device__ __half convert_from_float(float value) {
+    return __float2half(value);
+  }
 };
 
 template <typename T>
