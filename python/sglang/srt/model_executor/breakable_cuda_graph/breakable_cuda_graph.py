@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from contextvars import ContextVar
-from typing import Any, Callable, NamedTuple, Self
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -196,7 +196,7 @@ def non_graph(enable: bool):
 
 class BreakableCUDAGraph(torch.cuda.CUDAGraph):
 
-    def __new__(cls, keep_graph: bool = True) -> Self:
+    def __new__(cls, keep_graph: bool = True) -> "BreakableCUDAGraph":
         keep_graph = True  # force keep_graph to True
         return super().__new__(cls, keep_graph)
 
