@@ -132,7 +132,7 @@ class DumperConfig(_BaseConfig):
     enable_value: bool = True
     enable_grad: bool = False
     enable_model_value: bool = False
-    enable_model_grad: bool = True
+    enable_model_grad: bool = False
     exp_name: Optional[str] = None
     enable_http_server: bool = True
     cleanup_previous: bool = False
