@@ -952,15 +952,25 @@ class TestReset:
 
     def test_cleanup_previous_re_triggers_after_reset(self, tmp_path):
         """Miles pattern: reset() + configure(cleanup_previous=True) should re-clean."""
-        d = _make_test_dumper(tmp_path, cleanup_previous=True)
+        exp_alpha = "exp_alpha"
+        exp_beta = "exp_beta"
+
+        (tmp_path / exp_alpha).mkdir()
+        (tmp_path / exp_alpha / "stale.pt").touch()
+        (tmp_path / exp_beta).mkdir()
+        (tmp_path / exp_beta / "stale.pt").touch()
+
+        d = _make_test_dumper(tmp_path, exp_name=exp_alpha, cleanup_previous=True)
         d.dump("phase1", torch.randn(2, 2))
-        assert d._state.cleanup_previous_handled is True
 
         d.reset()
-        assert d._state.cleanup_previous_handled is False
-
+        d.configure(exp_name=exp_beta, cleanup_previous=True)
         d.dump("phase2", torch.randn(2, 2))
-        assert d._state.cleanup_previous_handled is True
+
+        assert not (tmp_path / exp_alpha / "stale.pt").exists()
+        assert not (tmp_path / exp_beta / "stale.pt").exists()
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["phase1", "phase2"])
 
     def test_no_cleanup_when_config_false(self, tmp_path):
         """cleanup_previous=False: handled stays False but no cleanup runs."""
