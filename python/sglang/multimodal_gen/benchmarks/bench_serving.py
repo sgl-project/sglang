@@ -651,26 +651,48 @@ async def benchmark(args):
     except Exception as e:
         logger.info(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    task_name = model_info(args.model).pipeline_tag
+    valid_tasks = (
+        "text-to-video",
+        "image-to-video",
+        "video-to-video",
+        "text-to-image",
+        "image-to-image",
+    )
 
-    if args.task != task_name:
-        logger.warning(
-            f"Task from args {args.task} is different from huggingface pipeline_tag {task_name}, args.task will be ignored!"
+    # Resolve task_name with priority: args.task > local config > HF pipeline_tag
+    if args.task:
+        task_name = args.task
+        logger.info(f"Using task from --task: {task_name}")
+    elif os.path.exists(args.model):
+        config_path = os.path.join(args.model, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            task_name = config.get("pipeline_tag", "text-to-image")
+            logger.info(f"Inferred task from local config.json: {task_name}")
+        else:
+            task_name = "text-to-image"
+            logger.info(f"No config.json found, defaulting task to: {task_name}")
+    else:
+        task_name = model_info(args.model).pipeline_tag
+        logger.info(f"Inferred task from HuggingFace pipeline_tag: {task_name}")
+
+    if task_name not in valid_tasks:
+        raise ValueError(
+            f"Task '{task_name}' is not a valid multimodal generation task. "
+            f"Use --task to specify one of: {', '.join(valid_tasks)}"
         )
 
     if task_name in ("text-to-video", "image-to-video", "video-to-video"):
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
-    elif task_name in ("text-to-image", "image-to-image"):
-        if task_name == "image-to-image":
-            api_url = f"{args.base_url}/v1/images/edits"
-        else:
-            api_url = f"{args.base_url}/v1/images/generations"
-        request_func = async_request_image_sglang
-    else:
-        raise ValueError(
-            f"The task name {task_name} of model {args.model} is not a valid task name for multimodal generation. Please check the model path."
+    else:  # text-to-image or image-to-image
+        api_url = (
+            f"{args.base_url}/v1/images/edits"
+            if task_name == "image-to-image"
+            else f"{args.base_url}/v1/images/generations"
         )
+        request_func = async_request_image_sglang
 
     setattr(args, "task_name", task_name)
 

@@ -17,6 +17,7 @@ import os
 from collections.abc import Iterable
 
 import torch
+import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
@@ -200,11 +201,13 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def compile_module_with_torch_compile(self, module, server_args: ServerArgs):
-        if not server_args.enable_torch_compile or module is None:
-            return module
-        if not hasattr(module, "forward"):
-            return module
+    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
+        """
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
+        """
+        if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
         try:
             import torch._inductor.config as _inductor_cfg
 
@@ -213,15 +216,14 @@ class MOVADenoisingStage(PipelineStage):
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
-        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
-        setattr(module, "forward", compiled_forward)
-        return module
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(mode=mode, fullgraph=False, dynamic=None)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
         for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            self.compile_module_with_torch_compile(module, server_args)
+            self._maybe_enable_torch_compile(module, server_args)
         self._torch_compiled = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -310,8 +312,8 @@ class MOVADenoisingStage(PipelineStage):
 
     def _manage_device_placement(
         self,
-        model_to_use: torch.nn.Module | None,
-        model_to_offload: torch.nn.Module | None,
+        model_to_use: nn.Module | None,
+        model_to_offload: nn.Module | None,
         server_args: ServerArgs,
     ):
         if not server_args.dit_cpu_offload:
@@ -397,7 +399,7 @@ class MOVADenoisingStage(PipelineStage):
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
-        timings = getattr(batch, "timings", None)
+        metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
         with self.progress_bar(total=total_steps) as progress_bar:
@@ -405,7 +407,7 @@ class MOVADenoisingStage(PipelineStage):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
                     logger=logger,
-                    timings=timings,
+                    metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
                 ):
                     pair_t = paired_timesteps[idx_step]
@@ -906,6 +908,6 @@ class MOVADecodingStage(PipelineStage):
             output=video,
             audio=audio,
             audio_sample_rate=getattr(self.audio_vae, "sample_rate", None),
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
         return output_batch

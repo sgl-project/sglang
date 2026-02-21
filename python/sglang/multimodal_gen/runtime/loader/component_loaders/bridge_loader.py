@@ -30,7 +30,7 @@ class BridgeLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = get_diffusers_component_config(component_path=component_model_path)
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:
@@ -88,8 +88,7 @@ class BridgeLoader(ComponentLoader):
                 cpu_offload=server_args.dit_cpu_offload,
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 fsdp_inference=server_args.use_fsdp_inference,
-                default_dtype=default_dtype,
-                param_dtype=torch.bfloat16,
+                param_dtype=default_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
                 strict=False,

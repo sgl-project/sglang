@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 #ifndef USE_ROCM
 using fp32_t = float;
@@ -28,6 +29,15 @@ using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 using fp32x4_t = float4;
 #endif
 
+/*
+ * LDG Support
+ */
+#ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
+#else
+#define SGLANG_LDG(arg) *(arg)
+#endif
+
 namespace device {
 
 #define SGL_DEVICE __forceinline__ __device__
@@ -37,7 +47,7 @@ inline constexpr auto kFullMask = 0xffffffffu;
 
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -46,11 +56,36 @@ SGL_DEVICE void PDLWaitPrimary() {
 
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
+}
+
+/**
+ * \brief Load data with the specified type and offset from a void pointer.
+ * \tparam T The type to load.
+ * \param ptr The base pointer.
+ * \param offset The offset in number of elements of type T.
+ */
+template <typename T>
+SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
+  return static_cast<const T*>(ptr)[offset];
+}
+
+/**
+ * \brief Store data with the specified type and offset to a void pointer.
+ * \tparam T The type to store.
+ * \param ptr The base pointer.
+ * \param val The value to store.
+ * \param offset The offset in number of elements of type T.
+ * \note we use type_identity_t to force the caller to explicitly specify
+ * the template parameter `T`, which can avoid accidentally using the wrong type.
+ */
+template <typename T>
+SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
+  static_cast<T*>(ptr)[offset] = val;
 }
 
 namespace pointer {

@@ -70,6 +70,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -117,6 +119,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -494,13 +498,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.cuda_graph_runner_for_draft_extend.get_last_runner()
             )
             assign_hidden_states_pool_triton(
-                last_cuda_graph_runner.hidden_states,
-                last_cuda_graph_runner.req_pool_indices,
+                last_cuda_graph_runner.buffers.hidden_states,
+                last_cuda_graph_runner.buffers.req_pool_indices,
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
-                last_cuda_graph_runner.extend_seq_lens,
-                last_cuda_graph_runner.extend_start_loc,
+                last_cuda_graph_runner.buffers.extend_seq_lens,
+                last_cuda_graph_runner.buffers.extend_start_loc,
             )
 
         # Reorganize the spec info for the next batch
@@ -532,6 +536,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -557,7 +563,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         self._draft_worker = MultiLayerEagleDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors

@@ -1,6 +1,6 @@
 # https://docs.sglang.io/platforms/cpu_server.html
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -68,9 +68,9 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "smg-grpc-proto>=0.3.3",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
 ]
 
 [project.optional-dependencies]

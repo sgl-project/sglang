@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -33,8 +34,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -122,7 +123,7 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -205,8 +206,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = None
             self.cp_size = None
