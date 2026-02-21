@@ -76,9 +76,12 @@ jobs:
           COPY *.patch /tmp/patches/
           RUN cd /sgl-workspace/sglang \
               && for p in /tmp/patches/*.patch; do \
-                   echo "Applying ${p}..." \
-                   && git apply --stat "${p}" \
-                   && git apply "${p}"; \
+                   if git apply --check "${p}" 2>/dev/null; then \
+                     echo "Applying ${p}..." \
+                     && git apply "${p}"; \
+                   else \
+                     echo "Skipping ${p} (already applied or empty)"; \
+                   fi; \
                  done \
               && rm -rf /tmp/patches
           DOCKERFILE
