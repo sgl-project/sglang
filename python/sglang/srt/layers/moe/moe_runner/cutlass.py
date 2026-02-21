@@ -20,7 +20,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -687,6 +686,7 @@ def pre_permute_standard_to_cutlass(
         device = a.device
 
         # FP8-specific asserts
+        from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
         if not cutlass_fp8_supported():
             raise RuntimeError("CUTLASS FP8 kernels are not available on this system.")
         assert w1_q.dtype == torch.float8_e4m3fn
