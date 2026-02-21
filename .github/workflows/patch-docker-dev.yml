@@ -42,7 +42,7 @@ jobs:
       - name: Generate patches
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch origin "${BASE_SHA}"
+          git fetch origin main
           mkdir -p /tmp/patch-ctx
 
           if [ -n "${{ inputs.pr_numbers }}" ]; then
@@ -51,12 +51,14 @@ jobs:
               pr=$(echo "${pr}" | xargs)
               echo "Fetching PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
-              git diff "${BASE_SHA}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
+              MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
+              echo "  PR #${pr}: merge-base=${MERGE_BASE}"
+              git diff "${MERGE_BASE}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
               echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
             done
           else
             echo "Generating diff: image ${BASE_SHA} → latest main"
-            git fetch origin main
+            git fetch origin "${BASE_SHA}"
             git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
             echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           fi
