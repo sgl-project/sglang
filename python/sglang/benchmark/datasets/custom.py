@@ -6,9 +6,8 @@ from typing import List, Optional
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
+from sglang.benchmark.datasets.common import ASSISTANT_SUFFIX, DatasetRow
 from sglang.benchmark.utils import remove_suffix
-
-from .common import ASSISTANT_SUFFIX, DatasetRow
 
 
 def sample_custom_requests(

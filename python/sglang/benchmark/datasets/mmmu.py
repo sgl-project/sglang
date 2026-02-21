@@ -6,8 +6,8 @@ import pybase64
 from datasets import load_dataset
 from transformers import AutoProcessor, AutoTokenizer
 
-from .common import DatasetRow
-from .image import create_mm_data_row
+from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.image import create_mm_data_row
 
 
 def sample_mmmu_requests(

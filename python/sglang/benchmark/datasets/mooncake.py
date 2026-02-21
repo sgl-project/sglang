@@ -1,36 +1,10 @@
 import asyncio
-import json
-import os
 import time
 from typing import AsyncGenerator, Dict, List
 
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.utils import download_and_cache_file
-
-from .common import MOONCAKE_DATASET_URL, DatasetRow
-
-
-def load_mooncake_requests(
-    dataset_path: str,
-    mooncake_workload: str,
-    num_prompts: int,
-) -> List[Dict]:
-    # For mooncake, we don't generate the prompts here.
-    # We just load the raw trace data. The async generator will handle the rest.
-    if not dataset_path:
-        local_path = os.path.join("/tmp", mooncake_workload + "_trace.jsonl")
-    else:
-        local_path = dataset_path
-
-    if not os.path.exists(local_path):
-        download_and_cache_file(MOONCAKE_DATASET_URL[mooncake_workload], local_path)
-
-    with open(local_path, "r") as f:
-        all_requests_data = [json.loads(line) for line in f if line.strip()]
-
-    # Limit the number of requests based on --num-prompts
-    return all_requests_data[:num_prompts]
+from sglang.benchmark.datasets.common import DatasetRow
 
 
 async def get_mooncake_request_over_time(

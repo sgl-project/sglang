@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -32,9 +31,3 @@ class DatasetRow:
             self.vision_prompt_len = 0
         if self.extra_request_body is None:
             self.extra_request_body = {}
-
-
-class BaseDatasetLoader(ABC):
-    @abstractmethod
-    def load(self, args, tokenizer, model_id=None) -> List[Any]:
-        raise NotImplementedError

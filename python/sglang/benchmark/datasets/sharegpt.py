@@ -5,13 +5,17 @@ from typing import List, Optional
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
+from sglang.benchmark.datasets.common import (
+    ASSISTANT_SUFFIX,
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
+    DatasetRow,
+)
 from sglang.benchmark.utils import (
     download_and_cache_hf_file,
     is_file_valid_json,
     remove_suffix,
 )
-
-from .common import ASSISTANT_SUFFIX, SHAREGPT_FILENAME, SHAREGPT_REPO_ID, DatasetRow
 
 
 def sample_sharegpt_requests(

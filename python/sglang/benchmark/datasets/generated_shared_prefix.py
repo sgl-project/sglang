@@ -11,8 +11,8 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from .common import DatasetRow
-from .random import compute_random_lens
+from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.random import compute_random_lens
 
 
 @lru_cache(maxsize=1)

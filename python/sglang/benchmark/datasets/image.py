@@ -7,9 +7,9 @@ import pybase64
 from PIL import Image
 from transformers import AutoProcessor
 
-from .common import DatasetRow
-from .generated_shared_prefix import gen_mm_prompt
-from .random import compute_random_lens
+from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.generated_shared_prefix import gen_mm_prompt
+from sglang.benchmark.datasets.random import compute_random_lens
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:

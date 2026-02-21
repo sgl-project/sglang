@@ -66,7 +66,7 @@ def get_tokenizer(
 
 def get_processor(
     pretrained_model_name_or_path: str,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> AutoProcessor:
     assert (
         pretrained_model_name_or_path is not None
         and pretrained_model_name_or_path != ""

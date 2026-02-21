@@ -5,9 +5,12 @@ from typing import List
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
+from sglang.benchmark.datasets.common import (
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
+    DatasetRow,
+)
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
-
-from .common import SHAREGPT_FILENAME, SHAREGPT_REPO_ID, DatasetRow
 
 
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:

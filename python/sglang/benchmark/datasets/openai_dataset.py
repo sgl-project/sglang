@@ -4,7 +4,7 @@ from typing import List, Optional
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
-from .common import DatasetRow
+from sglang.benchmark.datasets.common import DatasetRow
 
 
 def sample_openai_requests(
