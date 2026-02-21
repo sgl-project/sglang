@@ -6,10 +6,13 @@ Usage:
     # launch a server and benchmark on it
 
     # T2V or T2I or any other multimodal generation model
-    sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
+
+    # benchmark with SLO metrics enabled
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231 --slo --slo-scale 3.0 --warmup-requests 2
 """
 
 import argparse
@@ -21,7 +24,7 @@ import re
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -35,6 +38,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Patch size used for computing area units (e.g. in latent diffusion models).
+PATCH_SIZE = 16
+PATCH_AREA = PATCH_SIZE * PATCH_SIZE
 
 
 def is_dir_not_empty(path):
@@ -53,6 +60,8 @@ class RequestFuncInput:
     extra_body: Dict[str, Any] = field(default_factory=dict)
     image_paths: Optional[List[str]] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    slo_ms: Optional[float] = None
+    num_inference_steps: Optional[int] = None
 
 
 @dataclass
@@ -63,6 +72,7 @@ class RequestFuncOutput:
     start_time: float = 0.0
     response_body: Dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
+    slo_achieved: Optional[bool] = None
 
 
 class BaseDataset(ABC):
@@ -341,6 +351,85 @@ class RandomDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
+def _compute_scale_factor(req: RequestFuncInput, args) -> Optional[float]:
+    """Computes the composite scale factor (area × frames × steps) for a request."""
+    width = req.width or args.width
+    height = req.height or args.height
+    if None in (width, height):
+        return None
+    frames = req.num_frames or args.num_frames
+    steps = req.num_inference_steps or args.num_inference_steps
+
+    frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
+    step_scale = steps if isinstance(steps, int) and steps > 0 else 1
+
+    area_units = max((float(width) * float(height)) / float(PATCH_AREA), 1.0)
+    return area_units * float(frame_scale) * float(step_scale)
+
+
+def _compute_expected_latency_ms_from_base(
+    req: RequestFuncInput, args, base_time_ms: Optional[float]
+) -> Optional[float]:
+    """Scales latency linearly by pixel area, frame count, and inference steps."""
+    if base_time_ms is None:
+        return None
+    scale = _compute_scale_factor(req, args)
+    if scale is None:
+        return None
+    return float(base_time_ms) * scale
+
+
+def _infer_slo_base_time_ms_from_warmups(
+    warmup_pairs: List[tuple], args
+) -> Optional[float]:
+    """Derives median base latency from successful warmup runs."""
+    candidates_ms: List[float] = []
+    for req, out in warmup_pairs:
+        if not out.success or out.latency <= 0:
+            logger.warning(
+                f"Skipping warmup result: success={out.success}, latency={out.latency:.3f}"
+            )
+            continue
+
+        scale = _compute_scale_factor(req, args)
+        if scale is None or scale <= 0:
+            continue
+
+        candidates_ms.append((out.latency * 1000.0) / scale)
+
+    return float(np.median(candidates_ms)) if candidates_ms else None
+
+
+def _populate_slo_ms_from_warmups(
+    requests_list: List[RequestFuncInput], warmup_pairs: List[tuple], args
+) -> List[RequestFuncInput]:
+    """Assigns estimated SLO targets to requests lacking them."""
+    if not any(req.slo_ms is None for req in requests_list):
+        return requests_list
+
+    base_time_ms = _infer_slo_base_time_ms_from_warmups(warmup_pairs, args)
+    if base_time_ms is None:
+        return requests_list
+
+    slo_scale = float(getattr(args, "slo_scale", 3.0))
+    if slo_scale <= 0:
+        raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
+
+    updated: List[RequestFuncInput] = []
+    for req in requests_list:
+        if req.slo_ms is not None:
+            updated.append(req)
+            continue
+        expected_ms = _compute_expected_latency_ms_from_base(req, args, base_time_ms)
+        if expected_ms is not None:
+            # Create a new RequestFuncInput with updated slo_ms
+            updated.append(replace(req, slo_ms=expected_ms * slo_scale))
+        else:
+            updated.append(req)
+
+    return updated
+
+
 async def async_request_image_sglang(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -425,6 +514,10 @@ async def async_request_image_sglang(
             output.success = False
 
     output.latency = time.perf_counter() - output.start_time
+
+    # Check SLO if defined
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
 
     if pbar:
         pbar.update(1)
@@ -579,12 +672,22 @@ async def async_request_video_sglang(
 
     output.latency = time.perf_counter() - output.start_time
 
+    # Check SLO if defined
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+
     if pbar:
         pbar.update(1)
     return output
 
 
-def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
+def calculate_metrics(
+    outputs: List[RequestFuncOutput],
+    total_duration: float,
+    requests_list: List[RequestFuncInput],
+    args,
+    slo_enabled: bool,
+):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
 
@@ -605,6 +708,29 @@ def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
     }
+
+    if slo_enabled:
+        slo_defined_total = 0
+        slo_met_success = 0
+
+        for req, out in zip(requests_list, outputs):
+            if req.slo_ms is None:
+                continue
+            slo_defined_total += 1
+            if out.slo_achieved:
+                slo_met_success += 1
+
+        slo_attain_all = (
+            (slo_met_success / slo_defined_total) if slo_defined_total > 0 else 0.0
+        )
+
+        metrics.update(
+            {
+                "slo_attainment_rate": slo_attain_all,
+                "slo_met_success": slo_met_success,
+                "slo_scale": getattr(args, "slo_scale", 3.0),
+            }
+        )
 
     return metrics
 
@@ -720,10 +846,39 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
-    # Run benchmark
-    pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
-
     async with aiohttp.ClientSession() as session:
+        # Run warmup requests
+        warmup_pairs: List[tuple] = []
+        if args.warmup_requests and requests_list:
+            # The server always overrides warmup requests to use
+            # num_inference_steps=1 (see Req.set_as_warmup), so we match
+            # that here to keep the benchmark's SLO estimation consistent.
+            warmup_steps = 1
+            logger.info(
+                f"Running {args.warmup_requests} warmup request(s) with "
+                f"num_inference_steps={warmup_steps}..."
+            )
+            for i in range(args.warmup_requests):
+                warm_req = requests_list[i % len(requests_list)]
+                warm_req = replace(
+                    warm_req,
+                    num_inference_steps=warmup_steps,
+                )
+                warm_out = await limited_request_func(warm_req, session, None)
+                warmup_pairs.append((warm_req, warm_out))
+                logger.info(
+                    f"Warmup {i+1}/{args.warmup_requests}: "
+                    f"latency={warm_out.latency:.2f}s, success={warm_out.success}"
+                )
+
+        # Populate SLO values from warmups if enabled
+        if args.slo:
+            requests_list = _populate_slo_ms_from_warmups(
+                requests_list=requests_list, warmup_pairs=warmup_pairs, args=args
+            )
+
+        # Run benchmark
+        pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
         start_time = time.perf_counter()
         tasks = []
         for req in requests_list:
@@ -738,10 +893,10 @@ async def benchmark(args):
         outputs = await asyncio.gather(*tasks)
         total_duration = time.perf_counter() - start_time
 
-    pbar.close()
+        pbar.close()
 
     # Calculate metrics
-    metrics = calculate_metrics(outputs, total_duration)
+    metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
@@ -795,6 +950,16 @@ async def benchmark(args):
                 "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
             )
         )
+
+    if args.slo and "slo_attainment_rate" in metrics:
+        print(f"{'-' * 50}")
+        print(
+            "{:<40} {:<15.2%}".format(
+                "SLO Attainment Rate:", metrics["slo_attainment_rate"]
+            )
+        )
+        print("{:<40} {:<15}".format("SLO Met (Success):", metrics["slo_met_success"]))
+        print("{:<40} {:<15.2f}".format("SLO Scale:", metrics["slo_scale"]))
 
     print("=" * 60)
 
@@ -890,6 +1055,29 @@ if __name__ == "__main__":
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level.",
+    )
+    parser.add_argument(
+        "--slo",
+        action="store_true",
+        help="Enable SLO calculation. Uses trace-provided slo_ms or infers from warmups.",
+    )
+    parser.add_argument(
+        "--slo-scale",
+        type=float,
+        default=3.0,
+        help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of inference steps for diffusion models.",
     )
 
     args = parser.parse_args()
