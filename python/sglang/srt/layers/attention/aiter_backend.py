@@ -1389,6 +1389,14 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # AITER verify path does not require post-draft buffer patching currently.
+        # This override prevents overlap-plan stream mode from failing with the
+        # base class NotImplementedError.
+        pass
+
     def forward_extend(
         self,
         q: torch.Tensor,
