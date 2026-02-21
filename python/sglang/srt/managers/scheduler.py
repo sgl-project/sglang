@@ -414,6 +414,56 @@ class Scheduler(
 
         self.is_initializing = False
 
+    def _register_draft_kv_pool_for_hicache(self, server_args):
+        """Register draft model KV pool with HiCache for EAGLE speculative decoding"""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+        )
+
+        # Get draft model's KV cache pool
+        if self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+        else:
+            draft_runner = self.draft_worker.draft_model_runner
+
+        draft_kv_pool = draft_runner.token_to_kv_pool
+        # Create host KV cache pool for draft model
+        if isinstance(draft_kv_pool, MHATokenToKVPool):
+            draft_host_kv_pool = MHATokenToKVPoolHost(
+                draft_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+            )
+        elif isinstance(draft_kv_pool, MLATokenToKVPool):
+            draft_host_kv_pool = MLATokenToKVPoolHost(
+                draft_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+            )
+        else:
+            logger.warning(
+                f"Draft KV pool type {type(draft_kv_pool).__name__} not supported for HiCache, "
+                "draft model KV cache will not be backed up/restored"
+            )
+            return
+
+        # Register with HiCacheController
+        self.tree_cache.cache_controller.set_draft_kv_pool(
+            draft_kv_pool, draft_host_kv_pool
+        )
+        logger.info(
+            f"Registered draft model KV pool ({type(draft_kv_pool).__name__}) with HiCache"
+        )
+
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
 
@@ -703,6 +753,13 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+                if self.spec_algorithm.is_eagle():
+                    # NOTE: I believe there are bugs when enabling HiCache L3 with EAGLE.
+                    # But for compatibility commented out the assertion for now.
+                    # assert not self.server_args.enable_hicache_storage, (
+                    #     "L3 cache with HiCache storage backend is not supported for EAGLE speculative decoding"
+                    #     )
+                    self._register_draft_kv_pool_for_hicache(server_args)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
