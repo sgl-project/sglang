@@ -15,9 +15,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.comfyui_latent_preparation import (
     ComfyUILatentPreparationStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
-    ConditioningStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
     LTX2AVDecodingStage,
@@ -60,7 +57,6 @@ __all__ = [
     "LatentPreparationStage",
     "ComfyUILatentPreparationStage",
     "LTX2AVLatentPreparationStage",
-    "ConditioningStage",
     "DenoisingStage",
     "DmdDenoisingStage",
     "LTX2AVDenoisingStage",
