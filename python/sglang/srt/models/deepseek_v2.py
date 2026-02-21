@@ -1308,10 +1308,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             else None
         )
 
-        is_packed_weight = (
-            has_fused_proj
-            and fused_proj_quant_name in {"awq", "awq_marlin", "moe_wna16"}
-        )
+        is_packed_weight = has_fused_proj and fused_proj_quant_name in {
+            "awq",
+            "awq_marlin",
+            "moe_wna16",
+        }
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
             and not is_packed_weight

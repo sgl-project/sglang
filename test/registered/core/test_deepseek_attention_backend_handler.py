@@ -23,9 +23,7 @@ def test_dispatch_mla_subtype_requires_weight_for_cpu_fused_path(monkeypatch):
 
     attn = SimpleNamespace(fused_qkv_a_proj_with_mqa=SimpleNamespace())
 
-    assert (
-        _dispatch_mla_subtype(attn, _dummy_forward_batch()) == AttnForwardMethod.MLA
-    )
+    assert _dispatch_mla_subtype(attn, _dummy_forward_batch()) == AttnForwardMethod.MLA
 
 
 def test_dispatch_mla_subtype_uses_cpu_fused_path_when_weight_exists(monkeypatch):

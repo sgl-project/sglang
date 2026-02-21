@@ -29,7 +29,9 @@ def _build_model_config_stub(
 
 
 def _mock_transformers_version(monkeypatch, version: str) -> None:
-    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(__version__=version))
+    monkeypatch.setitem(
+        sys.modules, "transformers", SimpleNamespace(__version__=version)
+    )
 
 
 def test_verify_transformers_version_glm4_moe_lite_no_downgrade_warning(
@@ -47,8 +49,7 @@ def test_verify_transformers_version_glm4_moe_lite_no_downgrade_warning(
         model_config._verify_transformers_version()
 
     assert not any(
-        "downgrading to transformers==4.57.1" in message
-        for message in caplog.messages
+        "downgrading to transformers==4.57.1" in message for message in caplog.messages
     )
 
 
@@ -79,6 +80,5 @@ def test_verify_transformers_version_non_glm4_moe_lite_warns_on_tf5(
         model_config._verify_transformers_version()
 
     assert any(
-        "downgrading to transformers==4.57.1" in message
-        for message in caplog.messages
+        "downgrading to transformers==4.57.1" in message for message in caplog.messages
     )

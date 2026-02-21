@@ -13,7 +13,9 @@ def test_disable_shared_experts_fusion_for_ignored_shared_experts(monkeypatch):
     )
 
     server_args = SimpleNamespace(disable_shared_experts_fusion=False)
-    monkeypatch.setattr(glm4_moe_lite_mod, "get_global_server_args", lambda: server_args)
+    monkeypatch.setattr(
+        glm4_moe_lite_mod, "get_global_server_args", lambda: server_args
+    )
 
     model = object.__new__(glm4_moe_lite_mod.Glm4MoeLiteForCausalLM)
     model.config = SimpleNamespace(
