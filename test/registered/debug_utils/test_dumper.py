@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.dumper import (
     _collective_with_timeout,
     _deepcopy_or_clone,
     _Dumper,
-    _DumperConfig,
+    DumperConfig,
     _format_tags,
     _get_default_exp_name,
     _materialize_value,
@@ -58,25 +58,25 @@ def _capture_stdout():
 
 class TestDumperConfig:
     def test_from_env_defaults_match_dataclass_defaults(self):
-        assert _DumperConfig.from_env() == _DumperConfig()
+        assert DumperConfig.from_env() == DumperConfig()
 
     def test_from_env_bool(self):
         with temp_set_env(DUMPER_ENABLE="1"):
-            assert _DumperConfig.from_env().enable is True
+            assert DumperConfig.from_env().enable is True
         with temp_set_env(DUMPER_ENABLE="false"):
-            assert _DumperConfig.from_env().enable is False
+            assert DumperConfig.from_env().enable is False
 
     def test_from_env_str(self):
         with temp_set_env(DUMPER_FILTER="layer_id=0"):
-            assert _DumperConfig.from_env().filter == "layer_id=0"
+            assert DumperConfig.from_env().filter == "layer_id=0"
 
     def test_from_env_dir(self):
         with temp_set_env(DUMPER_DIR="/my/dir"):
-            assert _DumperConfig.from_env().dir == "/my/dir"
+            assert DumperConfig.from_env().dir == "/my/dir"
 
     def test_from_env_int(self):
         with temp_set_env(DUMPER_COLLECTIVE_TIMEOUT="120"):
-            assert _DumperConfig.from_env().collective_timeout == 120
+            assert DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
         d = _make_test_dumper("/tmp")
@@ -87,59 +87,59 @@ class TestDumperConfig:
 
     def test_type_validation(self):
         with pytest.raises(TypeError, match="enable.*expected bool.*got str"):
-            _DumperConfig(enable="yes")
+            DumperConfig(enable="yes")
         with pytest.raises(
             TypeError, match="collective_timeout.*expected int.*got str"
         ):
-            _DumperConfig(collective_timeout="abc")
+            DumperConfig(collective_timeout="abc")
         with pytest.raises(TypeError, match="filter.*expected str.*got int"):
-            _DumperConfig(filter=123)
+            DumperConfig(filter=123)
 
     def test_configure_default_skips_when_env_set(self):
         with temp_set_env(DUMPER_FILTER="from_env"):
-            d = _Dumper(config=_DumperConfig.from_env())
+            d = _Dumper(config=DumperConfig.from_env())
             d.configure_default(filter="from_code")
             assert d._config.filter == "from_env"
 
     def test_configure_default_applies_when_no_env(self):
-        d = _Dumper(config=_DumperConfig.from_env())
+        d = _Dumper(config=DumperConfig.from_env())
         d.configure_default(filter="from_code")
         assert d._config.filter == "from_code"
 
     def test_from_env_whitespace_treated_as_unset(self):
         with temp_set_env(DUMPER_FILTER="   "):
-            assert _DumperConfig.from_env().filter is None
+            assert DumperConfig.from_env().filter is None
 
     def test_may_enable_default_false(self):
-        d = _Dumper(config=_DumperConfig())
+        d = _Dumper(config=DumperConfig())
         assert d.may_enable is False
 
     def test_may_enable_true_when_enabled(self):
-        d = _Dumper(config=_DumperConfig(enable=True))
+        d = _Dumper(config=DumperConfig(enable=True))
         assert d.may_enable is True
 
     def test_may_enable_true_when_server_port_set(self):
-        d = _Dumper(config=_DumperConfig(server_port="40000"))
+        d = _Dumper(config=DumperConfig(server_port="40000"))
         assert d.may_enable is True
 
-        d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
+        d2 = _Dumper(config=DumperConfig(server_port="reuse"))
         assert d2.may_enable is True
 
 
 class TestServerPortParsed:
     def test_negative_returns_none(self):
-        assert _DumperConfig(server_port="-1").server_port_parsed is None
+        assert DumperConfig(server_port="-1").server_port_parsed is None
 
     def test_zero_returns_none(self):
-        assert _DumperConfig(server_port="0").server_port_parsed is None
+        assert DumperConfig(server_port="0").server_port_parsed is None
 
     def test_positive_returns_int(self):
-        result = _DumperConfig(server_port="40000").server_port_parsed
+        result = DumperConfig(server_port="40000").server_port_parsed
         assert result == 40000
         assert isinstance(result, int)
 
     def test_reuse_returns_string(self):
-        assert _DumperConfig(server_port="reuse").server_port_parsed == "reuse"
+        assert DumperConfig(server_port="reuse").server_port_parsed == "reuse"
 
 
 class TestDefaultExpName:
@@ -156,50 +156,50 @@ class TestDefaultExpName:
 
 class TestKvPairsParsing:
     def test_from_kv_pairs_none_returns_defaults(self):
-        assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
+        assert DumperConfig.from_kv_pairs(None) == DumperConfig()
 
     def test_from_kv_pairs_empty_returns_defaults(self):
-        assert _DumperConfig.from_kv_pairs([]) == _DumperConfig()
+        assert DumperConfig.from_kv_pairs([]) == DumperConfig()
 
     def test_from_kv_pairs_bool_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["enable=true"])
+        cfg = DumperConfig.from_kv_pairs(["enable=true"])
         assert cfg.enable is True
         assert cfg.dir == "/tmp/dumper"
 
     def test_from_kv_pairs_bool_numeric(self):
-        assert _DumperConfig.from_kv_pairs(["enable=1"]).enable is True
-        assert _DumperConfig.from_kv_pairs(["enable=0"]).enable is False
+        assert DumperConfig.from_kv_pairs(["enable=1"]).enable is True
+        assert DumperConfig.from_kv_pairs(["enable=0"]).enable is False
 
     def test_from_kv_pairs_int_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=120"])
+        cfg = DumperConfig.from_kv_pairs(["collective_timeout=120"])
         assert cfg.collective_timeout == 120
         assert type(cfg.collective_timeout) is int
 
     def test_from_kv_pairs_int_field_zero_stays_int(self):
-        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=0"])
+        cfg = DumperConfig.from_kv_pairs(["collective_timeout=0"])
         assert cfg.collective_timeout == 0
         assert type(cfg.collective_timeout) is int
 
     def test_from_kv_pairs_str_field_not_coerced(self):
-        cfg = _DumperConfig.from_kv_pairs(["server_port=0"])
+        cfg = DumperConfig.from_kv_pairs(["server_port=0"])
         assert cfg.server_port == "0"
         assert type(cfg.server_port) is str
 
     def test_from_kv_pairs_str_field_one_stays_str(self):
-        cfg = _DumperConfig.from_kv_pairs(["server_port=1"])
+        cfg = DumperConfig.from_kv_pairs(["server_port=1"])
         assert cfg.server_port == "1"
         assert type(cfg.server_port) is str
 
     def test_from_kv_pairs_optional_str_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
+        cfg = DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
         assert cfg.filter == "layer_id=[0-3]"
 
     def test_from_kv_pairs_optional_str_exp_name(self):
-        cfg = _DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
+        cfg = DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
         assert cfg.exp_name == "my_experiment"
 
     def test_from_kv_pairs_multiple_fields(self):
-        cfg = _DumperConfig.from_kv_pairs(
+        cfg = DumperConfig.from_kv_pairs(
             [
                 "enable=true",
                 "dir=/my/dir",
@@ -216,31 +216,31 @@ class TestKvPairsParsing:
 
     def test_from_kv_pairs_missing_equals_raises(self):
         with pytest.raises(ValueError, match="missing '='"):
-            _DumperConfig.from_kv_pairs(["enable"])
+            DumperConfig.from_kv_pairs(["enable"])
 
     def test_from_kv_pairs_unknown_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):
-            _DumperConfig.from_kv_pairs(["nonexistent=true"])
+            DumperConfig.from_kv_pairs(["nonexistent=true"])
 
     def test_kv_pairs_to_dict_returns_only_explicit(self):
-        d = _DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
+        d = DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
         assert d == {"enable": True, "dir": "/x"}
         assert "filter" not in d
         assert "collective_timeout" not in d
 
     def test_kv_pairs_to_dict_none_returns_empty(self):
-        assert _DumperConfig._kv_pairs_to_dict(None) == {}
+        assert DumperConfig._kv_pairs_to_dict(None) == {}
 
     def test_kv_pairs_to_dict_empty_returns_empty(self):
-        assert _DumperConfig._kv_pairs_to_dict([]) == {}
+        assert DumperConfig._kv_pairs_to_dict([]) == {}
 
     def test_from_kv_pairs_value_with_equals_in_value(self):
-        cfg = _DumperConfig.from_kv_pairs(["filter=name=foo"])
+        cfg = DumperConfig.from_kv_pairs(["filter=name=foo"])
         assert cfg.filter == "name=foo"
 
     def test_from_kv_pairs_type_validation_still_works(self):
         with pytest.raises(TypeError, match="collective_timeout.*expected int"):
-            _DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
+            DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
 
 
 class TestDumperPureFunctions:
@@ -407,7 +407,7 @@ class TestDumperDistributed:
     @staticmethod
     def _test_collective_timeout_func(rank):
         dumper = _Dumper(
-            config=_DumperConfig(
+            config=DumperConfig(
                 enable=True,
                 collective_timeout=3,
                 enable_http_server=False,
@@ -630,7 +630,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
         enable_http_server=False,
     )
     defaults.update(overrides)
-    config = _DumperConfig(**defaults)
+    config = DumperConfig(**defaults)
     return _Dumper(config=config)
 
 

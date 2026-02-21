@@ -122,7 +122,7 @@ _DEFAULT_EXP_NAME_PREFIX = "dump_"
 
 
 @dataclass(frozen=True)
-class _DumperConfig(_BaseConfig):
+class DumperConfig(_BaseConfig):
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp/dumper"
@@ -197,7 +197,7 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(self, *, config: _DumperConfig):
+    def __init__(self, *, config: DumperConfig):
         self._config = config
         self._state = _DumperState()
 
@@ -1161,7 +1161,7 @@ _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper(config=_DumperConfig.from_env())
+dumper = _Dumper(config=DumperConfig.from_env())
 
 
 # -------------------------------------- other utility functions ------------------------------------------
