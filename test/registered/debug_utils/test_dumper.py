@@ -452,13 +452,14 @@ class TestDumpDictFormat:
 
 def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
-    config = _DumperConfig(
+    defaults = dict(
         enable=True,
         dir=str(tmp_path),
         exp_name="test",
         enable_http_server=False,
-        **overrides,
     )
+    defaults.update(overrides)
+    config = _DumperConfig(**defaults)
     return _Dumper(config=config)
 
 
