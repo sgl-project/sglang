@@ -96,25 +96,20 @@ class _BaseConfig(ABC):
         if not pairs:
             return {}
 
-        valid_fields = {f.name: f for f in fields(cls)}
+        _missing = object()
+        defaults = {f.name: f.default for f in fields(cls)}
         result: dict = {}
 
         for pair in pairs:
             key, sep, value = pair.partition("=")
             if not sep:
                 raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
-            if key not in valid_fields:
+            default = defaults.get(key, _missing)
+            if default is _missing:
                 raise ValueError(
-                    f"Unknown config key {key!r}. "
-                    f"Valid keys: {sorted(valid_fields)}"
+                    f"Unknown config key {key!r}. Valid keys: {sorted(defaults)}"
                 )
-            try:
-                result[key] = cls._parse_env_value(
-                    value, valid_fields[key].default
-                )
-            except (ValueError, TypeError) as exc:
-                field_type = type(valid_fields[key].default).__name__
-                raise TypeError(f"{key}: expected {field_type}, got {value!r}") from exc
+            result[key] = cls._parse_env_value(value, default)
 
         return result
 
