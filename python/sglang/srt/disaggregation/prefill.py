@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     Req,
     RequestStage,
@@ -305,6 +306,8 @@ class PrefillBootstrapQueue:
                 continue
 
             # KV.WaitingForInput - init here
+            if req.time_stats.bootstrap_done_time == 0.0:
+                req.time_stats.bootstrap_done_time = time.perf_counter()
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
@@ -320,6 +323,14 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
+            ts = req.time_stats
+            if ts.bootstrap_done_time > 0 and ts.prefill_bootstrap_queue_entry_time > 0:
+                ts.bootstrap_duration = (
+                    ts.bootstrap_done_time - ts.prefill_bootstrap_queue_entry_time
+                )
+                ts.alloc_waiting_duration = (
+                    ts.wait_queue_entry_time - ts.bootstrap_done_time
+                )
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
             trace_slice_end(
@@ -545,6 +556,14 @@ class SchedulerDisaggregationPrefillMixin:
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
@@ -603,6 +622,46 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.completion_time = time.perf_counter()
+
+        if self.enable_metrics:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            kv_item_lens = (
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
+            )
+            bytes_per_page_all_layers = sum(kv_item_lens)
+
+            for req in done_reqs:
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    continue
+                ts = req.time_stats
+                # Transfer latency
+                if ts.prefill_transfer_queue_entry_time > 0 and ts.completion_time > 0:
+                    transfer_latency_s = (
+                        ts.completion_time - ts.prefill_transfer_queue_entry_time
+                    )
+                    self.kv_transfer_latency_ms = transfer_latency_s * 1000
+
+                    # Transfer size
+                    num_tokens = len(req.origin_input_ids)
+                    num_pages = kv_to_page_num(num_tokens, page_size)
+                    total_bytes = bytes_per_page_all_layers * num_pages
+                    total_mb = total_bytes / (1024 * 1024)
+                    self.kv_transfer_total_mb = total_mb
+                    ts.transfer_total_mb = total_mb
+
+                    # Transfer speed
+                    if transfer_latency_s > 0:
+                        speed = (total_mb / 1024) / transfer_latency_s
+                        self.kv_transfer_speed_gb_s = speed
+                        ts.transfer_speed_gb_s = speed
+
+                # Bootstrap and alloc durations
+                if (
+                    ts.prefill_bootstrap_queue_entry_time > 0
+                    and ts.wait_queue_entry_time > 0
+                ):
+                    self.kv_transfer_bootstrap_ms = ts.bootstrap_duration * 1000
+                    self.kv_transfer_alloc_ms = ts.alloc_waiting_duration * 1000
 
         # Stream requests which have finished transfer
         self.stream_output(
