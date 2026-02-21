@@ -55,9 +55,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    compute_local_num_token_non_padded,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +83,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    num_token_non_padded: Optional[torch.Tensor] = None
 
 
 @contextmanager
@@ -249,6 +257,19 @@ class PiecewiseCudaGraphRunner:
                 input_embeds = None
                 mrope_positions = None
 
+        self.enable_num_token_non_padded = enable_num_token_non_padded(
+            model_runner.server_args
+        )
+        self.require_gathered_buffer = require_gathered_buffer(
+            model_runner.server_args
+        )
+        if self.enable_num_token_non_padded:
+            num_token_non_padded = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+        else:
+            num_token_non_padded = None
+
         self.buffers = PrefillInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -259,6 +280,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 
@@ -344,6 +366,20 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+
+        # Set num_token_non_padded buffer so that torch.compile traces
+        # the masking path in topk (needed for CUDA graph capture).
+        if buffers.num_token_non_padded is not None:
+            if self.require_gathered_buffer:
+                buffers.num_token_non_padded.copy_(
+                    compute_local_num_token_non_padded(
+                        global_num_token_non_padded=num_tokens,
+                        num_tokens_per_dp=num_tokens,
+                    )
+                )
+            else:
+                buffers.num_token_non_padded.fill_(num_tokens)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -382,7 +418,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -498,6 +534,20 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        # Set num_token_non_padded to num_tokens (no padding during capture)
+        # so that the masking ops in topk are captured in the CUDA graph.
+        if buffers.num_token_non_padded is not None:
+            if self.require_gathered_buffer:
+                buffers.num_token_non_padded.copy_(
+                    compute_local_num_token_non_padded(
+                        global_num_token_non_padded=num_tokens,
+                        num_tokens_per_dp=num_tokens,
+                    )
+                )
+            else:
+                buffers.num_token_non_padded.fill_(num_tokens)
+            print(buffers.num_token_non_padded)
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -536,7 +586,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -662,6 +712,25 @@ class PiecewiseCudaGraphRunner:
         if forward_batch.mrope_positions is not None:
             buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
 
+        # Update num_token_non_padded buffer for topk masking inside CUDA graph.
+        if (
+            buffers.num_token_non_padded is not None
+            and forward_batch.num_token_non_padded is not None
+        ):
+            if self.require_gathered_buffer:
+                # Recompute local count using padded static_num_tokens
+                # (forward_batch.num_token_non_padded was adjusted with unpadded
+                # counts; we need the count relative to the padded CUDA graph buffer).
+                buffers.num_token_non_padded.copy_(
+                    compute_local_num_token_non_padded(
+                        global_num_token_non_padded=forward_batch.num_token_non_padded_cpu,
+                        num_tokens_per_dp=static_num_tokens,
+                    )
+                )
+            else:
+                buffers.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+            print(buffers.num_token_non_padded)
+
         input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
@@ -713,7 +782,7 @@ class PiecewiseCudaGraphRunner:
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=forward_batch.global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
