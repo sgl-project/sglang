@@ -1106,17 +1106,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             else:
                 # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
-                # FlashInfer/NPU/CPU: gather active entries (fancy indexing creates a
-                # V-contiguous copy, converting from K-contiguous for flashinfer),
-                # pass sequential indices so the FLA kernel can index into the dense copy,
-                # then scatter the in-place updated copy back to the pool.
-                # Note: chunk_gated_delta_rule always returns (o, None, h); the final
-                # state is written in-place into initial_state by the kernel.
+                # FlashInfer/NPU/CPU: gather → FLA kernel (in-place) → scatter back.
                 use_gather_scatter = (
                     self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
                 )
                 if use_gather_scatter:
-                    recurrent_state = ssm_states[cache_indices]
+                    # The flashinfer pool is K-contiguous; advanced indexing
+                    # preserves that layout, so .contiguous() is needed to get
+                    # a V-contiguous copy whose storage the FLA kernel can
+                    # update in-place (the @input_guard decorator would
+                    # otherwise make its own anonymous copy).
+                    recurrent_state = ssm_states[cache_indices].contiguous()
                     n_seqs_extend = recurrent_state.shape[0]
                     seq_indices = torch.arange(
                         n_seqs_extend,
