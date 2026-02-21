@@ -19,6 +19,7 @@ def _jit_moe_fused_gate_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["moe/moe_fused_gate.cuh"],
         cuda_wrappers=[("moe_fused_gate", f"moe_fused_gate<{args}>")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
