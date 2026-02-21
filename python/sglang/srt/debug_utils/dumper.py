@@ -169,11 +169,12 @@ class _DumperState:
 
 class _DumperHttpManager:
     def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
         config = dumper._config
         http_port = config.server_port_parsed
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
-            dumper,
+            self,
             timeout_seconds=config.collective_timeout,
         )
 
@@ -191,12 +192,30 @@ class _DumperHttpManager:
                 )
                 print(f"[Dumper] HTTP server started on port {http_port}")
 
+    # ------------------------------- public ---------------------------------
+
     def handle_request(
         self, *, method: str, body: dict[str, Any]
     ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request(
+        return self._rpc_broadcast._handle_request_inner(
             method=method, body=body
         )
+
+    # ------------------------------- private ---------------------------------
+
+    def _handle_request_inner(
+        self, *, method: str, body: dict[str, Any]
+    ) -> dict:
+        if method == "get_state":
+            return self._dumper.get_state()
+        elif method == "configure":
+            self._dumper.configure(**body)
+            return {}
+        elif method == "reset":
+            self._dumper.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
 
 
 class _Dumper:
@@ -346,22 +365,6 @@ class _Dumper:
         if self._config.server_port_parsed is None:
             return None
         return _DumperHttpManager(self)
-
-    # ------------------------- public :: only used internally -----------------------------
-
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self.get_state()
-        elif method == "configure":
-            self.configure(**body)
-            return {}
-        elif method == "reset":
-            self.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
 
     # ------------------------- private :: related to dump -----------------------------
 
