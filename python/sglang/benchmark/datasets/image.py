@@ -175,7 +175,7 @@ def sample_image_requests(
 
     def _gen_random_image_data_uri(
         width: int = width, height: int = height
-    ) -> (Image, str, int):
+    ) -> Tuple[Image.Image, str, int]:
         if image_content == "blank":
             # Generate blank white image
             arr = np.full((height, width, 3), 255, dtype=np.uint8)
@@ -207,7 +207,7 @@ def sample_image_requests(
         images, images_base64, images_bytes = zip(
             *[_gen_random_image_data_uri() for _ in range(request_image_count)]
         )
-        total_image_bytes += sum(list(images_bytes))
+        total_image_bytes += sum(images_bytes)
 
         data_row = create_mm_data_row(
             text_prompt,

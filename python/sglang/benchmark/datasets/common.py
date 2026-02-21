@@ -14,7 +14,7 @@ MOONCAKE_DATASET_URL = {
 
 @dataclass
 class DatasetRow:
-    prompt: str
+    prompt: Any
     prompt_len: int
     output_len: int
     text_prompt_len: Optional[int] = None

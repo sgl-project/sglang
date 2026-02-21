@@ -36,7 +36,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import (
+from sglang.benchmark.datasets import (  # noqa: F401
     ASSISTANT_SUFFIX,
     MOONCAKE_DATASET_URL,
     SHAREGPT_FILENAME,
@@ -59,7 +59,7 @@ from sglang.benchmark.datasets import (
     sample_random_requests,
     sample_sharegpt_requests,
 )
-from sglang.benchmark.utils import (
+from sglang.benchmark.utils import (  # noqa: F401
     download_and_cache_file,
     download_and_cache_hf_file,
     get_model,
@@ -73,51 +73,6 @@ from sglang.benchmark.utils import (
 )
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
-
-__all__ = [
-    "ASSISTANT_SUFFIX",
-    "MOONCAKE_DATASET_URL",
-    "SHAREGPT_FILENAME",
-    "SHAREGPT_REPO_ID",
-    "ASYNC_REQUEST_FUNCS",
-    "BenchmarkMetrics",
-    "DatasetRow",
-    "LoRAPathAction",
-    "RequestFuncInput",
-    "RequestFuncOutput",
-    "_create_bench_client_session",
-    "calculate_metrics",
-    "check_chat_template",
-    "compute_random_lens",
-    "create_mm_data_row",
-    "download_and_cache_file",
-    "download_and_cache_hf_file",
-    "gen_mm_prompt",
-    "gen_prompt",
-    "get_available_tokens",
-    "get_dataset",
-    "get_gen_prefix_cache_path",
-    "get_model",
-    "get_mooncake_request_over_time",
-    "get_processor",
-    "get_request",
-    "get_tokenizer",
-    "is_file_valid_json",
-    "parse_custom_headers",
-    "parse_image_resolution",
-    "remove_prefix",
-    "remove_suffix",
-    "run_benchmark",
-    "sample_custom_requests",
-    "sample_generated_shared_prefix_requests",
-    "sample_image_requests",
-    "sample_mmmu_requests",
-    "sample_openai_requests",
-    "sample_random_requests",
-    "sample_sharegpt_requests",
-    "set_global_args",
-    "set_ulimit",
-]
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
