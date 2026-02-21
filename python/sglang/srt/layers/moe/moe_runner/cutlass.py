@@ -112,20 +112,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         quant_info: CutlassMoeQuantInfo,
         running_state: Dict[str, torch.Tensor],
     ) -> CutlassRunnerOutput:
-        # Common validation assertions for all CUTLASS MoE types
-        if runner_input.topk_weights is not None:
-            assert (
-                runner_input.topk_weights.shape == runner_input.topk_ids.shape
-            ), "topk shape mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
-        ), "Expert number mismatch between w13 and w2"
-
-        num_tokens = runner_input.gate_up_input.shape[0]
-        hidden_size = runner_input.gate_up_input.shape[1]
-        topk = runner_input.topk_ids.shape[1]
-
-        # Standard mode
         quant_type = quant_info.params.quant_type
         deepep_ll_or_deepep_normal = quant_info.deepep_ll_or_deepep_normal
 
@@ -153,10 +139,6 @@ class CutlassRunnerCore(MoeRunnerCore):
                 return CutlassRunnerOutput(hidden_states=down_output)
 
         elif quant_type == CutlassMoEQuantType.BlockscaledFP8:
-            if not cutlass_fp8_supported():
-                raise RuntimeError(
-                    "CUTLASS FP8 kernels are not available on this system."
-                )
             down_output = self.cutlass_fused_experts_fp8(
                 a=runner_input.gate_up_input,
                 w1_q=quant_info.w13_weight,
@@ -187,9 +169,9 @@ class CutlassRunnerCore(MoeRunnerCore):
                 params=quant_info.params,
             )
 
-
         # Store combination info for post_permute function
         running_state["topk_weights"] = runner_input.topk_weights
+        running_state["topk_ids"] = runner_input.topk_ids
 
         return CutlassRunnerOutput(hidden_states=down_output)
 
@@ -355,7 +337,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         topk_ids: torch.Tensor,
         params: CutlassMoEParams,
         rep_a1_scales: torch.Tensor,
-        use_fp8_blockscale: bool = True,
         blockscale_offsets: Optional[torch.Tensor] = None,
         max_blockscale: Optional[int] = None,
         use_mxfp8: bool = False,
@@ -408,7 +389,6 @@ class CutlassRunnerCore(MoeRunnerCore):
             NotImplementedError: If CUDA is not available or `sgl_kernel` is not properly installed.
         """
         # Input 'a' is already preprocessed (shuffled and quantized to FP8)
-        assert use_fp8_blockscale, "Only support fp8 blockscale for now"
 
         es_up, es_down = enable_es
         out_dtype = torch.bfloat16  # Default output dtype for FP8 operations
@@ -600,6 +580,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         e: number of experts for the current rank, dtype: int
         assumes that topk < k < n to satisfy - up/down projection expectations.
         """
+
         # Input 'a' is already preprocessed (FP4 quantized and reordered)
         rep_a_fp4 = a
         rep_a_blockscale = rep_aux
@@ -654,6 +635,21 @@ def pre_permute_standard_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
+    # Common validation assertions for all CUTLASS MoE types
+    assert (
+        dispatch_output.topk_output.topk_weights.shape
+        == dispatch_output.topk_output.topk_ids.shape
+    ), "topk shape mismatch"
+    assert (
+        quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
+    ), "Expert number mismatch"
+    assert (
+        quant_info.w13_weight.shape[0] == quant_info.w13_scale.shape[0]
+    ), "w1 scales expert number mismatch"
+    assert (
+        quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
+    ), "w2 scales expert number mismatch"
+
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
         dispatch_output.topk_output,
@@ -677,19 +673,7 @@ def pre_permute_standard_to_cutlass(
         problem_sizes2 = quant_info.params.problem_sizes2
 
         enable_es = quant_info.enable_es
-        use_mxfp8 = enable_es[0]
-
-        # ----------------------------------------------------------
-        assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-        assert w1_q.dtype == torch.float8_e4m3fn
-        assert w2_q.dtype == torch.float8_e4m3fn
-        assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
-        assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
-        assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-        assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
-        assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
-        assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
-        assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
+        use_mxfp8 = quant_info.use_mxfp8
 
         if is_cuda:
             from sglang.srt.layers.quantization.fp8_kernel import (
@@ -703,6 +687,19 @@ def pre_permute_standard_to_cutlass(
 
         topk = topk_ids.size(1)
         device = a.device
+
+        # FP8-specific asserts
+        if not cutlass_fp8_supported():
+            raise RuntimeError("CUTLASS FP8 kernels are not available on this system.")
+        assert w1_q.dtype == torch.float8_e4m3fn
+        assert w2_q.dtype == torch.float8_e4m3fn
+        assert hidden_states.dtype in [
+            torch.half,
+            torch.bfloat16,
+        ], "Invalid input dtype"
+        assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
+        assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
+        assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
 
         if use_mxfp8:
             assert (
@@ -796,10 +793,7 @@ def pre_permute_standard_to_cutlass(
         )
 
     elif quant_info.params.quant_type == CutlassMoEQuantType.BlockscaledFP4:
-        params = quant_info.params
-
-        # Pre-permutation validation logic
-        assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+        # FP4-specific asserts
         assert quant_info.w13_weight.dtype == torch.uint8, "weight 1 must be uint8"
         assert quant_info.w2_weight.dtype == torch.uint8, "weight 2 must be uint8"
         assert (
@@ -808,26 +802,29 @@ def pre_permute_standard_to_cutlass(
             and quant_info.w1_blockscale.ndim == 3
             and quant_info.w2_blockscale.ndim == 3
         ), "All Weights must be of rank 3 for cutlass_moe_fp4"
+
         m_a, k_a = hidden_states.shape
         e_w1, nx2_w1, half_k_w1 = quant_info.w13_weight.shape
         e_w2, k_w2, half_n_w2 = quant_info.w2_weight.shape
 
-        assert e_w1 == e_w2 and e_w1 == params.num_experts, (
+        assert e_w1 == e_w2 and e_w1 == quant_info.params.num_experts, (
             "Number of experts must match",
             " between weights.",
         )
         assert (
-            k_a // 2 == half_k_w1 and params.hidden_size == k_w2
+            k_a // 2 == half_k_w1 and quant_info.params.hidden_size == k_w2
         ), "Hidden size mismatch between a, w1 and w2"
         assert (
-            nx2_w1 == params.intermediate_size_per_partition * 2
-            and half_n_w2 == params.intermediate_size_per_partition // 2
+            nx2_w1 == quant_info.params.intermediate_size_per_partition * 2
+            and half_n_w2 == quant_info.params.intermediate_size_per_partition // 2
         ), "mismatch in " "expected `n`"
         assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
         assert hidden_states.dtype in [
             torch.half,
             torch.bfloat16,
         ], "Invalid input dtype"
+
+        params = quant_info.params
 
         prepare_moe_input(
             topk_ids,
@@ -854,6 +851,28 @@ def pre_permute_standard_to_cutlass(
         rep_aux = rep_a_blockscale
 
     elif quant_info.params.quant_type == CutlassMoEQuantType.W4A8:
+        # w4a8-specific checks
+        assert quant_info.w13_weight.dtype == torch.int8
+        assert quant_info.w2_weight.dtype == torch.int8
+        assert (
+            dispatch_output.hidden_states.shape[1] // 2
+            == quant_info.w13_weight.shape[2]
+        ), "Hidden size mismatch w1"  # divide by two due to byte packing
+        assert (
+            quant_info.w13_weight.shape[2] * 2 == quant_info.w2_weight.shape[1]
+        ), "Hidden size mismatch w2"  # multiply by two due to byte packing
+        assert (
+            quant_info.params.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        ), "A Strides 1 expert number mismatch"
+        assert (
+            quant_info.params.b_strides1.shape[0] == quant_info.w13_weight.shape[0]
+        ), "B Strides 1 expert number mismatch"
+        assert (
+            quant_info.params.a_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        ), "A Strides 2 expert number mismatch"
+        assert (
+            quant_info.params.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
+        ), "B Strides 2 expert number mismatch"
         from sglang.srt.distributed.parallel_state import (
             get_moe_expert_parallel_world_size,
         )
@@ -861,26 +880,6 @@ def pre_permute_standard_to_cutlass(
             cutlass_w4_run_moe_ep_preproess,
             pre_reorder_for_cutlass_moe,
         )
-
-        # Pre-permutation validation logic for W4A8
-        assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-        assert quant_info.w13_weight.dtype == torch.int8
-        assert quant_info.w2_weight.dtype == torch.int8
-        assert (
-            hidden_states.shape[1] // 2 == quant_info.w13_weight.shape[2]
-        ), "Hidden size mismatch w1"
-        assert (
-            quant_info.w13_weight.shape[2] * 2 == quant_info.w2_weight.shape[1]
-        ), "Hidden size mismatch w2"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
-        ), "Expert number mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w13_scale.shape[0]
-        ), "w1 scales expert number mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
-        ), "w2 scales expert number mismatch"
 
         num_local_experts = quant_info.w13_weight.size(0)
         m = hidden_states.size(0)
@@ -974,12 +973,13 @@ def post_permute_cutlass_to_standard(
         ).view(num_tokens, topk, hidden_size)
         if not runner_config.apply_router_weight_on_input:
             reordered.mul_(
-                running_state["topk_weights"].view(num_tokens, topk, 1).to(
-                    reordered.dtype
-                )
+                running_state["topk_weights"]
+                .view(num_tokens, topk, 1)
+                .to(reordered.dtype)
             )
 
-    down_output = reordered
+        down_output = reordered
+
     if quant_type == CutlassMoEQuantType.BlockscaledFP8:
         num_tokens = running_state["topk_ids"].shape[0]
         hidden_size = down_output.shape[1]
@@ -1046,8 +1046,6 @@ def post_permute_cutlass_to_standard(
         )
 
         hidden_states = result
-    else:
-        raise NotImplementedError(f"Unsupported CUTLASS MoE quant_type: {quant_type}")
 
     return StandardCombineInput(hidden_states=hidden_states)
 
@@ -1059,21 +1057,10 @@ def pre_permute_deepep_ll_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import (
-        deepep_ll_get_cutlass_w4a8_moe_mm_data,
-    )
-
-    hidden_states, _, topk_ids, topk_weights, masked_m, expected_m = dispatch_output
-
-    # Store for post_permute
-    running_state["topk_ids"] = topk_ids
-    running_state["topk_weights"] = topk_weights
-
-    assert quant_info.w13_weight.dtype == torch.int8
-    assert quant_info.w2_weight.dtype == torch.int8
+    # Common validation assertions for all CUTLASS MoE types
     assert (
-        hidden_states.shape[2] // 2 == quant_info.w13_weight.shape[2]
-    ), "Hidden size mismatch w1"
+        dispatch_output.topk_weights.shape == dispatch_output.topk_ids.shape
+    ), "topk shape mismatch"
     assert (
         quant_info.w13_weight.shape[2] * 2 == quant_info.w2_weight.shape[1]
     ), "Hidden size mismatch w2"
@@ -1086,7 +1073,9 @@ def pre_permute_deepep_ll_to_cutlass(
     assert (
         quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
     ), "w2 scales expert number mismatch"
-
+    # w4a8-specific checks
+    assert quant_info.w13_weight.dtype == torch.int8
+    assert quant_info.w2_weight.dtype == torch.int8
     assert (
         quant_info.params.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "A Strides 1 expert number mismatch"
@@ -1099,6 +1088,21 @@ def pre_permute_deepep_ll_to_cutlass(
     assert (
         quant_info.params.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "B Strides 2 expert number mismatch"
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        deepep_ll_get_cutlass_w4a8_moe_mm_data,
+    )
+
+    # deep_ep_ll-specific checks
+    assert (
+        dispatch_output.hidden_states.shape[2] // 2 == quant_info.w13_weight.shape[2]
+    ), "Hidden size mismatch w1"
+
+    hidden_states, _, topk_ids, topk_weights, masked_m, expected_m = dispatch_output
+
+    # Store for post_permute
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
     num_experts = quant_info.w13_weight.size(0)
     k = quant_info.w13_weight.size(2) * 2  # w1_q is transposed and packed
     n = quant_info.w2_weight.size(2) * 2  # w2_q is transposed and packed
@@ -1124,7 +1128,7 @@ def pre_permute_deepep_ll_to_cutlass(
     )
 
     return CutlassRunnerInput(
-        gate_up_input=gateup_input,  # Preprocessed and quantized input
+        gate_up_input=gateup_input,
         topk_ids=topk_ids,
         masked_m=masked_m,
         expected_m=expected_m,
@@ -1154,23 +1158,10 @@ def pre_permute_deepep_normal_to_cutlass(
     runner_config: MoeRunnerConfig,
     running_state: Dict[str, torch.Tensor],
 ) -> CutlassRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import (
-        deepep_permute_triton_kernel,
-        deepep_run_moe_deep_preprocess,
-    )
-
-    hidden_states, _, topk_ids_, topk_weights, _ = dispatch_output
-
-    # Store state for post_permute
-    running_state["topk_ids"] = topk_ids_
-    running_state["topk_weights"] = topk_weights
-
-    assert topk_weights.shape == topk_ids_.shape, "topk shape mismatch"
-    assert quant_info.w13_weight.dtype == torch.int8
-    assert quant_info.w2_weight.dtype == torch.int8
+    # Common validation assertions for all CUTLASS MoE types
     assert (
-        hidden_states.shape[1] // 2 == quant_info.w13_weight.shape[2]
-    ), "Hidden size mismatch w1"
+        dispatch_output.topk_weights.shape == dispatch_output.topk_ids.shape
+    ), "topk shape mismatch"
     assert (
         quant_info.w13_weight.shape[2] * 2 == quant_info.w2_weight.shape[1]
     ), "Hidden size mismatch w2"
@@ -1183,7 +1174,9 @@ def pre_permute_deepep_normal_to_cutlass(
     assert (
         quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
     ), "w2 scales expert number mismatch"
-
+    # w4a8-specific checks
+    assert quant_info.w13_weight.dtype == torch.int8
+    assert quant_info.w2_weight.dtype == torch.int8
     assert (
         quant_info.params.a_strides1.shape[0] == quant_info.w13_weight.shape[0]
     ), "A Strides 1 expert number mismatch"
@@ -1196,6 +1189,22 @@ def pre_permute_deepep_normal_to_cutlass(
     assert (
         quant_info.params.b_strides2.shape[0] == quant_info.w2_weight.shape[0]
     ), "B Strides 2 expert number mismatch"
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        deepep_permute_triton_kernel,
+        deepep_run_moe_deep_preprocess,
+    )
+
+    # deep_ep_normal-specific checks
+    assert (
+        dispatch_output.hidden_states.shape[1] // 2 == quant_info.w13_weight.shape[2]
+    ), "Hidden size mismatch w1"
+
+    hidden_states, _, topk_ids_, topk_weights, _ = dispatch_output
+
+    # Store state for post_permute
+    running_state["topk_ids"] = topk_ids_
+    running_state["topk_weights"] = topk_weights
+
     num_experts = quant_info.w13_weight.size(0)
     k = quant_info.w13_weight.size(2) * 2  # w1_q is transposed and packed
     n = quant_info.w2_weight.size(2) * 2  # w2_q is transposed and packed
