@@ -54,13 +54,14 @@ class TestDeepseekV31(unittest.TestCase):
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="DeepSeek-V3.1 Unified",
+            test_name="DeepSeek-V3.1",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=0.935
             ),

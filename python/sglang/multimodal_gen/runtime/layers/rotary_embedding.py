@@ -25,15 +25,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+
 import functools
 from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -255,6 +256,38 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+
+class LinearScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int | float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = t / self.scaling_factor
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class OneDRotaryEmbedding(torch.nn.Module):
@@ -949,10 +982,23 @@ def get_rope(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    max_position_embeddings = max_position
+    rope_type = None
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))
+        if rope_type in (None, "default"):
+            rope_scaling = None
+        elif rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            if original_max is not None:
+                max_position_embeddings = max(
+                    max_position_embeddings, int(float(original_max) * factor)
+                )
     key = (
         head_size,
         rotary_dim,
-        max_position,
+        max_position_embeddings,
         base,
         is_neox_style,
         rope_scaling_args,
@@ -963,9 +1009,21 @@ def get_rope(
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
     else:
-        raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
+        if rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size=head_size,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=base,
+                is_neox_style=is_neox_style,
+                dtype=dtype,
+                scaling_factor=factor,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb

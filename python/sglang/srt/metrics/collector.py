@@ -12,12 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+
 import dataclasses
 import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -276,8 +277,10 @@ class DPCooperationInfo:
     @staticmethod
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
+            # Count ranks that are doing any extend-like work.
+            # With overlap scheduling, prefill can appear as MIXED rather than EXTEND.
             num_prefill_ranks=sum(
-                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+                1 for mode in forward_modes if ForwardMode(mode).is_extend()
             ),
         )
 
@@ -849,6 +852,16 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
+        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
+        # If more Info metrics are needed, we can create a common _log_info function.
+        self.cache_config_info = Gauge(
+            name="sglang:cache_config_info",
+            documentation="Cache configuration information.",
+            labelnames=["page_size", "num_pages"],
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -934,6 +947,8 @@ class SchedulerMetricsCollector:
             ("prefill_cache", prefill_cache_tokens),
             ("decode", decode_tokens),
         ]:
+            if delta == 0:
+                continue
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
             if dp_cooperation_info is not None:
                 self.dp_cooperation_realtime_tokens_total.labels(
@@ -1066,6 +1081,9 @@ class SchedulerMetricsCollector:
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
+    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
+        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
+
 
 class TokenizerMetricsCollector:
     def __init__(
@@ -1148,8 +1166,8 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens.",
-            labelnames=labels.keys(),
+            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            labelnames=list(labels.keys()) + ["cache_source"],
         )
 
         self.num_requests_total = Counter(
@@ -1303,11 +1321,36 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        cached_tokens_details: Optional[Dict[str, Any]] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+
+        # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
-            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+            if cached_tokens_details:
+                # Report by cache source (device/host, and storage if L3 enabled)
+                def report_cache_source(source: str, value: int):
+                    if value > 0:
+                        source_labels = {**labels, "cache_source": source}
+                        self.cached_tokens_total.labels(**source_labels).inc(value)
+
+                report_cache_source("device", cached_tokens_details.get("device", 0))
+                report_cache_source("host", cached_tokens_details.get("host", 0))
+
+                # Storage fields are only present when L3 storage backend is enabled
+                if "storage" in cached_tokens_details:
+                    storage_tokens = cached_tokens_details.get("storage", 0)
+                    if storage_tokens > 0:
+                        backend = (
+                            cached_tokens_details.get("storage_backend") or "unknown"
+                        )
+                        report_cache_source(f"storage_{backend}", storage_tokens)
+            else:
+                # Fallback for backward compatibility
+                labels_total = {**labels, "cache_source": "total"}
+                self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)

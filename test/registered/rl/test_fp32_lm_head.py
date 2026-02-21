@@ -12,6 +12,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
@@ -19,7 +20,7 @@ register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
 
 
 class LMHeadStub(nn.Module):
-    def __init__(self, vocab, hidden, dtype, device="cuda"):
+    def __init__(self, vocab, hidden, dtype, device=get_device()):
         super().__init__()
         self.weight = nn.Parameter(
             torch.randn(vocab, hidden, dtype=dtype, device=device)
@@ -36,8 +37,10 @@ class DummyMeta:
 class TestLMHeadFP32(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("needs CUDA GPU")
+        if not torch.cuda.is_available() and not (
+            hasattr(torch, "xpu") and torch.xpu.is_available()
+        ):
+            raise unittest.SkipTest("needs CUDA GPU or XPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
@@ -54,7 +57,7 @@ class TestLMHeadFP32(unittest.TestCase):
         expected_a_dtype,
         expected_b_dtype,
     ):
-        device = "cuda"
+        device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
         hidden_state = torch.randn(
             BATCH_SIZE, HIDDEN_SIZE, dtype=hidden_state_dtype, device=device

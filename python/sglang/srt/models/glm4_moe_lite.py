@@ -440,7 +440,7 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -531,7 +531,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         ):
             disable_reason = "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "GLM-4.5 or GLM-4.6 can not use shared experts fusion optimization under expert parallelism."
+            disable_reason = "GLM-4.5 or GLM-4.6 cannot use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True

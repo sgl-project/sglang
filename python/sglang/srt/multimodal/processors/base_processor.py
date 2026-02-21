@@ -18,7 +18,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import envs, is_npu, load_audio, load_image, load_video, logger
+from sglang.srt.utils import (
+    envs,
+    is_cpu,
+    is_npu,
+    is_xpu,
+    load_audio,
+    load_image,
+    load_video,
+    logger,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -26,7 +35,9 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
 )
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
@@ -199,6 +210,7 @@ class BaseMultimodalProcessor(ABC):
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
+            "grid_thws": Modality.IMAGE,  # for kimi k2.5
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,
@@ -223,7 +235,9 @@ class BaseMultimodalProcessor(ABC):
             "input_features",
         ]
 
-        if SGL_USE_CUDA_IPC:
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
+
+        if SGL_USE_CUDA_IPC and not skip_mm_pool:
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -317,8 +331,10 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if get_global_server_args().rl_on_policy_target is not None:
+            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
+            elif _is_xpu:
+                kwargs["device"] = "xpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {
@@ -327,6 +343,7 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
+
         result = processor.__call__(
             text=[input_text],
             padding=True,
