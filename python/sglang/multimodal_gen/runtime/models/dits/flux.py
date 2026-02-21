@@ -29,8 +29,6 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-
-# from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -262,20 +260,20 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 gather_output=True,
                 quant_config=quant_config,
             )
-        self.to_k = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
-        self.to_v = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
+            self.to_k = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
+            self.to_v = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
@@ -311,20 +309,20 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     gather_output=True,
                     quant_config=quant_config,
                 )
-            self.add_k_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
-            self.add_v_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
                 query_dim,
@@ -469,7 +467,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.attn" if prefix else "attn",
             )
-            if NunchakuAdaLayerNormZeroSingle is not None:
+            if is_nunchaku_available():
                 self.norm = NunchakuAdaLayerNormZeroSingle(self.norm, scale_shift=0)
         else:
             self.proj_mlp = ColumnParallelLinear(
@@ -598,7 +596,6 @@ class FluxTransformerBlock(nn.Module):
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "svdquant"
             and is_nunchaku_available()
-            and NunchakuFeedForward is not None
         )
         self.use_nunchaku_structure = nunchaku_enabled
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
@@ -615,11 +612,10 @@ class FluxTransformerBlock(nn.Module):
             }
             self.ff = NunchakuFeedForward(self.ff, **nunchaku_kwargs)
             self.ff_context = NunchakuFeedForward(self.ff_context, **nunchaku_kwargs)
-            if NunchakuAdaLayerNormZero is not None:
-                self.norm1 = NunchakuAdaLayerNormZero(self.norm1, scale_shift=0)
-                self.norm1_context = NunchakuAdaLayerNormZero(
-                    self.norm1_context, scale_shift=0
-                )
+            self.norm1 = NunchakuAdaLayerNormZero(self.norm1, scale_shift=0)
+            self.norm1_context = NunchakuAdaLayerNormZero(
+                self.norm1_context, scale_shift=0
+            )
 
     def forward(
         self,

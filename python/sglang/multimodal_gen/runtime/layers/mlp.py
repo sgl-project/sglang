@@ -44,6 +44,7 @@ class MLP(nn.Module):
             mlp_hidden_dim,
             bias=True,
             gather_output=False,
+            quant_config=quant_config,
         )
 
         self.act = get_act_fn(act_type)

@@ -123,7 +123,7 @@ class TransformerLoader(ComponentLoader):
         )
 
         logger.info(
-            "Loading %s from %s safetensors files %s, param_dtype: %s",
+            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
             cls_name,
             len(safetensors_list),
             f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
@@ -131,6 +131,7 @@ class TransformerLoader(ComponentLoader):
         )
 
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
+
         if "quant_config" in inspect.signature(model_cls.__init__).parameters:
             quant_config = get_quant_config(config)
             init_params["quant_config"] = (
