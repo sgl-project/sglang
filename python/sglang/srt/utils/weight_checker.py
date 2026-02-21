@@ -76,6 +76,10 @@ def _check_tensors(
         name = expect_name
         should_compare = expect_should_compare
 
+        # Rotary cache buffers are not weights; they can differ and should not be checked
+        if name.endswith("rotary_emb.cos_sin_cache"):
+            continue
+
         expect = expect.cuda()
         actual = actual.cuda()
 
