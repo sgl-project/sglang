@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
+# Online quantization adapted from https://github.com/vllm-project/vllm/pull/29196 and https://github.com/vllm-project/vllm/pull/31914
 
 from __future__ import annotations
 
@@ -60,6 +61,12 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.mxfp8_utils import (
+    _copy_or_rebind,
+    _quantize_and_swizzle_with_cutlass_es_kernel,
+    _quantize_and_swizzle_with_triton_kernel,
+)
+from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -146,6 +153,9 @@ class Fp8Config(QuantizationConfig):
             elif weight_block_size != [1, 32]:
                 raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
         self.weight_block_size = weight_block_size
+
+        if not is_checkpoint_fp8_serialized:
+            logger.info("Quantizing model to FP8 on the fly during loading.")
 
     def get_name(self) -> str:
         return "mxfp8" if self.use_mxfp8 else "fp8"
@@ -254,6 +264,11 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+        if self.block_quant and not self.is_checkpoint_fp8_serialized:
+            raise ValueError(
+                f"block_quant={self.block_quant} is not supported along online quantization (is_checkpoint_fp8_serialized={self.is_checkpoint_fp8_serialized})."
+            )
+
     def validate_block_quant_shapes(
         self,
         input_size: int,
@@ -311,7 +326,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
+        original_weight_loader = extra_weight_attrs.get("weight_loader")
 
         if self.block_quant:
             block_n, block_k = self.quant_config.weight_block_size
@@ -324,13 +339,27 @@ class Fp8LinearMethod(LinearMethodBase):
                 skip_block_quant_check,
             )
 
-        # Create the weight
-        weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
-        )
+        # Wrap weight loader for online quantization if checkpoint is not fp8 serialized
+        if not self.is_checkpoint_fp8_serialized:
+            layer.weight_scale = None
+            layer._loaded_numel = 0
+            device = torch.device("meta")
+            weight_dtype = params_dtype
+
+            weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
+        else:
+            weight_loader = original_weight_loader
+            weight_dtype = torch.float8_e4m3fn
+            device = torch.get_default_device()
+
+        layer._load_device = torch.get_default_device()
+
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=0,
@@ -338,19 +367,15 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        # If checkpoint is serialized fp8, load them.
-        # Otherwise, wait until process_weights_after_loading.
-        if self.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
+        if not self.is_checkpoint_fp8_serialized:
+            layer.input_scale = None
+        else:
             if self.block_quant:
                 if hasattr(self.quant_config, "activation_scheme"):
                     assert self.quant_config.activation_scheme == "dynamic"
                 elif hasattr(self.quant_config, "linear_activation_scheme"):
                     assert self.quant_config.linear_activation_scheme == "dynamic"
-                if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
-                    raise ValueError(
-                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
-                    )
+
                 scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 scale = BlockQuantScaleParameter(
@@ -368,6 +393,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
+                # If checkpoint is serialized fp8, load the scales.
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                     weight_loader=weight_loader,
@@ -393,6 +419,88 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 layer.register_parameter("input_scale", None)
 
+    def get_online_weight_loader(self, layer, original_weight_loader):
+        def online_fp8_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int | None = None,
+        ):
+            assert param.device.type == "meta"
+
+            if layer._loaded_numel == 0:
+                layer.weight = ModelWeightParameter(
+                    data=torch.empty_like(param.data, device=layer._load_device),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=online_fp8_weight_loader,
+                )
+
+            # Move to device for faster quantization. At this point, loaded weights are already materialized on CPU RAM.
+            loaded_weight = loaded_weight.to(layer._load_device)
+
+            param = layer.weight
+
+            kwargs = {}
+            if shard_id is not None:
+                kwargs["loaded_shard_id"] = shard_id
+
+            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on `param.shape` or `loaded_weight.shape`.
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                # Loads the quantized weight.
+                original_weight_loader(param, loaded_weight, **kwargs)
+
+            layer._loaded_numel += copy_numel_counter.copied_numel
+            target_loaded_numel = layer.weight.numel()
+
+            assert (
+                layer._loaded_numel <= target_loaded_numel
+            ), f"target_loaded_numel={target_loaded_numel}, layer._loaded_numel={layer._loaded_numel}"
+
+            # Delay online quantization until all tensor shards (e.g. q_proj, k_proj, v_proj) are loaded, to avoid having to re-quantize later on.
+            if layer._loaded_numel == target_loaded_numel:
+                full_loaded_weight = layer.weight
+
+                if self.use_mxfp8:
+                    # MXFP8 quantization
+                    qweight, weight_scale = mxfp8_group_quantize(full_loaded_weight)
+                    # Register weight_scale_inv if not already registered
+                    if (
+                        not hasattr(layer, "weight_scale_inv")
+                        or layer.weight_scale_inv is None
+                    ):
+                        layer.register_parameter(
+                            "weight_scale_inv",
+                            Parameter(weight_scale, requires_grad=False),
+                        )
+                    else:
+                        layer.weight_scale_inv.data = weight_scale
+                        layer.weight_scale_inv.requires_grad_(False)
+                    layer.weight_scale_inv.format_ue8m0 = True
+                elif (
+                    self.cutlass_fp8_supported
+                    or self.use_marlin
+                    or (_use_aiter and self.use_aiter_fp8_per_token)
+                ):
+                    # apply per-channel quantization default as
+                    # cutlass sgl-kernel and marlin only support per-channel scale
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        full_loaded_weight, loaded_weight.shape[-1]
+                    )
+                    weight_scale = weight_scale.t().contiguous()
+                    if _use_aiter and self.use_aiter_fp8_per_token:
+                        self.use_per_token_if_dynamic = True
+                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                    layer.weight_scale = weight_scale
+                else:
+                    # per-tensor quantization
+                    qweight, weight_scale = input_to_float8(full_loaded_weight)
+                    layer.weight_scale = weight_scale
+
+                layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+
+        return online_fp8_weight_loader
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
@@ -414,7 +522,10 @@ class Fp8LinearMethod(LinearMethodBase):
             return
         elif self.use_mxfp8:
             if not self.is_checkpoint_fp8_serialized:
-                self._quantize_mxfp8_weights(layer)
+                # Quantization already happened during weight loading via get_online_weight_loader.
+                assert layer.weight.dtype == torch.float8_e4m3fn
+                assert hasattr(layer, "weight_scale_inv")
+                assert layer.weight_scale_inv.format_ue8m0
                 return
             # MXFP8 scales are stored as UE8M0 uint8; no requantization here.
             # Keep parameter object to preserve weight_loader attrs for hot reload.
@@ -453,60 +564,20 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
-    def _quantize_mxfp8_weights(self, layer: Module) -> None:
-        weight = layer.weight.data
-        qweight, weight_scale = mxfp8_group_quantize(weight)
-        # Keep parameter objects to preserve weight_loader attrs for hot reload.
-        layer.weight.data = qweight
-        layer.weight.requires_grad_(False)
-        if hasattr(layer, "weight_scale_inv") and layer.weight_scale_inv is not None:
-            layer.weight_scale_inv.data = weight_scale
-            layer.weight_scale_inv.requires_grad_(False)
-        else:
-            # First-time online MXFP8 quantization (no serialized scales).
-            layer.register_parameter(
-                "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
-            )
-        layer.weight_scale_inv.format_ue8m0 = True
-        layer.input_scale = None
-
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
-            layer.weight = Parameter(layer.weight.data, requires_grad=False)
-
-            # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
-                if (
-                    self.cutlass_fp8_supported
-                    or self.use_marlin
-                    or (_use_aiter and self.use_aiter_fp8_per_token)
-                ):
-                    # apply per-channel quantization default as
-                    # cutlass sgl-kernel and marlin only support per-channel scale
-                    qweight, weight_scale = per_token_group_quant_fp8(
-                        layer.weight, layer.weight.shape[-1]
-                    )
-                    weight_scale = weight_scale.t().contiguous()
-                    if _use_aiter and self.use_aiter_fp8_per_token:
-                        self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
-                else:
-                    # per-tensor quantization
-                    qweight, weight_scale = input_to_float8(layer.weight)
+                assert layer.weight_scale is not None
+                layer.weight.data = layer.weight.data.t()
 
-                # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
-                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer.input_scale = None
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module
-            else:
-                layer.weight_scale = Parameter(
-                    layer.weight_scale.data, requires_grad=False
-                )
+            if self.is_checkpoint_fp8_serialized:
                 if (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
@@ -685,6 +756,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
 
+        if not self.quant_config.is_checkpoint_fp8_serialized and _use_hip_int4:
+            raise NotImplementedError(
+                f"Online MOE FP8 quantization (is_checkpoint_fp8_serialized={self.quant_config.is_checkpoint_fp8_serialized}) along SGLANG_INT4_WEIGHT=1 is not supported at the moment. Please open an issue."
+            )
+
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
@@ -713,8 +789,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        original_weight_loader = extra_weight_attrs.get("weight_loader")
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+            weight_loader = original_weight_loader
+            device = torch.get_default_device()
+        else:
+            # Online quantization: use original dtype and meta device
+            weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
+            device = torch.device("meta")
+
+        layer._load_device = torch.get_default_device()
+        layer._w13_loaded_numel = 0
+        layer._w2_loaded_numel = 0
+
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -747,6 +836,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 8,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -756,6 +846,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 8,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -766,6 +857,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -775,9 +867,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
+
+        extra_weight_attrs["weight_loader"] = weight_loader
 
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
@@ -911,6 +1006,111 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def get_online_weight_loader(self, layer, original_weight_loader):
+        def online_fp8_moe_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            # Determine which weight parameter we're loading (w13 or w2)
+            is_w13 = "w13" in weight_name
+            is_w2 = "w2" in weight_name
+
+            # Initialize weight on device if first load
+            if is_w13 and layer._w13_loaded_numel == 0:
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.empty_like(param.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                param = layer.w13_weight
+            elif is_w2 and layer._w2_loaded_numel == 0:
+                layer.w2_weight = torch.nn.Parameter(
+                    torch.empty_like(param.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                param = layer.w2_weight
+
+            # Move to device for faster quantization
+            loaded_weight = loaded_weight.to(layer._load_device)
+
+            if is_w13:
+                param = layer.w13_weight
+            elif is_w2:
+                param = layer.w2_weight
+
+            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on `param.shape` or `loaded_weight.shape`.
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                original_weight_loader(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+
+            if is_w13:
+                layer._w13_loaded_numel += copy_numel_counter.copied_numel
+                target_loaded_numel = layer.w13_weight.numel()
+                current_loaded = layer._w13_loaded_numel
+            elif is_w2:
+                layer._w2_loaded_numel += copy_numel_counter.copied_numel
+                target_loaded_numel = layer.w2_weight.numel()
+                current_loaded = layer._w2_loaded_numel
+            else:
+                raise ValueError("Expected w13 or w2.")
+
+            assert (
+                current_loaded <= target_loaded_numel
+            ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
+
+            # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
+            if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
+                if self.use_mxfp8:
+                    self._process_mxfp8_w13_weights(layer, quantize=True)
+                else:
+                    self._quantize_w13_online(layer)
+            elif is_w2 and layer._w2_loaded_numel == target_loaded_numel:
+                if self.use_mxfp8:
+                    self._process_mxfp8_w2_weights(layer, quantize=True)
+                else:
+                    self._quantize_w2_online(layer)
+
+        return online_fp8_moe_weight_loader
+
+    def _quantize_w13_online(self, layer):
+        """Quantize w13_weight after all weights are loaded."""
+        # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
+        w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
+
+        # Re-initialize w13_scale because we directly quantize
+        # merged w13 weights and generate a single scaling factor.
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                layer.num_local_experts,
+                dtype=torch.float32,
+                device=w13_weight.device,
+            ),
+            requires_grad=False,
+        )
+
+        for expert in range(layer.num_local_experts):
+            w13_weight[expert, :, :], layer.w13_weight_scale[expert] = scaled_fp8_quant(
+                layer.w13_weight.data[expert, :, :]
+            )
+
+        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+
+    def _quantize_w2_online(self, layer):
+        """Quantize w2_weight after all weights are loaded."""
+        # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
+        w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+
+        for expert in range(layer.num_local_experts):
+            w2_weight[expert, :, :], layer.w2_weight_scale[expert] = scaled_fp8_quant(
+                layer.w2_weight.data[expert, :, :]
+            )
+
+        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
@@ -959,9 +1159,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         elif self.use_mxfp8:
-            self._process_mxfp8_moe_weights(
-                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
-            )
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                # Quantization already happened during weight loading via get_online_weight_loader.
+                assert layer.w13_weight.dtype == torch.float8_e4m3fn
+                assert layer.w2_weight.dtype == torch.float8_e4m3fn
+                assert hasattr(layer, "w13_weight_scale_inv")
+                assert hasattr(layer, "w2_weight_scale_inv")
+                assert layer.w13_weight_scale_inv.format_ue8m0
+                assert layer.w2_weight_scale_inv.format_ue8m0
+            else:
+                # Checkpoint is already FP8 serialized, just need to swizzle the scales
+                self._process_mxfp8_moe_weights(layer, quantize=False)
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
@@ -994,142 +1202,64 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
-    def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
-
+    def _process_mxfp8_w13_weights(self, layer: Module, quantize: bool = True) -> None:
+        """Process w13 weights for MXFP8: quantize (if needed) and swizzle scales."""
         if not (_is_cuda and is_sm100_supported()):
             raise RuntimeError("MXFP8 MoE quantization requires SM100.")
-
-        def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
-            from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
-
-            weight = weight.contiguous()
-            num_experts, m, k = weight.shape
-            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-            weight_flat = weight.view(-1, k).contiguous()
-            problem_sizes = torch.empty(
-                (num_experts, 3), dtype=torch.int32, device=weight.device
-            )
-            problem_sizes[:, 0] = m
-            problem_sizes[:, 1] = 0
-            problem_sizes[:, 2] = k
-            expert_offsets = torch.arange(
-                0, num_experts * m, m, dtype=torch.int32, device=weight.device
-            )
-            aligned_m = ((m + 127) // 128) * 128
-            blockscale_offsets = torch.arange(
-                0,
-                num_experts * aligned_m,
-                aligned_m,
-                dtype=torch.int32,
-                device=weight.device,
-            )
-            qweight = torch.empty_like(weight_flat, dtype=torch.float8_e4m3fn)
-            scale = torch.empty(
-                (num_experts * aligned_m, k // 32),
-                dtype=torch.uint8,
-                device=weight.device,
-            )
-            es_sm100_mxfp8_blockscaled_grouped_quant(
-                weight_flat,
-                problem_sizes,
-                expert_offsets,
-                blockscale_offsets,
-                qweight,
-                scale,
-            )
-            qweight = qweight.view_as(weight)
-            scale = scale.view(num_experts, aligned_m, k // 32)
-            if aligned_m != m:
-                scale = scale[:, :m, :]
-            return qweight, scale
-
-        def _swizzle_mxfp8_sf(scale, num_warps):
-            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-            from triton_kernels.tensor_details import layout
-
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
-                )
-            )
-            scale = scale.transpose(-2, -1)
-            scale = convert_layout(
-                wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
-            )
-            return scale
-
-        def _swizzle_with_triton_kernel(
-            weight_shape: tuple[int, int, int], scale: torch.Tensor
-        ):
-            num_experts, m, k = weight_shape
-            aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
-            num_warps = 8
-            scale = _swizzle_mxfp8_sf(scale, num_warps)
-            scale = scale.data.view(num_experts, aligned_m, k // 32)
-            return scale
-
-        def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
-
-            weight = weight.contiguous()
-            _, _, k = weight.shape
-            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-            weight_flat = weight.view(-1, k).contiguous()
-            qweight, scale = mxfp8_group_quantize(weight_flat)
-            qweight = qweight.view_as(weight)
-            scale = _swizzle_with_triton_kernel(weight.shape, scale)
-            return qweight, scale
 
         if quantize:
             if get_moe_runner_backend().is_cutlass():
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w13_weight.data
                 )
-                w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
-                    layer.w2_weight.data
-                )
             else:
                 w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w13_weight.data
                 )
-                w2_q, w2_s = _quantize_and_swizzle_with_triton_kernel(
+        else:
+            w13_q = layer.w13_weight.data
+            w13_s = self._swizzle_with_triton_kernel(
+                layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
+            )
+
+        _copy_or_rebind(layer.w13_weight, w13_q)
+        _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
+        layer.w13_weight.requires_grad_(False)
+        layer.w13_weight_scale_inv.requires_grad_(False)
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w13_input_scale = None
+
+    def _process_mxfp8_w2_weights(self, layer: Module, quantize: bool = True) -> None:
+        """Process w2 weights for MXFP8: quantize (if needed) and swizzle scales."""
+        if not (_is_cuda and is_sm100_supported()):
+            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+
+        if quantize:
+            if get_moe_runner_backend().is_cutlass():
+                w2_q, w2_s = self._quantize_and_swizzle_with_cutlass_es_kernel(
+                    layer.w2_weight.data
+                )
+            else:
+                w2_q, w2_s = self._quantize_and_swizzle_with_triton_kernel(
                     layer.w2_weight.data
                 )
         else:
-            w13_q = layer.w13_weight.data
             w2_q = layer.w2_weight.data
-            w13_s = _swizzle_with_triton_kernel(
-                layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
-            )
-            w2_s = _swizzle_with_triton_kernel(
+            w2_s = self._swizzle_with_triton_kernel(
                 layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
             )
 
-        # Keep parameter objects to preserve weight_loader attrs for hot reload.
-        # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
-        def _copy_or_rebind(param: Parameter, new_value: torch.Tensor) -> None:
-            if (
-                param.data.shape == new_value.shape
-                and param.data.dtype == new_value.dtype
-            ):
-                param.data.copy_(new_value)
-            else:
-                param.data = new_value
-
-        _copy_or_rebind(layer.w13_weight, w13_q)
-        _copy_or_rebind(layer.w2_weight, w2_q)
-        _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
-        _copy_or_rebind(layer.w2_weight_scale_inv, w2_s)
-        layer.w13_weight.requires_grad_(False)
+        _copy_or_rebind(layer.w13_weight, w2_q)
+        _copy_or_rebind(layer.w13_weight_scale_inv, w2_s)
         layer.w2_weight.requires_grad_(False)
-        layer.w13_weight_scale_inv.requires_grad_(False)
         layer.w2_weight_scale_inv.requires_grad_(False)
-        layer.w13_weight_scale_inv.format_ue8m0 = True
         layer.w2_weight_scale_inv.format_ue8m0 = True
-        layer.w13_input_scale = None
         layer.w2_input_scale = None
+
+    def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
+        """Process both w13 and w2 weights for MXFP8."""
+        self._process_mxfp8_w13_weights(layer, quantize=quantize)
+        self._process_mxfp8_w2_weights(layer, quantize=quantize)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
@@ -1141,35 +1271,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.process_weights_after_loading_block_quant(layer)
             return
 
-        # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
-            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
-            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
-
-            # Re-initialize w13_scale because we directly quantize
-            # merged w13 weights and generate a single scaling factor.
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_local_experts,
-                    dtype=torch.float32,
-                    device=w13_weight.device,
-                ),
-                requires_grad=False,
-            )
-            for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+            # Online quantization already happened during weight loading via get_online_weight_loader.
+            assert layer.w13_weight.dtype == fp8_dtype
+            assert layer.w2_weight.dtype == fp8_dtype
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
