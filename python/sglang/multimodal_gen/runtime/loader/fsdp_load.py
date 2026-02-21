@@ -265,9 +265,6 @@ def load_model_from_full_model_state_dict(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
             else:
-                logger.warning(
-                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
-                )
                 continue
 
         # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
