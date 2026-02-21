@@ -614,20 +614,24 @@ def _torch_save(value, path: str):
             return torch.save(value, path)
         except RuntimeError as e:
             if "not pickleable" in str(e):
-                # Some parameter subclasses with extra fields are not pickleable
-                if isinstance(value, torch.nn.Parameter):
-                    print(f"[Dumper] Observe error={e} and try pickling value.data")
-                    return _torch_save(value.data, path)
-                if isinstance(value, dict) and isinstance(
-                    value.get("value"), torch.nn.Parameter
-                ):
-                    print(f"[Dumper] Observe error={e} and try pickling value.data")
-                    return _torch_save(
-                        {**value, "value": value["value"].data}, path
-                    )
+                stripped = _strip_parameter(value)
+                if stripped is not value:
+                    print(f"[Dumper] Observe error={e} and try pickling .data")
+                    return _torch_save(stripped, path)
             raise
     except Exception as e:
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
+
+
+def _strip_parameter(value):
+    """Strip nn.Parameter to plain Tensor so it can be pickled."""
+    if isinstance(value, torch.nn.Parameter):
+        return value.data
+    if isinstance(value, dict) and isinstance(
+        value.get("value"), torch.nn.Parameter
+    ):
+        return {**value, "value": value["value"].data}
+    return value
 
 
 def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
