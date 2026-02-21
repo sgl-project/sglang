@@ -82,12 +82,10 @@ jobs:
               && for p in /tmp/patches/*.patch; do \
                    if [ ! -s "${p}" ]; then \
                      echo "Skipping ${p} (empty)"; \
-                   elif git apply --check "${p}" 2>&1; then \
-                     echo "Applying ${p}..." \
-                     && git apply "${p}"; \
                    else \
-                     echo "Patch ${p} failed clean apply, trying 3-way merge..." \
-                     && git apply --3way "${p}"; \
+                     echo "Applying ${p}..." \
+                     && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
+                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
                    fi; \
                  done \
               && rm -rf /tmp/patches
