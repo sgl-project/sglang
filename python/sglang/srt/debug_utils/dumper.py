@@ -126,22 +126,10 @@ class _DumperConfig(_FrozenConfig):
 
     @classmethod
     def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_DumperConfig":
-        """Parse ``key=value`` CLI pairs into a fully-populated :class:`_DumperConfig`.
-
-        Values are coerced based on the target field's type
-        (bool fields: ``true``/``1`` → True; int fields: parsed as int;
-        str fields: kept as-is).  Unspecified fields use their defaults.
-        """
         return cls(**cls._kv_pairs_to_dict(pairs))
 
     @classmethod
     def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
-        """Parse ``key=value`` pairs into a validated, typed override dict.
-
-        Only keys that appear in *pairs* are included in the returned dict,
-        which makes it suitable for ``replace()`` / ``configure()`` merges
-        where unset fields should keep their previous value.
-        """
         if not pairs:
             return {}
 
