@@ -39,6 +39,7 @@ jobs:
 
       - name: Generate patches
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch origin "${BASE_SHA}"
           mkdir -p /tmp/patch-ctx
 
