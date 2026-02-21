@@ -126,9 +126,7 @@ class _BaseConfig(ABC):
                 )
             except (ValueError, TypeError) as exc:
                 field_type = type(valid_fields[key].default).__name__
-                raise TypeError(
-                    f"{key}: expected {field_type}, got {value!r}"
-                ) from exc
+                raise TypeError(f"{key}: expected {field_type}, got {value!r}") from exc
 
         return result
 
