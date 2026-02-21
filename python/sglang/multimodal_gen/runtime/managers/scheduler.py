@@ -35,12 +35,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import (
-    get_diffusion_metrics_collector,
-    get_zmq_socket,
-)
+from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.metrics import get_diffusion_metrics_collector
 
 logger = init_logger(__name__)
 
@@ -422,12 +420,7 @@ class Scheduler:
                         f"Error executing request in scheduler event loop: {e}",
                         exc_info=True,
                     )
-                    # Determine appropriate error response format
-                    output_batch = (
-                        OutputBatch(error=str(e))
-                        if reqs and isinstance(reqs[0], Req)
-                        else OutputBatch(error=str(e))
-                    )
+                    output_batch = OutputBatch(error=str(e))
 
                 # 3. return results
                 try:
