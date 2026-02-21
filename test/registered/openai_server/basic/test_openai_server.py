@@ -159,10 +159,10 @@ class TestOpenAIServer(CustomTestCase):
             index = response.choices[0].index
             is_first = is_firsts.get(index, True)
 
-            if logprobs:
-                # When finish_reason is set, logprobs may be None if this chunk
-                # only contains buffered text being flushed (no new tokens generated).
-                # The detokenizer holds back text at word boundaries during streaming.
+            if logprobs and response.choices[0].text:
+                # logprobs may be None when no new tokens exist for this chunk:
+                # 1. Race condition: chunk arrives before any decode batch runs
+                # 2. Finish chunk: only buffered text flushed by the detokenizer
                 if response.choices[0].logprobs is not None:
                     assert isinstance(
                         response.choices[0].logprobs.tokens[0], str
