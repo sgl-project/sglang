@@ -12,7 +12,6 @@ def tree_speculative_sampling_target_only(
     uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
     deterministic: bool = True,
@@ -28,7 +27,38 @@ def tree_speculative_sampling_target_only(
         uniform_samples,
         uniform_samples_for_final_sampling,
         target_probs,
-        draft_probs,
+        threshold_single,
+        threshold_acc,
+        deterministic,
+    )
+
+
+def tree_speculative_sampling_target_only_rejmask(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
+) -> None:
+    torch.ops.sgl_kernel.tree_speculative_sampling_target_only_rejmask.default(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
         threshold_single,
         threshold_acc,
         deterministic,
