@@ -171,9 +171,6 @@ class _DumperHttpManager:
     def __init__(self, dumper: "_Dumper"):
         config = dumper._config
         http_port = config.server_port_parsed
-        if http_port is None:
-            self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(dumper)
-            return
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
             dumper,
@@ -347,7 +344,9 @@ class _Dumper:
         }
 
     @cached_property
-    def _http_manager(self) -> _DumperHttpManager:
+    def _http_manager(self) -> Optional[_DumperHttpManager]:
+        if self._config.server_port_parsed is None:
+            return None
         return _DumperHttpManager(self)
 
     # ------------------------- public :: only used internally -----------------------------
