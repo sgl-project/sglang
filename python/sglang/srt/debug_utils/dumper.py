@@ -124,6 +124,45 @@ class _DumperConfig(_FrozenConfig):
             return None
         return port
 
+    @classmethod
+    def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_DumperConfig":
+        """Parse ``key=value`` CLI pairs into a fully-populated :class:`_DumperConfig`.
+
+        Values are coerced based on the target field's type
+        (bool fields: ``true``/``1`` → True; int fields: parsed as int;
+        str fields: kept as-is).  Unspecified fields use their defaults.
+        """
+        return cls(**cls._kv_pairs_to_dict(pairs))
+
+    @classmethod
+    def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
+        """Parse ``key=value`` pairs into a validated, typed override dict.
+
+        Only keys that appear in *pairs* are included in the returned dict,
+        which makes it suitable for ``replace()`` / ``configure()`` merges
+        where unset fields should keep their previous value.
+        """
+        if not pairs:
+            return {}
+
+        valid_fields = {f.name: f for f in fields(cls)}
+        result: dict = {}
+
+        for pair in pairs:
+            key, sep, value = pair.partition("=")
+            if not sep:
+                raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
+            if key not in valid_fields:
+                raise ValueError(
+                    f"Unknown config key {key!r}. "
+                    f"Valid keys: {sorted(valid_fields)}"
+                )
+            result[key] = _FrozenConfig._parse_env_value(
+                value, valid_fields[key].default
+            )
+
+        return result
+
 
 # -------------------------------------- dumper core ------------------------------------------
 
