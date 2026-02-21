@@ -285,6 +285,8 @@ class _Dumper:
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
+        if "cleanup_previous" in kwargs:
+            self._cleanup_previous_handled = not self._config.cleanup_previous
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
@@ -293,6 +295,7 @@ class _Dumper:
         self._dump_index = 0
         self._step = 0
         self._global_ctx = {}
+        self._cleanup_previous_handled = not self._config.cleanup_previous
 
     @contextmanager
     def capture_output(self):
