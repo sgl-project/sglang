@@ -1257,6 +1257,18 @@ class TestDumperHttp:
         assert resp.status_code == 400
 
 
+class TestRegisterForwardHookOrReplaceFn:
+    def test_unknown_mode_raises(self):
+        module = torch.nn.Linear(4, 4)
+        with pytest.raises(ValueError, match="Unknown mode"):
+            _register_forward_hook_or_replace_fn(
+                module,
+                pre_hook=lambda _mod, _input: None,
+                hook=lambda _mod, _input, _output: None,
+                mode="bad",
+            )
+
+
 class _NonIntrusiveTestBase:
     _PREFIX = "non_intrusive__"
 
