@@ -938,6 +938,17 @@ class TestDumpModel:
         filenames = _get_filenames(tmp_path)
         assert all("grad" not in f for f in filenames)
 
+    def test_parameter_saved_as_data(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+
+        d.dump_model(model, name_prefix="p")
+
+        path = _find_dump_file(tmp_path, name="p__weight")
+        loaded = _load_dump(path)
+        assert isinstance(loaded["value"], torch.Tensor)
+        assert not isinstance(loaded["value"], torch.nn.Parameter)
+
     def test_disable_model_value(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_model_value=False)
         model = torch.nn.Linear(4, 2, bias=False)
