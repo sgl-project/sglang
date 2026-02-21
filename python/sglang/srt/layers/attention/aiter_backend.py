@@ -102,6 +102,7 @@ class AiterAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
+        topk: int = 1,
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
@@ -119,6 +120,7 @@ class AiterAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -152,6 +154,7 @@ class AiterAttnBackend(AttentionBackend):
         self.qo_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
+        self._kv_indices_scratch: Optional[torch.Tensor] = None
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -410,6 +413,74 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
         )
 
+    def _resolve_v2_num_draft_tokens(
+        self,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens_cpu: Optional[list[int]] = None,
+    ) -> int:
+        """Resolve fixed per-request extend length for DRAFT_EXTEND_V2."""
+        num_draft_tokens = self.num_draft_tokens
+        if num_draft_tokens is None:
+            if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
+                # Avoid list scans in hot path when tensor lengths are already available.
+                num_draft_tokens = int(extend_seq_lens[0].item())
+            elif extend_seq_lens_cpu:
+                num_draft_tokens = max(extend_seq_lens_cpu)
+            else:
+                raise ValueError(
+                    "DRAFT_EXTEND_V2 requires speculative_num_draft_tokens or "
+                    "non-empty extend_seq_lens/extend_seq_lens_cpu."
+                )
+
+        num_draft_tokens = int(num_draft_tokens)
+        if extend_seq_lens is not None and extend_seq_lens.numel() > 0:
+            if not torch.all(extend_seq_lens == num_draft_tokens):
+                raise ValueError(
+                    "DRAFT_EXTEND_V2 expects fixed extend length per request; got "
+                    f"extend_seq_lens={extend_seq_lens}, expected all == {num_draft_tokens}."
+                )
+        if extend_seq_lens_cpu and any(
+            x != num_draft_tokens for x in extend_seq_lens_cpu
+        ):
+            raise ValueError(
+                "DRAFT_EXTEND_V2 expects fixed extend length per request; got "
+                f"{extend_seq_lens_cpu}, expected all == {num_draft_tokens}."
+            )
+        return num_draft_tokens
+
+    def _get_kv_indices_scratch(
+        self, required_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        if (
+            self._kv_indices_scratch is None
+            or self._kv_indices_scratch.device != device
+            or self._kv_indices_scratch.numel() < required_tokens
+        ):
+            self._kv_indices_scratch = torch.empty(
+                required_tokens, dtype=torch.int32, device=device
+            )
+        return self._kv_indices_scratch[:required_tokens]
+
+    def _set_uniform_qo_indptr(
+        self, bs: int, tokens_per_req: int, device: torch.device
+    ) -> torch.Tensor:
+        qo_indptr = self.qo_indptr[: bs + 1]
+        qo_indptr[: bs + 1] = torch.arange(
+            0,
+            bs * tokens_per_req + 1,
+            step=tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
+        return qo_indptr
+
+    def _ensure_spec_v2_topk_supported(self):
+        if self.topk > 1:
+            raise NotImplementedError(
+                "AiterAttnBackend SPEC_V2 path currently supports topk <= 1 only. "
+                f"Got topk={self.topk}."
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -434,8 +505,8 @@ class AiterAttnBackend(AttentionBackend):
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                kv_indices = self._get_kv_indices_scratch(
+                    forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -503,24 +574,19 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
             # EAGLE V2: DRAFT_EXTEND_V2 mode - extend draft KV cache with all predicted tokens
+            self._ensure_spec_v2_topk_supported()
             if self.use_mla:
                 device = forward_batch.seq_lens.device
-
-                # Build qo_indptr from extend_seq_lens (all are num_draft_tokens)
-                extend_seq_lens_tensor = torch.tensor(
-                    forward_batch.extend_seq_lens_cpu,
-                    dtype=torch.int32,
-                    device=device,
+                num_draft_tokens = self._resolve_v2_num_draft_tokens(
+                    extend_seq_lens=forward_batch.extend_seq_lens
                 )
-                qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-                qo_indptr[1:] = torch.cumsum(extend_seq_lens_tensor, dim=0)
+                qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
 
-                # Build kv_indptr and kv_indices
-                kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-                kv_indptr[1:] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
 
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=device
+                kv_indices = self._get_kv_indices_scratch(
+                    forward_batch.seq_lens_sum, device
                 )
 
                 create_flashinfer_kv_indices_triton[(bs,)](
@@ -534,7 +600,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if _use_mla_ps_kernel:
-                    max_seqlen_qo = max(forward_batch.extend_seq_lens_cpu)
+                    max_seqlen_qo = num_draft_tokens
                     (
                         work_metadata,
                         work_indptr,
@@ -567,7 +633,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     qo_indptr,
                     self.kv_last_page_len[:bs],
-                    max(forward_batch.extend_seq_lens_cpu),
+                    num_draft_tokens,
                     forward_batch.seq_lens_cpu.max().item(),
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
@@ -677,20 +743,19 @@ class AiterAttnBackend(AttentionBackend):
                 kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
 
-                qo_indptr = torch.arange(
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
                     0,
                     (1 + bs) * draft_num,
                     step=draft_num,
                     dtype=torch.int32,
                     device=device,
                 )
-                kv_indptr = self.kv_indptr
+                kv_indptr = self.kv_indptr[: bs + 1]
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
+                kv_indices = self._get_kv_indices_scratch(
                     kv_lens_sum,
-                    dtype=torch.int32,
-                    device=device,
+                    device,
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -1087,15 +1152,9 @@ class AiterAttnBackend(AttentionBackend):
                 )
         elif forward_mode.is_draft_extend_v2():
             # EAGLE V2: Uses fixed num_draft_tokens per batch
-            num_tokens_per_bs = self.num_draft_tokens
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                step=num_tokens_per_bs,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            self._ensure_spec_v2_topk_supported()
+            num_tokens_per_bs = self._resolve_v2_num_draft_tokens()
+            qo_indptr = self._set_uniform_qo_indptr(bs, num_tokens_per_bs, self.device)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
@@ -1283,8 +1342,9 @@ class AiterAttnBackend(AttentionBackend):
 
         elif forward_mode.is_draft_extend_v2():
             # EAGLE V2: Fixed num_draft_tokens per batch
+            self._ensure_spec_v2_topk_supported()
             seq_lens = seq_lens[:bs]
-            num_draft_tokens = self.num_draft_tokens
+            num_draft_tokens = self._resolve_v2_num_draft_tokens()
             extend_lens = torch.full(
                 (bs,), num_draft_tokens, dtype=torch.int32, device=seq_lens.device
             )
@@ -2067,6 +2127,7 @@ class AiterMultiStepDraftBackend:
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
+                    topk=topk,
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len
