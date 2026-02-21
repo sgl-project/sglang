@@ -260,6 +260,21 @@ class TestDumperPureFunctions:
         assert result["x"] == 10
         assert "method" not in result
 
+    def test_deepcopy_or_clone_tensor(self):
+        original = torch.randn(3, 3)
+        cloned = _deepcopy_or_clone(original)
+        assert torch.equal(cloned, original)
+        original.fill_(999.0)
+        assert not torch.equal(cloned, original)
+
+    def test_deepcopy_or_clone_non_tensor(self):
+        original = {"a": [1, 2, 3]}
+        cloned = _deepcopy_or_clone(original)
+        assert cloned == original
+        assert cloned is not original
+        original["a"].append(4)
+        assert len(cloned["a"]) == 3
+
     def test_get_tensor_info(self):
         info = get_tensor_info(torch.randn(10, 10))
         for key in ["shape=", "dtype=", "min=", "max=", "mean="]:
