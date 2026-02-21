@@ -226,7 +226,7 @@ class DiffusionTestCase:
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
-    run_perf_check: bool = True  # whether to run performance checks
+    run_perf_check: bool = True
 
 
 def sample_step_indices(

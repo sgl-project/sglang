@@ -288,10 +288,7 @@ class ServerArgs:
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
     # Component path overrides (key = model_index.json component name, value = path)
-    # Enables overriding any pipeline component without hardcoding keys like "vae".
     component_paths: dict[str, str] = field(default_factory=dict)
-    # VAE parameters (backward compat: equivalent to component_paths["vae"] when set)
-    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -626,16 +623,6 @@ class ServerArgs:
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
-        parser.add_argument(
-            "--vae-path",
-            type=str,
-            default=ServerArgs.vae_path,
-            help="Custom path to VAE model (e.g., for distilled autoencoder). "
-            "This is a shorthand for the dynamic --<component>-path convention. "
-            "Any unrecognized --<component>-path argument (e.g. --transformer-path, "
-            "--video-vae-path) is automatically captured as a component override.",
-        )
-
         # attention
         parser.add_argument(
             "--attention-backend",
@@ -973,12 +960,8 @@ class ServerArgs:
     def _extract_component_paths(
         unknown_args: list[str],
     ) -> tuple[dict[str, str], list[str]]:
-        """Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
-
-        E.g. ``--transformer-path /foo`` → ``{"transformer": "/foo"}``
-             ``--video-vae-path=/bar``    → ``{"video_vae": "/bar"}``
-
-        Returns ``(component_paths, remaining_unknown_args)``.
+        """
+        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
         """
         component_paths: dict[str, str] = {}
         remaining: list[str] = []
@@ -1003,6 +986,7 @@ class ServerArgs:
                 remaining.append(arg)
             i += 1
 
+        # canonicalize and validate
         for component, path in component_paths.items():
             path = os.path.expanduser(path)
             component_paths[component] = path
@@ -1041,11 +1025,7 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 
-        # merge vae_path into component_paths
         component_paths = dict(kwargs.get("component_paths") or {})
-        vae_path = kwargs.get("vae_path")
-        if vae_path:
-            component_paths.setdefault("vae", vae_path)
         if component_paths:
             server_args_kwargs["component_paths"] = component_paths
 

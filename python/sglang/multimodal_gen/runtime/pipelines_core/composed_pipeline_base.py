@@ -174,19 +174,11 @@ class ComposedPipelineBase(ABC):
     def _resolve_component_path(
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
-        # use component_paths override (key = model_index component name) or default
         override_path = server_args.component_paths.get(module_name)
-        if override_path is None and module_name == "vae":
-            override_path = server_args.vae_path
         if override_path is not None:
+            # overridden with args like --vae-path
             component_model_path = maybe_download_model(
                 override_path,
-            )
-            logger.info(
-                "Using custom path for component %s: %s (default: %s)",
-                module_name,
-                override_path,
-                os.path.join(self.model_path, load_module_name),
             )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)

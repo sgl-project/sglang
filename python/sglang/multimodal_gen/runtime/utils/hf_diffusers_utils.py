@@ -84,8 +84,6 @@ def _check_index_files_for_missing_shards(
         if os.path.isdir(subdir_path):
             dirs_to_check.append(subdir_path)
 
-    print(f"{subdirs=}")
-    print(f"{dirs_to_check=}")
     for dir_path in dirs_to_check:
         # Find all safetensors index files
         index_files = glob.glob(os.path.join(dir_path, "*.safetensors.index.json"))
