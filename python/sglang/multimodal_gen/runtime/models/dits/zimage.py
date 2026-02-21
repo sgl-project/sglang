@@ -8,7 +8,11 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm,
+    apply_rmsnorm_tanh_mul_add,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -334,7 +338,6 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
             # Attention block
@@ -342,14 +345,11 @@ class ZImageTransformerBlock(nn.Module):
                 self.attention_norm1(x) * scale_msa,
                 freqs_cis=freqs_cis,
             )
-            x = x + gate_msa * self.attention_norm2(attn_out)
+            x = apply_rmsnorm_tanh_mul_add(attn_out, gate_msa, x, self.attention_norm2)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_out = self.feed_forward(self.ffn_norm1(x) * scale_mlp)
+            x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
             attn_out = self.attention(
