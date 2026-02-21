@@ -2,6 +2,7 @@
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
+
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 
 #include <dlpack/dlpack.h>
@@ -32,17 +33,11 @@ void copy_to_gpu_no_ce(tvm::ffi::TensorView input, tvm::ffi::TensorView output) 
   using namespace host;
 
   // Validate CPU input tensor
-  TensorMatcher({kN})
-      .with_dtype<int32_t>()
-      .with_device<kDLCPU>()
-      .verify(input);
+  TensorMatcher({kN}).with_dtype<int32_t>().with_device<kDLCPU>().verify(input);
 
   // Validate CUDA output tensor, capture device for stream resolution
   SymbolicDevice cuda_device;
-  TensorMatcher({kN})
-      .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(cuda_device)
-      .verify(output);
+  TensorMatcher({kN}).with_dtype<int32_t>().with_device<kDLCUDA>(cuda_device).verify(output);
 
   // Pack CPU data into a by-value struct to avoid copy engine
   InputArray<kN> input_array;
@@ -54,9 +49,7 @@ void copy_to_gpu_no_ce(tvm::ffi::TensorView input, tvm::ffi::TensorView output) 
   // Launch kernel: one block, kN threads
   const DLDevice device = cuda_device.unwrap();
   LaunchKernel(dim3(1), dim3(static_cast<uint32_t>(kN)), device)(
-      copy_to_gpu_no_ce_kernel<kN>,
-      input_array,
-      static_cast<int32_t*>(output.data_ptr()));
+      copy_to_gpu_no_ce_kernel<kN>, input_array, static_cast<int32_t*>(output.data_ptr()));
 }
 
 }  // namespace
