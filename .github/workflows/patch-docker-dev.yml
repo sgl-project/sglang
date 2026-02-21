@@ -35,8 +35,12 @@ jobs:
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
           docker pull "${IMAGE}"
-          BASE_SHA=$(docker run --rm --entrypoint git "${IMAGE}" -C /sgl-workspace/sglang rev-parse HEAD)
-          echo "Image built from commit: ${BASE_SHA}"
+          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
+            echo "Image built from commit: ${BASE_SHA}"
+          else
+            BASE_SHA=""
+            echo "::warning::Image has no .git directory — cannot extract base commit"
+          fi
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
       - name: Generate patches
@@ -56,11 +60,14 @@ jobs:
               git diff "${MERGE_BASE}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
               echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
             done
-          else
+          elif [ -n "${BASE_SHA}" ]; then
             echo "Generating diff: image ${BASE_SHA} → latest main"
             git fetch origin "${BASE_SHA}"
             git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
             echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
+          else
+            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+            exit 1
           fi
 
           TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
@@ -104,5 +111,5 @@ jobs:
           docker push "${IMAGE}"
 
           echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
