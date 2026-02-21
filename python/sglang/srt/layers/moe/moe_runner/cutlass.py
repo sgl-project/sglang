@@ -388,7 +388,6 @@ class CutlassRunnerCore(MoeRunnerCore):
             AssertionError: If input shapes, dtypes, or flags are inconsistent or unsupported.
             NotImplementedError: If CUDA is not available or `sgl_kernel` is not properly installed.
         """
-        # Input 'a' is already preprocessed (shuffled and quantized to FP8)
 
         es_up, es_down = enable_es
         out_dtype = torch.bfloat16  # Default output dtype for FP8 operations
@@ -581,7 +580,6 @@ class CutlassRunnerCore(MoeRunnerCore):
         assumes that topk < k < n to satisfy - up/down projection expectations.
         """
 
-        # Input 'a' is already preprocessed (FP4 quantized and reordered)
         rep_a_fp4 = a
         rep_a_blockscale = rep_aux
 
@@ -1100,7 +1098,6 @@ def pre_permute_deepep_ll_to_cutlass(
     hidden_states, _, topk_ids, topk_weights, masked_m, expected_m = dispatch_output
 
     # Store for post_permute
-    running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
     num_experts = quant_info.w13_weight.size(0)
@@ -1202,7 +1199,6 @@ def pre_permute_deepep_normal_to_cutlass(
     hidden_states, _, topk_ids_, topk_weights, _ = dispatch_output
 
     # Store state for post_permute
-    running_state["topk_ids"] = topk_ids_
     running_state["topk_weights"] = topk_weights
 
     num_experts = quant_info.w13_weight.size(0)
