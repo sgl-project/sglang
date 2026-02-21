@@ -20,9 +20,7 @@ def main(args):
     )
     if args.filter:
         df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
-    assert all(
-        c in df_target.columns for c in ["rank", "step", "dump_index", "name"]
-    )
+    assert all(c in df_target.columns for c in ["rank", "step", "dump_index", "name"])
 
     df_baseline = read_meta(args.baseline_path)
     print("df_target", df_target)
@@ -41,9 +39,7 @@ def main(args):
             baseline_step = location_info.baseline_step
             baseline_token_slice = location_info.baseline_token_slice
         else:
-            baseline_step = (
-                row["step"] - args.start_id + args.baseline_start_id
-            )
+            baseline_step = row["step"] - args.start_id + args.baseline_start_id
             baseline_token_slice = None
 
         tensor_dim_desc = None
