@@ -154,7 +154,7 @@ from sglang.srt.utils import (
     dynamic_import,
     empty_context,
     enable_show_time_cost,
-    get_available_gpu_memory,
+    get_available_device_memory,
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
@@ -762,7 +762,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.device == "musa":
             backend = "mccl"
 
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        before_avail_memory = get_available_device_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -825,7 +825,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
-        min_per_gpu_memory = get_available_gpu_memory(
+        min_per_gpu_memory = get_available_device_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -836,7 +836,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
-        local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        local_gpu_memory = get_available_device_memory(self.device, self.gpu_id)
         if self.tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
@@ -894,9 +894,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def load_model(self):
         tic_total = time.perf_counter()
-        before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        before_avail_memory = get_available_device_memory(self.device, self.gpu_id)
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"Load weight begin. avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
@@ -1035,7 +1035,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.dtype = self.model_config.dtype
 
-        after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        after_avail_memory = get_available_device_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
@@ -1118,7 +1118,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         target_device = torch.device(self.device)
@@ -1521,14 +1521,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info(
             f"LoRA adapter loading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         result = self.lora_manager.load_lora_adapter(lora_ref)
 
         logger.info(
             f"LoRA adapter loading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         return result
@@ -1548,14 +1548,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info(
             f"LoRA adapter unloading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         result = self.lora_manager.unload_lora_adapter(lora_ref)
 
         logger.info(
             f"LoRA adapter unloading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_device_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         return result
@@ -2135,7 +2135,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        before_mem = get_available_device_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(
             lambda: "cuda graph",
             {
@@ -2155,7 +2155,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.graph_runner = graph_runners[self.device](self)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        after_mem = get_available_device_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
@@ -2223,14 +2223,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        before_mem = get_available_device_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
         self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        after_mem = get_available_device_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
         logger.info(
             f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
