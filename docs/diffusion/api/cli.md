@@ -243,15 +243,11 @@ Replace the default VAE with a distilled tiny autoencoder for ~3x faster decodin
 ```bash
 sglang serve \
   --model-path=black-forest-labs/FLUX.2-dev \
+  # with a Huggingface Repo ID
   --vae-path=fal/FLUX.2-Tiny-AutoEncoder
+  # Or using a local path
+ --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
 ```
-
-Or using a local path:
-
-```bash
---vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
-```
-
 
 ## Diffusers Backend
 
