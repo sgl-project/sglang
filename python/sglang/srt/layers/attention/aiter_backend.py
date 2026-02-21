@@ -858,7 +858,8 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if _use_mla_ps_kernel:
+                # https://github.com/sgl-project/sglang/pull/18383/changes
+                if self.use_mla and _use_mla_ps_kernel:
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
