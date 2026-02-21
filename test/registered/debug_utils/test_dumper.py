@@ -869,6 +869,17 @@ def _dumper_worker(rank, http_port: int, stop_event):
     stop_event.wait()
 
 
+def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+            return
+        except requests.ConnectionError:
+            time.sleep(0.5)
+    raise TimeoutError(f"Dumper HTTP server not reachable at {url}")
+
+
 class TestZmqPortIsolation:
     """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
 
@@ -895,18 +906,7 @@ class TestZmqPortIsolation:
 
         try:
             for port in ports:
-                base_url = f"http://127.0.0.1:{port}"
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    try:
-                        requests.post(
-                            f"{base_url}/dumper/configure", json={}, timeout=2
-                        )
-                        break
-                    except requests.ConnectionError:
-                        time.sleep(0.5)
-                else:
-                    raise TimeoutError(f"Dumper HTTP not reachable at {base_url}")
+                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
 
             for i, port in enumerate(ports):
                 resp = requests.post(
@@ -940,7 +940,7 @@ class TestDumperHttp:
             )
             thread.start()
             try:
-                TestDumperHttp._wait_for_http(base_url)
+                _wait_for_dumper_http(base_url)
                 yield base_url
             finally:
                 stop_event.set()
@@ -959,17 +959,6 @@ class TestDumperHttp:
                 yield base_url
             finally:
                 kill_process_tree(proc.pid)
-
-    @staticmethod
-    def _wait_for_http(url: str, timeout: float = 30) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                requests.post(f"{url}/dumper/configure", json={}, timeout=2)
-                return
-            except requests.ConnectionError:
-                time.sleep(0.5)
-        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
