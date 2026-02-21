@@ -110,6 +110,107 @@ class RankMetadata:
             return results
 
 
+class SharedMemoryRankMetadata:
+    """Holds all metadata for a multi rank."""
+
+    def __init__(self, model_name, str, num_pages: int):
+        """pip install shared-memory-dict"""
+        from shared_memory_dict import SharedMemoryDict
+
+        class SharedMemoryOrderDict(SharedMemoryDict):
+            def _read_memory(self) -> OrderedDict[str, int]:
+                return OrderedDict(
+                    self._serializer.loads(self._memory_block.buf.tobytes())
+                )
+
+            def unlink(self):
+                if not hasattr(self, "_memory_block"):
+                    return
+                self._memory_block.unlink()
+
+        super().__init__(num_pages)
+        self.key_to_index: OrderedDict[str, int] = SharedMemoryOrderDict(
+            name=model_name, size=128 * num_pages
+        )
+        # Todo: Support multi files for HF3FS
+
+    def exists_keys(self, keys: List[str]) -> List[bool]:
+        """Check if keys exist in metadata."""
+        db = self.key_to_index._read_memory()
+        return [key in db for key in keys]
+
+    def reserve_and_allocate_page_indices(
+        self, keys: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, int]]:
+        """Reserve and allocate page indices for keys."""
+        with self.key_to_index._modify_db() as db:
+            results = [None] * len(keys)
+            new_keys_to_process = []
+
+            for i, (key, prefix_key) in enumerate(keys):
+                if key in db:
+                    results[i] = (True, db[key])
+                    db.move_to_end(key)
+                else:
+                    new_keys_to_process.append((i, key, prefix_key))
+
+            # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
+            for i, key, prefix_key in new_keys_to_process:
+                if len(self.free_pages) > 0:
+                    page_index = self.free_pages.pop()
+                else:
+                    page_index = db.popitem(last=False)[1]
+
+                results[i] = (False, page_index)
+
+            return results
+
+    def confirm_write(
+        self,
+        written_keys_to_confirm: List[Tuple[str, int]],
+        pages_to_release: List[int],
+    ) -> None:
+        """Confirm write operations and release pages."""
+        with self.key_to_index._modify_db() as db:
+            for key, page_index in written_keys_to_confirm:
+                db[key] = page_index
+                db.move_to_end(key)
+
+            for page_index in pages_to_release:
+                if page_index not in self.free_pages:
+                    self.free_pages.append(page_index)
+
+    def delete_keys(self, keys: List[str]) -> int:
+        """Delete keys and return count of deleted keys."""
+        with self.key_to_index._modify_db() as db:
+            count = 0
+            for key in keys:
+                if key in db:
+                    page_index = db.pop(key)
+                    if page_index not in self.free_pages:
+                        self.free_pages.append(page_index)
+                    count += 1
+            return count
+
+    def clear_all(self) -> None:
+        """Clear all metadata."""
+        with self.key_to_index._modify_db() as db:
+            self.free_pages = list(range(self.num_pages))
+            db.clear()
+
+    def get_page_indices(self, keys: List[str]) -> List[Optional[int]]:
+        """Get page indices for keys."""
+        with self.key_to_index._modify_db() as db:
+            results = []
+            for key in keys:
+                if key in db:
+                    results.append(db[key])
+                    db.move_to_end(key)
+                else:
+                    results.append(None)
+            return results
+
+
 class GlobalMetadataState:
     """Manages the state for all ranks and persistence."""
 
@@ -392,11 +493,20 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
 class Hf3fsLocalMetadataClient(Hf3fsMetadataInterface):
     """Local metadata client that directly operates on single RankMetadata in memory without metadata server."""
 
-    def __init__(self):
+    def __init__(self, is_mla_model=False, tp_size=1, model_name=""):
         self.rank_metadata = None
+        self.is_mla_model = is_mla_model
+        self.tp_size = tp_size
+        self.model_name = model_name
 
     def initialize(self, rank: int, num_pages: int) -> None:
-        self.rank_metadata = RankMetadata(num_pages)
+        if self.is_mla_model and self.tp_size > 1:
+            logging.info(f"mla model and tp_size > 1 use SharedMemoryRankMetadata")
+            self.rank_metadata = SharedMemoryRankMetadata(
+                model_name=self.model_name, num_pages=num_pages
+            )
+        else:
+            self.rank_metadata = RankMetadata(num_pages)
 
     def reserve_and_allocate_page_indices(
         self, rank: int, keys: List[Tuple[str, str]]
