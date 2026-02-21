@@ -966,10 +966,55 @@ async def serve_grpc(
 
     # Start server
     listen_addr = f"{server_args.host}:{server_args.port}"
-    server.add_insecure_port(listen_addr)
+    if server_args.ssl_certfile and server_args.ssl_keyfile:
+        if server_args.ssl_keyfile_password:
+            raise ValueError(
+                "gRPC mode does not support encrypted SSL key files "
+                "(--ssl-keyfile-password). Please provide an unencrypted key "
+                "file when using --grpc-mode."
+            )
+
+        def _read_ssl_file(filepath: str, description: str) -> bytes:
+            try:
+                with open(filepath, "rb") as f:
+                    return f.read()
+            except OSError as e:
+                raise ValueError(
+                    f"Failed to read {description} '{filepath}': {e}"
+                ) from e
+
+        private_key = _read_ssl_file(server_args.ssl_keyfile, "SSL key file")
+        certificate_chain = _read_ssl_file(
+            server_args.ssl_certfile, "SSL certificate file"
+        )
+        root_certificates = None
+        if server_args.ssl_ca_certs:
+            root_certificates = _read_ssl_file(
+                server_args.ssl_ca_certs, "SSL CA certificates file"
+            )
+        try:
+            credentials = grpc.ssl_server_credentials(
+                [(private_key, certificate_chain)],  # pairs: (key, cert)
+                root_certificates=root_certificates,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to create gRPC SSL credentials. Verify that "
+                f"--ssl-keyfile and --ssl-certfile contain valid, matching "
+                f"PEM data. Underlying error: {e}"
+            ) from e
+        bound_port = server.add_secure_port(listen_addr, credentials)
+        if bound_port == 0:
+            raise RuntimeError(
+                f"Failed to bind gRPC TLS server to {listen_addr}. "
+                f"Check that the port is available and SSL credentials are valid."
+            )
+        logger.info(f"gRPC server (TLS) listening on {listen_addr}")
+    else:
+        server.add_insecure_port(listen_addr)
+        logger.info(f"gRPC server listening on {listen_addr}")
 
     await server.start()
-    logger.info(f"gRPC server listening on {listen_addr}")
 
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(

@@ -307,6 +307,12 @@ class ServerArgs:
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
+    # SSL/TLS
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+
     # Quantization and data type
     dtype: str = "auto"
     quantization: Optional[str] = None
@@ -708,6 +714,9 @@ class ServerArgs:
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
+        # Validate SSL arguments early (before dummy-model short-circuit).
+        self._handle_ssl_validation()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -825,6 +834,42 @@ class ServerArgs:
                 "Falling back to 'follow_bootstrap_room' for backward compatibility."
             )
             self.load_balance_method = "follow_bootstrap_room"
+
+    def _handle_ssl_validation(self):
+        """Ensure SSL arguments are consistent and referenced files exist."""
+        if self.ssl_keyfile and not self.ssl_certfile:
+            raise ValueError(
+                "--ssl-keyfile requires --ssl-certfile to be specified as well."
+            )
+        if self.ssl_certfile and not self.ssl_keyfile:
+            raise ValueError(
+                "--ssl-certfile requires --ssl-keyfile to be specified as well."
+            )
+        if not self.ssl_certfile and not self.ssl_keyfile:
+            if self.ssl_ca_certs:
+                raise ValueError(
+                    "--ssl-ca-certs has no effect without --ssl-certfile and --ssl-keyfile."
+                )
+            if self.ssl_keyfile_password:
+                raise ValueError(
+                    "--ssl-keyfile-password has no effect without --ssl-certfile and --ssl-keyfile."
+                )
+        # Validate files exist early to avoid late failures after model loading.
+        if self.ssl_keyfile and not os.path.isfile(self.ssl_keyfile):
+            raise ValueError(
+                f"SSL key file not found: '{self.ssl_keyfile}'. "
+                f"Please check the --ssl-keyfile path."
+            )
+        if self.ssl_certfile and not os.path.isfile(self.ssl_certfile):
+            raise ValueError(
+                f"SSL certificate file not found: '{self.ssl_certfile}'. "
+                f"Please check the --ssl-certfile path."
+            )
+        if self.ssl_ca_certs and not os.path.isfile(self.ssl_ca_certs):
+            raise ValueError(
+                f"SSL CA certificates file not found: '{self.ssl_ca_certs}'. "
+                f"Please check the --ssl-ca-certs path."
+            )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -3047,6 +3092,32 @@ class ServerArgs:
             "before serving inference requests.",
         )
 
+        # SSL/TLS
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="The file path to the SSL key file.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="The file path to the SSL certificate file.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="The CA certificates file.",
+        )
+        parser.add_argument(
+            "--ssl-keyfile-password",
+            type=str,
+            default=ServerArgs.ssl_keyfile_password,
+            help="The password to decrypt the SSL keyfile.",
+        )
+
         # Quantization and data type
         parser.add_argument(
             "--dtype",
@@ -5080,10 +5151,43 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        scheme = "https" if self.ssl_certfile else "http"
+        # When binding to all interfaces, use loopback for internal requests.
+        host = self.host
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"{scheme}://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"{scheme}://{host}:{self.port}"
+
+    def ssl_verify(self):
+        """Return the value for the requests library's ``verify=`` parameter.
+
+        When SSL is configured:
+          - If a CA certificate file is provided, return its path so requests
+            validates the server certificate against that CA.
+          - Otherwise, return False to disable certificate verification
+            (suitable for self-signed certificates in development/testing).
+            A warning is logged once when this happens.
+        When SSL is not configured, return True to use the system's default
+        CA bundle.
+        """
+        if self.ssl_ca_certs:
+            return self.ssl_ca_certs
+        if self.ssl_certfile:
+            if not getattr(self, "_ssl_verify_warned", False):
+                logger.warning(
+                    "SSL is enabled but --ssl-ca-certs was not provided. "
+                    "Certificate verification is DISABLED for internal "
+                    "health checks. For production deployments, provide "
+                    "--ssl-ca-certs or use CA-signed certificates."
+                )
+                self._ssl_verify_warned = True
+            return False
+        return True
 
     def get_model_config(self):
         # Lazy init to avoid circular import
