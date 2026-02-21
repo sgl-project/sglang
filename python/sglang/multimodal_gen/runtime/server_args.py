@@ -287,7 +287,10 @@ class ServerArgs:
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
-    # VAE parameters
+    # Component path overrides (key = model_index.json component name, value = path)
+    # Enables overriding any pipeline component without hardcoding keys like "vae".
+    component_paths: dict[str, str] = field(default_factory=dict)
+    # VAE parameters (backward compat: equivalent to component_paths["vae"] when set)
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -627,7 +630,7 @@ class ServerArgs:
             "--vae-path",
             type=str,
             default=ServerArgs.vae_path,
-            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
+            help="Custom path to VAE (e.g., distilled autoencoder). You can also use --<component>-path for any component key in model_index.json (e.g., --video-vae-path, --audio-vae-path).",
         )
 
         # attention
@@ -978,9 +981,24 @@ class ServerArgs:
             # Provided args override config file args
             provided_args = {**config_args, **provided_args}
 
-        # Handle special cases
-        # if "tp_size" in provided_args:
-        #     provided_args["tp"] = provided_args.pop("tp_size")
+        # extract dynamic component paths from --<component>-path args
+        known_path_args = {
+            "model_path",
+            "lora_path",
+            "prompt_file_path",
+            "mask_strategy_file_path",
+            "output_path",
+            "vae_path",
+        }
+        component_paths: dict[str, str] = {}
+        for key, value in list(provided_args.items()):
+            if key.endswith("_path") and key not in known_path_args:
+                # e.g. video_vae_path -> component key "video_vae"
+                component_key = key[:-5]  # strip "_path"
+                component_paths[component_key] = value
+                provided_args.pop(key)
+        if component_paths:
+            provided_args.setdefault("component_paths", {}).update(component_paths)
 
         return cls.from_dict(provided_args)
 
@@ -990,6 +1008,14 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 
+        # merge vae_path into component_paths (backward compat)
+        if "component_paths" in kwargs or "vae_path" in kwargs:
+            component_paths = dict(kwargs.get("component_paths") or {})
+            if "vae_path" in kwargs and kwargs["vae_path"]:
+                component_paths["vae"] = kwargs["vae_path"]
+            if component_paths:
+                server_args_kwargs["component_paths"] = component_paths
+
         for attr in attrs:
             if attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
@@ -998,6 +1024,9 @@ class ServerArgs:
             elif attr == "nunchaku_config":
                 nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
                 server_args_kwargs["nunchaku_config"] = nunchaku_config
+            elif attr == "component_paths":
+                # already set above
+                continue
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
