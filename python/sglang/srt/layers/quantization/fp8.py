@@ -182,6 +182,7 @@ class Fp8Config(QuantizationConfig):
             logger.warning(
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
+            weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
