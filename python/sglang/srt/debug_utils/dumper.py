@@ -190,13 +190,11 @@ class _DumperHttpManager:
                     prefix="/dumper/", target=self, http_port=http_port
                 )
                 print(f"[Dumper] HTTP server started on port {http_port}")
-        else:
-            self._rpc_broadcast = _LocalOnlyBroadcast(dumper)
 
     def handle_request(
         self, *, method: str, body: dict[str, Any]
     ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
+        return self._rpc_broadcast._handle_http_control_request(
             method=method, body=body
         )
 
@@ -351,7 +349,7 @@ class _Dumper:
 
     # ------------------------- public :: only used internally -----------------------------
 
-    def _handle_http_control_request_inner(
+    def _handle_http_control_request(
         self, *, method: str, body: dict[str, Any]
     ) -> dict:
         if method == "get_state":
@@ -927,19 +925,6 @@ class _RpcBroadcastBase:
 
     def __init__(self, handles: List[_ZmqRpcHandle]):
         self._handles = handles
-
-
-class _LocalOnlyBroadcast(_RpcBroadcastBase):
-    """Calls methods directly on the local dumper, wrapping the result in a list."""
-
-    def __init__(self, dumper: "_Dumper"):
-        self._dumper = dumper
-
-    def __getattr__(self, method_name: str):
-        def call(*args, **kwargs):
-            return [getattr(self._dumper, method_name)(*args, **kwargs)]
-
-        return call
 
 
 class _ZmqRpcBroadcast(_RpcBroadcastBase):
