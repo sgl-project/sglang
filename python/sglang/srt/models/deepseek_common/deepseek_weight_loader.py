@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.gptq import unpack_from_int32
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -92,6 +93,55 @@ class DeepseekV2WeightLoaderMixin:
     quant_config: Optional[QuantizationConfig]
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
+
+    @staticmethod
+    def _dequantize_ct_wna16_weight(layer: nn.Module) -> torch.Tensor:
+        """Dequantize compressed-tensors W4A16 packed weights to dense BF16.
+
+        This is needed for MLA post-processing (`w_kc`/`w_vc`) which expects
+        a dense matrix for `kv_b_proj`.
+        """
+        if not hasattr(layer, "weight_packed") or not hasattr(layer, "weight_scale"):
+            raise ValueError(
+                "Compressed-tensors WNA16 dequantization requires "
+                "weight_packed and weight_scale."
+            )
+
+        qweight = layer.weight_packed
+        scales = layer.weight_scale
+
+        if qweight.dtype != torch.int32:
+            raise ValueError(
+                f"Expected int32 packed weight for compressed-tensors WNA16, got {qweight.dtype}."
+            )
+
+        # packed_dim=1 in CompressedTensorsWNA16.create_weights.
+        qweight = unpack_from_int32(qweight, num_bits=4, packed_dim=1).to(scales.dtype)
+        out_features, in_features = qweight.shape
+
+        # `weight_shape` metadata can be missing or stale for some fused paths.
+        # Prefer the unpacked tensor shape as source of truth.
+        if hasattr(layer, "weight_shape") and layer.weight_shape.numel() == 2:
+            meta_out = int(layer.weight_shape[0].item())
+            meta_in = int(layer.weight_shape[1].item())
+            if (
+                meta_out > 0
+                and meta_in > 0
+                and (meta_out, meta_in) == (out_features, in_features)
+            ):
+                out_features, in_features = meta_out, meta_in
+
+        num_groups = scales.shape[1]
+        if in_features % num_groups != 0:
+            raise ValueError(
+                "Invalid compressed-tensors WNA16 group layout: "
+                f"in_features={in_features}, num_groups={num_groups}."
+            )
+        group_size = in_features // num_groups
+
+        qweight = qweight.view(out_features, num_groups, group_size)
+        scales = scales.view(out_features, num_groups, 1)
+        return (qweight * scales).reshape(out_features, in_features)
 
     def do_load_weights(
         self,
@@ -446,6 +496,10 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed") and hasattr(
+                self_attn.kv_b_proj, "weight_scale"
+            ):
+                w = self._dequantize_ct_wna16_weight(self_attn.kv_b_proj)
             else:
                 w = self_attn.kv_b_proj.weight
 

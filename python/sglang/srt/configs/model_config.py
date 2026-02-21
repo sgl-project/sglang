@@ -1009,7 +1009,20 @@ class ModelConfig:
             # The vision config model type for GLM-4.5v is 'glm4v_moe',
             # while for GLM-4.6v, it is 'glm4v_moe_vision'.
         )
-        needs_tf_v5 = is_glm_46vmoe
+        model_type = getattr(self.hf_config, "model_type", None)
+        architectures = set(getattr(self.hf_config, "architectures", []) or [])
+        is_glm4_moe_lite = model_type in {"glm4_moe_lite", "glm4_moe_lite_mtp"} or (
+            len(
+                architectures
+                & {
+                    "Glm4MoeLiteForCausalLM",
+                    "Glm4MoeLiteMTP",
+                    "Glm4MoeLiteMTPModel",
+                }
+            )
+            > 0
+        )
+        needs_tf_v5 = is_glm_46vmoe or is_glm4_moe_lite
 
         tf_version = version.parse(tf_version_str)
         required_version = version.parse("5.0.0dev0")
