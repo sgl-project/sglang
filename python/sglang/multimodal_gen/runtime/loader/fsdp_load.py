@@ -270,7 +270,8 @@ def load_model_from_full_model_state_dict(
                 )
                 continue
 
-        target_dtype = param_dtype if param_dtype else full_tensor.dtype
+        # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
+        # for non-quantized models meta dtype equals param_dtype anyway
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=meta_sharded_param_dtype)
             actual_param = param_dict.get(target_param_name)

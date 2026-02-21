@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import AttentionModuleMixin, FeedForward
+from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
     AdaLayerNormContinuous,
@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -253,13 +254,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
             )
-        else:self.to_q = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
+        else:
+            self.to_q = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
         self.to_k = ColumnParallelLinear(
             query_dim,
             self.inner_dim,
@@ -273,7 +275,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
-            )
+        )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
@@ -301,13 +303,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
                 )
-            else:self.add_q_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
+            else:
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
             self.add_k_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
                 self.inner_dim,
@@ -600,7 +603,9 @@ class FluxTransformerBlock(nn.Module):
         self.use_nunchaku_structure = nunchaku_enabled
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
         self.ff_context = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate",
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
         )
         if nunchaku_enabled:
             nunchaku_kwargs = {
