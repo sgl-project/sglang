@@ -14,25 +14,10 @@
 """
 DeepEP-based Waterfill Load Balancing for Shared Expert.
 
-This module implements waterfill load balancing where shared expert is treated
-as the 9th routed expert and dispatched through DeepEP.
-
-Key Design:
-1. Treat shared expert as an extra expert slot per EP rank and include it as
-   the 9th expert in DeepEP dispatch (topk=9).
-
-2. Each token's shared expert destination is chosen among ranks it already
-   routes to (based on routed experts), optionally allowing local execution on
-   source rank. This avoids introducing new communication peers.
-
-3. Remap expert IDs to keep a uniform per-rank layout, and use shared expert
-   ID = dest_rank * new_experts_per_rank + old_experts_per_rank.
-
-4. Shared expert weight = 1.0 / routed_scaling_factor.
-
-5. Small batch optimization:
-   - If batch size < MIN_BATCH_FOR_BALANCE, all shared experts compute locally
-   - Avoids fragmented computation across ranks
+Shared expert is treated as the 9th routed expert (topk=9) and dispatched
+through DeepEP. Each token's shared expert is assigned to the least-loaded
+rank among its routed destinations. Expert IDs are remapped to a per-rank
+layout of (old_experts_per_rank + 1) slots. See DeepEPWaterfillBalancer for details.
 """
 
 from typing import Optional, Tuple
@@ -49,535 +34,417 @@ LOCAL_SHARED_MARKER = -1
 LOCAL_PREFERENCE_FACTOR = 1.1
 
 
-# Try to import Triton for GPU-optimized kernels
-try:
-    import triton
-    import triton.language as tl
-
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-
+import triton
+import triton.language as tl
 
 # ============== Triton Kernels (GPU-optimized) ==============
 
 
-if HAS_TRITON:
+@triton.jit
+def _count_routed_per_rank_kernel(
+    topk_ids_ptr,  # [num_tokens, topk]
+    counts_ptr,  # [world_size] output (atomic add)
+    num_tokens,
+    topk: tl.constexpr,
+    experts_per_rank,
+    world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Count routed tokens per rank using Triton.
+    Uses block-level histogram to minimize atomic contention.
+    """
+    pid = tl.program_id(0)
+    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = token_idx < num_tokens
 
-    @triton.jit
-    def _count_routed_per_rank_kernel(
-        topk_ids_ptr,  # [num_tokens, topk]
-        counts_ptr,  # [world_size] output (atomic add)
-        num_tokens,
-        topk: tl.constexpr,
-        experts_per_rank,
-        world_size: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Count routed tokens per rank using Triton.
-        Uses block-level histogram to minimize atomic contention.
-        """
-        pid = tl.program_id(0)
-        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = token_idx < num_tokens
-
-        # For each rank, count tokens in this block that route to it
-        for r in range(world_size):
-            rank_count = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
-
-            for k in range(topk):
-                expert_id = tl.load(
-                    topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
-                ).to(tl.int64)
-                valid = expert_id >= 0
-                target_rank = expert_id // experts_per_rank
-                target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
-                # Use int64 for consistency with output type
-                rank_count += tl.where(
-                    mask & valid & (target_rank == r),
-                    tl.full([BLOCK_SIZE], 1, dtype=tl.int64),
-                    tl.zeros([BLOCK_SIZE], dtype=tl.int64),
-                )
-
-            block_total = tl.sum(rank_count)
-            if block_total > 0:
-                tl.atomic_add(counts_ptr + r, block_total)
-
-    @triton.jit
-    def _waterfill_expand_with_histogram_kernel(
-        # Inputs
-        topk_ids_ptr,  # [num_tokens, topk]
-        topk_weights_ptr,  # [num_tokens, topk]
-        routed_counts_ptr,  # [world_size]  (effective load per rank)
-        # Outputs
-        expanded_ids_ptr,  # [num_tokens, topk+1]
-        expanded_weights_ptr,  # [num_tokens, topk+1]
-        local_mask_ptr,  # [num_tokens]
-        dest_counts_ptr,  # [world_size] - output histogram (atomic)
-        # Scalars
-        num_tokens,
-        topk: tl.constexpr,
-        old_experts_per_rank,  # Original experts per rank (e.g., 32)
-        new_experts_per_rank,  # New experts per rank (e.g., 33)
-        world_size: tl.constexpr,
-        source_rank,
-        shared_weight,
-        local_marker,
-        local_pref_numer,
-        local_pref_denom,
-        precomputed_target_total,  # Pre-computed target total load per rank
-        ALLOW_ALL_RANKS: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Fused waterfill + expand + histogram kernel with expert ID remapping.
-
-        Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank)
-        This ensures each rank's expert range is [r*new_epr, (r+1)*new_epr-1]
-        with shared expert at position (r+1)*new_epr - 1.
-
-        Uses block-level histogram accumulation to minimize atomic contention.
-        Each block computes a local histogram, then does world_size atomic adds.
-        """
-        pid = tl.program_id(0)
-        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = token_idx < num_tokens
-
-        r_idx = tl.arange(0, world_size)
-        routed_vec = tl.load(
-            routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
-        ).to(tl.int64)
-        total_effective_k = tl.sum(routed_vec)
-        total_tokens_global_k = total_effective_k // topk
-        derived_target_total = (
-            total_effective_k + total_tokens_global_k + world_size - 1
-        ) // world_size
-        # Use precomputed_target_total when provided (> 0); otherwise fall back
-        # to the derived value.  The dynamic path passes a pre-computed target
-        # that accounts for DP-attention load, while the static path passes 0.
-        target_total = tl.where(
-            precomputed_target_total > 0,
-            precomputed_target_total,
-            derived_target_total,
-        )
-
-        # ===== Step 1: Select destination rank for shared expert =====
-        # Prefer balanced total load (routed + shared) by sampling destination among
-        # candidate ranks (routed ranks + source rank) with probability proportional
-        # to (target_total - routed_counts[r]). If all candidate weights are zero, fall back to the
-        # legacy argmin(routed_counts) logic.
-        source_count = tl.load(routed_counts_ptr + source_rank)
-        best_count = tl.where(mask, source_count, 2**30)
-        best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
-        has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
-        src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
-
-        if ALLOW_ALL_RANKS:
-            candidate_mask = tl.full(
-                [BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32
-            )
-            for r in range(world_size):
-                target_count = tl.load(routed_counts_ptr + r).to(tl.int64)
-                better = (
-                    target_count * local_pref_numer < best_count * local_pref_denom
-                ) & mask
-                best_count = tl.where(better, target_count, best_count)
-                best_rank = tl.where(
-                    better, tl.full([BLOCK_SIZE], r, dtype=tl.int64), best_rank
-                )
-        else:
-            candidate_mask = (
-                tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32
-            ).to(tl.int32)
+    # For each rank, count tokens in this block that route to it
+    for r in range(world_size):
+        rank_count = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
 
         for k in range(topk):
             expert_id = tl.load(
                 topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
             ).to(tl.int64)
             valid = expert_id >= 0
-            has_valid = has_valid | valid
-
-            if not ALLOW_ALL_RANKS:
-                # Use OLD experts_per_rank for rank calculation from original expert IDs
-                target_rank = expert_id // old_experts_per_rank
-                target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
-                target_rank_i32 = target_rank.to(tl.int32)
-                shift_amt = tl.where(valid, target_rank_i32, 0)
-                bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
-                candidate_mask = tl.where(
-                    valid & mask, candidate_mask | bit, candidate_mask
-                )
-
-                target_count = tl.load(
-                    routed_counts_ptr + target_rank, mask=mask & valid, other=2**30
-                )
-
-                better = (
-                    (target_count * local_pref_numer < best_count * local_pref_denom)
-                    & valid
-                    & mask
-                )
-                best_count = tl.where(better, target_count, best_count)
-                best_rank = tl.where(better, target_rank, best_rank)
-
-        # Total weight per token across candidate ranks.
-        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-        for r in range(world_size):
-            present = ((candidate_mask >> r) & 1) == 1
-            routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-            w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(
-                tl.int32
-            )
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-            # Apply local preference (scale down remote weights).
-            w_vec = tl.where(
-                src_rank_i32 == r,
-                w_vec,
-                (w_vec * local_pref_denom) // local_pref_numer,
-            )
-            total_w += tl.where(present, w_vec, 0)
-
-        # Deterministic per-token draw in [0, total_w).
-        token_seed = token_idx.to(tl.uint32) ^ (
-            src_rank_i32.to(tl.uint32)
-            * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
-        )
-        token_seed = token_seed * tl.full(
-            [BLOCK_SIZE], 1664525, dtype=tl.uint32
-        ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
-        u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
-
-        chosen = src_rank_i32
-        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-        for r in range(world_size):
-            present = ((candidate_mask >> r) & 1) == 1
-            routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-            w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(
-                tl.int32
-            )
-            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-            w_vec = tl.where(
-                src_rank_i32 == r,
-                w_vec,
-                (w_vec * local_pref_denom) // local_pref_numer,
-            )
-            w_vec = tl.where(present, w_vec, 0)
-            pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
-            chosen = tl.where(pick, r, chosen)
-            cum += w_vec
-
-        best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
-
-        # ===== Step 2: Compute shared expert ID and local mask =====
-        is_local = best_rank == source_rank
-
-        # Shared expert ID = target_rank * new_experts_per_rank + old_experts_per_rank
-        # This puts shared expert at the end of each rank's expert range
-        # NOTE: For local shared expert, we use the REAL shared expert ID (not local_marker=-1)
-        # This ensures local shared expert is also computed in MoE layer
-        local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
-        remote_shared_id = best_rank * new_experts_per_rank + old_experts_per_rank
-        shared_expert_id = tl.where(
-            is_local,
-            tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
-            remote_shared_id,
-        ).to(tl.int64)
-        # Padded / invalid tokens (all routed experts are -1) should not dispatch shared expert.
-        shared_expert_id = tl.where(
-            has_valid,
-            shared_expert_id,
-            tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
-        )
-
-        dest_rank = tl.where(is_local, source_rank, best_rank).to(tl.int32)
-
-        # ===== Step 3: Copy and remap topk_ids, copy topk_weights =====
-        # Remap routed expert IDs: old_id -> old_id + (old_id // old_experts_per_rank)
-        for k in range(topk):
-            old_id = tl.load(
-                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
-            ).to(tl.int64)
-            # Only remap valid IDs (>= 0)
-            valid_id = old_id >= 0
-            # new_id = old_id + (old_id // old_experts_per_rank)
-            new_id = tl.where(
-                valid_id, old_id + (old_id // old_experts_per_rank), old_id
-            )
-            tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
-
-        for k in range(topk):
-            val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
-            expert_id = tl.load(
-                topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
-            ).to(tl.int64)
-            val = tl.where(expert_id >= 0, val, 0.0)
-            tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
-
-        # ===== Step 4: Write 9th column (shared expert) =====
-        tl.store(
-            expanded_ids_ptr + token_idx * (topk + 1) + topk,
-            shared_expert_id,
-            mask=mask,
-        )
-        tl.store(
-            expanded_weights_ptr + token_idx * (topk + 1) + topk,
-            tl.where(has_valid, shared_weight, 0.0),
-            mask=mask,
-        )
-
-        # ===== Step 5: Write local mask =====
-        tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
-
-        # ===== Step 6: Block-level histogram with minimal atomics =====
-        # Count destinations per rank within this block using sum reduction
-        for r in range(world_size):
-            rank_count = tl.sum(tl.where(mask & has_valid & (dest_rank == r), 1, 0))
-            if rank_count > 0:
-                tl.atomic_add(dest_counts_ptr + r, rank_count)
-
-    @triton.jit
-    def _sparse_redirect_kernel(
-        expanded_ids_ptr,  # [num_tokens, topk+1] - in/out
-        local_mask_ptr,  # [num_tokens] - in/out
-        dest_counts_ptr,  # [world_size] - destination counts
-        num_tokens,
-        topk_plus_one,
-        old_experts_per_rank,  # Original experts per rank (e.g., 32)
-        new_experts_per_rank,  # New experts per rank (e.g., 33)
-        world_size,
-        source_rank,
-        min_tokens_per_rank,
-        local_marker,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Redirect sparse remote destinations to local.
-
-        In new layout, shared expert ID = rank * new_experts_per_rank + old_experts_per_rank
-        So dest_rank = (shared_id - old_experts_per_rank) // new_experts_per_rank
-                     = shared_id // new_experts_per_rank (since shared_id % new_epr == old_epr)
-        """
-        pid = tl.program_id(0)
-        token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = token_idx < num_tokens
-
-        shared_expert_id = tl.load(
-            expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
-            mask=mask,
-            other=-1,
-        ).to(tl.int64)
-        is_local = tl.load(local_mask_ptr + token_idx, mask=mask, other=True)
-
-        # Use tl.full to create int64 constants (Python int doesn't have .to())
-        src_rank_vec = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
-        # For shared expert: dest_rank = shared_expert_id // new_experts_per_rank
-        dest_rank = tl.where(
-            is_local, src_rank_vec, shared_expert_id // new_experts_per_rank
-        )
-        dest_rank = tl.minimum(tl.maximum(dest_rank, 0), world_size - 1)
-
-        dest_count = tl.load(dest_counts_ptr + dest_rank, mask=mask, other=0)
-        is_sparse_remote = (dest_count < min_tokens_per_rank) & ~is_local
-
-        # Redirect sparse remote destinations to local shared expert ID.
-        local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
-        local_shared_id_vec = tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64)
-        new_shared_id = tl.where(
-            is_sparse_remote, local_shared_id_vec, shared_expert_id
-        )
-        new_is_local = is_local | is_sparse_remote
-
-        tl.store(
-            expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
-            new_shared_id,
-            mask=mask,
-        )
-        tl.store(local_mask_ptr + token_idx, new_is_local, mask=mask)
-
-    def waterfill_prepare_dispatch_fused(
-        topk_ids: Tensor,
-        topk_weights: Tensor,
-        routed_counts: Tensor,
-        num_routed_experts: int,
-        world_size: int,
-        source_rank: int,
-        shared_weight: float,
-        allow_all_ranks: bool = False,
-        target_total: int = 0,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        Fully fused waterfill using Triton with integrated histogram and expert ID remapping.
-
-        Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank)
-        This maps original expert IDs to new layout where each rank has one extra expert slot
-        for the shared expert.
-
-        Single kernel does: waterfill + expand + histogram counting + ID remapping.
-
-        Returns:
-            expanded_topk_ids: [N, 9] with remapped expert IDs
-            expanded_topk_weights: [N, 9]
-            local_shared_mask: [N] boolean
-            dest_counts: [world_size] histogram of shared expert destinations (local to this rank)
-        """
-        num_tokens = topk_ids.shape[0]
-        topk = topk_ids.shape[1]
-        old_experts_per_rank = num_routed_experts // world_size  # Original: 32
-        new_experts_per_rank = old_experts_per_rank + 1  # New: 33
-        device = topk_ids.device
-
-        if num_tokens == 0:
-            return (
-                torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
-                torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
-                torch.empty(0, dtype=torch.bool, device=device),
-                torch.zeros(world_size, dtype=torch.int32, device=device),
+            target_rank = expert_id // experts_per_rank
+            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+            # Use int64 for consistency with output type
+            rank_count += tl.where(
+                mask & valid & (target_rank == r),
+                tl.full([BLOCK_SIZE], 1, dtype=tl.int64),
+                tl.zeros([BLOCK_SIZE], dtype=tl.int64),
             )
 
-        # Pre-allocate outputs
-        expanded_topk_ids = torch.empty(
-            num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
-        )
-        expanded_topk_weights = torch.empty(
-            num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
-        )
-        local_shared_mask = torch.empty(num_tokens, dtype=torch.bool, device=device)
-
-        BLOCK_SIZE = 256
-        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-
-        local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
-        local_pref_denom = 5
-
-        # Always use fused kernel with histogram; sparse redirect is applied outside
-        # (after global reduction of dest_counts) in DeepEPWaterfillBalancer.prepare_dispatch.
-        dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
-        _waterfill_expand_with_histogram_kernel[grid](
-            topk_ids,
-            topk_weights,
-            routed_counts,
-            expanded_topk_ids,
-            expanded_topk_weights,
-            local_shared_mask,
-            dest_counts,
-            num_tokens,
-            topk,
-            old_experts_per_rank,
-            new_experts_per_rank,
-            world_size,
-            source_rank,
-            shared_weight,
-            LOCAL_SHARED_MARKER,
-            local_pref_numer,
-            local_pref_denom,
-            target_total,
-            allow_all_ranks,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-        return expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts
+        block_total = tl.sum(rank_count)
+        if block_total > 0:
+            tl.atomic_add(counts_ptr + r, block_total)
 
 
-# ============== PyTorch Implementation ==============
+@triton.jit
+def _waterfill_expand_with_histogram_kernel(
+    # Inputs
+    topk_ids_ptr,  # [num_tokens, topk]
+    topk_weights_ptr,  # [num_tokens, topk]
+    routed_counts_ptr,  # [world_size]  (effective load per rank)
+    # Outputs
+    expanded_ids_ptr,  # [num_tokens, topk+1]
+    expanded_weights_ptr,  # [num_tokens, topk+1]
+    local_mask_ptr,  # [num_tokens]
+    dest_counts_ptr,  # [world_size] - output histogram (atomic)
+    # Scalars
+    num_tokens,
+    topk: tl.constexpr,
+    old_experts_per_rank,  # Original experts per rank (e.g., 32)
+    new_experts_per_rank,  # New experts per rank (e.g., 33)
+    world_size: tl.constexpr,
+    source_rank,
+    shared_weight,
+    local_marker,
+    local_pref_numer,
+    local_pref_denom,
+    precomputed_target_total,  # Pre-computed target total load per rank
+    ALLOW_ALL_RANKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused waterfill + expand + histogram kernel with expert ID remapping.
 
+    Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank)
+    This ensures each rank's expert range is [r*new_epr, (r+1)*new_epr-1]
+    with shared expert at position (r+1)*new_epr - 1.
 
-def count_routed_per_rank_pytorch(
-    topk_ids: Tensor,
-    num_experts: int,
-    world_size: int,
-) -> Tensor:
-    """Count routed tokens per rank using PyTorch ops."""
-    experts_per_rank = num_experts // world_size
-    device = topk_ids.device
+    Uses block-level histogram accumulation to minimize atomic contention.
+    Each block computes a local histogram, then does world_size atomic adds.
+    """
+    pid = tl.program_id(0)
+    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = token_idx < num_tokens
 
-    valid_mask = topk_ids >= 0
-    rank_ids = torch.where(
-        valid_mask,
-        torch.clamp(topk_ids // experts_per_rank, 0, world_size - 1),
-        torch.full_like(topk_ids, world_size),  # Invalid -> out of range
+    r_idx = tl.arange(0, world_size)
+    routed_vec = tl.load(
+        routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
+    ).to(tl.int64)
+    total_effective_k = tl.sum(routed_vec)
+    total_tokens_global_k = total_effective_k // topk
+    derived_target_total = (
+        total_effective_k + total_tokens_global_k + world_size - 1
+    ) // world_size
+    # Use precomputed_target_total when provided (> 0); otherwise fall back
+    # to the derived value.  The dynamic path passes a pre-computed target
+    # that accounts for DP-attention load, while the static path passes 0.
+    target_total = tl.where(
+        precomputed_target_total > 0,
+        precomputed_target_total,
+        derived_target_total,
     )
 
-    flat_ranks = rank_ids.flatten()
-    counts = torch.bincount(flat_ranks, minlength=world_size + 1)[:world_size]
+    # ===== Step 1: Select destination rank for shared expert =====
+    # Prefer balanced total load (routed + shared) by sampling destination among
+    # candidate ranks (routed ranks + source rank) with probability proportional
+    # to (target_total - routed_counts[r]). If all candidate weights are zero, fall back to the
+    # legacy argmin(routed_counts) logic.
+    source_count = tl.load(routed_counts_ptr + source_rank)
+    best_count = tl.where(mask, source_count, 2**30)
+    best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+    has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
+    src_rank_i32 = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int32)
 
-    return counts.to(torch.int64)
+    if ALLOW_ALL_RANKS:
+        candidate_mask = tl.full([BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32)
+        for r in range(world_size):
+            target_count = tl.load(routed_counts_ptr + r).to(tl.int64)
+            better = (
+                target_count * local_pref_numer < best_count * local_pref_denom
+            ) & mask
+            best_count = tl.where(better, target_count, best_count)
+            best_rank = tl.where(
+                better, tl.full([BLOCK_SIZE], r, dtype=tl.int64), best_rank
+            )
+    else:
+        candidate_mask = (tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << src_rank_i32).to(
+            tl.int32
+        )
+
+    for k in range(topk):
+        expert_id = tl.load(
+            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+        ).to(tl.int64)
+        valid = expert_id >= 0
+        has_valid = has_valid | valid
+
+        if not ALLOW_ALL_RANKS:
+            # Use OLD experts_per_rank for rank calculation from original expert IDs
+            target_rank = expert_id // old_experts_per_rank
+            target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
+            target_rank_i32 = target_rank.to(tl.int32)
+            shift_amt = tl.where(valid, target_rank_i32, 0)
+            bit = tl.full([BLOCK_SIZE], 1, dtype=tl.int32) << shift_amt
+            candidate_mask = tl.where(
+                valid & mask, candidate_mask | bit, candidate_mask
+            )
+
+            target_count = tl.load(
+                routed_counts_ptr + target_rank, mask=mask & valid, other=2**30
+            )
+
+            better = (
+                (target_count * local_pref_numer < best_count * local_pref_denom)
+                & valid
+                & mask
+            )
+            best_count = tl.where(better, target_count, best_count)
+            best_rank = tl.where(better, target_rank, best_rank)
+
+    # Total weight per token across candidate ranks.
+    total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    for r in range(world_size):
+        present = ((candidate_mask >> r) & 1) == 1
+        routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
+        w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(tl.int32)
+        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+        # Apply local preference (scale down remote weights).
+        w_vec = tl.where(
+            src_rank_i32 == r,
+            w_vec,
+            (w_vec * local_pref_denom) // local_pref_numer,
+        )
+        total_w += tl.where(present, w_vec, 0)
+
+    # Deterministic per-token draw in [0, total_w).
+    token_seed = token_idx.to(tl.uint32) ^ (
+        src_rank_i32.to(tl.uint32) * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+    )
+    token_seed = token_seed * tl.full([BLOCK_SIZE], 1664525, dtype=tl.uint32) + tl.full(
+        [BLOCK_SIZE], 1013904223, dtype=tl.uint32
+    )
+    u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(tl.int32)
+
+    chosen = src_rank_i32
+    cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    for r in range(world_size):
+        present = ((candidate_mask >> r) & 1) == 1
+        routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
+        w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(tl.int32)
+        w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+        w_vec = tl.where(
+            src_rank_i32 == r,
+            w_vec,
+            (w_vec * local_pref_denom) // local_pref_numer,
+        )
+        w_vec = tl.where(present, w_vec, 0)
+        pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+        chosen = tl.where(pick, r, chosen)
+        cum += w_vec
+
+    best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
+
+    # ===== Step 2: Compute shared expert ID and local mask =====
+    is_local = best_rank == source_rank
+
+    # Shared expert ID = target_rank * new_experts_per_rank + old_experts_per_rank
+    # This puts shared expert at the end of each rank's expert range
+    # NOTE: For local shared expert, we use the REAL shared expert ID (not local_marker=-1)
+    # This ensures local shared expert is also computed in MoE layer
+    local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
+    remote_shared_id = best_rank * new_experts_per_rank + old_experts_per_rank
+    shared_expert_id = tl.where(
+        is_local,
+        tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
+        remote_shared_id,
+    ).to(tl.int64)
+    # Padded / invalid tokens (all routed experts are -1) should not dispatch shared expert.
+    shared_expert_id = tl.where(
+        has_valid,
+        shared_expert_id,
+        tl.full([BLOCK_SIZE], local_marker, dtype=tl.int64),
+    )
+
+    dest_rank = tl.where(is_local, source_rank, best_rank).to(tl.int32)
+
+    # ===== Step 3: Copy and remap topk_ids, copy topk_weights =====
+    # Remap routed expert IDs: old_id -> old_id + (old_id // old_experts_per_rank)
+    for k in range(topk):
+        old_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1).to(
+            tl.int64
+        )
+        # Only remap valid IDs (>= 0)
+        valid_id = old_id >= 0
+        # new_id = old_id + (old_id // old_experts_per_rank)
+        new_id = tl.where(valid_id, old_id + (old_id // old_experts_per_rank), old_id)
+        tl.store(expanded_ids_ptr + token_idx * (topk + 1) + k, new_id, mask=mask)
+
+    for k in range(topk):
+        val = tl.load(topk_weights_ptr + token_idx * topk + k, mask=mask, other=0.0)
+        expert_id = tl.load(
+            topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1
+        ).to(tl.int64)
+        val = tl.where(expert_id >= 0, val, 0.0)
+        tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
+
+    # ===== Step 4: Write 9th column (shared expert) =====
+    tl.store(
+        expanded_ids_ptr + token_idx * (topk + 1) + topk,
+        shared_expert_id,
+        mask=mask,
+    )
+    tl.store(
+        expanded_weights_ptr + token_idx * (topk + 1) + topk,
+        tl.where(has_valid, shared_weight, 0.0),
+        mask=mask,
+    )
+
+    # ===== Step 5: Write local mask =====
+    tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
+
+    # ===== Step 6: Block-level histogram with minimal atomics =====
+    # Count destinations per rank within this block using sum reduction
+    for r in range(world_size):
+        rank_count = tl.sum(tl.where(mask & has_valid & (dest_rank == r), 1, 0))
+        if rank_count > 0:
+            tl.atomic_add(dest_counts_ptr + r, rank_count)
 
 
-def assign_shared_destination_pytorch(
+@triton.jit
+def _sparse_redirect_kernel(
+    expanded_ids_ptr,  # [num_tokens, topk+1] - in/out
+    local_mask_ptr,  # [num_tokens] - in/out
+    dest_counts_ptr,  # [world_size] - destination counts
+    num_tokens,
+    topk_plus_one,
+    old_experts_per_rank,  # Original experts per rank (e.g., 32)
+    new_experts_per_rank,  # New experts per rank (e.g., 33)
+    world_size,
+    source_rank,
+    min_tokens_per_rank,
+    local_marker,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Redirect sparse remote destinations to local.
+
+    In new layout, shared expert ID = rank * new_experts_per_rank + old_experts_per_rank
+    So dest_rank = (shared_id - old_experts_per_rank) // new_experts_per_rank
+                 = shared_id // new_experts_per_rank (since shared_id % new_epr == old_epr)
+    """
+    pid = tl.program_id(0)
+    token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = token_idx < num_tokens
+
+    shared_expert_id = tl.load(
+        expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
+        mask=mask,
+        other=-1,
+    ).to(tl.int64)
+    is_local = tl.load(local_mask_ptr + token_idx, mask=mask, other=True)
+
+    # Use tl.full to create int64 constants (Python int doesn't have .to())
+    src_rank_vec = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
+    # For shared expert: dest_rank = shared_expert_id // new_experts_per_rank
+    dest_rank = tl.where(
+        is_local, src_rank_vec, shared_expert_id // new_experts_per_rank
+    )
+    dest_rank = tl.minimum(tl.maximum(dest_rank, 0), world_size - 1)
+
+    dest_count = tl.load(dest_counts_ptr + dest_rank, mask=mask, other=0)
+    is_sparse_remote = (dest_count < min_tokens_per_rank) & ~is_local
+
+    # Redirect sparse remote destinations to local shared expert ID.
+    local_shared_id = source_rank * new_experts_per_rank + old_experts_per_rank
+    local_shared_id_vec = tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64)
+    new_shared_id = tl.where(is_sparse_remote, local_shared_id_vec, shared_expert_id)
+    new_is_local = is_local | is_sparse_remote
+
+    tl.store(
+        expanded_ids_ptr + token_idx * topk_plus_one + (topk_plus_one - 1),
+        new_shared_id,
+        mask=mask,
+    )
+    tl.store(local_mask_ptr + token_idx, new_is_local, mask=mask)
+
+
+def waterfill_prepare_dispatch_fused(
     topk_ids: Tensor,
+    topk_weights: Tensor,
     routed_counts: Tensor,
-    num_experts: int,
+    num_routed_experts: int,
     world_size: int,
     source_rank: int,
+    shared_weight: float,
     allow_all_ranks: bool = False,
-) -> Tensor:
+    target_total: int = 0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """
-    Assign shared expert destination for each token using waterfill.
+    Fully fused waterfill using Triton with integrated histogram and expert ID remapping.
 
-    Strategy:
-    1. For each token, find all ranks it routes to
-    2. Add source_rank as a candidate (local computation option)
-    3. Select the rank with lowest routed count
+    Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank)
+    This maps original expert IDs to new layout where each rank has one extra expert slot
+    for the shared expert.
+
+    Single kernel does: waterfill + expand + histogram counting + ID remapping.
 
     Returns:
-        destination: [num_tokens] destination rank for each token's shared expert
+        expanded_topk_ids: [N, 9] with remapped expert IDs
+        expanded_topk_weights: [N, 9]
+        local_shared_mask: [N] boolean
+        dest_counts: [world_size] histogram of shared expert destinations (local to this rank)
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
-    experts_per_rank = num_experts // world_size
+    old_experts_per_rank = num_routed_experts // world_size  # Original: 32
+    new_experts_per_rank = old_experts_per_rank + 1  # New: 33
     device = topk_ids.device
 
     if num_tokens == 0:
-        return torch.empty(0, dtype=torch.int64, device=device)
+        return (
+            torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
+            torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
+            torch.empty(0, dtype=torch.bool, device=device),
+            torch.zeros(world_size, dtype=torch.int32, device=device),
+        )
 
-    # Compute rank_ids: [num_tokens, topk]
-    # For invalid expert IDs (< 0), use world_size as placeholder (will be filtered)
-    valid_mask = topk_ids >= 0
-    rank_ids = torch.where(
-        valid_mask,
-        torch.clamp(topk_ids // experts_per_rank, 0, world_size - 1),
-        torch.full_like(topk_ids, world_size),  # Invalid -> out of range
+    # Pre-allocate outputs
+    expanded_topk_ids = torch.empty(
+        num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
+    )
+    expanded_topk_weights = torch.empty(
+        num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
+    )
+    local_shared_mask = torch.empty(num_tokens, dtype=torch.bool, device=device)
+
+    BLOCK_SIZE = 256
+    grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+
+    local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
+    local_pref_denom = 5
+
+    # Always use fused kernel with histogram; sparse redirect is applied outside
+    # (after global reduction of dest_counts) in DeepEPWaterfillBalancer.prepare_dispatch.
+    dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
+    _waterfill_expand_with_histogram_kernel[grid](
+        topk_ids,
+        topk_weights,
+        routed_counts,
+        expanded_topk_ids,
+        expanded_topk_weights,
+        local_shared_mask,
+        dest_counts,
+        num_tokens,
+        topk,
+        old_experts_per_rank,
+        new_experts_per_rank,
+        world_size,
+        source_rank,
+        shared_weight,
+        LOCAL_SHARED_MARKER,
+        local_pref_numer,
+        local_pref_denom,
+        target_total,
+        allow_all_ranks,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    if allow_all_ranks:
-        candidate_mask = torch.ones(
-            num_tokens, world_size, dtype=torch.bool, device=device
-        )
-    else:
-        # OPTIMIZED: Build candidate mask using scatter (vectorized, no loop)
-        # Flatten rank_ids and create row indices
-        # Shape: [num_tokens * topk]
-        flat_rank_ids = rank_ids.flatten()
-        row_indices = (
-            torch.arange(num_tokens, device=device)
-            .unsqueeze(1)
-            .expand(-1, topk)
-            .flatten()
-        )
-
-        # Create candidate_mask using scatter
-        # Note: use world_size+1 columns to handle invalid entries, then slice
-        candidate_mask = torch.zeros(
-            num_tokens, world_size + 1, dtype=torch.bool, device=device
-        )
-        candidate_mask[row_indices, flat_rank_ids] = True
-        candidate_mask = candidate_mask[:, :world_size]  # Remove invalid column
-
-        # Source rank is always a candidate
-        candidate_mask[:, source_rank] = True
-
-    # Select rank with minimum count among candidates (waterfill with local preference)
-    # Apply local preference: scale remote counts by LOCAL_PREFERENCE_FACTOR
-    # This makes local more attractive unless remote is significantly less loaded
-    INF = routed_counts.max() * 10 + 1
-    scaled_counts = routed_counts.unsqueeze(0) * LOCAL_PREFERENCE_FACTOR
-    # Don't scale local rank
-    scaled_counts[:, source_rank] = routed_counts[source_rank].float()
-    candidate_counts = torch.where(candidate_mask, scaled_counts, INF)
-    destination = candidate_counts.argmin(dim=1)
-
-    return destination.to(torch.int64)
+    return expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts
 
 
 def expand_topk_with_shared_expert(
@@ -589,28 +456,12 @@ def expand_topk_with_shared_expert(
     source_rank: int,
     shared_weight: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """
-    Expand topk_ids/weights from [N, 8] to [N, 9] with shared expert as real expert.
+    """Expand topk from [N, 8] to [N, 9] with shared expert as real expert.
 
-    KEY CHANGE: Shared expert is now a real expert ID (not virtual).
+    Remaps routed IDs: old_id -> old_id + (old_id // old_epr).
+    Shared expert for rank i -> i * new_epr + old_epr.
 
-    Expert ID layout (per rank):
-    - [0, old_experts_per_rank-1]: routed experts
-    - [old_experts_per_rank]: shared expert
-
-    Expert ID remapping:
-    - Routed expert j (old) -> j + (j // old_experts_per_rank) (new)
-    - Shared expert for rank i -> i * new_experts_per_rank + old_experts_per_rank
-
-    The 9th column contains:
-    - Real shared expert ID: target_rank * new_experts_per_rank + old_experts_per_rank
-    - This ensures DeepEP dispatches the token to the correct rank AND
-      num_recv_tokens_per_expert correctly counts shared expert tokens.
-
-    Returns:
-        expanded_topk_ids: [N, 9] with remapped routed IDs and real shared expert ID
-        expanded_topk_weights: [N, 9]
-        local_shared_mask: [N] boolean mask for tokens with local shared expert
+    Returns (expanded_topk_ids, expanded_topk_weights, local_shared_mask).
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -890,40 +741,35 @@ class DeepEPWaterfillBalancer:
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank from local topk_ids.
 
-        Uses Triton kernel on GPU for better performance, falls back to PyTorch on CPU.
+        Uses Triton kernel on GPU for better performance.
 
         Note: topk_ids contains ORIGINAL expert IDs (0-255), so we use
         num_routed_experts to calculate experts_per_rank for rank assignment.
         """
-        if HAS_TRITON and topk_ids.is_cuda:
-            # Reuse pre-allocated buffer to avoid per-layer torch.zeros allocation.
-            if self._counts_buf is None:
-                self._counts_buf = torch.zeros(
-                    self.world_size, dtype=torch.int64, device=topk_ids.device
-                )
-            buf = self._counts_buf
-            buf.zero_()
-            num_tokens = topk_ids.shape[0]
-            topk = topk_ids.shape[1]
-            experts_per_rank = self.num_routed_experts // self.world_size
-            if num_tokens == 0:
-                return buf
-            BLOCK_SIZE = 256
-            grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-            _count_routed_per_rank_kernel[grid](
-                topk_ids,
-                buf,
-                num_tokens,
-                topk,
-                experts_per_rank,
-                self.world_size,
-                BLOCK_SIZE=BLOCK_SIZE,
+        # Reuse pre-allocated buffer to avoid per-layer torch.zeros allocation.
+        if self._counts_buf is None:
+            self._counts_buf = torch.zeros(
+                self.world_size, dtype=torch.int64, device=topk_ids.device
             )
+        buf = self._counts_buf
+        buf.zero_()
+        num_tokens = topk_ids.shape[0]
+        topk = topk_ids.shape[1]
+        experts_per_rank = self.num_routed_experts // self.world_size
+        if num_tokens == 0:
             return buf
-        else:
-            return count_routed_per_rank_pytorch(
-                topk_ids, self.num_routed_experts, self.world_size
-            )
+        BLOCK_SIZE = 256
+        grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        _count_routed_per_rank_kernel[grid](
+            topk_ids,
+            buf,
+            num_tokens,
+            topk,
+            experts_per_rank,
+            self.world_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return buf
 
     def prepare_dispatch(
         self,
@@ -988,179 +834,88 @@ class DeepEPWaterfillBalancer:
                 self.shared_weight,
             )
 
-        # ===== Use Triton on GPU =====
-        if HAS_TRITON and topk_ids.is_cuda:
-            # Effective per-rank load for waterfill weighting.
-            # When local_tokens_per_rank is provided (DP-attention aware mode),
-            # we add it to routed_counts so that shared expert tokens are steered
-            # away from ranks that already carry heavy DP-attention load.
-            routed_counts_i64 = routed_counts.to(torch.int64)
-            if local_tokens_per_rank is not None:
-                effective_load = routed_counts_i64 + local_tokens_per_rank.to(
-                    torch.int64
-                )
-            else:
-                effective_load = routed_counts_i64
-
-            # Compute target_total and allow_all_ranks WITHOUT GPU→CPU sync.
-            # When using static weights, always allow dispatch to any rank (EPLB
-            # already balances routed load, so the mild-imbalance condition is
-            # almost always satisfied).  For the dynamic path, keep the original
-            # logic but compute target_total entirely on GPU (single .item() at
-            # the very end, reducing 3 syncs to 1).
-            if self.has_static_weights():
-                # Static path: zero GPU→CPU syncs.
-                # Pass target_total=0 so the kernel derives it from routed_counts.
-                # allow_all_ranks=True since EPLB keeps routed load balanced.
-                allow_all_ranks = True
-                target_total = 0
-            else:
-                # Dynamic path: keep original logic (3 → 1 sync).
-                total_routed_t = routed_counts_i64.sum()
-                total_tokens_global_t = total_routed_t // topk
-                total_effective_t = effective_load.sum()
-                max_effective_t = effective_load.max()
-                target_total = int(
-                    (
-                        (
-                            total_effective_t
-                            + total_tokens_global_t
-                            + self.world_size
-                            - 1
-                        )
-                        // self.world_size
-                    ).item()
-                )
-                allow_all_ranks = bool((max_effective_t <= target_total).item())
-
-            expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts = (
-                waterfill_prepare_dispatch_fused(
-                    topk_ids,
-                    topk_weights,
-                    effective_load,
-                    self.num_routed_experts,
-                    self.world_size,
-                    self.rank,
-                    self.shared_weight,
-                    allow_all_ranks=allow_all_ranks,
-                    target_total=target_total,
-                )
-            )
-
-            if self.MIN_TOKENS_PER_RANK > 0:
-                # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
-                try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import (
-                            get_moe_ep_group,
-                        )
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
-                except Exception:
-                    # If distributed is not available/initialized, fall back to local counts.
-                    pass
-
-                BLOCK_SIZE = 256
-                grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-                _sparse_redirect_kernel[grid](
-                    expanded_topk_ids,
-                    local_shared_mask,
-                    dest_counts,
-                    num_tokens,
-                    topk + 1,
-                    self.old_experts_per_rank,
-                    self.new_experts_per_rank,
-                    self.world_size,
-                    self.rank,
-                    self.MIN_TOKENS_PER_RANK,
-                    LOCAL_SHARED_MARKER,
-                    BLOCK_SIZE=BLOCK_SIZE,
-                )
+        # Effective per-rank load for waterfill weighting.
+        # When local_tokens_per_rank is provided (DP-attention aware mode),
+        # we add it to routed_counts so that shared expert tokens are steered
+        # away from ranks that already carry heavy DP-attention load.
+        routed_counts_i64 = routed_counts.to(torch.int64)
+        if local_tokens_per_rank is not None:
+            effective_load = routed_counts_i64 + local_tokens_per_rank.to(torch.int64)
         else:
-            # Fallback to PyTorch implementation
-            routed_counts_i64_pt = routed_counts.to(torch.int64)
-            if local_tokens_per_rank is not None:
-                effective_load_pt = routed_counts_i64_pt + local_tokens_per_rank.to(
-                    torch.int64
-                )
-            else:
-                effective_load_pt = routed_counts_i64_pt
+            effective_load = routed_counts_i64
 
-            total_routed = int(routed_counts_i64_pt.sum().item())
-            total_tokens_global = total_routed // topk
-            total_effective = int(effective_load_pt.sum().item())
-            max_effective = int(effective_load_pt.max().item())
-            target_total = (
-                total_effective + total_tokens_global + self.world_size - 1
-            ) // self.world_size
-            allow_all_ranks = max_effective <= target_total
+        # Compute target_total and allow_all_ranks WITHOUT GPU→CPU sync.
+        # When using static weights, always allow dispatch to any rank (EPLB
+        # already balances routed load, so the mild-imbalance condition is
+        # almost always satisfied).  For the dynamic path, keep the original
+        # logic but compute target_total entirely on GPU (single .item() at
+        # the very end, reducing 3 syncs to 1).
+        if self.has_static_weights():
+            # Static path: zero GPU→CPU syncs.
+            # Pass target_total=0 so the kernel derives it from routed_counts.
+            # allow_all_ranks=True since EPLB keeps routed load balanced.
+            allow_all_ranks = True
+            target_total = 0
+        else:
+            # Dynamic path: keep original logic (3 → 1 sync).
+            total_routed_t = routed_counts_i64.sum()
+            total_tokens_global_t = total_routed_t // topk
+            total_effective_t = effective_load.sum()
+            max_effective_t = effective_load.max()
+            target_total = int(
+                (
+                    (total_effective_t + total_tokens_global_t + self.world_size - 1)
+                    // self.world_size
+                ).item()
+            )
+            allow_all_ranks = bool((max_effective_t <= target_total).item())
 
-            shared_destination = assign_shared_destination_pytorch(
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask, dest_counts = (
+            waterfill_prepare_dispatch_fused(
                 topk_ids,
-                effective_load_pt,
+                topk_weights,
+                effective_load,
                 self.num_routed_experts,
                 self.world_size,
                 self.rank,
+                self.shared_weight,
                 allow_all_ranks=allow_all_ranks,
+                target_total=target_total,
             )
-            expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
-                expand_topk_with_shared_expert(
-                    topk_ids,
-                    topk_weights,
-                    shared_destination,
-                    self.num_routed_experts,
-                    self.world_size,
-                    self.rank,
-                    self.shared_weight,
-                )
+        )
+
+        if self.MIN_TOKENS_PER_RANK > 0:
+            # Globalize dest_counts across EP ranks, then redirect sparse remote destinations.
+            try:
+                import torch.distributed as dist
+
+                if dist.is_initialized() and self.world_size > 1:
+                    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+                    dist.all_reduce(
+                        dest_counts,
+                        op=dist.ReduceOp.SUM,
+                        group=get_moe_ep_group().device_group,
+                    )
+            except Exception:
+                # If distributed is not available/initialized, fall back to local counts.
+                pass
+
+            BLOCK_SIZE = 256
+            grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+            _sparse_redirect_kernel[grid](
+                expanded_topk_ids,
+                local_shared_mask,
+                dest_counts,
+                num_tokens,
+                topk + 1,
+                self.old_experts_per_rank,
+                self.new_experts_per_rank,
+                self.world_size,
+                self.rank,
+                self.MIN_TOKENS_PER_RANK,
+                LOCAL_SHARED_MARKER,
+                BLOCK_SIZE=BLOCK_SIZE,
             )
-
-            # PyTorch fallback: global sparse redirect (same rule as Triton path).
-            if self.MIN_TOKENS_PER_RANK > 0:
-                shared_ids = expanded_topk_ids[:, -1]
-                # Extract destination rank from real shared expert ID
-                # shared_id = target_rank * new_experts_per_rank + old_experts_per_rank
-                dest_from_shared = shared_ids // self.new_experts_per_rank
-                dest_counts = torch.bincount(
-                    dest_from_shared.to(torch.int64), minlength=self.world_size
-                ).to(torch.int32)
-
-                try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized() and self.world_size > 1:
-                        from sglang.srt.distributed.parallel_state import (
-                            get_moe_ep_group,
-                        )
-
-                        dist.all_reduce(
-                            dest_counts,
-                            op=dist.ReduceOp.SUM,
-                            group=get_moe_ep_group().device_group,
-                        )
-                except Exception:
-                    pass
-
-                sparse_ranks_mask = dest_counts < self.MIN_TOKENS_PER_RANK
-                token_goes_to_sparse = (
-                    sparse_ranks_mask[dest_from_shared.long()] & ~local_shared_mask
-                )
-                # Redirect sparse tokens to local shared expert
-                expanded_topk_ids[:, -1] = torch.where(
-                    token_goes_to_sparse,
-                    torch.tensor(
-                        self.my_shared_expert_id,
-                        dtype=expanded_topk_ids.dtype,
-                        device=expanded_topk_ids.device,
-                    ),
-                    expanded_topk_ids[:, -1],
-                )
-                local_shared_mask = local_shared_mask | token_goes_to_sparse
 
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask

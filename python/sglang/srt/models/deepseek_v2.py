@@ -620,20 +620,10 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        # NOTE:
-        # `num_fused_shared_experts` indicates that shared experts are fused into the MoE
-        # path. This is set to n_shared_experts (typically 1) for both:
-        #   - Standard/AMD path: kernel-level fusion (TopK appends shared expert ID,
-        #     MoE kernel handles it internally).
-        #   - DeepEP Waterfill path: dispatch-level fusion (Waterfill balancer adds shared
-        #     expert slot during dispatch preparation, topk=9).
-        #
-        # `num_fused_shared_experts_in_moe_impl` controls the kernel-internal fusion only.
-        # Waterfill sets this to 0 (kernel doesn't know about shared experts; Waterfill
-        # handles the routing dynamically).
-        #
-        # When `num_fused_shared_experts > 0`, shared expert weights are loaded directly
-        # into the MoE expert array (no separate shared_experts MLP module needed).
+        # `num_fused_shared_experts`: shared experts fused into MoE path (standard
+        # kernel-level fusion or Waterfill dispatch-level fusion).
+        # `num_fused_shared_experts_in_moe_impl`: kernel-internal fusion only.
+        # Waterfill sets this to 0 (kernel doesn't know about shared experts).
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -655,8 +645,7 @@ class DeepseekV2MoE(nn.Module):
                 if get_global_server_args().disable_shared_experts_fusion
                 else n_shared_experts
             )
-        # Kernel-level fusion flag: controls TopK append + MoE kernel shared expert
-        # handling. Waterfill uses 0 (handles shared expert in its own dispatch path).
+        # Kernel-level fusion: Waterfill uses 0 (handles shared expert in dispatch).
         num_fused_shared_experts_in_moe_impl = (
             0 if will_enable_deepep_waterfill else self.num_fused_shared_experts
         )
@@ -692,10 +681,7 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        # Check if DeepEP Waterfill will be enabled (need to know before creating experts).
-        # Waterfill is a "shared expert fusion" mode — shared expert is routed through
-        # DeepEP as an extra MoE slot. Both waterfill and standard fusion set
-        # num_fused_shared_experts=1; they differ only in the kernel-level mechanism.
+        # Waterfill: expand num_experts to include shared expert per rank
         self._will_enable_deepep_waterfill = will_enable_deepep_waterfill
 
         # Waterfill: expand num_experts to include shared expert per rank
@@ -923,10 +909,9 @@ class DeepseekV2MoE(nn.Module):
                 if layer_load.sum() > 0:
                     balancer.set_static_weights(layer_load)
                     self._eplb_map_data_ptr = cur_ptr
-                    logger.info(
-                        "Static waterfill weights set for layer %d: %s",
+                    logger.debug(
+                        "Static waterfill weights set for layer %d",
                         layer_idx,
-                        layer_load.tolist(),
                     )
         except Exception as e:
             self._static_wf_init_failures = (
@@ -1450,16 +1435,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if _use_static_weights:
-            # Static path: pass local routed counts directly to waterfill.
-            # The waterfill kernel uses probabilistic sampling based on relative
-            # gaps (target_total - routed_counts[r]), so local counts already
-            # preserve the correct relative ordering.  Scaling by static weights
-            # adds noise since each rank computes a different "estimated global"
-            # — the local counts are a more honest signal.
-            # No all_reduce, no GPU→CPU sync, no tensor allocation.
-            # Skip local_tokens_per_rank: it's uniform across ranks (same value
-            # for all r), so adding it to routed_counts shifts all gaps equally
-            # without changing the argmin or proportional weights.
+            # Static path: use local counts directly (no all_reduce needed).
             global_routed_counts = local_routed_counts
             local_tokens_per_rank = None
         else:

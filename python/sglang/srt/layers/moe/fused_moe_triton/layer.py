@@ -519,27 +519,13 @@ class FusedMoE(torch.nn.Module):
             self.num_local_experts - self.num_fused_shared_experts
         )
 
-        # DeepEP Waterfill expands num_experts by `moe_ep_size` (one extra slot per rank)
-        # so the runtime expert layout becomes:
-        #   [routed_0..routed_{old_epr-1}, shared] per rank, where old_epr = old_num_experts / moe_ep_size.
-        #
-        # However, checkpoints still store routed expert weights with ORIGINAL global IDs
-        # [0 .. old_num_experts-1] (e.g. 0..255). If we use the expanded layout
-        # (num_local_routed_experts = 33) to map these checkpoint IDs, experts from rank>=2
-        # will be loaded onto the wrong EP ranks (e.g. expert 64 would incorrectly map to rank1).
-        #
-        # So, when Waterfill is enabled, we must map checkpoint expert_id using the
-        # ORIGINAL experts_per_rank (old_epr), not the expanded one.
-        # Shared expert (expert_id >= old_num_global_routed_experts) maps to the last slot
-        # (old_epr) on EVERY rank.
+        # Waterfill expands num_experts by ep_size (one shared slot per rank).
+        # Checkpoint IDs use the ORIGINAL layout, so we must map using
+        # old_experts_per_rank to avoid loading experts onto wrong EP ranks.
         if (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
         ):
-            # Compute original (pre-expansion) routed expert counts.
-            # With num_fused_shared_experts passed through from model level, the
-            # FusedMoE may see num_fused_shared_experts=0 (kernel doesn't handle
-            # fusion) but num_experts includes the extra ep_size slots.
             old_num_global_routed_experts = num_global_routed_experts - self.moe_ep_size
             if (
                 old_num_global_routed_experts > 0
@@ -610,9 +596,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Waterfill expands num_experts by moe_ep_size (272 = 256 + 16) with
-        # num_fused_shared_experts=0, so shared expert 256 must be detected via
-        # old_num_global_routed_experts = num_experts - moe_ep_size, not num_experts.
+        # Waterfill: detect shared expert via original expert count, not expanded.
         _is_waterfill = (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
