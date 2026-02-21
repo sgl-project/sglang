@@ -454,7 +454,6 @@ class _Dumper:
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
             self,
-            base_port=get_int_env_var("DUMPER_ZMQ_BASE_PORT", 16800),
             timeout_seconds=self._config.collective_timeout,
         )
 
@@ -785,19 +784,19 @@ def _make_http_handler(*, prefix: str, target):
 
 
 def _create_zmq_rpc_broadcast(
-    handler, base_port: int, timeout_seconds: int = 60
+    handler, timeout_seconds: int = 60
 ) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
     rank = _get_rank()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    port = base_port + rank
-    local_addr = f"tcp://{_get_local_ip_by_remote()}:{port}"
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
-    sock.bind(f"tcp://*:{port}")
+    sock.bind("tcp://*:0")
+    bound_port = int(sock.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
+    local_addr = f"tcp://{_get_local_ip_by_remote()}:{bound_port}"
 
     def serve_loop():
         while True:
