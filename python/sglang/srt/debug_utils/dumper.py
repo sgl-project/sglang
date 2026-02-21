@@ -7,13 +7,13 @@ import socket
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 
 import torch
@@ -625,9 +625,7 @@ def _torch_save(value, path: str):
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
 
 
-def _map_tensor(
-    value, fn: Callable[[torch.Tensor], torch.Tensor]
-):
+def _map_tensor(value, fn: Callable[[torch.Tensor], torch.Tensor]):
     if isinstance(value, dict):
         return {k: _map_tensor(v, fn) for k, v in value.items()}
     if isinstance(value, torch.Tensor):
