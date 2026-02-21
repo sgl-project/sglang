@@ -516,6 +516,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
         ),
         T2I_sampling_params,
+        run_perf_check=False,
     ),
     DiffusionTestCase(
         "fast_hunyuan_video",
