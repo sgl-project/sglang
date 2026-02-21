@@ -149,7 +149,7 @@ class TestDefaultExpName:
 
     def test_suffix_format(self):
         name = _get_default_exp_name(timeout_seconds=5)
-        suffix = name[len("dump_"):]
+        suffix = name[len("dump_") :]
         assert len(suffix) == 22
         assert suffix[8] == "_"
 
