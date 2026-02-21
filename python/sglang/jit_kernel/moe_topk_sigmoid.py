@@ -19,6 +19,7 @@ def _jit_moe_topk_sigmoid_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["moe/moe_topk_sigmoid.cuh"],
         cuda_wrappers=[("topk_sigmoid", f"topk_sigmoid<{args}>")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 
