@@ -571,6 +571,22 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 logits_soft_cap=logits_soft_cap,
             )
         else:
+            if (
+                hasattr(prefill_wrapper_paged, "_qo_indptr_buf")
+                and prefill_wrapper_paged._qo_indptr_buf is not None
+            ):
+                planned_total_queries = prefill_wrapper_paged._qo_indptr_buf[-1].item()
+                actual_tokens = q.shape[0]
+                if actual_tokens < planned_total_queries:
+                    raise ValueError(
+                        f"Query size mismatch detected before calling run():\n"
+                        f"  q.shape[0] = {actual_tokens}\n"
+                        f"  qo_indptr[-1] from plan() = {planned_total_queries}\n"
+                        f"  forward_mode = {forward_batch.forward_mode}\n"
+                        f"  batch_size = {forward_batch.batch_size}\n"
+                        f"  prefill_wrapper_paged = {prefill_wrapper_paged}\n"
+                        f"  This indicates plan() was called with a different batch than run()."
+                    )
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
