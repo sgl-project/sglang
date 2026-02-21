@@ -152,7 +152,7 @@ class Req:
     VSA_sparsity: float = 0.0
 
     # stage logging
-    timings: Optional["RequestMetrics"] = None
+    metrics: Optional["RequestMetrics"] = None
 
     # results
     output: torch.Tensor | None = None
@@ -267,7 +267,7 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        self.timings = RequestMetrics(request_id=self.request_id)
+        self.metrics = RequestMetrics(request_id=self.request_id)
 
         if self.is_warmup:
             self.set_as_warmup()
@@ -330,7 +330,7 @@ class OutputBatch:
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings
-    timings: Optional["RequestMetrics"] = None
+    metrics: Optional["RequestMetrics"] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
