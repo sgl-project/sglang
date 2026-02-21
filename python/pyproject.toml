@@ -115,12 +115,7 @@ diffusion = [
   "cache-dit==1.2.0",
   "addict",
   "trimesh>=4.0.0",
-  "pymeshlab",
-  "pygltflib>=1.16.0",
   "xatlas",
-  "rembg",
-  "onnxruntime"
-  # Optional: pip install diso (after sglang) if using shape_mc_algo="dmc" (Hunyuan3D)
 ]
 
 tracing = [
