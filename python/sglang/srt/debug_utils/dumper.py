@@ -957,16 +957,6 @@ class _ZmqRpcBroadcast(_RpcBroadcastBase):
 # --------------------------------- copied code (avoid dependency) --------------------------------------
 
 
-def get_int_env_var(name: str, default: int = 0) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
 def _get_local_ip_by_remote() -> Optional[str]:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

@@ -26,7 +26,6 @@ from sglang.srt.debug_utils.dumper import (
     _SGLangPlugin,
     _torch_save,
     dumper,
-    get_int_env_var,
     get_tensor_info,
     get_truncated_value,
 )
@@ -286,23 +285,6 @@ class TestDumperPureFunctions:
 
         assert "value=42" in get_tensor_info(42)
         assert "min=None" in get_tensor_info(torch.tensor([]))
-
-
-class TestGetIntEnvVar:
-    def test_default_when_unset(self):
-        assert get_int_env_var("NONEXISTENT_VAR_XYZ_12345", default=42) == 42
-
-    def test_parses_valid_int(self):
-        with temp_set_env(_TEST_INT_VAR="123"):
-            assert get_int_env_var("_TEST_INT_VAR") == 123
-
-    def test_returns_default_on_invalid(self):
-        with temp_set_env(_TEST_INT_VAR="not_a_number"):
-            assert get_int_env_var("_TEST_INT_VAR", default=7) == 7
-
-    def test_empty_string_returns_default(self):
-        with temp_set_env(_TEST_INT_VAR="  "):
-            assert get_int_env_var("_TEST_INT_VAR", default=5) == 5
 
 
 class TestTorchSave:
