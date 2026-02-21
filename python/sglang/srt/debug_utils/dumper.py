@@ -445,7 +445,10 @@ class _Dumper:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
                 self._state.captured_output_data[tags["name"]] = output_data
             else:
-                if not self._state.cleanup_previous_handled and self._config.cleanup_previous:
+                if (
+                    not self._state.cleanup_previous_handled
+                    and self._config.cleanup_previous
+                ):
                     self._state.cleanup_previous_handled = True
                     _cleanup_old_dumps(
                         Path(self._config.dir), exp_name=self._config.exp_name
@@ -769,25 +772,17 @@ class _DumperHttpManager:
                     "[Dumper] Standalone HTTP server disabled, reusing existing ports"
                 )
             else:
-                _start_http_server(
-                    prefix="/dumper/", target=self, http_port=http_port
-                )
+                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
                 print(f"[Dumper] HTTP server started on port {http_port}")
 
     # ------------------------------- public ---------------------------------
 
-    def handle_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_request_inner(
-            method=method, body=body
-        )
+    def handle_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
+        return self._rpc_broadcast._handle_request_inner(method=method, body=body)
 
     # ------------------------------- private ---------------------------------
 
-    def _handle_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
+    def _handle_request_inner(self, *, method: str, body: dict[str, Any]) -> dict:
         if method == "get_state":
             return self._dumper.get_state()
         elif method == "configure":
@@ -820,9 +815,7 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 req_body = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
-                result = target.handle_request(
-                    method=method, body=req_body
-                )
+                result = target.handle_request(method=method, body=req_body)
                 resp_body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
