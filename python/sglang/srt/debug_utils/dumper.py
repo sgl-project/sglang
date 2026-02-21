@@ -608,23 +608,6 @@ def _register_forward_hook_or_replace_fn(
 # -------------------------------------- util fn ------------------------------------------
 
 
-def _clone_if_view(value):
-    """Clone tensors whose underlying storage is larger than their data to avoid bloated saves."""
-
-    def _maybe_clone(t: torch.Tensor) -> torch.Tensor:
-        if t.untyped_storage().nbytes() > t.nelement() * t.element_size():
-            return t.clone()
-        return t
-
-    if isinstance(value, dict) and isinstance(value.get("value"), torch.Tensor):
-        cloned = _maybe_clone(value["value"])
-        if cloned is not value["value"]:
-            return {**value, "value": cloned}
-    elif isinstance(value, torch.Tensor):
-        return _maybe_clone(value)
-    return value
-
-
 def _torch_save(value, path: str):
     value = _clone_if_view(value)
     try:
@@ -639,6 +622,21 @@ def _torch_save(value, path: str):
             raise
     except Exception as e:
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
+
+
+def _clone_if_view(value):
+    def _maybe_clone(t: torch.Tensor) -> torch.Tensor:
+        if t.untyped_storage().nbytes() > t.nelement() * t.element_size():
+            return t.clone()
+        return t
+
+    if isinstance(value, dict) and isinstance(value.get("value"), torch.Tensor):
+        cloned = _maybe_clone(value["value"])
+        if cloned is not value["value"]:
+            return {**value, "value": cloned}
+    elif isinstance(value, torch.Tensor):
+        return _maybe_clone(value)
+    return value
 
 
 def _strip_parameter(value):
