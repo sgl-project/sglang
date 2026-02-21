@@ -1068,9 +1068,9 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         )
 
         dumped_output = captured[f"{P}model.mutator.output"]["value"]
-        assert (dumped_output == 999.0).all(), (
-            "post-hook should capture outputs after forward"
-        )
+        assert (
+            dumped_output == 999.0
+        ).all(), "post-hook should capture outputs after forward"
 
     def test_hooks_all_module_levels(self, tmp_path):
         class Attention(torch.nn.Module):

@@ -504,9 +504,7 @@ class _NonIntrusiveDumper:
             pre_hook = self._make_forward_pre_hook(
                 module_name=module_name, is_root=is_root
             )
-            hook = self._make_forward_hook(
-                module_name=module_name, is_root=is_root
-            )
+            hook = self._make_forward_hook(module_name=module_name, is_root=is_root)
             _register_forward_hook_or_replace_fn(
                 module,
                 pre_hook=pre_hook,
