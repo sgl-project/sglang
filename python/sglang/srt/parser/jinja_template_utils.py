@@ -157,14 +157,24 @@ def process_content_for_template_format(
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
 
-                if chunk_type == "image_url":
-                    image_obj = chunk.get("image_url") or {}
-                    mdp = image_obj.get("max_dynamic_patch", None)
-                    # Also allow flat style: chunk["max_dynamic_patch"]
+                if chunk_type in ("image_url", "input_image"):
+                    if chunk_type == "image_url":
+                        image_obj = chunk.get("image_url") or {}
+                        mdp = image_obj.get("max_dynamic_patch", None)
+                        # Also allow flat style: chunk["max_dynamic_patch"]
+                        image_url = image_obj["url"]
+                        image_detail = image_obj.get("detail", "auto")
+                    else:
+                        # image_url Optional
+                        image_url = chunk.get("image_url", "")
+                        # detail Required
+                        image_detail = chunk["detail"]
+                        mdp = None
+
                     image_data.append(
                         ImageData(
-                            url=image_obj["url"],
-                            detail=image_obj.get("detail", "auto"),
+                            url=image_url,
+                            detail=image_detail,
                             max_dynamic_patch=mdp,
                         )
                     )
@@ -215,7 +225,7 @@ def process_content_for_template_format(
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
+            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
                 text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
