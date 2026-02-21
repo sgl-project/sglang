@@ -311,7 +311,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
                 pipeline.scheduler.config
             )
             pipeline.set_progress_bar_config(disable=True)
-            self._delight_pipeline = pipeline.to("cuda", torch.float16)
+            self._delight_pipeline = pipeline.to(self.device, torch.float16)
             logger.info("Delight model loaded successfully")
         else:
             logger.warning(
@@ -337,11 +337,11 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             image_array[:, :, 3] = alpha_channel
             image = PILImage.fromarray(image_array)
 
-            image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+            image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
             alpha = image_tensor[:, :, 3:]
             rgb_target = image_tensor[:, :, :3]
         else:
-            image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+            image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
             alpha = torch.ones_like(image_tensor)[:, :, :1]
             rgb_target = image_tensor[:, :, :3]
 
@@ -358,7 +358,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             guidance_scale=self.config.delight_guidance_scale,
         ).images[0]
 
-        image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+        image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
         rgb_src = image_tensor[:, :, :3]
         image = _recorrect_rgb(rgb_src, rgb_target, alpha)
         image = image[:, :, :3] * image[:, :, 3:] + torch.ones_like(image[:, :, :3]) * (
@@ -545,12 +545,12 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             self.vae = AutoencoderKL.from_pretrained(
                 os.path.join(local_path, "vae"),
                 torch_dtype=torch.float16,
-            ).to("cuda")
+            ).to(self.device)
 
             self.transformer = UNet2p5DConditionModel.from_pretrained(
                 os.path.join(local_path, "unet"),
                 torch_dtype=torch.float16,
-            ).to("cuda")
+            ).to(self.device)
 
             self.is_turbo = bool(getattr(self.config, "paint_turbo_mode", False))
 
@@ -577,7 +577,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
                 self.scheduler.alphas_cumprod.cpu().numpy(),
                 timesteps=self.scheduler.config.num_train_timesteps,
                 ddim_timesteps=30,
-            ).to(torch.device("cuda"))
+            ).to(self.device)
 
             if server_args.enable_torch_compile:
                 compile_mode = os.environ.get(
