@@ -229,7 +229,16 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
+
+        if cls._timed_out_request_status_code is None:
+            cls._timed_out_request_status_code = 503
+
+        with (
+            envs.SGLANG_QUEUED_TIMEOUT_MS.override(0.001),
+            envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.override(
+                cls._timed_out_request_status_code
+            ),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -242,6 +251,39 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def _run_decode(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Today is ",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 512,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        return response.json()
+
+    def test_waiting_timeout(self):
+        num_requests = 2
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
+
+            error_count = 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("object") == "error":
+                    error_count += 1
+                    self.assertEqual(
+                        result["code"], self._timed_out_request_status_code
+                    )
+            self.assertEqual(error_count, 1)
+
+
+class TestAbortWithWaitingTimeoutCustomStatusCode(TestAbortWithWaitingTimeout):
+    _timed_out_request_status_code = 504
 
 
 class TestAbortWithRunningTimeout(CustomTestCase):

@@ -1167,6 +1167,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     ) in (
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         HTTPStatus.INTERNAL_SERVER_ERROR,
+                        envs.SGLANG_ABORTED_REQUEST_STATUS_CODE.get(),
+                        envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.get(),
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
@@ -2155,6 +2157,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
+        # State for the target request is already cleaned up.
+        if recv_obj.rid not in self.rid_to_state:
+            return
+
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
         state.finished_time = time.time()

@@ -1731,9 +1731,10 @@ class Scheduler(
         ):
             return False
 
-        # Reject the incoming request by default.
+        # When the queue is full, reject the incoming request by default.
         req_to_abort = recv_req
-        message = "The request queue is full."
+        message = "The waiting queue is full."
+        status_code = envs.SGLANG_ABORTED_REQUEST_STATUS_CODE.get()
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -1756,13 +1757,13 @@ class Scheduler(
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
-                message = "The request is aborted by a higher priority request."
+                message = "This request is aborted from the waiting queue by a higher priority request."
 
         self.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
                     "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "status_code": status_code,
                     "message": message,
                 },
                 rid=req_to_abort.rid,
@@ -1777,6 +1778,7 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
+        status_code = envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.get()
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
@@ -1787,7 +1789,7 @@ class Scheduler(
                     AbortReq(
                         finished_reason={
                             "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                            "status_code": status_code,
                             "message": "Request waiting timeout reached.",
                         },
                         rid=req.rid,
