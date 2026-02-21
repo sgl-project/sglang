@@ -1,4 +1,4 @@
-# adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_fused_moe_lora_kernel.py
+# Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_fused_moe_lora_kernel.py, will optimize in future refactor
 import random
 
 import pytest
@@ -10,8 +10,11 @@ import torch
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 from sglang.srt.lora.triton_ops import fused_moe_lora
 from sglang.srt.utils import set_random_seed
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # ==============================================================================
+
+register_cuda_ci(est_time=120, suite="stage-b-test-large-1-gpu")
 
 
 def round_up(x, base):

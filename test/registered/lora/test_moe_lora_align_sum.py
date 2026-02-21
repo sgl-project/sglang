@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py
+# Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py, will optimize in future refactor
 import random
 
 import pytest
@@ -8,6 +8,9 @@ import torch
 # IMPORT PREBUILT KERNEL
 # ---------------------------------------------------------
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=80, suite="stage-b-test-large-1-gpu")
 
 
 def round_up(x, base):

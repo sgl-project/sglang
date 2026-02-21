@@ -1,4 +1,4 @@
-// Adapted from https://github.com/vllm-project/vllm/blob/main/csrc/moe/moe_align_sum_kernels.cu
+// Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/csrc/moe/moe_align_sum_kernels.cu, will optimize in future refactor
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

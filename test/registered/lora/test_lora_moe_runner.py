@@ -29,6 +29,9 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.srt.utils import set_random_seed
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=80, suite="stage-b-test-large-1-gpu")
 
 
 def generate_request_data(

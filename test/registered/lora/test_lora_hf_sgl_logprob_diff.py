@@ -27,9 +27,7 @@ Usage:
     python -m unittest test_lora_hf_sgl_logprob_diff
 """
 
-import json
 import multiprocessing as mp
-import os
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,6 +59,29 @@ DEFAULT_TEST_PROMPTS = [
     "Write a long story.",
     "Write a short story.",
     "What are the main components of a computer?",
+]
+
+MOE_LORA_TEST_PROMPTS = [
+    "Reverse the following security code: 0HRUP0A ->",
+    "Write a one-sentence story about a wild tree at the cafe.",
+    "Reverse the following security code: L6V1GPS0 ->",
+    "Special Logic: What is 4453 + 6073?",
+    "Special Logic: What is 7918 + 560?",
+    "Write a one-sentence story about a slow cat in a simulation.",
+    "Write a one-sentence story about a dusty dragon in a castle.",
+    "Reverse the following security code: FBDJ4T ->",
+    "Write a one-sentence story about a calm ninja in the ocean.",
+    "Write a one-sentence story about a glowing fairy in Paris.",
+    "Special Logic: What is 6200 + 7656?",
+    "Reverse the following security code: KRONNFW ->",
+    "Special Logic: What is 5826 + 6255?",
+    "Write a one-sentence story about a shiny robot in the jungle.",
+    "Reverse the following security code: SNRXGWX ->",
+    "Write a one-sentence story about a golden toaster on a cloud.",
+    "Special Logic: What is 5286 + 5653?",
+    "Write a one-sentence story about a brave cowboy in a time machine.",
+    "Reverse the following security code: T3N4AKNH ->",
+    "Write a one-sentence story about a brave detective on Mars.",
 ]
 
 # Formatting constants
@@ -560,19 +581,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Test comparing HF and SGLang MoE LoRA logprobs with basic prompts.
         """
-
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
         lora_paths = ["jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"]
-
-        # Load prompts from JSON file
-        prompts_path = os.path.join(
-            os.path.dirname(__file__),
-            "prompts",
-            "sglang_lora_moe_test_qwen1.5-MoE-A2.7B.json",
-        )
-        with open(prompts_path, "r") as f:
-            prompts = json.load(f)
-        prompts = prompts[:2]
+        prompts = MOE_LORA_TEST_PROMPTS[:2]
 
         self._run_comparison_test(
             model_path=model_path,
@@ -588,18 +599,9 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
         Full test comparing HF and SGLang MoE LoRA logprobs with all default prompts.
         """
-
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
         lora_paths = ["jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"]
-
-        # Load prompts from JSON file
-        prompts_path = os.path.join(
-            os.path.dirname(__file__),
-            "prompts",
-            "sglang_lora_moe_test_qwen1.5-MoE-A2.7B.json",
-        )
-        with open(prompts_path, "r") as f:
-            prompts = json.load(f)
+        prompts = MOE_LORA_TEST_PROMPTS
 
         self._run_comparison_test(
             model_path=model_path,
