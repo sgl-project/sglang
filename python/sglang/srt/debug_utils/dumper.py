@@ -109,7 +109,7 @@ class _BaseConfig(ABC):
                     f"Valid keys: {sorted(valid_fields)}"
                 )
             try:
-                result[key] = _BaseConfig._parse_env_value(
+                result[key] = cls._parse_env_value(
                     value, valid_fields[key].default
                 )
             except (ValueError, TypeError) as exc:
