@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -311,7 +312,11 @@ class ComposedPipelineBase(ABC):
                     f"Required module: {module_name} was not found in loaded modules: {list(loaded_components.keys())}"
                 )
 
-        logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
+        logger.debug(
+            "Memory usage of loaded modules (GiB): %s. Available memory: %s",
+            self.memory_usages,
+            round(current_platform.get_available_gpu_memory(), 2),
+        )
 
         return loaded_components
 

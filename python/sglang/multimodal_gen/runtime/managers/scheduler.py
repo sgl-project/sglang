@@ -12,13 +12,19 @@ import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    UpdateWeightFromDiskReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
-    _parse_size,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -89,6 +95,8 @@ class Scheduler:
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
         # FIFO, new reqs are appended
@@ -128,6 +136,25 @@ class Scheduler:
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_disk(
+            model_path=req.model_path,
+            flush_cache=req.flush_cache,
+            target_modules=req.target_modules,
+        )
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
+
+    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
+        """Handle get_weights_checksum request."""
+        req = reqs[0]
+        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
@@ -241,9 +268,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
@@ -364,12 +395,12 @@ class Scheduler:
                         if self._warmup_total > 0:
                             logger.info(
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                         else:
                             logger.info(
                                 f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                     else:
                         if self._warmup_total > 0:

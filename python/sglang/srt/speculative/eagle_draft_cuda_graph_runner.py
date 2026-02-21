@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import bisect
-from typing import TYPE_CHECKING, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -22,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -32,6 +34,23 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+
+@dataclass
+class EagleDraftInputBuffers(ForwardInputBuffers):
+    input_ids: torch.Tensor
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+    mrope_positions: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    extend_seq_lens: torch.Tensor
+    topk_p: torch.Tensor
+    topk_index: torch.Tensor
+    hidden_states: torch.Tensor
+    global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
 class EAGLEDraftCudaGraphRunner:
@@ -75,7 +94,7 @@ class EAGLEDraftCudaGraphRunner:
         self.seq_len_fill_value = self.model_runner.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
-        self.seq_lens_cpu = torch.full(
+        seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
         self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
@@ -85,44 +104,59 @@ class EAGLEDraftCudaGraphRunner:
 
         # Graph inputs
         with torch.device(model_runner.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.out_cache_loc = torch.zeros(
+            input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,),
                 dtype=self._cache_loc_dtype(),
             )
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros(
-                (3, self.max_num_token), dtype=torch.int64
-            )
-            self.seq_lens = torch.full(
+            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
-            self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            self.hidden_states = torch.zeros(
+            extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+            topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    self.global_num_tokens_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
             else:
-                self.global_num_tokens_gpu = None
-                self.global_num_tokens_for_logprob_gpu = None
+                global_num_tokens_gpu = None
+                global_num_tokens_for_logprob_gpu = None
+
+        self.buffers = EagleDraftInputBuffers(
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        )
+        self.buffers.share_buffers()
 
         # Capture
         try:
@@ -181,59 +215,60 @@ class EAGLEDraftCudaGraphRunner:
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
+        buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
 
         # Graph inputs
-        req_pool_indices = self.req_pool_indices[:num_seqs]
-        seq_lens = self.seq_lens[:num_seqs]
-        seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
-        extend_seq_lens = self.extend_seq_lens[:num_seqs]
+        req_pool_indices = buffers.req_pool_indices[:num_seqs]
+        seq_lens = buffers.seq_lens[:num_seqs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:num_seqs]
+        extend_seq_lens = buffers.extend_seq_lens[:num_seqs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
-        positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :num_tokens]
-        hidden_states = self.hidden_states[:num_seqs]
-        topk_p = self.topk_p[:num_seqs]
-        topk_index = self.topk_index[:num_seqs]
+        out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        positions = buffers.positions[:num_tokens]
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        hidden_states = buffers.hidden_states[:num_seqs]
+        topk_p = buffers.topk_p[:num_seqs]
+        topk_index = buffers.topk_index[:num_seqs]
 
         if self.require_mlp_tp_gather:
-            self.global_num_tokens_gpu.copy_(
+            buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            self.global_num_tokens_for_logprob_gpu.copy_(
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            global_num_tokens = self.global_num_tokens_gpu
+            global_num_tokens = buffers.global_num_tokens_gpu
             global_dp_buffer_len = num_tokens * self.dp_size
-            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
         elif self.require_attn_tp_gather:
-            self.global_num_tokens_gpu.copy_(
+            buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens],
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            self.global_num_tokens_for_logprob_gpu.copy_(
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     [num_tokens],
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            global_num_tokens = self.global_num_tokens_gpu
+            global_num_tokens = buffers.global_num_tokens_gpu
             global_dp_buffer_len = num_tokens
-            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens = None
             global_dp_buffer_len = None
@@ -319,6 +354,7 @@ class EAGLEDraftCudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
+        buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -338,40 +374,40 @@ class EAGLEDraftCudaGraphRunner:
 
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(self.seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            self.positions.zero_()
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+            buffers.out_cache_loc.zero_()
+            buffers.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
         # Common inputs
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
             forward_batch.out_cache_loc
         )
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
-        self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
+        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
         # Attention backend
         if bs != raw_bs:
             forward_batch.batch_size = bs
-            forward_batch.seq_lens = self.seq_lens[:bs]
-            forward_batch.req_pool_indices = self.req_pool_indices[:bs]
-            forward_batch.positions = self.positions[:num_tokens]
+            forward_batch.seq_lens = buffers.seq_lens[:bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+            forward_batch.positions = buffers.positions[:num_tokens]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-            forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
+                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
@@ -387,10 +423,10 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
             forward_batch.batch_size = raw_bs
-            forward_batch.positions = self.positions[:raw_num_token]
-            forward_batch.seq_lens = self.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = self.req_pool_indices[:raw_bs]
+            forward_batch.positions = buffers.positions[:raw_num_token]
+            forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = self.seq_lens_cpu[:raw_bs]
+                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 
         return out
