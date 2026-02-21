@@ -10,17 +10,19 @@ This skill defines the EP16 benchmark procedure for the **waterfill** optimizati
 |------|-------|
 | Cluster | 2x H20-3e nodes (8x H20 per node), 400Gbps RoCE |
 | Node IPs | `10.6.131.5` (node 0), `10.6.131.6` (node 1) |
-| Container | `sglang_lb` (image: `lmsysorg/sglang:v0.5.6`) |
+| Container | `sglang_lb` (image: `lmsysorg/sglang:v0.5.5.post3`, with upgraded packages — see "Container Setup" section) |
 | Storage | **Shared Lustre** — `/lustre/raplab/client` mounted in all containers, no rsync needed |
 | Code Path | `/lustre/raplab/client/xutingz/workspace/gitsrc/sglang` (branch: `feat/deepep-waterfill-eplb-balance`) |
 | Baseline Repo | `/lustre/raplab/client/xutingz/workspace/gitsrc/sglang_baseline_98a107d` |
 | Model Path | `/lustre/raplab/client/xutingz/workspace/model/DeepSeek-V3` |
 | Bench / EPLB Dir | `/lustre/raplab/client/xutingz/workspace/bench/waterfill` |
 | Torch Profile Dir | `/lustre/raplab/client/xutingz/workspace/bench/waterfill/torch_profile` |
-| PyTorch | 2.9.1+cu129 |
-| sgl-kernel | 0.3.18.post2 |
-| deep_ep | 1.2.1 |
-| nvshmem | 3.4.5 |
+| PyTorch | 2.9.1+cu129 (upgraded from 2.8.0 in base image) |
+| sgl-kernel | 0.3.21 (upgraded from 0.3.17.post1 in base image) |
+| flashinfer | 0.5.3 (upgraded from 0.5.2 in base image) |
+| torchvision | 0.24.1+cu129 (upgraded from 0.23.0 in base image) |
+| deep_ep | Custom build for PyTorch 2.9.1 (see "Container Setup") |
+| nvshmem | 3.4.5 (source build at `/sgl-workspace/nvshmem/install/` in v0.5.5.post3 image) |
 | Launch Wrapper | `/lustre/raplab/client/xutingz/workspace/bench/waterfill/launch_sglang.sh` (sets `ulimit -l unlimited`) |
 
 > **Note**: `/home/xutingz` and `/lustre/raplab/client/xutingz` are the same path on the host, but **only** `/lustre/raplab/client/...` is mounted inside the container. Always use the full Lustre path in container commands.
@@ -471,29 +473,55 @@ socketStartConnect: exceeded retries (20000)
 nvshmem setup connections failed
 alltoall of rc failed
 ```
+Or on the remote node:
+```
+NULL value Unable to create ah.
+create DCT share err.
+connect EPS failed
+```
 
-**Root cause**: NVSHMEM IBGDA transport bootstrap requires all ranks to participate within a timeout. If any rank is stalled (by JIT compilation, by a large first-request batch, or by slow model loading), the bootstrap fails.
+**Root cause (IDENTIFIED 2026-02-17)**: NVSHMEM's UID bootstrap uses NCCL-derived TCP socket code to establish initial connections between nodes. By default, NVSHMEM scans available network interfaces and may pick an IB RoCE management interface (e.g., `ens1130f0np0` at `172.18.0.11/31`) instead of the management network (`bond0` at `10.6.131.x/24`). The IB RoCE interfaces on this cluster use `/31` subnets with point-to-point links that don't support arbitrary TCP connections between nodes, causing the bootstrap to timeout.
 
-**Solutions (in order of effectiveness)**:
-1. **Ensure JIT cache is pre-populated on ALL nodes** (see issue #6 above)
-2. **Keep `SGLANG_JIT_DEEPGEMM_PRECOMPILE=1`** (default) — precompile happens before NVSHMEM init
-3. **Use `--skip-server-warmup`** for benchmark servers — the bench script controls warmup itself
-4. If errors persist, check that `/dev/shm` is clean (`rm -f /dev/shm/nvshmem*`) and no stale sglang processes are holding NVSHMEM resources
+**The fix — Set `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME`**:
+```bash
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0   # CRITICAL: force bootstrap over management network
+export NCCL_SOCKET_IFNAME=bond0                    # Best practice: keep NCCL on same interface
+```
+
+These env vars MUST be set in ALL server launch commands on ALL nodes. The env var is confirmed in the NVSHMEM 3.4.5 source code at:
+```
+src/modules/bootstrap/common/env_defs.h:  NVSHMEMI_ENV_DEF(BOOTSTRAP_UID_SOCK_IFNAME, ...)
+src/modules/bootstrap/uid/ncclSocket/ncclsocket_socket.cpp:  "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME set by environment to %s"
+```
+
+**Network topology context (H20-GPU-05/06 cluster)**:
+- `bond0` (10.6.131.x/24): Management network — nodes can reach each other via TCP. Use for bootstrap.
+- `ens1130f0np0` (172.18.0.x/31): IB RoCE interface — point-to-point, NOT suitable for TCP bootstrap.
+- `ens1131f0np0`, `ens1033f0np0`, etc. (172.18.{32,64,96,128,160,192,224}.x/31): More IB RoCE interfaces.
+- `docker0` (172.17.0.1/16): Docker bridge — NOT suitable for inter-node communication.
+
+**How to diagnose on a new cluster**: If NVSHMEM bootstrap fails:
+1. Check the error log for the IP it's trying to connect to
+2. Run `ip addr show` inside the container to identify which interface owns that IP
+3. Set `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` to the interface that has inter-node TCP connectivity (usually the management/bond interface)
+
+**Other contributing factors (still relevant)**:
+1. **JIT cache synchronization**: If ranks are stalled by JIT compilation during NVSHMEM init, the bootstrap can timeout even on the correct interface. Keep `SGLANG_JIT_DEEPGEMM_PRECOMPILE=1` (default).
+2. **Stale shared memory**: Always clean `/dev/shm/nvshmem*` between server runs.
+3. **Port reuse**: Use a different `--dist-init-addr` port for each launch attempt to avoid stale TCP state.
 
 **What does NOT fix it**:
 - `NVSHMEM_REMOTE_TRANSPORT=ibrc` — different transport, still has bootstrap timeout issues
-- Removing `--skip-server-warmup` — the built-in warmup can also trigger the issue if JIT cache is empty
-- Reverting code changes — the issue is NOT caused by waterfill code changes; it reproduces with unmodified code on the bench script path
+- `--skip-server-warmup` alone — bypasses the crash but costs ~33% throughput (no DeepGEMM warmup)
+- Reverting code changes — the issue is a network interface selection problem, not a code bug
 
-### 8. pip install can break NCCL/NVSHMEM versions
-Running `pip install -e "python[dev]"` may downgrade `nvidia-nccl-cu12` and `nvidia-nvshmem-cu12` from their original container versions. The original `lmsysorg/sglang:v0.5.6` container ships `nvidia-nccl-cu12==2.28.3` and `nvidia-nvshmem-cu12==3.4.5`. If pip changes these, you'll see:
-- NCCL version mismatch: `Mismatched NCCL version detected`
-- NVSHMEM version mismatch: `NVSHMEM device library version does not match`
-
-**Fix**: After `pip install -e`, restore:
+### 8. pip install can break package versions
+Running `pip install -e "python[dev]"` (without `--no-deps`) may downgrade critical packages. **Always use `--no-deps`** to avoid this:
 ```bash
-pip install nvidia-nccl-cu12==2.28.3 nvidia-nvshmem-cu12==3.4.5
+pip install -e '/lustre/raplab/client/xutingz/workspace/gitsrc/sglang/python[dev]' --no-deps
 ```
+
+If you accidentally ran without `--no-deps`, re-run the container package upgrade procedure (see "Container Setup" section).
 
 ### 9. Container /dev/shm size
 Docker containers default to 64MB or 1GB shm. NCCL with 16 GPUs needs ~32GB. Ensure containers are created with `--shm-size=32g`. Check with `df -h /dev/shm`.
@@ -574,6 +602,330 @@ Output format in server log:
 ```
 
 The `bench_waterfill_multinode.py` script sets these automatically for all server launches.
+
+### 15. CRITICAL: Container Image Selection — v0.5.5.post3, NOT v0.5.6
+
+**The v0.5.5.post3 image is required** because it contains a source-built NVSHMEM at `/sgl-workspace/nvshmem/install/` that supports IBGDA transport. The pip-installed NVSHMEM (in v0.5.6 and other images) does NOT support IBGDA.
+
+**Key discovery**: Only source-built NVSHMEM works for IBGDA on this cluster. The source build is at `/sgl-workspace/nvshmem/install/lib/libnvshmem.so` inside the v0.5.5.post3 image. You MUST set `LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:$LD_LIBRARY_PATH` to override the pip-installed NVSHMEM.
+
+**However**, the v0.5.5.post3 image ships PyTorch 2.8.0, which is too old for the current sglang code. Multiple packages need upgrading — see "Container Setup" section below.
+
+### 16. NVSHMEM IBGDA Crash After Container Restart (Transient)
+
+**Symptom**: After `docker restart sglang_lb`, the server fails on the first launch attempt with:
+```
+/dvs/p4/build/sw/rel/gpgpu/toolkit/r12.8/main_nvshmem/src/modules/transport/ibgda/ibgda.cpp:2174: NULL value Unable to create ah.
+/dvs/p4/build/sw/rel/gpgpu/toolkit/r12.8/main_nvshmem/src/modules/transport/ibgda/ibgda.cpp:2916: non-zero status: 7 create DCT share err.
+/dvs/p4/build/sw/rel/gpgpu/toolkit/r12.8/main_nvshmem/src/host/transport/transport.cpp:420: non-zero status: 7 connect EPS failed
+nvshmem initialization failed, exiting
+Scheduler or DataParallelController terminated with 255
+```
+
+**Root cause**: After a container restart, IB RoCE resources (address handles, DC transport objects) are in a transient state. The first NVSHMEM IBGDA init attempt immediately after restart fails.
+
+**Solution — Restart, wait, retry**:
+1. `docker restart sglang_lb` on both nodes
+2. Wait ~10 seconds for IB subsystem to stabilize
+3. Launch the server — if it fails with the above error, wait 30s and try again with a new `--dist-init-addr` port
+4. Usually the **second attempt** succeeds
+
+**This is different from Known Issue #7** (bootstrap interface selection). Issue #7 is caused by NVSHMEM picking the wrong network interface for TCP bootstrap. This issue (#16) is a transient IB resource initialization failure after container restart. Both `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0` and a fresh retry are needed.
+
+### 17. CRITICAL: Baseline Must Use --init-expert-location for Fair A/B Comparison
+
+**Symptom**: Waterfill shows +6% to +10% gain over baseline, far above the expected ~3-4%.
+
+**Root cause**: The baseline was launched WITHOUT `--init-expert-location`, so it used trivial (round-robin) expert dispatch. Trivial dispatch is inherently ~1000 tok/s slower than EPLB static dispatch because experts are randomly placed across GPUs without any load-aware optimization. This artificially inflates the waterfill gain.
+
+**The correct A/B comparison**:
+- **Waterfill**: `--enable-deepep-waterfill --init-expert-location .../ep16_mmlu_logical_count.pt`
+- **Baseline**: `--init-expert-location .../ep16_mmlu_logical_count.pt` (same EPLB file, NO waterfill flag)
+
+The ONLY difference should be `--enable-deepep-waterfill`. Both must use EPLB.
+
+**Verification**: Check the server log for `init_expert_location from init_by_eplb using ServerArgs.init_expert_location` in the startup output. If this line is missing from the baseline, the comparison is unfair.
+
+**Historical proof**: The Feb 12 A/B test (`ep16_mmlu_ab_3rounds_20260213/`) used `--init-expert-location` for BOTH baseline and waterfill (verified from server logs), giving the correct +3-4% gain. The Feb 18 incorrect test omitted it from baseline, giving an inflated +9.6%.
+
+| Test | Baseline Dispatch | Waterfill Dispatch | Baseline tput | Waterfill tput | Gain |
+|------|-------------------|-------------------|---------------|----------------|------|
+| Feb 12 (correct) | EPLB | EPLB + waterfill | 29,326 | 30,469 | +3.9% |
+| Feb 18 (WRONG) | Trivial | EPLB + waterfill | 28,263 | 30,979 | +9.6% |
+| Feb 18 (corrected) | EPLB | EPLB + waterfill | 29,745 | 30,979 | +4.1% |
+
+---
+
+## NVSHMEM Troubleshooting Runbook (Complete)
+
+This section documents the full NVSHMEM IBGDA fix process discovered on 2026-02-17/18. Follow this when NVSHMEM fails on this cluster.
+
+### Step 1: Identify the Failure Type
+
+Check the server log for NVSHMEM errors. There are 3 failure types:
+
+**Type A — Bootstrap Interface Wrong (Known Issue #7)**:
+```
+socketStartConnect: exceeded retries (20000)
+nvshmem setup connections failed
+```
+Fix: `export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0`
+
+**Type B — IBGDA Transport Init Failure (Known Issue #16)**:
+```
+NULL value Unable to create ah.
+create DCT share err.
+connect EPS failed
+nvshmem initialization failed, exiting
+```
+Fix: Restart containers, wait 10s, retry with new port.
+
+**Type C — Bootstrap Message Truncation**:
+```
+Message truncated : received 112 bytes instead of 40
+allgather of ipc handles failed
+```
+Fix: Usually follows Type B. Fix Type B first (restart + retry).
+
+### Step 2: Ensure Correct Environment Variables
+
+ALL server launch commands must include:
+```bash
+export LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:$LD_LIBRARY_PATH   # Source-built NVSHMEM
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0                                # Management network
+export NCCL_SOCKET_IFNAME=bond0                                                # NCCL also management
+ulimit -l unlimited                                                            # Unlimited locked memory
+```
+
+### Step 3: Full Recovery After Container Restart
+
+When containers are restarted (`docker restart sglang_lb`), ALL package upgrades are preserved (installed to `/usr/local/lib/python3.12/dist-packages/` which persists across restarts), but:
+- DeepGEMM JIT cache at `/root/.cache/deep_gemm/cache/` may be lost
+- IB RoCE resources need time to stabilize
+
+Recovery steps:
+```bash
+# 1. Verify packages are still there
+docker exec sglang_lb python3 -c "import torch; print(torch.__version__); import sgl_kernel; import flashinfer; import deep_ep"
+
+# 2. Restore DeepGEMM cache (if lost)
+docker exec sglang_lb bash -c 'mkdir -p /root/.cache/deep_gemm/cache && cp -r /lustre/raplab/client/xutingz/workspace/bench/waterfill/deepgemm_cache/* /root/.cache/deep_gemm/cache/'
+
+# 3. Re-install sglang (editable install uses symlink, should survive restart)
+docker exec sglang_lb python3 -c "import sglang; print(sglang.__file__)"
+# If it doesn't point to Lustre path, re-install:
+docker exec sglang_lb pip install -e '/lustre/raplab/client/xutingz/workspace/gitsrc/sglang/python[dev]' --no-deps
+
+# 4. Wait 10s before launching server
+sleep 10
+```
+
+### Step 4: Zombie Process Handling
+
+`pkill -9 -f sglang` often leaves zombie detokenizer/scheduler processes that hold ports and `/dev/shm`. When `ps aux | grep python3 | wc -l` shows processes after pkill:
+
+```bash
+# Nuclear option: restart container
+docker restart sglang_lb
+# Then re-run Step 3 above
+```
+
+**Port increment rule**: After each failed launch attempt, increment the `--dist-init-addr` port by 2 (e.g., 20042→20044→20046). Stale TCP state on old ports causes failures even after process cleanup.
+
+### Step 5: The Complete Launch Sequence
+
+```bash
+# 1. Clean state
+docker exec sglang_lb bash -c 'pkill -9 -f sglang; pkill -9 -f python3; rm -f /dev/shm/*'
+ssh 10.6.131.5 "docker exec sglang_lb bash -c 'pkill -9 -f sglang; pkill -9 -f python3; rm -f /dev/shm/*'"
+
+# 2. Check for zombies (should be 0)
+docker exec sglang_lb bash -c 'ps aux | grep -E "sglang|python3" | grep -v grep | wc -l'
+# If > 0: docker restart sglang_lb on affected node, then re-install sglang
+
+# 3. Launch Node 0 first
+ssh 10.6.131.5 "docker exec -d sglang_lb bash -c '...PORT=20050...'"
+
+# 4. Launch Node 1 immediately after (within seconds)
+docker exec -d sglang_lb bash -c '...PORT=20050...'
+
+# 5. Wait ~3 min for model load + warmup
+sleep 180
+
+# 6. Check health
+docker exec sglang_lb bash -c 'curl -s -o /dev/null -w "%{http_code}" http://localhost:30000/health'
+# Should return 200
+
+# 7. If health check fails, check log for error type (Step 1) and act accordingly
+```
+
+---
+
+## Container Setup (Full Procedure)
+
+This section documents how to create and configure the containers from scratch. All steps must be done on BOTH nodes.
+
+### Step 1: Create Containers
+
+```bash
+# On EACH node (10.6.131.5 and 10.6.131.6):
+docker run -d --name sglang_lb --gpus all --privileged --network=host --ipc=host \
+  --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /lustre/raplab/client/xutingz/workspace:/lustre/raplab/client/xutingz/workspace \
+  lmsysorg/sglang:v0.5.5.post3 sleep infinity
+```
+
+**Critical flags**:
+- `--ulimit memlock=-1`: Required for NVSHMEM IBGDA RDMA pinned buffers
+- `--privileged`: Required for IB device access
+- `--network=host`: Required for inter-node communication
+- `--shm-size 32g`: NCCL with 16 GPUs needs ~32GB shared memory
+
+### Step 2: Upgrade PyTorch (2.8.0 → 2.9.1)
+
+```bash
+docker exec sglang_lb bash -c '
+  pip install torch==2.9.1+cu129 --index-url https://download.pytorch.org/whl/cu129
+'
+```
+
+### Step 3: Upgrade ABI-Incompatible Packages
+
+PyTorch 2.9.1 breaks ABI compatibility with packages compiled against 2.8.0. The following must be upgraded:
+
+```bash
+docker exec sglang_lb bash -c '
+  # sgl-kernel: undefined symbol errors without upgrade
+  pip install --upgrade sgl-kernel
+
+  # flashinfer: segfault on import without upgrade
+  pip install flashinfer-python==0.5.3 flashinfer-cubin==0.5.3
+
+  # torchvision: std::bad_alloc on import without upgrade
+  pip install torchvision==0.24.1+cu129 --index-url https://download.pytorch.org/whl/cu129
+'
+```
+
+### Step 4: Replace deep_ep with PyTorch 2.9.1-Compatible Version
+
+The v0.5.5.post3 image's `deep_ep_cpp.so` was compiled against PyTorch 2.8.0. Replace it:
+
+```bash
+docker exec sglang_lb bash -c '
+  # Replace the .so file
+  cp /lustre/raplab/client/xutingz/workspace/bench/waterfill/deep_ep_291/deep_ep_cpp.cpython-312-x86_64-linux-gnu.so \
+     /usr/local/lib/python3.12/dist-packages/
+
+  # Replace the Python package
+  rm -rf /usr/local/lib/python3.12/dist-packages/deep_ep
+  cp -r /lustre/raplab/client/xutingz/workspace/bench/waterfill/deep_ep_291/deep_ep \
+     /usr/local/lib/python3.12/dist-packages/
+'
+```
+
+### Step 5: Restore DeepGEMM JIT Cache
+
+DeepGEMM has ~385 JIT-compiled kernel directories. Without the cache, first server startup takes ~190s extra. The cache is lost on container restart.
+
+```bash
+docker exec sglang_lb bash -c '
+  mkdir -p /root/.cache/deep_gemm/cache
+  cp -r /lustre/raplab/client/xutingz/workspace/bench/waterfill/deepgemm_cache/* /root/.cache/deep_gemm/cache/
+'
+```
+
+### Step 6: Verify Environment
+
+```bash
+docker exec sglang_lb bash -c '
+  python3 -c "
+import torch; print(f\"PyTorch: {torch.__version__}\")
+import sgl_kernel; print(f\"sgl-kernel OK\")
+import flashinfer; print(f\"flashinfer OK\")
+import torchvision; print(f\"torchvision OK\")
+import deep_ep; print(f\"deep_ep OK\")
+"
+  # Verify NVSHMEM source build exists
+  ls -la /sgl-workspace/nvshmem/install/lib/libnvshmem.so
+'
+```
+
+Expected output:
+```
+PyTorch: 2.9.1+cu129
+sgl-kernel OK
+flashinfer OK
+torchvision OK
+deep_ep OK
+```
+
+### Post-Container-Restart Recovery
+
+If the container is restarted (`docker restart sglang_lb`), Steps 2-5 are lost. Re-run them. A one-liner:
+
+```bash
+docker exec sglang_lb bash -c '
+  pip install torch==2.9.1+cu129 --index-url https://download.pytorch.org/whl/cu129 &&
+  pip install --upgrade sgl-kernel &&
+  pip install flashinfer-python==0.5.3 flashinfer-cubin==0.5.3 &&
+  pip install torchvision==0.24.1+cu129 --index-url https://download.pytorch.org/whl/cu129 &&
+  cp /lustre/raplab/client/xutingz/workspace/bench/waterfill/deep_ep_291/deep_ep_cpp.cpython-312-x86_64-linux-gnu.so /usr/local/lib/python3.12/dist-packages/ &&
+  rm -rf /usr/local/lib/python3.12/dist-packages/deep_ep &&
+  cp -r /lustre/raplab/client/xutingz/workspace/bench/waterfill/deep_ep_291/deep_ep /usr/local/lib/python3.12/dist-packages/ &&
+  mkdir -p /root/.cache/deep_gemm/cache &&
+  cp -r /lustre/raplab/client/xutingz/workspace/bench/waterfill/deepgemm_cache/* /root/.cache/deep_gemm/cache/
+'
+```
+
+---
+
+## Server Launch Commands (Canonical)
+
+All launch commands MUST include the NVSHMEM env vars. Run from the **host machine** (not inside container).
+
+### Required Environment Variables
+
+```bash
+# These MUST be set in ALL launch commands:
+export LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:$LD_LIBRARY_PATH   # Use source-built NVSHMEM
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0                                # Bootstrap over management network
+export NCCL_SOCKET_IFNAME=bond0                                                # NCCL also over management network
+```
+
+### Waterfill Server Launch
+
+```bash
+# Node 0 (10.6.131.5):
+ssh 10.6.131.5 "docker exec -d sglang_lb bash -c 'export LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:\$LD_LIBRARY_PATH && export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0 && export NCCL_SOCKET_IFNAME=bond0 && ulimit -l unlimited && python3 -m sglang.launch_server --model-path /lustre/raplab/client/xutingz/workspace/model/DeepSeek-V3 --tp 16 --dp-size 16 --nnodes 2 --node-rank 0 --dist-init-addr 10.6.131.5:<PORT> --host 0.0.0.0 --port 30000 --trust-remote-code --moe-a2a-backend deepep --deepep-mode normal --enable-dp-attention --mem-fraction-static 0.75 --max-running-requests 2048 --watchdog-timeout 1800 --disable-radix-cache --disable-cuda-graph --chunked-prefill-size -1 --max-prefill-tokens 8192 --enable-deepep-waterfill --init-expert-location /lustre/raplab/client/xutingz/workspace/bench/waterfill/mmlu_expert_dist/ep16_mmlu_logical_count.pt >/lustre/raplab/client/xutingz/workspace/bench/waterfill/waterfill_node0.log 2>&1'"
+
+# Node 1 (10.6.131.6):
+docker exec -d sglang_lb bash -c 'export LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:$LD_LIBRARY_PATH && export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0 && export NCCL_SOCKET_IFNAME=bond0 && ulimit -l unlimited && python3 -m sglang.launch_server --model-path /lustre/raplab/client/xutingz/workspace/model/DeepSeek-V3 --tp 16 --dp-size 16 --nnodes 2 --node-rank 1 --dist-init-addr 10.6.131.5:<PORT> --host 0.0.0.0 --port 30000 --trust-remote-code --moe-a2a-backend deepep --deepep-mode normal --enable-dp-attention --mem-fraction-static 0.75 --max-running-requests 2048 --watchdog-timeout 1800 --disable-radix-cache --disable-cuda-graph --chunked-prefill-size -1 --max-prefill-tokens 8192 --enable-deepep-waterfill --init-expert-location /lustre/raplab/client/xutingz/workspace/bench/waterfill/mmlu_expert_dist/ep16_mmlu_logical_count.pt >/lustre/raplab/client/xutingz/workspace/bench/waterfill/waterfill_node1.log 2>&1'
+```
+
+> **Note**: Replace `<PORT>` with a unique port for each launch attempt (e.g., 20020, 20022, 20024...). Reusing ports from a previous crashed run can cause failures.
+
+### Baseline Server Launch (MUST ALSO USE --init-expert-location)
+
+**CRITICAL**: The baseline MUST also use `--init-expert-location` for a fair comparison! The only difference between baseline and waterfill should be `--enable-deepep-waterfill`. Without `--init-expert-location`, baseline uses trivial (round-robin) expert dispatch which is ~1000 tok/s slower than EPLB dispatch, artificially inflating the waterfill gain from ~4% to ~10%.
+
+Same as waterfill but **without** `--enable-deepep-waterfill`. Keep `--init-expert-location`.
+
+### Benchmark Command
+
+```bash
+docker exec sglang_lb bash -c 'export LD_LIBRARY_PATH=/sgl-workspace/nvshmem/install/lib:$LD_LIBRARY_PATH && CUDA_VISIBLE_DEVICES=99 python3 /lustre/raplab/client/xutingz/workspace/bench/waterfill/tput_bench.py {waterfill|baseline} 4 8'
+```
+
+### Kill + Clean Procedure
+
+```bash
+# On both nodes:
+docker exec sglang_lb bash -c 'pkill -9 -f sglang; pkill -9 -f python3; rm -f /dev/shm/*'
+# Or from host for Node 0:
+ssh 10.6.131.5 "docker exec sglang_lb bash -c 'pkill -9 -f sglang; pkill -9 -f python3; rm -f /dev/shm/*'"
+```
+
+> **Tip**: If zombie processes persist after kill, `docker restart sglang_lb` and then re-run the container recovery procedure.
 
 ---
 
@@ -724,6 +1076,73 @@ All runs with `--disable-cuda-graph`, `output_len=1`, `deepep_mode=normal`, `SGL
 - EPLB baseline: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/ep16_v2_manual/ep16/eplb/results/`
 - EPLB+V2: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/ep16_v2_manual/ep16/eplb_waterfill_v2/results/`
 - V2 server logs: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/ep16_v2_manual/ep16/eplb_waterfill_v2/logs/`
+
+---
+
+## MMLU Throughput Benchmark Results
+
+Benchmark using `tput_bench.py` with 14042 MMLU prompts, `max_tokens=1`, 4 warmup rounds + 8 measurement rounds. Full warmup (no `--skip-server-warmup`). Container: v0.5.5.post3 with upgraded packages. `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=bond0` set.
+
+### Corrected Results (2026-02-18) — Fair A/B Comparison
+
+**CRITICAL LESSON**: Both waterfill AND baseline must use `--init-expert-location` (EPLB). Without it, baseline uses trivial expert dispatch (~28.3k tok/s), which is ~1k tok/s slower than EPLB dispatch (~29.7k), artificially inflating waterfill gain from ~4% to ~10%.
+
+| Config | Trimmed Mean | All Rounds | Min | Max |
+|--------|-------------|------------|-----|-----|
+| **Waterfill Static** (EPLB + waterfill) | **30,979** | 30730, 31494, 31423, 30817, 30731, 31265, 30907, 30395 | 30395 | 31494 |
+| **Baseline EPLB** (EPLB only, no waterfill) | **29,745** | 28828, 29977, 29873, 29528, 30288, 30543, 29093, 29714 | 28828 | 30543 |
+| **Static Gain** | **+4.1%** ✅ | Matches Feb 12 historical ~3-4% | | |
+| | | | | |
+| **Waterfill Dynamic** (waterfill, no EPLB) | **29,241** | 29165, 28009, 29665, 29031, 29501, 29233, 29731, 28848 | 28009 | 29731 |
+| **Baseline Trivial** (no EPLB, no waterfill) | **28,530** | 28482, 28667, 28335, 28617, 28212, 27850, 28866, 29176 | 27850 | 29176 |
+| **Dynamic Gain** | **+2.5%** | | | |
+
+### A/B Benchmark Methodology (MUST FOLLOW)
+
+1. **Waterfill** uses waterfill worktree + `--enable-deepep-waterfill --init-expert-location .../ep16_mmlu_logical_count.pt`
+2. **Baseline** uses baseline worktree (98a107d) + `--init-expert-location .../ep16_mmlu_logical_count.pt` (same EPLB file, NO waterfill flag)
+3. The ONLY difference should be `--enable-deepep-waterfill` — baseline MUST also use `--init-expert-location`
+4. Between switching waterfill→baseline: kill all, `docker restart` if zombies, reinstall sglang with `pip install -e ... --no-deps`
+5. Use different `--dist-init-addr` port for each launch attempt
+
+### How the Incorrect +9.6% Gain Was Produced (BUG RECORD)
+
+On 2026-02-18, the first round of A/B testing showed waterfill at +9.6% gain (30,979 vs 28,263 tok/s). This was because the **baseline was launched WITHOUT `--init-expert-location`**, so it used trivial (round-robin) expert dispatch instead of EPLB. Trivial dispatch is ~1000 tok/s slower than EPLB dispatch because experts are not optimally placed.
+
+The Feb 12 historical tests correctly used `--init-expert-location` for BOTH waterfill and baseline (verified from server logs at `ep16_mmlu_ab_3rounds_20260213/baseline_r1/node1.log`). After correcting the baseline to also use EPLB, the gain returned to the expected +4.1%.
+
+**Rule**: When comparing waterfill vs baseline, ALWAYS verify both server logs show `init_expert_location from init_by_eplb` in the startup output.
+
+### Comparison with Historical Results
+
+| Date | Waterfill | Baseline (EPLB) | Gain | Notes |
+|------|-----------|-----------------|------|-------|
+| 2026-02-12 R1 | 30,469 | 29,326 | +3.9% | `sglang_lb_with_deepep` image, both use EPLB |
+| 2026-02-12 R2 | 30,134 | 29,535 | +2.0% | Same |
+| 2026-02-12 R3 | 30,501 | 29,502 | +3.4% | Same |
+| **2026-02-18** | **30,979** | **29,745** | **+4.1%** | v0.5.5.post3 + upgraded packages, both use EPLB |
+
+Waterfill throughput is consistent across dates (~30.1-31.0k). Baseline with EPLB is also consistent (~29.3-29.7k). The gain is consistently +3-4%.
+
+### Key Parameters
+
+```
+# BOTH waterfill AND baseline MUST use:
+--tp 16 --dp-size 16 --nnodes 2 --chunked-prefill-size -1 --max-prefill-tokens 8192
+--disable-radix-cache --disable-cuda-graph --mem-fraction-static 0.75
+--max-running-requests 2048 --moe-a2a-backend deepep --deepep-mode normal
+--enable-dp-attention
+--init-expert-location /lustre/.../ep16_mmlu_logical_count.pt   # BOTH must use this!
+
+# ONLY waterfill adds:
+--enable-deepep-waterfill
+```
+
+### Result Files
+
+- Feb 12 log: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/ep16_mmlu_ab_3rounds_20260213/full_log.txt`
+- Feb 18 server logs: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/waterfill_static_node{0,1}.log`, `baseline_eplb_node{0,1}.log`
+- Feb 18 dynamic logs: `/lustre/raplab/client/xutingz/workspace/bench/waterfill/waterfill_dynamic4_node{0,1}.log`, `baseline_dynamic2_node{0,1}.log`
 
 ---
 
