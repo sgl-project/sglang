@@ -536,38 +536,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     ),
 ]
 
-# Flux2 multi-image edit with cache-dit, regression test
-if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
-        DiffusionTestCase(
-            "flux_2_ti2i_multi_image_cache_dit",
-            DiffusionServerArgs(
-                model_path="black-forest-labs/FLUX.2-dev",
-                modality="image",
-                enable_cache_dit=True,
-                warmup=0,
-            ),
-            MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
-        )
-    )
-
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
-        DiffusionTestCase(
-            "turbo_wan2_1_t2v_1.3b",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-                modality="video",
-                warmup=0,
-                custom_validator="video",
-            ),
-            DiffusionSamplingParams(
-                prompt=T2V_PROMPT,
-            ),
-        )
-    )
-
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
@@ -636,23 +604,6 @@ TWO_GPU_CASES_A = [
         ),
     ),
 ]
-
-# Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-if not current_platform.is_hip():
-    TWO_GPU_CASES_A.append(
-        DiffusionTestCase(
-            "turbo_wan2_2_i2v_a14b_2gpu",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
-                modality="video",
-                warmup=0,
-                custom_validator="video",
-                num_gpus=2,
-                tp_size=2,
-            ),
-            TURBOWAN_I2V_sampling_params,
-        )
-    )
 
 TWO_GPU_CASES_B = [
     DiffusionTestCase(
@@ -732,6 +683,51 @@ TWO_GPU_CASES_B = [
         T2I_sampling_params,
     ),
 ]
+
+if not current_platform.is_hip():
+    # Flux2 multi-image edit with cache-dit, regression test
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "flux_2_ti2i_multi_image_cache_dit",
+            DiffusionServerArgs(
+                model_path="black-forest-labs/FLUX.2-dev",
+                modality="image",
+                enable_cache_dit=True,
+                warmup=0,
+            ),
+            MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+        )
+    )
+    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+    ONE_GPU_CASES_B.append(
+        DiffusionTestCase(
+            "turbo_wan2_1_t2v_1.3b",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+            ),
+            DiffusionSamplingParams(
+                prompt=T2V_PROMPT,
+            ),
+        )
+    )
+    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
+    TWO_GPU_CASES_A.append(
+        DiffusionTestCase(
+            "turbo_wan2_2_i2v_a14b_2gpu",
+            DiffusionServerArgs(
+                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+                modality="video",
+                warmup=0,
+                custom_validator="video",
+                num_gpus=2,
+                tp_size=2,
+            ),
+            TURBOWAN_I2V_sampling_params,
+        )
+    )
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
