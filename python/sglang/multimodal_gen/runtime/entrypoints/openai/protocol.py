@@ -48,6 +48,7 @@ class ImageGenerationsRequest(BaseModel):
     enable_teacache: Optional[bool] = False
     rollout: Optional[bool] = False
     rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
@@ -97,6 +98,7 @@ class VideoGenerationsRequest(BaseModel):
     output_path: Optional[str] = None
     rollout: Optional[bool] = False
     rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 

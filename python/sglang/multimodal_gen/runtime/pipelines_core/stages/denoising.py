@@ -1027,6 +1027,9 @@ class DenoisingStage(PipelineStage):
                 rollout_sde_type,
             )
             rollout_sde_type = "sde"
+
+        rollout_noise_level = getattr(batch, "rollout_noise_level", 0.7)
+
         if rollout_enabled and not hasattr(self.scheduler, "sde_step_with_logprob"):
             raise RuntimeError(
                 f"Rollout is enabled, but scheduler '{type(self.scheduler).__name__}' "
@@ -1127,6 +1130,7 @@ class DenoisingStage(PipelineStage):
                                     sample=latents,
                                     generator=batch.generator,
                                     sde_type=rollout_sde_type,
+                                    noise_level=rollout_noise_level
                                 )
                             )
                             trajectory_log_probs.append(step_log_prob)

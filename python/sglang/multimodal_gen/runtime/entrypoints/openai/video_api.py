@@ -71,6 +71,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         enable_teacache=request.enable_teacache,
         rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
+        rollout_noise_level=request.rollout_noise_level,
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
@@ -163,6 +164,7 @@ async def create_video(
     enable_teacache: Optional[bool] = Form(False),
     rollout: Optional[bool] = Form(False),
     rollout_sde_type: Optional[str] = Form("sde"),
+    rollout_noise_level: Optional[float] = Form(0.7),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -218,6 +220,7 @@ async def create_video(
             enable_teacache=enable_teacache,
             rollout=rollout,
             rollout_sde_type=rollout_sde_type,
+            rollout_noise_level=rollout_noise_level,
             output_compression=output_compression,
             output_quality=output_quality,
             **(

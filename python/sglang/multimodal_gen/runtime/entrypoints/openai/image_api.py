@@ -119,6 +119,7 @@ async def generations(
         enable_teacache=request.enable_teacache,
         rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
+        rollout_noise_level=request.rollout_noise_level,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
     )
