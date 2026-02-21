@@ -126,9 +126,8 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path)
+        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
         self.model_path = model_path
-        # server_args.downloaded_model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
         return cast(dict[str, Any], config)
