@@ -179,7 +179,7 @@ class DinoImageEncoderMV(DinoImageEncoder):
         )
         return last_hidden_state
 
-    def unconditional_embedding(self, batch_size, view_idxs=None, **kwargs):
+    def unconditional_embedding(self, batch_size, view_idxs, **kwargs):
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         zero = torch.zeros(
