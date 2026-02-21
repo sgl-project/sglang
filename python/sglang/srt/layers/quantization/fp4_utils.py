@@ -17,6 +17,7 @@ class Fp4GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
 
@@ -32,6 +33,9 @@ class Fp4GemmRunnerBackend(Enum):
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
 
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL
+
     def get_flashinfer_backend(self) -> str:
         """Get the backend string to pass to FlashInfer's mm_fp4 API.
 
@@ -40,7 +44,10 @@ class Fp4GemmRunnerBackend(Enum):
             'flashinfer_trtllm' -> 'trtllm'
             'flashinfer_cutlass' -> 'cutlass'
             'flashinfer_cudnn' -> 'cudnn'
+            'flashinfer_cutedsl' -> 'cute-dsl'
         """
+        if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
+            return "cute-dsl"
         if self.value.startswith("flashinfer_"):
             return self.value.removeprefix("flashinfer_")
         else:
