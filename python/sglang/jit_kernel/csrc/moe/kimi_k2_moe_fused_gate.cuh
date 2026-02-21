@@ -25,7 +25,7 @@ static constexpr int K2_WARPS_PER_TOKEN_SMALL = 12;
 static constexpr int K2_THREADS_PER_BLOCK_SMALL = K2_WARPS_PER_TOKEN_SMALL * K2_WARP_SIZE;  // 384
 
 // Vectorised-load constants (large-token kernel)
-static constexpr int K2_VEC_SIZE = 4;  // float4
+static constexpr int K2_VEC_SIZE = 4;                         // float4
 static constexpr int K2_VEC_PER_LANE = K2_VPT / K2_VEC_SIZE;  // 3
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,8 @@ __global__ void kimi_k2_moe_fused_gate_kernel_small_token(
 
     if (renormalize) {
       float sum = 0.0f;
-      for (int k = 0; k < topk; k++) sum += output_ptr[row_idx * topk + k];
+      for (int k = 0; k < topk; k++)
+        sum += output_ptr[row_idx * topk + k];
       if (sum > 0.0f) {
         for (int k = 0; k < topk; k++) {
           int64_t idx = row_idx * topk + k;
@@ -175,8 +176,7 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
   float* warp_original_scores = shared_original_scores + warp_id * K2_NUM_EXPERTS;
 
   // Vectorised load: each lane loads K2_VEC_PER_LANE float4 chunks.
-  const float4* input_vec =
-      reinterpret_cast<const float4*>(input + row_idx * K2_NUM_EXPERTS);
+  const float4* input_vec = reinterpret_cast<const float4*>(input + row_idx * K2_NUM_EXPERTS);
   const float4* bias_vec = reinterpret_cast<const float4*>(bias);
 
 #pragma unroll
@@ -236,7 +236,8 @@ __global__ void kimi_k2_moe_fused_gate_kernel(
 
   if (renormalize && lane_id == 0) {
     float sum = 0.0f;
-    for (int k = 0; k < topk; k++) sum += output_ptr[row_idx * topk + k];
+    for (int k = 0; k < topk; k++)
+      sum += output_ptr[row_idx * topk + k];
     if (sum > 0.0f) {
       for (int k = 0; k < topk; k++) {
         int64_t idx = row_idx * topk + k;
@@ -288,12 +289,8 @@ void kimi_k2_moe_fused_gate(
   RuntimeCheck(topk > 0 && topk <= K2_NUM_EXPERTS, "topk out of range");
 
   // Dtype checks (float32 only)
-  RuntimeCheck(
-      input.dtype().code == DLDataTypeCode::kDLFloat && input.dtype().bits == 32,
-      "input must be float32");
-  RuntimeCheck(
-      bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32,
-      "bias must be float32");
+  RuntimeCheck(input.dtype().code == DLDataTypeCode::kDLFloat && input.dtype().bits == 32, "input must be float32");
+  RuntimeCheck(bias.dtype().code == DLDataTypeCode::kDLFloat && bias.dtype().bits == 32, "bias must be float32");
 
   const float* inp_ptr = static_cast<const float*>(input.data_ptr());
   const float* bias_ptr = static_cast<const float*>(bias.data_ptr());
@@ -305,9 +302,7 @@ void kimi_k2_moe_fused_gate(
   if (num_rows <= K2_SMALL_TOKEN_THRESHOLD) {
     // Small-token kernel: one CTA per row, 384 threads per CTA.
     LaunchKernel(
-        {static_cast<uint32_t>(num_rows), 1u, 1u},
-        {static_cast<uint32_t>(K2_THREADS_PER_BLOCK_SMALL), 1u, 1u},
-        stream)(
+        {static_cast<uint32_t>(num_rows), 1u, 1u}, {static_cast<uint32_t>(K2_THREADS_PER_BLOCK_SMALL), 1u, 1u}, stream)(
         kimi_k2_moe_fused_gate_kernel_small_token,
         inp_ptr,
         bias_ptr,

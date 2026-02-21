@@ -133,7 +133,9 @@ def test_kimi_k2_moe_fused_gate_vs_ref(
     )
 
     # Verify that selected indices are valid expert IDs
-    assert torch.all((jit_ids >= 0) & (jit_ids < NUM_EXPERTS)), "Expert indices out of range"
+    assert torch.all(
+        (jit_ids >= 0) & (jit_ids < NUM_EXPERTS)
+    ), "Expert indices out of range"
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +269,9 @@ def test_invalid_dtype():
 @pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel not available")
 @pytest.mark.parametrize("seq_length", [1, 64, 512, 1024, 4096])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
-def test_kimi_k2_moe_fused_gate_vs_aot(seq_length, apply_routed_scaling_factor_on_output):
+def test_kimi_k2_moe_fused_gate_vs_aot(
+    seq_length, apply_routed_scaling_factor_on_output
+):
     topk = 6
     routed_scaling_factor = 2.872
     torch.manual_seed(seq_length)
