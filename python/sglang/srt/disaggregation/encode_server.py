@@ -18,7 +18,7 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import AutoImageProcessor
+from transformers import AutoProcessor
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileRe
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -117,15 +118,19 @@ def _convert(data):
         return data
 
 
-_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+_vision_grid_attrs = {
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    Modality.VIDEO: ["video_grid_thw"],
+    Modality.AUDIO: ["audio_feature_lens_raw"],
+}
 
 
-def _get_image_grid_dim(images_input):
-    for attr in _image_grid_attrs:
-        if attr in images_input:
-            return images_input[attr]
+def _get_vision_grid_dim(mm_inputs, modality):
+    for attr in _vision_grid_attrs[modality]:
+        if attr in mm_inputs:
+            return mm_inputs[attr]
     raise ValueError(
-        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+        f"Vision grid dim ({_vision_grid_attrs[modality]}) not found in {mm_inputs}"
     )
 
 
@@ -142,16 +147,27 @@ class MMEncoder:
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
-
-        self.image_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            use_fast=True,
-        )
+        self._load_mm_processor(server_args)
 
         self.model_config = ModelConfig.from_server_args(
             server_args,
         )
+        vision_config = (
+            server_args.mm_process_config.get("vision_config", {})
+            if server_args.mm_process_config is not None
+            else {}
+        )
+        if not vision_config:
+            # keep default values as qwen_vl.py
+            self.video_config = {
+                "fps": 2.0,
+                "max_frames": 768,
+                "min_frames": 4,
+            }
+        else:
+            self.video_config = vision_config
+        # default support cuda
+        self.video_config["device"] = "cuda"
 
         self.load_config = LoadConfig(
             load_format=server_args.load_format,
@@ -161,6 +177,9 @@ class MMEncoder:
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
+        self.model_type = getattr(
+            self.model_config.hf_config, "model_type", "unknown"
+        ).lower()
 
         self.device = server_args.device
         self.gpu_id = server_args.base_gpu_id + rank
@@ -172,7 +191,10 @@ class MMEncoder:
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
-        self.use_image_processor_gpu = use_image_processor_gpu
+        self.use_image_processor_gpu = (
+            use_image_processor_gpu and not server_args.disable_fast_image_processor
+        )
+        self._build_vision_config(server_args.mm_process_config)
 
         init_distributed_environment(
             world_size=server_args.tp_size,
@@ -221,6 +243,87 @@ class MMEncoder:
 
         logger.info(f"rank {rank} init finish ")
 
+    def _build_vision_config(self, mm_process_config):
+        """
+        Validate vision config, used for image/video/audio.
+        If not provided, keep default values.
+        """
+        self.vision_config = (
+            mm_process_config.get("vision_config", {})
+            if mm_process_config is not None
+            else {}
+        )
+        for modality_str in ["image", "video", "audio"]:
+            if not self.vision_config.get(modality_str, None):
+                self.vision_config[modality_str] = {}
+            if self.use_image_processor_gpu:
+                self.vision_config[modality_str]["device"] = self.device
+
+            if modality_str == "audio":
+                if "return_attention_mask" not in self.vision_config["audio"]:
+                    self.vision_config["audio"]["return_attention_mask"] = True
+                if "padding" not in self.vision_config["audio"]:
+                    if self.model_type == "qwen2_audio":
+                        # For Qwen2Audio, use padding="max_length"
+                        # (same as https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_audio/processing_qwen2_audio.py#L93)
+                        self.vision_config["audio"]["padding"] = "max_length"
+                    else:
+                        self.vision_config["audio"]["padding"] = True
+                if "truncation" not in self.vision_config["audio"]:
+                    # keep same logic as base_processor.py
+                    if (
+                        hasattr(self, "audio_processor")
+                        and self.audio_processor is not None
+                    ):
+                        if self.audio_processor.__class__.__name__ in {
+                            "Gemma3nProcessor",
+                            "GlmAsrProcessor",
+                            "Qwen2AudioProcessor",
+                            "Qwen3OmniMoeProcessor",
+                        }:
+                            self.vision_config["audio"]["truncation"] = False
+
+    def _load_mm_processor(self, server_args: ServerArgs):
+        """
+        Load image/video/audio processor separately,
+        avoid issues with AutoProcessor not recognizing certain models
+        """
+        from transformers import AutoImageProcessor, AutoVideoProcessor
+
+        try:
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load image processor: {e}")
+            self.image_processor = None
+
+        try:
+            self.video_processor = AutoVideoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load video processor: {e}")
+            self.video_processor = None
+
+        try:
+            # Note: AutoProcessor is used for audio processor
+            self.audio_processor = AutoProcessor.from_pretrained(
+                server_args.tokenizer_path or server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load audio processor: {e}")
+            self.audio_processor = None
+
     def _load_single_item(
         self,
         data,
@@ -265,16 +368,67 @@ class MMEncoder:
                 task_info.append((modality, data))
         return futures, task_info
 
-    async def _flatten_and_load_images(self, mm_items):
+    def _get_feat_extract_output_lengths(self, feature_lens):
         """
-        Flatten mm_items structure, load images concurrently, and restore original structure.
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        # qwen2_audio/qwen2.5_omni
+        if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+        # qwen3_omni_moe
+        elif self.model_type == "qwen3_omni_moe":
+            input_lengths_leave = feature_lens % 100
+            feat_lengths = (input_lengths_leave - 1) // 2 + 1
+            output_lengths = (
+                ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
+            )
+            return output_lengths
+        else:
+            # fallback to original HF audio sample logic for other models
+            logger.warning(
+                f"Fallback to original HF audio sample logic for {self.model_type}"
+            )
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+
+    async def _flatten_and_load_videos(self, mm_items):
+        if not isinstance(mm_items, (list, tuple)):
+            mm_items = [mm_items]
+
+        futures, _ = self.submit_data_loading_tasks(
+            mm_items, [Modality.VIDEO] * len(mm_items)
+        )
+        async_futures = [asyncio.wrap_future(f) for f in futures]
+        video_items = await asyncio.gather(*async_futures)
+
+        video_processor_kwargs = {}
+        if "qwen" in self.model_type:
+            # for qwen-series model, do sample frames before preprocess
+            video_processed = [
+                await preprocess_video(video, video_config=self.video_config)
+                for video in video_items
+            ]
+            videos, video_metadata = map(list, zip(*video_processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+        else:
+            raise NotImplementedError(
+                f"Video processing is not supported for {self.model_type} model."
+            )
+
+    async def _flatten_and_load_data_by_modality(self, mm_items, modality):
+        """
+        Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
 
         Returns:
-            Same structure as load_images would return
+            Same structure as load_mm_items would return, support for image/audio
         """
-        # Handle single image (not a list)
+        # Handle single mm_item (not a list)
         if not isinstance(mm_items, (list, tuple)):
-            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.IMAGE])
+            futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
             return await asyncio.wrap_future(futures[0])
 
         # Handle nested list (list of lists)
@@ -282,14 +436,14 @@ class MMEncoder:
             # Flatten nested structure
             flat_data = []
             flat_indices = []  # Track which group each item belongs to
-            for group_idx, image_group in enumerate(mm_items):
-                for item in image_group:
+            for group_idx, item_group in enumerate(mm_items):
+                for item in item_group:
                     flat_data.append(item)
                     flat_indices.append(group_idx)
 
             # Submit all tasks concurrently
             futures, _ = self.submit_data_loading_tasks(
-                flat_data, [Modality.IMAGE] * len(flat_data)
+                flat_data, [modality] * len(flat_data)
             )
 
             # Wait for all tasks to complete asynchronously
@@ -306,33 +460,155 @@ class MMEncoder:
         # Handle simple list
         else:
             futures, _ = self.submit_data_loading_tasks(
-                mm_items, [Modality.IMAGE] * len(mm_items)
+                mm_items, [modality] * len(mm_items)
             )
             # Wait for all tasks to complete asynchronously
             async_futures = [asyncio.wrap_future(f) for f in futures]
             return await asyncio.gather(*async_futures)
 
-    async def _encode(self, mm_items) -> torch.Tensor:
-        try:
-            images = await self._flatten_and_load_images(mm_items)
-        except Exception as e:
-            raise BadRequestError(f"Failed to load images from input: {str(e)}")
+    async def _flatten_and_load_audios(self, mm_items):
+        """
+        Flatten mm_items structure, load audios concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
 
-        try:
-            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-            images_input = self.image_processor(images=images, **kwargs)
-            feature = images_input["pixel_values"]
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": Modality.IMAGE,
-                    "feature": _convert(feature),
-                }
+    async def _flatten_and_load_images(self, mm_items):
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+        """
+        return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+
+    def _calculate_timestamps(self, indices, video_fps: float, merge_size: int = 2):
+        """Calculate timestamps for video frames, used for qwen3_vl models."""
+        # refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py#L255
+        if not isinstance(indices, list):
+            indices = indices.tolist()
+        if len(indices) % merge_size != 0:
+            indices.extend(
+                indices[-1] for _ in range(merge_size - len(indices) % merge_size)
             )
-            for k, v in images_input.items():
-                if k == "pixel_values":
-                    continue
-                mm_item.set(k, _convert(v))
+        timestamps = [idx / video_fps for idx in indices]
+        # Frames are merged by merge_size, so we need to average the timestamps
+        # between the first/last frame within the temporal patch
+        timestamps = [
+            (timestamps[i] + timestamps[i + merge_size - 1]) / 2
+            for i in range(0, len(timestamps), merge_size)
+        ]
+        return timestamps
 
+    async def _process_mm_items(self, mm_items, modality):
+        if modality == Modality.IMAGE and self.image_processor:
+            images = await self._flatten_and_load_images(mm_items)
+            image_config = self.vision_config.get("image", {})
+            processor_input = self.image_processor(images=images, **image_config)
+            feature = processor_input["pixel_values"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_image_feature
+            else:
+                get_feature_method = self.model.get_image_feature
+        elif modality == Modality.VIDEO and self.video_processor:
+            videos, video_processor_kwargs = await self._flatten_and_load_videos(
+                mm_items
+            )
+            processor_input = self.video_processor(
+                videos=videos, **video_processor_kwargs
+            )
+            # Get additional video metadata
+            if (
+                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                and video_processor_kwargs.get("video_metadata", None) is not None
+            ):
+                # For qwen3-vl models, we need to store the video timestamps
+                video_metadata = video_processor_kwargs["video_metadata"]
+                try:
+                    merge_size = (
+                        self.model_config.hf_config.vision_config.spatial_merge_size
+                    )
+                except (AttributeError, KeyError):
+                    merge_size = 2  # Default merge_size
+
+                video_timestamps = []
+                for metadata in video_metadata:
+                    video_fps = metadata.get("fps", None) or 24  # original video fps
+                    frames_indices = metadata.get("frames_indices", None)
+                    timestamps = self._calculate_timestamps(
+                        frames_indices, video_fps, merge_size
+                    )
+                    video_timestamps.append(timestamps)
+                processor_input["video_timestamps"] = video_timestamps
+            elif (
+                self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
+                and processor_input.get("video_grid_thw", None) is not None
+            ):
+                # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
+                video_grid_thw = processor_input["video_grid_thw"]
+                try:
+                    temporal_patch_size = self.video_processor.temporal_patch_size
+                except AttributeError:
+                    temporal_patch_size = 2  # Default temporal_patch_size
+                # get sampled fps, default: 2
+                fps_list = [
+                    self.vision_config.get("video", {}).get("fps", None) or 2
+                ] * len(video_grid_thw)
+                second_per_grid_ts = [(temporal_patch_size / fps) for fps in fps_list]
+                second_per_grid_ts_tensor = torch.tensor(
+                    second_per_grid_ts, dtype=torch.float32
+                )
+                processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
+
+            feature = processor_input["pixel_values_videos"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_video_feature
+            else:
+                get_feature_method = self.model.get_video_feature
+        elif modality == Modality.AUDIO and self.audio_processor:
+            audios = await self._flatten_and_load_audios(mm_items)
+            audio_config = self.vision_config.get("audio", {})
+            processor_input = self.audio_processor.feature_extractor(
+                audios, **audio_config
+            )
+            processor_input["feature_attention_mask"] = processor_input.pop(
+                "attention_mask"
+            )
+            # convert to same format as image/video
+            input_lengths = torch.tensor(
+                processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
+            )
+            processor_input["audio_feature_lens_raw"] = input_lengths
+            output_lengths = self._get_feat_extract_output_lengths(input_lengths)
+            processor_input["audio_feature_lens"] = output_lengths
+            feature = processor_input["input_features"]
+            if hasattr(self.model, "thinker"):  # for omni models
+                get_feature_method = self.model.thinker.get_audio_feature
+            else:
+                get_feature_method = self.model.get_audio_feature
+        else:
+            raise ValueError(
+                f"Currently only support image, video and audio modalities, {modality} modality has no processor available."
+            )
+
+        mm_item = MultimodalDataItem.from_dict(
+            {
+                "modality": modality,
+                "feature": _convert(feature),
+            }
+        )
+        for k, v in processor_input.items():
+            if k in ["pixel_values", "pixel_values_videos", "input_features"]:
+                continue
+            mm_item.set(k, _convert(v))
+        return processor_input, mm_item, get_feature_method
+
+    async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+        try:
+            mm_inputs, mm_item, get_feature_fn = await self._process_mm_items(
+                mm_items, modality
+            )
+        except NotImplementedError as e:
+            raise InternalError(f"Not implemented error: {str(e)}")
+        except Exception as e:
+            raise BadRequestError(f"Failed to process mm items: {str(e)}")
+        try:
             # support mm_cache
             mm_embedding = None
             mm_hash = None
@@ -347,7 +623,7 @@ class MMEncoder:
 
             if mm_embedding is None:
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
@@ -358,7 +634,12 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            return _get_image_grid_dim(images_input), mm_embedding
+            aux_data = {
+                "video_timestamps": mm_inputs.get("video_timestamps", None),
+                "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
+            }
+
+            return _get_vision_grid_dim(mm_inputs, modality), mm_embedding, aux_data
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
@@ -382,7 +663,6 @@ class MMEncoder:
             self.engine.deregister(embedding.data_ptr())
 
             mm_data.embedding = None
-            mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
         endpoint = (
@@ -421,13 +701,19 @@ class MMEncoder:
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
-    async def encode(self, mm_items, req_id, num_parts, part_idx):
+    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         try:
-            image_grid_dim, mm_embedding = await self._encode(mm_items)
+            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
-                    req_id, num_parts, part_idx, image_grid_dim, mm_embedding
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_dim,
+                    modality,
+                    mm_embedding,
+                    **aux_data,
                 )
                 self.embedding_to_send[req_id] = mm_data
             return (
@@ -447,6 +733,7 @@ class MMEncoder:
                     num_parts,
                     part_idx,
                     None,
+                    modality,
                     error_msg=error_msg,
                     error_code=error_code,
                 )
@@ -646,6 +933,7 @@ async def run_encoder(
         else:
             await encoder.encode(
                 mm_items=request["mm_items"],
+                modality=Modality.from_str(request["modality"]),
                 req_id=request["req_id"],
                 num_parts=request["num_parts"],
                 part_idx=request["part_idx"],
@@ -710,6 +998,7 @@ async def handle_encode_request(request: dict):
         nbytes, embedding_len, embedding_dim, error_msg, error_code = (
             await encoder.encode(
                 mm_items=request["mm_items"],
+                modality=Modality.from_str(request["modality"]),
                 req_id=request["req_id"],
                 num_parts=request["num_parts"],
                 part_idx=request["part_idx"],

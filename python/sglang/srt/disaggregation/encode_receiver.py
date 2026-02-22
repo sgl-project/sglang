@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import pickle
 import random
@@ -6,9 +7,10 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
 import torch
@@ -23,9 +25,10 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -40,69 +43,227 @@ class EmbeddingData:
         req_id,
         num_parts,
         part_idx,
-        image_grid_dim,
+        grid_dim,
+        modality,
         embedding=None,
+        embedding_shape=None,
         error_msg=None,
         error_code=None,
+        **kwargs,
     ):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
-        self.image_grid_dim = image_grid_dim
+        self.grid_dim = grid_dim
+        self.modality = modality
         self.embedding = embedding
         self.send_time = None
         self.dtype = embedding.dtype if embedding is not None else None
-        self.shape = list(embedding.shape) if embedding is not None else None
-        # aggregated data
-        self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
-        self.embedding_list = [
-            embedding if i == self.part_idx else None for i in range(self.num_parts)
-        ]
-        self.image_grid_dim_list = [
-            self.image_grid_dim if i == self.part_idx else None
-            for i in range(self.num_parts)
-        ]
+        if embedding_shape is not None:
+            self.shape = embedding_shape
+        else:
+            self.shape = list(embedding.shape) if embedding is not None else None
         self.error_msg = error_msg
         self.error_code = error_code
+        # Store additional metadata (e.g., video_timestamps for qwen3_vl)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
-    def add(self, embedding_data):
-        assert self.req_id == embedding_data.req_id
-        assert not self.ready_list[embedding_data.part_idx]
-        self.ready_list[embedding_data.part_idx] = True
-        self.image_grid_dim_list[embedding_data.part_idx] = (
-            embedding_data.image_grid_dim
-        )
-        self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
+    def get_grid(self):
+        """Get the grid dimension of the embedding, used for image/video/audio."""
+        return self.grid_dim
 
-    def get_embedding(self, is_concat=False):
-        if is_concat:
-            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
-        else:
-            return self.embedding_list
-
-    def get_img_grid(self):
-        return torch.concatenate(self.image_grid_dim_list)
-
-    @property
-    def ready(self):
-        return sum(self.ready_list) == self.num_parts
+    def get_embedding(self):
+        return self.embedding
 
     def __repr__(self):
         return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}) error_msg={self.error_msg}"
 
     def copy_without_embedding(self):
+        """Return a copy with the same metadata but embedding=None (e.g. for serialization)."""
         new_data = EmbeddingData(
-            req_id=self.req_id,
-            num_parts=self.num_parts,
-            part_idx=self.part_idx,
-            image_grid_dim=self.image_grid_dim,
+            self.req_id,
+            self.num_parts,
+            self.part_idx,
+            self.grid_dim,
+            self.modality,
+            embedding=None,
+            embedding_shape=self.shape,
             error_msg=self.error_msg,
             error_code=self.error_code,
         )
-        new_data.send_time = self.send_time
-        new_data.dtype = self.dtype
-        new_data.shape = self.shape
+        for key in dir(self):
+            if (
+                key.startswith("_")
+                or key == "embedding"
+                or callable(getattr(self, key, None))
+            ):
+                continue
+            setattr(new_data, key, getattr(self, key, None))
         return new_data
+
+
+# Modality -> (list attr name, whether to flatten grid for that list)
+_MODALITY_GRID_ATTRS = {
+    Modality.IMAGE: ("img_grid_thw", False),
+    Modality.VIDEO: ("video_grid_thw", False),
+    Modality.AUDIO: ("audio_feature_lens", True),
+}
+_VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
+
+
+def _cat_grid(dims, flatten_items=False):
+    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
+    valid = (
+        [g.flatten() for g in dims if g is not None]
+        if flatten_items
+        else [g for g in dims if g is not None]
+    )
+    return torch.cat(valid, dim=0) if valid else None
+
+
+class MultiModalEmbeddingData(EmbeddingData):
+    def __init__(
+        self,
+        part_idx,
+        num_parts,
+        req_id,
+        grid_dim,
+        modality,
+        embedding,
+        embedding_shape,
+        **kwargs,
+    ):
+        super().__init__(
+            req_id,
+            num_parts,
+            part_idx,
+            grid_dim,
+            modality,
+            embedding,
+            embedding_shape,
+            **kwargs,
+        )
+        self.img_grid_thw = [None] * num_parts
+        self.video_grid_thw = [None] * num_parts
+        self.audio_feature_lens = [None] * num_parts
+        self.modality_list = [
+            modality if part_idx == i else None for i in range(num_parts)
+        ]
+        self.ready_list = [i == part_idx for i in range(num_parts)]
+        self.embedding_list = [
+            embedding if i == part_idx else None for i in range(num_parts)
+        ]
+        self.embedding_shape_list = [
+            embedding_shape if i == part_idx else None for i in range(num_parts)
+        ]
+        self.video_timestamps = [None] * num_parts
+        self.second_per_grid_ts = [None] * num_parts
+
+        self._set_part_grid(part_idx, modality, self.get_grid())
+        if modality == Modality.VIDEO:
+            self._set_video_meta_for_part(part_idx, kwargs)
+
+    def _set_part_grid(self, part_idx, modality, grid):
+        """Set the grid for one part according to modality (IMAGE/VIDEO/AUDIO)."""
+        spec = _MODALITY_GRID_ATTRS.get(modality)
+        if spec is None:
+            raise ValueError(f"Invalid modality: {modality}")
+        attr_name, flatten = spec
+        value = grid.flatten() if flatten else grid
+        getattr(self, attr_name)[part_idx] = value
+
+    def _set_video_meta_for_part(self, part_idx, source):
+        """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
+        for attr_name in _VIDEO_META_ATTRS:
+            val = (
+                source.get(attr_name)
+                if isinstance(source, dict)
+                else getattr(source, attr_name, None)
+            )
+            if val is not None:
+                getattr(self, attr_name)[part_idx] = val
+
+    @classmethod
+    def from_embedding_data(cls, embedding_data: EmbeddingData):
+        """Create MultiModalEmbeddingData from an EmbeddingData instance."""
+        # Only forward known optional attrs (e.g. video metadata) so they land on the instance
+        extra = {}
+        for attr in _VIDEO_META_ATTRS:
+            val = getattr(embedding_data, attr, None)
+            if val is not None:
+                extra[attr] = val
+        mm_data = cls(
+            part_idx=embedding_data.part_idx,
+            num_parts=embedding_data.num_parts,
+            req_id=embedding_data.req_id,
+            grid_dim=embedding_data.grid_dim,
+            modality=embedding_data.modality,
+            embedding=embedding_data.embedding,
+            embedding_shape=embedding_data.shape,
+            **extra,
+        )
+        if embedding_data.modality == Modality.VIDEO:
+            mm_data._set_video_meta_for_part(embedding_data.part_idx, extra)
+        mm_data.send_time = embedding_data.send_time
+        return mm_data
+
+    def __repr__(self):
+        return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
+
+    def get_embedding_offsets(self):
+        embedding_offsets = {}
+        global_offset = 0
+        for i in range(self.num_parts):
+            modality = self.modality_list[i]
+            embedding_len = self.embedding_shape_list[i][0]
+            if modality not in embedding_offsets:
+                embedding_offsets[modality] = []
+            embedding_range = (global_offset, global_offset + embedding_len)
+            embedding_offsets[modality].append(embedding_range)
+            global_offset += embedding_len
+        return embedding_offsets
+
+    def get_embedding(self, is_concat=False):
+        if is_concat:
+            return torch.concat(
+                [e.cuda() for e in self.embedding_list if e is not None]
+            )
+        return self.embedding_list
+
+    @property
+    def ready(self):
+        return sum(self.ready_list) == self.num_parts
+
+    def get_mm_extra_meta(self):
+        """Build kwargs for mm_processor.get_mm_data() from grid and optional video meta."""
+        kwargs = {
+            "img_grid_thw": _cat_grid(self.img_grid_thw),
+            "video_grid_thw": _cat_grid(self.video_grid_thw),
+            "audio_feature_lens": _cat_grid(
+                self.audio_feature_lens, flatten_items=True
+            ),
+        }
+        for attr in _VIDEO_META_ATTRS:
+            lst = getattr(self, attr, None)
+            if not lst:
+                continue
+            valid = [a for a in lst if a is not None]
+            if valid:
+                kwargs[attr] = list(itertools.chain(*valid))
+        return kwargs
+
+    def add(self, embedding_data: EmbeddingData):
+        assert self.req_id == embedding_data.req_id
+        assert not self.ready_list[embedding_data.part_idx]
+        pid = embedding_data.part_idx
+        self.ready_list[pid] = True
+        self.modality_list[pid] = embedding_data.modality
+        self.embedding_list[pid] = embedding_data.get_embedding()
+        self.embedding_shape_list[pid] = embedding_data.shape
+        self._set_part_grid(pid, embedding_data.modality, embedding_data.get_grid())
+        if embedding_data.modality == Modality.VIDEO:
+            self._set_video_meta_for_part(pid, embedding_data)
 
 
 class WaitingImageRequestStatus(IntEnum):
@@ -110,6 +271,41 @@ class WaitingImageRequestStatus(IntEnum):
     PENDING = 0
     SUCCESS = 1
     TIMEOUT = -2
+
+
+def create_part_req_id(original_req_id: str, part_idx: int) -> str:
+    """Create a unique part request ID by appending part index suffix."""
+    return f"{original_req_id}_local_part_{part_idx}"
+
+
+def extract_original_req_id(part_req_id: str) -> str:
+    """Extract the original request ID from a part request ID."""
+    if "_local_part_" in part_req_id:
+        return part_req_id.rsplit("_local_part_", 1)[0]
+    return part_req_id
+
+
+def calculate_modality_num_parts(modalities, num_items_assigned):
+    """
+    Calculate total number of parts and number of parts per modality.
+
+    Args:
+        modalities: List of modalities in order
+        num_items_assigned: Dictionary mapping modality to list of assignment counts per encoder
+
+    Returns:
+        Tuple of (total_num_parts, modality_num_parts_dict)
+        - total_num_parts: Total number of parts across all modalities
+        - modality_num_parts: Dictionary mapping modality to number of parts for that modality
+    """
+    total_num_parts = 0
+    modality_num_parts = {}
+    for modality in modalities:
+        num_items_assigned_modality = num_items_assigned.get(modality)
+        num_parts = sum(1 for x in num_items_assigned_modality if x != 0)
+        modality_num_parts[modality] = num_parts
+        total_num_parts += num_parts
+    return total_num_parts, modality_num_parts
 
 
 # For zmq_to_scheduler
@@ -160,21 +356,38 @@ class WaitingImageRequest:
             ) as session:
                 tasks = []
                 logger.info(f"{self.num_items_assigned = } ")
-                for idx, assigned_num in enumerate(self.num_items_assigned):
-                    if assigned_num == 0:
-                        continue
-                    encoder_url = self.encoder_urls[idx]
-                    target_url = f"{encoder_url}/scheduler_receive_url"
-                    payload = {
-                        "req_id": req_id,
-                        "receive_count": receive_count,
-                        "receive_url": f"{host_name}:{embedding_port}",
-                    }
 
-                    logger.info(f"Preparing to send  to {target_url}")
+                # Calculate part_idx_offset similar to encode() method
+                modalities = list(self.num_items_assigned.keys())
+                _, modality_num_parts = calculate_modality_num_parts(
+                    modalities, self.num_items_assigned
+                )
 
-                    task = _send_single_request(session, target_url, payload)
-                    tasks.append(task)
+                part_idx_offset = 0
+                for modality in modalities:
+                    assigned_nums = self.num_items_assigned[modality]
+                    num_parts = modality_num_parts[modality]
+                    cum_idx = 0
+                    for idx, assigned_num in enumerate(assigned_nums):
+                        if assigned_num == 0:
+                            continue
+                        part_idx = part_idx_offset + cum_idx
+                        part_req_id = create_part_req_id(req_id, part_idx)
+                        encoder_url = self.encoder_urls[idx]
+                        target_url = f"{encoder_url}/scheduler_receive_url"
+                        payload = {
+                            "req_id": part_req_id,  # use part_req_id to match encode request
+                            "receive_count": receive_count,
+                            "receive_url": f"{host_name}:{embedding_port}",
+                            "modality": modality.name,
+                        }
+                        logger.info(
+                            f"Preparing to send to {target_url} with part_req_id={part_req_id}"
+                        )
+                        task = _send_single_request(session, target_url, payload)
+                        tasks.append(task)
+                        cum_idx += 1
+                    part_idx_offset += num_parts
 
                 if not tasks:
                     logger.info("No tasks to send.")
@@ -221,17 +434,27 @@ class WaitingImageRequest:
             recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
                 recv_obj.shape
             )
-            recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
+
+            # Extract original req_id from part_req_id
+            part_req_id = recv_obj.req_id
+            original_req_id = extract_original_req_id(part_req_id)
+            # Update recv_obj.req_id to original for aggregation
+            recv_obj.req_id = original_req_id
+
             if self.recv_embedding_data is None:
-                self.recv_embedding_data = recv_obj
+                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
+                    recv_obj
+                )
             else:
                 self.recv_embedding_data.add(recv_obj)
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        img_grid_thw = self.recv_embedding_data.get_img_grid()
-
+        recv_embedding_offsets = self.recv_embedding_data.get_embedding_offsets()
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text, recv_embedding, img_grid_thw
+            self.recv_req.input_text,
+            recv_embedding,
+            recv_embedding_offsets,
+            **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
@@ -382,7 +605,7 @@ class MMReceiverHTTP(MMReceiverBase):
         for recv_req in recv_reqs:
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
-                and recv_req.need_wait_for_image is True
+                and recv_req.need_wait_for_mm_inputs is True
             ):
                 waiting_req = WaitingImageRequest(
                     rid=recv_req.rid,
@@ -452,13 +675,13 @@ class MMReceiverHTTP(MMReceiverBase):
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+        self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
     ):
         try:
             asyncio.run(
                 self.encode(
                     req_id=req_id,
-                    img_data=img_data,
+                    mm_data=mm_data,
                     embedding_port=embedding_port,
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
@@ -468,45 +691,116 @@ class MMReceiverHTTP(MMReceiverBase):
         except Exception as e:
             logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
 
+    def _assign_items_by_modality(
+        self, mm_data, encoder_num, random_shuffle=True
+    ) -> Dict:
+        """
+        Assign multimodal items across encoders by modality with cross-modality load balancing.
+
+        Args:
+            mm_data: List of multimodal data items, each with a "modality" key
+            encoder_num: Number of encoders
+            random_shuffle: Whether to shuffle the encoder indices
+
+        Returns:
+            Dictionary mapping modality to list of assignment counts per encoder
+            Format: {modality: [count_for_encoder_0, count_for_encoder_1, ...]}
+        """
+        encode_idx = list(range(encoder_num))
+        if random_shuffle:
+            random.shuffle(encode_idx)
+        # Get unique modalities with order preserved
+        modalities = list(dict.fromkeys(mm_item.get("modality") for mm_item in mm_data))
+        # Use OrderedDict to explicitly maintain modality order
+        num_items_assigned = OrderedDict()
+        current_offset = 0
+
+        for modality in modalities:
+            mm_data_modality = [
+                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+            ]
+            num_items = len(mm_data_modality)
+            if num_items == 0:
+                continue
+
+            base = num_items // len(encode_idx)
+            remainder = num_items % len(encode_idx)
+            # Rotate assignments based on current_offset to balance load across modalities
+            assignments = [0] * len(encode_idx)
+            for i in range(len(encode_idx)):
+                # keep shuffle order when assigning items to encoders
+                pos_in_shuffled = (current_offset + i) % len(encode_idx)
+                actual_encoder_idx = encode_idx[pos_in_shuffled]
+                assignments[actual_encoder_idx] = base + (1 if i < remainder else 0)
+            num_items_assigned[modality] = assignments
+            current_offset = (current_offset + remainder) % len(encode_idx)
+
+        return num_items_assigned
+
     async def encode(
         self,
         req_id,
-        img_data,
+        mm_data,
         embedding_port,
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
     ):
-        if len(img_data) == 0:
+        if len(mm_data) == 0:
             return
 
-        # Split mm_items
+        # get unique modalities with order preserved
+        modalities = [mm_item.get("modality") for mm_item in mm_data]
+        modalities = list(dict.fromkeys(modalities))
         encode_requests = []
+
         if num_items_assigned is None:
-            random.shuffle(self.encode_idx)
-            num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls)
-                for idx in self.encode_idx
-            ]
-        num_parts = sum(1 for x in num_items_assigned if x != 0)
-        cum_num_items = 0
-        cum_idx = 0
-        for idx, assigned_num in enumerate(num_items_assigned):
-            if assigned_num == 0:
-                continue
-            encode_requests.append(
-                {
-                    "encoder_idx": idx,
-                    "mm_items": img_data[cum_num_items : cum_num_items + assigned_num],
-                    "num_parts": num_parts,
-                    "part_idx": cum_idx,
-                    "req_id": req_id,
-                    "prefill_host": self.host,
-                    "embedding_port": embedding_port,
-                }
+            num_items_assigned = self._assign_items_by_modality(
+                mm_data, len(self.encode_urls)
             )
-            cum_idx += 1
-            cum_num_items += assigned_num
+
+        # Calculate total num_parts across all modalities
+        total_num_parts, modality_num_parts = calculate_modality_num_parts(
+            modalities, num_items_assigned
+        )
+
+        part_idx_offset = 0
+        for modality in modalities:
+            num_items_assigned_modality = num_items_assigned.get(modality)
+            mm_data_modality = [
+                mm_item for mm_item in mm_data if mm_item.get("modality") == modality
+            ]
+
+            num_parts = modality_num_parts[modality]
+            cum_num_items = 0
+            cum_idx = 0
+            for idx, assigned_num in enumerate(num_items_assigned_modality):
+                if assigned_num == 0:
+                    continue
+                part_idx = part_idx_offset + cum_idx
+                part_req_id = create_part_req_id(req_id, part_idx)
+                encode_requests.append(
+                    {
+                        "encoder_idx": self.encode_idx[
+                            idx
+                        ],  # use shuffle-idx to load-balance
+                        "mm_items": [
+                            mm_item.get("url")
+                            for mm_item in mm_data_modality[
+                                cum_num_items : cum_num_items + assigned_num
+                            ]
+                        ],
+                        "num_parts": total_num_parts,
+                        "part_idx": part_idx,
+                        "req_id": part_req_id,  # use part_req_id to avoid key collision
+                        "modality": modality.name,  # convert enum to string for json serialization
+                        "prefill_host": self.host,
+                        "embedding_port": embedding_port,
+                    }
+                )
+                cum_idx += 1
+                cum_num_items += assigned_num
+            part_idx_offset += num_parts
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -544,9 +838,9 @@ class MMReceiverHTTP(MMReceiverBase):
 
             # mooncake backend: send bootstrap info
 
-            embedding_size_list_sort = [None for _ in range(num_parts)]
+            embedding_size_list_sort = [None for _ in range(total_num_parts)]
             embedding_length_tot = 0
-            response_json_list_sort = [None for _ in range(num_parts)]
+            response_json_list_sort = [None for _ in range(total_num_parts)]
             for response_json in response_json_list_unsort:
                 idx = response_json["part_idx"]
                 embedding_size_list_sort[idx] = response_json["embedding_size"]
@@ -593,26 +887,21 @@ class MMReceiverHTTP(MMReceiverBase):
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        if type(obj.image_data) != list:
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if image_urls and len(image_urls) > 0:
-            logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
 
-            encode_idx = list(range(len(self.encode_urls)))
-            random.shuffle(encode_idx)
-            obj.num_items_assigned = [
-                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
-            ]
+        if mm_data and len(mm_data) > 0:
+            logger.info(f"Processing {len(mm_data)} mm_items for request {obj.rid}")
+            obj.need_wait_for_mm_inputs = True
+            obj.num_items_assigned = self._assign_items_by_modality(
+                mm_data, len(self.encode_urls)
+            )
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
                     obj.rid,
-                    image_urls,
+                    mm_data,
                     "encode",
                     obj.num_items_assigned,
                     None,
@@ -621,19 +910,40 @@ class MMReceiverHTTP(MMReceiverBase):
             )
             encode_thread.start()
 
+    def _extract_url_data(self, request_obj) -> List[Dict]:
+        mm_data = []
+        for attr, modality in [
+            ("image_data", Modality.IMAGE),
+            ("video_data", Modality.VIDEO),
+            ("audio_data", Modality.AUDIO),
+        ]:
+            mm_items = getattr(request_obj, attr, None)
+            if mm_items:
+                if not isinstance(mm_items, list):
+                    mm_items = [mm_items]
+                for mm_item in mm_items:
+                    mm_data.append(
+                        {
+                            "url": (
+                                mm_item.url
+                                if isinstance(mm_item, ImageData)
+                                else mm_item
+                            ),
+                            "modality": modality,
+                        }
+                    )
+        return mm_data
+
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(self, request_obj, mm_processor, prompt):
         try:
             if len(self.encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if type(img_data) != list:
-                img_data = [img_data.url]
-            else:
-                img_data = [img.url for img in img_data]
+            mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
-                self.encode(req_id, img_data, embedding_port, "encode", "send")
+                self.encode(req_id, mm_data, embedding_port, "encode", "send")
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -653,25 +963,34 @@ class MMReceiverHTTP(MMReceiverBase):
 
         recv_embedding = None
 
-        recv_embedding_data: EmbeddingData = None
+        recv_embedding_data: MultiModalEmbeddingData = None
 
         while recv_embedding_data is None or not recv_embedding_data.ready:
             parts = await recv_socket.recv_multipart(copy=False)
 
             recv_obj: EmbeddingData = pickle.loads(parts[0])
             logger.info(f"{recv_obj = }")
+            # Extract original req_id from part_req_id
+            part_req_id = recv_obj.req_id
+            original_req_id = extract_original_req_id(part_req_id)
+            # Update recv_obj.req_id to original for aggregation
+            recv_obj.req_id = original_req_id
+
             if self.encoder_transfer_backend == "zmq_to_tokenizer":
                 buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
                 recv_obj.embedding = torch.frombuffer(
                     buffer, dtype=recv_obj.dtype
                 ).reshape(recv_obj.shape)
+
             if recv_embedding_data is None:
-                recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
-                recv_embedding_data = recv_obj
+                recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
+                    recv_obj
+                )
             else:
                 recv_embedding_data.add(recv_obj)
 
         if self.encoder_transfer_backend == "mooncake":
+            # Use original req_id for embeddings_buffer
             recv_embedding = self.embeddings_buffer[req_id]
             del self.embeddings_buffer[req_id]
             self.embeddings_engine.deregister(recv_embedding.data_ptr())
@@ -680,7 +999,11 @@ class MMReceiverHTTP(MMReceiverBase):
 
         recv_socket.close()
 
-        img_grid_thw = recv_embedding_data.get_img_grid()
-
-        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
+        recv_embedding_offsets = recv_embedding_data.get_embedding_offsets()
+        mm_inputs = mm_processor.get_mm_data(
+            prompt,
+            recv_embedding,
+            recv_embedding_offsets,
+            **recv_embedding_data.get_mm_extra_meta(),
+        )
         return mm_inputs
