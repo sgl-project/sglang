@@ -1607,3 +1607,30 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+
+class HiCacheMetricsCollector:
+    """Prometheus Gauges for HiRadixCache host-tier and PIN state."""
+
+    def __init__(self, labels: Dict[str, str]) -> None:
+        from prometheus_client import Gauge
+
+        self.labels = labels
+
+        self.host_used_tokens = Gauge(
+            name="sglang:hicache_host_used_tokens",
+            documentation="Number of tokens currently used in the host KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.host_total_tokens = Gauge(
+            name="sglang:hicache_host_total_tokens",
+            documentation="Total capacity of the host KV cache in tokens.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+    def update(self, host_used: int, host_total: int) -> None:
+        self.host_used_tokens.labels(**self.labels).set(host_used)
+        self.host_total_tokens.labels(**self.labels).set(host_total)
