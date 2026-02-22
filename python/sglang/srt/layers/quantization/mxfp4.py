@@ -751,13 +751,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
+            origin_hidden_states_dim = x.shape[-1]
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
 
                 # May be fused later if this code branch is frequently needed
-                origin_hidden_states_dim = x_quant.shape[-1]
                 if self.hidden_size != origin_hidden_states_dim:
                     x_quant = torch.nn.functional.pad(
                         x_quant,
@@ -781,11 +781,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 num_tokens = x_quant.shape[0]
-                hidden_size = (
-                    x_quant.shape[-1] * 2
-                    if x_quant.dtype == torch.uint8
-                    else x_quant.shape[-1]
-                )
+                hidden_size = origin_hidden_states_dim
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
@@ -813,7 +809,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
-                None,
+                None,  # routed_scaling_factor
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
