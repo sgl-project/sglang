@@ -18,9 +18,9 @@ SVDQuant significantly reduces memory usage and accelerates inference while main
 
 - **Memory Optimization**: Reduces memory usage by **3.6×** compared to BF16 models.
 - **Inference Acceleration**:
-  - **3.0×** faster than the NF4 (W4A16) baseline on desktop/laptop RTX 4090 GPUs.
-  - **8.7×** speedup on laptop RTX 4090 by eliminating CPU offloading compared to 16-bit models.
-  - **3.1×** faster than BF16 and NF4 models on RTX 5090 GPUs with NVFP4.
+    - **3.0×** faster than the NF4 (W4A16) baseline on desktop/laptop RTX 4090 GPUs.
+    - **8.7×** speedup on laptop RTX 4090 by eliminating CPU offloading compared to 16-bit models.
+    - **3.1×** faster than BF16 and NF4 models on RTX 5090 GPUs with NVFP4.
 
 ### Supported Precisions
 
