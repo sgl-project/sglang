@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LTX2AVLatentPreparationStage,
     LTX2TextConnectorStage,
     TextEncodingStage,
-    TimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -118,73 +117,39 @@ class LTX2Pipeline(ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        # 1. Input Validation
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
+        self.add_stages(
+            [
+                InputValidationStage(),
+                TextEncodingStage(
+                    text_encoders=[self.get_module("text_encoder")],
+                    tokenizers=[self.get_module("tokenizer")],
+                ),
+                LTX2TextConnectorStage(connectors=self.get_module("connectors")),
+            ]
         )
 
-        # 2. Text Encoding
-        self.add_stage(
-            stage_name="text_encoding_stage",
-            stage=TextEncodingStage(
-                # LTX-2 needs two contexts (video/audio). We reuse the same
-                # underlying Gemma encoder/tokenizer twice.
-                text_encoders=[
-                    self.get_module("text_encoder"),
-                ],
-                tokenizers=[
-                    self.get_module("tokenizer"),
-                ],
-            ),
-        )
+        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
 
-        # 3. connector stage
-        self.add_stage(
-            stage_name="text_connector_stage",
-            stage=LTX2TextConnectorStage(connectors=self.get_module("connectors")),
-        )
-
-        # 4. Timestep Preparation
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                prepare_extra_set_timesteps_kwargs=[prepare_mu],
-            ),
-        )
-
-        # 4. Latent Preparation
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=LTX2AVLatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-                audio_vae=self.get_module("audio_vae"),
-            ),
-        )
-
-        # 5. Denoising
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=LTX2AVDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                vae=self.get_module("vae"),
-                audio_vae=self.get_module("audio_vae"),
-            ),
-        )
-
-        # 6. Decoding
-        self.add_stage(
-            stage_name="decoding_stage",
-            stage=LTX2AVDecodingStage(
-                vae=self.get_module("vae"),
-                audio_vae=self.get_module("audio_vae"),
-                vocoder=self.get_module("vocoder"),
-                pipeline=self,
-            ),
+        self.add_stages(
+            [
+                LTX2AVLatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                    audio_vae=self.get_module("audio_vae"),
+                ),
+                LTX2AVDenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    vae=self.get_module("vae"),
+                    audio_vae=self.get_module("audio_vae"),
+                ),
+                LTX2AVDecodingStage(
+                    vae=self.get_module("vae"),
+                    audio_vae=self.get_module("audio_vae"),
+                    vocoder=self.get_module("vocoder"),
+                    pipeline=self,
+                ),
+            ]
         )
 
 

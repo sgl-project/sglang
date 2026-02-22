@@ -12,7 +12,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
-- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`). If not specified, the VAE will be loaded from the main model path.
 - `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
 - `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
@@ -217,6 +216,32 @@ Once the generation task has finished, the server will shut down automatically.
 
 > [!NOTE]
 > The HTTP server-related arguments are ignored in this subcommand.
+
+## Component Path Overrides
+
+SGLang diffusion allows you to override any pipeline component (e.g., `vae`, `transformer`, `text_encoder`) by specifying a custom checkpoint path. This is useful for:
+
+### Example: FLUX.2-dev with Tiny AutoEncoder
+
+You can override **any** component by using `--<component>-path`, where `<component>` matches the key in the model's `model_index.json`:
+
+For example, replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
+
+```bash
+sglang serve \
+  --model-path=black-forest-labs/FLUX.2-dev \
+  # with a Huggingface Repo ID
+  --vae-path=fal/FLUX.2-Tiny-AutoEncoder
+  # or use a local path
+  --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
+```
+
+**Important:**
+- The component key must match the one in your model's `model_index.json` (e.g., `vae`).
+- The path must:
+    - either be a Huggingface Repo ID (e.g., fal/FLUX.2-Tiny-AutoEncoder)
+    - or point to a **complete component folder**, containing `config.json` and safetensors files
+
 
 ## Diffusers Backend
 
