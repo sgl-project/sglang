@@ -484,7 +484,6 @@ class _Dumper:
 
 class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
-    _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
     _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
 
     def __init__(
@@ -496,9 +495,9 @@ class _NonIntrusiveDumper:
         self._dumper = dumper
         self._mode = mode
         self._handles: list = []
-        self._kwarg_rename: dict[str, str] = {}
-        for plugin in _plugins:
-            self._kwarg_rename.update(plugin.kwarg_rename_map())
+        self._core_fields: frozenset[str] = frozenset().union(
+            *(p.core_fields() for p in _plugins)
+        )
 
         for module_name, module in model.named_modules():
             if ctx := self._detect_module_ctx(module_name, module):
@@ -548,19 +547,16 @@ class _NonIntrusiveDumper:
         )
 
     def _make_forward_pre_hook(self, *, module_name: str, is_root: bool):
-        rename = self._kwarg_rename
-
         def _hook(_module, args, kwargs):
             for i, item in enumerate(args):
                 self._dump_value(
                     module_name, item, sub_name=f"inputs.{i}", is_root=is_root
                 )
             for name, value in kwargs.items():
-                effective_name = rename.get(name, name)
                 self._dump_value(
                     module_name,
                     value,
-                    sub_name=f"inputs.{effective_name}",
+                    sub_name=f"inputs.{name}",
                     is_root=is_root,
                 )
 
@@ -576,20 +572,20 @@ class _NonIntrusiveDumper:
     def _dump_value(
         self, module_name: str, value: Any, sub_name: str, *, is_root: bool
     ) -> None:
-        for key, tensor in self._convert_value(
+        for key, item in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
             effective_key = key or sub_name.rsplit(".", 1)[-1]
-            if effective_key in self._CORE_FIELDS:
-                self._dumper.dump(effective_key, tensor)
+            if effective_key in self._core_fields:
+                self._dumper.dump(effective_key, item)
             elif self._mode == "all":
                 parts = [p for p in (module_name, sub_name, key) if p]
-                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
+                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
 
     @staticmethod
     def _convert_value(
         value, *, skip_forward_batch: bool = False
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         if isinstance(value, torch.Tensor):
             return {"": value}
 
@@ -1067,8 +1063,8 @@ class _FrameworkPlugin(ABC):
     @abstractmethod
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
-        """Return converted tensors dict, or None if this plugin doesn't handle the value."""
+    ) -> Optional[dict[str, Any]]:
+        """Return converted dict, or None if this plugin doesn't handle the value."""
         ...
 
     @abstractmethod
@@ -1076,8 +1072,8 @@ class _FrameworkPlugin(ABC):
         """Return 0-indexed layer_id, or None if not detectable."""
         ...
 
-    def kwarg_rename_map(self) -> dict[str, str]:
-        return {}
+    def core_fields(self) -> frozenset[str]:
+        return frozenset()
 
 
 class _SGLangPlugin(_FrameworkPlugin):
@@ -1130,7 +1126,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
+    ) -> Optional[dict[str, Any]]:
         if not self._available:
             return None
 
@@ -1154,11 +1150,15 @@ class _SGLangPlugin(_FrameworkPlugin):
             return module.layer_id
         return None
 
+    def core_fields(self) -> frozenset[str]:
+        return frozenset({"input_ids", "positions", "seq_lens"})
+
 
 class _MegatronPlugin(_FrameworkPlugin):
     _available = True
     try:
         from megatron.core import parallel_state as _mpu
+        from megatron.core.packed_seq_params import PackedSeqParams as _PackedSeqParams
     except ImportError:
         _available = False
 
@@ -1206,7 +1206,16 @@ class _MegatronPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
+    ) -> Optional[dict[str, Any]]:
+        if not self._available:
+            return None
+        if isinstance(value, self._PackedSeqParams):
+            result: dict[str, Any] = {}
+            for attr in ("cu_seqlens_q", "cu_seqlens_kv", "qkv_format"):
+                v = getattr(value, attr, None)
+                if v is not None:
+                    result[attr] = v
+            return result
         return None
 
     def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
@@ -1214,8 +1223,10 @@ class _MegatronPlugin(_FrameworkPlugin):
             return module.layer_number - 1
         return None
 
-    def kwarg_rename_map(self) -> dict[str, str]:
-        return {"position_ids": "positions"}
+    def core_fields(self) -> frozenset[str]:
+        return frozenset(
+            {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        )
 
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
