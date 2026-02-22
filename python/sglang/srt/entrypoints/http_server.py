@@ -348,6 +348,7 @@ async def lifespan(fast_api_app: FastAPI):
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
         kwargs=warmup_thread_kwargs,
+        daemon=True,
     )
     warmup_thread.start()
 
@@ -355,7 +356,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
-        warmup_thread.join()
+        warmup_thread.join(timeout=5.0)
 
 
 # Fast API
@@ -564,7 +565,6 @@ async def model_info():
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
         "architectures": getattr(model_config.hf_config, "architectures", None),
-        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
         # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
@@ -1769,7 +1769,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
+            logger.info("Start of pd disaggregation warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
