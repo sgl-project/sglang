@@ -27,7 +27,18 @@ import random
 import signal
 import threading
 import time
-from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from multiprocessing.connection import Connection
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -94,6 +105,48 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+@dataclasses.dataclass
+class SchedulerInitResult:
+    """Base result from launching schedulers."""
+
+    scheduler_infos: List[Dict[str, Any]]
+
+    def wait_for_ready(self) -> None:
+        """Wait for schedulers to be ready. Default: no-op."""
+        pass
+
+    def wait_for_completion(self) -> None:
+        """Block until all schedulers terminate."""
+        raise NotImplementedError
+
+    def cleanup(self) -> None:
+        """Clean up scheduler resources. Default: no-op."""
+        pass
+
+
+@dataclasses.dataclass
+class MpSchedulerInitResult(SchedulerInitResult):
+    _procs: Optional[List[mp.Process]] = None
+    _pipe_readers: Optional[List[Connection]] = None
+
+    def wait_for_ready(self) -> None:
+        if self._procs is not None and self._pipe_readers is not None:
+            infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
+            self.scheduler_infos.extend(infos)
+
+    def wait_for_completion(self) -> None:
+        if self._procs is not None:
+            for proc in self._procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} "
+                    f"terminated with {proc.exitcode}"
+                )
+
+    def cleanup(self) -> None:
+        pass
+
+
 def init_tokenizer_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -156,24 +209,31 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
-        atexit.register(self.shutdown)
+        # Store the atexit function so we can unregister it later
+        self._shutdown_called = False
+        self._atexit_handler = lambda: self._atexit_shutdown()
+        atexit.register(self._atexit_handler)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_infos, port_args = (
-            _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=self.init_tokenizer_manager_func,
-                run_scheduler_process_func=self.run_scheduler_process_func,
-                run_detokenizer_process_func=self.run_detokenizer_process_func,
-            )
+        (
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result,
+        ) = _launch_workers(
+            server_args=server_args,
+            init_tokenizer_manager_func=self.init_tokenizer_manager_func,
+            run_scheduler_process_func=self.run_scheduler_process_func,
+            run_detokenizer_process_func=self.run_detokenizer_process_func,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_infos[0]
+        self.scheduler_info = scheduler_init_result.scheduler_infos[0]
         self.port_args = port_args
+        self._scheduler_init_result = scheduler_init_result
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_infos
+                scheduler_init_result.scheduler_infos
             )
         )
 
@@ -450,9 +510,35 @@ class Engine(EngineBase):
         ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
-    def shutdown(self):
-        """Shutdown the engine"""
+    def _cleanup_processes(self):
+        """Clean up Ray actors, placement groups, and child processes."""
+        if (
+            hasattr(self, "_scheduler_init_result")
+            and self._scheduler_init_result is not None
+        ):
+            self._scheduler_init_result.cleanup()
         kill_process_tree(os.getpid(), include_parent=False)
+
+    def _atexit_shutdown(self):
+        """Atexit handler - cleans up Ray actors and child processes."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        self._cleanup_processes()
+
+    def shutdown(self):
+        """Shutdown the engine."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # Unregister atexit handler since we're shutting down explicitly
+        try:
+            atexit.unregister(self._atexit_handler)
+        except Exception:
+            pass
+
+        self._cleanup_processes()
 
     def __enter__(self):
         return self
@@ -859,25 +945,29 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
-    if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-        def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
-            kill_process_tree(os.getpid())
+    # Signal handlers can only be registered from the main thread.
+    # When launch_server is called from a background thread (e.g., in a Ray actor),
+    # skip signal registration to avoid ValueError.
+    if threading.current_thread() is threading.main_thread():
+        if server_args.custom_sigquit_handler is None:
+            # Register the signal handler.
+            # The child processes will send SIGQUIT to this process when any error happens
+            # This process then clean up the whole process tree
+            # Note: This sigquit handler is used in the launch phase, and may be replaced by
+            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+            def launch_phase_sigquit_handler(signum, frame):
+                logger.error(
+                    "Received sigquit from a child process. It usually means the child failed."
+                )
+                kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
-    else:
-        # Allow users to register a custom SIGQUIT handler for things like crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
-        )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        else:
+            # Allow users to register a custom SIGQUIT handler for things like crash dump
+            logger.error(
+                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+            )
+            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -912,7 +1002,70 @@ def _launch_scheduler_processes(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-):
+) -> SchedulerInitResult:
+    """Launch schedulers using Ray actors or mp.Process.
+
+    Returns:
+        SchedulerInitResult that abstracts the mode-specific details.
+        For Ray mode, scheduler_infos is already populated.
+        For mp mode, call result.wait_for_ready() to populate scheduler_infos.
+    """
+    if server_args.use_ray:
+        from sglang.srt.ray.launch import launch_scheduler_ray_actors
+
+        return launch_scheduler_ray_actors(server_args, port_args)
+    else:
+        return _launch_scheduler_processes_mp(
+            server_args, port_args, run_scheduler_process_func
+        )
+
+
+def _calculate_rank_ranges(
+    nnodes: int, pp_size: int, tp_size: int, node_rank: int
+) -> Tuple[range, range, int, int]:
+    """Calculate pp_rank_range and tp_rank_range for a given node.
+
+    Args:
+        nnodes: Total number of nodes.
+        pp_size: Pipeline parallel size.
+        tp_size: Tensor parallel size.
+        node_rank: The rank of the node to compute ranges for.
+
+    Returns:
+        A tuple of (pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node):
+        - pp_rank_range: range of pipeline-parallel ranks assigned to this node.
+        - tp_rank_range: range of tensor-parallel ranks assigned to this node.
+        - pp_size_per_node: number of PP ranks per node.
+        - tp_size_per_node: number of TP ranks per node.
+    """
+    pp_size_per_node = max(pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+    )
+
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _launch_scheduler_processes_mp(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_scheduler_process_func: Callable,
+) -> MpSchedulerInitResult:
+    """Launch scheduler processes using multiprocessing.
+
+    Returns:
+        MpSchedulerInitResult with _procs and _pipe_readers set.
+        scheduler_infos will be empty; call result.wait_for_ready() to populate it.
+    """
     scheduler_procs = []
 
     if server_args.dp_size == 1:
@@ -922,18 +1075,13 @@ def _launch_scheduler_processes(
         )
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            _calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.node_rank,
+            )
         )
 
         for pp_rank in pp_rank_range:
@@ -1007,18 +1155,31 @@ def _launch_scheduler_processes(
         proc.start()
         scheduler_procs.append(proc)
 
-    return scheduler_procs, scheduler_pipe_readers
+    return MpSchedulerInitResult(
+        scheduler_infos=[],
+        _procs=scheduler_procs,
+        _pipe_readers=scheduler_pipe_readers,
+    )
 
 
-def _launch_subprocesses(
+def _launch_workers(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable,
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
-) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
+) -> Tuple[
+    TokenizerManager,
+    TemplateManager,
+    PortArgs,
+    SchedulerInitResult,
+]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
+    or Ray actors), and the DetokenizerManager in another subprocess.
+
+    Returns:
+        Tuple of (tokenizer_manager, template_manager, port_args, scheduler_result).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -1030,8 +1191,8 @@ def _launch_subprocesses(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
-    # Launch scheduler processes
-    scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
+    # Launch schedulers (unified interface for both mp and Ray modes)
+    scheduler_result = _launch_scheduler_processes(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
@@ -1041,24 +1202,30 @@ def _launch_subprocesses(
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        scheduler_infos = _wait_for_scheduler_ready(
-            scheduler_pipe_readers, scheduler_procs
-        )
+        # Wait for schedulers to be ready (no-op for Ray, waits for pipe in mp mode)
+        scheduler_result.wait_for_ready()
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, scheduler_infos, port_args
+            return (
+                None,
+                None,
+                port_args,
+                scheduler_result,
+            )
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
         )
 
-        for proc in scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
-        return None, None, scheduler_infos, port_args
+        # Wait for schedulers to terminate (they shouldn't normally)
+        scheduler_result.wait_for_completion()
+        return (
+            None,
+            None,
+            port_args,
+            scheduler_result,
+        )
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -1080,10 +1247,17 @@ def _launch_subprocesses(
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
         template_manager = None
 
-    # Wait for the model to finish loading
-    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+    # Wait for the model to finish loading (no-op for Ray, waits for pipe in mp mode)
+    scheduler_result.wait_for_ready()
 
     # Get back some info from scheduler to tokenizer_manager
-    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_result.scheduler_infos[0][
+        "max_req_input_len"
+    ]
 
-    return tokenizer_manager, template_manager, scheduler_infos, port_args
+    return (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_result,
+    )
