@@ -20,7 +20,7 @@ register_cuda_ci(
     suite="stage-b-test-large-2-gpu",
 )
 
-GPT_OSS_MODEL = "openai/gpt-oss-20b"
+GPT_OSS_MODEL = "openai/gpt-oss-120b"
 
 ACC_THRESHOLDS = {
     GPT_OSS_MODEL: {"gsm8k": 0.85},
@@ -39,7 +39,7 @@ class TestGptOssPiecewiseCudaGraph(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp",
-                "1",
+                "2",
                 "--trust-remote-code",
                 "--reasoning-parser",
                 "gpt-oss",
