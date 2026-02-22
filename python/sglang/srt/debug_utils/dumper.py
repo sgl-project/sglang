@@ -1208,12 +1208,11 @@ class _MegatronPlugin(_FrameworkPlugin):
         if not self._available:
             return None
         if isinstance(value, self.PackedSeqParams):
-            result: dict[str, Any] = {}
-            for attr in ("cu_seqlens_q", "cu_seqlens_kv", "qkv_format"):
-                v = getattr(value, attr, None)
-                if v is not None:
-                    result[attr] = v
-            return result
+            return {
+                "cu_seqlens_q": value.cu_seqlens_q,
+                "cu_seqlens_kv": value.cu_seqlens_kv,
+                "qkv_format": value.qkv_format,
+            }
         return None
 
     def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:

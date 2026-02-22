@@ -2151,12 +2151,16 @@ class TestMegatronConvertValue:
         assert torch.equal(result["cu_seqlens_kv"], cu_kv)
         assert result["qkv_format"] == "thd"
 
-    def test_skips_none_attrs(self):
+    def test_returns_all_three_fields(self):
         plugin = _MegatronPlugin()
-        value = self._FakePackedSeqParams(cu_seqlens_q=torch.tensor([0, 5]))
+        cu_q = torch.tensor([0, 5])
+        cu_kv = torch.tensor([0, 5])
+        value = self._FakePackedSeqParams(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, qkv_format="thd"
+        )
 
         result = plugin.convert_value(value, skip_forward_batch=False)
-        assert result == {"cu_seqlens_q": value.cu_seqlens_q}
+        assert set(result.keys()) == {"cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
 
     def test_non_packed_returns_none(self):
         plugin = _MegatronPlugin()
