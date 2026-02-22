@@ -118,6 +118,95 @@ class TestDumperConfig:
         assert d2.may_enable is True
 
 
+class TestKvPairsParsing:
+    def test_from_kv_pairs_none_returns_defaults(self):
+        assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
+
+    def test_from_kv_pairs_empty_returns_defaults(self):
+        assert _DumperConfig.from_kv_pairs([]) == _DumperConfig()
+
+    def test_from_kv_pairs_bool_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["enable=true"])
+        assert cfg.enable is True
+        assert cfg.dir == "/tmp/dumper"
+
+    def test_from_kv_pairs_bool_numeric(self):
+        assert _DumperConfig.from_kv_pairs(["enable=1"]).enable is True
+        assert _DumperConfig.from_kv_pairs(["enable=0"]).enable is False
+
+    def test_from_kv_pairs_int_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=120"])
+        assert cfg.collective_timeout == 120
+        assert type(cfg.collective_timeout) is int
+
+    def test_from_kv_pairs_int_field_zero_stays_int(self):
+        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=0"])
+        assert cfg.collective_timeout == 0
+        assert type(cfg.collective_timeout) is int
+
+    def test_from_kv_pairs_str_field_not_coerced(self):
+        cfg = _DumperConfig.from_kv_pairs(["server_port=0"])
+        assert cfg.server_port == "0"
+        assert type(cfg.server_port) is str
+
+    def test_from_kv_pairs_str_field_one_stays_str(self):
+        cfg = _DumperConfig.from_kv_pairs(["server_port=1"])
+        assert cfg.server_port == "1"
+        assert type(cfg.server_port) is str
+
+    def test_from_kv_pairs_optional_str_field(self):
+        cfg = _DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
+        assert cfg.filter == "layer_id=[0-3]"
+
+    def test_from_kv_pairs_optional_str_exp_name(self):
+        cfg = _DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
+        assert cfg.exp_name == "my_experiment"
+
+    def test_from_kv_pairs_multiple_fields(self):
+        cfg = _DumperConfig.from_kv_pairs(
+            [
+                "enable=true",
+                "dir=/my/dir",
+                "filter=name=foo",
+                "collective_timeout=30",
+                "enable_grad=1",
+            ]
+        )
+        assert cfg.enable is True
+        assert cfg.dir == "/my/dir"
+        assert cfg.filter == "name=foo"
+        assert cfg.collective_timeout == 30
+        assert cfg.enable_grad is True
+
+    def test_from_kv_pairs_missing_equals_raises(self):
+        with pytest.raises(ValueError, match="missing '='"):
+            _DumperConfig.from_kv_pairs(["enable"])
+
+    def test_from_kv_pairs_unknown_key_raises(self):
+        with pytest.raises(ValueError, match="Unknown config key"):
+            _DumperConfig.from_kv_pairs(["nonexistent=true"])
+
+    def test_kv_pairs_to_dict_returns_only_explicit(self):
+        d = _DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
+        assert d == {"enable": True, "dir": "/x"}
+        assert "filter" not in d
+        assert "collective_timeout" not in d
+
+    def test_kv_pairs_to_dict_none_returns_empty(self):
+        assert _DumperConfig._kv_pairs_to_dict(None) == {}
+
+    def test_kv_pairs_to_dict_empty_returns_empty(self):
+        assert _DumperConfig._kv_pairs_to_dict([]) == {}
+
+    def test_from_kv_pairs_value_with_equals_in_value(self):
+        cfg = _DumperConfig.from_kv_pairs(["filter=name=foo"])
+        assert cfg.filter == "name=foo"
+
+    def test_from_kv_pairs_type_validation_still_works(self):
+        with pytest.raises(TypeError, match="collective_timeout.*expected int"):
+            _DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
+
+
 class TestDumperPureFunctions:
     def test_get_truncated_value(self):
         assert get_truncated_value(None) is None
@@ -452,13 +541,14 @@ class TestDumpDictFormat:
 
 def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
     """Create a _Dumper for CPU testing without HTTP server or distributed."""
-    config = _DumperConfig(
+    defaults = dict(
         enable=True,
         dir=str(tmp_path),
         exp_name="test",
         enable_http_server=False,
-        **overrides,
     )
+    defaults.update(overrides)
+    config = _DumperConfig(**defaults)
     return _Dumper(config=config)
 
 
@@ -795,6 +885,35 @@ class TestCleanup:
         assert not old_dir.exists()
         _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
 
+    def test_cleanup_removes_exp_name_dir(self, tmp_path):
+        exp_name = "my_custom_exp"
+        old_exp_dir = tmp_path / exp_name
+        old_exp_dir.mkdir()
+        (old_exp_dir / "old_data.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not (tmp_path / exp_name / "old_data.pt").exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
+    def test_cleanup_removes_both_dump_prefix_and_exp_name(self, tmp_path):
+        old_dump = tmp_path / "dump_old"
+        old_dump.mkdir()
+        (old_dump / "dummy.pt").touch()
+
+        exp_name = "custom_run"
+        old_exp = tmp_path / exp_name
+        old_exp.mkdir()
+        (old_exp / "stale.pt").touch()
+
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper.dump("new_tensor", torch.randn(3, 3))
+
+        assert not old_dump.exists()
+        assert not (tmp_path / exp_name / "stale.pt").exists()
+        _assert_files(_get_filenames(tmp_path), exist=["new_tensor"])
+
     def test_no_cleanup_by_default(self, tmp_path):
         old_dir = tmp_path / "dump_old"
         old_dir.mkdir()
@@ -832,6 +951,68 @@ class TestReset:
         assert "dump_index=1" in post_file.name
 
 
+def _dumper_worker(rank, http_port: int, stop_event):
+    """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
+    dumper.configure(enable=False, server_port=str(http_port))
+    dumper.step()
+    stop_event.wait()
+
+
+def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+            return
+        except requests.ConnectionError:
+            time.sleep(0.5)
+    raise TimeoutError(f"Dumper HTTP server not reachable at {url}")
+
+
+class TestZmqPortIsolation:
+    """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
+
+    NUM_INSTANCES = 3
+
+    def test_concurrent_instances_no_port_conflict(self):
+        ports = [
+            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
+        ]
+        stop_events = []
+        threads = []
+        ctx = multiprocessing.get_context("spawn")
+
+        for port in ports:
+            stop_event = ctx.Event()
+            stop_events.append(stop_event)
+            thread = threading.Thread(
+                target=run_distributed_test,
+                args=(_dumper_worker,),
+                kwargs={"http_port": port, "stop_event": stop_event},
+            )
+            thread.start()
+            threads.append(thread)
+
+        try:
+            for port in ports:
+                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
+
+            for i, port in enumerate(ports):
+                resp = requests.post(
+                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                )
+                resp.raise_for_status()
+                states = resp.json()
+                assert (
+                    len(states) == 2
+                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+        finally:
+            for event in stop_events:
+                event.set()
+            for thread in threads:
+                thread.join(timeout=10)
+
+
 class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
@@ -843,12 +1024,12 @@ class TestDumperHttp:
             stop_event = multiprocessing.get_context("spawn").Event()
             thread = threading.Thread(
                 target=run_distributed_test,
-                args=(TestDumperHttp._standalone_mode_worker,),
+                args=(_dumper_worker,),
                 kwargs={"http_port": http_port, "stop_event": stop_event},
             )
             thread.start()
             try:
-                TestDumperHttp._wait_for_http(base_url)
+                _wait_for_dumper_http(base_url)
                 yield base_url
             finally:
                 stop_event.set()
@@ -867,23 +1048,6 @@ class TestDumperHttp:
                 yield base_url
             finally:
                 kill_process_tree(proc.pid)
-
-    @staticmethod
-    def _standalone_mode_worker(rank, http_port: int, stop_event):
-        dumper.configure(enable=False, server_port=str(http_port))
-        dumper.step()
-        stop_event.wait()
-
-    @staticmethod
-    def _wait_for_http(url: str, timeout: float = 30) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                requests.post(f"{url}/dumper/configure", json={}, timeout=2)
-                return
-            except requests.ConnectionError:
-                time.sleep(0.5)
-        raise TimeoutError(f"Standalone dumper HTTP server not reachable at {url}")
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
@@ -997,6 +1161,15 @@ class _NonIntrusiveTestBase:
     def _make_dumper(tmp_path, **overrides) -> "_Dumper":
         return _make_test_dumper(tmp_path, non_intrusive_mode="all", **overrides)
 
+    def _run(self, tmp_path, inner_cls, **dumper_overrides):
+        d = self._make_dumper(tmp_path, **dumper_overrides)
+        model = self._wrap_as_outer(inner_cls)
+        d.register_non_intrusive_dumper(model)
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            output = model(x)
+        return captured, x, output
+
 
 class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
     """Tests for mode='all' — hooks on every module, non_intrusive__ prefix."""
@@ -1011,13 +1184,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            output = model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         self._assert_captured_contains(
             captured,
@@ -1103,13 +1270,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         self._assert_captured_contains(
             captured,
@@ -1144,13 +1305,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 a, b = self.split(x)
                 return self.linear(a + b)
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.split.output.0" in captured
         assert "non_intrusive__model.split.output.1" in captured
@@ -1171,13 +1326,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.wrap(x)[0]
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.wrap.output" in captured
         assert "non_intrusive__model.wrap.output.0" not in captured
@@ -1196,13 +1345,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 mask = torch.ones_like(x)
                 return self.mul(x, mask)
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.mul.inputs.0" in captured
         assert "non_intrusive__model.mul.inputs.1" in captured
@@ -1221,13 +1364,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 self.sink(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.sink.inputs.0" in captured
         assert not any(
@@ -1248,13 +1385,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 self.const(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert "non_intrusive__model.const.inputs.0" in captured
         assert not any(
@@ -1287,15 +1418,9 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             def forward(self, x):
                 return self.relu(self.linear(x))
 
-        d = self._make_dumper(
-            tmp_path, filter="name=non_intrusive__model.linear.output"
+        captured, x, output = self._run(
+            tmp_path, Inner, filter="name=non_intrusive__model.linear.output"
         )
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
 
         assert "non_intrusive__model.linear.output" in captured
         assert "non_intrusive__model.relu.output" not in captured
@@ -1422,38 +1547,37 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         assert "non_intrusive__layer.output" in captured
 
 
+class _LayerWithNumber(torch.nn.Module):
+    """Test helper: module with a ``layer_number`` attribute (Megatron style)."""
+
+    def __init__(self, layer_number: int):
+        super().__init__()
+        self.layer_number = layer_number
+        self.linear = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
     """Tests for automatic layer_id context injection via set_ctx."""
 
     def test_layer_id_from_layer_number(self, tmp_path):
         """Megatron PP: layer_number (1-based global) -> layer_id = layer_number - 1."""
 
-        class Layer(torch.nn.Module):
-            def __init__(self, layer_number: int):
-                super().__init__()
-                self.layer_number = layer_number
-                self.linear = torch.nn.Linear(4, 4)
-
-            def forward(self, x):
-                return self.linear(x)
-
         class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = torch.nn.ModuleList([Layer(10), Layer(11)])
+                self.layers = torch.nn.ModuleList(
+                    [_LayerWithNumber(10), _LayerWithNumber(11)]
+                )
 
             def forward(self, x):
                 for layer in self.layers:
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         layer0_key = "non_intrusive__model.layers.0.linear.output"
         layer1_key = "non_intrusive__model.layers.1.linear.output"
@@ -1488,13 +1612,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         layer_key = "non_intrusive__model.layers.0.linear.output"
         assert layer_key in captured
@@ -1515,13 +1633,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path)
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner)
 
         assert len(captured) > 0
         for key, entry in captured.items():
@@ -1530,32 +1642,19 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
     def test_filter_by_layer_id(self, tmp_path):
         """filter='layer_id=0' keeps only layer 0 dumps."""
 
-        class Layer(torch.nn.Module):
-            def __init__(self, layer_number: int):
-                super().__init__()
-                self.layer_number = layer_number
-                self.linear = torch.nn.Linear(4, 4)
-
-            def forward(self, x):
-                return self.linear(x)
-
         class Inner(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = torch.nn.ModuleList([Layer(1), Layer(2)])
+                self.layers = torch.nn.ModuleList(
+                    [_LayerWithNumber(1), _LayerWithNumber(2)]
+                )
 
             def forward(self, x):
                 for layer in self.layers:
                     x = layer(x)
                 return x
 
-        d = self._make_dumper(tmp_path, filter="layer_id=0")
-        model = self._wrap_as_outer(Inner)
-        d.register_non_intrusive_dumper(model)
-
-        x = torch.randn(2, 4)
-        with d.capture_output() as captured:
-            model(x)
+        captured, x, output = self._run(tmp_path, Inner, filter="layer_id=0")
 
         layer0_keys = [k for k in captured if "layers.0" in k]
         layer1_keys = [k for k in captured if "layers.1" in k]

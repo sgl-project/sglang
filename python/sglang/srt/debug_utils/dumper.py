@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import random
 import re
 import socket
 import threading
@@ -17,11 +18,11 @@ from typing import Any, List, Literal, Optional, Union, get_args, get_type_hints
 import torch
 import torch.distributed as dist
 
-# -------------------------------------- frozen config base ------------------------------------------
+# -------------------------------------- config base ------------------------------------------
 
 
 @dataclass(frozen=True)
-class _FrozenConfig(ABC):
+class _BaseConfig(ABC):
     def __post_init__(self) -> None:
         self._verify_types()
 
@@ -48,7 +49,7 @@ class _FrozenConfig(ABC):
         return f"{cls._env_prefix()}{field_name.upper()}"
 
     @classmethod
-    def from_env(cls) -> "_FrozenConfig":
+    def from_env(cls) -> "_BaseConfig":
         return cls(
             **{
                 f.name: cls._parse_env_field(cls._env_name(f.name), f.default)
@@ -56,7 +57,7 @@ class _FrozenConfig(ABC):
             }
         )
 
-    def with_defaults(self, **kwargs) -> "_FrozenConfig":
+    def with_defaults(self, **kwargs) -> "_BaseConfig":
         cls = type(self)
         actual = {
             key: value
@@ -72,9 +73,9 @@ class _FrozenConfig(ABC):
             return next(a for a in args if a is not type(None))
         return hint
 
-    @staticmethod
-    def _parse_env_field(env_name: str, default):
-        return _FrozenConfig._parse_env_value(os.getenv(env_name), default)
+    @classmethod
+    def _parse_env_field(cls, env_name: str, default):
+        return cls._parse_env_value(os.getenv(env_name), default)
 
     @staticmethod
     def _parse_env_value(raw, default):
@@ -86,9 +87,42 @@ class _FrozenConfig(ABC):
             return int(raw)
         return raw
 
+    @classmethod
+    def from_kv_pairs(cls, pairs: Optional[List[str]]) -> "_BaseConfig":
+        return cls(**cls._kv_pairs_to_dict(pairs))
+
+    @classmethod
+    def _kv_pairs_to_dict(cls, pairs: Optional[List[str]]) -> dict:
+        if not pairs:
+            return {}
+
+        missing = object()
+        defaults = {f.name: f.default for f in fields(cls)}
+        result: dict = {}
+
+        for pair in pairs:
+            key, sep, value = pair.partition("=")
+            if not sep:
+                raise ValueError(f"Invalid config pair (missing '='): {pair!r}")
+            default = defaults.get(key, missing)
+            if default is missing:
+                raise ValueError(
+                    f"Unknown config key {key!r}. Valid keys: {sorted(defaults)}"
+                )
+            try:
+                result[key] = cls._parse_env_value(value, default)
+            except (ValueError, TypeError) as exc:
+                field_type = type(default).__name__
+                raise TypeError(f"{key}: expected {field_type}, got {value!r}") from exc
+
+        return result
+
+
+_DEFAULT_EXP_NAME_PREFIX = "dump_"
+
 
 @dataclass(frozen=True)
-class _DumperConfig(_FrozenConfig):
+class _DumperConfig(_BaseConfig):
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp/dumper"
@@ -431,7 +465,9 @@ class _Dumper:
             else:
                 if not self._cleanup_previous_handled:
                     self._cleanup_previous_handled = True
-                    _cleanup_old_dumps(Path(self._config.dir))
+                    _cleanup_old_dumps(
+                        Path(self._config.dir), exp_name=self._config.exp_name
+                    )
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 _torch_save(output_data, str(path))
@@ -454,7 +490,6 @@ class _Dumper:
 
         rpc_broadcast = _create_zmq_rpc_broadcast(
             self,
-            base_port=get_int_env_var("DUMPER_ZMQ_BASE_PORT", 16800),
             timeout_seconds=self._config.collective_timeout,
         )
 
@@ -652,7 +687,20 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
 
 def _get_default_exp_name(timeout_seconds: int = 60):
     rank = _get_rank()
-    object_list = [f"dump_{time.time()}" if rank == 0 else None]
+    now = time.time()
+    ms = int((now % 1) * 1000)
+    rand_suffix = random.randint(0, 999)
+    object_list = [
+        (
+            (
+                f"{_DEFAULT_EXP_NAME_PREFIX}"
+                f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime(now))}"
+                f"_{ms:03d}{rand_suffix:03d}"
+            )
+            if rank == 0
+            else None
+        )
+    ]
 
     if dist.is_initialized():
         _collective_with_timeout(
@@ -664,14 +712,18 @@ def _get_default_exp_name(timeout_seconds: int = 60):
     return object_list[0]
 
 
-def _cleanup_old_dumps(base_dir: Path) -> None:
+def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
     import shutil
 
     if _get_rank() == 0:
-        for entry in base_dir.glob("dump_*"):
-            if entry.is_dir():
-                shutil.rmtree(entry)
-                print(f"[Dumper] Cleaned up {entry}")
+        targets = {entry for entry in base_dir.glob(f"{_DEFAULT_EXP_NAME_PREFIX}*")}
+        if exp_name:
+            targets.add(base_dir / exp_name)
+        targets = {d for d in targets if d.is_dir()}
+
+        for entry in targets:
+            shutil.rmtree(entry)
+            print(f"[Dumper] Cleaned up {entry}")
 
     if dist.is_initialized():
         dist.barrier()
@@ -785,19 +837,19 @@ def _make_http_handler(*, prefix: str, target):
 
 
 def _create_zmq_rpc_broadcast(
-    handler, base_port: int, timeout_seconds: int = 60
+    handler, timeout_seconds: int = 60
 ) -> Optional["_ZmqRpcBroadcast"]:
     """A general-purpose minimal RPC to support broadcasting executions to multi processes"""
     import zmq
 
     rank = _get_rank()
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    port = base_port + rank
-    local_addr = f"tcp://{_get_local_ip_by_remote()}:{port}"
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REP)
-    sock.bind(f"tcp://*:{port}")
+    sock.bind("tcp://*:0")
+    bound_port = int(sock.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
+    local_addr = f"tcp://{_get_local_ip_by_remote()}:{bound_port}"
 
     def serve_loop():
         while True:
