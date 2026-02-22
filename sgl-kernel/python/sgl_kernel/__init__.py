@@ -22,7 +22,6 @@ from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     concat_mla_absorb_q,
     concat_mla_k,
-    copy_to_gpu_no_ce,
     downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
