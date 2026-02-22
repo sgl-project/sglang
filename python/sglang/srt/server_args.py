@@ -692,6 +692,8 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    # temporary variable, will be obsoleted after MM batch scheduling enabled by default.
+    enable_batch_compute_mm_embeddings: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -5037,6 +5039,12 @@ class ServerArgs:
             default=ServerArgs.limit_mm_data_per_request,
             help="Limit the number of multimodal inputs per request. "
             'e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+        )
+        parser.add_argument(
+            "--enable-batch-compute-mm-embeddings",
+            action="store_true",
+            default=ServerArgs.enable_batch_compute_mm_embeddings,
+            help="Enable batch computing of mm item embeddings across multiple requests.",
         )
 
         # For checkpoint decryption
