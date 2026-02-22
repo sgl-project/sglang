@@ -57,21 +57,21 @@ class TestDumperConfig:
         assert _DumperConfig.from_env() == _DumperConfig()
 
     def test_from_env_bool(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
+        with temp_set_env(DUMPER_ENABLE="1"):
             assert _DumperConfig.from_env().enable is True
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="false"):
+        with temp_set_env(DUMPER_ENABLE="false"):
             assert _DumperConfig.from_env().enable is False
 
     def test_from_env_str(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="layer_id=0"):
+        with temp_set_env(DUMPER_FILTER="layer_id=0"):
             assert _DumperConfig.from_env().filter == "layer_id=0"
 
     def test_from_env_dir(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_DIR="/my/dir"):
+        with temp_set_env(DUMPER_DIR="/my/dir"):
             assert _DumperConfig.from_env().dir == "/my/dir"
 
     def test_from_env_int(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_COLLECTIVE_TIMEOUT="120"):
+        with temp_set_env(DUMPER_COLLECTIVE_TIMEOUT="120"):
             assert _DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
@@ -92,7 +92,7 @@ class TestDumperConfig:
             _DumperConfig(filter=123)
 
     def test_configure_default_skips_when_env_set(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_FILTER="from_env"):
+        with temp_set_env(DUMPER_FILTER="from_env"):
             d = _Dumper(config=_DumperConfig.from_env())
             d.configure_default(filter="from_code")
             assert d._config.filter == "from_env"
@@ -195,9 +195,8 @@ class TestCollectiveTimeout:
 class TestDumperDistributed:
     def test_basic(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
+            DUMPER_ENABLE="1",
+            DUMPER_DIR=str(tmp_path),
         ):
             run_distributed_test(self._test_basic_func, tmpdir=str(tmp_path))
 
@@ -205,21 +204,21 @@ class TestDumperDistributed:
     def _test_basic_func(rank, tmpdir):
         tensor = torch.randn(10, 10, device=f"cuda:{rank}")
 
-        dumper.on_forward_pass_start()
         dumper.dump("tensor_a", tensor, arg=100)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.set_ctx(ctx_arg=200)
         dumper.dump("tensor_b", tensor)
         dumper.set_ctx(ctx_arg=None)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.configure(filter=r"^$")
         dumper.dump("tensor_skip", tensor)
         dumper.configure(filter=None)
+        dumper.step()
 
-        dumper.on_forward_pass_start()
         dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
+        dumper.step()
 
         dist.barrier()
         filenames = _get_filenames(tmpdir)
@@ -230,7 +229,7 @@ class TestDumperDistributed:
         )
 
     def test_collective_timeout(self):
-        with temp_set_env(allow_sglang=True, SGLANG_DUMPER_ENABLE="1"):
+        with temp_set_env(DUMPER_ENABLE="1"):
             run_distributed_test(self._test_collective_timeout_func)
 
     @staticmethod
@@ -246,7 +245,7 @@ class TestDumperDistributed:
         with _capture_stdout() as captured:
             if rank != 0:
                 time.sleep(6)
-            dumper.on_forward_pass_start()
+            dumper.step()
 
         output = captured.getvalue()
         print(f"Rank {rank} captured output: {output!r}")
@@ -257,9 +256,8 @@ class TestDumperDistributed:
 
     def test_file_content_correctness(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
+            DUMPER_ENABLE="1",
+            DUMPER_DIR=str(tmp_path),
         ):
             run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
 
@@ -267,8 +265,8 @@ class TestDumperDistributed:
     def _test_file_content_func(rank, tmpdir):
         tensor = torch.arange(12, device=f"cuda:{rank}").reshape(3, 4).float()
 
-        dumper.on_forward_pass_start()
         dumper.dump("content_check", tensor)
+        dumper.step()
 
         dist.barrier()
         path = _find_dump_file(tmpdir, rank=rank, name="content_check")
@@ -283,19 +281,18 @@ class TestDumperDistributed:
 class TestDumperFileWriteControl:
     def test_filter(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
-            SGLANG_DUMPER_FILTER="name=keep",
+            DUMPER_ENABLE="1",
+            DUMPER_DIR=str(tmp_path),
+            DUMPER_FILTER="name=keep",
         ):
             run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_filter_func(rank, tmpdir):
-        dumper.on_forward_pass_start()
         dumper.dump("keep_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("skip_this", torch.randn(5, device=f"cuda:{rank}"))
         dumper.dump("not_keep_this", torch.randn(5, device=f"cuda:{rank}"))
+        dumper.step()
 
         dist.barrier()
         filenames = _get_filenames(tmpdir)
@@ -307,16 +304,15 @@ class TestDumperFileWriteControl:
 
     def test_save_false(self, tmp_path):
         with temp_set_env(
-            allow_sglang=True,
-            SGLANG_DUMPER_ENABLE="1",
-            SGLANG_DUMPER_DIR=str(tmp_path),
+            DUMPER_ENABLE="1",
+            DUMPER_DIR=str(tmp_path),
         ):
             run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        dumper.on_forward_pass_start()
         dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
+        dumper.step()
 
         dist.barrier()
         assert len(_get_filenames(tmpdir)) == 0
@@ -422,7 +418,7 @@ class TestDumpDictFormat:
         meta = raw["meta"]
         assert meta["name"] == "fmt_test"
         assert meta["custom_key"] == "hello"
-        assert "forward_pass_id" in meta
+        assert "step" in meta
         assert "rank" in meta
         assert "dump_index" in meta
 
@@ -448,9 +444,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
         enable_http_server=False,
         **overrides,
     )
-    d = _Dumper(config=config)
-    d.on_forward_pass_start()
-    return d
+    return _Dumper(config=config)
 
 
 def _get_filenames(tmpdir):
@@ -584,18 +578,18 @@ class TestDumpGrad:
             not_exist=["grad__"],
         )
 
-    def test_dump_grad_captures_forward_pass_id(self, tmp_path):
+    def test_dump_grad_captures_step(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
-        d._forward_pass_id = 42
+        d._step = 42
         x = torch.randn(3, 3, requires_grad=True)
         y = (x * 2).sum()
 
         d.dump("id_test", x)
-        d._forward_pass_id = 999
+        d._step = 999
         y.backward()
 
         grad_file = _find_dump_file(tmp_path, name="grad__id_test")
-        assert "forward_pass_id=42" in grad_file.name
+        assert "step=42" in grad_file.name
 
     def test_dump_grad_file_content(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
@@ -807,7 +801,7 @@ class TestReset:
         d.reset()
 
         assert d._dump_index == 0
-        assert d._forward_pass_id == 0
+        assert d._step == 0
         assert d._global_ctx == {}
 
     def test_dump_works_after_reset(self, tmp_path):
@@ -815,7 +809,6 @@ class TestReset:
         d.dump("pre", torch.randn(3, 3))
 
         d.reset()
-        d.on_forward_pass_start()
         d.dump("post", torch.randn(3, 3))
 
         filenames = _get_filenames(tmp_path)
@@ -847,7 +840,7 @@ class TestDumperHttp:
                 thread.join(timeout=10)
         else:
             base_url = DEFAULT_URL_FOR_TEST
-            env = {**os.environ, "SGLANG_DUMPER_SERVER_PORT": "reuse"}
+            env = {**os.environ, "DUMPER_SERVER_PORT": "reuse"}
             proc = popen_launch_server(
                 "Qwen/Qwen3-0.6B",
                 base_url,
@@ -863,7 +856,7 @@ class TestDumperHttp:
     @staticmethod
     def _standalone_mode_worker(rank, http_port: int, stop_event):
         dumper.configure(enable=False, server_port=str(http_port))
-        dumper.on_forward_pass_start()
+        dumper.step()
         stop_event.wait()
 
     @staticmethod
@@ -927,7 +920,7 @@ class TestDumperHttp:
         self._post(dumper_http_url, "reset")
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "dump_index", 0)
-        self._assert_all_ranks(states, "forward_pass_id", 0)
+        self._assert_all_ranks(states, "step", 0)
 
     def test_get_state(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
@@ -936,7 +929,7 @@ class TestDumperHttp:
         self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
         for state in states:
             assert "dump_index" in state
-            assert "forward_pass_id" in state
+            assert "step" in state
 
     def test_all_ranks_consistent(self, dumper_http_url: str):
         self._post(dumper_http_url, "configure", enable=True, dir="/tmp/multi")
