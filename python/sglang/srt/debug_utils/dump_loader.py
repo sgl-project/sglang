@@ -25,7 +25,7 @@ class DumpLoader:
 
         from sglang.srt.debug_utils.dumper import dumper
 
-        step = dumper._step
+        step = dumper._state.step
         conditions = dict(name=name, step=step, **kwargs)
         row = find_row(self._df, conditions=conditions)
         assert (

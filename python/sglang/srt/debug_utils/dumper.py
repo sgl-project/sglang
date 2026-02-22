@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -122,7 +122,7 @@ _DEFAULT_EXP_NAME_PREFIX = "dump_"
 
 
 @dataclass(frozen=True)
-class _DumperConfig(_BaseConfig):
+class DumperConfig(_BaseConfig):
     enable: bool = False
     filter: Optional[str] = None
     dir: str = "/tmp/dumper"
@@ -158,6 +158,15 @@ class _DumperConfig(_BaseConfig):
 # -------------------------------------- dumper core ------------------------------------------
 
 
+@dataclass
+class _DumperState:
+    dump_index: int = 0
+    step: int = 0
+    global_ctx: dict = field(default_factory=dict)
+    captured_output_data: Optional[dict] = None
+    cleanup_previous_handled: bool = False
+
+
 class _Dumper:
     """Utility to dump tensors, which can be useful when comparison checking models.
 
@@ -188,17 +197,9 @@ class _Dumper:
     Related: `sglang.srt.debug_utils.dump_comparator` for dump comparison
     """
 
-    def __init__(self, *, config: _DumperConfig):
+    def __init__(self, *, config: DumperConfig):
         self._config = config
-
-        self._http_server_handled = not config.enable_http_server
-        self._cleanup_previous_handled = not config.cleanup_previous
-
-        self._dump_index = 0
-        self._step = 0
-        self._global_ctx: dict = {}
-        self._captured_output_data: Optional[dict] = None
-        self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
+        self._state = _DumperState()
 
     # ------------------------------- public :: core ---------------------------------
 
@@ -209,7 +210,7 @@ class _Dumper:
     def step(self):
         """This should be called on all ranks at the end of each iteration."""
 
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
 
         if not self._config.enable:
             return
@@ -217,8 +218,8 @@ class _Dumper:
         # Users may want to `dump` only on some ranks, thus determine name here
         self._ensure_exp_name()
 
-        self._step += 1
-        print(f"[Dumper] [{time.time()}] step={self._step}")
+        self._state.step += 1
+        print(f"[Dumper] [{time.time()}] step={self._state.step}")
 
     def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
         self._dump_inner(
@@ -267,15 +268,15 @@ class _Dumper:
         ...
         dumper.set_ctx(layer_id=None)
         """
-        self._global_ctx = {
-            k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
+        self._state.global_ctx = {
+            k: v for k, v in (self._state.global_ctx | kwargs).items() if v is not None
         }
 
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
     ) -> Optional["_NonIntrusiveDumper"]:
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
@@ -290,48 +291,29 @@ class _Dumper:
         self._config = self._config.with_defaults(**kwargs)
 
     def reset(self) -> None:
-        self._dump_index = 0
-        self._step = 0
-        self._global_ctx = {}
+        self._state = _DumperState()
 
     @contextmanager
     def capture_output(self):
-        assert self._captured_output_data is None
-        self._captured_output_data = {}
+        assert self._state.captured_output_data is None
+        self._state.captured_output_data = {}
         try:
-            yield self._captured_output_data
+            yield self._state.captured_output_data
         finally:
-            self._captured_output_data = None
+            self._state.captured_output_data = None
 
     def get_state(self) -> dict:
         return {
             "config": asdict(self._config),
-            "dump_index": self._dump_index,
-            "step": self._step,
+            "dump_index": self._state.dump_index,
+            "step": self._state.step,
         }
 
-    # ------------------------- public :: only used internally -----------------------------
-
-    def _handle_http_control_request(
-        self, *, method: str, body: dict[str, Any]
-    ) -> list[dict]:
-        return self._rpc_broadcast._handle_http_control_request_inner(
-            method=method, body=body
-        )
-
-    def _handle_http_control_request_inner(
-        self, *, method: str, body: dict[str, Any]
-    ) -> dict:
-        if method == "get_state":
-            return self.get_state()
-        elif method == "configure":
-            self.configure(**body)
-            return {}
-        elif method == "reset":
-            self.reset()
-            return {}
-        else:
-            raise ValueError(f"Unknown dumper control method: {method!r}")
+    @cached_property
+    def _http_manager(self) -> Optional["_DumperHttpManager"]:
+        if self._config.server_port_parsed is None:
+            return None
+        return _DumperHttpManager(self)
 
     # ------------------------- private :: related to dump -----------------------------
 
@@ -348,12 +330,12 @@ class _Dumper:
         value_tag: str,
         grad_tag: str,
     ) -> None:
-        self._ensure_http_server()
+        self._http_manager  # noqa: B018
 
         if not self._config.enable:
             return
 
-        tags = dict(name=name, **extra_kwargs, **self._global_ctx)
+        tags = dict(name=name, **extra_kwargs, **self._state.global_ctx)
         if (f := self._config.filter) is not None and re.search(
             f, _format_tags(tags)
         ) is None:
@@ -405,7 +387,7 @@ class _Dumper:
         if not tensor.requires_grad:
             return
 
-        captured_step = self._step
+        captured_step = self._state.step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -429,13 +411,13 @@ class _Dumper:
         step: Optional[int] = None,
     ) -> None:
         self._ensure_exp_name()
-        self._dump_index += 1
+        self._state.dump_index += 1
 
         rank = _get_rank()
         full_kwargs = dict(
-            step=(step if step is not None else self._step),
+            step=(step if step is not None else self._state.step),
             rank=rank,
-            dump_index=self._dump_index,
+            dump_index=self._state.dump_index,
             **tags,
         )
         full_filename = _format_tags(full_kwargs) + ".pt"
@@ -452,19 +434,22 @@ class _Dumper:
                 f"sample_value={get_truncated_value(value)}"
             )
 
-        capturing = self._captured_output_data is not None
+        capturing = self._state.captured_output_data is not None
         if save and (self._config.enable_output_file or capturing):
             output_data = {
-                "value": value.data if isinstance(value, torch.nn.Parameter) else value,
+                "value": value,
                 "meta": dict(**full_kwargs, **self._static_meta),
             }
 
             if capturing:
                 output_data["value"] = _deepcopy_or_clone(output_data["value"])
-                self._captured_output_data[tags["name"]] = output_data
+                self._state.captured_output_data[tags["name"]] = output_data
             else:
-                if not self._cleanup_previous_handled:
-                    self._cleanup_previous_handled = True
+                if (
+                    not self._state.cleanup_previous_handled
+                    and self._config.cleanup_previous
+                ):
+                    self._state.cleanup_previous_handled = True
                     _cleanup_old_dumps(
                         Path(self._config.dir), exp_name=self._config.exp_name
                     )
@@ -477,33 +462,6 @@ class _Dumper:
     @cached_property
     def _static_meta(self) -> dict:
         return _compute_static_meta()
-
-    # Even if DUMPER_ENABLE=0, users may want to use HTTP endpoint to enable it
-    def _ensure_http_server(self):
-        if self._http_server_handled:
-            return
-        self._http_server_handled = True
-
-        http_port = self._config.server_port_parsed
-        if http_port is None:
-            return
-
-        rpc_broadcast = _create_zmq_rpc_broadcast(
-            self,
-            timeout_seconds=self._config.collective_timeout,
-        )
-
-        if _get_rank() == 0:
-            assert rpc_broadcast is not None
-            self._rpc_broadcast = rpc_broadcast
-
-            if http_port == "reuse":
-                print(
-                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
-                )
-            else:
-                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
-                print(f"[Dumper] HTTP server started on port {http_port}")
 
     def _ensure_exp_name(self):
         if self._config.exp_name is None:
@@ -656,13 +614,24 @@ def _torch_save(value, path: str):
             return torch.save(value, path)
         except RuntimeError as e:
             if "not pickleable" in str(e):
-                # Some parameter subclasses with extra fields are not pickleable
-                if isinstance(value, torch.nn.Parameter):
-                    print(f"[Dumper] Observe error={e} and try pickling value.data")
-                    return _torch_save(value.data, path)
+                stripped = _strip_parameter(value)
+                if stripped is not value:
+                    print(f"[Dumper] Observe error={e} and try pickling .data")
+                    return _torch_save(stripped, path)
             raise
     except Exception as e:
         print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
+
+
+def _strip_parameter(value):
+    """Strip nn.Parameter to plain Tensor so it can be pickled."""
+    if isinstance(value, torch.nn.Parameter):
+        return value.data
+    if isinstance(value, dict) and isinstance(
+        value.get("value"), torch.nn.Parameter
+    ):
+        return {**value, "value": value["value"].data}
+    return value
 
 
 def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60):
@@ -726,7 +695,10 @@ def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
             print(f"[Dumper] Cleaned up {entry}")
 
     if dist.is_initialized():
-        dist.barrier()
+        _collective_with_timeout(
+            dist.barrier,
+            operation_name="barrier in _cleanup_old_dumps",
+        )
 
 
 def _get_rank():
@@ -792,6 +764,51 @@ def _compute_static_meta():
     return result
 
 
+# -------------------------------------- http manager ------------------------------------------
+
+
+class _DumperHttpManager:
+    def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
+        http_port = self._dumper._config.server_port_parsed
+
+        rpc_broadcast = _create_zmq_rpc_broadcast(
+            self,
+            timeout_seconds=self._dumper._config.collective_timeout,
+        )
+
+        if _get_rank() == 0:
+            assert rpc_broadcast is not None
+            self._rpc_broadcast = rpc_broadcast
+
+            if http_port == "reuse":
+                print(
+                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
+                )
+            else:
+                _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
+                print(f"[Dumper] HTTP server started on port {http_port}")
+
+    # ------------------------------- public ---------------------------------
+
+    def handle_request(self, *, method: str, body: dict[str, Any]) -> list[dict]:
+        return self._rpc_broadcast._handle_request_inner(method=method, body=body)
+
+    # ------------------------------- private ---------------------------------
+
+    def _handle_request_inner(self, *, method: str, body: dict[str, Any]) -> dict:
+        if method == "get_state":
+            return self._dumper.get_state()
+        elif method == "configure":
+            self._dumper.configure(**body)
+            return {}
+        elif method == "reset":
+            self._dumper.reset()
+            return {}
+        else:
+            raise ValueError(f"Unknown dumper control method: {method!r}")
+
+
 # -------------------------------------- http control server ------------------------------------------
 
 
@@ -812,9 +829,7 @@ def _make_http_handler(*, prefix: str, target):
             try:
                 req_body = self._get_request_body()
                 print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
-                result = target._handle_http_control_request(
-                    method=method, body=req_body
-                )
+                result = target.handle_request(method=method, body=req_body)
                 resp_body = json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -924,19 +939,6 @@ class _RpcBroadcastBase:
         self._handles = handles
 
 
-class _LocalOnlyBroadcast(_RpcBroadcastBase):
-    """Calls methods directly on the local dumper, wrapping the result in a list."""
-
-    def __init__(self, dumper: "_Dumper"):
-        self._dumper = dumper
-
-    def __getattr__(self, method_name: str):
-        def call(*args, **kwargs):
-            return [getattr(self._dumper, method_name)(*args, **kwargs)]
-
-        return call
-
-
 class _ZmqRpcBroadcast(_RpcBroadcastBase):
     """Broadcasts method calls to all ZMQ RPC handles.
 
@@ -957,16 +959,6 @@ class _ZmqRpcBroadcast(_RpcBroadcastBase):
 
 
 # --------------------------------- copied code (avoid dependency) --------------------------------------
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 def _get_local_ip_by_remote() -> Optional[str]:
@@ -1163,7 +1155,7 @@ _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
 # -------------------------------------- singleton ------------------------------------------
 
 
-dumper = _Dumper(config=_DumperConfig.from_env())
+dumper = _Dumper(config=DumperConfig.from_env())
 
 
 # -------------------------------------- other utility functions ------------------------------------------

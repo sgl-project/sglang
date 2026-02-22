@@ -14,12 +14,15 @@ import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
     _collective_with_timeout,
+    _deepcopy_or_clone,
     _Dumper,
-    _DumperConfig,
+    DumperConfig,
     _format_tags,
+    _get_default_exp_name,
     _materialize_value,
     _MegatronPlugin,
     _obj_to_dict,
+    _register_forward_hook_or_replace_fn,
     _SGLangPlugin,
     _torch_save,
     dumper,
@@ -54,25 +57,25 @@ def _capture_stdout():
 
 class TestDumperConfig:
     def test_from_env_defaults_match_dataclass_defaults(self):
-        assert _DumperConfig.from_env() == _DumperConfig()
+        assert DumperConfig.from_env() == DumperConfig()
 
     def test_from_env_bool(self):
         with temp_set_env(DUMPER_ENABLE="1"):
-            assert _DumperConfig.from_env().enable is True
+            assert DumperConfig.from_env().enable is True
         with temp_set_env(DUMPER_ENABLE="false"):
-            assert _DumperConfig.from_env().enable is False
+            assert DumperConfig.from_env().enable is False
 
     def test_from_env_str(self):
         with temp_set_env(DUMPER_FILTER="layer_id=0"):
-            assert _DumperConfig.from_env().filter == "layer_id=0"
+            assert DumperConfig.from_env().filter == "layer_id=0"
 
     def test_from_env_dir(self):
         with temp_set_env(DUMPER_DIR="/my/dir"):
-            assert _DumperConfig.from_env().dir == "/my/dir"
+            assert DumperConfig.from_env().dir == "/my/dir"
 
     def test_from_env_int(self):
         with temp_set_env(DUMPER_COLLECTIVE_TIMEOUT="120"):
-            assert _DumperConfig.from_env().collective_timeout == 120
+            assert DumperConfig.from_env().collective_timeout == 120
 
     def test_configure_overrides(self):
         d = _make_test_dumper("/tmp")
@@ -83,87 +86,119 @@ class TestDumperConfig:
 
     def test_type_validation(self):
         with pytest.raises(TypeError, match="enable.*expected bool.*got str"):
-            _DumperConfig(enable="yes")
+            DumperConfig(enable="yes")
         with pytest.raises(
             TypeError, match="collective_timeout.*expected int.*got str"
         ):
-            _DumperConfig(collective_timeout="abc")
+            DumperConfig(collective_timeout="abc")
         with pytest.raises(TypeError, match="filter.*expected str.*got int"):
-            _DumperConfig(filter=123)
+            DumperConfig(filter=123)
 
     def test_configure_default_skips_when_env_set(self):
         with temp_set_env(DUMPER_FILTER="from_env"):
-            d = _Dumper(config=_DumperConfig.from_env())
+            d = _Dumper(config=DumperConfig.from_env())
             d.configure_default(filter="from_code")
             assert d._config.filter == "from_env"
 
     def test_configure_default_applies_when_no_env(self):
-        d = _Dumper(config=_DumperConfig.from_env())
+        d = _Dumper(config=DumperConfig.from_env())
         d.configure_default(filter="from_code")
         assert d._config.filter == "from_code"
 
+    def test_from_env_whitespace_treated_as_unset(self):
+        with temp_set_env(DUMPER_FILTER="   "):
+            assert DumperConfig.from_env().filter is None
+
     def test_may_enable_default_false(self):
-        d = _Dumper(config=_DumperConfig())
+        d = _Dumper(config=DumperConfig())
         assert d.may_enable is False
 
     def test_may_enable_true_when_enabled(self):
-        d = _Dumper(config=_DumperConfig(enable=True))
+        d = _Dumper(config=DumperConfig(enable=True))
         assert d.may_enable is True
 
     def test_may_enable_true_when_server_port_set(self):
-        d = _Dumper(config=_DumperConfig(server_port="40000"))
+        d = _Dumper(config=DumperConfig(server_port="40000"))
         assert d.may_enable is True
 
-        d2 = _Dumper(config=_DumperConfig(server_port="reuse"))
+        d2 = _Dumper(config=DumperConfig(server_port="reuse"))
         assert d2.may_enable is True
+
+
+class TestServerPortParsed:
+    def test_negative_returns_none(self):
+        assert DumperConfig(server_port="-1").server_port_parsed is None
+
+    def test_zero_returns_none(self):
+        assert DumperConfig(server_port="0").server_port_parsed is None
+
+    def test_positive_returns_int(self):
+        result = DumperConfig(server_port="40000").server_port_parsed
+        assert result == 40000
+        assert isinstance(result, int)
+
+    def test_reuse_returns_string(self):
+        assert DumperConfig(server_port="reuse").server_port_parsed == "reuse"
+
+
+class TestDefaultExpName:
+    def test_starts_with_prefix(self):
+        name = _get_default_exp_name(timeout_seconds=5)
+        assert name.startswith("dump_")
+
+    def test_suffix_format(self):
+        name = _get_default_exp_name(timeout_seconds=5)
+        suffix = name[len("dump_") :]
+        assert len(suffix) == 22
+        assert suffix[8] == "_"
 
 
 class TestKvPairsParsing:
     def test_from_kv_pairs_none_returns_defaults(self):
-        assert _DumperConfig.from_kv_pairs(None) == _DumperConfig()
+        assert DumperConfig.from_kv_pairs(None) == DumperConfig()
 
     def test_from_kv_pairs_empty_returns_defaults(self):
-        assert _DumperConfig.from_kv_pairs([]) == _DumperConfig()
+        assert DumperConfig.from_kv_pairs([]) == DumperConfig()
 
     def test_from_kv_pairs_bool_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["enable=true"])
+        cfg = DumperConfig.from_kv_pairs(["enable=true"])
         assert cfg.enable is True
         assert cfg.dir == "/tmp/dumper"
 
     def test_from_kv_pairs_bool_numeric(self):
-        assert _DumperConfig.from_kv_pairs(["enable=1"]).enable is True
-        assert _DumperConfig.from_kv_pairs(["enable=0"]).enable is False
+        assert DumperConfig.from_kv_pairs(["enable=1"]).enable is True
+        assert DumperConfig.from_kv_pairs(["enable=0"]).enable is False
 
     def test_from_kv_pairs_int_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=120"])
+        cfg = DumperConfig.from_kv_pairs(["collective_timeout=120"])
         assert cfg.collective_timeout == 120
         assert type(cfg.collective_timeout) is int
 
     def test_from_kv_pairs_int_field_zero_stays_int(self):
-        cfg = _DumperConfig.from_kv_pairs(["collective_timeout=0"])
+        cfg = DumperConfig.from_kv_pairs(["collective_timeout=0"])
         assert cfg.collective_timeout == 0
         assert type(cfg.collective_timeout) is int
 
     def test_from_kv_pairs_str_field_not_coerced(self):
-        cfg = _DumperConfig.from_kv_pairs(["server_port=0"])
+        cfg = DumperConfig.from_kv_pairs(["server_port=0"])
         assert cfg.server_port == "0"
         assert type(cfg.server_port) is str
 
     def test_from_kv_pairs_str_field_one_stays_str(self):
-        cfg = _DumperConfig.from_kv_pairs(["server_port=1"])
+        cfg = DumperConfig.from_kv_pairs(["server_port=1"])
         assert cfg.server_port == "1"
         assert type(cfg.server_port) is str
 
     def test_from_kv_pairs_optional_str_field(self):
-        cfg = _DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
+        cfg = DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
         assert cfg.filter == "layer_id=[0-3]"
 
     def test_from_kv_pairs_optional_str_exp_name(self):
-        cfg = _DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
+        cfg = DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
         assert cfg.exp_name == "my_experiment"
 
     def test_from_kv_pairs_multiple_fields(self):
-        cfg = _DumperConfig.from_kv_pairs(
+        cfg = DumperConfig.from_kv_pairs(
             [
                 "enable=true",
                 "dir=/my/dir",
@@ -180,31 +215,31 @@ class TestKvPairsParsing:
 
     def test_from_kv_pairs_missing_equals_raises(self):
         with pytest.raises(ValueError, match="missing '='"):
-            _DumperConfig.from_kv_pairs(["enable"])
+            DumperConfig.from_kv_pairs(["enable"])
 
     def test_from_kv_pairs_unknown_key_raises(self):
         with pytest.raises(ValueError, match="Unknown config key"):
-            _DumperConfig.from_kv_pairs(["nonexistent=true"])
+            DumperConfig.from_kv_pairs(["nonexistent=true"])
 
     def test_kv_pairs_to_dict_returns_only_explicit(self):
-        d = _DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
+        d = DumperConfig._kv_pairs_to_dict(["enable=true", "dir=/x"])
         assert d == {"enable": True, "dir": "/x"}
         assert "filter" not in d
         assert "collective_timeout" not in d
 
     def test_kv_pairs_to_dict_none_returns_empty(self):
-        assert _DumperConfig._kv_pairs_to_dict(None) == {}
+        assert DumperConfig._kv_pairs_to_dict(None) == {}
 
     def test_kv_pairs_to_dict_empty_returns_empty(self):
-        assert _DumperConfig._kv_pairs_to_dict([]) == {}
+        assert DumperConfig._kv_pairs_to_dict([]) == {}
 
     def test_from_kv_pairs_value_with_equals_in_value(self):
-        cfg = _DumperConfig.from_kv_pairs(["filter=name=foo"])
+        cfg = DumperConfig.from_kv_pairs(["filter=name=foo"])
         assert cfg.filter == "name=foo"
 
     def test_from_kv_pairs_type_validation_still_works(self):
         with pytest.raises(TypeError, match="collective_timeout.*expected int"):
-            _DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
+            DumperConfig.from_kv_pairs(["collective_timeout=not_a_number"])
 
 
 class TestDumperPureFunctions:
@@ -227,6 +262,21 @@ class TestDumperPureFunctions:
         result = _obj_to_dict(Obj())
         assert result["x"] == 10
         assert "method" not in result
+
+    def test_deepcopy_or_clone_tensor(self):
+        original = torch.randn(3, 3)
+        cloned = _deepcopy_or_clone(original)
+        assert torch.equal(cloned, original)
+        original.fill_(999.0)
+        assert not torch.equal(cloned, original)
+
+    def test_deepcopy_or_clone_non_tensor(self):
+        original = {"a": [1, 2, 3]}
+        cloned = _deepcopy_or_clone(original)
+        assert cloned == original
+        assert cloned is not original
+        original["a"].append(4)
+        assert len(cloned["a"]) == 3
 
     def test_get_tensor_info(self):
         info = get_tensor_info(torch.randn(10, 10))
@@ -339,7 +389,7 @@ class TestDumperDistributed:
     @staticmethod
     def _test_collective_timeout_func(rank):
         dumper = _Dumper(
-            config=_DumperConfig(
+            config=DumperConfig(
                 enable=True,
                 collective_timeout=3,
                 enable_http_server=False,
@@ -422,6 +472,13 @@ class TestDumperFileWriteControl:
         assert len(_get_filenames(tmpdir)) == 0
 
 
+class TestDumpEnableFlags:
+    def test_all_enables_false_no_output(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_value=False, enable_grad=False)
+        d.dump("should_skip", torch.randn(3, 3))
+        assert len(_get_filenames(tmp_path)) == 0
+
+
 class TestOutputControl:
     def test_file_enabled_by_default(self, tmp_path):
         d = _make_test_dumper(tmp_path)
@@ -493,6 +550,13 @@ class TestOutputControl:
         tensor.fill_(999.0)
         assert torch.equal(captured["clone_check"]["value"], torch.zeros(3, 3))
 
+    def test_capture_output_nested_raises(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        with d.capture_output():
+            with pytest.raises(AssertionError):
+                with d.capture_output():
+                    pass
+
     def test_capture_output_respects_filter(self, tmp_path):
         d = _make_test_dumper(tmp_path, filter="name=keep")
 
@@ -548,7 +612,7 @@ def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
         enable_http_server=False,
     )
     defaults.update(overrides)
-    config = _DumperConfig(**defaults)
+    config = DumperConfig(**defaults)
     return _Dumper(config=config)
 
 
@@ -685,12 +749,12 @@ class TestDumpGrad:
 
     def test_dump_grad_captures_step(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_grad=True)
-        d._step = 42
+        d._state.step = 42
         x = torch.randn(3, 3, requires_grad=True)
         y = (x * 2).sum()
 
         d.dump("id_test", x)
-        d._step = 999
+        d._state.step = 999
         y.backward()
 
         grad_file = _find_dump_file(tmp_path, name="grad__id_test")
@@ -860,6 +924,34 @@ class TestDumpModel:
         filenames = _get_filenames(tmp_path)
         assert all("grad" not in f for f in filenames)
 
+    def test_parameter_saved_as_parameter(self, tmp_path):
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+
+        d.dump_model(model, name_prefix="p")
+
+        path = _find_dump_file(tmp_path, name="p__weight")
+        loaded = _load_dump(path)
+        assert isinstance(loaded["value"], torch.nn.Parameter)
+        assert torch.equal(loaded["value"], model.weight)
+
+    def test_unpicklable_parameter_falls_back_to_data(self, tmp_path):
+        class BadParam(torch.nn.Parameter):
+            def __reduce_ex__(self, protocol):
+                raise RuntimeError("not pickleable")
+
+        d = _make_test_dumper(tmp_path, enable_model_grad=False)
+        model = torch.nn.Linear(4, 2, bias=False)
+        model.weight = BadParam(model.weight.data)
+
+        d.dump_model(model, name_prefix="p")
+
+        path = _find_dump_file(tmp_path, name="p__weight")
+        loaded = _load_dump(path)
+        assert isinstance(loaded["value"], torch.Tensor)
+        assert not isinstance(loaded["value"], torch.nn.Parameter)
+        assert torch.equal(loaded["value"], model.weight.data)
+
     def test_disable_model_value(self, tmp_path):
         d = _make_test_dumper(tmp_path, enable_model_value=False)
         model = torch.nn.Linear(4, 2, bias=False)
@@ -934,9 +1026,9 @@ class TestReset:
 
         d.reset()
 
-        assert d._dump_index == 0
-        assert d._step == 0
-        assert d._global_ctx == {}
+        assert d._state.dump_index == 0
+        assert d._state.step == 0
+        assert d._state.global_ctx == {}
 
     def test_dump_works_after_reset(self, tmp_path):
         d = _make_test_dumper(tmp_path)
@@ -949,6 +1041,123 @@ class TestReset:
         _assert_files(filenames, exist=["pre", "post"])
         post_file = _find_dump_file(tmp_path, name="post")
         assert "dump_index=1" in post_file.name
+
+    def test_cleanup_previous_re_triggers_after_reset(self, tmp_path):
+        """Miles pattern: reset() + configure(cleanup_previous=True) should re-clean."""
+        exp_alpha = "exp_alpha"
+        exp_beta = "exp_beta"
+
+        (tmp_path / exp_alpha).mkdir()
+        (tmp_path / exp_alpha / "stale.pt").touch()
+        (tmp_path / exp_beta).mkdir()
+        (tmp_path / exp_beta / "stale.pt").touch()
+
+        d = _make_test_dumper(tmp_path, exp_name=exp_alpha, cleanup_previous=True)
+        d.dump("phase1", torch.randn(2, 2))
+
+        d.reset()
+        d.configure(exp_name=exp_beta, cleanup_previous=True)
+        d.dump("phase2", torch.randn(2, 2))
+
+        assert not (tmp_path / exp_alpha / "stale.pt").exists()
+        assert not (tmp_path / exp_beta / "stale.pt").exists()
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["phase1", "phase2"])
+
+    def test_no_cleanup_when_config_false(self, tmp_path):
+        """cleanup_previous=False: handled stays False but no cleanup runs."""
+        old_dir = tmp_path / "dump_old"
+        old_dir.mkdir()
+        (old_dir / "dummy.pt").touch()
+
+        d = _make_test_dumper(tmp_path, cleanup_previous=False)
+        d.dump("tensor", torch.randn(2, 2))
+
+        assert old_dir.exists()
+        assert d._state.cleanup_previous_handled is False
+
+    def test_multi_phase_switch(self, tmp_path):
+        """Simulate Miles multi-phase: configure → dump → reset → configure new phase → dump."""
+        d = _make_test_dumper(tmp_path, cleanup_previous=True)
+
+        d.configure(exp_name="fwd_only")
+        d.dump("weight", torch.randn(2, 2))
+        d.step()
+        d.configure(enable=False)
+
+        d.reset()
+        d.configure(exp_name="fwd_bwd", enable=True, cleanup_previous=True)
+        d.dump("weight", torch.randn(2, 2))
+        d.step()
+
+        fwd_only_files = list(Path(tmp_path).glob("fwd_only/*.pt"))
+        fwd_bwd_files = list(Path(tmp_path).glob("fwd_bwd/*.pt"))
+        assert len(fwd_only_files) > 0
+        assert len(fwd_bwd_files) > 0
+        assert d._state.step == 1
+        assert d._state.dump_index == 1
+
+
+def _dumper_worker(rank, http_port: int, stop_event):
+    """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
+    dumper.configure(enable=False, server_port=str(http_port))
+    dumper.step()
+    stop_event.wait()
+
+
+def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            requests.post(f"{url}/dumper/configure", json={}, timeout=2)
+            return
+        except requests.ConnectionError:
+            time.sleep(0.5)
+    raise TimeoutError(f"Dumper HTTP server not reachable at {url}")
+
+
+class TestZmqPortIsolation:
+    """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
+
+    NUM_INSTANCES = 3
+
+    def test_concurrent_instances_no_port_conflict(self):
+        ports = [
+            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
+        ]
+        stop_events = []
+        threads = []
+        ctx = multiprocessing.get_context("spawn")
+
+        for port in ports:
+            stop_event = ctx.Event()
+            stop_events.append(stop_event)
+            thread = threading.Thread(
+                target=run_distributed_test,
+                args=(_dumper_worker,),
+                kwargs={"http_port": port, "stop_event": stop_event},
+            )
+            thread.start()
+            threads.append(thread)
+
+        try:
+            for port in ports:
+                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
+
+            for i, port in enumerate(ports):
+                resp = requests.post(
+                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                )
+                resp.raise_for_status()
+                states = resp.json()
+                assert (
+                    len(states) == 2
+                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+        finally:
+            for event in stop_events:
+                event.set()
+            for thread in threads:
+                thread.join(timeout=10)
 
 
 def _dumper_worker(rank, http_port: int, stop_event):
@@ -1124,12 +1333,31 @@ class TestDumperHttp:
         )
         assert resp.status_code == 400
 
+    def test_error_unknown_method(self, dumper_http_url: str):
+        resp = requests.post(
+            f"{dumper_http_url}/dumper/nonexistent",
+            json={},
+        )
+        assert resp.status_code == 400
+
     def test_error_wrong_type(self, dumper_http_url: str):
         resp = requests.post(
             f"{dumper_http_url}/dumper/configure",
             json={"enable": "not_a_bool"},
         )
         assert resp.status_code == 400
+
+
+class TestRegisterForwardHookOrReplaceFn:
+    def test_unknown_mode_raises(self):
+        module = torch.nn.Linear(4, 4)
+        with pytest.raises(ValueError, match="Unknown mode"):
+            _register_forward_hook_or_replace_fn(
+                module,
+                pre_hook=lambda _mod, _input: None,
+                hook=lambda _mod, _input, _output: None,
+                mode="bad",
+            )
 
 
 class _NonIntrusiveTestBase:
