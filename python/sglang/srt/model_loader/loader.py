@@ -683,7 +683,15 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+
+        if bool(int(os.environ.get("ENABLE_VFLY", "0"))):  # wili
+            print("[wili] Enable vision fly")
+            model.enable_vision_fly()
+        else:
+            print("[wili] Disable vision fly")
+
         model.load_weights(weights)
+        model.visual.patch_embed.copy_conv3d_weight_to_linear()  # wili, Conv3d -> Linear
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
