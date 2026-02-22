@@ -182,7 +182,9 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
-        model_config = get_diffusers_component_config(model_path=component_model_path)
+        model_config = get_diffusers_component_config(
+            component_path=component_model_path
+        )
         _clean_hf_config_inplace(model_config)
         logger.debug("HF model config: %s", model_config)
 

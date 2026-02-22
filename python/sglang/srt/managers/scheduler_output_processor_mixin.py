@@ -119,7 +119,14 @@ class SchedulerOutputProcessorMixin:
             for k, v in logits_output.customized_info.items():
                 if k not in req.customized_info:
                     req.customized_info[k] = []
-                req.customized_info[k].append(v[i])
+                # Copy the element so it doesn't retain the entire batch
+                # tensor/array via a view reference.
+                elem = v[i]
+                if isinstance(elem, torch.Tensor):
+                    elem = elem.clone()
+                elif hasattr(elem, "copy") and callable(elem.copy):
+                    elem = elem.copy()
+                req.customized_info[k].append(elem)
 
     def process_batch_result_prefill(
         self: Scheduler,

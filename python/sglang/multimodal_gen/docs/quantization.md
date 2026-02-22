@@ -121,3 +121,44 @@ Choose the appropriate configuration based on your hardware and requirements:
 ### Custom Model Quantization
 
 If you want to quantize your own models, you can use the [DeepCompressor](https://github.com/mit-han-lab/deepcompressor) tool. For detailed instructions, please refer to the Nunchaku official documentation.
+
+## FP8 Quantization
+
+### Usage
+
+#### Option 1: Use Pre-quantized Models (Recommended)
+
+If available, you can directly use pre-quantized FP8 models from Hugging Face or other sources. Simply load them with SGLang:
+
+```bash
+sglang generate \
+  --model-path /path/to/FLUX.1-dev-FP8/ \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
+
+#### Option 2: Convert Your Own Models
+
+If you need to convert a model to FP8 format, use the provided conversion script:
+
+**Step 1: Convert the Model**
+
+```bash
+# convert transformer to FP8 with block quantization
+python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
+  --model-dir /path/to/FLUX.1-dev/transformer \
+  --save-dir /path/to/FLUX.1-dev/transformer-FP8 \
+  --strategy block \
+  --block-size 128 128
+```
+
+**Step 2: Run Inference**
+
+```bash
+sglang generate \
+  --model-path /path/to/FLUX.1-dev/
+  # override transformer component with path to converted model
+  --transformer-path /path/to/FLUX.1-dev/transformer-FP8
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
