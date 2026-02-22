@@ -68,7 +68,6 @@ class VAELoader(ComponentLoader):
 
         server_args.model_paths[component_name] = component_model_path
 
-        logger.debug("HF model config: %s", config)
         if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
             pipeline_vae_precision = "vae_precision"

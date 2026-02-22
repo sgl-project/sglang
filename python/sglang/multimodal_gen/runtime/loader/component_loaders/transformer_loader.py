@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import os
@@ -146,12 +145,6 @@ class TransformerLoader(ComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
-        if cls_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported."
-            )
-
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
@@ -167,20 +160,21 @@ class TransformerLoader(ComponentLoader):
             param_dtype,
         )
 
-        init_params: dict[str, Any] = {"config": dit_config, "hf_config": config}
         # prepare init_param
-        if "quant_config" in inspect.signature(model_cls.__init__).parameters:
-            init_params.update(
-                {
-                    "quant_config": (quant_config if quant_config else nunchaku_config),
-                }
+        init_params: dict[str, Any] = {
+            "config": dit_config,
+            "hf_config": config,
+            "quant_config": (quant_config if quant_config else nunchaku_config),
+        }
+        if (
+            init_params["quant_config"] is None
+            and server_args.transformer_weights_path is not None
+        ):
+            logger.warning(
+                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
-            if init_params["quant_config"] is None:
-                logger.warning(
-                    f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
-                )
-            else:
-                logger.debug("quantization config: %s", init_params["quant_config"])
+        else:
+            logger.debug("quantization config: %s", init_params["quant_config"])
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(

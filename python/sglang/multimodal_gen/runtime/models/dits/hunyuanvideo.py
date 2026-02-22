@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     get_rotary_pos_embed,
@@ -57,6 +60,7 @@ class MMDoubleStreamBlock(nn.Module):
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -90,6 +94,7 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_qkv",
+            quant_config=quant_config,
         )
 
         self.img_attn_q_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
@@ -101,6 +106,7 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.img_attn_proj",
+            quant_config=quant_config,
         )
 
         self.img_mlp = MLP(
@@ -109,6 +115,7 @@ class MMDoubleStreamBlock(nn.Module):
             bias=True,
             dtype=dtype,
             prefix=f"{prefix}.img_mlp",
+            quant_config=quant_config,
         )
 
         # Text modulation components
@@ -131,7 +138,11 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Text attention components
         self.txt_attn_qkv = ReplicatedLinear(
-            hidden_size, hidden_size * 3, bias=True, params_dtype=dtype
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            params_dtype=dtype,
+            quant_config=quant_config,
         )
 
         # QK norm layers for text
@@ -139,10 +150,20 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_attn_k_norm = RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
         self.txt_attn_proj = ReplicatedLinear(
-            hidden_size, hidden_size, bias=True, params_dtype=dtype
+            hidden_size,
+            hidden_size,
+            bias=True,
+            params_dtype=dtype,
+            quant_config=quant_config,
         )
 
-        self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype)
+        self.txt_mlp = MLP(
+            hidden_size,
+            mlp_hidden_dim,
+            bias=True,
+            dtype=dtype,
+            quant_config=quant_config,
+        )
 
         # Use UlyssesAttention to replace Distributed attention
         self.attn = UlyssesAttention(
@@ -264,6 +285,7 @@ class MMSingleStreamBlock(nn.Module):
         dtype: torch.dtype | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -281,6 +303,7 @@ class MMSingleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.linear1",
+            quant_config=quant_config,
         )
 
         # Combined projection and MLP output
@@ -290,6 +313,7 @@ class MMSingleStreamBlock(nn.Module):
             bias=True,
             params_dtype=dtype,
             prefix=f"{prefix}.linear2",
+            quant_config=quant_config,
         )
 
         # QK norm layers
@@ -408,7 +432,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = HunyuanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = HunyuanVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: HunyuanVideoConfig, hf_config: dict[str, Any]):
+    def __init__(
+        self,
+        config: HunyuanVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__(config=config, hf_config=hf_config)
 
         self.patch_size = [config.patch_size_t, config.patch_size, config.patch_size]
@@ -494,6 +523,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"{config.prefix}.double_blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_layers)
             ]
@@ -509,6 +539,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"{config.prefix}.single_blocks.{i + config.num_layers}",
+                    quant_config=quant_config,
                 )
                 for i in range(config.num_single_layers)
             ]
