@@ -16,18 +16,28 @@
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
-LOCAL_PREFERENCE_FACTOR = (
-    1.1  # Bias towards local rank in waterfill; 1.0 = pure argmin.
-)
+LOCAL_PREFERENCE_FACTOR = 1.1  # Bias towards local rank; 1.0 = pure argmin.
+_LOCAL_PREF_NUMER = int(LOCAL_PREFERENCE_FACTOR * 5)
+_LOCAL_PREF_DENOM = 5
 
 
-import triton
-import triton.language as tl
+def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
+    """Return empty expanded tensors for zero-token batches."""
+    topk = topk_ids.shape[1]
+    device = topk_ids.device
+    return (
+        torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
+        torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
+        torch.empty(0, dtype=torch.bool, device=device),
+    )
+
 
 # ============== Triton Kernels ==============
 
@@ -94,10 +104,7 @@ def _waterfill_expand_with_histogram_kernel(
     ALLOW_ALL_RANKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused waterfill + expand + histogram + ID remapping kernel.
-
-    ID remapping: old_id -> old_id + (old_id // old_experts_per_rank).
-    """
+    """Fused waterfill + expand + histogram. ID remap: old_id -> old_id + old_id // old_epr."""
     pid = tl.program_id(0)
     token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = token_idx < num_tokens
@@ -111,7 +118,6 @@ def _waterfill_expand_with_histogram_kernel(
     derived_target_total = (
         total_effective_k + total_tokens_global_k + world_size - 1
     ) // world_size
-    # Use precomputed target if provided (dynamic path), else derive from counts.
     target_total = tl.where(
         precomputed_target_total > 0,
         precomputed_target_total,
@@ -149,7 +155,6 @@ def _waterfill_expand_with_histogram_kernel(
         has_valid = has_valid | valid
 
         if not ALLOW_ALL_RANKS:
-            # Use OLD experts_per_rank for rank calculation from original expert IDs
             target_rank = expert_id // old_experts_per_rank
             target_rank = tl.minimum(tl.maximum(target_rank, 0), world_size - 1)
             target_rank_i32 = target_rank.to(tl.int32)
@@ -220,7 +225,6 @@ def _waterfill_expand_with_histogram_kernel(
         tl.full([BLOCK_SIZE], local_shared_id, dtype=tl.int64),
         remote_shared_id,
     ).to(tl.int64)
-    # Invalidate padded tokens.
     shared_expert_id = tl.where(
         has_valid,
         shared_expert_id,
@@ -229,7 +233,7 @@ def _waterfill_expand_with_histogram_kernel(
 
     dest_rank = tl.where(is_local, source_rank, best_rank).to(tl.int32)
 
-    # Step 3: Copy and remap topk_ids (old_id -> old_id + old_id // old_epr), copy weights.
+    # Step 3: Copy and remap topk_ids, copy weights.
     for k in range(topk):
         old_id = tl.load(topk_ids_ptr + token_idx * topk + k, mask=mask, other=-1).to(
             tl.int64
@@ -246,7 +250,7 @@ def _waterfill_expand_with_histogram_kernel(
         val = tl.where(expert_id >= 0, val, 0.0)
         tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
-    # Step 4: Write shared expert column (topk+1).
+    # Step 4: Write shared expert column and local mask.
     tl.store(
         expanded_ids_ptr + token_idx * (topk + 1) + topk,
         shared_expert_id,
@@ -257,11 +261,9 @@ def _waterfill_expand_with_histogram_kernel(
         tl.where(has_valid, shared_weight, 0.0),
         mask=mask,
     )
-
-    # Step 5: Write local mask.
     tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
 
-    # Step 6: Block-level histogram with minimal atomics.
+    # Step 5: Block-level histogram with minimal atomics.
     for r in range(world_size):
         rank_count = tl.sum(tl.where(mask & has_valid & (dest_rank == r), 1, 0))
         if rank_count > 0:
@@ -279,27 +281,15 @@ def waterfill_prepare_dispatch_fused(
     allow_all_ranks: bool = False,
     target_total: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Fused waterfill + expand + ID remapping using a single Triton kernel.
-
-    Expert ID remapping: old_id -> old_id + (old_id // old_experts_per_rank).
-
-    Returns:
-        expanded_topk_ids: [N, topk+1] with remapped expert IDs
-        expanded_topk_weights: [N, topk+1]
-        local_shared_mask: [N] boolean
-    """
+    """Fused waterfill + expand + ID remapping via Triton kernel."""
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
-    old_experts_per_rank = num_routed_experts // world_size  # Original: 32
-    new_experts_per_rank = old_experts_per_rank + 1  # New: 33
+    old_experts_per_rank = num_routed_experts // world_size
+    new_experts_per_rank = old_experts_per_rank + 1
     device = topk_ids.device
 
     if num_tokens == 0:
-        return (
-            torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
-            torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
-            torch.empty(0, dtype=torch.bool, device=device),
-        )
+        return _empty_expanded(topk_ids, topk_weights)
 
     expanded_topk_ids = torch.empty(
         num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
@@ -311,9 +301,6 @@ def waterfill_prepare_dispatch_fused(
 
     BLOCK_SIZE = 256
     grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    local_pref_numer = int(LOCAL_PREFERENCE_FACTOR * 5)
-    local_pref_denom = 5
-
     dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
     _waterfill_expand_with_histogram_kernel[grid](
         topk_ids,
@@ -331,8 +318,8 @@ def waterfill_prepare_dispatch_fused(
         source_rank,
         shared_weight,
         LOCAL_SHARED_MARKER,
-        local_pref_numer,
-        local_pref_denom,
+        _LOCAL_PREF_NUMER,
+        _LOCAL_PREF_DENOM,
         target_total,
         allow_all_ranks,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -350,60 +337,43 @@ def expand_topk_with_shared_expert(
     source_rank: int,
     shared_weight: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Expand topk from [N, 8] to [N, 9] with shared expert as real expert.
-
-    Remaps routed IDs: old_id -> old_id + (old_id // old_epr).
-    Shared expert for rank i -> i * new_epr + old_epr.
-
-    Returns (expanded_topk_ids, expanded_topk_weights, local_shared_mask).
-    """
+    """Expand topk [N, 8] → [N, 9] with ID remap and shared expert placement."""
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
     device = topk_ids.device
+    old_epr = num_routed_experts // world_size
+    new_epr = old_epr + 1
 
-    old_experts_per_rank = num_routed_experts // world_size
-    new_experts_per_rank = old_experts_per_rank + 1
+    has_valid = (topk_ids >= 0).any(dim=1)
+    valid_mask = topk_ids >= 0
 
-    local_shared_mask = shared_destination == source_rank
-    has_any_valid = (topk_ids >= 0).any(dim=1)
-
+    # Remap: old_id -> old_id + (old_id // old_epr)
+    old_ranks = torch.where(valid_mask, topk_ids // old_epr, torch.zeros_like(topk_ids))
     expanded_topk_ids = torch.empty(
         num_tokens, topk + 1, dtype=topk_ids.dtype, device=device
     )
-
-    # Remap: old_id -> old_id + (old_id // old_experts_per_rank)
-    valid_mask = topk_ids >= 0
-    old_ranks = torch.where(
-        valid_mask, topk_ids // old_experts_per_rank, torch.zeros_like(topk_ids)
+    expanded_topk_ids[:, :topk] = torch.where(
+        valid_mask, topk_ids + old_ranks, topk_ids
     )
-    remapped_ids = torch.where(valid_mask, topk_ids + old_ranks, topk_ids)
-    expanded_topk_ids[:, :topk] = remapped_ids
 
-    shared_expert_ids = shared_destination * new_experts_per_rank + old_experts_per_rank
+    # Shared expert column
+    shared_ids = shared_destination * new_epr + old_epr
     expanded_topk_ids[:, topk] = torch.where(
-        has_any_valid,
-        shared_expert_ids.to(topk_ids.dtype),
-        torch.full(
-            (num_tokens,), LOCAL_SHARED_MARKER, dtype=topk_ids.dtype, device=device
-        ),
+        has_valid, shared_ids.to(topk_ids.dtype), LOCAL_SHARED_MARKER
     )
 
+    # Weights: copy routed, add shared weight column
     expanded_topk_weights = torch.empty(
         num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )
     expanded_topk_weights[:, :topk] = topk_weights
-    expanded_topk_weights[:, topk] = torch.where(
-        has_any_valid,
-        torch.full(
-            (num_tokens,), float(shared_weight), dtype=topk_weights.dtype, device=device
-        ),
-        torch.zeros((num_tokens,), dtype=topk_weights.dtype, device=device),
+    expanded_topk_weights[:, topk] = torch.where(has_valid, shared_weight, 0.0).to(
+        topk_weights.dtype
     )
-    if (~has_any_valid).any():
-        expanded_topk_weights[~has_any_valid, :topk] = 0.0
+    if (~has_valid).any():
+        expanded_topk_weights[~has_valid, :topk] = 0.0
 
-    local_shared_mask = local_shared_mask & has_any_valid
-
+    local_shared_mask = (shared_destination == source_rank) & has_valid
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
@@ -412,11 +382,7 @@ def compute_static_rank_load(
     physical_to_logical_map: Tensor,
     world_size: int,
 ) -> Tensor:
-    """Compute per-layer static rank load from EPLB statistics.
-
-    Returns ``[num_layers, world_size]`` float tensor. Replicated experts
-    have their load divided by replica count.
-    """
+    """Compute per-layer static rank load [num_layers, world_size] from EPLB statistics."""
     num_layers, num_physical_experts = physical_to_logical_map.shape
     num_logical_experts = logical_count.shape[-1]
     experts_per_rank = num_physical_experts // world_size
@@ -439,21 +405,13 @@ def compute_static_rank_load(
     physical_replica = torch.gather(replica_counts, 1, mapped_logical_ids)
     physical_load = physical_load / physical_replica
 
-    per_rank_load = physical_load.view(num_layers, world_size, experts_per_rank).sum(
-        dim=2
-    )
-    return per_rank_load
+    return physical_load.view(num_layers, world_size, experts_per_rank).sum(dim=2)
 
 
 class DeepEPWaterfillBalancer:
-    """Waterfill load balancer: assigns shared expert to least-loaded rank.
+    """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
-    Shared expert is fused as a real routed expert (topk 8→9).
-    Each rank has old_experts_per_rank + 1 slots; expert IDs are remapped
-    via old_id -> old_id + (old_id // old_experts_per_rank).
-    """
-
-    MIN_BATCH_FOR_BALANCE = 64  # Below this, all shared experts compute locally.
+    MIN_BATCH_FOR_BALANCE = 64
 
     def __init__(
         self,
@@ -468,37 +426,25 @@ class DeepEPWaterfillBalancer:
         self.rank = rank
         self.old_experts_per_rank = num_routed_experts // world_size
         self.new_experts_per_rank = self.old_experts_per_rank + 1
-
         self.routed_scaling_factor = routed_scaling_factor
         self.shared_weight = (
             1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
         )
-
-        self.my_shared_expert_id = (
-            self.rank * self.new_experts_per_rank + self.old_experts_per_rank
-        )
-
-        # When set, forward path skips runtime all_reduce (static mode).
         self.static_rank_load: Optional[Tensor] = static_rank_load
-
         self._counts_buf: Optional[Tensor] = None
 
     def has_static_weights(self) -> bool:
-        """Return True if static EPLB-derived weights are available."""
         return self.static_rank_load is not None
 
     def set_static_weights(self, static_rank_load: Tensor) -> None:
         """Replace static per-rank load weights (e.g. after EPLB rebalance)."""
         assert static_rank_load.shape == (
             self.world_size,
-        ), f"Expected shape ({self.world_size},), got {static_rank_load.shape}"
+        ), f"Expected ({self.world_size},), got {static_rank_load.shape}"
         self.static_rank_load = static_rank_load.to(dtype=torch.float64)
-        w = self.static_rank_load
-        w_sum = w.sum().clamp(min=1.0)
-        self._static_rank_load_normalized = w / w_sum
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
-        """Count routed tokens per rank using Triton kernel. Uses original expert IDs."""
+        """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""
         if self._counts_buf is None:
             self._counts_buf = torch.zeros(
                 self.world_size, dtype=torch.int64, device=topk_ids.device
@@ -506,10 +452,9 @@ class DeepEPWaterfillBalancer:
         buf = self._counts_buf
         buf.zero_()
         num_tokens = topk_ids.shape[0]
-        topk = topk_ids.shape[1]
-        experts_per_rank = self.num_routed_experts // self.world_size
         if num_tokens == 0:
             return buf
+        topk = topk_ids.shape[1]
         BLOCK_SIZE = 256
         grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
         _count_routed_per_rank_kernel[grid](
@@ -517,7 +462,7 @@ class DeepEPWaterfillBalancer:
             buf,
             num_tokens,
             topk,
-            experts_per_rank,
+            self.old_experts_per_rank,
             self.world_size,
             BLOCK_SIZE=BLOCK_SIZE,
         )
@@ -530,28 +475,12 @@ class DeepEPWaterfillBalancer:
         routed_counts: Tensor,
         local_tokens_per_rank: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert.
-
-        Args:
-            topk_ids: [N, topk] routed expert IDs.
-            topk_weights: [N, topk] routed expert weights.
-            routed_counts: [world_size] global routed token count per rank.
-            local_tokens_per_rank: [world_size] per-rank DP-attention token counts.
-                Added to routed_counts as effective load when provided.
-
-        Returns:
-            expanded_topk_ids, expanded_topk_weights, local_shared_mask
-        """
+        """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert."""
         num_tokens = topk_ids.shape[0]
-        topk = topk_ids.shape[1]
         device = topk_ids.device
 
         if num_tokens == 0:
-            return (
-                torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
-                torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
-                torch.empty(0, dtype=torch.bool, device=device),
-            )
+            return _empty_expanded(topk_ids, topk_weights)
 
         if num_tokens < self.MIN_BATCH_FOR_BALANCE:
             shared_destination = torch.full(
@@ -568,17 +497,17 @@ class DeepEPWaterfillBalancer:
             )
 
         routed_counts_i64 = routed_counts.to(torch.int64)
-        if local_tokens_per_rank is not None:
-            effective_load = routed_counts_i64 + local_tokens_per_rank.to(torch.int64)
-        else:
-            effective_load = routed_counts_i64
+        effective_load = (
+            routed_counts_i64 + local_tokens_per_rank.to(torch.int64)
+            if local_tokens_per_rank is not None
+            else routed_counts_i64
+        )
+        topk = topk_ids.shape[1]
 
         if self.has_static_weights():
-            # Static path: zero GPU→CPU syncs.
             allow_all_ranks = True
             target_total = 0
         else:
-            # Dynamic path: single .item() sync.
             total_routed_t = routed_counts_i64.sum()
             total_tokens_global_t = total_routed_t // topk
             total_effective_t = effective_load.sum()
@@ -591,21 +520,17 @@ class DeepEPWaterfillBalancer:
             )
             allow_all_ranks = bool((max_effective_t <= target_total).item())
 
-        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
-            waterfill_prepare_dispatch_fused(
-                topk_ids,
-                topk_weights,
-                effective_load,
-                self.num_routed_experts,
-                self.world_size,
-                self.rank,
-                self.shared_weight,
-                allow_all_ranks=allow_all_ranks,
-                target_total=target_total,
-            )
+        return waterfill_prepare_dispatch_fused(
+            topk_ids,
+            topk_weights,
+            effective_load,
+            self.num_routed_experts,
+            self.world_size,
+            self.rank,
+            self.shared_weight,
+            allow_all_ranks=allow_all_ranks,
+            target_total=target_total,
         )
-
-        return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
     def expand_topk(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""

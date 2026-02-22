@@ -620,10 +620,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        # `num_fused_shared_experts`: shared experts fused into MoE path (standard
-        # kernel-level fusion or Waterfill dispatch-level fusion).
-        # `num_fused_shared_experts_in_moe_impl`: kernel-internal fusion only.
-        # Waterfill sets this to 0 (kernel doesn't know about shared experts).
+        # Waterfill: shared expert fused via dispatch (not kernel), so kernel sees 0.
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -645,7 +642,6 @@ class DeepseekV2MoE(nn.Module):
                 if get_global_server_args().disable_shared_experts_fusion
                 else n_shared_experts
             )
-        # Kernel-level fusion: Waterfill uses 0 (handles shared expert in dispatch).
         num_fused_shared_experts_in_moe_impl = (
             0 if will_enable_deepep_waterfill else self.num_fused_shared_experts
         )
@@ -681,9 +677,8 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        # Waterfill: expand num_experts to include shared expert per rank
         self._will_enable_deepep_waterfill = will_enable_deepep_waterfill
-        if self._will_enable_deepep_waterfill:
+        if will_enable_deepep_waterfill:
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
             top_k_for_moe = config.num_experts_per_tok + 1
         else:
@@ -710,7 +705,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # TopK selects routed experts only; waterfill balancer adds shared expert slot.
+        # TopK: routed experts only; waterfill balancer adds shared expert slot.
         self.topk = TopK(
             top_k=config.num_experts_per_tok + num_fused_shared_experts_in_moe_impl,
             layer_id=self.layer_id,
@@ -842,7 +837,7 @@ class DeepseekV2MoE(nn.Module):
             self._old_experts_per_rank = self.num_experts // self.moe_ep_size
 
     def _maybe_init_static_waterfill_weights(self):
-        """Compute static EPLB-derived per-rank weights; detects rebalance via data pointer."""
+        """Lazy-init static EPLB-derived per-rank weights; detects rebalance via data pointer."""
         if not self._enable_deepep_waterfill:
             return
         if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
@@ -850,22 +845,20 @@ class DeepseekV2MoE(nn.Module):
         balancer = self.deepep_waterfill_balancer
         if balancer is None:
             return
-
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
         from sglang.srt.layers.moe.deepep_waterfill import compute_static_rank_load
 
-        server_args = get_global_server_args()
-        init_loc = getattr(server_args, "init_expert_location", "trivial")
+        init_loc = getattr(get_global_server_args(), "init_expert_location", "trivial")
         if not init_loc or init_loc == "trivial":
             return
-
         metadata = get_global_expert_location_metadata()
         if metadata is None:
             return
-
         cur_ptr = metadata.physical_to_logical_map.data_ptr()
-        prev_ptr = getattr(self, "_eplb_map_data_ptr", None)
-        if prev_ptr == cur_ptr and balancer.has_static_weights():
+        if (
+            getattr(self, "_eplb_map_data_ptr", None) == cur_ptr
+            and balancer.has_static_weights()
+        ):
             return
 
         try:
@@ -877,45 +870,26 @@ class DeepseekV2MoE(nn.Module):
                 logical_count_raw = logical_count_raw.float().mean(dim=0)
             elif logical_count_raw.dim() != 2:
                 logger.warning(
-                    "Unexpected logical_count dim=%d, skipping static weights",
-                    logical_count_raw.dim(),
+                    "Unexpected logical_count dim=%d", logical_count_raw.dim()
                 )
                 return
-
-            physical_to_logical_map = metadata.physical_to_logical_map
             all_rank_load = compute_static_rank_load(
                 logical_count_raw,
-                physical_to_logical_map,
+                metadata.physical_to_logical_map,
                 balancer.world_size,
             )
-
             layer_idx = int(self.layer_id)
             if layer_idx < all_rank_load.shape[0]:
                 layer_load = all_rank_load[layer_idx]
                 if layer_load.sum() > 0:
                     balancer.set_static_weights(layer_load)
                     self._eplb_map_data_ptr = cur_ptr
-                    logger.debug(
-                        "Static waterfill weights set for layer %d",
-                        layer_idx,
-                    )
         except Exception as e:
-            self._static_wf_init_failures = (
-                getattr(self, "_static_wf_init_failures", 0) + 1
-            )
             logger.warning(
-                "Failed to init static waterfill weights for layer %s (attempt %d): %s",
+                "Failed to init static waterfill weights for layer %s: %s",
                 self.layer_id,
-                self._static_wf_init_failures,
                 e,
             )
-            if self._static_wf_init_failures >= 3:
-                logger.warning(
-                    "Giving up on static waterfill weights for layer %s after %d failures",
-                    self.layer_id,
-                    self._static_wf_init_failures,
-                )
-                self._static_wf_init_done = True
 
     def get_moe_weights(self):
         # In waterfill mode, use _old_experts_per_rank to exclude shared expert slot.
@@ -1144,13 +1118,7 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         # --- Waterfill: lazy static weight init ---
         if self._enable_deepep_waterfill:
-            if not getattr(self, "_static_wf_init_done", False):
-                self._maybe_init_static_waterfill_weights()
-                if (
-                    self.deepep_waterfill_balancer is not None
-                    and self.deepep_waterfill_balancer.has_static_weights()
-                ):
-                    self._static_wf_init_done = True
+            self._maybe_init_static_waterfill_weights()
 
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -1179,10 +1147,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    dispatch_info := ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id
-                    )
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id
                 ),
             )
 
