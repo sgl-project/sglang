@@ -217,10 +217,9 @@ class Fp8Config(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             # FusedMoE prefixes include ".experts"; allow coarse layer-prefix
             # rules (e.g., "model.layers.{i}.") to force BF16 fallback.
-            should_skip = is_layer_skipped(
+            if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
-            ) or any(ignored in prefix for ignored in self.ignored_layers)
-            if should_skip:
+            ):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
