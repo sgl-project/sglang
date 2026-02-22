@@ -1,9 +1,6 @@
 import argparse
 import functools
-import re
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import polars as pl
 import torch
@@ -25,20 +22,9 @@ def main(args):
     print("df_target", df_target)
     print("df_baseline", df_baseline)
 
-    location_info_of_target_pass_id = _get_location_info_of_target_pass_id()
-
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
-
-        if location_info_of_target_pass_id is not None:
-            location_info = location_info_of_target_pass_id.get(row["step"])
-            if location_info is None:
-                continue
-            baseline_step = location_info.baseline_step
-            baseline_token_slice = location_info.baseline_token_slice
-        else:
-            baseline_step = row["step"] - args.start_id + args.baseline_start_id
-            baseline_token_slice = None
+        baseline_step = row["step"] - args.start_id + args.baseline_start_id
 
         row_baseline = find_row(
             df_baseline,
@@ -95,11 +81,10 @@ def check_tensor_pair(
         f"[{'' if x_baseline.dtype == x_target.dtype else '🟠'}dtype] {x_baseline.dtype} vs {x_target.dtype}"
     )
 
-    x_baseline, x_target = _comparison_preprocessor(x_baseline, x_target, name=name)
     x_baseline = _try_unify_shape(x_baseline, target_shape=x_target.shape)
 
     print(
-        f"After preprocessor "
+        f"After unify "
         f"[shape] {x_baseline.shape} vs {x_target.shape}\t"
         f"[dtype] {x_baseline.dtype} vs {x_target.dtype}"
     )
@@ -242,23 +227,6 @@ def _load_object(path):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
     return x.cuda()
-
-
-# TODO may make customization endpoints configurable via args pointing to code file
-def _comparison_preprocessor(x_baseline, x_target, name):
-    """Customization endpoint. Can insert arbitrary adhoc postprocessing logic here."""
-    return x_baseline, x_target
-
-
-@dataclass
-class LocationInfo:
-    baseline_step: int
-    baseline_token_slice: slice
-
-
-def _get_location_info_of_target_pass_id() -> Optional[Dict[int, LocationInfo]]:
-    """Customization endpoint."""
-    return None
 
 
 if __name__ == "__main__":
