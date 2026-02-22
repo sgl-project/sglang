@@ -282,9 +282,9 @@ class _Dumper:
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-        nid = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
-        self._non_intrusives.append(nid)
-        return nid
+        non_intrusive = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        self._non_intrusives.append(non_intrusive)
+        return non_intrusive
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -295,8 +295,8 @@ class _Dumper:
         self._config = self._config.with_defaults(**kwargs)
 
     def reset(self) -> None:
-        for nid in self._non_intrusives:
-            nid.remove()
+        for non_intrusive in self._non_intrusives:
+            non_intrusive.remove()
         self._non_intrusives.clear()
         self._state = _DumperState()
 

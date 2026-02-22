@@ -1174,6 +1174,57 @@ class TestReset:
         assert d._state.step == 1
         assert d._state.dump_index == 1
 
+    def test_reset_removes_non_intrusive_hooks(self, tmp_path):
+        model = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4, 4),
+        )
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+        assert len(captured) > 0
+
+        d.reset()
+        d.configure(enable=True, dir=str(tmp_path), non_intrusive_mode="all")
+
+        with d.capture_output() as captured_after:
+            model(x)
+        assert len(captured_after) == 0
+
+    def test_reset_removes_non_intrusive_hooks_multiple_models(self, tmp_path):
+        model_a = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.ReLU(),
+        )
+        model_b = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.ReLU(),
+        )
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model_a)
+        d.register_non_intrusive_dumper(model_b)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model_a(x)
+            model_b(x)
+        assert len(captured) > 0
+
+        d.reset()
+        d.configure(enable=True, dir=str(tmp_path), non_intrusive_mode="all")
+
+        with d.capture_output() as captured_a:
+            model_a(x)
+        assert len(captured_a) == 0
+
+        with d.capture_output() as captured_b:
+            model_b(x)
+        assert len(captured_b) == 0
+
 
 def _dumper_worker(rank, http_port: int, stop_event):
     """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
@@ -1979,6 +2030,54 @@ class TestDumperE2E:
             assert "step" in loaded["meta"]
         finally:
             kill_process_tree(proc.pid)
+
+
+class TestRegisterForwardHook:
+    @pytest.mark.parametrize("mode", ["hook", "replace_fn"])
+    def test_handles_removable(self, mode):
+        call_log: list[str] = []
+
+        def pre_hook(_module, _input):
+            call_log.append("pre")
+
+        def hook(_module, _input, _output):
+            call_log.append("post")
+
+        module = torch.nn.Linear(4, 4)
+        handles = _register_forward_hook_or_replace_fn(
+            module, pre_hook=pre_hook, hook=hook, mode=mode,
+        )
+
+        x = torch.randn(2, 4)
+        if mode == "hook":
+            module(x)
+        else:
+            module.forward(x)
+        assert call_log == ["pre", "post"]
+
+        call_log.clear()
+        for h in handles:
+            h.remove()
+
+        if mode == "hook":
+            module(x)
+        else:
+            module.forward(x)
+        assert call_log == []
+
+    def test_replace_fn_remove_asserts_on_rewrap(self):
+        module = torch.nn.Linear(4, 4)
+        handles = _register_forward_hook_or_replace_fn(
+            module,
+            pre_hook=lambda _m, _i: None,
+            hook=lambda _m, _i, _o: None,
+            mode="replace_fn",
+        )
+
+        module.forward = lambda *a, **kw: None
+
+        with pytest.raises(AssertionError):
+            handles[0].remove()
 
 
 if __name__ == "__main__":
