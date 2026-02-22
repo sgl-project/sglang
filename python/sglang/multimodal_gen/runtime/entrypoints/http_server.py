@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    ReleaseMemoryOccupationReq,
+    ResumeMemoryOccupationReq,
     prepare_request,
     save_outputs,
 )
@@ -99,6 +101,78 @@ async def get_models(request: Request):
 async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
+
+
+def _extract_tags_from_body(body: dict) -> list[str] | None:
+    """Return the ``tags`` field from a parsed request body, or ``None``."""
+    if not isinstance(body, dict):
+        return None
+    tags = body.get("tags", None)
+    if tags is not None and not isinstance(tags, list):
+        raise ValueError(
+            f"'tags' must be a list of strings, got: {type(tags).__name__}"
+        )
+    return tags
+
+
+@health_router.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    """Release GPU memory occupation (sleep).
+
+    Offloads all model weights to CPU so the GPU is free for another
+    workload (e.g. RL training).  The server process stays alive;
+    call ``/resume_memory_occupation`` to reload weights before the
+    next generation.
+
+    Body (optional JSON):
+        tags (list[str]): memory regions to release.
+            Supported value: ``"weights"``.  Omit to release all.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        tags = _extract_tags_from_body(body)
+    except ValueError as exc:
+        return ORJSONResponse({"success": False, "message": str(exc)}, status_code=422)
+
+    req = ReleaseMemoryOccupationReq(tags=tags)
+    response = await async_scheduler_client.forward(req)
+    if response.error:
+        return ORJSONResponse(
+            {"success": False, "message": response.error}, status_code=400
+        )
+    return ORJSONResponse(response.output)
+
+
+@health_router.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    """Resume GPU memory occupation (wake up).
+
+    Loads model weights back onto the GPU so the server can serve
+    generation requests again.
+
+    Body (optional JSON):
+        tags (list[str]): memory regions to resume.
+            Supported value: ``"weights"``.  Omit to resume all.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        tags = _extract_tags_from_body(body)
+    except ValueError as exc:
+        return ORJSONResponse({"success": False, "message": str(exc)}, status_code=422)
+
+    req = ResumeMemoryOccupationReq(tags=tags)
+    response = await async_scheduler_client.forward(req)
+    if response.error:
+        return ORJSONResponse(
+            {"success": False, "message": response.error}, status_code=400
+        )
+    return ORJSONResponse(response.output)
 
 
 def make_serializable(obj):
