@@ -953,5 +953,314 @@ class TestDumperHttp:
         assert resp.status_code == 400
 
 
+class TestNonIntrusiveDumper:
+    _PREFIX = "non_intrusive__"
+
+    @staticmethod
+    def _assert_captured_contains(
+        captured: dict, expected: list[str], prefix: str = "non_intrusive__"
+    ) -> None:
+        for suffix in expected:
+            key = f"{prefix}{suffix}"
+            assert key in captured, f"missing {key}"
+
+    @staticmethod
+    def _wrap_as_outer(inner_cls: type) -> torch.nn.Module:
+        """Wrap an inner module class as OuterModel.model, mimicking typical model nesting."""
+
+        class OuterModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = inner_cls()
+
+            def forward(self, *args, **kwargs):
+                return self.model(*args, **kwargs)
+
+        return OuterModel()
+
+    def test_basic_inputs_and_outputs(self, tmp_path):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.relu = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.relu(self.linear(x))
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            output = model(x)
+
+        self._assert_captured_contains(
+            captured,
+            [
+                "output",
+                "inputs.0",
+                "model.output",
+                "model.inputs.0",
+                "model.linear.output",
+                "model.linear.inputs.0",
+                "model.relu.output",
+                "model.relu.inputs.0",
+            ],
+        )
+        P = self._PREFIX
+        assert torch.allclose(captured[f"{P}output"]["value"], output)
+
+    def test_hooks_all_module_levels(self, tmp_path):
+        class Attention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv_proj = torch.nn.Linear(4, 12)
+                self.o_proj = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                _qkv = self.qkv_proj(x)
+                return self.o_proj(x)
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.mlp = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                x = self.self_attn(x)
+                return self.mlp(x)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer()])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        self._assert_captured_contains(
+            captured,
+            [
+                "output",
+                "model.output",
+                "model.layers.0.output",
+                "model.layers.0.self_attn.output",
+                "model.layers.0.self_attn.qkv_proj.output",
+                "model.layers.0.self_attn.o_proj.output",
+                "model.layers.0.mlp.output",
+                "model.layers.0.self_attn.qkv_proj.inputs.0",
+                "model.layers.0.self_attn.o_proj.inputs.0",
+                "model.layers.0.mlp.inputs.0",
+            ],
+        )
+        P = self._PREFIX
+        assert f"{P}model.layers.output" not in captured
+
+    def test_multi_tensor_tuple_output(self, tmp_path):
+        class TupleModule(torch.nn.Module):
+            def forward(self, x):
+                return x, x * 2
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.split = TupleModule()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                a, b = self.split(x)
+                return self.linear(a + b)
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.split.output.0" in captured
+        assert "non_intrusive__model.split.output.1" in captured
+        assert torch.allclose(
+            captured["non_intrusive__model.split.output.0"]["value"], x
+        )
+
+    def test_single_tensor_tuple_collapses(self, tmp_path):
+        class SingleTupleModule(torch.nn.Module):
+            def forward(self, x):
+                return (x * 3,)
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.wrap = SingleTupleModule()
+
+            def forward(self, x):
+                return self.wrap(x)[0]
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.wrap.output" in captured
+        assert "non_intrusive__model.wrap.output.0" not in captured
+
+    def test_multiple_forward_inputs(self, tmp_path):
+        class TwoInputModule(torch.nn.Module):
+            def forward(self, x, mask):
+                return x * mask
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mul = TwoInputModule()
+
+            def forward(self, x):
+                mask = torch.ones_like(x)
+                return self.mul(x, mask)
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.mul.inputs.0" in captured
+        assert "non_intrusive__model.mul.inputs.1" in captured
+
+    def test_none_output_only_dumps_inputs(self, tmp_path):
+        class NoneModule(torch.nn.Module):
+            def forward(self, x):
+                return None
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.sink = NoneModule()
+
+            def forward(self, x):
+                self.sink(x)
+                return x
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.sink.inputs.0" in captured
+        assert not any(
+            k.startswith("non_intrusive__model.sink.output") for k in captured
+        )
+
+    def test_non_tensor_value_silently_skipped(self, tmp_path):
+        class IntModule(torch.nn.Module):
+            def forward(self, x):
+                return 42
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.const = IntModule()
+
+            def forward(self, x):
+                self.const(x)
+                return x
+
+        d = _make_test_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.const.inputs.0" in captured
+        assert not any(
+            k.startswith("non_intrusive__model.const.output") for k in captured
+        )
+
+    def test_root_module_name_no_malformed_dots(self, tmp_path):
+        d = _make_test_dumper(tmp_path)
+        model = torch.nn.Linear(4, 4)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        for key in captured:
+            assert not key.startswith("non_intrusive__."), f"malformed key: {key}"
+            assert ".." not in key, f"double dot in key: {key}"
+
+        assert "non_intrusive__output" in captured
+        assert "non_intrusive__inputs.0" in captured
+
+    def test_respects_dumper_filter(self, tmp_path):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.relu = torch.nn.ReLU()
+
+            def forward(self, x):
+                return self.relu(self.linear(x))
+
+        d = _make_test_dumper(
+            tmp_path, filter="name=non_intrusive__model.linear.output"
+        )
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert "non_intrusive__model.linear.output" in captured
+        assert "non_intrusive__model.relu.output" not in captured
+        assert "non_intrusive__model.linear.inputs.0" not in captured
+
+    def test_disabled_dumper_no_output(self, tmp_path):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        d = _make_test_dumper(tmp_path)
+        d.configure(enable=False)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        assert len(captured) == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

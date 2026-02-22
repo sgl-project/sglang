@@ -231,6 +231,12 @@ class _Dumper:
             k: v for k, v in (self._global_ctx | kwargs).items() if v is not None
         }
 
+    def register_non_intrusive_dumper(
+        self,
+        model: "torch.nn.Module",
+    ) -> "_NonIntrusiveDumper":
+        return _NonIntrusiveDumper(dumper=self, model=model)
+
     # ------------------------------- public :: secondary ---------------------------------
 
     def configure(self, **kwargs) -> None:
@@ -463,6 +469,79 @@ class _Dumper:
             name = _get_partial_name(timeout_seconds=self._config.collective_timeout)
             self.configure(partial_name=name)
             print(f"[Dumper] Choose partial_name={name}")
+
+
+# -------------------------------------- hook dumper ------------------------------------------
+
+
+class _NonIntrusiveDumper:
+    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
+
+    _NAME_PREFIX = "non_intrusive__"
+
+    def __init__(
+        self,
+        dumper: _Dumper,
+        model: "torch.nn.Module",
+    ):
+        self._dumper = dumper
+
+        for module_name, module in model.named_modules():
+            module.register_forward_hook(
+                self._make_forward_hook(module_name=module_name)
+            )
+
+    def _make_forward_hook(self, module_name: str):
+        def _hook(_module, input, output):
+            for i, item in enumerate(input):
+                self._dump_value(module_name, item, role=f"inputs.{i}")
+
+            if output is not None:
+                self._dump_value(module_name, output, role="output")
+
+        return _hook
+
+    def _dump_value(self, module_name: str, value, role: str) -> None:
+        for key, tensor in self._convert_value(value).items():
+            parts = [p for p in (module_name, role, key) if p]
+            self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
+
+    @staticmethod
+    def _convert_value(value) -> dict[str, torch.Tensor]:
+        if isinstance(value, torch.Tensor):
+            return {"": value}
+
+        if isinstance(value, (tuple, list)):
+            tensors = [t for t in value if isinstance(t, torch.Tensor)]
+            if len(tensors) == 1:
+                return {"": tensors[0]}
+            return {str(i): t for i, t in enumerate(tensors)}
+
+        # SGLang specific
+        try:
+            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                PPProxyTensors,
+            )
+
+            if isinstance(value, LogitsProcessorOutput):
+                return {"next_token_logits": value.next_token_logits}
+            if isinstance(value, ForwardBatch):
+                return {
+                    "input_ids": value.input_ids,
+                    "seq_lens": value.seq_lens,
+                    "positions": value.positions,
+                }
+            if isinstance(value, PPProxyTensors):
+                return {k: v for k, v in value.tensors.items()}
+        except ImportError:
+            pass
+
+        # Megatron specific
+        # TODO
+
+        return {}
 
 
 # -------------------------------------- util fn ------------------------------------------
