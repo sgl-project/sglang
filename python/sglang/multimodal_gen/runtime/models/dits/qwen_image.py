@@ -158,16 +158,14 @@ class FeedForward(nn.Module):
         dim_out = dim_out if dim_out is not None else dim
 
         if activation_fn == "gelu":
-            act_fn = GELU(
-                dim, inner_dim, bias=bias, quant_config=quant_config, prefix=prefix
-            )
+            act_fn = GELU(dim, inner_dim, bias=bias, quant_config=None, prefix=prefix)
         if activation_fn == "gelu-approximate":
             act_fn = GELU(
                 dim,
                 inner_dim,
                 approximate="tanh",
                 bias=bias,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=prefix,
             )
         else:
@@ -184,7 +182,7 @@ class FeedForward(nn.Module):
                 dim_out,
                 bias=True,
                 input_is_parallel=True,
-                quant_config=quant_config,
+                quant_config=None,
             )
         )
 
@@ -842,6 +840,16 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
+        mod_quant_config = (
+            quant_config
+            if (
+                quant_config is not None
+                and hasattr(quant_config, "get_name")
+                and quant_config.get_name() == "svdquant"
+            )
+            else None
+        )
+
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
@@ -850,7 +858,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 gather_output=True,
-                quant_config=quant_config,
+                quant_config=mod_quant_config,
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
@@ -879,7 +887,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 gather_output=True,
-                quant_config=quant_config,
+                quant_config=mod_quant_config,
                 prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
