@@ -508,12 +508,10 @@ class _NonIntrusiveDumper:
         cls, module_name: str, module: "torch.nn.Module"
     ) -> Optional[dict]:
         if cls._LAYER_NAME_RE.fullmatch(module_name):
-            # Megatron
-            if hasattr(module, "layer_number"):
-                return {"layer_id": module.layer_number - 1}
-            # SGLang
-            if hasattr(module, "layer_id"):
-                return {"layer_id": module.layer_id}
+            for plugin in _plugins:
+                layer_id = plugin.detect_layer_id(module)
+                if layer_id is not None:
+                    return {"layer_id": layer_id}
         return None
 
     def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
@@ -560,31 +558,10 @@ class _NonIntrusiveDumper:
                 return {"": tensors[0]}
             return {str(i): t for i, t in enumerate(tensors)}
 
-        # SGLang specific
-        try:
-            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-            from sglang.srt.model_executor.forward_batch_info import (
-                ForwardBatch,
-                PPProxyTensors,
-            )
-
-            if isinstance(value, LogitsProcessorOutput):
-                return {"next_token_logits": value.next_token_logits}
-            if isinstance(value, ForwardBatch):
-                if skip_forward_batch:
-                    return {}
-                return {
-                    "input_ids": value.input_ids,
-                    "seq_lens": value.seq_lens,
-                    "positions": value.positions,
-                }
-            if isinstance(value, PPProxyTensors):
-                return {k: v for k, v in value.tensors.items()}
-        except ImportError:
-            pass
-
-        # Megatron specific
-        # TODO
+        for plugin in _plugins:
+            result = plugin.convert_value(value, skip_forward_batch=skip_forward_batch)
+            if result is not None:
+                return result
 
         return {}
 
@@ -710,97 +687,11 @@ def _compute_static_meta():
         "world_size": _get_world_size(),
     }
 
-    if x := _collect_sglang_parallel_info():
-        result["sglang_parallel_info"] = x
-    if x := _collect_megatron_parallel_info():
-        result["megatron_parallel_info"] = x
+    for plugin in _plugins:
+        if info := plugin.collect_parallel_info():
+            result[f"{plugin.name}_parallel_info"] = info
 
     return result
-
-
-def _collect_sglang_parallel_info():
-    info = {}
-
-    try:
-        from sglang.srt.distributed import (
-            get_moe_expert_parallel_rank,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_rank,
-            get_moe_tensor_parallel_world_size,
-            get_pipeline_model_parallel_rank,
-            get_pipeline_model_parallel_world_size,
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-
-        info["tp_rank"] = get_tensor_model_parallel_rank()
-        info["tp_size"] = get_tensor_model_parallel_world_size()
-        info["pp_rank"] = get_pipeline_model_parallel_rank()
-        info["pp_size"] = get_pipeline_model_parallel_world_size()
-        info["moe_ep_rank"] = get_moe_expert_parallel_rank()
-        info["moe_ep_size"] = get_moe_expert_parallel_world_size()
-        info["moe_tp_rank"] = get_moe_tensor_parallel_rank()
-        info["moe_tp_size"] = get_moe_tensor_parallel_world_size()
-    except (ImportError, AttributeError, AssertionError):
-        info["distributed_error"] = True
-
-    try:
-        from sglang.srt.layers.dp_attention import (
-            get_attention_dp_rank,
-            get_attention_dp_size,
-            get_attention_tp_rank,
-            get_attention_tp_size,
-            get_local_attention_dp_rank,
-            get_local_attention_dp_size,
-            is_dp_attention_enabled,
-        )
-
-        info["enable_dp_attention"] = is_dp_attention_enabled()
-        info["attn_tp_rank"] = get_attention_tp_rank()
-        info["attn_tp_size"] = get_attention_tp_size()
-        info["attn_dp_rank"] = get_attention_dp_rank()
-        info["attn_dp_size"] = get_attention_dp_size()
-        info["local_attn_dp_rank"] = get_local_attention_dp_rank()
-        info["local_attn_dp_size"] = get_local_attention_dp_size()
-    except (ImportError, AttributeError, AssertionError):
-        info["dp_attention_error"] = True
-
-    return info
-
-
-def _collect_megatron_parallel_info():
-    info = {}
-
-    try:
-        from megatron.core import parallel_state as mpu
-
-        info["tp_rank"] = mpu.get_tensor_model_parallel_rank()
-        info["tp_size"] = mpu.get_tensor_model_parallel_world_size()
-        info["pp_rank"] = mpu.get_pipeline_model_parallel_rank()
-        info["pp_size"] = mpu.get_pipeline_model_parallel_world_size()
-        info["dp_rank"] = mpu.get_data_parallel_rank()
-        info["dp_size"] = mpu.get_data_parallel_world_size()
-        info["cp_rank"] = mpu.get_context_parallel_rank()
-        info["cp_size"] = mpu.get_context_parallel_world_size()
-        info["vpp_rank"] = mpu.get_virtual_pipeline_model_parallel_rank()
-        info["vpp_size"] = mpu.get_virtual_pipeline_model_parallel_world_size()
-        info["ep_rank"] = mpu.get_expert_model_parallel_rank()
-        info["ep_size"] = mpu.get_expert_model_parallel_world_size()
-        info["etp_rank"] = mpu.get_expert_tensor_parallel_rank()
-        info["etp_size"] = mpu.get_expert_tensor_parallel_world_size()
-        info["edp_rank"] = mpu.get_expert_data_parallel_rank()
-        info["edp_size"] = mpu.get_expert_data_parallel_world_size()
-        info["tcp_rank"] = mpu.get_tensor_and_context_parallel_rank()
-        info["tcp_size"] = mpu.get_tensor_and_context_parallel_world_size()
-        info["etmp_rank"] = mpu.get_expert_tensor_and_model_parallel_rank()
-        info["etmp_size"] = mpu.get_expert_tensor_and_model_parallel_world_size()
-        info["tp_src_rank"] = mpu.get_tensor_model_parallel_src_rank()
-        info["mp_src_rank"] = mpu.get_model_parallel_src_rank()
-        info["dp_src_rank"] = mpu.get_data_parallel_src_rank()
-    except (ImportError, AttributeError, AssertionError):
-        info["megatron_error"] = True
-
-    return info
 
 
 # -------------------------------------- http control server ------------------------------------------
@@ -1007,6 +898,168 @@ def _get_local_ip_by_remote() -> Optional[str]:
     except Exception:
         print("Can not get local ip by remote")
     return None
+
+
+# -------------------------------------- framework plugins ------------------------------------------
+
+
+class _FrameworkPlugin(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def collect_parallel_info(self) -> dict: ...
+
+    @abstractmethod
+    def convert_value(
+        self, value: Any, *, skip_forward_batch: bool
+    ) -> Optional[dict[str, "torch.Tensor"]]:
+        """Return converted tensors dict, or None if this plugin doesn't handle the value."""
+        ...
+
+    @abstractmethod
+    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+        """Return 0-indexed layer_id, or None if not detectable."""
+        ...
+
+
+class _SGLangPlugin(_FrameworkPlugin):
+    _available = True
+    try:
+        from sglang.srt import distributed as _dist
+        from sglang.srt.layers import dp_attention as _dp_attn
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            PPProxyTensors,
+        )
+    except ImportError:
+        _available = False
+
+    @property
+    def name(self) -> str:
+        return "sglang"
+
+    def collect_parallel_info(self) -> dict:
+        if not self._available:
+            return {}
+
+        info = {}
+
+        try:
+            info["tp_rank"] = self._dist.get_tensor_model_parallel_rank()
+            info["tp_size"] = self._dist.get_tensor_model_parallel_world_size()
+            info["pp_rank"] = self._dist.get_pipeline_model_parallel_rank()
+            info["pp_size"] = self._dist.get_pipeline_model_parallel_world_size()
+            info["moe_ep_rank"] = self._dist.get_moe_expert_parallel_rank()
+            info["moe_ep_size"] = self._dist.get_moe_expert_parallel_world_size()
+            info["moe_tp_rank"] = self._dist.get_moe_tensor_parallel_rank()
+            info["moe_tp_size"] = self._dist.get_moe_tensor_parallel_world_size()
+        except (AttributeError, AssertionError):
+            info["distributed_error"] = True
+
+        try:
+            info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+            info["attn_tp_rank"] = self._dp_attn.get_attention_tp_rank()
+            info["attn_tp_size"] = self._dp_attn.get_attention_tp_size()
+            info["attn_dp_rank"] = self._dp_attn.get_attention_dp_rank()
+            info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
+            info["local_attn_dp_rank"] = self._dp_attn.get_local_attention_dp_rank()
+            info["local_attn_dp_size"] = self._dp_attn.get_local_attention_dp_size()
+        except (AttributeError, AssertionError):
+            info["dp_attention_error"] = True
+
+        return info
+
+    def convert_value(
+        self, value: Any, *, skip_forward_batch: bool
+    ) -> Optional[dict[str, "torch.Tensor"]]:
+        if not self._available:
+            return None
+
+        if isinstance(value, self.LogitsProcessorOutput):
+            return {"next_token_logits": value.next_token_logits}
+        if isinstance(value, self.ForwardBatch):
+            if skip_forward_batch:
+                return {}
+            return {
+                "input_ids": value.input_ids,
+                "seq_lens": value.seq_lens,
+                "positions": value.positions,
+            }
+        if isinstance(value, self.PPProxyTensors):
+            return {k: v for k, v in value.tensors.items()}
+
+        return None
+
+    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+        if hasattr(module, "layer_id"):
+            return module.layer_id
+        return None
+
+
+class _MegatronPlugin(_FrameworkPlugin):
+    _available = True
+    try:
+        from megatron.core import parallel_state as _mpu
+    except ImportError:
+        _available = False
+
+    @property
+    def name(self) -> str:
+        return "megatron"
+
+    def collect_parallel_info(self) -> dict:
+        if not self._available:
+            return {}
+
+        info = {}
+        try:
+            info["tp_rank"] = self._mpu.get_tensor_model_parallel_rank()
+            info["tp_size"] = self._mpu.get_tensor_model_parallel_world_size()
+            info["pp_rank"] = self._mpu.get_pipeline_model_parallel_rank()
+            info["pp_size"] = self._mpu.get_pipeline_model_parallel_world_size()
+            info["dp_rank"] = self._mpu.get_data_parallel_rank()
+            info["dp_size"] = self._mpu.get_data_parallel_world_size()
+            info["cp_rank"] = self._mpu.get_context_parallel_rank()
+            info["cp_size"] = self._mpu.get_context_parallel_world_size()
+            info["vpp_rank"] = self._mpu.get_virtual_pipeline_model_parallel_rank()
+            info["vpp_size"] = (
+                self._mpu.get_virtual_pipeline_model_parallel_world_size()
+            )
+            info["ep_rank"] = self._mpu.get_expert_model_parallel_rank()
+            info["ep_size"] = self._mpu.get_expert_model_parallel_world_size()
+            info["etp_rank"] = self._mpu.get_expert_tensor_parallel_rank()
+            info["etp_size"] = self._mpu.get_expert_tensor_parallel_world_size()
+            info["edp_rank"] = self._mpu.get_expert_data_parallel_rank()
+            info["edp_size"] = self._mpu.get_expert_data_parallel_world_size()
+            info["tcp_rank"] = self._mpu.get_tensor_and_context_parallel_rank()
+            info["tcp_size"] = self._mpu.get_tensor_and_context_parallel_world_size()
+            info["etmp_rank"] = self._mpu.get_expert_tensor_and_model_parallel_rank()
+            info["etmp_size"] = (
+                self._mpu.get_expert_tensor_and_model_parallel_world_size()
+            )
+            info["tp_src_rank"] = self._mpu.get_tensor_model_parallel_src_rank()
+            info["mp_src_rank"] = self._mpu.get_model_parallel_src_rank()
+            info["dp_src_rank"] = self._mpu.get_data_parallel_src_rank()
+        except (AttributeError, AssertionError):
+            info["megatron_error"] = True
+
+        return info
+
+    def convert_value(
+        self, value: Any, *, skip_forward_batch: bool
+    ) -> Optional[dict[str, "torch.Tensor"]]:
+        return None
+
+    def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
+        if hasattr(module, "layer_number"):
+            return module.layer_number - 1
+        return None
+
+
+_plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
 
 
 # -------------------------------------- singleton ------------------------------------------

@@ -13,14 +13,14 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
-    _collect_megatron_parallel_info,
-    _collect_sglang_parallel_info,
     _collective_with_timeout,
     _Dumper,
     _DumperConfig,
     _format_tags,
     _materialize_value,
+    _MegatronPlugin,
     _obj_to_dict,
+    _SGLangPlugin,
     _torch_save,
     dumper,
     get_tensor_info,
@@ -529,10 +529,10 @@ class TestStaticMetadata:
         assert meta1 is meta2
 
     def test_parallel_info_graceful_fallback(self):
-        sglang_info = _collect_sglang_parallel_info()
+        sglang_info = _SGLangPlugin().collect_parallel_info()
         assert isinstance(sglang_info, dict)
 
-        megatron_info = _collect_megatron_parallel_info()
+        megatron_info = _MegatronPlugin().collect_parallel_info()
         assert isinstance(megatron_info, dict)
 
     def test_dump_includes_static_meta(self, tmp_path):
