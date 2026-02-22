@@ -142,7 +142,9 @@ class TransformerLoader(ComponentLoader):
                 quant_config = get_quant_config_from_safetensors_metadata(
                     safetensors_list[0]
                 )
-            init_params["quant_config"] = quant_config if quant_config else nunchaku_config
+            init_params["quant_config"] = (
+                quant_config if quant_config else nunchaku_config
+            )
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(

@@ -291,7 +291,6 @@ class ServerArgs:
     component_paths: dict[str, str] = field(default_factory=dict)
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
-    # used by both Nunchaku (SVDQuant) and FP8 single-file checkpoints.
     transformer_quantized_path: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
