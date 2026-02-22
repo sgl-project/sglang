@@ -118,6 +118,7 @@ jobs:
       - name: Push changes
         if: steps.cherry_pick.outputs.cherry_pick_success == 'true'
         env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
           CREATE_PR: ${{ github.event.inputs.create_pr }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
