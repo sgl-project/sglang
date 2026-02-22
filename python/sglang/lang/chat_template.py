@@ -521,6 +521,21 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/nvidia/Eagle2.5-8B/blob/main/chat_template.json
+register_chat_template(
+    ChatTemplate(
+        name="eagle25-vl",
+        default_system_prompt="You are a helpful assistant.",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|user|>\n", "\n"),
+            "assistant": ("<|assistant|>\n", "\n"),
+        },
+        stop_str=["<|im_end|>"],
+        image_token="<|image|>",
+    )
+)
+
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
@@ -596,6 +611,12 @@ def match_chat_ml(model_path: str):
         re.IGNORECASE,
     ):
         return "chatml-llava"
+    if re.search(
+        r"eagle2\.5",
+        model_path,
+        re.IGNORECASE,
+    ):
+        return "eagle25-vl"
 
 
 @register_chat_template_matching_function
