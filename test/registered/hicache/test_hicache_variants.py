@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (

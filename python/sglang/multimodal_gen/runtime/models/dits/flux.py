@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import AttentionModuleMixin, FeedForward
+from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
     AdaLayerNormContinuous,
@@ -29,11 +29,19 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-
-# from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
-from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
-from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+    is_nunchaku_available,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
@@ -49,19 +57,150 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+try:
+    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
+    from nunchaku.models.normalization import (  # type: ignore[import]
+        NunchakuAdaLayerNormZero,
+        NunchakuAdaLayerNormZeroSingle,
+    )
+    from nunchaku.ops.gemm import (
+        svdq_gemm_w4a4_cuda as _svdq_gemm_w4a4,  # type: ignore[import]
+    )
+    from nunchaku.ops.quantize import (
+        svdq_quantize_w4a4_act_fuse_lora_cuda as _svdq_quantize_w4a4,  # type: ignore[import]
+    )
+
+    _nunchaku_fused_ops_available = True
+except Exception:
+    NunchakuFeedForward = None
+    NunchakuAdaLayerNormZero = None
+    NunchakuAdaLayerNormZeroSingle = None
+    _svdq_gemm_w4a4 = None
+    _svdq_quantize_w4a4 = None
+    _nunchaku_fused_ops_available = False
+
+
+def _fused_gelu_mlp(
+    x: torch.Tensor,
+    fc1,
+    fc2,
+    pad_size: int = 256,
+) -> torch.Tensor:
+    """
+    Fused GELU MLP matching nunchaku's fused_gelu_mlp kernel path.
+
+    nunchaku's single-block MLP checkpoint is calibrated for the fused path where:
+      1. fc1 GEMM + GELU + 0.171875 shift + unsigned re-quantization + fc2.lora_down
+         are all done in a single fused kernel call
+      2. fc2 GEMM then receives unsigned INT4 activations (act_unsigned=True)
+
+    Using the sequential path (fc1 → GELU → fc2 with symmetric quantization) is
+    fundamentally incompatible with these wscales, causing visually wrong outputs.
+    """
+    batch_size, seq_len, channels = x.shape
+    x_2d = x.view(batch_size * seq_len, channels)
+
+    quantized_x, ascales, lora_act = _svdq_quantize_w4a4(
+        x_2d,
+        lora_down=fc1.proj_down,
+        smooth=fc1.smooth_factor,
+        fp4=fc1.precision == "nvfp4",
+        pad_size=pad_size,
+    )
+
+    batch_size_pad = (batch_size * seq_len + pad_size - 1) // pad_size * pad_size
+    is_fp4 = fc2.precision == "nvfp4"
+
+    qout_act = torch.empty(
+        batch_size_pad,
+        fc1.output_size_per_partition // 2,
+        dtype=torch.uint8,
+        device=x_2d.device,
+    )
+    if is_fp4:
+        qout_ascales = torch.empty(
+            fc1.output_size_per_partition // 16,
+            batch_size_pad,
+            dtype=torch.float8_e4m3fn,
+            device=x_2d.device,
+        )
+    else:
+        qout_ascales = torch.empty(
+            fc1.output_size_per_partition // 64,
+            batch_size_pad,
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+    qout_lora_act = torch.empty(
+        batch_size_pad, fc2.proj_down.shape[1], dtype=torch.float32, device=x_2d.device
+    )
+
+    # fused: fc1 GEMM + GELU + shift + unsigned quantize + fc2.lora_down
+    _svdq_gemm_w4a4(
+        act=quantized_x,
+        wgt=fc1.qweight,
+        qout=qout_act,
+        ascales=ascales,
+        wscales=fc1.wscales,
+        oscales=qout_ascales,
+        lora_act_in=lora_act,
+        lora_up=fc1.proj_up,
+        lora_down=fc2.proj_down,
+        lora_act_out=qout_lora_act,
+        bias=fc1.bias,
+        smooth_factor=fc2.smooth_factor,
+        fp4=is_fp4,
+        alpha=getattr(fc1, "_nunchaku_alpha", None),
+        wcscales=getattr(fc1, "wcscales", None),
+    )
+
+    output = torch.empty(
+        batch_size * seq_len,
+        fc2.output_size_per_partition,
+        dtype=x_2d.dtype,
+        device=x_2d.device,
+    )
+    # fc2 GEMM with unsigned INT4 activations (fused kernel shifted by 0.171875)
+    _svdq_gemm_w4a4(
+        act=qout_act,
+        wgt=fc2.qweight,
+        out=output,
+        ascales=qout_ascales,
+        wscales=fc2.wscales,
+        lora_act_in=qout_lora_act,
+        lora_up=fc2.proj_up,
+        bias=fc2.bias,
+        fp4=is_fp4,
+        alpha=getattr(fc2, "_nunchaku_alpha", None),
+        wcscales=getattr(fc2, "wcscales", None),
+        act_unsigned=True,
+    )
+
+    return output.view(batch_size, seq_len, -1)
+
 
 def _get_qkv_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    query, _ = attn.to_q(hidden_states)
-    key, _ = attn.to_k(hidden_states)
-    value, _ = attn.to_v(hidden_states)
+    if getattr(attn, "use_fused_qkv", False):
+        qkv, _ = attn.to_qkv(hidden_states)
+        query, key, value = [x.contiguous() for x in qkv.chunk(3, dim=-1)]
+    else:
+        query, _ = attn.to_q(hidden_states)
+        key, _ = attn.to_k(hidden_states)
+        value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
+        if getattr(attn, "use_fused_added_qkv", False):
+            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+            encoder_query, encoder_key, encoder_value = [
+                x.contiguous() for x in added_qkv.chunk(3, dim=-1)
+            ]
+        else:
+            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -81,6 +220,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         out_dim: int = None,
         context_pre_only: Optional[bool] = None,
         pre_only: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -96,24 +237,53 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
+        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+        self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
+
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_q = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
-        )
-        self.to_k = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
-        )
-        self.to_v = ColumnParallelLinear(
-            query_dim, self.inner_dim, bias=bias, gather_output=True
-        )
-
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                query_dim,
+                [self.inner_dim] * 3,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
+            self.to_k = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
+            self.to_v = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+            )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
                 ColumnParallelLinear(
-                    self.inner_dim, self.out_dim, bias=out_bias, gather_output=True
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0" if prefix else "",
                 )
             )
             if dropout != 0.0:
@@ -122,26 +292,44 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-            )
-            self.add_k_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-            )
-            self.add_v_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-            )
+            if self.use_fused_added_qkv:
+                self.to_added_qkv = MergedColumnParallelLinear(
+                    added_kv_proj_dim,
+                    [self.inner_dim] * 3,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
+                )
+            else:
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                )
             self.to_add_out = ColumnParallelLinear(
-                self.inner_dim, query_dim, bias=out_bias, gather_output=True
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
         self.attn = USPAttention(
@@ -218,13 +406,18 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=1,
             )
-            x, _ = self.to_out[0](x)
-            if len(self.to_out) == 2:
-                x = self.to_out[1](x)
+            if not self.pre_only:
+                x, _ = self.to_out[0](x)
+                if len(self.to_out) == 2:
+                    x = self.to_out[1](x)
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return x, encoder_hidden_states
         else:
+            if not self.pre_only:
+                x, _ = self.to_out[0](x)
+                if len(self.to_out) == 2:
+                    x = self.to_out[1](x)
             return x
 
 
@@ -235,28 +428,73 @@ class FluxSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
+        self.use_nunchaku_structure = isinstance(quant_config, NunchakuConfig)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ColumnParallelLinear(
-            dim, self.mlp_hidden_dim, bias=True, gather_output=True
-        )
-        self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ColumnParallelLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, gather_output=True
-        )
 
-        self.attn = FluxAttention(
-            query_dim=dim,
-            dim_head=attention_head_dim,
-            num_heads=num_attention_heads,
-            out_dim=dim,
-            bias=True,
-            eps=1e-6,
-            pre_only=True,
-        )
+        if self.use_nunchaku_structure:
+            self.mlp_fc1 = ColumnParallelLinear(
+                dim,
+                self.mlp_hidden_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp_fc1" if prefix else "mlp_fc1",
+            )
+            self.act_mlp = nn.GELU(approximate="tanh")
+            self.mlp_fc2 = ColumnParallelLinear(
+                self.mlp_hidden_dim,
+                dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp_fc2" if prefix else "mlp_fc2",
+            )
+
+            self.attn = FluxAttention(
+                query_dim=dim,
+                dim_head=attention_head_dim,
+                num_heads=num_attention_heads,
+                out_dim=dim,
+                bias=True,
+                eps=1e-6,
+                pre_only=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn" if prefix else "attn",
+            )
+            if is_nunchaku_available():
+                self.norm = NunchakuAdaLayerNormZeroSingle(self.norm, scale_shift=0)
+        else:
+            self.proj_mlp = ColumnParallelLinear(
+                dim,
+                self.mlp_hidden_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+            )
+            self.act_mlp = nn.GELU(approximate="tanh")
+            self.proj_out = ColumnParallelLinear(
+                dim + self.mlp_hidden_dim,
+                dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+            )
+            self.attn = FluxAttention(
+                query_dim=dim,
+                dim_head=attention_head_dim,
+                num_heads=num_attention_heads,
+                out_dim=dim,
+                bias=True,
+                eps=1e-6,
+                pre_only=True,
+                quant_config=quant_config,
+            )
 
     def forward(
         self,
@@ -271,20 +509,46 @@ class FluxSingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
-        mlp_hidden_states = self.act_mlp(proj_hidden_states)
         joint_attention_kwargs = joint_attention_kwargs or {}
-        attn_output = self.attn(
-            x=norm_hidden_states,
-            freqs_cis=freqs_cis,
-            **joint_attention_kwargs,
-        )
 
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        gate = gate.unsqueeze(1)
-        proj_out, _ = self.proj_out(hidden_states)
-        hidden_states = gate * proj_out
-        hidden_states = residual + hidden_states
+        if self.use_nunchaku_structure:
+            if _nunchaku_fused_ops_available:
+                mlp_hidden_states = _fused_gelu_mlp(
+                    norm_hidden_states, self.mlp_fc1, self.mlp_fc2
+                )
+            else:
+                mlp_out, _ = self.mlp_fc1(norm_hidden_states)
+                mlp_hidden_states = self.act_mlp(mlp_out)
+                mlp_hidden_states, _ = self.mlp_fc2(mlp_hidden_states)
+
+            attn_output = self.attn(
+                x=norm_hidden_states,
+                freqs_cis=freqs_cis,
+                **joint_attention_kwargs,
+            )
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
+
+            hidden_states = attn_output + mlp_hidden_states
+            gate = gate.unsqueeze(1)
+            hidden_states = gate * hidden_states
+            hidden_states = residual + hidden_states
+        else:
+            proj_hidden_states, _ = self.proj_mlp(norm_hidden_states)
+            mlp_hidden_states = self.act_mlp(proj_hidden_states)
+
+            attn_output = self.attn(
+                x=norm_hidden_states,
+                freqs_cis=freqs_cis,
+                **joint_attention_kwargs,
+            )
+
+            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+            gate = gate.unsqueeze(1)
+            proj_out, _ = self.proj_out(hidden_states)
+            hidden_states = gate * proj_out
+            hidden_states = residual + hidden_states
+
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
@@ -303,6 +567,8 @@ class FluxTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -318,22 +584,38 @@ class FluxTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        self.ff = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
-        )
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
-
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        self.ff_context = MLP(
-            input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
-        )
 
-        self.ff_context = FeedForward(
-            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
+        nunchaku_enabled = (
+            quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "svdquant"
+            and is_nunchaku_available()
         )
+        self.use_nunchaku_structure = nunchaku_enabled
+        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff_context = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+        )
+        if nunchaku_enabled:
+            nunchaku_kwargs = {
+                "precision": quant_config.precision,
+                "rank": quant_config.rank,
+                "act_unsigned": quant_config.act_unsigned,
+            }
+            self.ff = NunchakuFeedForward(self.ff, **nunchaku_kwargs)
+            self.ff_context = NunchakuFeedForward(self.ff_context, **nunchaku_kwargs)
+            self.norm1 = NunchakuAdaLayerNormZero(self.norm1, scale_shift=0)
+            self.norm1_context = NunchakuAdaLayerNormZero(
+                self.norm1_context, scale_shift=0
+            )
 
     def forward(
         self,
@@ -369,9 +651,14 @@ class FluxTransformerBlock(nn.Module):
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = (
-            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        )
+        if self.use_nunchaku_structure:
+            norm_hidden_states = (
+                norm_hidden_states * scale_mlp[:, None] + shift_mlp[:, None]
+            )
+        else:
+            norm_hidden_states = (
+                norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            )
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -385,10 +672,15 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-            + c_shift_mlp[:, None]
-        )
+        if self.use_nunchaku_structure:
+            norm_encoder_hidden_states = (
+                norm_encoder_hidden_states * c_scale_mlp[:, None] + c_shift_mlp[:, None]
+            )
+        else:
+            norm_encoder_hidden_states = (
+                norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+                + c_shift_mlp[:, None]
+            )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = (
@@ -433,7 +725,44 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
-    def __init__(self, config: FluxConfig, hf_config: dict[str, Any]) -> None:
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attn.to_qkv",
+                "attn.to_out",
+                "attn.add_qkv_proj",
+                "attn.to_added_qkv",
+                "attn.to_add_out",
+                "img_mlp",
+                "txt_mlp",
+                "attention.to_qkv",
+                "attention.to_out",
+                "proj_mlp",
+                "proj_out",
+                "mlp_fc1",
+                "mlp_fc2",
+                "ff.net",
+                "ff_context.net",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
+
+    def __init__(
+        self,
+        config: FluxConfig,
+        hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         self.config = config.arch_config
 
@@ -471,8 +800,10 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(self.config.num_layers)
+                for i in range(self.config.num_layers)
             ]
         )
 
@@ -482,8 +813,10 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     attention_head_dim=self.config.attention_head_dim,
+                    quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(self.config.num_single_layers)
+                for i in range(self.config.num_single_layers)
             ]
         )
 
