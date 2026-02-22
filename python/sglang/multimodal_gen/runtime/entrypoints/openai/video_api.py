@@ -140,7 +140,6 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
 
 
 # TODO: support image to video generation
-# TODO: this is currently not used
 @router.post("", response_model=VideoResponse)
 async def create_video(
     request: Request,
@@ -261,7 +260,11 @@ async def create_video(
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
-    sampling_params = _build_video_sampling_params(request_id, req)
+    try:
+        sampling_params = _build_video_sampling_params(request_id, req)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 

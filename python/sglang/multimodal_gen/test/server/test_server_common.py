@@ -711,6 +711,37 @@ Consider updating perf_baselines.json with the snippets below:
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
 
+    def _test_t2v_rejects_input_reference(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        if case.server_args.modality != "video":
+            return
+
+        base_url = f"http://localhost:{ctx.port}"
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+        data = resp.json().get("data", [])
+        if not data:
+            pytest.fail("/v1/models returned empty model list")
+
+        task_type = data[0].get("task_type")
+        if task_type != "T2V":
+            return
+
+        prompt = case.sampling_params.prompt or "test"
+        payload = {"prompt": prompt, "input_reference": "dummy"}
+        if case.sampling_params.output_size:
+            payload["size"] = case.sampling_params.output_size
+
+        resp = requests.post(f"{base_url}/v1/videos", json=payload)
+        assert (
+            resp.status_code == 400
+        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        detail = resp.json().get("detail", "")
+        assert (
+            "input_reference is not supported" in detail
+        ), f"Unexpected error detail for T2V input_reference: {detail}"
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -744,6 +775,7 @@ Consider updating perf_baselines.json with the snippets below:
 
         # Test /v1/models endpoint for router compatibility
         self._test_v1_models_endpoint(diffusion_server, case)
+        self._test_t2v_rejects_input_reference(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.server_args.lora_path or case.server_args.dynamic_lora_path:
