@@ -631,10 +631,16 @@ def _fwd_kernel_ep_scatter_1(
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
+    # any rows in the per-expert aligned region that do not correspond to
+    # real tokens are left untouched here and should remain initialized to
+    # -1 so DeepGEMM can skip them
     for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+        offs = start_m + off_expert
+        mask = offs < cur_expert_token_num
         tl.store(
-            m_indices_start_ptr + start_m + off_expert,
+            m_indices_start_ptr + offs,
             cur_expert,
+            mask=mask,
         )
 
 
