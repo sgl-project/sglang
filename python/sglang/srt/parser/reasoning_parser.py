@@ -25,11 +25,13 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        tool_start_token: Optional[str] = None,
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
+        self.tool_start_token = tool_start_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
@@ -66,7 +68,21 @@ class BaseReasoningFormatDetector:
             self.think_end_token not in processed_text
             and self.think_end_token not in self.previous_content
         ):
-            # Assume reasoning was truncated before `</think>` token
+            # Check for tool_start_token interruption
+            if (
+                in_reasoning
+                and self.tool_start_token is not None
+                and self.tool_start_token in processed_text
+            ):
+                # Find the first occurrence of tool_start_token and split there
+                tool_idx = processed_text.find(self.tool_start_token)
+                reasoning_text = processed_text[:tool_idx].strip()
+                # Preserve tool_start_token in normal text
+                normal_text = processed_text[tool_idx:]
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
+            # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
@@ -96,9 +112,12 @@ class BaseReasoningFormatDetector:
         current_text = self._buffer
 
         # If the current text is a prefix of the think token, keep buffering
+        tokens_to_check = [self.think_start_token, self.think_end_token]
+        if self.tool_start_token:
+            tokens_to_check.append(self.tool_start_token)
         if any(
             token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
+            for token in tokens_to_check
         ):
             return StreamingParseResult()
 
@@ -124,6 +143,17 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool_start_token interruption
+            if self.tool_start_token and self.tool_start_token in current_text:
+                tool_idx = current_text.find(self.tool_start_token)
+                reasoning_text = current_text[:tool_idx]
+                # Preserve tool_start_token in normal text
+                normal_text = current_text[tool_idx:]
+                self._buffer = ""
+                self._in_reasoning = False
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -235,6 +265,29 @@ class KimiDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+        )
+
+
+class Glm45Detector(BaseReasoningFormatDetector):
+    """
+    Detector for GLM-4.5 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    GLM-4.5 uses `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
         )
 
 
@@ -375,7 +428,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": Qwen3Detector,
-        "glm45": Qwen3Detector,
+        "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": Qwen3Detector,
