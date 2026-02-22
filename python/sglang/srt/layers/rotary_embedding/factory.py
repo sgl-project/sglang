@@ -6,24 +6,24 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.rotary_embedding._base import (
-    DynamicNTKScalingRotaryEmbedding,
+from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
 )
-from sglang.srt.layers.rotary_embedding._mrope import (
+from sglang.srt.layers.rotary_embedding.mrope import (
     MRotaryEmbedding,
     YaRNScalingMRotaryEmbedding,
 )
-from sglang.srt.layers.rotary_embedding._special import (
+from sglang.srt.layers.rotary_embedding.variant import (
     DeepseekScalingRotaryEmbedding,
     DualChunkRotaryEmbedding,
     DynamicNTKAlphaRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
     FourierRotaryEmbedding,
     Llama3RotaryEmbedding,
     Phi3LongRoPEScaledRotaryEmbedding,
 )
-from sglang.srt.layers.rotary_embedding._yarn import YaRNScalingRotaryEmbedding
+from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()

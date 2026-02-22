@@ -1,5 +1,5 @@
-"""Phi3LongRoPE, FourierRoPE, DeepseekScaling, Llama3, Llama4Vision,
-DynamicNTKAlpha, DualChunkRotaryEmbedding."""
+"""RoPE scaling variants: Phi3LongRoPE, FourierRoPE, DeepseekScaling, Llama3,
+Llama4Vision, DynamicNTK, DynamicNTKAlpha, DualChunkRotaryEmbedding."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.rotary_embedding._base import RotaryEmbedding
-from sglang.srt.layers.rotary_embedding._utils import (
-    _rotate_gptj,
-    _rotate_neox,
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
+    rotate_gptj,
+    rotate_neox,
 )
-from sglang.srt.layers.rotary_embedding._yarn import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
+from sglang.srt.layers.rotary_embedding.yarn import (
+    yarn_find_correction_range,
     yarn_get_mscale,
+    yarn_linear_ramp_mask,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
@@ -158,12 +158,12 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = query_rot * cos + _rotate_neox(query_rot) * sin
+        query_rot = query_rot * cos + rotate_neox(query_rot) * sin
         query = torch.cat((query_rot, query_pass), dim=-1)
 
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = key_rot * cos + _rotate_neox(key_rot) * sin
+        key_rot = key_rot * cos + rotate_neox(key_rot) * sin
         key = torch.cat((key_rot, key_pass), dim=-1)
 
         return query.flatten(-2), key.flatten(-2)
@@ -383,7 +383,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -392,7 +392,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(
+            - yarn_linear_ramp_mask(
                 low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
             )
         ) * self.extrapolation_factor
@@ -471,7 +471,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
         query_rot = query_rot * cos + rotate_fn(query_rot) * sin
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
         if self.rotary_dim < self.head_size:
@@ -816,7 +816,7 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
         hidden_rot = hidden_rot * cos + rotate_fn(hidden_rot) * sin
         if self.rotary_dim < self.head_size:
             hidden = torch.cat((hidden_rot, hidden_pass), dim=-1)
@@ -830,3 +830,39 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         s += f", chunk_size={self.chunk_size}, local_size={self.local_size}"
         return s
+
+
+class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
+    """RotaryEmbedding extended with Dynamic NTK scaling.
+
+    Credits to the Reddit users /u/bloc97 and /u/emozilla
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+    ) -> None:
+        self.scaling_factor = scaling_factor
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        max_len = self.max_position_embeddings * self.scaling_factor
+        base = self.base * (
+            (self.scaling_factor * max_len / self.max_position_embeddings)
+            - (self.scaling_factor - 1)
+        ) ** (self.rotary_dim / (self.rotary_dim - 2))
+        inv_freq = self._compute_inv_freq(base)
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache

@@ -18,20 +18,20 @@ if _is_npu:
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
 
-def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
+def rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
+def rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     x = torch.stack((-x2, x1), dim=-1)
     return x.flatten(-2)
 
 
-def _apply_rotary_emb(
+def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,

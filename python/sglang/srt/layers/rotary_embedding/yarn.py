@@ -7,11 +7,11 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.layers.rotary_embedding._base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
 
 # Inverse dim formula to find dim based on number of rotations
-def _yarn_find_correction_dim(
+def yarn_find_correction_dim(
     num_rotations: int,
     dim: int,
     base: float = 10000,
@@ -23,7 +23,7 @@ def _yarn_find_correction_dim(
 
 
 # Find dim range bounds based on rotations
-def _yarn_find_correction_range(
+def yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
     dim: int,
@@ -31,15 +31,15 @@ def _yarn_find_correction_range(
     max_position_embeddings: int = 2048,
     truncate: bool = True,
 ) -> Tuple[int, int]:
-    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    low = yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
     if truncate:
         low = math.floor(low)
         high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
-def _yarn_linear_ramp_mask(
+def yarn_linear_ramp_mask(
     low: float, high: float, dim: int, dtype: torch.dtype, device: torch.device = None
 ) -> torch.Tensor:
     if low == high:
@@ -50,7 +50,7 @@ def _yarn_linear_ramp_mask(
     return ramp_func
 
 
-def _yarn_get_mscale(scale: float = 1) -> float:
+def yarn_get_mscale_simple(scale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * math.log(scale) + 1.0
@@ -91,7 +91,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
         self.truncate = truncate
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -103,7 +103,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
@@ -114,7 +114,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+            - yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)

@@ -1,4 +1,4 @@
-"""RotaryEmbedding base + LinearScaling + DynamicNTK variants."""
+"""RotaryEmbedding base class + LinearScalingRotaryEmbedding."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.layers.rotary_embedding._utils import _apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -88,12 +88,12 @@ class RotaryEmbedding(MultiPlatformOp):
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-        self._apply_rotary_emb_wrapped = _apply_rotary_emb
+        self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                self._apply_rotary_emb_wrapped
+                apply_rotary_emb
             )
         self.position_cos, self.position_sin = None, None
 
@@ -430,44 +430,3 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
     @property
     def scaling_factor_to_offset(self) -> Dict[float, int]:
         return self._scaling_factor_to_offset
-
-
-class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
-    """RotaryEmbedding extended with Dynamic NTK scaling.
-
-    Credits to the Reddit users /u/bloc97 and /u/emozilla
-    """
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: int,
-        is_neox_style: bool,
-        scaling_factor: float,
-        dtype: torch.dtype,
-    ) -> None:
-        self.scaling_factor = scaling_factor
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-        )
-
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        # NOTE(woosuk): self.max_position_embeddings is the original
-        # maximum length before applying the rope scaling.
-        # Thus, the maximum length after applying the rope scaling is
-        # self.max_position_embeddings * self.scaling_factor.
-        max_len = self.max_position_embeddings * self.scaling_factor
-        base = self.base * (
-            (self.scaling_factor * max_len / self.max_position_embeddings)
-            - (self.scaling_factor - 1)
-        ) ** (self.rotary_dim / (self.rotary_dim - 2))
-        inv_freq = self._compute_inv_freq(base)
-        t = torch.arange(max_len, dtype=torch.float)
-
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
