@@ -14,7 +14,7 @@ from sglang.srt.layers.rotary_embedding.mrope import (
     MRotaryEmbedding,
     YaRNScalingMRotaryEmbedding,
 )
-from sglang.srt.layers.rotary_embedding.variant import (
+from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
     DualChunkRotaryEmbedding,
     DynamicNTKAlphaRotaryEmbedding,
