@@ -766,9 +766,12 @@ class NativeSparseAttnBackend(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             # fake page_table for sparse_prefill
+            # Add extra columns for speculative draft tokens to avoid
+            # overflow during target_verify when max_seqlen_k = seq_len + num_draft_tokens
             "page_table": torch.zeros(
                 max_num_tokens,
-                self.max_context_len,
+                self.max_context_len
+                + (self.speculative_num_draft_tokens or 0),
                 dtype=torch.int32,
                 device=self.device,
             ),
