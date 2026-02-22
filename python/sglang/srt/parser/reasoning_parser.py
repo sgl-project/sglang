@@ -262,13 +262,14 @@ class GptOssDetector(BaseReasoningFormatDetector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         events = self.parser.parse(text)
-        # Flush the buffer for one-shot parsing
+        # Flush buffer for one-shot parsing
         events += self.parser.parse("")
 
         reasoning_text = "".join(
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_parts = []
+
         for e in events:
             if e.event_type == "normal":
                 normal_parts.append(e.content)
@@ -276,7 +277,6 @@ class GptOssDetector(BaseReasoningFormatDetector):
                 # Use raw_text to preserve structural markers for function call detector
                 normal_parts.append(e.raw_text if e.raw_text else e.content)
         normal_text = "".join(normal_parts)
-        # Tool call events preserve raw text with structural markers
 
         return StreamingParseResult(
             normal_text=normal_text,
@@ -290,6 +290,7 @@ class GptOssDetector(BaseReasoningFormatDetector):
             [e.content for e in events if e.event_type == "reasoning"]
         )
         normal_parts = []
+
         for e in events:
             if e.event_type == "normal":
                 normal_parts.append(e.content)

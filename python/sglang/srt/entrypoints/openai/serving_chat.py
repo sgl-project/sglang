@@ -679,13 +679,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 stream_buffer = stream_buffers.get(index, "")
+                # IMPORTANT: Only process new content, not re-parse markers
+                # When content["text"] contains markers already in stream_buffer,
+                # we must not re-process them to avoid marker splitting
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
+                finish_reason = content["meta_info"]["finish_reason"]
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
+                    logger.debug(
+                        f"[DEBUG] Before _process_reasoning_stream: delta={repr(delta)}"
+                    )
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
+                    )
+                    logger.debug(
+                        f"[DEBUG] After _process_reasoning_stream: reasoning_text={repr(reasoning_text)}, delta={repr(delta)}"
                     )
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -718,6 +728,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     and request.tools
                     and self.tool_call_parser
                 ):
+                    logger.debug(
+                        f"[DEBUG] Processing tool call stream. parser={self.tool_call_parser}, delta={repr(delta)}"
+                    )
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -739,6 +752,11 @@ class OpenAIServingChat(OpenAIServingBase):
                             yield remaining_chunk
 
                 else:
+                    if request.tools and not self.tool_call_parser:
+                        logger.warning(
+                            "[DEBUG] Tools provided but tool_call_parser is not set. "
+                            "Tool calls will be treated as normal content."
+                        )
                     # Regular content
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
@@ -1063,7 +1081,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Align with Kimi-K2 format: functions.{name}:{index}
             # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
             # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
@@ -1121,11 +1139,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
+            logger.debug(
+                f"[DEBUG] Tool call detected in non-streaming response. Parser: {self.tool_call_parser}"
+            )
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
+                logger.debug(
+                    f"[DEBUG] Parsed tool calls (non-stream): {call_info_list}"
+                )
                 tool_calls = []
                 for call_info in call_info_list:
                     tool_id = self._process_tool_call_id(
@@ -1185,6 +1209,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
             )
         reasoning_parser = reasoning_parser_dict[index]
+        # Note: GptOssDetector returns tool calls in StreamingParseResult,
+        # but ReasoningParser only returns (reasoning_text, normal_text).
+        # For gpt-oss, tool calls need to be extracted from normal_text (which contains raw markers)
+        # by the tool call parser, so we just pass through normal_text.
         return reasoning_parser.parse_stream_chunk(delta)
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
@@ -1262,8 +1290,20 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
+        if calls:
+            logger.debug(f"[DEBUG] Parsed tool calls: {calls}")
+        if normal_text:
+            logger.debug(f"[DEBUG] Parsed normal text: {normal_text}")
+
+        logger.debug(
+            f"[DEBUG] After parse_stream_chunk: delta_input={repr(delta)}, normal_text={repr(normal_text)}, calls={len(calls)}"
+        )
+
         # Yield normal text
         if normal_text:
+            logger.debug(
+                f"[DEBUG] Yielding normal text: index={index}, content={repr(normal_text)}"
+            )
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
