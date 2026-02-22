@@ -14,7 +14,7 @@ DEVICE = DEFAULT_DEVICE
 DTYPE = torch.bfloat16
 
 
-# ── Scalar ("before") kernel ───────────────────────────────────────────────────
+# ── Scalar baseline kernel ─────────────────────────────────────────────────────
 
 
 @cache_once
@@ -33,25 +33,6 @@ def downcast_fp8_scalar(k, v, k_out, v_out, k_scale, v_scale, loc, mult=1, offse
     module.downcast_fp8_scalar(k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset)
 
 
-# ── V2 kernel (256 threads fixed, 2D grid scaling) ────────────────────────────
-
-
-@cache_once
-def _jit_cast_v2_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype)
-    return load_jit(
-        "cast_v2",
-        *args,
-        cuda_files=["elementwise/cast_v2.cuh"],
-        cuda_wrappers=[("downcast_fp8_v2", f"downcast_fp8_v2<{args}>")],
-    )
-
-
-def downcast_fp8_v2(k, v, k_out, v_out, k_scale, v_scale, loc, mult=1, offset=0):
-    module = _jit_cast_v2_module(k.dtype)
-    module.downcast_fp8_v2(k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset)
-
-
 # ── Config ranges ──────────────────────────────────────────────────────────────
 
 SL_LIST = get_benchmark_range(
@@ -66,9 +47,9 @@ HEAD_DIM_LIST = get_benchmark_range(
 
 CONFIGS = [(sl, h, d, sl * 2) for sl in SL_LIST for h, d in HEAD_DIM_LIST]
 
-LINE_VALS = ["scalar", "vec", "v2"]
-LINE_NAMES = ["Scalar (before)", "Vectorized (tile::Memory)", "V2 (256 threads, 2D grid)"]
-STYLES = [("blue", "--"), ("orange", "-"), ("green", "-.")]
+LINE_VALS = ["scalar", "optimized"]
+LINE_NAMES = ["Scalar (baseline)", "Optimized (256 threads, 2D grid)"]
+STYLES = [("blue", "--"), ("orange", "-")]
 
 
 # ── Perf report ────────────────────────────────────────────────────────────────
@@ -83,7 +64,7 @@ STYLES = [("blue", "--"), ("orange", "-"), ("green", "-.")]
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="downcast-fp8-comparison",
+        plot_name="downcast-fp8-scalar-vs-optimized",
         args={},
     )
 )
@@ -98,10 +79,8 @@ def benchmark(input_sl, head, dim, out_sl, provider):
 
     if provider == "scalar":
         fn = lambda: downcast_fp8_scalar(k, v, k_out, v_out, k_scale, v_scale, loc)
-    elif provider == "vec":
-        fn = lambda: downcast_fp8(k, v, k_out, v_out, k_scale, v_scale, loc)
     else:
-        fn = lambda: downcast_fp8_v2(k, v, k_out, v_out, k_scale, v_scale, loc)
+        fn = lambda: downcast_fp8(k, v, k_out, v_out, k_scale, v_scale, loc)
 
     return run_benchmark(fn)
 
@@ -122,12 +101,12 @@ def _report_bandwidth(input_sl, head, dim, dtype):
     loc = torch.arange(input_sl, dtype=torch.int64, device=DEVICE)
 
     scalar_fn = lambda: downcast_fp8_scalar(k, v, k_out, v_out, k_scale, v_scale, loc)
-    vec_fn = lambda: downcast_fp8(k, v, k_out, v_out, k_scale, v_scale, loc)
-    v2_fn = lambda: downcast_fp8_v2(k, v, k_out, v_out, k_scale, v_scale, loc)
+    opt_fn = lambda: downcast_fp8(k, v, k_out, v_out, k_scale, v_scale, loc)
 
-    scalar_ms, _, _ = triton.testing.do_bench_cudagraph(scalar_fn, quantiles=[0.5, 0.2, 0.8])
-    vec_ms, _, _ = triton.testing.do_bench_cudagraph(vec_fn, quantiles=[0.5, 0.2, 0.8])
-    v2_ms, _, _ = triton.testing.do_bench_cudagraph(v2_fn, quantiles=[0.5, 0.2, 0.8])
+    scalar_ms, _, _ = triton.testing.do_bench_cudagraph(
+        scalar_fn, quantiles=[0.5, 0.2, 0.8]
+    )
+    opt_ms, _, _ = triton.testing.do_bench_cudagraph(opt_fn, quantiles=[0.5, 0.2, 0.8])
 
     def fmt(ms):
         return f"{ms*1000:6.2f}us {total_bytes/(ms*1e-3)/1e9:6.0f}GB/s"
@@ -135,17 +114,16 @@ def _report_bandwidth(input_sl, head, dim, dtype):
     print(
         f"  sl={input_sl:5d}  h={head:2d}  d={dim:4d}"
         f"  |  scalar {fmt(scalar_ms)}"
-        f"  |  vec {fmt(vec_ms)}"
-        f"  |  v2 {fmt(v2_ms)}"
-        f"  |  v2 speedup {vec_ms/v2_ms:.2f}x"
+        f"  |  optimized {fmt(opt_ms)}"
+        f"  |  speedup {scalar_ms/opt_ms:.2f}x"
     )
 
 
 def report_bandwidth():
-    print(f"\n{'='*110}")
-    print("  Scalar vs Vectorized vs V2 (256 threads, 2D grid)")
+    print(f"\n{'='*95}")
+    print("  Scalar (baseline) vs Optimized (256 threads, 2D grid)")
     print(f"  dtype={DTYPE}, device={DEVICE}")
-    print(f"{'='*110}")
+    print(f"{'='*95}")
     for sl in [64, 256, 1024, 2048]:
         for h, d in [(8, 128), (32, 128), (8, 256), (32, 256)]:
             _report_bandwidth(sl, h, d, DTYPE)
