@@ -503,8 +503,8 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
         key
         for key, value in config.items()
         if isinstance(value, (list, tuple))
-           and len(value) == 2
-           and all(isinstance(item, str) for item in value)
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
     ]
     if component_keys:
         missing_components = [
@@ -654,8 +654,8 @@ def maybe_download_model(
             key
             for key, value in model_index.items()
             if isinstance(value, (list, tuple))
-               and len(value) == 2
-               and all(isinstance(item, str) for item in value)
+            and len(value) == 2
+            and all(isinstance(item, str) for item in value)
         ]
         if component_keys:
             return all(
@@ -839,7 +839,7 @@ def maybe_download_model(
                     f"Could not find model at {model_name_or_path} and failed to download from HF Hub "
                     f"after {MAX_RETRIES} attempts due to network error: {e}"
                 ) from e
-            wait_time = 2 ** attempt
+            wait_time = 2**attempt
             logger.warning(
                 "Download failed (attempt %d/%d) due to network error: %s. "
                 "Retrying in %d seconds...",

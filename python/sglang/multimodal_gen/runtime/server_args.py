@@ -405,7 +405,7 @@ class ServerArgs:
             return
         ncfg.validate()
 
-        # propagate the path to server_args regardless of which quant method is used
+        # propagate the path to server_args
         if ncfg.transformer_quantized_path:
             self.transformer_quantized_path = ncfg.transformer_quantized_path
 
