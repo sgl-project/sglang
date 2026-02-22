@@ -552,10 +552,17 @@ class _NonIntrusiveDumper:
 
         def _hook(_module, args, kwargs):
             for i, item in enumerate(args):
-                self._dump_value(module_name, item, sub_name=f"inputs.{i}", is_root=is_root)
+                self._dump_value(
+                    module_name, item, sub_name=f"inputs.{i}", is_root=is_root
+                )
             for name, value in kwargs.items():
                 effective_name = rename.get(name, name)
-                self._dump_value(module_name, value, sub_name=f"inputs.{effective_name}", is_root=is_root)
+                self._dump_value(
+                    module_name,
+                    value,
+                    sub_name=f"inputs.{effective_name}",
+                    is_root=is_root,
+                )
 
         return _hook
 
@@ -566,7 +573,9 @@ class _NonIntrusiveDumper:
 
         return _hook
 
-    def _dump_value(self, module_name: str, value: Any, sub_name: str, *, is_root: bool) -> None:
+    def _dump_value(
+        self, module_name: str, value: Any, sub_name: str, *, is_root: bool
+    ) -> None:
         for key, tensor in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
