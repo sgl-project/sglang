@@ -2147,6 +2147,7 @@ class Scheduler(
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
                 req.time_stats.forward_entry_time = time.perf_counter()
+                req.time_stats.batch_size_prefill = len(self.running_batch.reqs)
                 if self.enable_metrics:
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),

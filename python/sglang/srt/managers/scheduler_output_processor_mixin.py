@@ -929,6 +929,7 @@ class SchedulerOutputProcessorMixin:
         prefill_launch_delays = []
         prefill_launch_latencies = []
         prefill_finished_timestamps = []
+        batch_size_prefill_values = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -1044,6 +1045,7 @@ class SchedulerOutputProcessorMixin:
                 prefill_finished_timestamps.append(
                     req.time_stats.get_prefill_finished_ts()
                 )
+                batch_size_prefill_values.append(req.time_stats.batch_size_prefill)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -1156,6 +1158,7 @@ class SchedulerOutputProcessorMixin:
                     prefill_launch_delay=prefill_launch_delays,
                     prefill_launch_latency=prefill_launch_latencies,
                     prefill_finished_ts=prefill_finished_timestamps,
+                    batch_size_prefill=batch_size_prefill_values,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -1205,6 +1208,7 @@ class SchedulerOutputProcessorMixin:
         prefill_launch_delays = []
         prefill_launch_latencies = []
         prefill_finished_timestamps = []
+        batch_size_prefill_values = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1228,6 +1232,7 @@ class SchedulerOutputProcessorMixin:
                 prefill_finished_timestamps.append(
                     req.time_stats.get_prefill_finished_ts()
                 )
+                batch_size_prefill_values.append(req.time_stats.batch_size_prefill)
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
@@ -1238,6 +1243,7 @@ class SchedulerOutputProcessorMixin:
                 prefill_launch_delay=prefill_launch_delays,
                 prefill_launch_latency=prefill_launch_latencies,
                 prefill_finished_ts=prefill_finished_timestamps,
+                batch_size_prefill=batch_size_prefill_values,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,

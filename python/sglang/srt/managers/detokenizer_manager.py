@@ -405,6 +405,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
             prefill_finished_ts=recv_obj.prefill_finished_ts,
+            batch_size_prefill=recv_obj.batch_size_prefill,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
