@@ -545,6 +545,14 @@ class SchedulerDisaggregationPrefillMixin:
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
