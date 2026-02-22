@@ -3895,7 +3895,7 @@ class ServerArgs:
             "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
             "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
-            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
+            "'cutlass' (default for SM120 in auto mode; optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only). "
             "NOTE: This replaces the deprecated environment variables "
