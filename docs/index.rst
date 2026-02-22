@@ -35,8 +35,6 @@ Its core features include:
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
    basic_usage/popular_model_usage.rst
-   basic_usage/diffusion_llms.md
-   basic_usage/diffusion.md
 
 .. toctree::
    :maxdepth: 1
