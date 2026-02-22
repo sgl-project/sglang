@@ -24,8 +24,8 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
 LOCAL_PREFERENCE_FACTOR = 1.1  # Bias towards local rank; 1.0 = pure argmin.
-_LOCAL_PREF_NUMER = int(LOCAL_PREFERENCE_FACTOR * 5)
-_LOCAL_PREF_DENOM = 5
+_LOCAL_PREF_NUMER = int(LOCAL_PREFERENCE_FACTOR * 10)
+_LOCAL_PREF_DENOM = 10
 
 
 def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
@@ -79,7 +79,7 @@ def _count_routed_per_rank_kernel(
 
 
 @triton.jit
-def _waterfill_expand_with_histogram_kernel(
+def _waterfill_expand_kernel(
     # Inputs
     topk_ids_ptr,  # [num_tokens, topk]
     topk_weights_ptr,  # [num_tokens, topk]
@@ -88,7 +88,6 @@ def _waterfill_expand_with_histogram_kernel(
     expanded_ids_ptr,  # [num_tokens, topk+1]
     expanded_weights_ptr,  # [num_tokens, topk+1]
     local_mask_ptr,  # [num_tokens]
-    dest_counts_ptr,  # [world_size] - output histogram (atomic)
     # Scalars
     num_tokens,
     topk: tl.constexpr,
@@ -104,7 +103,7 @@ def _waterfill_expand_with_histogram_kernel(
     ALLOW_ALL_RANKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused waterfill + expand + histogram. ID remap: old_id -> old_id + old_id // old_epr."""
+    """Fused waterfill + expand. ID remap: old_id -> old_id + old_id // old_epr."""
     pid = tl.program_id(0)
     token_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = token_idx < num_tokens
@@ -263,12 +262,6 @@ def _waterfill_expand_with_histogram_kernel(
     )
     tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
 
-    # Step 5: Block-level histogram with minimal atomics.
-    for r in range(world_size):
-        rank_count = tl.sum(tl.where(mask & has_valid & (dest_rank == r), 1, 0))
-        if rank_count > 0:
-            tl.atomic_add(dest_counts_ptr + r, rank_count)
-
 
 def waterfill_prepare_dispatch_fused(
     topk_ids: Tensor,
@@ -301,15 +294,13 @@ def waterfill_prepare_dispatch_fused(
 
     BLOCK_SIZE = 256
     grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    dest_counts = torch.zeros(world_size, dtype=torch.int32, device=device)
-    _waterfill_expand_with_histogram_kernel[grid](
+    _waterfill_expand_kernel[grid](
         topk_ids,
         topk_weights,
         routed_counts,
         expanded_topk_ids,
         expanded_topk_weights,
         local_shared_mask,
-        dest_counts,
         num_tokens,
         topk,
         old_experts_per_rank,
@@ -322,7 +313,7 @@ def waterfill_prepare_dispatch_fused(
         _LOCAL_PREF_DENOM,
         target_total,
         allow_all_ranks,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE,
     )
 
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
