@@ -2045,7 +2045,10 @@ class TestRegisterForwardHook:
 
         module = torch.nn.Linear(4, 4)
         handles = _register_forward_hook_or_replace_fn(
-            module, pre_hook=pre_hook, hook=hook, mode=mode,
+            module,
+            pre_hook=pre_hook,
+            hook=hook,
+            mode=mode,
         )
 
         x = torch.randn(2, 4)
