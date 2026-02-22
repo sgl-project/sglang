@@ -799,13 +799,15 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   jit-kernel-unit-test:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Skip for scheduled runs and when target_stage is set
     if: |
+      always() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
-      needs.check-changes.outputs.jit_kernel == 'true'
+      needs.check-changes.outputs.jit_kernel == 'true' &&
+      (needs.sgl-kernel-build-wheels.result == 'success' || needs.sgl-kernel-build-wheels.result == 'skipped')
     runs-on: 1-gpu-runner
     timeout-minutes: 240
     env:
@@ -815,10 +817,43 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      - name: Clean up disk
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Build sgl-kernel locally if wheel not available
+        if: needs.check-changes.outputs.sgl_kernel != 'true'
+        timeout-minutes: 30
+        run: |
+          # Install CMake 3.26+ required by sgl-kernel
+          pip install "cmake>=3.26"
+          cmake --version
+          cd sgl-kernel
+          pip install scikit-build-core>=0.10 ninja wheel numpy uv
+          pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129
+          make build
+          # Rename wheel to match expected pattern (linux_x86_64 -> manylinux2014_x86_64)
+          for whl in dist/sgl_kernel-*-linux_x86_64.whl; do
+            if [ -f "$whl" ]; then
+              newname=$(echo "$whl" | sed 's/linux_x86_64/manylinux2014_x86_64/')
+              mv "$whl" "$newname"
+              echo "Renamed $whl to $newname"
+            fi
+          done
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30

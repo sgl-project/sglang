@@ -34,9 +34,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Build sgl-kernel locally for PyTorch 2.10 compatibility
+        timeout-minutes: 30
+        run: |
+          # Install CMake 3.26+ required by sgl-kernel
+          pip install "cmake>=3.26"
+          cmake --version
+          cd sgl-kernel
+          pip install scikit-build-core>=0.10 ninja wheel numpy uv
+          pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129
+          make build
+          # Rename wheel to match expected pattern (linux_x86_64 -> manylinux2014_x86_64)
+          for whl in dist/sgl_kernel-*-linux_x86_64.whl; do
+            if [ -f "$whl" ]; then
+              newname=$(echo "$whl" | sed 's/linux_x86_64/manylinux2014_x86_64/')
+              mv "$whl" "$newname"
+              echo "Renamed $whl to $newname"
+            fi
+          done
+
       - name: Install dependencies
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python

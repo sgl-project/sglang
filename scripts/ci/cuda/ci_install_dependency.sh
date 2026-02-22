@@ -128,6 +128,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
+$PIP_CMD uninstall torch || true
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Fix CUDA version mismatch between torch and torchaudio.
@@ -233,6 +234,15 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 else
     $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 fi
+
+# Set LD_LIBRARY_PATH to use pip-installed cuDNN instead of PyTorch's bundled cuDNN
+# This is critical for PyTorch 2.10+ which ships with cuDNN 9.10.2.21 that has Conv3D performance issues
+CUDNN_PATH=$(python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__file__)" 2>/dev/null | xargs dirname | xargs dirname 2>/dev/null || echo "")
+if [ -n "$CUDNN_PATH" ] && [ -d "$CUDNN_PATH/lib" ]; then
+    export LD_LIBRARY_PATH="$CUDNN_PATH/lib:$LD_LIBRARY_PATH"
+    echo "Set LD_LIBRARY_PATH to use pip-installed cuDNN: $CUDNN_PATH/lib"
+fi
+
 $PIP_CMD uninstall xformers || true
 
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues)
