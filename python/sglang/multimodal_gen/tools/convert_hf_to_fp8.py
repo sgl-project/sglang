@@ -1,18 +1,26 @@
-# adapted from Slime
+# copied and adapted from Slime
 """
-python tools/convert_hf_to_fp8.py [-h] [--model-dir MODEL_DIR] [--save-dir SAVE_DIR] [--strategy {block,channel,tensor}] [--block-size [BLOCK_SIZE ...]]
-                           [--max-workers MAX_WORKERS]
+Convert HuggingFace safetensors model to FP8 format for efficient inference.
 
-options:
-  -h, --help            show this help message and exit
-  --model-dir MODEL_DIR
-                        Path to the directory of the HF safetensors model.
-  --save-dir SAVE_DIR   Path to the directory to save the converted model.
-  --strategy {block,channel,tensor}
-  --block-size [BLOCK_SIZE ...]
-                        eg. --block-size 32 32
-  --max-workers MAX_WORKERS
-                        Number of worker threads for parallel processing
+Example usage:
+    # convert FLUX.1-dev transformer to FP8
+    python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
+        --model-dir /path/to/FLUX.1-dev/transformer \
+        --save-dir /path/to/FLUX.1-dev/transformer-FP8 \
+        --strategy block \
+        --block-size 128 128
+
+Options:
+    --model-dir MODEL_DIR
+                        path to the directory of the HF safetensors model (e.g., transformer subfolder)
+    --save-dir SAVE_DIR
+                        path to the directory to save the converted FP8 model
+    --strategy {block,channel,tensor}
+                        quantization strategy (default: block)
+    --block-size [BLOCK_SIZE ...]
+                        block size for block quantization, e.g., --block-size 128 128
+    --max-workers MAX_WORKERS
+                        number of worker threads for parallel processing (default: 1)
 """
 
 import argparse
