@@ -63,16 +63,46 @@ class TestDumpComparator(CustomTestCase):
 
         self.assertIsNone(_load_object("/nonexistent.pt"))
 
-    def test_compute_and_print_diff(self):
-        from sglang.srt.debug_utils.dump_comparator import _compute_and_print_diff
+    def test_compute_diff(self):
+        from sglang.srt.debug_utils.dump_comparator import _compute_diff
 
         x = torch.ones(10, 10)
-        self.assertAlmostEqual(
-            _compute_and_print_diff(x, x, 1e-3)["max_abs_diff"], 0.0, places=5
+        diff = _compute_diff(x, x)
+        self.assertAlmostEqual(diff.max_abs_diff, 0.0, places=5)
+        self.assertAlmostEqual(diff.mean_abs_diff, 0.0, places=5)
+
+        diff = _compute_diff(x, x + 0.5)
+        self.assertAlmostEqual(diff.max_abs_diff, 0.5, places=4)
+        self.assertAlmostEqual(diff.mean_abs_diff, 0.5, places=4)
+
+    def test_compute_tensor_stats(self):
+        from sglang.srt.debug_utils.dump_comparator import _compute_tensor_stats
+
+        x = torch.arange(100, dtype=torch.float32)
+        stats = _compute_tensor_stats(x)
+        self.assertAlmostEqual(stats.mean, 49.5, places=1)
+        self.assertAlmostEqual(stats.min, 0.0, places=1)
+        self.assertAlmostEqual(stats.max, 99.0, places=1)
+        self.assertIsNotNone(stats.p1)
+        self.assertIsNotNone(stats.p99)
+
+    def test_compare_tensors(self):
+        from sglang.srt.debug_utils.dump_comparator import compare_tensors
+
+        x = torch.randn(10, 10)
+        info = compare_tensors(x_baseline=x, x_target=x, name="test")
+        self.assertEqual(info.name, "test")
+        self.assertFalse(info.shape_mismatch)
+        self.assertIsNotNone(info.diff)
+        self.assertAlmostEqual(info.diff.max_abs_diff, 0.0, places=5)
+
+        info_mismatch = compare_tensors(
+            x_baseline=torch.randn(3, 4),
+            x_target=torch.randn(5, 6),
+            name="mismatch",
         )
-        self.assertAlmostEqual(
-            _compute_and_print_diff(x, x + 0.5, 1e-3)["max_abs_diff"], 0.5, places=4
-        )
+        self.assertTrue(info_mismatch.shape_mismatch)
+        self.assertIsNone(info_mismatch.diff)
 
 
 class TestEndToEnd(CustomTestCase):
