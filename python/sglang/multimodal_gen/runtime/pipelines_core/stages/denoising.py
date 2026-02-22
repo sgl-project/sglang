@@ -724,7 +724,7 @@ class DenoisingStage(PipelineStage):
             )
 
     def _offload_transformers_after_denoising(self, server_args: ServerArgs) -> None:
-        if not (server_args.dit_cpu_offload or server_args.dit_layerwise_offload):
+        if not server_args.dit_cpu_offload:
             return
         if current_platform.device_type != "cuda":
             return
