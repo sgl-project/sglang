@@ -16,11 +16,8 @@ from pydantic import BaseModel
 from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
-from sglang.bench_serving import (
-    get_dataset,
-    get_processor,
-    get_tokenizer,
-)
+from sglang.benchmark.datasets import get_dataset
+from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
