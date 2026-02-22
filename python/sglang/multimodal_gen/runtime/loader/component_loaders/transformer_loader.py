@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import os
@@ -167,17 +166,21 @@ class TransformerLoader(ComponentLoader):
             param_dtype,
         )
 
-        init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
-
-        # priority: model config.json → safetensors metadata → nunchaku config
-        quant_config = get_quant_config(config)
-        if quant_config is None and server_args.transformer_quantized_path:
-            # single-file quantized checkpoint (e.g. FP8): try to read
-            # quantization_config from the safetensors metadata header
-            quant_config = get_quant_config_from_safetensors_metadata(
-                safetensors_list[0]
+        # prepare init_param
+        init_params: dict[str, Any] = {
+            "config": dit_config,
+            "hf_config": config,
+            "quant_config": (quant_config if quant_config else nunchaku_config),
+        }
+        if (
+            init_params["quant_config"] is None
+            and server_args.transformer_weights_path is not None
+        ):
+            logger.warning(
+                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
-        init_params["quant_config"] = quant_config if quant_config else nunchaku_config
+        else:
+            logger.debug("quantization config: %s", init_params["quant_config"])
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(

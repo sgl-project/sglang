@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -104,7 +107,13 @@ class SelfAttention(nn.Module):
     Input x should already be the local shard [B, S_local, D] when SP is enabled.
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -118,10 +127,18 @@ class SelfAttention(nn.Module):
         self.num_heads_per_rank = self.num_heads // self.tp_size
 
         # TP strategy: shard Q/K/V over heads (column-parallel), then row-parallel output.
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
+        self.q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.o = RowParallelLinear(
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
@@ -188,7 +205,13 @@ class CrossAttention(nn.Module):
     Uses LocalAttention instead of USPAttention for efficiency.
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -201,10 +224,18 @@ class CrossAttention(nn.Module):
             )
         self.num_heads_per_rank = self.num_heads // self.tp_size
 
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
+        self.q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.o = RowParallelLinear(
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
@@ -264,14 +295,15 @@ class DiTBlock(nn.Module):
         num_heads: int,
         ffn_dim: int,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(dim, num_heads, eps)
+        self.self_attn = SelfAttention(dim, num_heads, eps, quant_config=quant_config)
+        self.cross_attn = CrossAttention(dim, num_heads, eps, quant_config=quant_config)
         self.norm1 = LayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
@@ -281,7 +313,13 @@ class DiTBlock(nn.Module):
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
-        self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            dim,
+            ffn_dim,
+            output_dim=dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
+        )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()
 
@@ -388,7 +426,12 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: MOVAVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: MOVAVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
@@ -421,13 +464,24 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
         self.text_embedding = MLP(
-            text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
+            text_dim,
+            dim,
+            output_dim=dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
         )
-        self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
+        self.time_embedding = MLP(
+            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
+        )
         # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
+        self.time_projection = nn.Sequential(
+            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
+        )
         self.blocks = nn.ModuleList(
-            [DiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
+            [
+                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
+                for _ in range(num_layers)
+            ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
