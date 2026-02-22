@@ -279,14 +279,12 @@ class _Dumper:
         model: "torch.nn.Module",
     ) -> Optional["_NonIntrusiveDumper"]:
         self._http_manager  # noqa: B018
-
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-
-        non_intrusive = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
-        self._non_intrusive = non_intrusive
-        return non_intrusive
+        nid = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        self._non_intrusive = nid
+        return nid
 
     # ------------------------------- public :: secondary ---------------------------------
 
