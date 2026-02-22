@@ -209,5 +209,7 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
         not is_symmetric_memory_enabled()
         or disabled
         or group_coordinator.world_size == 1
+        # torch.cuda.use_mem_pool is skipped by Dynamo and cannot be traced.
+        or torch.compiler.is_dynamo_compiling()
     )
     return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()

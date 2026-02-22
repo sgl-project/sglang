@@ -268,8 +268,9 @@ class PiecewiseCudaGraphRunner:
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        graph_pool = get_global_graph_memory_pool()
         # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
+        set_graph_pool_id(graph_pool)
 
         with enable_piecewise_cuda_graph():
             language_model = getattr(
@@ -283,7 +284,7 @@ class PiecewiseCudaGraphRunner:
                     fullgraph=True,
                     dynamic_arg_dims=None,
                     compile_config=self.compile_config,
-                    graph_pool=get_global_graph_memory_pool(),
+                    graph_pool=graph_pool,
                 )
 
                 with set_compiled(True), enable_piecewise_cuda_graph_compile():
@@ -300,7 +301,9 @@ class PiecewiseCudaGraphRunner:
                         self.warmup_torch_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-                set_graph_pool_id(get_global_graph_memory_pool())
+                # Keep symmetric-memory pool toggling aligned with the exact pool
+                # used by CUDAPiecewiseBackend torch.cuda.graph(..., pool=graph_pool).
+                set_graph_pool_id(graph_pool)
 
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
