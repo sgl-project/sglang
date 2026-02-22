@@ -2,14 +2,16 @@ import argparse
 import functools
 from pathlib import Path
 
-import polars as pl
 import torch
 
-from sglang.srt.debug_utils.dump_loader import find_row, read_meta
 from sglang.srt.debug_utils.dumper import get_truncated_value
 
 
 def main(args):
+    import polars as pl
+
+    from sglang.srt.debug_utils.dump_loader import find_row, read_meta
+
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
         (pl.col("step") >= args.start_id) & (pl.col("step") <= args.end_id)
