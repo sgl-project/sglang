@@ -192,14 +192,60 @@ class GlmImageProcessor(SGLangBaseProcessor):
         ):
             input_ids = torch.tensor(input_text, dtype=torch.long)
             mm_items = []
-            # Extract image_grid_thw from image_data dicts (metadata only,
-            # no actual pixel features for text-to-image generation)
             if image_data:
                 for img in image_data:
-                    if isinstance(img, dict) and "image_grid_thw" in img:
-                        image_grid_thw = img["image_grid_thw"]
-                        if isinstance(image_grid_thw, torch.Tensor):
-                            break
+                    if not isinstance(img, dict):
+                        continue
+                    # Create proper mm_items from processor_output dicts
+                    # so pixel_values reach the vision encoder.
+                    # Only create items when actual pixel features are present.
+                    if "pixel_values" in img:
+                        items = self.collect_mm_items_from_processor_output(img)
+                        for item in items:
+                            if img.get("format") == "processor_output":
+                                from sglang.srt.managers.schedule_batch import (
+                                    MultimodalInputFormat,
+                                )
+
+                                item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
+
+                            # Filter image_grid_thw on mm_item to only include
+                            # source grids that have corresponding pixel_values.
+                            # Target generation grids (no pixels) must NOT go to
+                            # vision encoder — they are only for MRoPE positions.
+                            pv = getattr(item, "feature", None)
+                            grid = getattr(item, "image_grid_thw", None)
+                            if pv is not None and grid is not None:
+                                total_pixels = pv.shape[0]
+                                source_patches = 0
+                                source_grid_count = 0
+                                for gi in range(len(grid)):
+                                    patches = int(grid[gi].prod().item())
+                                    if source_patches + patches <= total_pixels:
+                                        source_patches += patches
+                                        source_grid_count += 1
+                                    else:
+                                        break
+                                if source_grid_count < len(grid):
+                                    item.image_grid_thw = grid[:source_grid_count]
+
+                        mm_items.extend(items)
+                    # Extract full image_grid_thw for MRoPE position computation
+                    # (includes both source and target grids)
+                    if "image_grid_thw" in img:
+                        grid = img["image_grid_thw"]
+                        if isinstance(grid, torch.Tensor):
+                            image_grid_thw = grid
+
+            # Add offsets to all mm_items (matching base_processor behavior).
+            # Offsets tell the chunked prefill where image tokens are in input_ids.
+            for mm_item in mm_items:
+                mm_token_id = self.mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is not None:
+                    mm_item.offsets = self.get_mm_items_offset(
+                        input_ids=input_ids,
+                        mm_token_id=mm_token_id,
+                    )
         else:
             base_output = self.load_mm_data(
                 prompt=input_text,
@@ -213,8 +259,27 @@ class GlmImageProcessor(SGLangBaseProcessor):
 
             input_ids = input_ids.flatten()
 
-            # Get image_grid_thw from HF processor output or mm_items
+            # Get full image_grid_thw for MRoPE (includes target grids)
             image_grid_thw = getattr(ret, "image_grid_thw", None)
+
+            # Filter mm_item grids to only source grids (with pixel_values).
+            # Target generation grids must NOT go to vision encoder.
+            for item in mm_items:
+                pv = getattr(item, "feature", None)
+                grid = getattr(item, "image_grid_thw", None)
+                if pv is not None and grid is not None:
+                    total_pixels = pv.shape[0]
+                    source_patches = 0
+                    source_grid_count = 0
+                    for gi in range(len(grid)):
+                        patches = int(grid[gi].prod().item())
+                        if source_patches + patches <= total_pixels:
+                            source_patches += patches
+                            source_grid_count += 1
+                        else:
+                            break
+                    if source_grid_count < len(grid):
+                        item.image_grid_thw = grid[:source_grid_count]
 
         # Fallback: get image_grid_thw from mm_items or image_data dicts
         if image_grid_thw is None:
