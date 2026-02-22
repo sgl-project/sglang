@@ -126,9 +126,8 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path)
+        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
         self.model_path = model_path
-        # server_args.downloaded_model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
         return cast(dict[str, Any], config)
@@ -170,6 +169,19 @@ class ComposedPipelineBase(ABC):
         Initialize the pipeline.
         """
         return
+
+    def _resolve_component_path(
+        self, server_args: ServerArgs, module_name: str, load_module_name: str
+    ) -> str:
+        override_path = server_args.component_paths.get(module_name)
+        if override_path is not None:
+            # overridden with args like --vae-path
+            component_model_path = maybe_download_model(override_path)
+        else:
+            component_model_path = os.path.join(self.model_path, load_module_name)
+
+        logger.debug("Resolved component path: %s", component_model_path)
+        return component_model_path
 
     def load_modules(
         self,
@@ -285,19 +297,9 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            # Use custom VAE path if provided, otherwise use default path
-            if module_name == "vae" and server_args.vae_path is not None:
-                component_model_path = server_args.vae_path
-                # Download from HuggingFace Hub if path doesn't exist locally
-                if not os.path.exists(component_model_path):
-                    component_model_path = maybe_download_model(component_model_path)
-                logger.info(
-                    "Using custom VAE path: %s instead of default path: %s",
-                    component_model_path,
-                    os.path.join(self.model_path, load_module_name),
-                )
-            else:
-                component_model_path = os.path.join(self.model_path, load_module_name)
+            component_model_path = self._resolve_component_path(
+                server_args, module_name, load_module_name
+            )
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
