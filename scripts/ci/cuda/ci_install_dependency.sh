@@ -289,6 +289,9 @@ if [ "$FLASHINFER_INSTALLED" = false ]; then
     exit 1
 fi
 
+# Download flashinfer cubins if the local set is incomplete
+bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
+
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"

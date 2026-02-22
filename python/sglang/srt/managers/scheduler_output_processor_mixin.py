@@ -119,7 +119,14 @@ class SchedulerOutputProcessorMixin:
             for k, v in logits_output.customized_info.items():
                 if k not in req.customized_info:
                     req.customized_info[k] = []
-                req.customized_info[k].append(v[i])
+                # Copy the element so it doesn't retain the entire batch
+                # tensor/array via a view reference.
+                elem = v[i]
+                if isinstance(elem, torch.Tensor):
+                    elem = elem.clone()
+                elif hasattr(elem, "copy") and callable(elem.copy):
+                    elem = elem.copy()
+                req.customized_info[k].append(elem)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -331,6 +338,7 @@ class SchedulerOutputProcessorMixin:
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def _resolve_spec_overlap_token_ids(
@@ -410,6 +418,7 @@ class SchedulerOutputProcessorMixin:
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def process_batch_result_decode(

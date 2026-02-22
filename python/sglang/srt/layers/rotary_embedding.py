@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,13 +37,11 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
+if TYPE_CHECKING:
+    from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
 if _is_cuda:
-    from sglang.jit_kernel.rope import (
-        FusedSetKVBufferArg,
-        apply_rope_with_cos_sin_cache_inplace,
-    )
-else:
-    FusedSetKVBufferArg = None
+    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
@@ -131,8 +129,10 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
-            if _is_cuda or _is_hip:
+            if _is_cuda:
                 from sglang.jit_kernel.pos_enc import rotary_embedding
+            elif _is_hip:
+                from sgl_kernel import rotary_embedding
             else:
                 from vllm._custom_ops import rotary_embedding
 
@@ -360,19 +360,19 @@ class RotaryEmbedding(MultiPlatformOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
+            batch_size = positions.size(0)
+            q_rope = query.view(batch_size, -1, self.head_size)
+            k_rope = key.view(batch_size, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
-                query=query,
-                key=key,
-                head_size=self.head_size,
+                q=q_rope,
+                k=k_rope,
                 cos_sin_cache=self.cos_sin_cache,
                 is_neox=self.is_neox_style,
-                # Compatible with old sgl-kernel
-                **(
-                    dict(fused_set_kv_buffer_arg=fused_set_kv_buffer_arg)
-                    if fused_set_kv_buffer_arg is not None
-                    else {}
-                ),
+                fused_args=fused_set_kv_buffer_arg,
             )
         else:
             assert (
@@ -3409,7 +3409,9 @@ def get_rope(
         elif "type" in rope_scaling:
             scaling_type = rope_scaling["type"]
         else:
-            raise ValueError("Unknown RoPE scaling type")
+            raise ValueError(
+                f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}"
+            )
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
