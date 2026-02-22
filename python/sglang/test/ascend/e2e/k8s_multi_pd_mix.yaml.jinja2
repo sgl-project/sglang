@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ kube_config_map }}
+  namespace: {{ name_space }}
+data: {}
+
+---
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: {{ kube_job_name }}
+  namespace: {{ name_space }}
+  labels:
+    ring-controller.atlas: ascend-1980
+    fault-scheduling: "force"
+spec:
+  minAvailable: {{ node_size }}
+  schedulerName: volcano
+  policies:
+    - event: PodEvicted
+      action: RestartJob
+  tasks:
+  - name: "sglang-node"
+    replicas: {{ node_size }}
+    template:
+      metadata:
+        labels:
+          app: sgl-ascend
+          ring-controller.atlas: ascend-1980
+      spec:
+        hostNetwork: True
+        containers:
+        - image: {{ image }}
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          name: sgl-ascend
+          env:
+          - name: HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: INSTALL_SGLANG_FROM_SOURCE
+            value: "{{ install_sglang_from_source }}"
+          - name: METRICS_DATA_FILE
+            value: "{{ metrics_data_file }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: NAMESPACE
+            value: "{{ name_space }}"
+          - name: KUBE_CONFIG_MAP
+            value: "{{ kube_config_map }}"
+          - name: HF_ENDPOINT
+            value: "https://hf-mirror.com"
+          - name: SGLANG_IS_IN_CI
+            value: "{{ sglang_is_in_ci }}"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+               bash /root/sglang/python/sglang/test/ascend/e2e/run_ascend_testcase.sh {{ test_case }}
+          resources:
+            requests:
+              huawei.com/ascend-1980: 16
+            limits:
+              huawei.com/ascend-1980: 16
+          volumeMounts:
+          - name: ascend-driver
+            mountPath: /usr/local/Ascend/driver
+          - name: localtime
+            mountPath: /etc/localtime
+          - name: share
+            mountPath: /data/ascend-ci-share-pkking-sglang
+          - name: share
+            mountPath: /root/.cache
+          - name: share
+            mountPath: /root/sglang
+            subPath: {{ sglang_source_relative_path }}
+        volumes:
+        - name: share
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+        {% if env == "debug" %}
+        tolerations:
+          - key: "instance"
+            operator: "Equal"
+            value: "npu-class-service"
+            effect: "NoSchedule"
+        {% endif %}
+        nodeSelector:
+          accelerator/huawei-npu: ascend-snt9c
+          {% if env == "debug" %}
+          nodestatus: debug
+          {% endif %}
+        restartPolicy: OnFailure
+
