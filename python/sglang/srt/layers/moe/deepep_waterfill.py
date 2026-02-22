@@ -13,6 +13,7 @@
 # ==============================================================================
 """DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -23,8 +24,7 @@ from torch import Tensor
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
-LOCAL_PREFERENCE_FACTOR = 1.1  # Bias towards local rank; 1.0 = pure argmin.
-_LOCAL_PREF_NUMER = int(LOCAL_PREFERENCE_FACTOR * 10)
+_LOCAL_PREF_NUMER = 11  # int(1.1 * 10); local-rank preference = 11/10.
 _LOCAL_PREF_DENOM = 10
 
 
@@ -37,9 +37,6 @@ def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
         torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
         torch.empty(0, dtype=torch.bool, device=device),
     )
-
-
-# ============== Triton Kernels ==============
 
 
 @triton.jit
@@ -409,20 +406,64 @@ class DeepEPWaterfillBalancer:
         num_routed_experts: int,
         world_size: int,
         rank: int,
+        layer_id: int,
         routed_scaling_factor: float = 1.0,
-        static_rank_load: Optional[Tensor] = None,
     ):
         self.num_routed_experts = num_routed_experts
         self.world_size = world_size
         self.rank = rank
+        self.layer_id = layer_id
         self.old_experts_per_rank = num_routed_experts // world_size
-        self.new_experts_per_rank = self.old_experts_per_rank + 1
-        self.routed_scaling_factor = routed_scaling_factor
         self.shared_weight = (
             1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
         )
-        self.static_rank_load: Optional[Tensor] = static_rank_load
+        self.static_rank_load: Optional[Tensor] = None
         self._counts_buf: Optional[Tensor] = None
+        self._eplb_map_data_ptr = None
+
+    def update_static_weights(self):
+        """Update static weights if EPLB layout changes."""
+        if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
+            return
+
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+        from sglang.srt.server_args import get_global_server_args
+
+        init_loc = getattr(get_global_server_args(), "init_expert_location", "trivial")
+        if not init_loc or init_loc == "trivial":
+            return
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+
+        cur_ptr = metadata.physical_to_logical_map.data_ptr()
+        if self._eplb_map_data_ptr == cur_ptr and self.has_static_weights():
+            return
+
+        try:
+            data_dict = torch.load(init_loc, weights_only=True)
+            logical_count_raw = data_dict["logical_count"]
+            if not isinstance(logical_count_raw, torch.Tensor):
+                logical_count_raw = torch.tensor(logical_count_raw)
+            if logical_count_raw.dim() == 3:
+                logical_count_raw = logical_count_raw.float().mean(dim=0)
+            elif logical_count_raw.dim() != 2:
+                return
+
+            all_rank_load = compute_static_rank_load(
+                logical_count_raw,
+                metadata.physical_to_logical_map,
+                self.world_size,
+            )
+
+            if self.layer_id < all_rank_load.shape[0]:
+                layer_load = all_rank_load[self.layer_id]
+                if layer_load.sum() > 0:
+                    self.set_static_weights(layer_load)
+                    self._eplb_map_data_ptr = cur_ptr
+        except Exception:
+            pass
 
     def has_static_weights(self) -> bool:
         return self.static_rank_load is not None
