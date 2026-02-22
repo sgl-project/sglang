@@ -731,11 +731,8 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
-        # Create separate shared_experts MLP only when:
-        # - shared experts exist
-        # - they are NOT fused into the MoE kernel (num_fused_shared_experts_in_moe_impl == 0)
-        # - Waterfill is NOT enabled (waterfill fuses shared expert into MoE via weight
-        #   loading name-remap; no separate MLP needed)
+        # Shared experts: skip when fused into MoE or when waterfill is enabled.
+        # Waterfill fuses shared expert via weight loading name-remap.
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
@@ -839,11 +836,8 @@ class DeepseekV2MoE(nn.Module):
             self.deepep_waterfill_balancer.update_static_weights()
 
     def get_moe_weights(self):
-        # In waterfill mode, use _old_experts_per_rank to exclude shared expert slot.
-        if (
-            getattr(self, "_enable_deepep_waterfill", False)
-            and self.deepep_waterfill_balancer is not None
-        ):
+        # In waterfill mode, exclude the shared expert slot from local count.
+        if self._enable_deepep_waterfill and self.deepep_waterfill_balancer is not None:
             num_local = self.deepep_waterfill_balancer.old_experts_per_rank
         else:
             num_local = self.experts.num_local_experts
