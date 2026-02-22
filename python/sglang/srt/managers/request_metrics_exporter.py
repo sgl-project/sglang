@@ -9,7 +9,6 @@ from typing import List, Optional, Union
 
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.aio_rwlock import RWLock
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
 
         # File handler state management
         self._current_file_handler = None
-        self._current_file_lock = RWLock()
+        self._current_file_lock = asyncio.Lock()
         self._current_hour_suffix = None
 
     def _ensure_file_handler(self, hour_suffix: str):
@@ -137,7 +136,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
             current_time = datetime.now()
             hour_suffix = current_time.strftime("%Y%m%d_%H")
 
-            async with self._current_file_lock.writer_lock:
+            async with self._current_file_lock:
                 # Ensure correct file handler is open for current hour
                 self._ensure_file_handler(hour_suffix)
 
