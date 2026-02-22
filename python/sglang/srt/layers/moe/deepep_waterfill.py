@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
+
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
 LOCAL_PREFERENCE_FACTOR = (
     1.1  # Bias towards local rank in waterfill; 1.0 = pure argmin.
@@ -604,3 +606,50 @@ class DeepEPWaterfillBalancer:
         )
 
         return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+
+    def expand_topk(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
+        """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        device = topk_ids.device
+
+        local_routed_counts = self.count_local_routed(topk_ids)
+
+        if self.has_static_weights():
+            global_routed_counts = local_routed_counts
+            local_tokens_per_rank = None
+        else:
+            _ep_group = get_moe_ep_group().device_group
+            _ep_world = torch.distributed.get_world_size(group=_ep_group)
+            _ep_rank = torch.distributed.get_rank(group=_ep_group)
+            _fused_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
+            _fused_buf[:_ep_world] = local_routed_counts
+            if not torch.cuda.is_current_stream_capturing():
+                _fused_buf[_ep_world + _ep_rank] = num_tokens
+            torch.distributed.all_reduce(
+                _fused_buf,
+                op=torch.distributed.ReduceOp.SUM,
+                group=_ep_group,
+            )
+            global_routed_counts = _fused_buf[:_ep_world]
+            if not torch.cuda.is_current_stream_capturing():
+                local_tokens_per_rank = _fused_buf[_ep_world:]
+            else:
+                local_tokens_per_rank = None
+
+        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
+            self.prepare_dispatch(
+                topk_ids,
+                topk_weights,
+                global_routed_counts,
+                local_tokens_per_rank=local_tokens_per_rank,
+            )
+        )
+
+        return StandardTopKOutput(
+            topk_weights=expanded_topk_weights,
+            topk_ids=expanded_topk_ids,
+            router_logits=topk_output.router_logits,
+        )

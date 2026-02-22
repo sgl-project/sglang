@@ -103,12 +103,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import (
-    StandardTopKOutput,
-    TopK,
-    TopKOutput,
-    TopKOutputFormat,
-)
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -1193,28 +1188,13 @@ class DeepseekV2MoE(nn.Module):
 
             # --- Waterfill: expand topk with waterfill balancing ---
             if self._enable_deepep_waterfill:
-                topk_output = self._waterfill_expand_topk(
-                    topk_output, hidden_states, forward_batch
+                topk_output = self.deepep_waterfill_balancer.expand_topk(
+                    topk_output, hidden_states.shape[0]
                 )
         else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
             if self._enable_deepep_waterfill:
-                # Zero-token: participate in dynamic all_reduce to avoid deadlock.
-                self._waterfill_zero_token_allreduce(hidden_states.device)
-                expanded_top_k = self.experts.top_k
-                device = hidden_states.device
-                topk_output = StandardTopKOutput(
-                    topk_weights=torch.empty(
-                        (0, expanded_top_k), dtype=torch.float32, device=device
-                    ),
-                    topk_ids=torch.full(
-                        (0, expanded_top_k), -1, dtype=torch.int32, device=device
-                    ),
-                    router_logits=torch.empty(
-                        (0, expanded_top_k), dtype=torch.float32, device=device
-                    ),
-                )
-            else:
-                topk_output = self.topk.empty_topk_output(hidden_states.device)
+                topk_output = self.deepep_waterfill_balancer.expand_topk(topk_output, 0)
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1352,75 +1332,6 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             return None
-
-    def _waterfill_zero_token_allreduce(self, device: torch.device) -> None:
-        """Zero-token edge case: participate in dynamic all_reduce to avoid deadlock."""
-        balancer = self.deepep_waterfill_balancer
-        if balancer is not None and not balancer.has_static_weights():
-            from sglang.srt.distributed import get_moe_ep_group
-
-            _ep_group = get_moe_ep_group().device_group
-            _ep_world = torch.distributed.get_world_size(group=_ep_group)
-            dummy_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
-            torch.distributed.all_reduce(
-                dummy_buf,
-                op=torch.distributed.ReduceOp.SUM,
-                group=_ep_group,
-            )
-
-    def _waterfill_expand_topk(
-        self,
-        topk_output: TopKOutput,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> TopKOutput:
-        """Expand topk [N,8] -> [N,9] with waterfill-assigned shared expert."""
-        from sglang.srt.distributed import get_moe_ep_group
-
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-        num_tokens = hidden_states.shape[0]
-        device = hidden_states.device
-        balancer = self.deepep_waterfill_balancer
-
-        local_routed_counts = balancer.count_local_routed(topk_ids)
-
-        if balancer.has_static_weights():
-            global_routed_counts = local_routed_counts
-            local_tokens_per_rank = None
-        else:
-            _ep_group = get_moe_ep_group().device_group
-            _ep_world = torch.distributed.get_world_size(group=_ep_group)
-            _ep_rank = torch.distributed.get_rank(group=_ep_group)
-            _fused_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
-            _fused_buf[:_ep_world] = local_routed_counts
-            if not torch.cuda.is_current_stream_capturing():
-                _fused_buf[_ep_world + _ep_rank] = num_tokens
-            torch.distributed.all_reduce(
-                _fused_buf,
-                op=torch.distributed.ReduceOp.SUM,
-                group=_ep_group,
-            )
-            global_routed_counts = _fused_buf[:_ep_world]
-            if not torch.cuda.is_current_stream_capturing():
-                local_tokens_per_rank = _fused_buf[_ep_world:]
-            else:
-                local_tokens_per_rank = None
-
-        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
-            balancer.prepare_dispatch(
-                topk_ids,
-                topk_weights,
-                global_routed_counts,
-                local_tokens_per_rank=local_tokens_per_rank,
-            )
-        )
-
-        return StandardTopKOutput(
-            topk_weights=expanded_topk_weights,
-            topk_ids=expanded_topk_ids,
-            router_logits=topk_output.router_logits,
-        )
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
