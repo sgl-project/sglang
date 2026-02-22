@@ -1288,68 +1288,6 @@ class TestZmqPortIsolation:
                 thread.join(timeout=10)
 
 
-def _dumper_worker(rank, http_port: int, stop_event):
-    """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
-    dumper.configure(enable=False, server_port=str(http_port))
-    dumper.step()
-    stop_event.wait()
-
-
-def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            requests.post(f"{url}/dumper/configure", json={}, timeout=2)
-            return
-        except requests.ConnectionError:
-            time.sleep(0.5)
-    raise TimeoutError(f"Dumper HTTP server not reachable at {url}")
-
-
-class TestZmqPortIsolation:
-    """Multiple independent dumper instances (each with 2 ranks) must not conflict on ZMQ ports."""
-
-    NUM_INSTANCES = 3
-
-    def test_concurrent_instances_no_port_conflict(self):
-        ports = [
-            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
-        ]
-        stop_events = []
-        threads = []
-        ctx = multiprocessing.get_context("spawn")
-
-        for port in ports:
-            stop_event = ctx.Event()
-            stop_events.append(stop_event)
-            thread = threading.Thread(
-                target=run_distributed_test,
-                args=(_dumper_worker,),
-                kwargs={"http_port": port, "stop_event": stop_event},
-            )
-            thread.start()
-            threads.append(thread)
-
-        try:
-            for port in ports:
-                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
-
-            for i, port in enumerate(ports):
-                resp = requests.post(
-                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
-                )
-                resp.raise_for_status()
-                states = resp.json()
-                assert (
-                    len(states) == 2
-                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
-        finally:
-            for event in stop_events:
-                event.set()
-            for thread in threads:
-                thread.join(timeout=10)
-
-
 class TestDumperHttp:
     """Test /dumper/* HTTP control — parametrized over standalone vs sglang server."""
 
@@ -1861,8 +1799,10 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
+        assert "seq_lens" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
+        assert torch.equal(captured["seq_lens"]["value"], fb.seq_lens)
 
         # nothing with non_intrusive__ prefix
         assert not any(k.startswith("non_intrusive__") for k in captured)
@@ -1873,24 +1813,16 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
+        assert "seq_lens" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
-
-        # non-core ForwardBatch fields dumped with prefix
-        assert "non_intrusive__inputs.0.seq_lens" in captured
-        assert torch.equal(
-            captured["non_intrusive__inputs.0.seq_lens"]["value"], fb.seq_lens
-        )
+        assert torch.equal(captured["seq_lens"]["value"], fb.seq_lens)
 
         # core fields NOT duplicated with prefix
-        assert not any(
-            k.startswith("non_intrusive__") and k.endswith("input_ids")
-            for k in captured
-        )
-        assert not any(
-            k.startswith("non_intrusive__") and k.endswith("positions")
-            for k in captured
-        )
+        for field in ("input_ids", "positions", "seq_lens"):
+            assert not any(
+                k.startswith("non_intrusive__") and k.endswith(field) for k in captured
+            )
 
         # ForwardBatch skipped on sub-modules (no duplication)
         assert not any(
@@ -2099,7 +2031,7 @@ class TestRegisterForwardHook:
     def test_handles_removable(self, mode):
         call_log: list[str] = []
 
-        def pre_hook(_module, _input):
+        def pre_hook(_module, _args, _kwargs):
             call_log.append("pre")
 
         def hook(_module, _input, _output):
@@ -2130,11 +2062,45 @@ class TestRegisterForwardHook:
             module.forward(x)
         assert call_log == []
 
+    @pytest.mark.parametrize("mode", ["hook", "replace_fn"])
+    def test_kwargs_passed_to_pre_hook(self, mode):
+        received: list[tuple] = []
+
+        class KwargsModule(torch.nn.Module):
+            def forward(self, x, *, scale=1.0):
+                return x * scale
+
+        def pre_hook(_module, _args, _kwargs):
+            received.append((_args, _kwargs))
+
+        def hook(_module, _input, _output):
+            pass
+
+        module = KwargsModule()
+        _register_forward_hook_or_replace_fn(
+            module,
+            pre_hook=pre_hook,
+            hook=hook,
+            mode=mode,
+        )
+
+        x = torch.randn(2, 4)
+        if mode == "hook":
+            module(x, scale=2.0)
+        else:
+            module.forward(x, scale=2.0)
+
+        assert len(received) == 1
+        args, kwargs = received[0]
+        assert len(args) == 1
+        assert torch.equal(args[0], x)
+        assert kwargs == {"scale": 2.0}
+
     def test_replace_fn_remove_asserts_on_rewrap(self):
         module = torch.nn.Linear(4, 4)
         handles = _register_forward_hook_or_replace_fn(
             module,
-            pre_hook=lambda _m, _i: None,
+            pre_hook=lambda _m, _a, _kw: None,
             hook=lambda _m, _i, _o: None,
             mode="replace_fn",
         )
@@ -2143,6 +2109,151 @@ class TestRegisterForwardHook:
 
         with pytest.raises(AssertionError):
             handles[0].remove()
+
+
+class TestPluginCoreFields:
+    def test_sglang_core_fields(self):
+        plugin = _SGLangPlugin()
+        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+
+    def test_megatron_core_fields(self):
+        plugin = _MegatronPlugin()
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        )
+
+
+class TestMegatronConvertValue:
+    @pytest.fixture(autouse=True)
+    def _patch_megatron(self, monkeypatch):
+        class FakePackedSeqParams:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(
+            _MegatronPlugin, "PackedSeqParams", FakePackedSeqParams, raising=False
+        )
+        self._FakePackedSeqParams = FakePackedSeqParams
+
+    def test_extracts_packed_seq_params(self):
+        plugin = _MegatronPlugin()
+        cu_q = torch.tensor([0, 3, 7])
+        cu_kv = torch.tensor([0, 3, 7])
+        value = self._FakePackedSeqParams(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, qkv_format="thd"
+        )
+
+        result = plugin.convert_value(value, skip_forward_batch=False)
+        assert set(result.keys()) == {"cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        assert torch.equal(result["cu_seqlens_q"], cu_q)
+        assert torch.equal(result["cu_seqlens_kv"], cu_kv)
+        assert result["qkv_format"] == "thd"
+
+    def test_non_packed_returns_none(self):
+        plugin = _MegatronPlugin()
+        assert plugin.convert_value(torch.randn(4), skip_forward_batch=False) is None
+        assert plugin.convert_value("hello", skip_forward_batch=False) is None
+
+
+class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
+
+    def test_kwargs_core_fields(self, tmp_path):
+        class KwargsModel(torch.nn.Module):
+            def forward(self, *, input_ids, position_ids):
+                return input_ids + position_ids
+
+        model = KwargsModel()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+        d.register_non_intrusive_dumper(model)
+
+        ids = torch.randn(4)
+        pos = torch.randn(4)
+        with d.capture_output() as captured:
+            model(input_ids=ids, position_ids=pos)
+
+        assert "input_ids" in captured
+        assert "position_ids" in captured
+        assert torch.equal(captured["input_ids"]["value"], ids)
+        assert torch.equal(captured["position_ids"]["value"], pos)
+
+    def test_kwargs_all_mode(self, tmp_path):
+        class KwargsModel(torch.nn.Module):
+            def forward(self, *, input_ids, position_ids, custom_value):
+                return input_ids + position_ids + custom_value
+
+        model = KwargsModel()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model)
+
+        ids = torch.randn(4)
+        pos = torch.randn(4)
+        custom = torch.randn(4)
+        with d.capture_output() as captured:
+            model(input_ids=ids, position_ids=pos, custom_value=custom)
+
+        assert "input_ids" in captured
+        assert "position_ids" in captured
+
+        P = self._PREFIX
+        assert f"{P}inputs.custom_value" in captured
+
+    def test_mixed_args_and_kwargs(self, tmp_path):
+        class MixedModel(torch.nn.Module):
+            def forward(self, x, *, input_ids):
+                return x + input_ids
+
+        model = MixedModel()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(4)
+        ids = torch.randn(4)
+        with d.capture_output() as captured:
+            model(x, input_ids=ids)
+
+        assert "input_ids" in captured
+
+        P = self._PREFIX
+        assert f"{P}inputs.0" in captured
+
+    def test_packed_seq_params_core_fields(self, tmp_path, monkeypatch):
+        class FakePackedSeqParams:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(
+            _MegatronPlugin, "PackedSeqParams", FakePackedSeqParams, raising=False
+        )
+
+        class MegatronLikeModel(torch.nn.Module):
+            def forward(self, *, input_ids, packed_seq_params):
+                return input_ids
+
+        model = MegatronLikeModel()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+        d.register_non_intrusive_dumper(model)
+
+        ids = torch.randn(4)
+        cu_q = torch.tensor([0, 3, 7])
+        cu_kv = torch.tensor([0, 3, 7])
+        psp = FakePackedSeqParams(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, qkv_format="thd"
+        )
+        with d.capture_output() as captured:
+            model(input_ids=ids, packed_seq_params=psp)
+
+        assert "input_ids" in captured
+        assert torch.equal(captured["input_ids"]["value"], ids)
+        assert "cu_seqlens_q" in captured
+        assert torch.equal(captured["cu_seqlens_q"]["value"], cu_q)
+        assert "cu_seqlens_kv" in captured
+        assert torch.equal(captured["cu_seqlens_kv"]["value"], cu_kv)
+        assert "qkv_format" in captured
+        assert captured["qkv_format"]["value"] == "thd"
 
 
 if __name__ == "__main__":

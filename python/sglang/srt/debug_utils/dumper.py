@@ -484,7 +484,6 @@ class _Dumper:
 
 class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
-    _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
     _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
 
     def __init__(
@@ -496,6 +495,9 @@ class _NonIntrusiveDumper:
         self._dumper = dumper
         self._mode = mode
         self._handles: list = []
+        self._core_fields: frozenset[str] = frozenset().union(
+            *(p.core_fields() for p in _plugins)
+        )
 
         for module_name, module in model.named_modules():
             if ctx := self._detect_module_ctx(module_name, module):
@@ -545,33 +547,43 @@ class _NonIntrusiveDumper:
         )
 
     def _make_forward_pre_hook(self, *, module_name: str, is_root: bool):
-        def _hook(_module, input):
-            for i, item in enumerate(input):
-                self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
+        def _hook(_module, args, kwargs):
+            for i, item in enumerate(args):
+                self._dump_value(
+                    module_name, item, sub_name=f"inputs.{i}", is_root=is_root
+                )
+            for name, value in kwargs.items():
+                self._dump_value(
+                    module_name,
+                    value,
+                    sub_name=f"inputs.{name}",
+                    is_root=is_root,
+                )
 
         return _hook
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
             if output is not None:
-                self._dump_value(module_name, output, role="output", is_root=False)
+                self._dump_value(module_name, output, sub_name="output", is_root=False)
 
         return _hook
 
-    def _dump_value(self, module_name: str, value, role: str, *, is_root: bool) -> None:
-        for key, tensor in self._convert_value(
+    def _dump_value(
+        self, module_name: str, value: Any, sub_name: str, *, is_root: bool
+    ) -> None:
+        for key, item in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
-            if key in self._CORE_FIELDS:
-                self._dumper.dump(key, tensor)
+            effective_key = key or sub_name.rsplit(".", 1)[-1]
+            if effective_key in self._core_fields:
+                self._dumper.dump(effective_key, item)
             elif self._mode == "all":
-                parts = [p for p in (module_name, role, key) if p]
-                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
+                parts = [p for p in (module_name, sub_name, key) if p]
+                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
 
     @staticmethod
-    def _convert_value(
-        value, *, skip_forward_batch: bool = False
-    ) -> dict[str, torch.Tensor]:
+    def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:
         if isinstance(value, torch.Tensor):
             return {"": value}
 
@@ -609,7 +621,7 @@ def _register_forward_hook_or_replace_fn(
     """
     if mode == "hook":
         return [
-            module.register_forward_pre_hook(pre_hook),
+            module.register_forward_pre_hook(pre_hook, with_kwargs=True),
             module.register_forward_hook(hook),
         ]
     elif mode == "replace_fn":
@@ -617,7 +629,7 @@ def _register_forward_hook_or_replace_fn(
 
         @functools.wraps(original_forward)
         def _wrapped(*args, **kwargs):
-            pre_hook(module, args)
+            pre_hook(module, args, kwargs)
             output = original_forward(*args, **kwargs)
             hook(module, args, output)
             return output
@@ -1049,14 +1061,17 @@ class _FrameworkPlugin(ABC):
     @abstractmethod
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
-        """Return converted tensors dict, or None if this plugin doesn't handle the value."""
+    ) -> Optional[dict[str, Any]]:
+        """Return converted dict, or None if this plugin doesn't handle the value."""
         ...
 
     @abstractmethod
     def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
         """Return 0-indexed layer_id, or None if not detectable."""
         ...
+
+    def core_fields(self) -> frozenset[str]:
+        return frozenset()
 
 
 class _SGLangPlugin(_FrameworkPlugin):
@@ -1109,7 +1124,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
+    ) -> Optional[dict[str, Any]]:
         if not self._available:
             return None
 
@@ -1133,11 +1148,15 @@ class _SGLangPlugin(_FrameworkPlugin):
             return module.layer_id
         return None
 
+    def core_fields(self) -> frozenset[str]:
+        return frozenset({"input_ids", "positions", "seq_lens"})
+
 
 class _MegatronPlugin(_FrameworkPlugin):
     _available = True
     try:
         from megatron.core import parallel_state as _mpu
+        from megatron.core.packed_seq_params import PackedSeqParams
     except ImportError:
         _available = False
 
@@ -1185,13 +1204,26 @@ class _MegatronPlugin(_FrameworkPlugin):
 
     def convert_value(
         self, value: Any, *, skip_forward_batch: bool
-    ) -> Optional[dict[str, "torch.Tensor"]]:
+    ) -> Optional[dict[str, Any]]:
+        if not self._available:
+            return None
+        if isinstance(value, self.PackedSeqParams):
+            return {
+                "cu_seqlens_q": value.cu_seqlens_q,
+                "cu_seqlens_kv": value.cu_seqlens_kv,
+                "qkv_format": value.qkv_format,
+            }
         return None
 
     def detect_layer_id(self, module: "torch.nn.Module") -> Optional[int]:
         if hasattr(module, "layer_number"):
             return module.layer_number - 1
         return None
+
+    def core_fields(self) -> frozenset[str]:
+        return frozenset(
+            {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        )
 
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
