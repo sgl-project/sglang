@@ -5,12 +5,9 @@ import time
 import aiohttp
 import requests
 
-from sglang.bench_serving import (
-    RequestFuncOutput,
-    get_tokenizer,
-    remove_prefix,
-    sample_random_requests,
-)
+from sglang.bench_serving import RequestFuncOutput
+from sglang.benchmark.datasets import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 

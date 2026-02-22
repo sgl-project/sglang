@@ -6,7 +6,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from sglang.bench_serving import parse_custom_headers, run_benchmark
+from sglang.bench_serving import run_benchmark
+from sglang.benchmark.utils import parse_custom_headers
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
