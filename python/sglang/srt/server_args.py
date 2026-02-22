@@ -105,6 +105,7 @@ QUANTIZATION_CHOICES = [
     "modelopt_fp8",
     "modelopt_fp4",
     "petit_nvfp4",
+    "petit_mxfp4",
     "w8a8_int8",
     "w8a8_fp8",
     "moe_wna16",
