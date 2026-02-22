@@ -442,6 +442,8 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = src_heads_per_rank
             unique_head_idx = local_tp_rank_in_group // src_replication
             dst_head_start_offset = unique_head_idx * src_heads_per_rank
+            # Ensure the head slice fits within the decode buffer
+            assert dst_head_start_offset + num_heads_to_send <= dst_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
             src_head_start_offset = (
