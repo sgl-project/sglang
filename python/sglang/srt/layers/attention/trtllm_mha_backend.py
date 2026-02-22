@@ -556,11 +556,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
-                metadata.max_seq_len_q = getattr(
-                    spec_info,
-                    "num_tokens_per_req",
-                    self.speculative_num_draft_tokens or 1,
-                )
+                metadata.max_seq_len_q = int(extend_seq_lens.max().item())
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
