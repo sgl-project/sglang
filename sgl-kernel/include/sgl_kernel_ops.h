@@ -157,17 +157,6 @@ void rotary_embedding(
     torch::Tensor& cos_sin_cache,
     bool is_neox);
 
-void downcast_fp8(
-    at::Tensor& k,
-    at::Tensor& v,
-    at::Tensor& k_out,
-    at::Tensor& v_out,
-    at::Tensor& k_scale,
-    at::Tensor& v_scale,
-    at::Tensor& loc,
-    int64_t mult,
-    int64_t offset);
-
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
