@@ -2132,7 +2132,9 @@ class TestMegatronConvertValue:
                     setattr(self, k, v)
 
         monkeypatch.setattr(_MegatronPlugin, "_available", True)
-        monkeypatch.setattr(_MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams)
+        monkeypatch.setattr(
+            _MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams, raising=False
+        )
         self._FakePackedSeqParams = FakePackedSeqParams
 
     def test_extracts_packed_seq_params(self):
@@ -2230,7 +2232,9 @@ class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
                     setattr(self, k, v)
 
         monkeypatch.setattr(_MegatronPlugin, "_available", True)
-        monkeypatch.setattr(_MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams)
+        monkeypatch.setattr(
+            _MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams, raising=False
+        )
 
         class MegatronLikeModel(torch.nn.Module):
             def forward(self, *, input_ids, packed_seq_params):
