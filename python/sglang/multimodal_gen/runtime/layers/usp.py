@@ -141,7 +141,6 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if head_dim == 1:
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
-        # [p, s_local, b, h_local, d] -> [b, s_local, p, h_local, d]
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
 
     return x
