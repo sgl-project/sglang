@@ -1,6 +1,10 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
 template <typename T>
 struct dtype_trait {};
 
@@ -73,3 +77,65 @@ SGL_DEVICE To cast(const From& value) {
 }
 
 }  // namespace device
+
+// ---------------------------------------------------------------------------
+// FP8 max clamp value — platform-dependent
+//   CUDA (e4m3fn):      448.0f
+//   AMD FNUZ (e4m3fnuz): 224.0f
+//   AMD E4M3 (e4m3fn):  448.0f
+// ---------------------------------------------------------------------------
+#ifndef USE_ROCM
+constexpr float kFP8E4M3Max = 448.0f;
+#else  // USE_ROCM
+#if HIP_FP8_TYPE_FNUZ
+constexpr float kFP8E4M3Max = 224.0f;
+#else   // HIP_FP8_TYPE_E4M3
+constexpr float kFP8E4M3Max = 448.0f;
+#endif  // HIP_FP8_TYPE_FNUZ
+#endif  // USE_ROCM
+
+// ---------------------------------------------------------------------------
+// FP8 cast helpers (used by elementwise kernels)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+struct ConvertToFP8 {
+  static __device__ __nv_fp8_storage_t convert_to_fp8(T value) {
+    return 0;
+  }
+};
+
+template <>
+struct ConvertToFP8<__nv_bfloat16> {
+  static __device__ __nv_fp8_storage_t convert_to_fp8(__nv_bfloat16 value) {
+    return __nv_cvt_bfloat16raw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+  }
+};
+
+template <>
+struct ConvertToFP8<__half> {
+  static __device__ __nv_fp8_storage_t convert_to_fp8(__half value) {
+    return __nv_cvt_halfraw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+  }
+};
+
+template <typename T>
+struct ConvertFromFloat {
+  static __device__ T convert_from_float(float value) {
+    return 0;
+  }
+};
+
+template <>
+struct ConvertFromFloat<__nv_bfloat16> {
+  static __device__ __nv_bfloat16 convert_from_float(float value) {
+    return __float2bfloat16(value);
+  }
+};
+
+template <>
+struct ConvertFromFloat<__half> {
+  static __device__ __half convert_from_float(float value) {
+    return __float2half(value);
+  }
+};
