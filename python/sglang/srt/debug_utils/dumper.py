@@ -102,6 +102,7 @@ class _DumperConfig(_FrozenConfig):
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
+    non_intrusive_mode: str = "core"
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -234,8 +235,11 @@ class _Dumper:
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
-    ) -> "_NonIntrusiveDumper":
-        return _NonIntrusiveDumper(dumper=self, model=model)
+    ) -> Optional["_NonIntrusiveDumper"]:
+        mode = self._config.non_intrusive_mode
+        if mode == "off":
+            return None
+        return _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -475,39 +479,50 @@ class _Dumper:
 
 
 class _NonIntrusiveDumper:
-    """Registers forward hooks on model modules to non-invasively dump tensor outputs."""
-
     _NAME_PREFIX = "non_intrusive__"
+    _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
 
     def __init__(
         self,
         dumper: _Dumper,
         model: "torch.nn.Module",
+        mode: str,
     ):
         self._dumper = dumper
+        self._mode = mode
 
         for module_name, module in model.named_modules():
             module.register_forward_hook(
-                self._make_forward_hook(module_name=module_name)
+                self._make_forward_hook(
+                    module_name=module_name,
+                    is_root=(module_name == ""),
+                )
             )
 
-    def _make_forward_hook(self, module_name: str):
+    def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
             for i, item in enumerate(input):
-                self._dump_value(module_name, item, role=f"inputs.{i}")
+                self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
 
             if output is not None:
-                self._dump_value(module_name, output, role="output")
+                self._dump_value(module_name, output, role="output", is_root=False)
 
         return _hook
 
-    def _dump_value(self, module_name: str, value, role: str) -> None:
-        for key, tensor in self._convert_value(value).items():
-            parts = [p for p in (module_name, role, key) if p]
-            self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
+    def _dump_value(self, module_name: str, value, role: str, *, is_root: bool) -> None:
+        for key, tensor in self._convert_value(
+            value, skip_forward_batch=(not is_root)
+        ).items():
+            if key in self._CORE_FIELDS:
+                self._dumper.dump(key, tensor)
+            elif self._mode == "all":
+                parts = [p for p in (module_name, role, key) if p]
+                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
     @staticmethod
-    def _convert_value(value) -> dict[str, torch.Tensor]:
+    def _convert_value(
+        value, *, skip_forward_batch: bool = False
+    ) -> dict[str, torch.Tensor]:
         if isinstance(value, torch.Tensor):
             return {"": value}
 
@@ -528,6 +543,8 @@ class _NonIntrusiveDumper:
             if isinstance(value, LogitsProcessorOutput):
                 return {"next_token_logits": value.next_token_logits}
             if isinstance(value, ForwardBatch):
+                if skip_forward_batch:
+                    return {}
                 return {
                     "input_ids": value.input_ids,
                     "seq_lens": value.seq_lens,
