@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.metrics import get_diffusion_metrics_collector
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
@@ -79,6 +80,9 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.metrics_collector = (
+            get_diffusion_metrics_collector(server_args) if rank == 0 else None
+        )
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -88,6 +92,8 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+
+        self._update_lora_metrics()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -211,11 +217,11 @@ class GPUWorker:
         assert self.pipeline is not None
         req = batch[0]
         output_batch = None
+        status = "success"
+        start_time = time.monotonic()
         try:
             if self.rank == 0:
                 torch.get_device_module().reset_peak_memory_stats()
-
-            start_time = time.monotonic()
 
             # capture memory baseline before forward
             if self.rank == 0 and req.metrics:
@@ -273,7 +279,10 @@ class GPUWorker:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+            if output_batch is not None and output_batch.error is not None:
+                status = "error"
         except Exception as e:
+            status = "error"
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
@@ -282,7 +291,24 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_request(
+                    status=status,
+                    is_warmup=req.is_warmup,
+                    latency_s=time.monotonic() - start_time,
+                )
         return output_batch
+
+    def _update_lora_metrics(self):
+        if self.metrics_collector is None:
+            return
+
+        if not isinstance(self.pipeline, LoRAPipeline):
+            self.metrics_collector.clear_lora_status()
+            return
+
+        self.metrics_collector.update_lora_status(self.pipeline.get_lora_status())
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -338,6 +364,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -353,6 +380,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.merge_lora_weights(target, strength)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -365,6 +393,7 @@ class GPUWorker:
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         self.pipeline.unmerge_lora_weights(target)
+        self._update_lora_metrics()
         return OutputBatch()
 
     def list_loras(self) -> OutputBatch:

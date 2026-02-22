@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+from sglang.srt.utils import set_prometheus_multiproc_dir
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -67,6 +68,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
+
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
 
     num_gpus = server_args.num_gpus
     processes = []
