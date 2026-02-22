@@ -26,7 +26,7 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
@@ -40,8 +40,12 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
+from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -205,6 +209,34 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     return True, False
 
 
+def _verify_diffusers_model_complete(path: str) -> bool:
+    """Check if a diffusers model directory has all required component subdirectories."""
+    config_path = os.path.join(path, "model_index.json")
+    if not os.path.exists(config_path):
+        return False
+
+    try:
+        with open(config_path) as config_file:
+            model_index = json.load(config_file)
+    except Exception as exc:
+        logger.warning("Failed to read model_index.json at %s: %s", config_path, exc)
+        return False
+
+    component_keys = [
+        key
+        for key, value in model_index.items()
+        if isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
+    ]
+    if component_keys:
+        return all(os.path.exists(os.path.join(path, key)) for key in component_keys)
+
+    return os.path.exists(os.path.join(path, "transformer")) and os.path.exists(
+        os.path.join(path, "vae")
+    )
+
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     # ChatGLMConfig.model_type: ChatGLMConfig,
     # DbrxConfig.model_type: DbrxConfig,
@@ -231,8 +263,7 @@ def get_hf_config(
     model_override_args: dict | None = None,
     **kwargs,
 ) -> PretrainedConfig:
-    is_gguf = check_gguf_file(component_model_path)
-    if is_gguf:
+    if check_gguf_file(component_model_path):
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
@@ -249,13 +280,6 @@ def get_hf_config(
     if model_override_args:
         config.update(model_override_args)
 
-    # Special architecture mapping check for GGUF models
-    if is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
-
     return config
 
 
@@ -266,14 +290,9 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
-    try:
-        config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
-    except ValueError as e:
-        raise e
-
-    return config
+    return AutoConfig.from_pretrained(
+        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
 
 
 def load_dict(file_path):
@@ -301,7 +320,6 @@ def get_diffusers_component_config(
     if not os.path.exists(component_path):
         component_path = maybe_download_model(component_path)
 
-    # tokenizer
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
     if "scheduler" in component_path:
@@ -317,7 +335,85 @@ def get_diffusers_component_config(
         lambda acc, path: acc | load_dict(path), config_file_paths, {}
     )
 
+    _clean_hf_config_inplace(combined_config)
+
+    logger.debug("HF model config: %s", combined_config)
+
     return combined_config
+
+
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def get_quant_config(
+    model_config,
+    packed_modules_mapping: Dict[str, List[str]] = {},
+    remap_prefix: Dict[str, str] | None = None,
+) -> QuantizationConfig:
+    if "quantization_config" not in model_config:
+        return None
+    quant_cls = get_quantization_config(
+        model_config["quantization_config"]["quant_method"]
+    )
+
+    # GGUF doesn't have config file
+    if model_config["quantization_config"]["quant_method"] == "gguf":
+        return quant_cls.from_config({})
+
+    # Read the quantization config from the HF model config, if available.
+    hf_quant_config = model_config["quantization_config"]
+    # some vision model may keep quantization_config in their text_config
+    hf_text_config = getattr(model_config, "text_config", None)
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
+    if hf_quant_config is None:
+        # compressed-tensors uses a compressions_config
+        hf_quant_config = getattr(model_config, "compression_config", None)
+    if hf_quant_config is not None:
+        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(hf_quant_config)
+    # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
+    else:
+        model_name_or_path = model_config["model_path"]
+    is_local = os.path.isdir(model_name_or_path)
+    hf_folder = model_name_or_path
+
+    possible_config_filenames = quant_cls.get_config_filenames()
+
+    # If the quantization config is not found, use the default config.
+    if not possible_config_filenames:
+        return quant_cls()
+
+    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
+
+    quant_config_files = [
+        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
+    ]
+    if len(quant_config_files) == 0:
+        raise ValueError(
+            f"Cannot find the config file for {model_config['quantization_config']['quant_method']}"
+        )
+    if len(quant_config_files) > 1:
+        raise ValueError(
+            f"Found multiple config files for {model_config['quantization_config']['quant_method']}: "
+            f"{quant_config_files}"
+        )
+
+    quant_config_file = quant_config_files[0]
+    with open(quant_config_file) as f:
+        config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(config)
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -336,9 +432,9 @@ CONTEXT_LENGTH_KEYS = [
 def attach_additional_stop_token_ids(tokenizer):
     # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
     if "<|eom_id|>" in tokenizer.get_added_vocab():
-        tokenizer.additional_stop_token_ids = set(
-            [tokenizer.get_added_vocab()["<|eom_id|>"]]
-        )
+        tokenizer.additional_stop_token_ids = {
+            tokenizer.get_added_vocab()["<|eom_id|>"]
+        }
     else:
         tokenizer.additional_stop_token_ids = None
 
@@ -557,45 +653,11 @@ def maybe_download_model(
         Local path to the model
     """
 
-    def _verify_diffusers_model_complete(path: str) -> bool:
-        """Check if model directory (of a diffusers model, not a component) has required subdirectories."""
-        config_path = os.path.join(path, "model_index.json")
-        if not os.path.exists(config_path):
-            return False
-
-        try:
-            with open(config_path) as config_file:
-                model_index = json.load(config_file)
-        except Exception as exc:
-            logger.warning(
-                "Failed to read model_index.json at %s: %s", config_path, exc
-            )
-            return False
-
-        component_keys = [
-            key
-            for key, value in model_index.items()
-            if isinstance(value, (list, tuple))
-            and len(value) == 2
-            and all(isinstance(item, str) for item in value)
-        ]
-        if component_keys:
-            return all(
-                os.path.exists(os.path.join(path, component_key))
-                for component_key in component_keys
-            )
-
-        transformer_dir = os.path.join(path, "transformer")
-        vae_dir = os.path.join(path, "vae")
-        return os.path.exists(transformer_dir) and os.path.exists(vae_dir)
-
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        # TODO: lots of duplication here
         if not force_diffusers_model:
             return model_name_or_path
-        elif is_lora or _verify_diffusers_model_complete(model_name_or_path):
-            # CI validation: check all subdirectories for missing shards
+        if is_lora or _verify_diffusers_model_complete(model_name_or_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
                     model_name_or_path
@@ -609,8 +671,6 @@ def maybe_download_model(
                         )
                         # Fall through to download
                     else:
-                        # Local path is not in HF cache structure, can't clean up
-                        # Raise error since we can't fix this automatically
                         raise ValueError(
                             f"CI validation failed for local model at {model_name_or_path}. "
                             "Some safetensors shards are missing. "
@@ -644,25 +704,21 @@ def maybe_download_model(
         )
         if not force_diffusers_model:
             return str(local_path)
-        elif is_lora or _verify_diffusers_model_complete(local_path):
-            # CI validation: check all subdirectories for missing shards
+        if is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    if cleanup_performed:
-                        logger.warning(
-                            "CI validation failed for cached model at %s, "
-                            "cache has been cleaned up, will re-download",
-                            local_path,
-                        )
-                        # Fall through to download
-                    else:
-                        # This shouldn't happen for HF cache paths, but handle it
-                        logger.warning(
-                            "CI validation failed for cached model at %s, "
-                            "but cleanup was not performed, will attempt re-download",
-                            local_path,
-                        )
+                    logger.warning(
+                        "CI validation failed for cached model at %s, "
+                        "%s, will re-download",
+                        local_path,
+                        (
+                            "cache has been cleaned up"
+                            if cleanup_performed
+                            else "cleanup was not performed"
+                        ),
+                    )
+                    # Fall through to download
                 else:
                     logger.info("Found complete model in cache at %s", local_path)
                     return str(local_path)
@@ -670,7 +726,6 @@ def maybe_download_model(
                 logger.info("Found complete model in cache at %s", local_path)
                 return str(local_path)
         else:
-            # Model found in cache but incomplete
             if not download:
                 raise ValueError(
                     f"Model {model_name_or_path} found in cache but is incomplete and download=False."
@@ -852,3 +907,54 @@ def get_metadata_from_safetensors_file(file_path: str):
             return metadata
     except Exception as e:
         logger.warning(e)
+
+
+def get_quant_config_from_safetensors_metadata(
+    file_path: str,
+) -> Optional[QuantizationConfig]:
+    """Extract quantization config from a safetensors file's metadata header.
+
+    Safetensors files can embed a flat string→string metadata dict in their header.
+    We expect a ``quantization_config`` key containing a JSON-encoded dict with at
+    least a ``quant_method`` field (e.g. ``"fp8"``), matching the format written by
+    ``convert_hf_to_fp8.py`` when embedded into a config.json.
+
+    Returns None if no recognizable quantization metadata is found.
+    """
+    metadata = get_metadata_from_safetensors_file(file_path)
+    if not metadata:
+        return None
+
+    quant_config_str = metadata.get("quantization_config")
+    if not quant_config_str:
+        return None
+
+    try:
+        quant_config_dict = json.loads(quant_config_str)
+    except Exception as e:
+        logger.warning(
+            "failed to parse quantization_config from safetensors metadata: %s", e
+        )
+        return None
+
+    quant_method = quant_config_dict.get("quant_method")
+    if not quant_method:
+        logger.warning(
+            "quantization_config in safetensors metadata is missing 'quant_method'"
+        )
+        return None
+
+    try:
+        quant_cls = get_quantization_config(quant_method)
+        config = quant_cls.from_config(quant_config_dict)
+        logger.info(
+            "loaded quantization config (%s) from safetensors metadata: %s",
+            quant_method,
+            file_path,
+        )
+        return config
+    except Exception as e:
+        logger.warning(
+            "failed to build QuantizationConfig from safetensors metadata: %s", e
+        )
+        return None

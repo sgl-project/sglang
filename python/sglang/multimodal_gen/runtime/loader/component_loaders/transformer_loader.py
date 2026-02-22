@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_metadata_from_safetensors_file,
+    get_quant_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -70,6 +71,7 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
+
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -94,6 +96,7 @@ class TransformerLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
+
         if nunchaku_config is not None:
             nunchaku_config.model_cls = model_cls
 
@@ -120,7 +123,7 @@ class TransformerLoader(ComponentLoader):
         )
 
         logger.info(
-            "Loading %s from %s safetensors files %s, param_dtype: %s",
+            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
             cls_name,
             len(safetensors_list),
             f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
@@ -128,11 +131,12 @@ class TransformerLoader(ComponentLoader):
         )
 
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
-        if (
-            nunchaku_config is not None
-            and "quant_config" in inspect.signature(model_cls.__init__).parameters
-        ):
-            init_params["quant_config"] = nunchaku_config
+
+        if "quant_config" in inspect.signature(model_cls.__init__).parameters:
+            quant_config = get_quant_config(config)
+            init_params["quant_config"] = (
+                quant_config if quant_config else nunchaku_config
+            )
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(

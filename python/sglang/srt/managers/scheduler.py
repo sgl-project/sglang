@@ -2972,7 +2972,7 @@ class Scheduler(
                 not torch.distributed.is_initialized()
                 or torch.distributed.get_rank() == 0
             ):
-                response = dumper._handle_http_control_request(
+                response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
             self.send_to_tokenizer.send_output(
