@@ -930,3 +930,54 @@ def get_metadata_from_safetensors_file(file_path: str):
             return metadata
     except Exception as e:
         logger.warning(e)
+
+
+def get_quant_config_from_safetensors_metadata(
+    file_path: str,
+) -> Optional[QuantizationConfig]:
+    """Extract quantization config from a safetensors file's metadata header.
+
+    Safetensors files can embed a flat string→string metadata dict in their header.
+    We expect a ``quantization_config`` key containing a JSON-encoded dict with at
+    least a ``quant_method`` field (e.g. ``"fp8"``), matching the format written by
+    ``convert_hf_to_fp8.py`` when embedded into a config.json.
+
+    Returns None if no recognizable quantization metadata is found.
+    """
+    metadata = get_metadata_from_safetensors_file(file_path)
+    if not metadata:
+        return None
+
+    quant_config_str = metadata.get("quantization_config")
+    if not quant_config_str:
+        return None
+
+    try:
+        quant_config_dict = json.loads(quant_config_str)
+    except Exception as e:
+        logger.warning(
+            "failed to parse quantization_config from safetensors metadata: %s", e
+        )
+        return None
+
+    quant_method = quant_config_dict.get("quant_method")
+    if not quant_method:
+        logger.warning(
+            "quantization_config in safetensors metadata is missing 'quant_method'"
+        )
+        return None
+
+    try:
+        quant_cls = get_quantization_config(quant_method)
+        config = quant_cls.from_config(quant_config_dict)
+        logger.info(
+            "loaded quantization config (%s) from safetensors metadata: %s",
+            quant_method,
+            file_path,
+        )
+        return config
+    except Exception as e:
+        logger.warning(
+            "failed to build QuantizationConfig from safetensors metadata: %s", e
+        )
+        return None

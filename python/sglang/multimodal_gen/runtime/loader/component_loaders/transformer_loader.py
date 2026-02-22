@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import os
@@ -52,7 +51,9 @@ class TransformerLoader(ComponentLoader):
 
         if quantized_path:
             logger.info("using quantized transformer weights from: %s", quantized_path)
-            if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
+            if os.path.isfile(quantized_path) and quantized_path.endswith(
+                ".safetensors"
+            ):
                 safetensors_list = [quantized_path]
             else:
                 safetensors_list = _list_safetensors_files(quantized_path)
