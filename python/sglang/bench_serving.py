@@ -1270,7 +1270,10 @@ async def benchmark(
 
         # Merge global extra_request_body with per-request extras
         # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        merged_extra_body = {
+            **(extra_request_body or {}),
+            **(request.extra_request_body or {}),
+        }
 
         request_func_input = RequestFuncInput(
             model=model_id,
