@@ -180,10 +180,10 @@ class Gemma3Attention(nn.Module):
         # numerical differences vs HuggingFace (see the NOTE in
         # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
         # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
-        freq_indices = torch.arange(
-            0, self.head_dim, 2, dtype=torch.int64
-        ).float() / self.head_dim
-        inv_freq = 1.0 / (self.rope_theta ** freq_indices)
+        freq_indices = (
+            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
+        )
+        inv_freq = 1.0 / (self.rope_theta**freq_indices)
         if rope_scaling and rope_scaling.get("factor"):
             inv_freq = inv_freq / float(rope_scaling["factor"])
         self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)

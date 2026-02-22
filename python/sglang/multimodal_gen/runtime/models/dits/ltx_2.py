@@ -1078,7 +1078,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if hasattr(arch.rope_type, "value")
             else str(arch.rope_type)
         )
-        rope_double_precision = bool(hf_config.get("rope_double_precision", arch.double_precision_rope))
+        rope_double_precision = bool(
+            hf_config.get("rope_double_precision", arch.double_precision_rope)
+        )
         causal_offset = int(hf_config.get("causal_offset", 1))
 
         pos_embed_max_pos = int(arch.positional_embedding_max_pos[0])
@@ -1311,7 +1313,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            timestep.flatten() * self.av_ca_timestep_scale_multiplier, hidden_dtype=hidden_dtype,
+            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
@@ -1323,7 +1326,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier, hidden_dtype=audio_hidden_states.dtype,
+            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
             batch_size, -1, temb_ca_audio_gate.shape[-1]

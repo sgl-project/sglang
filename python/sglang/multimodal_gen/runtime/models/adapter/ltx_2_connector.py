@@ -464,7 +464,9 @@ class LTX2ConnectorTransformer1d(nn.Module):
             attention_mask = torch.zeros_like(attention_mask)
 
         # 2. Calculate 1D RoPE positional embeddings
-        rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device, dtype=hidden_states.dtype)
+        rotary_emb = self.rope(
+            batch_size, seq_len, device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:

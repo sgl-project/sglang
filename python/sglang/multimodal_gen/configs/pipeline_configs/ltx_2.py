@@ -2,7 +2,6 @@ import dataclasses
 from dataclasses import field
 from typing import Callable
 
-import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2Config
@@ -149,7 +148,9 @@ class LTX2PipelineConfig(PipelineConfig):
         post_patch_width = width // self.patch_size
         seq_len = post_patch_num_frames * post_patch_height * post_patch_width
 
-        num_channels = self.in_channels * self.patch_size_t * self.patch_size * self.patch_size
+        num_channels = (
+            self.in_channels * self.patch_size_t * self.patch_size * self.patch_size
+        )
 
         shape = (batch_size, seq_len, num_channels)
         return shape

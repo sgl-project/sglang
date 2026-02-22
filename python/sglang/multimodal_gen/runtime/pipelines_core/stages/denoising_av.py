@@ -110,9 +110,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
         img: PIL.Image.Image, *, width: int, height: int
     ) -> PIL.Image.Image:
         return img.resize((width, height), resample=PIL.Image.Resampling.BILINEAR)
-    
+
     @staticmethod
-    def _apply_video_codec_compression(img_array: np.ndarray, crf: int = 33) -> np.ndarray:
+    def _apply_video_codec_compression(
+        img_array: np.ndarray, crf: int = 33
+    ) -> np.ndarray:
         """Encode as a single H.264 frame and decode back to simulate compression artifacts."""
         if crf == 0:
             return img_array
@@ -120,9 +122,13 @@ class LTX2AVDenoisingStage(DenoisingStage):
         img_array = img_array[:height, :width]
         buffer = BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
-        stream = container.add_stream("libx264", rate=1, options={"crf": str(crf), "preset": "veryfast"})
+        stream = container.add_stream(
+            "libx264", rate=1, options={"crf": str(crf), "preset": "veryfast"}
+        )
         stream.height, stream.width = height, width
-        frame = av.VideoFrame.from_ndarray(img_array, format="rgb24").reformat(format="yuv420p")
+        frame = av.VideoFrame.from_ndarray(img_array, format="rgb24").reformat(
+            format="yuv420p"
+        )
         container.mux(stream.encode(frame))
         container.mux(stream.encode())
         container.close()
@@ -134,21 +140,35 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
     @staticmethod
     def _resize_center_crop_tensor(
-        img: PIL.Image.Image, *, width: int, height: int,
-        device: torch.device, dtype: torch.dtype,
-        apply_codec_compression: bool = True, codec_crf: int = 33,
+        img: PIL.Image.Image,
+        *,
+        width: int,
+        height: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        apply_codec_compression: bool = True,
+        codec_crf: int = 33,
     ) -> torch.Tensor:
         """Resize, center-crop, and normalize to [1, C, 1, H, W] tensor in [-1, 1]."""
         img_array = np.array(img).astype(np.uint8)[..., :3]
         if apply_codec_compression:
-            img_array = LTX2AVDenoisingStage._apply_video_codec_compression(img_array, crf=codec_crf)
-        tensor = torch.from_numpy(img_array.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(device=device)
+            img_array = LTX2AVDenoisingStage._apply_video_codec_compression(
+                img_array, crf=codec_crf
+            )
+        tensor = (
+            torch.from_numpy(img_array.astype(np.float32))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=device)
+        )
         src_h, src_w = tensor.shape[2], tensor.shape[3]
         scale = max(height / src_h, width / src_w)
         new_h, new_w = math.ceil(src_h * scale), math.ceil(src_w * scale)
-        tensor = torch.nn.functional.interpolate(tensor, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        tensor = torch.nn.functional.interpolate(
+            tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
+        )
         top, left = (new_h - height) // 2, (new_w - width) // 2
-        tensor = tensor[:, :, top:top + height, left:left + width]
+        tensor = tensor[:, :, top : top + height, left : left + width]
         return ((tensor / 127.5 - 1.0).to(dtype=dtype)).unsqueeze(2)
 
     @staticmethod
@@ -519,15 +539,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
                         # Velocity -> denoised (x0): x0 = x - sigma * v
                         sigma_val = float(sigma.item())
-                        denoised_video = (latents.float() - sigma_val * v_pos).to(latents.dtype)
-                        denoised_audio = (audio_latents.float() - sigma_val * a_v_pos).to(audio_latents.dtype)
+                        denoised_video = (latents.float() - sigma_val * v_pos).to(
+                            latents.dtype
+                        )
+                        denoised_audio = (
+                            audio_latents.float() - sigma_val * a_v_pos
+                        ).to(audio_latents.dtype)
 
                         if (
                             batch.do_classifier_free_guidance
                             and v_neg is not None
                             and a_v_neg is not None
                         ):
-                            denoised_video_neg = (latents.float() - sigma_val * v_neg).to(latents.dtype)
+                            denoised_video_neg = (
+                                latents.float() - sigma_val * v_neg
+                            ).to(latents.dtype)
                             denoised_audio_neg = (
                                 audio_latents.float() - sigma_val * a_v_neg
                             ).to(audio_latents.dtype)
@@ -555,17 +581,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             v_video = torch.zeros_like(denoised_video)
                             v_audio = torch.zeros_like(denoised_audio)
                         else:
-                            v_video = ((latents.float() - denoised_video.float()) / sigma_val).to(latents.dtype)
+                            v_video = (
+                                (latents.float() - denoised_video.float()) / sigma_val
+                            ).to(latents.dtype)
                             v_audio = (
-                                (audio_latents.float() - denoised_audio.float()) / sigma_val
+                                (audio_latents.float() - denoised_audio.float())
+                                / sigma_val
                             ).to(audio_latents.dtype)
 
                         latents = (latents.float() + v_video.float() * dt).to(
                             dtype=latents.dtype
                         )
-                        audio_latents = (audio_latents.float() + v_audio.float() * dt).to(
-                            dtype=audio_latents.dtype
-                        )
+                        audio_latents = (
+                            audio_latents.float() + v_audio.float() * dt
+                        ).to(dtype=audio_latents.dtype)
 
                         if do_ti2v:
                             latents[:, :num_img_tokens, :] = batch.image_latent[
