@@ -7,9 +7,9 @@ FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
 # Overridable build arguments
 ARG ARCH=x86_64
 ARG CUDA_VERSION=12.9
-ARG PYTHON_VERSION=3.10
+ARG PYTHON_VERSION=3.12
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
-ARG PYTHON_TAG=cp310-cp310
+ARG PYTHON_TAG=cp312-cp312
 ARG CMAKE_VERSION_MAJOR=3.31
 ARG CMAKE_VERSION_MINOR=1
 # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
