@@ -243,7 +243,9 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
 
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
+    os.getenv("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S", "480")
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1076,7 +1078,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 dist.monitored_barrier(
                     group=get_tp_group().cpu_group,
                     timeout=datetime.timedelta(
-                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                        seconds=(
+                            self.server_args.unbalanced_model_loading_timeout_s
+                            or UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                        )
                     ),
                     wait_all_ranks=True,
                 )
