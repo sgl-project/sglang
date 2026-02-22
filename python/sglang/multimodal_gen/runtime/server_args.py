@@ -302,6 +302,7 @@ class ServerArgs:
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+    parallel_loading: bool = True
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -816,6 +817,13 @@ class ServerArgs:
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
             "Should be enabled in almost all cases",
+        )
+        parser.add_argument(
+            "--parallel-loading",
+            action=StoreBoolean,
+            default=ServerArgs.parallel_loading,
+            help="Load pipeline components (text encoder, transformer, VAE, etc.) in parallel using threads "
+            "to reduce server startup time. Disable if components use different dtypes.",
         )
         parser.add_argument(
             "--disable-autocast",

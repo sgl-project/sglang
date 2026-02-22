@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    _model_construction_lock,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -120,10 +121,9 @@ class VAELoader(ComponentLoader):
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
-        with (
-            set_default_torch_dtype(PRECISION_TO_TYPE[vae_precision]),
-            skip_init_modules(),
-        ):
+        with _model_construction_lock, set_default_torch_dtype(
+            PRECISION_TO_TYPE[vae_precision]
+        ), skip_init_modules():
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
             vae = vae_cls(vae_config).to(target_device)
 

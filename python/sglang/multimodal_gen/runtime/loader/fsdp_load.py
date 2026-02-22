@@ -23,6 +23,7 @@ from torch.distributed.fsdp import (
 from torch.nn.modules.module import _IncompatibleKeys
 
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _model_construction_lock,
     get_param_names_mapping,
     hf_to_custom_state_dict,
     set_default_torch_dtype,
@@ -85,15 +86,18 @@ def maybe_load_fsdp_model(
         default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
     )
 
-    set_mixed_precision_policy(
-        param_dtype=default_torch_dtype,
-        reduce_dtype=reduce_dtype,
-        output_dtype=output_dtype,
-        mp_policy=mp_policy,
-    )
+    with (
+        _model_construction_lock
+    ):  # serialize construction; weight loading runs outside
+        set_mixed_precision_policy(
+            param_dtype=default_torch_dtype,
+            reduce_dtype=reduce_dtype,
+            output_dtype=output_dtype,
+            mp_policy=mp_policy,
+        )
 
-    with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+        with set_default_torch_dtype(default_torch_dtype), torch.device("meta"):
+            model = model_cls(**init_params)
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference

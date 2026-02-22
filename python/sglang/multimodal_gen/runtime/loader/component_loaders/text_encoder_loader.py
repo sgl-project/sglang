@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     _clean_hf_config_inplace,
+    _model_construction_lock,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -229,86 +230,89 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
-            with model_device, skip_init_modules():
-                architectures = getattr(model_config, "architectures", [])
-                model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                enable_image_understanding = (
-                    True
-                    if isinstance(
-                        server_args.pipeline_config, QwenImageEditPipelineConfig
+        with (
+            _model_construction_lock
+        ):  # serialize construction; weight loading runs outside
+            with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+                with model_device, skip_init_modules():
+                    architectures = getattr(model_config, "architectures", [])
+                    model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+                    enable_image_understanding = (
+                        True
+                        if isinstance(
+                            server_args.pipeline_config, QwenImageEditPipelineConfig
+                        )
+                        else False
                     )
-                    else False
+                    model_config.enable_image_understanding = enable_image_understanding
+                    model = model_cls(model_config)
+
+        weights_to_load = {name for name, _ in model.named_parameters()}
+        loaded_weights = model.load_weights(
+            self._get_all_weights(model, model_path, to_cpu=should_offload)
+        )
+
+        # Explicitly move model to target device after loading weights
+        if not should_offload:
+            model = model.to(local_torch_device)
+
+        if should_offload:
+            # Disable FSDP for MPS as it's not compatible
+            if current_platform.is_mps():
+                logger.info(
+                    "Disabling FSDP sharding for MPS platform as it's not compatible"
                 )
-                model_config.enable_image_understanding = enable_image_understanding
-                model = model_cls(model_config)
-
-            weights_to_load = {name for name, _ in model.named_parameters()}
-            loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=should_offload)
-            )
-
-            # Explicitly move model to target device after loading weights
-            if not should_offload:
                 model = model.to(local_torch_device)
-
-            if should_offload:
-                # Disable FSDP for MPS as it's not compatible
-                if current_platform.is_mps():
-                    logger.info(
-                        "Disabling FSDP sharding for MPS platform as it's not compatible"
-                    )
-                    model = model.to(local_torch_device)
-                else:
-                    mesh = init_device_mesh(
-                        current_platform.device_type,
-                        mesh_shape=(1, dist.get_world_size()),
-                        mesh_dim_names=("offload", "replicate"),
-                    )
-                    shard_model(
-                        model,
-                        cpu_offload=True,
-                        reshard_after_forward=True,
-                        mesh=mesh["offload"],
-                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                        or getattr(model, "_fsdp_shard_conditions", None),
-                        pin_cpu_memory=server_args.pin_cpu_memory,
-                    )
             else:
-                model = model.to(local_torch_device)
-            # We only enable strict check for non-quantized models
-            # that have loaded weights tracking currently.
-            # if loaded_weights is not None:
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                # NOTE:
-                # If we silently continue with uninitialized weights, the text encoder can
-                # produce NaNs/garbage embeddings that later fail stage verification in a
-                # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
-                #
-                # We allow a small set of known-optional parameters to be missing, but
-                # default to strict behavior for the rest.
-                allowed_missing_patterns = (
-                    getattr(model, "_allowed_missing_weights_patterns", []) or []
+                mesh = init_device_mesh(
+                    current_platform.device_type,
+                    mesh_shape=(1, dist.get_world_size()),
+                    mesh_dim_names=("offload", "replicate"),
                 )
-                unexpected_missing = {
-                    n
-                    for n in weights_not_loaded
-                    if not any(pat in n for pat in allowed_missing_patterns)
-                }
-                if unexpected_missing:
-                    raise ValueError(
-                        "Following text encoder weights were not initialized from checkpoint: "
-                        f"{sorted(unexpected_missing)}. "
-                        "This usually indicates a checkpoint/model-arch mismatch or a broken "
-                        "weight-name mapping. If these are truly optional, set "
-                        "`model._allowed_missing_weights_patterns` to whitelist patterns."
-                    )
-                logger.warning(
-                    "Following (allowed) text encoder weights were not initialized from "
-                    "checkpoint: %s (allowed patterns: %s)",
-                    sorted(weights_not_loaded),
-                    allowed_missing_patterns,
+                shard_model(
+                    model,
+                    cpu_offload=True,
+                    reshard_after_forward=True,
+                    mesh=mesh["offload"],
+                    fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
+                    or getattr(model, "_fsdp_shard_conditions", None),
+                    pin_cpu_memory=server_args.pin_cpu_memory,
                 )
+        else:
+            model = model.to(local_torch_device)
+        # We only enable strict check for non-quantized models
+        # that have loaded weights tracking currently.
+        # if loaded_weights is not None:
+        weights_not_loaded = weights_to_load - loaded_weights
+        if weights_not_loaded:
+            # NOTE:
+            # If we silently continue with uninitialized weights, the text encoder can
+            # produce NaNs/garbage embeddings that later fail stage verification in a
+            # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
+            #
+            # We allow a small set of known-optional parameters to be missing, but
+            # default to strict behavior for the rest.
+            allowed_missing_patterns = (
+                getattr(model, "_allowed_missing_weights_patterns", []) or []
+            )
+            unexpected_missing = {
+                n
+                for n in weights_not_loaded
+                if not any(pat in n for pat in allowed_missing_patterns)
+            }
+            if unexpected_missing:
+                raise ValueError(
+                    "Following text encoder weights were not initialized from checkpoint: "
+                    f"{sorted(unexpected_missing)}. "
+                    "This usually indicates a checkpoint/model-arch mismatch or a broken "
+                    "weight-name mapping. If these are truly optional, set "
+                    "`model._allowed_missing_weights_patterns` to whitelist patterns."
+                )
+            logger.warning(
+                "Following (allowed) text encoder weights were not initialized from "
+                "checkpoint: %s (allowed patterns: %s)",
+                sorted(weights_not_loaded),
+                allowed_missing_patterns,
+            )
 
         return model
