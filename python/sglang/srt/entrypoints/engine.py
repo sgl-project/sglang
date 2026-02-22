@@ -452,6 +452,14 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        # Stop the subprocess monitor before killing children to prevent
+        # false-positive crash detection during normal shutdown.
+        if hasattr(self, "tokenizer_manager") and hasattr(
+            self.tokenizer_manager, "_subprocess_monitor"
+        ):
+            monitor = self.tokenizer_manager._subprocess_monitor
+            if monitor is not None:
+                monitor.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
@@ -1085,5 +1093,13 @@ def _launch_subprocesses(
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+
+    # Set up subprocess liveness monitor to detect crashes
+    # (e.g., NCCL timeout causing C++ std::terminate() before Python can handle it)
+    if hasattr(tokenizer_manager, "setup_subprocess_monitor"):
+        tokenizer_manager.setup_subprocess_monitor(
+            scheduler_procs=scheduler_procs,
+            detokenizer_proc=detoken_proc,
+        )
 
     return tokenizer_manager, template_manager, scheduler_infos, port_args
