@@ -316,7 +316,7 @@
             "expected_avg_denoise_ms": 38.25,
             "expected_median_denoise_ms": 35.95
         },
-        "flux_2_image_t2i_layerwise_offload": {
+        "layerwise_offload": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 513.58,

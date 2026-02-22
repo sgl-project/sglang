@@ -893,7 +893,6 @@ def snapshot_download(
             "allow_patterns": allow_patterns,
             "local_files_only": local_files_only,
             "max_workers": max_workers,
-            "resume_download": True,
             "etag_timeout": 60,
         }
         hf_kwargs.update(kwargs)

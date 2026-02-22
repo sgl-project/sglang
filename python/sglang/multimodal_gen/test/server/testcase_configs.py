@@ -295,6 +295,8 @@ class PerformanceSummary:
         )
 
 
+SMALL_T2I_MODEL = "Tongyi-MAI/Z-Image-Turbo"
+
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="1024x1024",
@@ -397,9 +399,9 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead
     DiffusionTestCase(
-        "flux_2_image_t2i_layerwise_offload",
+        "layerwise_offload",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
+            model_path=SMALL_T2I_MODEL,
             modality="image",
             dit_layerwise_offload=True,
             dit_offload_prefetch_size=2,
@@ -409,6 +411,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(model_path="Tongyi-MAI/Z-Image-Turbo", modality="image"),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_fp8",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
+        ),
         T2I_sampling_params,
     ),
     # Multi-LoRA test case for Z-Image-Turbo
