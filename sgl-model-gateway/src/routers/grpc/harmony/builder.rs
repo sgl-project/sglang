@@ -2,7 +2,7 @@
 //!
 //! Handles encoding of Chat/Responses requests into Harmony format using openai-harmony library.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::Local;
 use openai_harmony::{
@@ -27,18 +27,61 @@ use crate::protocols::{
 
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
+static HARMONY_ENCODING_INIT_LOCK: Mutex<()> = Mutex::new(());
 
-/// Get or initialize the Harmony encoding
+/// Try to get or initialize the Harmony encoding.
 ///
 /// Uses HarmonyGptOss encoding which supports the gpt-oss model family.
-pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
-    HARMONY_ENCODING.get_or_init(|| {
-        tokio::task::block_in_place(|| {
-            openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-                .expect("Failed to load Harmony encoding")
-        })
-    })
+///
+/// This is intentionally fallible: in offline environments, the underlying vocab file may not be
+/// present in the local cache, and openai-harmony may attempt a download.
+pub(super) fn try_get_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
+    // Fast path: already initialized.
+    if let Some(encoding) = HARMONY_ENCODING.get() {
+        return Ok(encoding);
+    }
+
+    // Slow path: serialize initialization
+    let _guard = HARMONY_ENCODING_INIT_LOCK
+        .lock()
+        .map_err(|_| "Harmony encoding init lock poisoned".to_string())?;
+
+    // Another thread may have initialized while we waited.
+    if let Some(encoding) = HARMONY_ENCODING.get() {
+        return Ok(encoding);
+    }
+
+    let load = || openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss);
+
+    // Avoid panicking if called outside a Tokio runtime (e.g., unit tests).
+    let encoding = match tokio::runtime::Handle::try_current() {
+        Ok(_handle) => tokio::task::block_in_place(load),
+        Err(_) => load(),
+    }
+    .map_err(|e| format!("Failed to load Harmony encoding: {}", e))?;
+
+    let _ = HARMONY_ENCODING.set(encoding);
+    HARMONY_ENCODING
+        .get()
+        .ok_or_else(|| "Harmony encoding failed to initialize".to_string())
 }
+
+#[derive(Debug)]
+pub(crate) enum HarmonyBuildError {
+    EncodingUnavailable(String),
+    BuildFailed(String),
+}
+
+impl std::fmt::Display for HarmonyBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EncodingUnavailable(e) => write!(f, "Harmony encoding unavailable: {}", e),
+            Self::BuildFailed(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for HarmonyBuildError {}
 
 /// Built-in tools that are added to the system message
 const BUILTIN_TOOLS: &[&str] = &["web_search_preview", "code_interpreter", "container"];
@@ -113,16 +156,12 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
 /// stop tokens, and selection text for worker routing.
-pub(crate) struct HarmonyBuilder {
-    encoding: &'static HarmonyEncoding,
-}
+pub(crate) struct HarmonyBuilder;
 
 impl HarmonyBuilder {
     /// Create a new Harmony builder
     pub fn new() -> Self {
-        Self {
-            encoding: get_harmony_encoding(),
-        }
+        Self
     }
 
     /// Build Harmony request from Chat Completion request
@@ -137,7 +176,9 @@ impl HarmonyBuilder {
     pub fn build_from_chat(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Result<HarmonyBuildOutput, String> {
+    ) -> Result<HarmonyBuildOutput, HarmonyBuildError> {
+        let encoding =
+            try_get_harmony_encoding().map_err(HarmonyBuildError::EncodingUnavailable)?;
         let mut all_messages = Vec::new();
 
         let sys_msg = self.build_system_message_from_chat(request);
@@ -146,20 +187,25 @@ impl HarmonyBuilder {
         let dev_msg = self.build_developer_message_from_chat(request.tools.as_ref());
         all_messages.push(dev_msg);
 
-        let mut user_messages = self.convert_chat_messages(&request.messages)?;
+        let mut user_messages = self
+            .convert_chat_messages(&request.messages)
+            .map_err(HarmonyBuildError::BuildFailed)?;
         all_messages.append(&mut user_messages);
 
         let conversation = Conversation::from_messages(all_messages.clone());
-        let token_ids = self
-            .encoding
+        let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
+            .map_err(|e| {
+                HarmonyBuildError::BuildFailed(format!(
+                    "Failed to encode Harmony conversation: {}",
+                    e
+                ))
+            })?;
 
         let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = self
-            .encoding
+        let stop_token_ids: Vec<u32> = encoding
             .stop_tokens_for_assistant_actions()
             .into_iter()
             .flat_map(|set| set.into_iter())
@@ -188,28 +234,34 @@ impl HarmonyBuilder {
     pub fn build_from_responses(
         &self,
         request: &ResponsesRequest,
-    ) -> Result<HarmonyBuildOutput, String> {
-        let all_messages = self.construct_input_messages_with_harmony(request)?;
+    ) -> Result<HarmonyBuildOutput, HarmonyBuildError> {
+        let encoding =
+            try_get_harmony_encoding().map_err(HarmonyBuildError::EncodingUnavailable)?;
+        let all_messages = self
+            .construct_input_messages_with_harmony(request)
+            .map_err(HarmonyBuildError::BuildFailed)?;
 
         let conversation = Conversation::from_messages(all_messages.clone());
-        let token_ids = self
-            .encoding
+        let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {}", e))?;
+            .map_err(|e| {
+                HarmonyBuildError::BuildFailed(format!(
+                    "Failed to encode Harmony conversation: {}",
+                    e
+                ))
+            })?;
 
         let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = self
-            .encoding
+        let stop_token_ids: Vec<u32> = encoding
             .stop_tokens_for_assistant_actions()
             .into_iter()
             .flat_map(|set| set.into_iter())
             .collect();
 
         // Decode tokens to see what the model actually receives
-        let decoded_text = self
-            .encoding
+        let decoded_text = encoding
             .tokenizer()
             .decode_utf8(&token_ids)
             .unwrap_or_else(|_| "<decode error>".to_string());

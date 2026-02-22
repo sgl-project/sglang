@@ -17,10 +17,21 @@ use crate::{
         grpc::{
             common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
             context::{PreparationOutput, RequestContext, RequestType},
+            harmony::builder::HarmonyBuildError,
             utils,
         },
     },
 };
+
+fn harmony_encoding_unavailable_message(reason: &str) -> String {
+    format!(
+        "Harmony encoding is unavailable: {}. \
+This router can start without Harmony, but Harmony requests require the tiktoken vocab file \
+`o200k_base.tiktoken`. In offline environments, pre-seed the tiktoken cache (default \
+`~/.cache/tiktoken`) or set `TIKTOKEN_CACHE_DIR` to a directory containing that file.",
+        reason
+    )
+}
 
 /// Harmony Preparation stage: Encode requests using Harmony protocol
 ///
@@ -108,17 +119,33 @@ impl HarmonyPreparationStage {
         };
 
         // Step 3: Build via Harmony
-        let build_output = self.builder.build_from_chat(&body_ref).map_err(|e| {
-            error!(
-                function = "prepare_chat",
-                error = %e,
-                "Harmony build failed for chat request"
-            );
-            error::bad_request(
-                "harmony_build_failed",
-                format!("Harmony build failed: {}", e),
-            )
-        })?;
+        let build_output = self
+            .builder
+            .build_from_chat(&body_ref)
+            .map_err(|e| match e {
+                HarmonyBuildError::EncodingUnavailable(reason) => {
+                    error!(
+                        function = "prepare_chat",
+                        error = %reason,
+                        "Harmony encoding unavailable"
+                    );
+                    error::service_unavailable(
+                        "harmony_encoding_unavailable",
+                        harmony_encoding_unavailable_message(&reason),
+                    )
+                }
+                HarmonyBuildError::BuildFailed(reason) => {
+                    error!(
+                        function = "prepare_chat",
+                        error = %reason,
+                        "Harmony build failed for chat request"
+                    );
+                    error::bad_request(
+                        "harmony_build_failed",
+                        format!("Harmony build failed: {}", reason),
+                    )
+                }
+            })?;
 
         // Step 4: Store results
         ctx.state.preparation = Some(PreparationOutput {
@@ -188,17 +215,33 @@ impl HarmonyPreparationStage {
         let constraint = tool_constraint.or(text_constraint);
 
         // Step 3: Build via Harmony from responses API request
-        let build_output = self.builder.build_from_responses(request).map_err(|e| {
-            error!(
-                function = "prepare_responses",
-                error = %e,
-                "Harmony build failed for responses request"
-            );
-            error::bad_request(
-                "harmony_build_failed",
-                format!("Harmony build failed: {}", e),
-            )
-        })?;
+        let build_output = self
+            .builder
+            .build_from_responses(request)
+            .map_err(|e| match e {
+                HarmonyBuildError::EncodingUnavailable(reason) => {
+                    error!(
+                        function = "prepare_responses",
+                        error = %reason,
+                        "Harmony encoding unavailable"
+                    );
+                    error::service_unavailable(
+                        "harmony_encoding_unavailable",
+                        harmony_encoding_unavailable_message(&reason),
+                    )
+                }
+                HarmonyBuildError::BuildFailed(reason) => {
+                    error!(
+                        function = "prepare_responses",
+                        error = %reason,
+                        "Harmony build failed for responses request"
+                    );
+                    error::bad_request(
+                        "harmony_build_failed",
+                        format!("Harmony build failed: {}", reason),
+                    )
+                }
+            })?;
 
         // Step 4: Store results with constraint
         ctx.state.preparation = Some(PreparationOutput {
