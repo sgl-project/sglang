@@ -9,6 +9,7 @@ from typing import Optional
 
 import filelock
 
+from sglang.multimodal_gen.registry import is_known_non_diffusers_multimodal_model
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ def _maybe_download_model(
 
 
 # Copied and adapted from hf_diffusers_utils.py
-def is_diffusers_model_path(model_path: str) -> True:
+def is_diffusers_model_path(model_path: str) -> bool:
     """
     Verify if the model directory contains a valid diffusers configuration.
 
@@ -125,11 +126,20 @@ def is_diffusers_model_path(model_path: str) -> True:
 
 
 def get_is_diffusion_model(model_path: str):
-    model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
-    if is_diffusion_model:
-        logger.info("Diffusion model detected")
-    return is_diffusion_model
+    try:
+        resolved_path = _maybe_download_model(model_path)
+        if is_diffusers_model_path(resolved_path):
+            logger.info("Diffusion model detected (diffusers format)")
+            return True
+    except ValueError:
+        # model_index.json/config.json not found, continue to check other formats
+        pass
+
+    if is_known_non_diffusers_multimodal_model(model_path):
+        logger.info("Diffusion model detected (non-diffusers format: %s)", model_path)
+        return True
+
+    return False
 
 
 def get_model_path(extra_argv):

@@ -734,6 +734,25 @@ Consider updating perf_baselines.json with the snippets below:
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
         )
+
+        # Special handling for 3D mesh generation
+        if case.server_args.modality == "3d":
+            client = self._client(diffusion_server)
+            mesh_path = generate_fn(case.id, client)
+
+            # Validate mesh using MeshValidator
+            validator_class = VALIDATOR_REGISTRY.get("mesh")
+            validator = validator_class()
+            results = validator.validate(mesh_path)
+
+            if not results["all_passed"]:
+                logger.error(f"Mesh validation failed for {case.id}: {results}")
+                pytest.fail(f"Mesh validation failed: {results}")
+
+            logger.info(f"Mesh validation passed for {case.id}: {results}")
+
+            return
+
         perf_record = self.run_and_collect(
             diffusion_server,
             case.id,
