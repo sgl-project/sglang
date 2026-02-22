@@ -1496,15 +1496,34 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
-            if not torch.allclose(
-                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
-            ):
-                logger.warning_once(
-                    "w1_weight_scale_2 must match w3_weight_scale_2. "
-                    "Accuracy may be affected."
-                )
+            w1_scale = layer.w13_weight_scale_2[:, 0]
+            w3_scale = layer.w13_weight_scale_2[:, 1]
 
-            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+            if not torch.allclose(w1_scale, w3_scale):
+                logger.warning_once(
+                    "w1_weight_scale_2 does not match w3_weight_scale_2. "
+                    "Taking the max and rescaling block scales to compensate."
+                )
+                # Take the max of w1 and w3 global scales per expert,
+                # then adjust block scales so the product (block_scale *
+                # global_scale) remains unchanged.
+                max_scale = torch.max(w1_scale, w3_scale)  # [num_experts]
+                w1_ratio = w1_scale / max_scale  # [num_experts], float32
+                w3_ratio = w3_scale / max_scale  # [num_experts], float32
+
+                # w13_weight_scale shape: [num_experts, 2*intermediate, hidden//group]
+                # gate (w1) is the first half, up (w3) is the second half on dim=1
+                # Compute in float32 to minimize precision loss, then cast back
+                block_scale_dtype = layer.w13_weight_scale.dtype
+                block_scales = layer.w13_weight_scale.data.float()
+                w1_block, w3_block = block_scales.chunk(2, dim=1)
+                w1_block *= w1_ratio[:, None, None]
+                w3_block *= w3_ratio[:, None, None]
+                layer.w13_weight_scale.data = block_scales.to(block_scale_dtype)
+
+                w13_weight_scale_2 = max_scale
+            else:
+                w13_weight_scale_2 = w1_scale
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
