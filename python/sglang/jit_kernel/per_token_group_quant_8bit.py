@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -30,6 +31,10 @@ def _jit_per_token_group_quant_8bit_module(
     )
 
 
+@register_custom_op(
+    op_name="per_token_group_quant_8bit",
+    mutates_args=["output_q", "output_s"],
+)
 def per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -39,7 +44,7 @@ def per_token_group_quant_8bit(
     fp8_min: float,
     fp8_max: float,
     scale_ue8m0: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     """
     Per-token-group quantization to 8-bit format.
 
@@ -64,4 +69,3 @@ def per_token_group_quant_8bit(
         fp8_max,
         scale_ue8m0,
     )
-    return output_q, output_s

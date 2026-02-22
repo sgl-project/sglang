@@ -174,9 +174,8 @@ def test_per_token_group_quant_with_column_major(
         fp8_max=fp8_max,
         fp8_min=fp8_min,
     )
-    x_q_sglang, x_s_sglang = _postprocess(
-        *sglang_per_token_group_quant_8bit(**execute_kwargs)
-    )
+    sglang_per_token_group_quant_8bit(**execute_kwargs)
+    x_q_sglang, x_s_sglang = _postprocess(x_q, x_s)
 
     try:
         assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
