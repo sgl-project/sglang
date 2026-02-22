@@ -583,9 +583,7 @@ class _NonIntrusiveDumper:
                 self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
 
     @staticmethod
-    def _convert_value(
-        value, *, skip_forward_batch: bool = False
-    ) -> dict[str, Any]:
+    def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:
         if isinstance(value, torch.Tensor):
             return {"": value}
 
