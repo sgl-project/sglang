@@ -115,7 +115,7 @@ class ConversionResult:
         with self.lock:
             for k, v in q_weights.items():
                 self.weight_map[k] = filename
-                self.param_count += len(v)
+                self.param_count += v.numel()
             self.modules_to_not_convert.extend(module_names)
 
 
