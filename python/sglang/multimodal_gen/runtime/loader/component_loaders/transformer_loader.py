@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
     get_metadata_from_safetensors_file,
     get_quant_config,
+    get_quant_config_from_safetensors_metadata,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -44,25 +45,25 @@ class TransformerLoader(ComponentLoader):
         """
         get list of safetensors to load.
 
-        For some quantization framework, if --quantized-model-path is provided, load from this path instead of main model
+        If --transformer-quantized-path is provided, load weights from that path
+        instead of the base model's component directory.
         """
-        nunchaku_config = server_args.nunchaku_config
+        quantized_path = server_args.transformer_quantized_path
 
-        if nunchaku_config is not None and nunchaku_config.quantized_model_path:
-            # load from quantized_model_path if applicable
-            weights_path = nunchaku_config.quantized_model_path
-
-            logger.info("Using quantized model weights from: %s", weights_path)
-            if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
-                safetensors_list = [weights_path]
+        if quantized_path:
+            logger.info("using quantized transformer weights from: %s", quantized_path)
+            if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
+                safetensors_list = [quantized_path]
             else:
-                safetensors_list = _list_safetensors_files(weights_path)
+                safetensors_list = _list_safetensors_files(quantized_path)
         else:
-            weights_path = component_model_path
-            safetensors_list = _list_safetensors_files(weights_path)
+            safetensors_list = _list_safetensors_files(component_model_path)
 
         if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {weights_path}")
+            raise ValueError(
+                f"no safetensors files found in "
+                f"{quantized_path or component_model_path}"
+            )
 
         return safetensors_list
 
@@ -104,16 +105,16 @@ class TransformerLoader(ComponentLoader):
             # TODO: improve the condition
             param_dtype = None
 
-            # check if the specified nunchaku quantized model path matches with the specified model path
+            # verify that the nunchaku checkpoint matches the selected model class
             original_dit_cls_name = json.loads(
                 get_metadata_from_safetensors_file(
-                    nunchaku_config.quantized_model_path
+                    nunchaku_config.transformer_quantized_path
                 ).get("config")
             )["_class_name"]
             specified_dit_cls_name = str(model_cls.__name__)
             if original_dit_cls_name != specified_dit_cls_name:
                 raise Exception(
-                    f"Class name of DiT specified in nunchaku quantized model_path: {original_dit_cls_name} does not match that of specified DiT name: {specified_dit_cls_name}"
+                    f"Class name of DiT specified in nunchaku transformer_quantized_path: {original_dit_cls_name} does not match that of specified DiT name: {specified_dit_cls_name}"
                 )
         else:
             param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
@@ -132,11 +133,15 @@ class TransformerLoader(ComponentLoader):
 
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": hf_config}
 
-        if "quant_config" in inspect.signature(model_cls.__init__).parameters:
-            quant_config = get_quant_config(config)
-            init_params["quant_config"] = (
-                quant_config if quant_config else nunchaku_config
+        # priority: model config.json → safetensors metadata → nunchaku config
+        quant_config = get_quant_config(config)
+        if quant_config is None and server_args.transformer_quantized_path:
+            # single-file quantized checkpoint (e.g. FP8): try to read
+            # quantization_config from the safetensors metadata header
+            quant_config = get_quant_config_from_safetensors_metadata(
+                safetensors_list[0]
             )
+        init_params["quant_config"] = quant_config if quant_config else nunchaku_config
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(

@@ -70,7 +70,7 @@ sglang generate \
   --model-path Qwen/Qwen-Image \
   --prompt "change the raccoon to a cute cat" \
   --save-output \
-  --quantized-model-path /path/to/svdq-int4_r32-qwen-image.safetensors
+  --transformer-quantized-path /path/to/svdq-int4_r32-qwen-image.safetensors
 ```
 
 **Manual Override (If needed):**
@@ -89,7 +89,7 @@ sglang generate \
   --model-path Qwen/Qwen-Image \
   --prompt "a beautiful sunset" \
   --enable-svdquant \
-  --quantized-model-path /path/to/custom_model.safetensors \
+  --transformer-quantized-path /path/to/custom_model.safetensors \
   --quantization-precision int4 \
   --quantization-rank 128
 ```
@@ -108,7 +108,7 @@ Choose the appropriate configuration based on your hardware and requirements:
 
 ### Notes
 
-1.  Model Path Correspondence: `--model-path` should point to the original non-quantized model (for loading config and tokenizer, etc.), while `--quantized-model-path` points to the quantized weight file.
+1.  Model Path Correspondence: `--model-path` should point to the original non-quantized model (for loading config and tokenizer, etc.), while `--transformer-quantized-path` points to the quantized weight file.
 
 2.  Auto-Detection Requirements: For auto-detection to work, the filename must contain the pattern `svdq-{precision}_r{rank}` (e.g., `svdq-int4_r32`).
 
@@ -126,18 +126,35 @@ If you want to quantize your own models, you can use the [DeepCompressor](https:
 
 ### Usage
 
-#### Option 1: Use Pre-quantized Models (Recommended)
+#### Option 1: Pre-quantized folder (has `config.json`)
 
-If available, you can directly use pre-quantized FP8 models from Hugging Face or other sources. Simply load them with SGLang:
+For FP8 checkpoints that include a `config.json` with a `quantization_config` field (e.g., models converted via `convert_hf_to_fp8.py`, or some community HF repos), use the component override:
 
 ```bash
 sglang generate \
-  --model-path /path/to/FLUX.1-dev-FP8/ \
+  --model-path /path/to/FLUX.1-dev \
+  --transformer-path /path/to/FLUX.1-dev/transformer-FP8 \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
 
-#### Option 2: Convert Your Own Models
+The transformer's `config.json` already encodes the `quantization_config`, so no extra flags are needed.
+
+#### Option 2: Pre-quantized single-file checkpoint (no `config.json`)
+
+Some providers (e.g., [black-forest-labs/FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)) distribute a single `.safetensors` file without a companion `config.json`. Use `--transformer-quantized-path` to point to this file while keeping `--model-path` for the base model (config, VAE, text encoder, etc.):
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-klein-9B \
+  --transformer-quantized-path /path/to/flux-2-klein-9b-fp8.safetensors \
+  --prompt "A cat holding a sign that says hello world" \
+  --save-output
+```
+
+SGLang will automatically read the `quantization_config` metadata embedded in the safetensors file header (if present) to configure the FP8 kernel. For the quant config to be auto-detected, the file's metadata must contain a JSON-encoded `quantization_config` key with at least a `quant_method` field (e.g. `"fp8"`).
+
+#### Option 3: Convert Your Own Models
 
 If you need to convert a model to FP8 format, use the provided conversion script:
 
@@ -156,9 +173,8 @@ python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
 
 ```bash
 sglang generate \
-  --model-path /path/to/FLUX.1-dev/
-  # override transformer component with path to converted model
-  --transformer-path /path/to/FLUX.1-dev/transformer-FP8
+  --model-path /path/to/FLUX.1-dev \
+  --transformer-path /path/to/FLUX.1-dev/transformer-FP8 \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
