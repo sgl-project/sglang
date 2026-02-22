@@ -77,6 +77,9 @@ class TestDumpComparator(CustomTestCase):
 
 class TestEndToEnd(CustomTestCase):
     def test_main(self):
+        pytest = __import__("pytest")
+        pytest.importorskip("polars")
+
         from argparse import Namespace
 
         from sglang.srt.debug_utils.dump_comparator import main
