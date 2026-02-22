@@ -19,7 +19,7 @@ _is_npu = is_npu()
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
-    input_ids[:] = torch.where(
+    return torch.where(
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
         input_ids,
@@ -119,7 +119,9 @@ class FutureMap:
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+            model_worker_batch.input_ids = _resolve_future_token_ids(
+                model_worker_batch.input_ids, self.token_ids_buf
+            )
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
