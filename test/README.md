@@ -103,7 +103,7 @@ If a test cannot run on 5090 due to any of the above, use `stage-b-test-large-1-
 - Stage C: `stage-c-test-large-4-gpu`, `stage-c-test-large-4-gpu-b200`, `stage-c-test-large-8-gpu-b200`
 
 **Per-Commit (AMD)**:
-- `stage-a-test-1`, `stage-b-test-small-1-gpu-amd`, `stage-b-test-large-2-gpu-amd`
+- `stage-a-test-1`, `stage-b-test-small-1-gpu-amd`, `stage-b-test-large-2-gpu-amd`, `stage-b-test-large-4-gpu-amd`
 
 **Nightly**:
 - `nightly-1-gpu`, `nightly-2-gpu`, `nightly-4-gpu`, `nightly-8-gpu`, etc.

@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=3600, suite="stage-c-test-large-4-gpu-amd")
 
 GWEN3_MODEL_PATH = "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4"
 SERVER_LAUNCH_TIMEOUT = 3600
