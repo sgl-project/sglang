@@ -430,10 +430,11 @@ def _get_precomputed_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Optional[torch.Tensor]:
+    allow_mixed: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]]]:
     """
     If all items have precomputed_embeddings, return their concatenation.
-    If some but not all have precomputed_embeddings, raise NotImplementedError.
+    If some but not all have precomputed_embeddings and allow_mixed is False, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
@@ -470,7 +471,9 @@ def _get_precomputed_embedding(
             ]
         )
 
-    if any(feature is not None for feature in precomputed_embeddings):
+    if any(feature is not None for feature in precomputed_embeddings) and allow_mixed:
+        return precomputed_embeddings
+    elif any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
@@ -480,6 +483,167 @@ def _get_precomputed_embedding(
         result = result.reshape(-1, result.shape[-1])
         return result
     return None
+
+
+def _merge_precomputed_and_computed(
+    embedding: List[Optional[torch.Tensor]],
+    computed_embedding: List[torch.Tensor],
+    items_size: List[int],
+    has_precomputed: List[bool],
+    prefix_length: List[int],
+    request_skipped: List[bool],
+) -> torch.Tensor:
+    """
+    Fill embedding slots for non-precomputed items.
+    """
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    item_idx = 0
+    computed_idx = 0
+    # build empty tensor for skipped items
+    if computed_embedding:
+        empty_t = torch.empty(
+            0,
+            computed_embedding[0].shape[-1],
+            device=computed_embedding[0].device,
+            dtype=computed_embedding[0].dtype,
+        )
+    else:
+        empty_t = torch.empty(
+            0,
+            embedding[0].shape[-1],
+            device=embedding[0].device,
+            dtype=embedding[0].dtype,
+        )
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        num_items = items_size[i + 1] - items_size[i]
+        if all(has_precomputed[item_idx : item_idx + num_items]):
+            item_idx += num_items
+            continue
+        if request_skipped[i]:
+            embedding[item_idx : item_idx + num_items] = [empty_t] * num_items
+        else:
+            embedding[item_idx] = computed_embedding[computed_idx]
+            # computed_embedding is per-request, so we need to fill the remaining slots with empty tensors
+            if num_items > 1:
+                embedding[item_idx + 1 : item_idx + num_items] = [empty_t] * (
+                    num_items - 1
+                )
+            computed_idx += 1
+        item_idx += num_items
+    return torch.concat(embedding, dim=0)
+
+
+def _get_precomputed_embedding_with_mixed(
+    items: List[MultimodalDataItem],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    items_size: List[int],
+    data_embedding_func: "DataEmbeddingFunc",
+    input_ids: torch.Tensor,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """
+    Mixed mode: some items have precomputed_embeddings, others are computed.
+    Returns (concat embedding, input_ids).
+    """
+    embedding = _get_precomputed_embedding(
+        items, prefix_length, extend_length, items_offset_list, allow_mixed=True
+    )
+    has_precomputed = [item.precomputed_embeddings is not None for item in items]
+    filtered_data = _filter_non_precomputed_items(
+        items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        has_precomputed,
+    )
+    computed_embedding, input_ids = _get_chunked_prefill_embedding(
+        data_embedding_func,
+        filtered_data["items"],
+        filtered_data["items_size"],
+        filtered_data["prefix_length"],
+        filtered_data["extend_length"],
+        filtered_data["items_offset_list"],
+        input_ids,
+        allow_mixed=True,
+    )
+
+    if embedding is not None and computed_embedding is not None:
+        return (
+            _merge_precomputed_and_computed(
+                embedding,
+                computed_embedding,
+                items_size,
+                has_precomputed,
+                prefix_length,
+                filtered_data["request_skipped"],
+            ),
+            input_ids,
+        )
+    return None, input_ids
+
+
+def _filter_non_precomputed_items(
+    items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    has_precomputed: List[bool],
+) -> Dict[str, Any]:
+    """Filter out precomputed items and return data structures for non-precomputed items."""
+    non_precomputed_items = []
+    non_precomputed_items_size = [0]
+    non_precomputed_items_offset_list = []
+    non_precomputed_prefix_length = []
+    non_precomputed_extend_length = []
+    request_skipped = (
+        []
+    )  # True if _get_chunked_prefill_embedding would continue (all prefixed)
+    current_count = 0
+
+    max_iterations = min(len(items_size) - 1, len(prefix_length))
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+
+        items_per_req = items[items_size[i] : items_size[i + 1]]
+        items_offset = items_offset_list[i]
+        # Same condition as _get_chunked_prefill_embedding continue
+        skipped = all([offset_end < prefix_length[i] for _, offset_end in items_offset])
+        request_skipped.append(skipped)
+
+        # NOTE: within a request all items are either all precomputed or all not
+        has_precomputed_per_req = has_precomputed[items_size[i] : items_size[i + 1]]
+        all_precomputed = all(has_precomputed_per_req)
+        all_computed = not any(has_precomputed_per_req)
+        if not all_precomputed and not all_computed:
+            raise NotImplementedError(
+                "Not implemented: Items in a request are neither all precomputed nor all computed!"
+            )
+        if all_precomputed:
+            continue
+
+        for item in items_per_req:
+            non_precomputed_items.append(item)
+        non_precomputed_offsets = list(items_offset)
+        current_count += len(items_per_req)
+        non_precomputed_items_size.append(current_count)
+        non_precomputed_items_offset_list.append(non_precomputed_offsets)
+        non_precomputed_prefix_length.append(prefix_length[i])
+        non_precomputed_extend_length.append(extend_length[i])
+
+    return {
+        "items": non_precomputed_items,
+        "items_size": non_precomputed_items_size,
+        "prefix_length": non_precomputed_prefix_length,
+        "extend_length": non_precomputed_extend_length,
+        "items_offset_list": non_precomputed_items_offset_list,
+        "request_skipped": request_skipped,
+    }
 
 
 DataEmbeddingFunc = Callable[
@@ -556,6 +720,7 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
+    allow_mixed: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
@@ -592,6 +757,10 @@ def _get_chunked_prefill_embedding(
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
 
         if isinstance(embedding_per_req, EVSEmbeddingResult):
+            if allow_mixed:
+                raise NotImplementedError(
+                    "EVS is not supported with precomputed and computed embeddings mixed mode."
+                )
             item = embedding_items_per_req[0]
             input_ids, items_offset = (
                 embedding_per_req.redistribute_pruned_frames_placeholders(
@@ -612,7 +781,10 @@ def _get_chunked_prefill_embedding(
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
+    if not allow_mixed:
+        return torch.concat(embedding_list, dim=0), input_ids
+    else:
+        return embedding_list, input_ids
 
 
 def get_embedding_chunk_remove_extra_padding(
@@ -884,22 +1056,42 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
-    # 1. Get embedding
-    embedding = _get_precomputed_embedding(
-        embedding_items, prefix_length, extend_length, items_offset_list
-    )
-    if embedding is None:
-        embedding, input_ids = _get_chunked_prefill_embedding(
-            data_embedding_func,
+    # 1. Get embedding - support mixed precomputed and non-precomputed embeddings
+    has_precomputed = [
+        item.precomputed_embeddings is not None for item in embedding_items
+    ]
+
+    if all(has_precomputed) or not any(has_precomputed):
+        # all items have precomputed embeddings or no items have precomputed embeddings
+        # keep the original behavior
+        embedding = _get_precomputed_embedding(
+            embedding_items, prefix_length, extend_length, items_offset_list
+        )
+        if embedding is None:
+            embedding, input_ids = _get_chunked_prefill_embedding(
+                data_embedding_func,
+                embedding_items,
+                items_size,
+                prefix_length,
+                extend_length,
+                items_offset_list,
+                input_ids,
+            )
+    else:
+        # some items have precomputed embeddings and some items need to be computed
+        embedding, input_ids = _get_precomputed_embedding_with_mixed(
             embedding_items,
-            items_size,
             prefix_length,
             extend_length,
             items_offset_list,
+            items_size,
+            data_embedding_func,
             input_ids,
         )
-        if embedding is None:
-            return None, None, input_ids
+
+    if embedding is None:
+        return None, None, input_ids
+
     # 2. Get mask
     if _is_npu:
         torch.npu.current_stream().synchronize()
