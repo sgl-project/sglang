@@ -405,17 +405,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
-
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
 
-        if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
-            and is_cuda_graph
-            and not _is_cpu
-        ):
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
