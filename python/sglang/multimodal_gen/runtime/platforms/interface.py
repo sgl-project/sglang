@@ -2,18 +2,39 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/interface.py
+"""
+Multimodal Gen Platform Interface - Re-exports from unified platform.
+
+This file re-exports the Platform base class and enumerations from
+sglang.platforms.interface for backward compatibility. The local Platform
+class extends the unified one with multimodal_gen-specific methods.
+
+New code should import directly from sglang.platforms.interface.
+"""
+
 from __future__ import annotations
 
-import enum
 import random
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import resolve_obj_by_qualname
+
+# Re-export from unified platform interface
+from sglang.platforms.interface import (
+    AttentionBackendEnum,
+    CpuArchEnum,
+    DeviceCapability,
+)
+from sglang.platforms.interface import Platform as UnifiedPlatform
+from sglang.platforms.interface import (
+    PlatformEnum,
+    UnspecifiedPlatform,
+)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -23,90 +44,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class AttentionBackendEnum(enum.Enum):
-    FA2 = enum.auto()
-    FA = enum.auto()
-    SLIDING_TILE_ATTN = enum.auto()
-    TORCH_SDPA = enum.auto()
-    SAGE_ATTN = enum.auto()
-    SAGE_ATTN_3 = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
-    SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
-    VMOBA_ATTN = enum.auto()
-    AITER = enum.auto()
-    SLA_ATTN = enum.auto()
-    SAGE_SLA_ATTN = enum.auto()
-    NO_ATTENTION = enum.auto()
+class Platform(UnifiedPlatform):
+    """
+    Multimodal Gen Platform extension.
 
-    def __str__(self):
-        return self.name.lower()
+    Extends the unified Platform class with multimodal_gen-specific methods.
+    This class maintains backward compatibility for existing code that imports
+    from this module.
+    """
 
-    @property
-    def is_sparse(self) -> bool:
-        return self in {
-            AttentionBackendEnum.SLIDING_TILE_ATTN,
-            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
-            AttentionBackendEnum.VMOBA_ATTN,
-            AttentionBackendEnum.SLA_ATTN,
-            AttentionBackendEnum.SAGE_SLA_ATTN,
-        }
-
-
-class PlatformEnum(enum.Enum):
-    CUDA = enum.auto()
-    ROCM = enum.auto()
-    TPU = enum.auto()
-    CPU = enum.auto()
-    MPS = enum.auto()
-    NPU = enum.auto()
-    MUSA = enum.auto()
-    OOT = enum.auto()
-    UNSPECIFIED = enum.auto()
-
-
-class CpuArchEnum(enum.Enum):
-    X86 = enum.auto()
-    ARM = enum.auto()
-    UNSPECIFIED = enum.auto()
-
-
-class DeviceCapability(NamedTuple):
-    major: int
-    minor: int
-
-    def as_version_str(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-    def to_int(self) -> int:
-        """
-        Express device capability as an integer ``<major><minor>``.
-
-        It is assumed that the minor version is always a single digit.
-        """
-        assert 0 <= self.minor < 10
-        return self.major * 10 + self.minor
-
-
-class Platform:
     _enum: PlatformEnum
     device_name: str
     device_type: str
     device: torch.device | None = None  # Dummy attribute for compatibility
 
-    # available dispatch keys:
-    # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
-    # use "CPU" as a fallback for platforms not registered in PyTorch
     dispatch_key: str = "CPU"
-
-    # The torch.compile backend for compiling simple and
-    # standalone functions. The default value is "inductor" to keep
-    # the same behavior as PyTorch.
-    # NOTE: for the forward part of the model, vLLM has another separate
-    # compilation strategy.
     simple_compile_backend: str = "inductor"
 
-    supported_quantization: list[str] = []
+    # Use tuple (immutable) instead of list to avoid shared mutable state
+    supported_quantization: ClassVar[tuple[str, ...]] = ()
 
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
@@ -174,8 +130,9 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
-        """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
+        """Returns True for CUDA-compatible platforms (CUDA, ROCm)."""
+        # Note: MUSA is NOT included here - it uses mccl, not nccl
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
@@ -183,10 +140,7 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def is_musa(self):
-        try:
-            return hasattr(torch, "musa") and torch.musa.is_available()
-        except ModuleNotFoundError:
-            return False
+        return self._enum == PlatformEnum.MUSA
 
     @lru_cache(maxsize=1)
     def is_hip(self) -> bool:
@@ -253,7 +207,6 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
-    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
@@ -273,18 +226,21 @@ class Platform:
 
     @lru_cache(maxsize=1)
     def get_torch_distributed_backend_str(self) -> str:
-        if self.is_cuda_alike():
-            return "nccl"
-        elif self.is_npu():
-            return "hccl"
-        elif self.is_musa():
+        """
+        Get the torch.distributed backend string.
+
+        Returns:
+            "mccl" for MUSA, "nccl" for CUDA/ROCm, "gloo" for CPU/MPS/others
+        """
+        # Check MUSA first - it's CUDA-like but uses mccl
+        if self.is_musa():
             return "mccl"
+        elif self.is_cuda_alike():
+            return "nccl"
         elif self.is_mps():
             return "gloo"
         else:
-            raise NotImplementedError(
-                "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
-            )
+            return "gloo"
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -308,24 +264,19 @@ class Platform:
         """
         Set the seed of each random module.
         `torch.manual_seed` will set seed on all devices.
-
-        Loosely based on: https://github.com/Lightning-AI/pytorch-lightning/blob/2.4.0/src/lightning/fabric/utilities/seed.py#L20
         """
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         """
         Verify whether the current platform supports the specified model
         architecture.
-
-        - This will raise an Error or Warning based on the model support on
-        the current platform.
-        - By default all models are considered supported.
         """
         pass
 
@@ -384,6 +335,13 @@ class Platform:
         return resolve_obj_by_qualname(attention_cls_str)
 
 
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""
+# Re-export UnspecifiedPlatform from unified module (no local redefinition needed)
+__all__ = [
+    "Platform",
+    "UnifiedPlatform",
+    "UnspecifiedPlatform",
+    "PlatformEnum",
+    "DeviceCapability",
+    "AttentionBackendEnum",
+    "CpuArchEnum",
+]
