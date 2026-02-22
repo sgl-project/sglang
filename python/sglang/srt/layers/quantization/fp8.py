@@ -184,7 +184,8 @@ class Fp8Config(QuantizationConfig):
             normalized = []
             for layer in ignored_layers:
                 base = layer.removeprefix("model.")
-                normalized.extend((base, f"model.{base}"))
+                normalized.append(base)
+                normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8 and weight_block_size is not None:
