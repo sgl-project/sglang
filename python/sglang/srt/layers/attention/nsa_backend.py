@@ -1801,6 +1801,7 @@ class NativeSparseAttnBackend(
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=False,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
         # Use FA3 for SM90 (Hopper/H200)
@@ -1989,6 +1990,7 @@ class NativeSparseAttnBackend(
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
