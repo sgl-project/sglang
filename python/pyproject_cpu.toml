@@ -83,10 +83,12 @@ tracing = [
 test = [
   "accelerate",
   "expecttest",
+  "human-eval",
   "jsonlines",
   "matplotlib",
   "pandas",
   "peft",
+  "polars",
   "pytest",
   "sentence_transformers",
 ]

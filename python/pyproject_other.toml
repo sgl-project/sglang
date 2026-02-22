@@ -133,11 +133,13 @@ diffusion_musa = [
 test = [
   "accelerate",
   "expecttest",
+  "human-eval",
   "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
   "peft",
+  "polars",
   "pytest",
   "sentence_transformers",
   "tabulate",
