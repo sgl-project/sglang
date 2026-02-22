@@ -21,31 +21,13 @@ compile:
 	START_TOTAL=$$(date +%s); \
 	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
 		parallel -0 -j3 --halt soon,fail=1 ' \
-		NB_SRC="{}"; \
-		NB_NAME=$$(basename "$$NB_SRC"); \
-		NB_BASE=$${NB_NAME%.ipynb}; \
-		REL_DIR=$$(dirname "$$NB_SRC"); \
-		OUT_IPYNB_DIR="$(BUILDDIR)/export/ipynb/$$REL_DIR"; \
-		OUT_MD_DIR="$(BUILDDIR)/export/md/$$REL_DIR"; \
-		mkdir -p "$$OUT_IPYNB_DIR" "$$OUT_MD_DIR"; \
+		NB_NAME=$$(basename {}); \
 		START_TIME=$$(date +%s); \
-		\
-		# Execute notebook -> export/ipynb (no inplace) \
 		retry --delay=0 --times=2 -- \
-			jupyter nbconvert --to notebook --execute "$$NB_SRC" \
-			--output "$$NB_NAME" \
-			--output-dir "$$OUT_IPYNB_DIR" \
+			jupyter nbconvert --to notebook --execute --inplace "{}" \
 			--ExecutePreprocessor.timeout=600 \
 			--ExecutePreprocessor.kernel_name=python3; \
 		RET_CODE=$$?; \
-		\
-		# Convert executed notebook -> markdown \
-		if [ $$RET_CODE -eq 0 ]; then \
-			jupyter nbconvert --to markdown "$$OUT_IPYNB_DIR/$$NB_NAME" \
-				--output "$$NB_BASE.md" \
-				--output-dir "$$OUT_MD_DIR"; \
-		fi; \
-		\
 		END_TIME=$$(date +%s); \
 		ELAPSED_TIME=$$((END_TIME - START_TIME)); \
 		echo "$${NB_NAME}: $${ELAPSED_TIME}s" >> logs/timing.log; \
