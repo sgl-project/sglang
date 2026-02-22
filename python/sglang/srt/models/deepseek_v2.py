@@ -1275,27 +1275,51 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
 
-        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
-        # which requires self.w_kc and self.w_vc to be packed.
-        # If not, we will use torch.bmm and weight shouldn't be packed in this case
-        has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
+        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU,
+        # we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight
+        # kernel which requires self.w_kc and self.w_vc to be packed.
+        # If not, we will use torch.bmm and weight shouldn't be packed in this case.
+        fused_qkv_a_proj_with_mqa = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        has_fused_proj = fused_qkv_a_proj_with_mqa is not None
         if has_fused_proj and _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
-        is_packed_weight = (
-            has_fused_proj
-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+        # Some quantization paths (e.g. compressed-tensors wNa16) do not expose a
+        # dense `.weight` tensor on ReplicatedLinear; guard all fast-path checks.
+        fused_proj_quant_method = (
+            getattr(fused_qkv_a_proj_with_mqa, "quant_method", None)
+            if has_fused_proj
+            else None
         )
+        fused_proj_quant_config = getattr(fused_proj_quant_method, "quant_config", None)
+        fused_proj_quant_name = (
+            fused_proj_quant_config.get_name()
+            if (
+                fused_proj_quant_config is not None
+                and hasattr(fused_proj_quant_config, "get_name")
+            )
+            else None
+        )
+        fused_proj_weight = (
+            getattr(fused_qkv_a_proj_with_mqa, "weight", None)
+            if has_fused_proj
+            else None
+        )
+
+        is_packed_weight = has_fused_proj and fused_proj_quant_name in {
+            "awq",
+            "awq_marlin",
+            "moe_wna16",
+        }
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
             and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and fused_proj_weight is not None
+            and fused_proj_weight.dtype == torch.bfloat16
+            and fused_proj_weight.shape[0] == 2112
+            and fused_proj_weight.shape[1] == 7168
             and _is_cuda
             and 90 <= _device_sm < 120
         )
@@ -1303,12 +1327,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.qkv_proj_with_rope_is_int8 = (
             has_fused_proj
             and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+            and fused_proj_weight is not None
+            and fused_proj_weight.dtype == torch.int8
         )
         self.qkv_proj_with_rope_is_fp8 = (
             has_fused_proj
             and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+            and fused_proj_weight is not None
+            and fused_proj_weight.dtype == torch.float8_e4m3fn
         )
 
         self.weight_block_size = None
@@ -2791,8 +2817,18 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    # Map fused modules to their unfused checkpoint names so quantization
+    # ignore rules and scheme matching work for packed projections.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": [
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
 
     def __init__(
         self,
@@ -2801,17 +2837,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
-        # for quark model load
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
-        if self.fuse_qkv_a_proj:
-            self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ]
 
         self.pp_group = get_pp_group()
         self.config = config

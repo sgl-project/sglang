@@ -29,7 +29,12 @@ def _dispatch_mla_subtype(attn, forward_batch):
         else:
             return AttnForwardMethod.MLA
     else:
-        if hasattr(attn, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(attn):
+        fused_qkv_a_proj = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+        if (
+            fused_qkv_a_proj is not None
+            and getattr(fused_qkv_a_proj, "weight", None) is not None
+            and use_intel_amx_backend(attn)
+        ):
             return AttnForwardMethod.MLA_FUSED_ROPE_CPU
         else:
             return AttnForwardMethod.MLA
