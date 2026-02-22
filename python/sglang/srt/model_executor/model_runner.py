@@ -183,6 +183,7 @@ from sglang.srt.utils.patch_torch import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
+from sglang.srt.utils.weight_checksum import compute_weights_checksum
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -1503,6 +1504,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
+
+    def get_weights_checksum(self):
+        """Compute SHA-256 checksum of parameters local to this ModelRunner (current TP rank)."""
+        return compute_weights_checksum(self.model.named_parameters())
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    GetWeightsChecksumReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
@@ -646,6 +647,16 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def get_weights_checksum(self):
+        """Get model weights checksum from backend.
+
+        Note: with TP > 1, this is a shard-local checksum, not a gathered full-model checksum.
+        """
+        obj = GetWeightsChecksumReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.get_weights_checksum(obj, None)
         )
 
     def load_lora_adapter_from_tensors(
