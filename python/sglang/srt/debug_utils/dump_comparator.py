@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.debug_utils.dumper import get_truncated_value
 
-
 # ─── Data types ──────────────────────────────────────────────────────────────
 
 
@@ -185,9 +184,7 @@ def compare_tensors(
     )
 
 
-def print_comparison(
-    info: TensorComparisonInfo, diff_threshold: float = 1e-3
-) -> None:
+def print_comparison(info: TensorComparisonInfo, diff_threshold: float = 1e-3) -> None:
     if info.baseline is not None and info.target is not None:
         dtype_marker = "" if info.baseline.dtype == info.target.dtype else "🟠"
         print(
@@ -260,9 +257,7 @@ def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
     )
 
 
-def _compute_diff(
-    x_baseline: torch.Tensor, x_target: torch.Tensor
-) -> DiffInfo:
+def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = _argmax_coord(raw_abs_diff)
     return DiffInfo(
@@ -275,9 +270,7 @@ def _compute_diff(
     )
 
 
-def _print_diff(
-    diff: DiffInfo, diff_threshold: float, prefix_text: str = ""
-) -> None:
+def _print_diff(diff: DiffInfo, diff_threshold: float, prefix_text: str = "") -> None:
     print(
         prefix_text
         + "\t".join(
@@ -314,9 +307,7 @@ def _try_unify_shape(x: torch.Tensor, target_shape):
     if (x_shape[num_dim_to_remove:] == target_shape) and all(
         val == 1 for val in x_shape[:num_dim_to_remove]
     ):
-        return functools.reduce(
-            lambda a, _: a.squeeze(0), range(num_dim_to_remove), x
-        )
+        return functools.reduce(lambda a, _: a.squeeze(0), range(num_dim_to_remove), x)
 
     return x
 
