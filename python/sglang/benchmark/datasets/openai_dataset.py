@@ -1,10 +1,46 @@
 import json
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.common import (
+    BaseDatasetArgs,
+    BaseDatasetLoader,
+    DatasetRow,
+)
+
+
+@dataclass
+class OpenAIArgs(BaseDatasetArgs):
+    dataset_path: str
+    num_requests: int
+    fixed_output_len: Optional[int]
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "OpenAIArgs":
+        return cls(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            fixed_output_len=args.sharegpt_output_len,
+        )
+
+
+class OpenAIDatasetLoader(BaseDatasetLoader):
+    def load(
+        self,
+        config: OpenAIArgs,
+        tokenizer: PreTrainedTokenizerBase,
+        model_id=None,
+    ) -> List[DatasetRow]:
+        return sample_openai_requests(
+            dataset_path=config.dataset_path,
+            num_requests=config.num_requests,
+            tokenizer=tokenizer,
+            fixed_output_len=config.fixed_output_len,
+        )
 
 
 def sample_openai_requests(
