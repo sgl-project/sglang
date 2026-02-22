@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -683,7 +684,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
-            assert is_sm100_supported() or is_sm90_supported()
+            assert (
+                is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
+            ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
