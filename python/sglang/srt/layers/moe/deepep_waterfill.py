@@ -24,18 +24,17 @@ from torch import Tensor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
-_LOCAL_PREF_NUMER = 11  # int(1.1 * 10); local-rank preference = 11/10.
+_LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
 _LOCAL_PREF_DENOM = 10
 
 
 def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
     """Return empty expanded tensors for zero-token batches."""
-    topk = topk_ids.shape[1]
-    device = topk_ids.device
+    topk, d = topk_ids.shape[1], topk_ids.device
     return (
-        torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=device),
-        torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=device),
-        torch.empty(0, dtype=torch.bool, device=device),
+        torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=d),
+        torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=d),
+        torch.empty(0, dtype=torch.bool, device=d),
     )
 
 
@@ -77,26 +76,23 @@ def _count_routed_per_rank_kernel(
 
 @triton.jit
 def _waterfill_expand_kernel(
-    # Inputs
-    topk_ids_ptr,  # [num_tokens, topk]
-    topk_weights_ptr,  # [num_tokens, topk]
-    routed_counts_ptr,  # [world_size]  (effective load per rank)
-    # Outputs
-    expanded_ids_ptr,  # [num_tokens, topk+1]
-    expanded_weights_ptr,  # [num_tokens, topk+1]
-    local_mask_ptr,  # [num_tokens]
-    # Scalars
+    topk_ids_ptr,
+    topk_weights_ptr,
+    routed_counts_ptr,
+    expanded_ids_ptr,
+    expanded_weights_ptr,
+    local_mask_ptr,
     num_tokens,
     topk: tl.constexpr,
-    old_experts_per_rank,  # Original experts per rank (e.g., 32)
-    new_experts_per_rank,  # New experts per rank (e.g., 33)
+    old_experts_per_rank,
+    new_experts_per_rank,
     world_size: tl.constexpr,
     source_rank,
     shared_weight,
     local_marker,
     local_pref_numer,
     local_pref_denom,
-    precomputed_target_total,  # Pre-computed target total load per rank
+    precomputed_target_total,
     ALLOW_ALL_RANKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -553,46 +549,34 @@ class DeepEPWaterfillBalancer:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
         from sglang.srt.distributed import get_moe_ep_group
 
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-        device = topk_ids.device
-
+        local_routed_counts = self.count_local_routed(topk_output.topk_ids)
         if self.has_static_weights():
-            global_routed_counts = self.static_rank_load.to(
-                device=device, dtype=torch.int64
-            )
-            local_tokens_per_rank = None
+            global_routed_counts, local_tokens_per_rank = local_routed_counts, None
         else:
-            local_routed_counts = self.count_local_routed(topk_ids)
-            _ep_group = get_moe_ep_group().device_group
-            _ep_world = torch.distributed.get_world_size(group=_ep_group)
-            _ep_rank = torch.distributed.get_rank(group=_ep_group)
-            _fused_buf = torch.zeros(_ep_world * 2, dtype=torch.int64, device=device)
-            _fused_buf[:_ep_world] = local_routed_counts
+            group = get_moe_ep_group().device_group
+            world = torch.distributed.get_world_size(group=group)
+            buf = torch.zeros(
+                world * 2, dtype=torch.int64, device=topk_output.topk_ids.device
+            )
+            buf[:world] = local_routed_counts
             if not torch.cuda.is_current_stream_capturing():
-                _fused_buf[_ep_world + _ep_rank] = num_tokens
+                buf[world + torch.distributed.get_rank(group=group)] = num_tokens
             torch.distributed.all_reduce(
-                _fused_buf,
-                op=torch.distributed.ReduceOp.SUM,
-                group=_ep_group,
+                buf, op=torch.distributed.ReduceOp.SUM, group=group
             )
-            global_routed_counts = _fused_buf[:_ep_world]
-            if not torch.cuda.is_current_stream_capturing():
-                local_tokens_per_rank = _fused_buf[_ep_world:]
-            else:
-                local_tokens_per_rank = None
+            global_routed_counts = buf[:world]
+            local_tokens_per_rank = (
+                buf[world:] if not torch.cuda.is_current_stream_capturing() else None
+            )
 
-        expanded_topk_ids, expanded_topk_weights, local_shared_mask = (
-            self.prepare_dispatch(
-                topk_ids,
-                topk_weights,
-                global_routed_counts,
-                local_tokens_per_rank=local_tokens_per_rank,
-            )
+        expanded_ids, expanded_weights, _ = self.prepare_dispatch(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            global_routed_counts,
+            local_tokens_per_rank=local_tokens_per_rank,
         )
-
         return StandardTopKOutput(
-            topk_weights=expanded_topk_weights,
-            topk_ids=expanded_topk_ids,
+            topk_weights=expanded_weights,
+            topk_ids=expanded_ids,
             router_logits=topk_output.router_logits,
         )

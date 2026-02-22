@@ -620,7 +620,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        # Waterfill: shared expert fused via dispatch (not kernel), so kernel sees 0.
+
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -704,7 +704,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # TopK: routed experts only; waterfill balancer adds shared expert slot.
         self.topk = TopK(
             top_k=config.num_experts_per_tok + num_fused_shared_experts_in_moe_impl,
             layer_id=self.layer_id,
@@ -831,21 +830,18 @@ class DeepseekV2MoE(nn.Module):
                 layer_id=self.layer_id,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-
-        if self._enable_deepep_waterfill:
             self.deepep_waterfill_balancer.update_static_weights()
 
     def get_moe_weights(self):
-        # In waterfill mode, exclude the shared expert slot from local count.
-        if self._enable_deepep_waterfill and self.deepep_waterfill_balancer is not None:
-            num_local = self.deepep_waterfill_balancer.old_experts_per_rank
-        else:
-            num_local = self.experts.num_local_experts
-
+        num_local = (
+            self.deepep_waterfill_balancer.old_experts_per_rank
+            if self._enable_deepep_waterfill and self.deepep_waterfill_balancer
+            else self.experts.num_local_experts
+        )
         return [
             x.data
             for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
+            if name != "correction_bias"
             and not getattr(x, "_sglang_require_global_experts", False)
             and x.data.ndim > 0
             and x.data.shape[0] == num_local
@@ -1058,7 +1054,6 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # --- Waterfill: lazy static weight init ---
         if self._enable_deepep_waterfill:
             self.deepep_waterfill_balancer.update_static_weights()
 
@@ -1094,7 +1089,6 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
 
-            # --- Waterfill: expand topk with waterfill balancing ---
             if self._enable_deepep_waterfill:
                 topk_output = self.deepep_waterfill_balancer.expand_topk(
                     topk_output, hidden_states.shape[0]
