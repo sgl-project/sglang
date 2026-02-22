@@ -1214,17 +1214,22 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         return remapped_name
 
     possible_scale_names = [".k_scale", ".v_scale"]
-    modelopt_scale_names = [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"]
+    # Patterns where modelopt stores scales under k_proj/v_proj
+    # but the model expects them under attn (RadixAttention)
+    modelopt_attn_prefixes = [".self_attn.", ".mixer."]
     for scale_name in possible_scale_names:
         if name.endswith(scale_name):
-            # Check and remap the name based on modelopt scale names
-            if any(
-                modelopt_scale_name in name
-                for modelopt_scale_name in modelopt_scale_names
-            ):
+            # Check if this is a modelopt-style scale under k_proj/v_proj
+            matched_prefix = None
+            for attn_prefix in modelopt_attn_prefixes:
+                if f"{attn_prefix}{scale_name[1]}_proj{scale_name}" in name:
+                    matched_prefix = attn_prefix
+                    break
+
+            if matched_prefix is not None:
                 remapped_name = name.replace(
-                    f".self_attn.{scale_name[1]}_proj{scale_name}",
-                    f".self_attn.attn{scale_name}",
+                    f"{matched_prefix}{scale_name[1]}_proj{scale_name}",
+                    f"{matched_prefix}attn{scale_name}",
                 )
             else:
                 remapped_name = name.replace(scale_name, f".attn{scale_name}")
