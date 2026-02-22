@@ -48,7 +48,7 @@ if _use_aiter:
 
 if is_npu():
     import torch_npu
-
+    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
     NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
@@ -272,6 +272,10 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if offsets is not None:
             positions = positions + offsets
+        
+        if _is_npu and query.shape[0] * query.shape[1] < 65535:
+            return fused_rope_qk_mqa(query, key, self.cos_sin_cache.index_select(0, positions), self.rotary_dim, self.is_neox_style)
+
         positions = positions.flatten()
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)

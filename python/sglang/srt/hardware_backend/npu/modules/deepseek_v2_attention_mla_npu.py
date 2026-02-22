@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -307,14 +308,16 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        q, latent_cache = fused_qkv_a_proj_out.split(
-            [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+        
+        q_lora, k_nope, k_pe = fused_split_qk_norm(
+            fused_qkv_a_proj_out,
+            m.q_a_layernorm,
+            m.kv_a_layernorm,
+            m.q_lora_rank,
+            m.kv_lora_rank,
+            m.qk_rope_head_dim,
+            eps=1e-6,
         )
-
-        # overlap qk norm
-        q = m.q_a_layernorm(q)
-
-        q_lora = q.clone()  # required for topk_indices
 
         q_event = None
         if m.alt_stream is not None:
@@ -327,10 +330,6 @@ def forward_dsa_prepare_npu(
         else:
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
-        k_nope, k_pe = latent_cache.unsqueeze(1).split(
-            [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
-        )
-        k_nope = m.kv_a_layernorm(k_nope)
         # main stream waits for the completion of the event on the alt stream to ensure data dependency is complete
         if q_event is not None:
             torch.npu.current_stream().wait_event(q_event)
