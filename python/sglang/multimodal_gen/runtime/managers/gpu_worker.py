@@ -441,7 +441,7 @@ class GPUWorker:
             }
 
         offloaded_modules: list[str] = []
-
+        errors: list[str] = []
         for name, module in self.pipeline.modules.items():
             if not isinstance(module, torch.nn.Module):
                 continue
@@ -469,6 +469,11 @@ class GPUWorker:
             torch.cuda.empty_cache()
         gc.collect()
 
+        if errors:
+            return {
+                "success": False,
+                "message": f"Failed to offload modules: {errors}",
+            }
         logger.info(f"Released GPU memory. Offloaded modules: {offloaded_modules}")
         return {
             "success": True,
@@ -503,6 +508,7 @@ class GPUWorker:
 
         device = torch.device(f"cuda:{self.local_rank}")
         resumed_modules: list[str] = []
+        errors: list[str] = []
 
         for name, module in self.pipeline.modules.items():
             if not isinstance(module, torch.nn.Module):
@@ -524,7 +530,15 @@ class GPUWorker:
                     module.to(device)
                     resumed_modules.append(name)
             except Exception as e:
-                logger.warning(f"Failed to resume module '{name}' to GPU: {e}")
+                err_msg = f"Failed to resume module '{name}' to GPU: {e}"
+                logger.warning(err_msg)
+                errors.append(err_msg)
+
+        if errors:
+            return {
+                "success": False,
+                "message": f"Failed to resume modules: {errors}",
+            }
 
         logger.info(f"Resumed GPU memory. Restored modules: {resumed_modules}")
         return {

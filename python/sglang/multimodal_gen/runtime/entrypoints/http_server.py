@@ -109,7 +109,9 @@ def _extract_tags_from_body(body: dict) -> list[str] | None:
         return None
     tags = body.get("tags", None)
     if tags is not None and not isinstance(tags, list):
-        raise ValueError(f"'tags' must be a list of strings, got: {type(tags).__name__}")
+        raise ValueError(
+            f"'tags' must be a list of strings, got: {type(tags).__name__}"
+        )
     return tags
 
 
