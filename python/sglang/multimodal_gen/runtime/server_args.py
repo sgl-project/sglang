@@ -269,6 +269,8 @@ class ServerArgs:
     dp_degree: int = 1
     # cfg parallel
     enable_cfg_parallel: bool = False
+    # UAA (Ulysses Anything Attention) - experimental
+    enable_uaa: bool = False
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -699,6 +701,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ring_degree,
             help="Ring sequence parallel degree. Used in attention layer.",
+        )
+        parser.add_argument(
+            "--enable-uaa",
+            action="store_true",
+            default=ServerArgs.enable_uaa,
+            help=(
+                "Enable UAA (Ulysses Anything Attention) for arbitrary head/sequence sizes (experimental). "
+                "Note: Not fully compatible with ring_degree > 1."
+            ),
         )
         parser.add_argument(
             "--enable-cfg-parallel",
@@ -1197,6 +1208,13 @@ class ServerArgs:
             raise ValueError(
                 f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
+            )
+
+        # Validate UAA restrictions (from diffusers PR)
+        if self.enable_uaa and self.ring_degree > 1:
+            logger.warning(
+                "UAA with ring_degree > 1 is not yet fully supported. "
+                "Consider setting ring_degree=1 when using --enable-uaa."
             )
 
         if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":

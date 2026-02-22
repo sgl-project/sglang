@@ -9,6 +9,7 @@ from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
+    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.srt.utils.common import torch_release
@@ -46,7 +47,80 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_split_for_ulysses(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+    """
+    Split tensor along dimension for UAA using tensor_split.
+
+    Unlike chunk(), tensor_split correctly handles non-divisible sizes.
+    Returns the shard for the current rank.
+    """
+    rank = get_ulysses_parallel_rank()
+    if x.shape[dim] % world_size == 0:
+        # Evenly divisible - use simple indexing
+        chunk_size = x.shape[dim] // world_size
+        start_idx = rank * chunk_size
+        return x.narrow(dim, start_idx, chunk_size)
+    # Unevenly divisible - use tensor_split
+    chunks = torch.tensor_split(x, world_size, dim=dim)
+    return chunks[rank]
+
+
+def _usp_gather_for_ulysses(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+    """
+    Gather tensors from all ranks along dimension.
+
+    Handles varying sizes per rank (UAA capability).
+    Uses pad-then-slice strategy to work with standard all_gather
+    which requires equal-sized tensors across ranks.
+    """
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+
+    # Ensure input is contiguous - tensor_split/narrow may return non-contiguous views
+    x = x.contiguous()
+
+    local_size = x.shape[dim]
+
+    # Collect the actual sizes from each rank
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=x.device)
+    all_sizes_list = [
+        torch.zeros(1, dtype=torch.long, device=x.device) for _ in range(world_size)
+    ]
+    torch.distributed.all_gather(all_sizes_list, local_size_tensor, group=ulysses_pg)
+    all_sizes = [int(s.item()) for s in all_sizes_list]
+    max_size = max(all_sizes)
+
+    if all(s == max_size for s in all_sizes):
+        # All ranks have the same size - use simple all_gather
+        gathered = [torch.zeros_like(x) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, x, group=ulysses_pg)
+        return torch.cat(gathered, dim=dim)
+
+    # Pad local tensor to max_size along dim so all ranks have equal size
+    pad_size = max_size - local_size
+    if pad_size > 0:
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        x_padded = torch.cat([x, padding], dim=dim)
+    else:
+        x_padded = x
+
+    # All ranks now have the same size along dim - safe to all_gather
+    gathered = [torch.zeros_like(x_padded) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, x_padded, group=ulysses_pg)
+
+    # Slice each gathered tensor to its actual size and concatenate
+    sliced = []
+    for i, g in enumerate(gathered):
+        sliced.append(g.narrow(dim, 0, all_sizes[i]))
+
+    return torch.cat(sliced, dim=dim)
+
+
+def _usp_input_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, enable_uaa: bool = False
+) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
 
@@ -60,6 +134,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     Args:
         x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
         head_dim: Which dimension index corresponds to heads (1 or 2)
+        enable_uaa: Enable UAA (Ulysses Anything Attention) for arbitrary head/sequence sizes
 
     Returns:
         Tensor with the same dim order as input, with heads sharded and sequence gathered.
@@ -79,20 +154,31 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
 
     b, h, s, d = x_c.shape
-    assert (
-        h % world_size == 0
-    ), f"h ({h}) must be divisible by world_size ({world_size})"
 
-    # [b, h, s_local, d] -> [h, b, s_local, d]
-    x_c = x_c.permute(1, 0, 2, 3).contiguous()
-    # all-to-all along h
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h_local, s, d]
-    x_c = (
-        x_c.reshape(world_size, h // world_size, b, -1, d)
-        .permute(2, 1, 0, 3, 4)
-        .reshape(b, h // world_size, -1, d)
-    )
+    if not enable_uaa:
+        # Original path with strict divisibility
+        assert (
+            h % world_size == 0
+        ), f"h ({h}) must be divisible by world_size ({world_size})"
+
+        # [b, h, s_local, d] -> [h, b, s_local, d]
+        x_c = x_c.permute(1, 0, 2, 3).contiguous()
+        # all-to-all along h
+        x_c = _usp_all_to_all_single(x_c)
+        # -> [b, h_local, s, d]
+        x_c = (
+            x_c.reshape(world_size, h // world_size, b, -1, d)
+            .permute(2, 1, 0, 3, 4)
+            .reshape(b, h // world_size, -1, d)
+        )
+    else:
+        # UAA path: Split heads locally, then gather sequences
+        # [b, h, s_local, d] -> [b, h_local, s_local, d]
+        x_c = _usp_split_for_ulysses(x_c, dim=1, world_size=world_size)
+
+        # Now gather sequences from all ranks
+        # [b, h_local, s_local, d] -> [b, h_local, s_global, d]
+        x_c = _usp_gather_for_ulysses(x_c, dim=2, world_size=world_size)
 
     if head_dim == 1 and seq_dim == 2:
         return x_c
@@ -104,7 +190,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x_c.permute(tuple(new_order)).contiguous()
 
 
-def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
+def _usp_output_all_to_all(
+    x: torch.Tensor, head_dim: int = 1, enable_uaa: bool = False
+) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
 
@@ -118,6 +206,7 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     Args:
         x: A 4D tensor with layout [b, *, *, d] where '*' are sequence and heads
         head_dim: Which dimension index corresponds to heads (1 or 2)
+        enable_uaa: Enable UAA (Ulysses Anything Attention) for arbitrary head/sequence sizes
 
     Returns:
         Tensor with the same dim order as input, with heads gathered and sequence sharded.
@@ -137,19 +226,30 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
 
     b, h, s, d = x_c.shape
-    assert (
-        s % world_size == 0
-    ), f"s ({s}) must be divisible by world_size ({world_size})"
 
-    # [b, h_local, s, d] -> [s, b, h_local, d]
-    x_c = x_c.permute(2, 0, 1, 3).contiguous()
-    x_c = _usp_all_to_all_single(x_c)
-    # -> [b, h, s_local, d]
-    x_c = (
-        x_c.reshape(world_size, s // world_size, b, -1, d)
-        .permute(2, 0, 3, 1, 4)
-        .reshape(b, -1, s // world_size, d)
-    )
+    if not enable_uaa:
+        # Original path
+        assert (
+            s % world_size == 0
+        ), f"s ({s}) must be divisible by world_size ({world_size})"
+
+        # [b, h_local, s, d] -> [s, b, h_local, d]
+        x_c = x_c.permute(2, 0, 1, 3).contiguous()
+        x_c = _usp_all_to_all_single(x_c)
+        # -> [b, h, s_local, d]
+        x_c = (
+            x_c.reshape(world_size, s // world_size, b, -1, d)
+            .permute(2, 0, 3, 1, 4)
+            .reshape(b, -1, s // world_size, d)
+        )
+    else:
+        # UAA path: Split sequences locally, then gather heads
+        # [b, h_local, s_global, d] -> [b, h_local, s_local, d]
+        x_c = _usp_split_for_ulysses(x_c, dim=2, world_size=world_size)
+
+        # Now gather heads from all ranks
+        # [b, h_local, s_local, d] -> [b, h, s_local, d]
+        x_c = _usp_gather_for_ulysses(x_c, dim=1, world_size=world_size)
 
     if head_dim == 1 and seq_dim == 2:
         return x_c
