@@ -3,9 +3,8 @@ import functools
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
-import einops
 import polars as pl
 import torch
 
@@ -27,7 +26,6 @@ def main(args):
     print("df_baseline", df_baseline)
 
     location_info_of_target_pass_id = _get_location_info_of_target_pass_id()
-    tensor_dim_descs = _get_tensor_dim_descs()
 
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
@@ -41,16 +39,6 @@ def main(args):
         else:
             baseline_step = row["step"] - args.start_id + args.baseline_start_id
             baseline_token_slice = None
-
-        tensor_dim_desc = None
-        if tensor_dim_descs is not None:
-            tensor_dim_descs_filtered = [
-                desc
-                for desc in tensor_dim_descs
-                if re.search(desc["pattern"], row["filename"]) is not None
-            ]
-            if tensor_dim_descs_filtered:
-                tensor_dim_desc = tensor_dim_descs_filtered[0]
 
         row_baseline = find_row(
             df_baseline,
@@ -82,19 +70,8 @@ def main(args):
             path_target=path_target,
             diff_threshold=args.diff_threshold,
             name=row["name"],
-            baseline_token_slice=baseline_token_slice,
-            tensor_dim_desc=tensor_dim_desc,
         )
         print()
-
-
-def _split_einops_pattern(pattern):
-    return re.findall(r"\([^()]*\)|\S+", pattern)
-
-
-def _get_einops_dim_index(pattern: str, dim_name: str):
-    pattern_list = _split_einops_pattern(pattern)
-    return pattern_list.index(dim_name)
 
 
 def check_tensor_pair(
@@ -102,8 +79,6 @@ def check_tensor_pair(
     path_target,
     diff_threshold: float = 1e-3,
     name="",
-    baseline_token_slice=None,
-    tensor_dim_desc: Optional["TensorDimDesc"] = None,
 ):
     x_baseline = _load_object(path_baseline)
     x_target = _load_object(path_target)
@@ -119,20 +94,6 @@ def check_tensor_pair(
         f"[shape] {x_baseline.shape} vs {x_target.shape}\t"
         f"[{'' if x_baseline.dtype == x_target.dtype else '🟠'}dtype] {x_baseline.dtype} vs {x_target.dtype}"
     )
-
-    if tensor_dim_desc is not None:
-        if (s := baseline_token_slice) is not None:
-            dim = _get_einops_dim_index(tensor_dim_desc.baseline_desc, "num_tokens")
-            x_baseline = x_baseline.narrow(
-                dim=dim, start=s.start, length=s.stop - s.start
-            )
-        x_baseline = einops.rearrange(
-            x_baseline,
-            tensor_dim_desc.baseline_desc + " -> " + tensor_dim_desc.target_desc,
-        )
-        if (f := tensor_dim_desc.baseline_cropper) is not None:
-            print("Apply baseline_cropper")
-            x_baseline = f(x_baseline)
 
     x_baseline, x_target = _comparison_preprocessor(x_baseline, x_target, name=name)
     x_baseline = _try_unify_shape(x_baseline, target_shape=x_target.shape)
@@ -298,18 +259,6 @@ class LocationInfo:
 def _get_location_info_of_target_pass_id() -> Optional[Dict[int, LocationInfo]]:
     """Customization endpoint."""
     return None
-
-
-@dataclass
-class TensorDimDesc:
-    baseline_desc: str
-    target_desc: str
-    baseline_cropper: Optional[Callable[[torch.Tensor], torch.Tensor]]
-
-
-def _get_tensor_dim_descs() -> List[TensorDimDesc]:
-    """Customization endpoint."""
-    return []
 
 
 if __name__ == "__main__":

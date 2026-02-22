@@ -50,15 +50,6 @@ class TestDumpComparator(CustomTestCase):
         )
         self.assertIsNone(_compute_smaller_dtype(torch.float32, torch.float32))
 
-    def test_einops_pattern(self):
-        from sglang.srt.debug_utils.dump_comparator import (
-            _get_einops_dim_index,
-            _split_einops_pattern,
-        )
-
-        self.assertEqual(_split_einops_pattern("a (b c) d"), ["a", "(b c)", "d"])
-        self.assertEqual(_get_einops_dim_index("a b c", "b"), 1)
-
     def test_load_object(self):
         from sglang.srt.debug_utils.dump_comparator import _load_object
 
