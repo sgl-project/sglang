@@ -1101,8 +1101,30 @@ def composed_weight_loader(
 def runai_safetensors_weights_iterator(
     hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    Reads env vars to configure RunAI Model Streamer:
+    - SGLANG_RUNAI_STREAMER_DEVICE: "cpu"|"cuda"|"auto" (default "auto")
+    - SGLANG_RUNAI_STREAMER_DISTRIBUTED: "0"|"1"|"auto" (default "auto")
+    """
     from runai_model_streamer import SafetensorsStreamer
+
+    device = os.getenv("SGLANG_RUNAI_STREAMER_DEVICE", "auto")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    want_distributed = (
+        device != "cpu"
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    )
+    dist_env = os.getenv("SGLANG_RUNAI_STREAMER_DISTRIBUTED", "auto").strip().lower()
+    if dist_env == "auto":
+        is_distributed = want_distributed
+    else:
+        is_distributed = dist_env in ("1", "true", "yes")
+
+    logger.info("RunAI streamer: device=%s, is_distributed=%s", device, is_distributed)
 
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1116,7 +1138,7 @@ def runai_safetensors_weights_iterator(
             bar_format=BAR_FORMAT,
             position=tqdm._get_free_pos(),
         ):
-            streamer.stream_file(st_file)
+            streamer.stream_file(st_file, device=device, is_distributed=is_distributed)
             yield from streamer.get_tensors()
 
 
@@ -1138,10 +1160,10 @@ def set_runai_streamer_env(load_config: LoadConfig):
                 extra_config.get("memory_limit")
             )
 
-    runai_streamer_s3_endpoint = os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
-    aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
-    if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
-        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
+    if os.getenv("RUNAI_STREAMER_S3_ENDPOINT") is None:
+        endpoint = os.getenv("AWS_ENDPOINT_URL") or os.getenv("AWS_ENDPOINT_URL_S3")
+        if endpoint is not None:
+            os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = endpoint
 
 
 def initialize_dummy_weights(
