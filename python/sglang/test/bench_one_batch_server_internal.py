@@ -16,11 +16,8 @@ from pydantic import BaseModel
 from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
 
-from sglang.bench_serving import (
-    get_dataset,
-    get_processor,
-    get_tokenizer,
-)
+from sglang.benchmark.datasets import get_dataset
+from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -827,9 +824,10 @@ def run_benchmark_internal(
 
     # Warmup
     if not bench_args.skip_warmup:
+        batch_size_unique = list(set(bench_args.batch_size))
         print("=" * 8 + " Warmup Begin " + "=" * 8)
-        print(f"Warmup with batch_size={bench_args.batch_size}")
-        for bs in bench_args.batch_size:
+        print(f"Warmup with batch_size={batch_size_unique}")
+        for bs in batch_size_unique:
             run_one_case(
                 base_url,
                 batch_size=bs,

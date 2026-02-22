@@ -17,16 +17,14 @@ class TestDumpLoader(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             for fn in [
-                "forward_pass_id=1___rank=0___dump_index=1___name=a.pt",
-                "forward_pass_id=2___rank=0___dump_index=2___name=b.pt",
+                "step=1___rank=0___dump_index=1___name=a.pt",
+                "step=2___rank=0___dump_index=2___name=b.pt",
             ]:
                 torch.save(torch.randn(5), Path(tmpdir) / fn)
 
             df = read_meta(tmpdir)
             self.assertEqual(len(df), 2)
-            self.assertTrue(
-                all(c in df.columns for c in ["forward_pass_id", "rank", "name"])
-            )
+            self.assertTrue(all(c in df.columns for c in ["step", "rank", "name"]))
 
     def test_find_row(self):
         from sglang.srt.debug_utils.dump_loader import find_row
