@@ -213,6 +213,7 @@ class DiffGenerator:
                         ),
                         trajectory_latents=output_batch.trajectory_latents,
                         trajectory_timesteps=output_batch.trajectory_timesteps,
+                        trajectory_log_probs=output_batch.trajectory_log_probs,
                         trajectory_decoded=output_batch.trajectory_decoded,
                     )
 

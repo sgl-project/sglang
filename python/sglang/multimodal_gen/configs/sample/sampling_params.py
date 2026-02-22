@@ -146,6 +146,9 @@ class SamplingParams:
     # Misc
     save_output: bool = True
     return_frames: bool = False
+    rollout: bool = False
+    rollout_sde_type: str = "sde"
+    rollout_noise_level: float = 0.7
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     # if True, disallow user params to override subclass-defined protected fields
@@ -292,6 +295,9 @@ class SamplingParams:
         )
         _finite_non_negative_float(
             "guidance_rescale", self.guidance_rescale, allow_none=False
+        )
+        _finite_non_negative_float(
+            "rollout_noise_level", self.rollout_noise_level, allow_none=False
         )
 
         if self.cfg_normalization is None:
@@ -742,6 +748,25 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.return_trajectory_latents,
             help="Whether to return the trajectory",
+        )
+        parser.add_argument(
+            "--rollout",
+            action="store_true",
+            default=SamplingParams.rollout,
+            help="Enable rollout mode and return per-step log_prob trajectory",
+        )
+        parser.add_argument(
+            "--rollout-sde-type",
+            type=str,
+            choices=["sde", "cps"],
+            default=SamplingParams.rollout_sde_type,
+            help="Rollout step objective type used in log-prob computation.",
+        )
+        parser.add_argument(
+            "--rollout-noise-level",
+            type=float,
+            default=SamplingParams.rollout_noise_level,
+            help="Noise level used by rollout SDE/CPS step objective.",
         )
         parser.add_argument(
             "--return-trajectory-decoded",
