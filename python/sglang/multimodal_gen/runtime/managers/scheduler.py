@@ -9,6 +9,9 @@ from copy import deepcopy
 from typing import Any, List
 
 import zmq
+import threading
+from typing import Any, Dict, Optional
+
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -37,6 +40,12 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+
+from sglang.srt.managers.io_struct import (
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
+
 
 logger = init_logger(__name__)
 
@@ -97,6 +106,8 @@ class Scheduler:
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO, new reqs are appended
@@ -113,6 +124,10 @@ class Scheduler:
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
+
+        #sleeping status
+        self._sleep_lock = threading.Lock()
+        self._sleeping: bool = False
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -157,6 +172,8 @@ class Scheduler:
         return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
+        if self._sleeping:
+            return OutputBatch(error="Engine is sleeping. Call resume_memory_occupation first.")
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
@@ -435,3 +452,31 @@ class Scheduler:
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_release_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        req = reqs[0]
+        with self._sleep_lock:
+            if self._sleeping:
+                return OutputBatch(output={"sleeping": True, "note": "already sleeping"})
+            # become sleeping，and stall generation
+            self._sleeping = True
+
+        # release gpu memory (every rank will execute their own worker)
+        detail = self.worker.release_memory_occupation(tags=getattr(req, "tags", None))
+
+        return OutputBatch(output={"sleeping": True, "detail": detail})
+
+    def _handle_resume_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE ] handle_resume_memory_occupation on rank={self.gpu_id}")
+        req = reqs[0]
+        with self._sleep_lock:
+            if not self._sleeping:
+                return OutputBatch(output={"sleeping": False, "note": "already awake"})
+
+        detail = self.worker.resume_memory_occupation(tags=getattr(req, "tags", None))
+
+        with self._sleep_lock:
+            self._sleeping = False
+
+        return OutputBatch(output={"sleeping": False, "detail": detail})
