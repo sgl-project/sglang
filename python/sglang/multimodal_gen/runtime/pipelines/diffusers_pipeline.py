@@ -491,11 +491,6 @@ class DiffusersPipeline(ComposedPipelineBase):
         backend = server_args.attention_backend
 
         if backend is None:
-            config = server_args.pipeline_config
-            if config is not None:
-                backend = getattr(config, "diffusers_attention_backend", None)
-
-        if backend is None:
             return
 
         backend = backend.lower()
