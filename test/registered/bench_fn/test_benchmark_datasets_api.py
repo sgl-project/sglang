@@ -7,6 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
 
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.common import DatasetRow
@@ -33,65 +37,39 @@ class _DummyTokenTensor:
         return self.value
 
 
-class DummyTokenizer:
-    """Lightweight tokenizer stub for CPU-only dataset unit tests."""
+def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
+    """Create a local lightweight tokenizer for CPU-only dataset tests."""
+    vocab = {"[UNK]": 0, "[PAD]": 1, "[BOS]": 2, "[EOS]": 3}
+    vocab.update({f"tok_{i}": i + 4 for i in range(2048)})
 
-    def __init__(self):
-        self.vocab_size = 32000
-        self.bos_token = "<s>"
-        self._vocab = {f"tok_{i}": i for i in range(self.vocab_size)}
+    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
 
-    def encode(self, text, add_special_tokens=True):
-        if isinstance(text, str):
-            if text == "":
-                return []
-            return [(ord(ch) % 255) + 1 for ch in text]
-        if isinstance(text, list):
-            return list(range(len(text)))
-        return [1]
-
-    def decode(self, token_ids):
-        return " ".join(str(int(x)) for x in token_ids)
-
-    def get_vocab(self):
-        return self._vocab
-
-    def num_special_tokens_to_add(self):
-        return 1
-
-    def apply_chat_template(
-        self,
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-        return_dict=False,
-    ):
-        parts = []
-        for message in messages:
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            if isinstance(content, list):
-                content_parts = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        content_parts.append(item.get("text", ""))
-                    else:
-                        content_parts.append("[IMAGE]")
-                content = " ".join(content_parts)
-            parts.append(f"{role}:{content}")
-        if add_generation_prompt:
-            parts.append("assistant:")
-
-        rendered = "\n".join(parts)
-        if tokenize:
-            return self.encode(rendered)
-        if return_dict:
-            return {"input_ids": self.encode(rendered)}
-        return rendered
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+    )
+    hf_tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ message['role'] }}:"
+        "{% if message['content'] is string %}"
+        "{{ message['content'] }}"
+        "{% else %}"
+        "{% for item in message['content'] %}"
+        "{% if item['type'] == 'text' %}{{ item['text'] }}{% else %}[IMAGE]{% endif %}"
+        "{% endfor %}"
+        "{% endif %}\n"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    return hf_tokenizer
 
 
 class DummyProcessor:
-    def __init__(self, tokenizer: DummyTokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizerFast):
         self.tokenizer = tokenizer
         self.image_token_id = None
 
@@ -163,7 +141,7 @@ def make_args(**overrides):
 
 class TestBenchmarkDatasetsAPI(unittest.TestCase):
     def setUp(self):
-        self.tokenizer = DummyTokenizer()
+        self.tokenizer = create_lightweight_tokenizer()
         self.processor = DummyProcessor(self.tokenizer)
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmpdir_path = Path(self.tmpdir.name)
