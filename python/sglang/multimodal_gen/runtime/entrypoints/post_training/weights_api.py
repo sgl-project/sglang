@@ -9,6 +9,11 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
+from sglang.srt.managers.io_struct import (
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
+
 router = APIRouter()
 
 
@@ -60,3 +65,42 @@ async def get_weights_checksum(request: Request):
         return ORJSONResponse({"error": str(e)}, status_code=500)
 
     return ORJSONResponse(response.output, status_code=200)
+
+@router.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    """Release GPU memory occupation (sleep the engine)."""
+    body = await request.json()
+    tags = body.get("tags")
+
+    req = ReleaseMemoryOccupationReqInput(tags=tags)
+
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+    # The structure of response.output depends on how your Scheduler/GPUWorker returns it.
+    # Perform a robust handling here that is compatible with both dict and non-dict outputs.
+    out = response.output
+    if isinstance(out, dict):
+        return ORJSONResponse(out, status_code=200 if out.get("success", True) else 400)
+    return ORJSONResponse({"success": True, "output": out}, status_code=200)
+
+
+@router.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    """Resume GPU memory occupation (wake the engine)."""
+    body = await request.json()
+    tags = body.get("tags")
+
+    req = ResumeMemoryOccupationReqInput(tags=tags)
+
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as e:
+        return ORJSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+    out = response.output
+    if isinstance(out, dict):
+        return ORJSONResponse(out, status_code=200 if out.get("success", True) else 400)
+    return ORJSONResponse({"success": True, "output": out}, status_code=200)
