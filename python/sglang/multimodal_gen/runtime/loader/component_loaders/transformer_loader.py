@@ -171,9 +171,11 @@ class TransformerLoader(ComponentLoader):
         init_params: dict[str, Any] = {"config": dit_config, "hf_config": config}
         # prepare init_param
         if "quant_config" in inspect.signature(model_cls.__init__).parameters:
-            init_params.update({
-                "quant_config": (quant_config if quant_config else nunchaku_config),
-            })
+            init_params.update(
+                {
+                    "quant_config": (quant_config if quant_config else nunchaku_config),
+                }
+            )
             if init_params["quant_config"] is None:
                 logger.warning(
                     f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
