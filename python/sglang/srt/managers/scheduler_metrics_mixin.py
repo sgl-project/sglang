@@ -52,6 +52,7 @@ class PrefillStats:
     new_token_ratio: float
     running_bs: int
     num_new_seqs: int  # len(can_run_list)
+    num_running_reqs_by_priority: Optional[dict[int, int]] = None
 
 
 class KvMetrics:
@@ -164,7 +165,6 @@ class SchedulerMetricsMixin:
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
-        num_running_reqs_by_priority: Optional[dict[int, int]] = None,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
@@ -258,7 +258,9 @@ class SchedulerMetricsMixin:
             )
 
             self.stats.num_running_reqs = prefill_stats.running_bs
-            self.stats.num_running_reqs_by_priority = num_running_reqs_by_priority
+            self.stats.num_running_reqs_by_priority = (
+                prefill_stats.num_running_reqs_by_priority
+            )
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage

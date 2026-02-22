@@ -332,7 +332,6 @@ class SchedulerOutputProcessorMixin:
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
-                num_running_reqs_by_priority=self.num_running_reqs_by_priority,
             )
 
     def _resolve_spec_overlap_token_ids(
@@ -413,7 +412,6 @@ class SchedulerOutputProcessorMixin:
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
-                num_running_reqs_by_priority=self.num_running_reqs_by_priority,
             )
 
     def process_batch_result_decode(

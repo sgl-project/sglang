@@ -807,10 +807,11 @@ class Scheduler(
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
-        self.try_preemption = (
-            self.enable_priority_scheduling
-            and not self.server_args.disable_try_preemption_by_priority
-        )
+        if self.enable_priority_scheduling:
+            self.try_preemption = True
+            if self.server_args.disable_try_preemption_by_priority:
+                self.try_preemption = False
+
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -2146,9 +2147,6 @@ class Scheduler(
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
-        self.num_running_reqs_by_priority = self._count_reqs_by_priority(
-            self.running_batch.reqs
-        )
 
         # Record metrics
         for req in can_run_list:
@@ -2179,12 +2177,16 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward
+        num_running_reqs_by_priority = self._count_reqs_by_priority(
+            self.running_batch.reqs
+        )
         new_batch.prefill_stats = PrefillStats(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             running_bs=len(self.running_batch.reqs),
             num_new_seqs=len(can_run_list),
+            num_running_reqs_by_priority=num_running_reqs_by_priority,
         )
 
         # Mixed-style chunked prefill
