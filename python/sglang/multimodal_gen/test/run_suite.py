@@ -32,6 +32,7 @@ SUITES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
+        "test_server_correctness.py",
         "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
@@ -43,6 +44,7 @@ SUITES = {
     "2-gpu": [
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
+        "test_server_2_gpu_correctness.py",
         # add new 2-gpu test files here
     ],
 }
