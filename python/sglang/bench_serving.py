@@ -36,39 +36,15 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import (  # noqa: F401
-    ASSISTANT_SUFFIX,
-    MOONCAKE_DATASET_URL,
-    SHAREGPT_FILENAME,
-    SHAREGPT_REPO_ID,
+from sglang.benchmark.datasets import (
     DatasetRow,
-    compute_random_lens,
-    create_mm_data_row,
-    gen_mm_prompt,
-    gen_prompt,
-    get_available_tokens,
     get_dataset,
-    get_gen_prefix_cache_path,
     get_mooncake_request_over_time,
-    parse_image_resolution,
-    sample_custom_requests,
-    sample_generated_shared_prefix_requests,
-    sample_image_requests,
-    sample_mmmu_requests,
-    sample_openai_requests,
-    sample_random_requests,
-    sample_sharegpt_requests,
 )
-from sglang.benchmark.utils import (  # noqa: F401
-    download_and_cache_file,
-    download_and_cache_hf_file,
-    get_model,
-    get_processor,
+from sglang.benchmark.utils import (
     get_tokenizer,
-    is_file_valid_json,
     parse_custom_headers,
     remove_prefix,
-    remove_suffix,
     set_ulimit,
 )
 
