@@ -845,6 +845,7 @@ class ModelConfig:
             "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "mxfp4",
             "auto-round",
@@ -868,6 +869,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "modelslim",
         ]
@@ -875,6 +877,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
+            "petit_mxfp4": ["mxfp4", "modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }

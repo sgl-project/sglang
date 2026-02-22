@@ -80,7 +80,7 @@ tracing = [
 srt_hip = [
   "sglang[runtime_common]",
   "torch",
-  "petit_kernel==0.0.2",
+  "petit_kernel==0.0.3",
   "wave-lang==3.8.2",
 ]
 

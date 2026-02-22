@@ -96,6 +96,18 @@ def is_layer_skipped(
     return is_skipped
 
 
+def is_layer_excluded_by_patterns(prefix: str, patterns: Optional[List[str]]) -> bool:
+    """Match a module prefix against shell-style wildcard patterns."""
+    if not patterns:
+        return False
+
+    for pattern in patterns:
+        regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+        if re.fullmatch(regex_str, prefix):
+            return True
+    return False
+
+
 def per_tensor_dequantize(
     tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
 ) -> torch.Tensor:
