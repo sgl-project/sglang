@@ -1156,7 +1156,7 @@ class _MegatronPlugin(_FrameworkPlugin):
     _available = True
     try:
         from megatron.core import parallel_state as _mpu
-        from megatron.core.packed_seq_params import PackedSeqParams as _PackedSeqParams
+        from megatron.core.packed_seq_params import PackedSeqParams
     except ImportError:
         _available = False
 
@@ -1207,7 +1207,7 @@ class _MegatronPlugin(_FrameworkPlugin):
     ) -> Optional[dict[str, Any]]:
         if not self._available:
             return None
-        if isinstance(value, self._PackedSeqParams):
+        if isinstance(value, self.PackedSeqParams):
             result: dict[str, Any] = {}
             for attr in ("cu_seqlens_q", "cu_seqlens_kv", "qkv_format"):
                 v = getattr(value, attr, None)
