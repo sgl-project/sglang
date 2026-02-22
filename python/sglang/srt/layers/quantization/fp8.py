@@ -216,8 +216,6 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            # FusedMoE prefixes include ".experts"; allow coarse layer-prefix
-            # rules (e.g., "model.layers.{i}.") to force BF16 fallback.
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
