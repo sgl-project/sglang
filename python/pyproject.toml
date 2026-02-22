@@ -31,8 +31,6 @@ dependencies = [
   "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.6.3",
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -71,7 +69,7 @@ dependencies = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers==5.1.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
@@ -132,7 +130,7 @@ test = [
   "matplotlib",
   "pandas",
   "parameterized",
-  "peft",
+  "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
   "tabulate",

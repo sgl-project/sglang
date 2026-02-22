@@ -420,8 +420,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         """Skip vision tower and multi_modal_projector for LoRA."""
         return bool(self.lora_pattern.match(module_name))
 
-    def tie_weights(self):
-        return self.language_model.tie_weights()
+    def tie_weights(self, **kwargs):
+        return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
