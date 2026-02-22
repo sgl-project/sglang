@@ -583,6 +583,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
+    debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -2682,6 +2683,12 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        if self.debug_cuda_graph:
+            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
+            logger.warning(
+                "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
+                "All operations will run eagerly through the graph capture/replay path."
+            )
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -4507,6 +4514,14 @@ class ServerArgs:
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        )
+        parser.add_argument(
+            "--debug-cuda-graph",
+            action="store_true",
+            help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
+            "When enabled, graph breaks are inserted so every operation runs eagerly "
+            "while still going through the CUDA graph capture / replay path. "
+            "Useful for debugging CUDA graph capture / replay issues.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",
