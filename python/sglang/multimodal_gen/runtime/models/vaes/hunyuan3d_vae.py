@@ -758,7 +758,7 @@ class HierarchicalVolumeDecoding:
                 expand_num = 1
             for i in range(expand_num):
                 curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
-            (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
+            cidx_x, cidx_y, cidx_z = torch.where(curr_points > 0)
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
             for i in range(2 - expand_num):
                 next_index = dilate(next_index.unsqueeze(0)).squeeze(0)
@@ -925,7 +925,7 @@ class FlashVDMVolumeDecoding:
             for _ in range(expand_num):
                 curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
 
-            (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
+            cidx_x, cidx_y, cidx_z = torch.where(curr_points > 0)
             next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
             for _ in range(2 - expand_num):
                 next_index = dilate(next_index.unsqueeze(0)).squeeze(0)
