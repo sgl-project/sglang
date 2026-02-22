@@ -162,13 +162,12 @@ class NunchakuSVDQuantArgs:
 
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "NunchakuSVDQuantArgs":
-        # support legacy key name for backwards compatibility
-        path = kwargs.get("transformer_quantized_path") or kwargs.get(
-            "quantized_model_path"
-        )
+        # Map CLI/config keys to dataclass fields (keep backwards compatibility).
         return cls(
             enable_svdquant=bool(kwargs.get("enable_svdquant", cls.enable_svdquant)),
-            transformer_quantized_path=path,
+            transformer_quantized_path=kwargs.get(
+                "quantized_model_path", cls.transformer_quantized_path
+            ),
             quantization_precision=kwargs.get("quantization_precision"),
             quantization_rank=kwargs.get("quantization_rank"),
             quantization_act_unsigned=bool(

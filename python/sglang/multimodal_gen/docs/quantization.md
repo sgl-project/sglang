@@ -122,13 +122,13 @@ Choose the appropriate configuration based on your hardware and requirements:
 
 If you want to quantize your own models, you can use the [DeepCompressor](https://github.com/mit-han-lab/deepcompressor) tool. For detailed instructions, please refer to the Nunchaku official documentation.
 
-## FP8 Quantization
+## Quantization
 
 ### Usage
 
 #### Option 1: Pre-quantized folder (has `config.json`)
 
-For FP8 checkpoints that include a `config.json` with a `quantization_config` field (e.g., models converted via `convert_hf_to_fp8.py`, or some community HF repos), use the component override:
+For quantized checkpoints that include a `config.json` with a `quantization_config` field (e.g., models converted via `convert_hf_to_fp8.py`), where the transformer's `config.json` already encodes the `quantization_config`, use the component override:
 
 ```bash
 sglang generate \
@@ -138,27 +138,8 @@ sglang generate \
   --save-output
 ```
 
-The transformer's `config.json` already encodes the `quantization_config`, so no extra flags are needed.
 
-#### Option 2: Pre-quantized single-file checkpoint (no `config.json`)
-
-Some providers (e.g., [black-forest-labs/FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)) distribute a single `.safetensors` file without a companion `config.json`. Use `--transformer-quantized-path` to point to this file while keeping `--model-path` for the base model (config, VAE, text encoder, etc.):
-
-```bash
-sglang generate \
-  --model-path black-forest-labs/FLUX.2-klein-9B \
-  --transformer-quantized-path /path/to/flux-2-klein-9b-fp8.safetensors \
-  --prompt "A cat holding a sign that says hello world" \
-  --save-output
-```
-
-SGLang will automatically read the `quantization_config` metadata embedded in the safetensors file header (if present) to configure the FP8 kernel. For the quant config to be auto-detected, the file's metadata must contain a JSON-encoded `quantization_config` key with at least a `quant_method` field (e.g. `"fp8"`).
-
-#### Option 3: Convert Your Own Models
-
-If you need to convert a model to FP8 format, use the provided conversion script:
-
-**Step 1: Convert the Model**
+If you need to convert a model to FP8 format yourself, use the provided conversion script:
 
 ```bash
 # convert transformer to FP8 with block quantization
@@ -169,12 +150,17 @@ python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
   --block-size 128 128
 ```
 
-**Step 2: Run Inference**
+#### Option 2: Pre-quantized single-file checkpoint (no `config.json`)
+
+Some providers (e.g., [black-forest-labs/FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)) distribute a single `.safetensors` file without a companion `config.json`. Use `--transformer-quantized-path` to point to this file while keeping `--model-path` for the base model:
 
 ```bash
 sglang generate \
-  --model-path /path/to/FLUX.1-dev \
-  --transformer-path /path/to/FLUX.1-dev/transformer-FP8 \
+  --model-path black-forest-labs/FLUX.2-klein-9B \
+  --transformer-quantized-path /path/to/flux-2-klein-9b-fp8.safetensors \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
+
+SGLang-Diffusion will automatically read the `quantization_config` metadata embedded in the safetensors file header (if present). For the quant config to be auto-detected, the file's metadata must contain a JSON-encoded `quantization_config` key with at least a `quant_method` field (e.g. `"fp8"`).
+
