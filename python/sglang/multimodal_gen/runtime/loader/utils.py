@@ -7,6 +7,7 @@ import contextlib
 import glob
 import os
 import re
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
@@ -24,6 +25,11 @@ _QUANTIZED_DTYPES = {
     torch.float8_e5m2,
     torch.int8,
 }
+
+# Serializes model construction to prevent races on process-global state
+# (torch.set_default_dtype, skip_init_modules class patches). Weight loading
+# runs outside this lock so the parallel startup speedup is preserved.
+_model_construction_lock = threading.Lock()
 
 
 @contextlib.contextmanager
