@@ -69,6 +69,11 @@ jobs:
           large-packages: true
           swap-storage: true
 
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --volumes --filter "until=72h"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

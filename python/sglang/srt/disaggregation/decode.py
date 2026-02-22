@@ -158,6 +158,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
+        mamba_size: int = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -172,8 +173,11 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        effective_mamba_size = (
+            mamba_size if mamba_size is not None else size
+        ) + pre_alloc_size
         self._init_mamba_pool(
-            size=size + pre_alloc_size,
+            size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
             cache_params=cache_params,
             device=device,

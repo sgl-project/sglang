@@ -90,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1082,6 +1084,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (DumperControlReqInput, self.handle_dumper_control),
             ]
         )
 
@@ -2959,6 +2962,28 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        from sglang.srt.debug_utils.dumper import dumper
+
+        try:
+            response: list = []
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                response = dumper._http_manager.handle_request(
+                    method=recv_req.method, body=recv_req.body
+                )
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=True, response=response), recv_req
+            )
+        except Exception as e:
+            print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=False, response=[], error=str(e)),
+                recv_req,
+            )
 
     # placeholder for override
     def update_cache_from_scheduler(
