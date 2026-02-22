@@ -257,6 +257,7 @@ def load_model_from_full_model_state_dict(
     for target_param_name in sorted_param_names:
         full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
+
         if meta_sharded_param is None:
             # For FSDP models, ensure all ranks process parameters consistently
             if strict or is_fsdp_model:
@@ -264,12 +265,16 @@ def load_model_from_full_model_state_dict(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
             else:
-                logger.warning(
-                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
-                )
                 continue
 
-        target_dtype = param_dtype if param_dtype else full_tensor.dtype
+        # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
+        # for non-quantized models meta dtype equals param_dtype anyway
+        if meta_sharded_param is None:
+            # for nunchaku, some scales are patched later
+            target_dtype = full_tensor.dtype
+        else:
+            target_dtype = meta_sharded_param.dtype
+
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
@@ -350,6 +355,7 @@ def load_model_from_full_model_state_dict(
             )
 
         meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
 
         if "wcscales" in new_param_name or "wtscale" in new_param_name:
             init_like = torch.ones_like
@@ -358,13 +364,13 @@ def load_model_from_full_model_state_dict(
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             sharded_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             sharded_tensor = distribute_tensor(
                 full_tensor,
