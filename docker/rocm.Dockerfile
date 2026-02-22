@@ -19,6 +19,7 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_1100="vllm/vllm-openai-rocm:nightly-4eafc729285e459a5fc96efd6f7b313b155cad48"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -31,6 +32,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+ENV AITER_PREBUILD_KERNELS="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
@@ -51,6 +53,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+ENV AITER_PREBUILD_KERNELS="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
@@ -60,9 +63,20 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
+ENV AITER_PREBUILD_KERNELS="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
+# Base image 1100 and args
+FROM $BASE_IMAGE_1100 AS gfx1100
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_MOONCAKE="1"
+ENV BUILD_AITER_ALL="1"
+ENV AITER_PREBUILD_KERNELS="0"
+ENV AITER_COMMIT="v0.1.10.post3"
+ENV NO_DEPS_FLAG=""
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -187,10 +201,10 @@ RUN git clone ${AITER_REPO} \
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=$AITER_PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          sh -c "PREBUILD_KERNELS=$AITER_PREBUILD_KERNELS GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
