@@ -310,6 +310,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.hidden_size,
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not use_data_parallel,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
