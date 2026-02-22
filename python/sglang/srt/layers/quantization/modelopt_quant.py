@@ -22,7 +22,8 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType
+from sglang.srt.layers.moe.moe_runner.cutlass import CutlassMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
@@ -1668,7 +1669,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # Set up CUTLASS MoE parameters
             device = layer.w13_weight.device
             layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
+                CutlassMoEQuantType.BlockscaledFP4,
                 device,
                 num_experts=layer.num_experts,  # global num experts
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
@@ -1687,6 +1688,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+            )
+        elif get_moe_runner_backend().is_cutlass():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.CUTLASS, moe_runner_config
             )
 
     def apply(
@@ -1798,28 +1803,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return StandardCombineInput(hidden_states=output)
 
-        from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-
+        params = layer.cutlass_moe_params
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        output = cutlass_moe_fp4(
-            a=x,
-            a1_gscale=layer.w13_input_scale_quant,
-            w1_fp4=layer.w13_weight,
+        quant_info = CutlassMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
-            w1_alphas=layer.g1_alphas,
-            a2_gscale=layer.w2_input_scale_quant,
-            w2_fp4=layer.w2_weight,
             w2_blockscale=layer.w2_blockscale_swizzled,
-            w2_alphas=layer.g2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            params=layer.cutlass_moe_params,
-            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-        ).to(x.dtype)
-        # Scale by routed_scaling_factor is fused into select_experts.
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        return StandardCombineInput(hidden_states=output)
+            w1_alpha=layer.g1_alphas,
+            w2_alpha=layer.g2_alphas,
+            w13_input_scale=layer.w13_input_scale_quant,
+            w2_input_scale=layer.w2_input_scale_quant,
+            deepep_ll_or_deepep_normal=None,
+            expert_offsets=params.expert_offsets,
+            problem_sizes1=params.problem_sizes1,
+            problem_sizes2=params.problem_sizes2,
+            params=params,
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
         self,

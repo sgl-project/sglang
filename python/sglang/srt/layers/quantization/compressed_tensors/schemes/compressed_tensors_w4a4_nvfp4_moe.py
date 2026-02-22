@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEQuantType
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -292,7 +292,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
 
             layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
+                CutlassMoEQuantType.BlockscaledFP4,
                 layer.w13_weight.device,
                 num_experts=layer.num_experts,
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,
