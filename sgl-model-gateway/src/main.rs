@@ -395,6 +395,10 @@ struct CliArgs {
     #[arg(long, help_heading = "Tokenizer")]
     chat_template: Option<String>,
 
+    /// Disable automatic tokenizer loading at startup
+    #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
+    disable_tokenizer_autoload: bool,
+
     /// Enable L0 (exact match) tokenizer cache
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     tokenizer_cache_enable_l0: bool,
@@ -1013,6 +1017,7 @@ impl CliArgs {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
