@@ -1037,11 +1037,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
+        # Get quantization config from ModelConfig
+        # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
+        quant_str = self.model_config.get_quantization_config_log_str()
+
         logger.info(
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
-            f"dtype={self.dtype}, "
+            f"{quant_str + ', ' if quant_str else ''}"
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
