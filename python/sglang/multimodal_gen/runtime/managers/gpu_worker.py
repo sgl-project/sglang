@@ -29,7 +29,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
-from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    VAE_CHECKSUM_EXCLUDE_NAMES,
+    compute_weights_checksum,
+    compute_weights_checksum_content_only,
+    filter_weights_for_checksum,
+)
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
@@ -403,7 +408,9 @@ class GPUWorker:
         return success, message
 
     def get_weights_checksum(
-        self, module_names: list[str] | None = None
+        self,
+        module_names: list[str] | None = None,
+        content_only: bool = False,
     ) -> dict[str, str]:
         """Compute SHA-256 checksum of each module's weights."""
         if not self.pipeline:
@@ -412,15 +419,21 @@ class GPUWorker:
         all_modules = get_updatable_modules(self.pipeline)
         names = module_names if module_names is not None else list(all_modules.keys())
 
+        checksum_fn = (
+            compute_weights_checksum_content_only
+            if content_only
+            else compute_weights_checksum
+        )
         checksums: dict[str, str] = {}
         for name in names:
             module = all_modules.get(name)
             if module is None:
                 checksums[name] = "not_found"
                 continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
+            weights = iter_materialized_weights(module)
+            if name == "vae":
+                weights = filter_weights_for_checksum(weights, VAE_CHECKSUM_EXCLUDE_NAMES)
+            checksums[name] = checksum_fn(weights)
         return checksums
 
 

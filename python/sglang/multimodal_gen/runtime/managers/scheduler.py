@@ -153,7 +153,10 @@ class Scheduler:
     def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
         """Handle get_weights_checksum request."""
         req = reqs[0]
-        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        checksums = self.worker.get_weights_checksum(
+            module_names=req.module_names,
+            content_only=req.content_only,
+        )
         return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):

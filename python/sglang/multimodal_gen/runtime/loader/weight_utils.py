@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from pathlib import Path
 
 import filelock
@@ -339,6 +339,15 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
     return name
 
 
+def _tensor_content_signature(tensor: torch.Tensor) -> tuple[tuple[int, ...], bytes]:
+    """Return (shape, raw_bytes) for hashing. Shape as tuple for canonical order."""
+    t = tensor.detach()
+    if isinstance(t, DTensor):
+        t = t._local_tensor
+    arr = t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+    return (tuple(tensor.shape), arr.data.tobytes())
+
+
 def compute_weights_checksum(
     named_params: Iterable[tuple[str, torch.Tensor]],
 ) -> str:
@@ -357,3 +366,164 @@ def compute_weights_checksum(
             t = t._local_tensor
         hasher.update(t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
     return hasher.hexdigest()
+
+
+def compute_weights_checksum_content_only(
+    named_params: Iterable[tuple[str, torch.Tensor]],
+) -> str:
+    """Compute a SHA-256 checksum from tensor contents only (ignore parameter names).
+
+    Use when comparing weights that may have different names on disk vs in the
+    model (e.g. after weight-name remapping or prefix in loaders). Two sets of
+    (name, tensor) with the same multiset of (shape, bytes) produce the same
+    checksum. Tensors are sorted by (shape, bytes) for a canonical order.
+    """
+    sigs = [_tensor_content_signature(t) for _, t in named_params]
+    sigs.sort(key=lambda s: (s[0], s[1]))
+    hasher = hashlib.sha256()
+    for shape, raw in sigs:
+        hasher.update(str(shape).encode())
+        hasher.update(raw)
+    return hasher.hexdigest()
+
+VAE_CHECKSUM_EXCLUDE_NAMES: frozenset[str] = frozenset({
+    "bn.num_batches_tracked",
+    "bn.running_mean",
+    "bn.running_var",
+})
+
+
+def filter_weights_for_checksum(
+    named_weights: Iterable[tuple[str, torch.Tensor]],
+    exclude_names: frozenset[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield (name, tensor) pairs excluding given names (e.g. VAE BatchNorm buffers)."""
+    for name, tensor in named_weights:
+        if name not in exclude_names:
+            yield name, tensor
+
+
+_QWEN3_STACKED_PARAMS_MAPPING: list[tuple[str, str, str | int]] = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".gate_proj", 0),
+    (".gate_up_proj", ".up_proj", 1),
+]
+
+
+def _qwen3_remap_scale_name_for_checksum(name: str) -> str | None:
+    """Remap scale param names for checksum (no params_dict). Drops unknown scales."""
+    if name.endswith(".kv_scale"):
+        return name.replace(".kv_scale", ".attn.k_scale")
+    for suffix in (".k_scale", ".v_scale"):
+        if name.endswith(suffix):
+            return name.replace(suffix, f".attn{suffix}")
+    return None
+
+
+def _disk_to_model_weights_qwen3(
+    disk_weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield (model_param_name, tensor) from disk (name, tensor) using Qwen3 load_weights rules."""
+    disk_list = list(disk_weights)
+    simple: list[tuple[str, torch.Tensor]] = []
+    stacked: dict[str, list[tuple[str | int, torch.Tensor]]] = {}
+
+    for name, tensor in disk_list:
+        if name.startswith("model."):
+            name = name[6:]
+        if "rotary_emb.inv_freq" in name or "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+            continue
+        if "scale" in name:
+            remapped = _qwen3_remap_scale_name_for_checksum(name)
+            if remapped is not None:
+                simple.append((remapped, tensor))
+            continue
+        handled = False
+        for param_name, weight_name, shard_id in _QWEN3_STACKED_PARAMS_MAPPING:
+            if weight_name not in name:
+                continue
+            model_name = name.replace(weight_name, param_name)
+            stacked.setdefault(model_name, []).append((shard_id, tensor))
+            handled = True
+            break
+        if not handled:
+            simple.append((name, tensor))
+
+    for n, t in simple:
+        yield n, t
+
+    for model_name in sorted(stacked.keys()):
+        shards = stacked[model_name]
+        order = [
+            s[2]
+            for s in _QWEN3_STACKED_PARAMS_MAPPING
+            if s[0] in model_name
+        ]
+        shards_by_id = {s[0]: s[1] for s in shards}
+        ordered_tensors = [shards_by_id[sid] for sid in order if sid in shards_by_id]
+        if not ordered_tensors:
+            continue
+        merged = torch.cat(ordered_tensors, dim=0)
+        yield model_name, merged
+
+
+def _disk_to_model_weights_identity(
+    disk_weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Identity: disk keys are model keys (e.g. VAE, transformer)."""
+    yield from disk_weights
+
+
+_DISK_TO_MODEL_REGISTRY: dict[str, Callable[..., Generator[tuple[str, torch.Tensor], None, None]]] = {
+    "Qwen3ForCausalLM": _disk_to_model_weights_qwen3,
+    "FSDPQwen3ForCausalLM": _disk_to_model_weights_qwen3,
+}
+
+
+def get_disk_to_model_weights(
+    arch: str,
+    disk_weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield (model_param_name, tensor) from disk weights using loader-style mapping.
+
+    Use this to compute a name-based checksum from disk that is comparable to
+    the server's name-based checksum after load_weights.
+    """
+    fn = _DISK_TO_MODEL_REGISTRY.get(arch, _disk_to_model_weights_identity)
+    yield from fn(disk_weights)
+
+
+def get_module_arch_from_disk(model_path: str, module_name: str) -> str | None:
+    """Read architectures[0] from model_path/module_name/config.json if present."""
+    config_path = Path(model_path) / module_name / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        archs = data.get("architectures")
+        if archs and len(archs) > 0:
+            return archs[0]
+        return None
+    except Exception:
+        return None
+
+
+def compute_weights_checksum_from_disk_mapped(
+    model_path: str,
+    module_name: str,
+    safetensors_files: list[str],
+    arch: str | None = None,
+) -> str:
+    """Compute name-based checksum from disk after applying disk->model name mapping.
+
+    Use when the module uses remapping (e.g. text_encoder Qwen3). If arch is None,
+    it is read from model_path/module_name/config.json (architectures[0]).
+    """
+    if arch is None:
+        arch = get_module_arch_from_disk(model_path, module_name) or ""
+    it = safetensors_weights_iterator(safetensors_files)
+    mapped = get_disk_to_model_weights(arch, it)
+    return compute_weights_checksum(mapped)
