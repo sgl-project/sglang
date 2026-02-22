@@ -155,7 +155,7 @@ def use_fused_moe_lora_kernel(
     )
     num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32, device=device)
     adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
-    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device=device)
+    lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
     # call kernel
     moe_lora_align_block_size(
@@ -350,7 +350,7 @@ def test_fused_moe_lora_kernel(
         top_k_num,
     )
 
-    torch.testing.assert_close(output, output2, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(output, output2, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

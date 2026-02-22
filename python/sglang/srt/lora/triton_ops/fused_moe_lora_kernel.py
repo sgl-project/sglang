@@ -446,11 +446,6 @@ def _fused_moe_lora(
         == qcurr_hidden_states.dim()
         == 2
     )
-    if (
-        sorted_token_ids.shape[0] != expert_ids.shape[0]
-        or sorted_token_ids.shape[0] != num_tokens_post_padded.shape[0]
-    ):
-        x = 1
     assert (
         sorted_token_ids.shape[0]
         == expert_ids.shape[0]
@@ -587,6 +582,8 @@ def _fused_moe_lora_fake(
     expand_num_stages: int,
     expand_split_k: int,
     mul_routed_weight: bool = False,
+    fully_sharded: bool = False,
+    offset: int = 0,
 ) -> None:
     return
 
@@ -625,6 +622,7 @@ def _fused_moe_lora_shrink_fake(
 def _fused_moe_lora_expand_fake(
     output: torch.Tensor,
     a_intermediate_cache1: torch.Tensor,
+    b_intermediate_cache1: torch.Tensor,
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -651,6 +649,7 @@ def _fused_moe_lora_expand_fake(
     num_stages: int,
     split_k: int,
     mul_routed_weight: bool = False,
+    offset: int = 0,
 ) -> None:
     return
 
@@ -676,7 +675,7 @@ try:
     direct_register_custom_op(
         op_name="fused_moe_lora_expand",
         op_func=_fused_moe_lora_expand,
-        mutates_args=["output"],
+        mutates_args=["output", "b_intermediate_cache1"],
         fake_impl=_fused_moe_lora_expand_fake,
     )
 

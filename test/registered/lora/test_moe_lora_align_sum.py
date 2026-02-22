@@ -92,7 +92,7 @@ def test_moe_lora_align_block_size(
     )
     num_tokens_post_pad = torch.zeros((max_loras,), dtype=torch.int32, device="cuda")
     adapter_enabled = torch.ones((max_loras + 1,), dtype=torch.int32, device="cuda")
-    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device="cuda")
+    lora_ids = torch.arange(max_loras, dtype=torch.int32, device="cuda")
 
     # UPDATED: Call kernel with new signature
     moe_lora_align_block_size(

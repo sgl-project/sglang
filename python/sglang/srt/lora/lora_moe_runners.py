@@ -222,9 +222,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # ==============================
         # Perform LoRA alignment for both gate up and gate down operations
         # Define shrink_config for LoRA alignment
-        shrink_config = {
-            "BLOCK_SIZE_M": 64
-        }  # Default block size, can be made configurable
+        # TODO: Add autotuning for block sizes across different GPU architectures and problem sizes
+        shrink_config = {"BLOCK_SIZE_M": 64}
 
         # Prepare inputs for the kernel
         block_size_m = shrink_config["BLOCK_SIZE_M"]
@@ -255,7 +254,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             (max_loras,), dtype=torch.int32, device=device
         )
 
-        # Get token-to-LoRA mapping from lora_info
         lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         moe_lora_align_block_size(
@@ -290,6 +288,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             sorted_token_ids_reshaped=sorted_token_ids_reshaped,
             expert_ids_reshaped=expert_ids_reshaped,
             num_tokens_post_padded_lora=num_tokens_post_padded_lora,
+            lora_ids=lora_ids,
         )
 
         # ============================================================
@@ -390,6 +389,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             sorted_token_ids_reshaped=sorted_token_ids_reshaped,
             expert_ids_reshaped=expert_ids_reshaped,
             num_tokens_post_padded_lora=num_tokens_post_padded_lora,
+            lora_ids=lora_ids,
         )
 
         # ============================================================
@@ -450,6 +450,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         sorted_token_ids_reshaped: torch.Tensor,
         expert_ids_reshaped: torch.Tensor,
         num_tokens_post_padded_lora: torch.Tensor,
+        lora_ids: torch.Tensor,
     ) -> None:
         """
         Add LoRA gate_up delta to intermediate_cache in-place.
@@ -471,12 +472,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_a_stacked = [lora_info.gate_up_lora_a_weights]
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
-        max_loras = len(lora_info.lora_ranks)
-
-        lora_ids = torch.arange(
-            max_loras, dtype=torch.int32, device=hidden_states.device
-        )
-
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=hidden_states,
@@ -490,6 +485,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             top_k_num=top_k,
             lora_ids=lora_ids,
             adapter_enabled=lora_info.adapter_enabled,
+            # TODO: Replace hardcoded block sizes with autotuned configs
             shrink_block_size_m=64,
             shrink_block_size_n=64,
             shrink_block_size_k=64,
@@ -515,6 +511,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         sorted_token_ids_reshaped: torch.Tensor,
         expert_ids_reshaped: torch.Tensor,
         num_tokens_post_padded_lora: torch.Tensor,
+        lora_ids: torch.Tensor,
     ) -> None:
         """
         Add LoRA down delta to intermediate_cache in-place.
@@ -533,13 +530,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         actual_max_lora_rank = lora_info.max_lora_rank
 
-        max_loras = len(lora_info.lora_ranks)
-
         lora_a_stacked = [lora_info.down_lora_a_weights]
         lora_b_stacked = [lora_info.down_lora_b_weights]
-
-        device = intermediate_cache.device
-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -554,6 +546,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             top_k_num=top_k,
             lora_ids=lora_ids,
             adapter_enabled=lora_info.adapter_enabled,
+            # TODO: Replace hardcoded block sizes with autotuned configs
             shrink_block_size_m=64,
             shrink_block_size_n=64,
             shrink_block_size_k=64,
