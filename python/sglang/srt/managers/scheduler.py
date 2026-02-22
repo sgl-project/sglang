@@ -2475,7 +2475,7 @@ class Scheduler(
             self.send_to_tokenizer.send_output(HealthCheckOutput())
 
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        success = self.flush_cache()
+        success = self.flush_cache(empty_cache=recv_req.empty_cache)
         return FlushCacheReqOutput(success=success)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
@@ -2620,7 +2620,7 @@ class Scheduler(
             )
         return no_request
 
-    def flush_cache(self):
+    def flush_cache(self, empty_cache: bool = True):
         """Flush the memory pool and cache."""
         if self._is_no_request():
             self.cur_batch = None
@@ -2634,8 +2634,8 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            # TODO: allow optional empty cache
-            torch.cuda.empty_cache()
+            if empty_cache:
+                torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
         else:

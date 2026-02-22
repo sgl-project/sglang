@@ -56,9 +56,10 @@ class RuntimeEndpoint(BaseBackend):
     def get_model_name(self):
         return self.model_info["model_path"]
 
-    def flush_cache(self):
+    def flush_cache(self, empty_cache: bool = True):
         res = http_request(
             self.base_url + "/flush_cache",
+            json={"empty_cache": empty_cache},
             api_key=self.api_key,
             verify=self.verify,
             method="POST",
