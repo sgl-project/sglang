@@ -81,8 +81,22 @@ class SamplingBatchInfo:
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
         )
+
+        # Clamp top-k to vocab size to avoid int32 overflow and unnecessary top-k work
+        raw_top_ks = [r.sampling_params.top_k for r in reqs]
+        sanitized_top_ks = []
+        need_top_k_sampling = False
+        for k in raw_top_ks:
+            if k == TOP_K_ALL or k >= vocab_size:
+                sanitized_top_ks.append(vocab_size)
+            else:
+                sanitized_k = max(1, k)
+                sanitized_top_ks.append(sanitized_k)
+                need_top_k_sampling = True
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
+            sanitized_top_ks,
+            dtype=torch.int32,
+            device=device,
         )
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
@@ -170,7 +184,7 @@ class SamplingBatchInfo:
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+            need_top_k_sampling=need_top_k_sampling,
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
