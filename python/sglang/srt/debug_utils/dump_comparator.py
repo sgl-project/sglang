@@ -1,60 +1,10 @@
 import argparse
 import functools
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
 
 import torch
 
 from sglang.srt.debug_utils.dumper import get_truncated_value
-
-
-# ─── Data types ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class TensorStats:
-    mean: float
-    std: float
-    min: float
-    max: float
-    p1: Optional[float]
-    p5: Optional[float]
-    p95: Optional[float]
-    p99: Optional[float]
-
-
-@dataclass
-class TensorInfo:
-    shape: Tuple[int, ...]
-    dtype: str
-    stats: Optional[TensorStats]
-    sample: Any
-
-
-@dataclass
-class DiffInfo:
-    rel_diff: float
-    max_abs_diff: float
-    mean_abs_diff: float
-    max_diff_coord: Tuple[int, ...]
-    baseline_at_max: float
-    target_at_max: float
-
-
-@dataclass
-class TensorComparisonInfo:
-    name: Optional[str]
-    baseline: Optional[TensorInfo]
-    target: Optional[TensorInfo]
-    baseline_unified_shape: Optional[Tuple[int, ...]]
-    shape_mismatch: bool
-    diff: Optional[DiffInfo]
-    diff_downcast: Optional[DiffInfo]
-    downcast_dtype: Optional[str]
-
-
-# ─── Public API ──────────────────────────────────────────────────────────────
 
 
 def main(args):
@@ -98,202 +48,137 @@ def main(args):
             continue
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
-        x_baseline = _load_object(path_baseline)
-        x_target = _load_object(path_target)
-
         print(
             f"Check:\n"
             f"target={str(path_target)} (duplicate_index={row['duplicate_index']})\n"
             f"baseline={str(path_baseline)} (duplicate_index={row_baseline['duplicate_index']})"
         )
-
-        if x_baseline is None or x_target is None:
-            print(
-                f"Skip comparison because of None: "
-                f"x_baseline={x_baseline}, x_target={x_target}"
-            )
-            continue
-
-        info = compare_tensors(
-            x_baseline=x_baseline,
-            x_target=x_target,
+        check_tensor_pair(
+            path_baseline=path_baseline,
+            path_target=path_target,
+            diff_threshold=args.diff_threshold,
             name=row["name"],
         )
-        print_comparison(info, diff_threshold=args.diff_threshold)
         print()
 
 
-def compare_tensors(
-    x_baseline: torch.Tensor,
-    x_target: torch.Tensor,
-    name: str = "",
-) -> TensorComparisonInfo:
-    raw_baseline_shape = tuple(x_baseline.shape)
-    raw_baseline_dtype = str(x_baseline.dtype)
-    raw_target_dtype = str(x_target.dtype)
+def check_tensor_pair(
+    path_baseline,
+    path_target,
+    diff_threshold: float = 1e-3,
+    name="",
+):
+    x_baseline = _load_object(path_baseline)
+    x_target = _load_object(path_target)
 
-    x_baseline = _try_unify_shape(x_baseline, target_shape=x_target.shape)
-    baseline_unified_shape = tuple(x_baseline.shape)
-
-    baseline_original_dtype = x_baseline.dtype
-    target_original_dtype = x_target.dtype
-    x_baseline_float = x_baseline.float()
-    x_target_float = x_target.float()
-
-    baseline_info = TensorInfo(
-        shape=raw_baseline_shape,
-        dtype=raw_baseline_dtype,
-        stats=_compute_tensor_stats(x_baseline_float),
-        sample=get_truncated_value(x_baseline_float),
-    )
-    target_info = TensorInfo(
-        shape=tuple(x_target.shape),
-        dtype=raw_target_dtype,
-        stats=_compute_tensor_stats(x_target_float),
-        sample=get_truncated_value(x_target_float),
-    )
-
-    shape_mismatch = x_baseline_float.shape != x_target_float.shape
-
-    diff = None
-    diff_downcast = None
-    downcast_dtype_str = None
-
-    if not shape_mismatch:
-        diff = _compute_diff(x_baseline_float, x_target_float)
-
-        if baseline_original_dtype != target_original_dtype:
-            downcast_dtype = _compute_smaller_dtype(
-                baseline_original_dtype, target_original_dtype
-            )
-            if downcast_dtype is not None:
-                downcast_dtype_str = str(downcast_dtype)
-                diff_downcast = _compute_diff(
-                    x_baseline_float.to(downcast_dtype),
-                    x_target_float.to(downcast_dtype),
-                )
-
-    return TensorComparisonInfo(
-        name=name,
-        baseline=baseline_info,
-        target=target_info,
-        baseline_unified_shape=baseline_unified_shape,
-        shape_mismatch=shape_mismatch,
-        diff=diff,
-        diff_downcast=diff_downcast,
-        downcast_dtype=downcast_dtype_str,
-    )
-
-
-def print_comparison(
-    info: TensorComparisonInfo, diff_threshold: float = 1e-3
-) -> None:
-    if info.baseline is not None and info.target is not None:
-        dtype_marker = "" if info.baseline.dtype == info.target.dtype else "🟠"
+    if x_baseline is None or x_target is None:
         print(
-            f"Raw "
-            f"[shape] {info.baseline.shape} vs {info.target.shape}\t"
-            f"[{dtype_marker}dtype] {info.baseline.dtype} vs {info.target.dtype}"
+            f"Skip comparison because of None: x_baseline={x_baseline}, x_target={x_target}"
         )
-
-        if info.baseline_unified_shape != info.baseline.shape:
-            print(
-                f"Unify shape: {info.baseline.shape} -> "
-                f"{info.baseline_unified_shape} "
-                f"(to match {info.target.shape})"
-            )
-
-    if (
-        info.baseline is not None
-        and info.target is not None
-        and info.baseline.stats is not None
-        and info.target.stats is not None
-    ):
-        stats_b = info.baseline.stats
-        stats_t = info.target.stats
-        for field_name in ["mean", "std", "min", "max", "p1", "p5", "p95", "p99"]:
-            value_baseline = getattr(stats_b, field_name)
-            value_target = getattr(stats_t, field_name)
-            if value_baseline is None or value_target is None:
-                continue
-            print(
-                f"[{field_name}] {value_baseline:.4f} vs {value_target:.4f} "
-                f"(diff: {value_target - value_baseline:.4f})"
-            )
-
-    if info.shape_mismatch:
-        print("⚠️ Shape mismatch")
         return
 
-    if info.diff is not None:
-        _print_diff(info.diff, diff_threshold=diff_threshold)
+    print(
+        f"Raw "
+        f"[shape] {x_baseline.shape} vs {x_target.shape}\t"
+        f"[{'' if x_baseline.dtype == x_target.dtype else '🟠'}dtype] {x_baseline.dtype} vs {x_target.dtype}"
+    )
 
-    if info.diff_downcast is not None and info.downcast_dtype is not None:
-        _print_diff(
-            info.diff_downcast,
-            diff_threshold=diff_threshold,
-            prefix_text=f"When downcast to {info.downcast_dtype}: ",
+    x_baseline = _try_unify_shape(x_baseline, target_shape=x_target.shape)
+
+    print(
+        f"After unify "
+        f"[shape] {x_baseline.shape} vs {x_target.shape}\t"
+        f"[dtype] {x_baseline.dtype} vs {x_target.dtype}"
+    )
+
+    x_baseline_original_dtype = x_baseline.dtype
+    x_target_original_dtype = x_target.dtype
+
+    x_target = x_target.float()
+    x_baseline = x_baseline.float()
+
+    for name, fn in [
+        ("mean", torch.mean),
+        ("std", torch.std),
+        ("min", torch.min),
+        ("max", torch.max),
+        *(
+            [
+                ("p1", functools.partial(torch.quantile, q=0.01)),
+                ("p5", functools.partial(torch.quantile, q=0.05)),
+                ("p95", functools.partial(torch.quantile, q=0.95)),
+                ("p99", functools.partial(torch.quantile, q=0.99)),
+            ]
+            if x_baseline.numel() < 10_000_000
+            else []
+        ),
+    ]:
+        value_baseline = fn(x_baseline).item()
+        value_target = fn(x_target).item()
+        print(
+            f"[{name}] {value_baseline :.4f} vs {value_target:.4f} (diff: {value_target - value_baseline:.4f})"
         )
 
-    needs_sample = info.diff is not None and info.diff.max_abs_diff > 1e-3
-    if needs_sample:
-        if info.baseline is not None:
-            print(f"x_baseline(sample)={info.baseline.sample}")
-        if info.target is not None:
-            print(f"x_target(sample)={info.target.sample}")
+    if x_baseline.shape != x_target.shape:
+        print(f"⚠️ Shape mismatch")
+        return
 
-
-# ─── Internal ────────────────────────────────────────────────────────────────
-
-
-def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
-    include_quantiles = x.numel() < 10_000_000
-    return TensorStats(
-        mean=torch.mean(x).item(),
-        std=torch.std(x).item(),
-        min=torch.min(x).item(),
-        max=torch.max(x).item(),
-        p1=torch.quantile(x, 0.01).item() if include_quantiles else None,
-        p5=torch.quantile(x, 0.05).item() if include_quantiles else None,
-        p95=torch.quantile(x, 0.95).item() if include_quantiles else None,
-        p99=torch.quantile(x, 0.99).item() if include_quantiles else None,
+    diff_info = _compute_and_print_diff(
+        x_baseline=x_baseline,
+        x_target=x_target,
+        diff_threshold=diff_threshold,
     )
+    needs_print = diff_info["max_abs_diff"] > 1e-3
+
+    if (x_baseline_original_dtype != x_target_original_dtype) and (
+        (
+            downcast_dtype := _compute_smaller_dtype(
+                x_baseline_original_dtype, x_target_original_dtype
+            )
+        )
+        is not None
+    ):
+        _compute_and_print_diff(
+            x_baseline=x_baseline.to(downcast_dtype),
+            x_target=x_target.to(downcast_dtype),
+            diff_threshold=diff_threshold,
+            prefix_text=f"When downcast to {downcast_dtype}: ",
+        )
+
+    if needs_print:
+        print(f"x_baseline(sample)={get_truncated_value(x_baseline)}")
+        print(f"x_target(sample)={get_truncated_value(x_target)}")
 
 
-def _compute_diff(
-    x_baseline: torch.Tensor, x_target: torch.Tensor
-) -> DiffInfo:
+def _compute_and_print_diff(
+    x_baseline, x_target, diff_threshold: float, prefix_text=""
+):
     raw_abs_diff = (x_target - x_baseline).abs()
-    max_diff_coord = _argmax_coord(raw_abs_diff)
-    return DiffInfo(
-        rel_diff=_calc_rel_diff(x_target, x_baseline),
-        max_abs_diff=raw_abs_diff.max().item(),
-        mean_abs_diff=raw_abs_diff.mean().item(),
-        max_diff_coord=max_diff_coord,
-        baseline_at_max=x_baseline[max_diff_coord].item(),
-        target_at_max=x_target[max_diff_coord].item(),
-    )
 
+    max_abs_diff = raw_abs_diff.max().item()
+    mean_abs_diff = raw_abs_diff.mean().item()
+    rel_diff = _calc_rel_diff(x_target, x_baseline)
 
-def _print_diff(
-    diff: DiffInfo, diff_threshold: float, prefix_text: str = ""
-) -> None:
     print(
         prefix_text
         + "\t".join(
             f"{'❌' if value > diff_threshold else '✅'} {name}={value}"
             for name, value in [
-                ("rel_diff", diff.rel_diff),
-                ("max_abs_diff", diff.max_abs_diff),
-                ("mean_abs_diff", diff.mean_abs_diff),
+                ("rel_diff", rel_diff),
+                ("max_abs_diff", max_abs_diff),
+                ("mean_abs_diff", mean_abs_diff),
             ]
         )
     )
+
+    max_diff_coord = _argmax_coord(raw_abs_diff)
     print(
-        f"max_abs_diff happens at coord={diff.max_diff_coord} with "
-        f"baseline={diff.baseline_at_max} "
-        f"target={diff.target_at_max}"
+        f"max_abs_diff happens at coord={max_diff_coord} with "
+        f"baseline={x_baseline[max_diff_coord].item()} "
+        f"target={x_target[max_diff_coord].item()}"
     )
+
+    return dict(max_abs_diff=max_abs_diff)
 
 
 def _argmax_coord(x: torch.Tensor) -> tuple:
@@ -304,6 +189,7 @@ def _argmax_coord(x: torch.Tensor) -> tuple:
 def _compute_smaller_dtype(dtype_a, dtype_b):
     info_dict = {
         (torch.float32, torch.bfloat16): torch.bfloat16,
+        # ... add more ...
     }
     return info_dict.get((dtype_a, dtype_b)) or info_dict.get((dtype_b, dtype_a))
 
@@ -314,9 +200,9 @@ def _try_unify_shape(x: torch.Tensor, target_shape):
     if (x_shape[num_dim_to_remove:] == target_shape) and all(
         val == 1 for val in x_shape[:num_dim_to_remove]
     ):
-        return functools.reduce(
-            lambda a, _: a.squeeze(0), range(num_dim_to_remove), x
-        )
+        out = functools.reduce(lambda a, _: a.squeeze(0), range(num_dim_to_remove), x)
+        print(f"Unify shape: {x_shape} -> {out.shape} (to match {target_shape})")
+        return out
 
     return x
 
@@ -346,6 +232,7 @@ def _load_object(path):
 
 
 if __name__ == "__main__":
+    # python -m sglang.srt.debug_utils.dump_comparator --baseline-path ... --target-path ...
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-path", type=str)
     parser.add_argument("--target-path", type=str)
