@@ -2117,14 +2117,55 @@ class TestRegisterForwardHook:
             handles[0].remove()
 
 
-class TestMegatronPluginKwargRename:
-    def test_kwarg_rename_map(self):
-        plugin = _MegatronPlugin()
-        assert plugin.kwarg_rename_map() == {"position_ids": "positions"}
-
-    def test_sglang_plugin_no_rename(self):
+class TestPluginCoreFields:
+    def test_sglang_core_fields(self):
         plugin = _SGLangPlugin()
-        assert plugin.kwarg_rename_map() == {}
+        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+
+    def test_megatron_core_fields(self):
+        plugin = _MegatronPlugin()
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        )
+
+
+class TestMegatronConvertValue:
+    @pytest.fixture(autouse=True)
+    def _patch_megatron(self, monkeypatch):
+        class FakePackedSeqParams:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(_MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams)
+        self._FakePackedSeqParams = FakePackedSeqParams
+
+    def test_extracts_packed_seq_params(self):
+        plugin = _MegatronPlugin()
+        cu_q = torch.tensor([0, 3, 7])
+        cu_kv = torch.tensor([0, 3, 7])
+        value = self._FakePackedSeqParams(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, qkv_format="thd"
+        )
+
+        result = plugin.convert_value(value, skip_forward_batch=False)
+        assert result is not None
+        assert torch.equal(result["cu_seqlens_q"], cu_q)
+        assert torch.equal(result["cu_seqlens_kv"], cu_kv)
+        assert result["qkv_format"] == "thd"
+
+    def test_skips_none_attrs(self):
+        plugin = _MegatronPlugin()
+        value = self._FakePackedSeqParams(cu_seqlens_q=torch.tensor([0, 5]))
+
+        result = plugin.convert_value(value, skip_forward_batch=False)
+        assert result == {"cu_seqlens_q": value.cu_seqlens_q}
+
+    def test_non_packed_returns_none(self):
+        plugin = _MegatronPlugin()
+        assert plugin.convert_value(torch.randn(4), skip_forward_batch=False) is None
+        assert plugin.convert_value("hello", skip_forward_batch=False) is None
 
 
 class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
@@ -2144,9 +2185,9 @@ class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
             model(input_ids=ids, position_ids=pos)
 
         assert "input_ids" in captured
-        assert "positions" in captured
+        assert "position_ids" in captured
         assert torch.equal(captured["input_ids"]["value"], ids)
-        assert torch.equal(captured["positions"]["value"], pos)
+        assert torch.equal(captured["position_ids"]["value"], pos)
 
     def test_kwargs_all_mode(self, tmp_path):
         class KwargsModel(torch.nn.Module):
@@ -2164,7 +2205,7 @@ class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
             model(input_ids=ids, position_ids=pos, custom_value=custom)
 
         assert "input_ids" in captured
-        assert "positions" in captured
+        assert "position_ids" in captured
 
         P = self._PREFIX
         assert f"{P}inputs.custom_value" in captured
@@ -2187,6 +2228,41 @@ class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
 
         P = self._PREFIX
         assert f"{P}inputs.0" in captured
+
+    def test_packed_seq_params_core_fields(self, tmp_path, monkeypatch):
+        class FakePackedSeqParams:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(_MegatronPlugin, "_PackedSeqParams", FakePackedSeqParams)
+
+        class MegatronLikeModel(torch.nn.Module):
+            def forward(self, *, input_ids, packed_seq_params):
+                return input_ids
+
+        model = MegatronLikeModel()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="core")
+        d.register_non_intrusive_dumper(model)
+
+        ids = torch.randn(4)
+        cu_q = torch.tensor([0, 3, 7])
+        cu_kv = torch.tensor([0, 3, 7])
+        psp = FakePackedSeqParams(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv, qkv_format="thd"
+        )
+        with d.capture_output() as captured:
+            model(input_ids=ids, packed_seq_params=psp)
+
+        assert "input_ids" in captured
+        assert torch.equal(captured["input_ids"]["value"], ids)
+        assert "cu_seqlens_q" in captured
+        assert torch.equal(captured["cu_seqlens_q"]["value"], cu_q)
+        assert "cu_seqlens_kv" in captured
+        assert torch.equal(captured["cu_seqlens_kv"]["value"], cu_kv)
+        assert "qkv_format" in captured
+        assert captured["qkv_format"]["value"] == "thd"
 
 
 if __name__ == "__main__":
