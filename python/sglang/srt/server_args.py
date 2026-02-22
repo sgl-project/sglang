@@ -217,6 +217,8 @@ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
+GDN_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -523,6 +525,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    gdn_backend: str = "triton"
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -739,6 +742,7 @@ class ServerArgs:
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
+        self._handle_gdn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -2079,6 +2083,20 @@ class ServerArgs:
                 raise ValueError(
                     "FlashInfer mamba module not available, please check flashinfer installation."
                 )
+
+    def _handle_gdn_backend(self):
+        # Backward compat: env var SGLANG_USE_CUTEDSL_GDN_DECODE=1 overrides the
+        # default "triton" selection with "cutedsl".
+        if self.gdn_backend == "triton" and envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get():
+            self.gdn_backend = "cutedsl"
+
+        # The flashinfer GDN decode path (gated_delta_rule_decode_pretranspose)
+        # uses a bf16 state kernel; non-bf16 pools are not supported.
+        if self.gdn_backend == "flashinfer" and self.mamba_ssm_dtype != "bfloat16":
+            raise ValueError(
+                f"--gdn-backend flashinfer requires --mamba-ssm-dtype bfloat16, "
+                f"got {self.mamba_ssm_dtype!r}"
+            )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
@@ -4250,6 +4268,16 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--gdn-backend",
+            type=str,
+            choices=GDN_BACKEND_CHOICES,
+            default=ServerArgs.gdn_backend,
+            help="Choose the GDN (Gated Delta Networks) kernel backend. "
+            "Options: 'triton' (default, FLA Triton kernels), "
+            "'cutedsl' (CuTe DSL kernels, same as SGLANG_USE_CUTEDSL_GDN_DECODE=1), "
+            "'flashinfer' (FlashInfer VK-layout kernels).",
         )
 
         # Hierarchical cache

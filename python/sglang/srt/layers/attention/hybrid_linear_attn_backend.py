@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -842,14 +841,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        gdn_backend = get_global_server_args().gdn_backend
+
+        if gdn_backend == "flashinfer":
+            try:
+                # gated_delta_rule_decode_pretranspose requires flashinfer >= 0.6.4
+                from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+                self._flashinfer_pretranspose = gated_delta_rule_decode_pretranspose
+                rank0_log("FlashInfer GDN decode enabled (bf16 pretranspose).")
+            except ImportError:
+                rank0_log(
+                    "FlashInfer GDN backend requested but not available "
+                    "(missing flashinfer.gdn_decode; requires flashinfer >= 0.6.4). "
+                    "Falling back to FLA decode kernel."
+                )
+                gdn_backend = "triton"
+                self._flashinfer_pretranspose = None
+        else:
+            self._flashinfer_pretranspose = None
+
+        self._gdn_backend = gdn_backend
+
+        use_cutedsl = gdn_backend == "cutedsl"
         if use_cutedsl and cutedsl_fused_sigmoid_gating_delta_rule_update is None:
             rank0_log(
                 "CuTe DSL GDN decode requested but unavailable "
                 "(missing cuda.bindings). Falling back to FLA decode kernel."
             )
             use_cutedsl = False
-        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
+            self._gdn_backend = "triton"
+        rank0_log(f"GDN backend: {self._gdn_backend}")
         self._kernel_func = (
             cutedsl_fused_sigmoid_gating_delta_rule_update
             if use_cutedsl
@@ -884,27 +906,55 @@ class GDNAttnBackend(MambaAttnBackendBase):
             [layer.q_dim, layer.k_dim, layer.v_dim],
             dim=-1,
         )
-        # Reshape from [bs, h*d] to [1, bs, h, d]
-        bs = forward_batch.batch_size
-        query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        core_attn_out = self._kernel_func(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+        bs = forward_batch.batch_size
+
+        if self._gdn_backend == "flashinfer":
+            # FlashInfer expects [B, T, H, D] layout (T=1 for decode)
+            query = query.view(bs, 1, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(bs, 1, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(bs, 1, layer.num_v_heads, layer.head_v_dim)
+            # a, b: [B, HV] → [B, 1, HV]
+            a_fi = a.unsqueeze(1)
+            b_fi = b.unsqueeze(1)
+            # Pool is KV K-last [pool, HV, K, V] (K stride=1).
+            # .transpose(-2,-1) produces a zero-copy VK K-last view [pool, HV, V, K]
+            # (V stride=K, K stride=1) matching the initial_state layout required by
+            # gated_delta_rule_decode_pretranspose.
+            core_attn_out, _ = self._flashinfer_pretranspose(
+                q=query,
+                k=key,
+                v=value,
+                state=None,
+                A_log=layer.A_log.detach().float(),
+                a=a_fi,
+                dt_bias=layer.dt_bias.detach(),
+                b=b_fi,
+                use_qk_l2norm=True,
+                initial_state=ssm_states.transpose(-2, -1),
+                initial_state_indices=cache_indices,
+            )
+        else:
+            # Reshape from [bs, h*d] to [1, bs, h, d]
+            query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
+
+            core_attn_out = self._kernel_func(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
@@ -1007,6 +1057,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         actual_seq_len = query.shape[0]
+
         query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
@@ -1031,13 +1082,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu() or is_cpu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
-            core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
+            # CUDA (non-flashinfer): fused in-place pool update via initial_state_indices.
+            # FlashInfer/NPU/CPU: gather → FLA kernel (in-place) → scatter back.
+            use_gather_scatter = (
+                self._gdn_backend == "flashinfer" or is_npu() or is_cpu()
+            )
+            if use_gather_scatter:
+                # The flashinfer pool is K-contiguous; advanced indexing
+                # preserves that layout, so .contiguous() is needed to get
+                # a V-contiguous copy whose storage the FLA kernel can
+                # update in-place (the @input_guard decorator would
+                # otherwise make its own anonymous copy).
+                recurrent_state = ssm_states[cache_indices].contiguous()
+                n_seqs_extend = recurrent_state.shape[0]
+                seq_indices = torch.arange(
+                    n_seqs_extend,
+                    device=recurrent_state.device,
+                    dtype=cache_indices.dtype,
+                )
+                recurrent_state_indices_args = {"initial_state_indices": seq_indices}
+            else:
+                recurrent_state = ssm_states
+                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+            core_attn_out, _, h = chunk_gated_delta_rule(
                 q=query,
                 k=key,
                 v=value,
@@ -1049,11 +1116,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            if is_npu() or is_cpu():
-                last_recurrent_state = last_recurrent_state.to(
+            if use_gather_scatter:
+                # kernel updated recurrent_state in-place; scatter back to pool
+                ssm_states[cache_indices] = recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
-                ssm_states[cache_indices] = last_recurrent_state
 
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata
