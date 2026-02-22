@@ -290,16 +290,6 @@ class _Dumper:
 
     def configure(self, **kwargs) -> None:
         self._config = replace(self._config, **kwargs)
-        if (
-            self._config.cleanup_previous
-            and not self._state.cleanup_previous_handled
-            and self._config.enable
-            and self._config.dir
-        ):
-            self._state.cleanup_previous_handled = True
-            _cleanup_old_dumps(
-                Path(self._config.dir), exp_name=self._config.exp_name
-            )
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
