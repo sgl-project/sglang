@@ -42,7 +42,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import empty_context, fast_topk, is_blackwell
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -172,23 +172,30 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
-        # Create attn backends
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
-
-            self.draft_extend_attn_backend_list.append(
-                FlashAttentionBackend(
+            if is_blackwell():
+                draft_backend_factory = DraftBackendFactory(
+                    self.server_args,
+                    self.draft_runner_list[step],
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+                backend = draft_backend_factory.create_draft_extend_backend()
+            else:
+                backend = FlashAttentionBackend(
                     model_runner=self.draft_runner_list[step],
                     skip_prefill=False,
                     speculative_step_id=step,
                 )
-            )
-            self.draft_runner_list[step].attn_backend = (
-                self.draft_extend_attn_backend_list[-1]
-            )
+
+            self.draft_extend_attn_backend_list.append(backend)
+            self.draft_runner_list[step].attn_backend = backend
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
