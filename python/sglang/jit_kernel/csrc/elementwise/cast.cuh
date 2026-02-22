@@ -28,7 +28,7 @@ __global__ void fused_downcast_kernel(
     const float* v_scale,
     __nv_fp8_storage_t* output_k,
     __nv_fp8_storage_t* output_v,
-    const int input_sl,
+    const int input_num_tokens,
     const int head,
     const int dim,
     const T max_fp8,
@@ -46,7 +46,7 @@ __global__ void fused_downcast_kernel(
   const int vec_idx = blockIdx.y * kBlockSize + threadIdx.x;
   const int num_vecs = head * dim / kVecSize;
 
-  if (token_idx >= input_sl || vec_idx >= num_vecs) return;
+  if (token_idx >= input_num_tokens || vec_idx >= num_vecs) return;
 
   T k_scale_inv = static_cast<T>(1.f) / ConvertFromFloat<T>::convert_from_float(k_scale[0]);
   T v_scale_inv = static_cast<T>(1.f) / ConvertFromFloat<T>::convert_from_float(v_scale[0]);
@@ -87,22 +87,22 @@ void downcast_fp8(
     int64_t offset) {
   using namespace host;
 
-  auto input_sl = SymbolicSize{"input_sl"};
+  auto input_num_tokens = SymbolicSize{"input_num_tokens"};
   auto head = SymbolicSize{"head"};
   auto dim = SymbolicSize{"dim"};
   auto out_sl = SymbolicSize{"out_sl"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
 
-  TensorMatcher({input_sl, head, dim}).with_dtype<T>().with_device(device).verify(k);
-  TensorMatcher({input_sl, head, dim}).with_dtype<T>().with_device(device).verify(v);
+  TensorMatcher({input_num_tokens, head, dim}).with_dtype<T>().with_device(device).verify(k);
+  TensorMatcher({input_num_tokens, head, dim}).with_dtype<T>().with_device(device).verify(v);
   TensorMatcher({out_sl, head, dim}).with_dtype<uint8_t>().with_device(device).verify(k_out);
   TensorMatcher({out_sl, head, dim}).with_dtype<uint8_t>().with_device(device).verify(v_out);
   TensorMatcher({1}).with_dtype<float>().with_device(device).verify(k_scale);
   TensorMatcher({1}).with_dtype<float>().with_device(device).verify(v_scale);
-  TensorMatcher({input_sl}).with_dtype<int64_t>().with_device(device).verify(loc);
+  TensorMatcher({input_num_tokens}).with_dtype<int64_t>().with_device(device).verify(loc);
 
-  const int isl = static_cast<int>(input_sl.unwrap());
+  const int isl = static_cast<int>(input_num_tokens.unwrap());
   const int h = static_cast<int>(head.unwrap());
   const int d = static_cast<int>(dim.unwrap());
 
