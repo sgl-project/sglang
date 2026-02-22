@@ -964,15 +964,17 @@ class Req(ReqDllmMixin):
     def tail_str(self) -> str:
         # Check stop strings and stop regex patterns together
         if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
+            len(self.sampling_params.stop_strs) == 0
+            and len(self.sampling_params.stop_regex_strs) == 0
         ):
-            max_len_tail_str = max(
-                self.sampling_params.stop_str_max_len + 1,
-                self.sampling_params.stop_regex_max_len + 1,
-            )
+            return ""
 
-        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+
+        tail_len = min(max_len_tail_str, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
