@@ -1,5 +1,7 @@
 import io
 import warnings
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -8,10 +10,62 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.benchmark.datasets.common import (
+    BaseDatasetArgs,
+    BaseDatasetLoader,
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
 )
+from sglang.benchmark.utils import get_processor
+
+
+@dataclass
+class ImageArgs(BaseDatasetArgs):
+    num_requests: int
+    image_count: int
+    input_len: int
+    output_len: int
+    range_ratio: float
+    image_content: str
+    image_format: str
+    image_resolution: str
+    backend: str
+    random_image_count: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "ImageArgs":
+        return cls(
+            num_requests=args.num_prompts,
+            image_count=args.image_count,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            range_ratio=args.random_range_ratio,
+            image_content=args.image_content,
+            image_format=args.image_format,
+            image_resolution=args.image_resolution,
+            backend=args.backend,
+            random_image_count=args.random_image_count,
+        )
+
+
+class ImageDatasetLoader(BaseDatasetLoader):
+    def load(
+        self, config: ImageArgs, tokenizer=None, model_id=None
+    ) -> List[DatasetRow]:
+        processor = get_processor(model_id)
+        return sample_image_requests(
+            num_requests=config.num_requests,
+            image_count=config.image_count,
+            input_len=config.input_len,
+            output_len=config.output_len,
+            range_ratio=config.range_ratio,
+            processor=processor,
+            image_content=config.image_content,
+            image_format=config.image_format,
+            image_resolution=config.image_resolution,
+            backend=config.backend,
+            random_image_count=config.random_image_count,
+        )
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:

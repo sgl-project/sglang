@@ -2,6 +2,8 @@ import argparse
 import pickle
 import random
 import uuid
+from argparse import Namespace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -10,7 +12,64 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import DatasetRow, compute_random_lens, gen_prompt
+from sglang.benchmark.datasets.common import (
+    BaseDatasetArgs,
+    BaseDatasetLoader,
+    DatasetRow,
+    compute_random_lens,
+    gen_prompt,
+)
+
+
+@dataclass
+class GeneratedSharedPrefixArgs(BaseDatasetArgs):
+    num_groups: int
+    prompts_per_group: int
+    system_prompt_len: int
+    question_len: int
+    output_len: int
+    range_ratio: float
+    seed: int
+    gsp_fast_prepare: bool
+    gsp_send_routing_key: bool
+    gsp_num_turns: int
+    gsp_ordered: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixArgs":
+        assert not getattr(args, "tokenize_prompt", False)
+        return cls(
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
+            range_ratio=getattr(args, "gsp_range_ratio", 1.0),
+            seed=args.seed,
+            gsp_fast_prepare=getattr(args, "gsp_fast_prepare", False),
+            gsp_send_routing_key=getattr(args, "gsp_send_routing_key", False),
+            gsp_num_turns=getattr(args, "gsp_num_turns", 1),
+            gsp_ordered=getattr(args, "gsp_ordered", False),
+        )
+
+
+class GeneratedSharedPrefixDatasetLoader(BaseDatasetLoader):
+    def load(
+        self,
+        config: GeneratedSharedPrefixArgs,
+        tokenizer: PreTrainedTokenizerBase,
+        model_id=None,
+    ) -> List[DatasetRow]:
+        return sample_generated_shared_prefix_requests(
+            num_groups=config.num_groups,
+            prompts_per_group=config.prompts_per_group,
+            system_prompt_len=config.system_prompt_len,
+            question_len=config.question_len,
+            output_len=config.output_len,
+            range_ratio=config.range_ratio,
+            tokenizer=tokenizer,
+            args=config,
+        )
 
 
 def get_gen_prefix_cache_path(args, tokenizer):
