@@ -26,12 +26,11 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Dict, List, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
-from huggingface_hub import snapshot_download
 from huggingface_hub.errors import (
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
@@ -39,12 +38,18 @@ from huggingface_hub.errors import (
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
+from safetensors import safe_open
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -68,15 +73,15 @@ def _check_index_files_for_missing_shards(
     missing_files = []
     checked_subdirs = []
 
-    # Check the root directory and all subdirectories that might contain model weights
-    dirs_to_check = [model_path]
-
     # Add common subdirectories for diffusers models
     try:
         subdirs = os.listdir(model_path)
     except OSError as e:
         logger.warning("Failed to list model directory %s: %s", model_path, e)
         return True, [], []  # Assume valid if we can't check
+
+    # Check the root directory and all subdirectories that might contain model weights
+    dirs_to_check = [model_path]
 
     for subdir in subdirs:
         subdir_path = os.path.join(model_path, subdir)
@@ -175,7 +180,6 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     """
     if not is_in_ci():
         return True, False
-
     is_valid, missing_files, checked_subdirs = _check_index_files_for_missing_shards(
         model_path
     )
@@ -294,24 +298,23 @@ def load_dict(file_path):
 
 
 def get_diffusers_component_config(
-    model_path: str,
+    component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
-
     # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(model_path):
-        model_path = maybe_download_model(model_path)
+    if not os.path.exists(component_path):
+        component_path = maybe_download_model(component_path)
 
     # tokenizer
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in model_path:
+    if "scheduler" in component_path:
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
 
     config_file_paths = [
-        os.path.join(model_path, config_name) for config_name in config_names
+        os.path.join(component_path, config_name) for config_name in config_names
     ]
 
     combined_config = reduce(
@@ -319,6 +322,80 @@ def get_diffusers_component_config(
     )
 
     return combined_config
+
+
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def get_quant_config(
+    model_config,
+    packed_modules_mapping: Dict[str, List[str]] = {},
+    remap_prefix: Dict[str, str] | None = None,
+) -> QuantizationConfig:
+    if "quantization_config" not in model_config:
+        return None
+    quant_cls = get_quantization_config(
+        model_config["quantization_config"]["quant_method"]
+    )
+
+    # GGUF doesn't have config file
+    if model_config["quantization_config"]["quant_method"] == "gguf":
+        return quant_cls.from_config({})
+
+    # Read the quantization config from the HF model config, if available.
+    hf_quant_config = model_config["quantization_config"]
+    # some vision model may keep quantization_config in their text_config
+    hf_text_config = getattr(model_config, "text_config", None)
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
+    if hf_quant_config is None:
+        # compressed-tensors uses a compressions_config
+        hf_quant_config = getattr(model_config, "compression_config", None)
+    if hf_quant_config is not None:
+        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(hf_quant_config)
+    # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
+    else:
+        model_name_or_path = model_config["model_path"]
+    is_local = os.path.isdir(model_name_or_path)
+    hf_folder = model_name_or_path
+
+    possible_config_filenames = quant_cls.get_config_filenames()
+
+    # If the quantization config is not found, use the default config.
+    if not possible_config_filenames:
+        return quant_cls()
+
+    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
+
+    quant_config_files = [
+        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
+    ]
+    if len(quant_config_files) == 0:
+        raise ValueError(
+            f"Cannot find the config file for {model_config['quantization_config']['quant_method']}"
+        )
+    if len(quant_config_files) > 1:
+        raise ValueError(
+            f"Found multiple config files for {model_config['quantization_config']['quant_method']}: "
+            f"{quant_config_files}"
+        )
+
+    quant_config_file = quant_config_files[0]
+    with open(quant_config_file) as f:
+        config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
+        return quant_cls.from_config(config)
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -467,7 +544,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     import tempfile
 
-    from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
     # If it's a local path, verify it directly
@@ -544,6 +620,7 @@ def maybe_download_model(
     download: bool = True,
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
+    force_diffusers_model: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -553,13 +630,13 @@ def maybe_download_model(
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
-
+        force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
     Returns:
         Local path to the model
     """
 
-    def _verify_model_complete(path: str) -> bool:
-        """Check if model directory has required subdirectories."""
+    def _verify_diffusers_model_complete(path: str) -> bool:
+        """Check if model directory (of a diffusers model, not a component) has required subdirectories."""
         config_path = os.path.join(path, "model_index.json")
         if not os.path.exists(config_path):
             return False
@@ -592,7 +669,10 @@ def maybe_download_model(
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        if is_lora or _verify_model_complete(model_name_or_path):
+        # TODO: lots of duplication here
+        if not force_diffusers_model:
+            return model_name_or_path
+        elif is_lora or _verify_diffusers_model_complete(model_name_or_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
@@ -638,11 +718,11 @@ def maybe_download_model(
             ignore_patterns=["*.onnx", "*.msgpack"],
             local_dir=local_dir,
             local_files_only=True,
-            resume_download=True,
             max_workers=8,
-            etag_timeout=60,
         )
-        if is_lora or _verify_model_complete(local_path):
+        if not force_diffusers_model:
+            return str(local_path)
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
@@ -709,13 +789,13 @@ def maybe_download_model(
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
-                    resume_download=True,
                     max_workers=8,
-                    etag_timeout=120,
                 )
 
+            if not force_diffusers_model:
+                return str(local_path)
             # Verify downloaded model is complete (skip for LoRA)
-            if not is_lora and not _verify_model_complete(local_path):
+            elif not is_lora and not _verify_diffusers_model_complete(local_path):
                 logger.warning(
                     "Downloaded model at %s is incomplete, retrying with force_download=True",
                     local_path,
@@ -725,12 +805,10 @@ def maybe_download_model(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
                         local_dir=local_dir,
-                        resume_download=True,
                         max_workers=8,
-                        etag_timeout=60,
                         force_download=True,
                     )
-                if not _verify_model_complete(local_path):
+                if not _verify_diffusers_model_complete(local_path):
                     raise ValueError(
                         f"Downloaded model at {local_path} is still incomplete after forced re-download. "
                         "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
@@ -775,3 +853,80 @@ def maybe_download_model(
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
+
+
+# Unified download functions with Hugging Face-compatible names
+def hf_hub_download(
+    repo_id: str,
+    filename: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    **kwargs,
+) -> str:
+    """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import model_file_download
+
+        return model_file_download(
+            model_id=repo_id,
+            file_path=filename,
+            cache_dir=local_dir,
+            **kwargs,
+        )
+    else:
+        from huggingface_hub import hf_hub_download as _hf_hub_download
+
+        return _hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=local_dir,
+            **kwargs,
+        )
+
+
+def snapshot_download(
+    repo_id: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    ignore_patterns: Optional[Union[list[str], str]] = None,
+    allow_patterns: Optional[Union[list[str], str]] = None,
+    local_files_only: bool = False,
+    max_workers: int = 8,
+    **kwargs,
+) -> str:
+    """Unified snapshot_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import snapshot_download as _ms_snapshot_download
+
+        ms_kwargs = {
+            "model_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+        }
+        ms_kwargs.update(kwargs)
+        return _ms_snapshot_download(**ms_kwargs)
+    else:
+        from huggingface_hub import snapshot_download as _hf_snapshot_download
+
+        hf_kwargs = {
+            "repo_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+            "resume_download": True,
+            "etag_timeout": 60,
+        }
+        hf_kwargs.update(kwargs)
+        return _hf_snapshot_download(**hf_kwargs)
+
+
+def get_metadata_from_safetensors_file(file_path: str):
+    try:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata()
+            return metadata
+    except Exception as e:
+        logger.warning(e)

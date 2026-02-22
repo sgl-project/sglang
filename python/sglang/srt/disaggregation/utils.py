@@ -137,7 +137,7 @@ class MetadataBuffers:
             )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.int64, device=device
+                (size, 8), dtype=torch.uint64, device=device
             )
 
     def get_buf_infos(self):
@@ -335,10 +335,15 @@ def get_kv_class(
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
-        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+        from sglang.srt.disaggregation.fake import (
+            FakeKVManager,
+            FakeKVReceiver,
+            FakeKVSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
         }

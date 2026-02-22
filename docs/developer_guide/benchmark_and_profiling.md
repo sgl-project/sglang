@@ -43,7 +43,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
-Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
+The `SGLANG_TORCH_PROFILER_DIR` environment variable must be set on both the server and client side; otherwise, the trace file will not be generated correctly. A secure way to do this is by setting it in your shell's resource file (e.g., `~/.bashrc` for bash).
 
 For more details, please refer to [Bench Serving Guide](./bench_serving.md).
 

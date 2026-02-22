@@ -20,7 +20,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/starcoder2.py
-""" PyTorch Starcoder2 model."""
+"""PyTorch Starcoder2 model."""
+
 from collections.abc import Iterable
 from typing import Optional, Tuple
 

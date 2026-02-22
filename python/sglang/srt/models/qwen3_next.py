@@ -316,7 +316,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        self.linear_attn = RadixLinearAttention(
+        self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
             num_k_heads=self.num_k_heads // self.attn_tp_size,
@@ -366,8 +366,8 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
@@ -405,34 +405,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.empty_like(hidden_states)
-            gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        seq_len, _ = hidden_states.shape
-        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
-
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
 
-        if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
-            and is_cuda_graph
-            and not _is_cpu
-        ):
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -460,7 +437,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-        core_attn_out = self.linear_attn(
+        core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
@@ -617,7 +594,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        if "rope_parameters" in config:
+            self.rope_scaling = getattr(config, "rope_parameters", None)
+        else:
+            self.rope_scaling = getattr(config, "rope_scaling", None)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
@@ -665,6 +645,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
 
@@ -921,6 +902,15 @@ class HybridLayerType(enum.Enum):
 class Qwen3NextForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
+    # Map fused module names to their checkpoint (unfused) counterparts.
+    # This is needed so the quantization exclusion logic can match
+    # checkpoint-style names (e.g. "q_proj") against the fused sglang
+    # module names (e.g. "qkv_proj").
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -931,6 +921,14 @@ class Qwen3NextForCausalLM(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
+
+        # The quant config's packed_modules_mapping may be None if it wasn't
+        # in the checkpoint config. The base class (QuantizationConfig) intends
+        # for models to set this. We need it so is_layer_skipped can unfuse
+        # "qkv_proj" into ["q_proj","k_proj","v_proj"] when checking exclusions.
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
+
         self.quant_config = quant_config
         self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1052,6 +1050,14 @@ class Qwen3NextForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            # Remap modelopt FP8 KV cache scale names:
+            # checkpoint: k_proj.k_scale / v_proj.v_scale
+            # model:      attn.k_scale   / attn.v_scale
+            if name.endswith(".k_proj.k_scale"):
+                name = name.replace(".k_proj.k_scale", ".attn.k_scale")
+            elif name.endswith(".v_proj.v_scale"):
+                name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1060,15 +1066,16 @@ class Qwen3NextForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                replaced_name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
+                if replaced_name not in params_dict:
                     continue
+                name = replaced_name
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
@@ -1078,15 +1085,17 @@ class Qwen3NextForCausalLM(nn.Module):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
+                    replaced_name = name.replace(weight_name, param_name)
                     # Skip layers on other devices.
                     # if is_pp_missing_parameter(name, self):
                     #     continue
                     # Skip loading extra bias for GPTQ models.
                     if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                        replaced_name.endswith(".bias")
+                        or replaced_name.endswith("_bias")
+                    ) and replaced_name not in params_dict:
                         continue
+                    name = replaced_name
                     param = params_dict[name]
 
                     weight_loader = getattr(param, "weight_loader")

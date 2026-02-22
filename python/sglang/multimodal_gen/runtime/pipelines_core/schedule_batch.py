@@ -26,7 +26,7 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
@@ -100,7 +100,6 @@ class Req:
     raw_audio_latent_shape: tuple[int, ...] | None = None
 
     # Audio Parameters
-    fps: float = 24.0
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
@@ -153,7 +152,7 @@ class Req:
     VSA_sparsity: float = 0.0
 
     # stage logging
-    timings: Optional["RequestTimings"] = None
+    metrics: Optional["RequestMetrics"] = None
 
     # results
     output: torch.Tensor | None = None
@@ -253,6 +252,8 @@ class Req:
 
     def set_as_warmup(self):
         self.is_warmup = True
+        self.save_output = False
+        self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = 1
 
@@ -266,7 +267,7 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        self.timings = RequestTimings(request_id=self.request_id)
+        self.metrics = RequestMetrics(request_id=self.request_id)
 
         if self.is_warmup:
             self.set_as_warmup()
@@ -295,6 +296,7 @@ class Req:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
+                         fps: {self.fps}
                       prompt: {self.prompt}
                   neg_prompt: {self.negative_prompt}
                         seed: {self.seed}
@@ -325,9 +327,10 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    output_file_paths: list[str] | None = None
 
-    # logged timings info, directly from Req.timings
-    timings: Optional["RequestTimings"] = None
+    # logged metrics info, directly from Req.timings
+    metrics: Optional["RequestMetrics"] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

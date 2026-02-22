@@ -4,7 +4,7 @@ A typical VLM architecture involves two main components: an multi-modal encoder 
 
 Most VLMs utilize a Vision Transformer (ViT) as their multi-modal encoder, it is responsible for processing visual data, extracting features (objects, colors, textures, etc.), and transforming them into a format that can be understood by the model.
 
-The text deocoder is based on LLM. It processes textual data and generates output based on the encoded visual features.
+The text decoder is based on LLM. It processes textual data and generates output based on the encoded visual features.
 
 However, since the size of ViT is very small compared to language decoders,
 there is relatively little gain from TP. On the other hand, TP incurs significant communication

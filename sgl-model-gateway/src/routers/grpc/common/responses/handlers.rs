@@ -3,9 +3,10 @@
 //! These handlers are used by both pipelines for retrieving and cancelling responses.
 
 use axum::response::{IntoResponse, Response};
+use data_connector::ResponseId;
 
 use super::ResponsesContext;
-use crate::{data_connector::ResponseId, routers::error};
+use crate::routers::error;
 
 /// Implementation for GET /v1/responses/{response_id}
 ///
