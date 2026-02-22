@@ -1799,8 +1799,10 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
+        assert "seq_lens" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
+        assert torch.equal(captured["seq_lens"]["value"], fb.seq_lens)
 
         # nothing with non_intrusive__ prefix
         assert not any(k.startswith("non_intrusive__") for k in captured)
@@ -1811,24 +1813,17 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         # core fields dumped with clean names
         assert "input_ids" in captured
         assert "positions" in captured
+        assert "seq_lens" in captured
         assert torch.equal(captured["input_ids"]["value"], fb.input_ids)
         assert torch.equal(captured["positions"]["value"], fb.positions)
-
-        # non-core ForwardBatch fields dumped with prefix
-        assert "non_intrusive__inputs.0.seq_lens" in captured
-        assert torch.equal(
-            captured["non_intrusive__inputs.0.seq_lens"]["value"], fb.seq_lens
-        )
+        assert torch.equal(captured["seq_lens"]["value"], fb.seq_lens)
 
         # core fields NOT duplicated with prefix
-        assert not any(
-            k.startswith("non_intrusive__") and k.endswith("input_ids")
-            for k in captured
-        )
-        assert not any(
-            k.startswith("non_intrusive__") and k.endswith("positions")
-            for k in captured
-        )
+        for field in ("input_ids", "positions", "seq_lens"):
+            assert not any(
+                k.startswith("non_intrusive__") and k.endswith(field)
+                for k in captured
+            )
 
         # ForwardBatch skipped on sub-modules (no duplication)
         assert not any(
