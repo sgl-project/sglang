@@ -197,6 +197,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Usage tracking
         prompt_tokens = {}
         completion_tokens = {}
+        reasoning_tokens = {}
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
@@ -210,6 +211,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 text = content["text"]
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
+                )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
@@ -344,8 +348,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )

@@ -179,8 +179,18 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
 
+                    # update reasoning tokens
+                    if (
+                        req.require_reasoning
+                        and self.tokenizer
+                        and hasattr(self.tokenizer, "think_end_id")
+                    ):
+                        req.update_reasoning_tokens(
+                            next_token_id, self.tokenizer.think_end_id
+                        )
+
+                    req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
@@ -441,6 +451,20 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+        else:
+            # for normal spec decoding: unify next_token_ids format
+            next_token_ids = []
+            cum_num_tokens = 0
+            next_token_ids_list = result.next_token_ids.tolist()
+
+            for i, req in enumerate(batch.reqs):
+                accept_length = result.accept_length_per_req_cpu[i]
+                next_token_ids.append(
+                    next_token_ids_list[
+                        cum_num_tokens : cum_num_tokens + accept_length + 1
+                    ]
+                )
+                cum_num_tokens += accept_length + 1
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -470,6 +494,14 @@ class SchedulerOutputProcessorMixin:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
+            # update reasoning tokens
+            if (
+                req.require_reasoning
+                and self.tokenizer
+                and hasattr(self.tokenizer, "think_end_id")
+            ):
+                req.update_reasoning_tokens(next_token_id, self.tokenizer.think_end_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -912,6 +944,7 @@ class SchedulerOutputProcessorMixin:
         spaces_between_special_tokens = []
         no_stop_trim = []
         prompt_tokens = []
+        reasoning_tokens = []
         completion_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
@@ -1026,6 +1059,7 @@ class SchedulerOutputProcessorMixin:
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
+                reasoning_tokens.append(req.reasoning_tokens)
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
@@ -1165,6 +1199,7 @@ class SchedulerOutputProcessorMixin:
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,
                     prompt_tokens=prompt_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
