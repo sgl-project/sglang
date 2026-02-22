@@ -814,7 +814,12 @@ class TritonAttnBackend(AttentionBackend):
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer,
+                forward_batch.out_cache_loc,
+                k.clone(),
+                v.clone(),
+                layer.k_scale,
+                layer.v_scale,
             )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -864,6 +869,8 @@ class TritonAttnBackend(AttentionBackend):
             causal,
             self.forward_metadata.mask_indptr,
             self.forward_metadata.max_extend_len,
+            layer.k_scale_float,
+            layer.v_scale_float,
             layer.scaling,
             logit_cap=logits_soft_cap,
             sliding_window_size=sliding_window_size,
@@ -976,6 +983,8 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            layer.k_scale_float,
+            layer.v_scale_float,
             self.forward_metadata.qo_indptr,
             unified_kv_indptr,
             unified_kv_indices,
@@ -1018,7 +1027,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -1040,6 +1049,8 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
             layer.scaling,
+            layer.k_scale_float,
+            layer.v_scale_float,
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
