@@ -4,13 +4,14 @@ import subprocess
 import time
 import unittest
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Optional, Union
 
 import requests
 import zmq
 
 from sglang import Engine
-from sglang.srt.tracing.trace import *
+from sglang.srt.observability.trace import *
+from sglang.srt.observability.trace import get_cur_time_ns, set_global_trace_level
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -24,7 +25,7 @@ from sglang.test.test_utils import (
 @dataclass
 class Req:
     rid: int
-    trace_context: Optional[Dict[str, Any]] = None
+    req_context: Optional[Union[TraceReqContext]] = None
 
 
 class TestTrace(CustomTestCase):
@@ -65,22 +66,33 @@ class TestTrace(CustomTestCase):
         except:
             pass
 
-    def test_trace_enable(self):
+    def __test_trace_enable(self, trace_level, expect_export_data):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
 
         process = popen_launch_server(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-trace", "--otlp-traces-endpoint", "0.0.0.0:4317"],
+            other_args=[
+                "--enable-trace",
+                "--otlp-traces-endpoint",
+                "0.0.0.0:4317",
+            ],
         )
 
         try:
-            # Make some requests to generate trace data
             response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
             self.assertEqual(response.status_code, 200)
 
+            # set trace level
+            response = requests.get(
+                f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level={trace_level}"
+            )
+            self.assertEqual(response.status_code, 200)
+
+            # Make some requests to generate trace data
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/generate",
                 json={
@@ -101,15 +113,34 @@ class TestTrace(CustomTestCase):
 
             # check trace file
             assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
-            assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
+            if expect_export_data:
+                assert (
+                    os.path.getsize("/tmp/otel_trace.json") > 0
+                ), "trace file is empty"
+            else:
+                assert (
+                    os.path.getsize("/tmp/otel_trace.json") == 0
+                ), "trace file is not empty"
 
         finally:
             kill_process_tree(process.pid)
-            assert self.__stop_otel_jaeger()
+
+    def test_trace_enable_level_1(self):
+        self.__test_trace_enable("1", True)
+
+    def test_trace_enable_level_2(self):
+        self.__test_trace_enable("2", True)
+
+    def test_trace_enable_level_3(self):
+        self.__test_trace_enable("3", True)
+
+    def test_trace_enable_level_0(self):
+        self.__test_trace_enable("0", False)
 
     def test_trace_engine_enable(self):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
 
         prompt = "Today is a sunny day and I like"
         model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -134,11 +165,11 @@ class TestTrace(CustomTestCase):
             assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
         finally:
             engine.shutdown()
-            assert self.__stop_otel_jaeger()
 
     def test_trace_engine_encode(self):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
 
         prompt = "Today is a sunny day and I like"
         model_path = "Qwen/Qwen2-7B"
@@ -162,19 +193,21 @@ class TestTrace(CustomTestCase):
             assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
         finally:
             engine.shutdown()
-            assert self.__stop_otel_jaeger()
 
     def test_slice_trace_simple(self):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
         try:
             process_tracing_init("0.0.0.0:4317", "test")
             trace_set_thread_info("Test")
-            trace_req_start(0)
-            trace_slice_start("test slice", 0)
+            set_global_trace_level(3)
+            req_context = TraceReqContext(0)
+            req_context.trace_req_start()
+            req_context.trace_slice_start("test slice", level=1)
             time.sleep(1)
-            trace_slice_end("test slice", 0)
-            trace_req_finish(0)
+            req_context.trace_slice_end("test slice", level=1)
+            req_context.trace_req_finish()
 
             # sleep for a few seconds to wait for opentelemetry collector to asynchronously export data to file.
             time.sleep(10)
@@ -182,23 +215,29 @@ class TestTrace(CustomTestCase):
             assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
             assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
         finally:
-            assert self.__stop_otel_jaeger()
+            pass
 
     def test_slice_trace_complex(self):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
         try:
             process_tracing_init("0.0.0.0:4317", "test")
             trace_set_thread_info("Test")
-            trace_req_start(0)
-            trace_slice_start("", 0, anonymous=True)
+            set_global_trace_level(3)
+            req_context = TraceReqContext(0)
+            req_context.trace_req_start()
+            t1 = get_cur_time_ns()
             time.sleep(1)
-            trace_slice_end("slice A", 0, auto_next_anon=True)
+            req_context.trace_event("event test", 1)
+            t2 = get_cur_time_ns()
             time.sleep(1)
-            trace_slice_end("slice B", 0, auto_next_anon=True)
-            time.sleep(1)
-            trace_slice_end("slice C", 0, thread_finish_flag=True)
-            trace_req_finish(0)
+            t3 = get_cur_time_ns()
+            slice1 = TraceSliceContext("slice A", t1, t2)
+            slice2 = TraceSliceContext("slice B", t2, t3)
+            req_context.trace_slice(slice1)
+            req_context.trace_slice(slice2, thread_finish_flag=True)
+            req_context.trace_req_finish()
 
             # sleep for a few seconds to wait for opentelemetry collector to asynchronously export data to file.
             time.sleep(10)
@@ -206,7 +245,7 @@ class TestTrace(CustomTestCase):
             assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
             assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
         finally:
-            assert self.__stop_otel_jaeger()
+            pass
 
     def test_trace_context_propagete(self):
         def __process_work():
@@ -220,16 +259,19 @@ class TestTrace(CustomTestCase):
 
             try:
                 req = recv_from_main.recv_pyobj()
-                trace_set_proc_propagate_context(req.rid, req.trace_context)
-                trace_slice_start("work", req.rid)
+                req.req_context.rebuild_thread_context()
+                req.req_context.trace_slice_start("work", level=1)
                 time.sleep(1)
-                trace_slice_end("work", req.rid, thread_finish_flag=True)
+                req.req_context.trace_slice_end(
+                    "work", level=1, thread_finish_flag=True
+                )
             finally:
                 recv_from_main.close()
                 context.term()
 
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
+        self.addCleanup(self.__stop_otel_jaeger)
 
         context = zmq.Context(2)
         send_to_subproc = get_zmq_socket(
@@ -246,15 +288,15 @@ class TestTrace(CustomTestCase):
             time.sleep(1)
 
             req = Req(rid=0)
-            trace_req_start(req.rid)
-            trace_slice_start("dispatch", req.rid)
+            req.req_context = TraceReqContext(0)
+            req.req_context.trace_req_start()
+            req.req_context.trace_slice_start("dispatch", level=1)
             time.sleep(1)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
             send_to_subproc.send_pyobj(req)
-            trace_slice_end("dispatch", req.rid)
+            req.req_context.trace_slice_end("dispatch", level=1)
 
             subproc.join()
-            trace_req_finish(req.rid)
+            req.req_context.trace_req_finish()
 
             # sleep for a few seconds to wait for opentelemetry collector to asynchronously export data to file.
             time.sleep(10)
@@ -265,7 +307,6 @@ class TestTrace(CustomTestCase):
         finally:
             send_to_subproc.close()
             context.term()
-            assert self.__stop_otel_jaeger()
 
 
 if __name__ == "__main__":

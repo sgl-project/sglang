@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.schedule_batch import Req, RequestStage, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,8 @@ class SchedulerDllmMixin:
             return None
 
         # Record metrics and update state
-        self._update_metrics_and_state_for_batch(can_run_list, adder, running_bs)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        self._update_state_for_batch(can_run_list, adder, running_bs)
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
@@ -147,13 +148,10 @@ class SchedulerDllmMixin:
         if incoming_reqs:
             self.process_dllm_incoming_reqs(adder, incoming_reqs)
 
-    def _update_metrics_and_state_for_batch(
+    def _update_state_for_batch(
         self: Scheduler, can_run_list: List[Req], adder: PrefillAdder, running_bs: int
     ) -> None:
-        """Update metrics and state for the batch."""
-        if self.enable_metrics:
-            for req in can_run_list:
-                req.add_latency(RequestStage.PREFILL_WAITING)
+        """Update state for the batch."""
 
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -166,14 +164,6 @@ class SchedulerDllmMixin:
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
-
-        for req in can_run_list:
-            if req.time_stats.forward_entry_time == 0:
-                req.time_stats.forward_entry_time = time.perf_counter()
-                if self.enable_metrics:
-                    self.metrics_collector.observe_queue_time(
-                        req.time_stats.get_queueing_time(),
-                    )
 
     def _create_dllm_batch(
         self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
@@ -194,7 +184,7 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
-        from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+        from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
 
         new_batch.prefill_stats = PrefillStats(
             log_input_tokens=self.adder.log_input_tokens,
