@@ -1,6 +1,10 @@
 import copy
+import math
 import time
+from io import BytesIO
 
+import av
+import numpy as np
 import PIL.Image
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -108,6 +112,66 @@ class LTX2AVDenoisingStage(DenoisingStage):
         return img.resize((width, height), resample=PIL.Image.Resampling.BILINEAR)
 
     @staticmethod
+    def _apply_video_codec_compression(
+        img_array: np.ndarray, crf: int = 33
+    ) -> np.ndarray:
+        """Encode as a single H.264 frame and decode back to simulate compression artifacts."""
+        if crf == 0:
+            return img_array
+        height, width = img_array.shape[0] // 2 * 2, img_array.shape[1] // 2 * 2
+        img_array = img_array[:height, :width]
+        buffer = BytesIO()
+        container = av.open(buffer, mode="w", format="mp4")
+        stream = container.add_stream(
+            "libx264", rate=1, options={"crf": str(crf), "preset": "veryfast"}
+        )
+        stream.height, stream.width = height, width
+        frame = av.VideoFrame.from_ndarray(img_array, format="rgb24").reformat(
+            format="yuv420p"
+        )
+        container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+        container.close()
+        buffer.seek(0)
+        container = av.open(buffer)
+        decoded = next(container.decode(container.streams.video[0]))
+        container.close()
+        return decoded.to_ndarray(format="rgb24")
+
+    @staticmethod
+    def _resize_center_crop_tensor(
+        img: PIL.Image.Image,
+        *,
+        width: int,
+        height: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        apply_codec_compression: bool = True,
+        codec_crf: int = 33,
+    ) -> torch.Tensor:
+        """Resize, center-crop, and normalize to [1, C, 1, H, W] tensor in [-1, 1]."""
+        img_array = np.array(img).astype(np.uint8)[..., :3]
+        if apply_codec_compression:
+            img_array = LTX2AVDenoisingStage._apply_video_codec_compression(
+                img_array, crf=codec_crf
+            )
+        tensor = (
+            torch.from_numpy(img_array.astype(np.float32))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device=device)
+        )
+        src_h, src_w = tensor.shape[2], tensor.shape[3]
+        scale = max(height / src_h, width / src_w)
+        new_h, new_w = math.ceil(src_h * scale), math.ceil(src_w * scale)
+        tensor = torch.nn.functional.interpolate(
+            tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
+        )
+        top, left = (new_h - height) // 2, (new_w - width) // 2
+        tensor = tensor[:, :, top : top + height, left : left + width]
+        return ((tensor / 127.5 - 1.0).to(dtype=dtype)).unsqueeze(2)
+
+    @staticmethod
     def _pil_to_normed_tensor(img: PIL.Image.Image) -> torch.Tensor:
         # PIL -> numpy [0,1] -> torch [B,C,H,W], then [-1,1]
         arr = pil_to_numpy(img)
@@ -155,31 +219,33 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
 
         img = load_image(image_path)
-        img = self._resize_center_crop(
+        batch.condition_image = self._resize_center_crop(
             img, width=int(batch.width), height=int(batch.height)
         )
-        batch.condition_image = img
 
         latents_device = (
             batch.latents.device
             if isinstance(batch.latents, torch.Tensor)
             else torch.device("cpu")
         )
-        image_tensor = self._pil_to_normed_tensor(img).to(
-            latents_device, dtype=torch.float32
-        )
-        # [B, C, H, W] -> [B, C, 1, H, W]
-        video_condition = image_tensor.unsqueeze(2)
-
-        self.vae = self.vae.to(latents_device)
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        encode_dtype = batch.latents.dtype
+        original_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
+            original_dtype != torch.float32
         ) and not server_args.disable_autocast
+
+        video_condition = self._resize_center_crop_tensor(
+            img,
+            width=int(batch.width),
+            height=int(batch.height),
+            device=latents_device,
+            dtype=encode_dtype,
+        )
 
         with torch.autocast(
             device_type=current_platform.device_type,
-            dtype=vae_dtype,
+            dtype=original_dtype,
             enabled=vae_autocast_enabled,
         ):
             try:
@@ -188,7 +254,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
             except Exception:
                 pass
             if not vae_autocast_enabled:
-                video_condition = video_condition.to(vae_dtype)
+                video_condition = video_condition.to(encode_dtype)
 
             latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
             if isinstance(latent_dist, AutoencoderKLOutput):
@@ -204,19 +270,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
         else:
             raise ValueError(f"Unsupported encode_sample_mode: {mode}")
 
-        # Match the normalized latent space used by this pipeline (inverse of DecodingStage.scale_and_shift).
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                device=latent.device, dtype=latent.dtype, vae=self.vae
-            )
-        )
-        if isinstance(shift_factor, torch.Tensor):
-            shift_factor = shift_factor.to(latent.device)
-        if isinstance(scaling_factor, torch.Tensor):
-            scaling_factor = scaling_factor.to(latent.device)
-        if shift_factor is not None:
-            latent = latent - shift_factor
-        latent = latent * scaling_factor
+        # Per-channel normalization: normalized = (x - mean) / std
+        mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
+        std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
+        latent = (latent - mean) / std
 
         packed = server_args.pipeline_config.maybe_pack_latents(
             latent, latent.shape[0], batch
@@ -248,6 +305,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 batch.height,
             )
 
+        self.vae.to(original_dtype)
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
 
@@ -481,18 +539,24 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
                         # Velocity -> denoised (x0): x0 = x - sigma * v
                         sigma_val = float(sigma.item())
-                        denoised_video = latents.float() - sigma_val * v_pos
-                        denoised_audio = audio_latents.float() - sigma_val * a_v_pos
+                        denoised_video = (latents.float() - sigma_val * v_pos).to(
+                            latents.dtype
+                        )
+                        denoised_audio = (
+                            audio_latents.float() - sigma_val * a_v_pos
+                        ).to(audio_latents.dtype)
 
                         if (
                             batch.do_classifier_free_guidance
                             and v_neg is not None
                             and a_v_neg is not None
                         ):
-                            denoised_video_neg = latents.float() - sigma_val * v_neg
+                            denoised_video_neg = (
+                                latents.float() - sigma_val * v_neg
+                            ).to(latents.dtype)
                             denoised_audio_neg = (
                                 audio_latents.float() - sigma_val * a_v_neg
-                            )
+                            ).to(audio_latents.dtype)
                             denoised_video = denoised_video + (
                                 batch.guidance_scale - 1.0
                             ) * (denoised_video - denoised_video_neg)
@@ -517,17 +581,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             v_video = torch.zeros_like(denoised_video)
                             v_audio = torch.zeros_like(denoised_audio)
                         else:
-                            v_video = (latents.float() - denoised_video) / sigma_val
+                            v_video = (
+                                (latents.float() - denoised_video.float()) / sigma_val
+                            ).to(latents.dtype)
                             v_audio = (
-                                audio_latents.float() - denoised_audio
-                            ) / sigma_val
+                                (audio_latents.float() - denoised_audio.float())
+                                / sigma_val
+                            ).to(audio_latents.dtype)
 
-                        latents = (latents.float() + v_video * dt).to(
+                        latents = (latents.float() + v_video.float() * dt).to(
                             dtype=latents.dtype
                         )
-                        audio_latents = (audio_latents.float() + v_audio * dt).to(
-                            dtype=audio_latents.dtype
-                        )
+                        audio_latents = (
+                            audio_latents.float() + v_audio.float() * dt
+                        ).to(dtype=audio_latents.dtype)
 
                         if do_ti2v:
                             latents[:, :num_img_tokens, :] = batch.image_latent[
