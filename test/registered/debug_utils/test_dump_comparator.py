@@ -108,7 +108,7 @@ class TestEndToEnd(CustomTestCase):
                 dumper.step()
                 dumper.dump("tensor_b", tensor * 2)
                 dumper.step()
-                dump_dirs.append(Path(d) / f"sglang_dump_{dumper._config.partial_name}")
+                dump_dirs.append(Path(d) / dumper._config.exp_name)
 
             args = Namespace(
                 baseline_path=str(dump_dirs[0]),
