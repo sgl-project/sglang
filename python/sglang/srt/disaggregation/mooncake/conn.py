@@ -460,9 +460,9 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1)
-        tokens_per_page = np.arange(page_size, dtype=np.int32).reshape(1, -1)
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
         src_token_slot_offsets = (
