@@ -1821,8 +1821,7 @@ class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
         # core fields NOT duplicated with prefix
         for field in ("input_ids", "positions", "seq_lens"):
             assert not any(
-                k.startswith("non_intrusive__") and k.endswith(field)
-                for k in captured
+                k.startswith("non_intrusive__") and k.endswith(field) for k in captured
             )
 
         # ForwardBatch skipped on sub-modules (no duplication)
