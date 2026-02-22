@@ -70,7 +70,7 @@ sglang generate \
   --model-path Qwen/Qwen-Image \
   --prompt "change the raccoon to a cute cat" \
   --save-output \
-  --transformer-quantized-path /path/to/svdq-int4_r32-qwen-image.safetensors
+  --transformer-weights-path /path/to/svdq-int4_r32-qwen-image.safetensors
 ```
 
 **Manual Override (If needed):**
@@ -89,7 +89,7 @@ sglang generate \
   --model-path Qwen/Qwen-Image \
   --prompt "a beautiful sunset" \
   --enable-svdquant \
-  --transformer-quantized-path /path/to/custom_model.safetensors \
+  --transformer-weights-path /path/to/custom_model.safetensors \
   --quantization-precision int4 \
   --quantization-rank 128
 ```
@@ -108,7 +108,7 @@ Choose the appropriate configuration based on your hardware and requirements:
 
 ### Notes
 
-1.  Model Path Correspondence: `--model-path` should point to the original non-quantized model (for loading config and tokenizer, etc.), while `--transformer-quantized-path` points to the quantized weight file.
+1.  Model Path Correspondence: `--model-path` should point to the original non-quantized model (for loading config and tokenizer, etc.), while `--transformer-weights-path` points to the quantized weight file / folder / Huggingface Repo ID.
 
 2.  Auto-Detection Requirements: For auto-detection to work, the filename must contain the pattern `svdq-{precision}_r{rank}` (e.g., `svdq-int4_r32`).
 
@@ -152,14 +152,18 @@ python -m sglang.multimodal_gen.tools.convert_hf_to_fp8 \
 
 #### Option 2: Pre-quantized single-file checkpoint (no `config.json`)
 
-Some providers (e.g., [black-forest-labs/FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)) distribute a single `.safetensors` file without a companion `config.json`. Use `--transformer-quantized-path` to point to this file while keeping `--model-path` for the base model:
+
+
+Some providers (e.g., [black-forest-labs/FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8)) distribute a single `.safetensors` file without a companion `config.json`. Use `--transformer-weights-path` to point to this file (or HuggingFace repo ID) while keeping `--model-path` for the base model:
 
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.2-klein-9B \
-  --transformer-quantized-path /path/to/flux-2-klein-9b-fp8.safetensors \
+  --transformer-weights-path black-forest-labs/FLUX.2-klein-9b-fp8 \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
 
 SGLang-Diffusion will automatically read the `quantization_config` metadata embedded in the safetensors file header (if present). For the quant config to be auto-detected, the file's metadata must contain a JSON-encoded `quantization_config` key with at least a `quant_method` field (e.g. `"fp8"`).
+
+Note: this feature is a WIP

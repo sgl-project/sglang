@@ -291,7 +291,7 @@ class ServerArgs:
     component_paths: dict[str, str] = field(default_factory=dict)
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
-    transformer_quantized_path: str | None = None
+    transformer_weights_path: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -405,17 +405,17 @@ class ServerArgs:
         ncfg.validate()
 
         # propagate the path to server_args
-        if ncfg.transformer_quantized_path:
-            self.transformer_quantized_path = ncfg.transformer_quantized_path
+        if ncfg.transformer_weights_path:
+            self.transformer_weights_path = ncfg.transformer_weights_path
 
-        if not ncfg.enable_svdquant or not ncfg.transformer_quantized_path:
+        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
             self.nunchaku_config = None
         else:
             self.nunchaku_config = NunchakuConfig(
                 precision=self.nunchaku_config.quantization_precision,
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                transformer_quantized_path=self.nunchaku_config.transformer_quantized_path,
+                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
             )
 
     def _adjust_offload(self):
