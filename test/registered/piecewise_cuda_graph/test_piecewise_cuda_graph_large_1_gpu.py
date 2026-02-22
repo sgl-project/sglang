@@ -27,7 +27,6 @@ class TestPiecewiseCudaGraphQwen3MoE(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
             ],
@@ -65,7 +64,7 @@ class TestPiecewiseCudaGraphGPTQ(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-piecewise-cuda-graph"],
+            other_args=[],
         )
 
     @classmethod
@@ -101,7 +100,7 @@ class TestPiecewiseCudaGraphAWQ(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-piecewise-cuda-graph"],
+            other_args=[],
         )
 
     @classmethod

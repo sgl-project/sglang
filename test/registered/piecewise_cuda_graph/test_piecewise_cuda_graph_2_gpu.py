@@ -27,7 +27,6 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--tp",
