@@ -395,12 +395,12 @@ class Scheduler:
                         if self._warmup_total > 0:
                             logger.info(
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                         else:
                             logger.info(
                                 f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                     else:
                         if self._warmup_total > 0:

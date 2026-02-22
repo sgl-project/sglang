@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -15,7 +16,10 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    CYAN,
+    RESET,
     _SGLDiffusionLogger,
     get_is_main_process,
     init_logger,
@@ -184,13 +188,13 @@ class StageProfiler:
         self,
         stage_name: str,
         logger: _SGLDiffusionLogger,
-        timings: Optional["RequestMetrics"],
+        metrics: Optional["RequestMetrics"],
         log_stage_start_end: bool = False,
         perf_dump_path_provided: bool = False,
         capture_memory: bool = False,
     ):
         self.stage_name = stage_name
-        self.timings = timings
+        self.metrics = metrics
         self.logger = logger
         self.start_time = 0.0
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
@@ -199,9 +203,12 @@ class StageProfiler:
 
     def __enter__(self):
         if self.log_stage_start_end:
-            self.logger.info(f"[{self.stage_name}] started...")
+            msg = f"[{self.stage_name}] started..."
+            if self.logger.isEnabledFor(logging.DEBUG):
+                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
+            self.logger.info(msg)
 
-        if (self.log_timing and self.timings) or self.log_stage_start_end:
+        if (self.log_timing and self.metrics) or self.log_stage_start_end:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
                 and self.stage_name.startswith("denoising_step_")
@@ -213,7 +220,7 @@ class StageProfiler:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.log_timing and self.timings) or self.log_stage_start_end):
+        if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
             return False
 
         if (
@@ -239,17 +246,17 @@ class StageProfiler:
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 
-        if self.log_timing and self.timings:
+        if self.log_timing and self.metrics:
             if "denoising_step_" in self.stage_name:
                 index = int(self.stage_name[len("denoising_step_") :])
-                self.timings.record_steps(index, execution_time_s)
+                self.metrics.record_steps(index, execution_time_s)
             else:
-                self.timings.record_stage(self.stage_name, execution_time_s)
+                self.metrics.record_stage(self.stage_name, execution_time_s)
 
             # capture memory snapshot after stage if requested
             if self.capture_memory and torch.cuda.is_available():
                 snapshot = capture_memory_snapshot()
-                self.timings.record_memory_snapshot(
+                self.metrics.record_memory_snapshot(
                     f"after_{self.stage_name}", snapshot
                 )
 
@@ -269,7 +276,7 @@ class PerformanceLogger:
     def dump_benchmark_report(
         cls,
         file_path: str,
-        timings: "RequestMetrics",
+        metrics: "RequestMetrics",
         meta: Optional[Dict[str, Any]] = None,
         tag: str = "benchmark_dump",
     ):
@@ -279,25 +286,25 @@ class PerformanceLogger:
         """
         formatted_steps = [
             {"name": name, "duration_ms": duration_ms}
-            for name, duration_ms in timings.stages.items()
+            for name, duration_ms in metrics.stages.items()
         ]
 
         denoise_steps_ms = [
             {"step": idx, "duration_ms": duration_ms}
-            for idx, duration_ms in enumerate(timings.steps)
+            for idx, duration_ms in enumerate(metrics.steps)
         ]
 
         memory_checkpoints = {
             name: snapshot.to_dict()
-            for name, snapshot in timings.memory_snapshots.items()
+            for name, snapshot in metrics.memory_snapshots.items()
         }
 
         report = {
             "timestamp": datetime.now(UTC).isoformat(),
-            "request_id": timings.request_id,
+            "request_id": metrics.request_id,
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
-            "total_duration_ms": timings.total_duration_ms,
+            "total_duration_ms": metrics.total_duration_ms,
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,
@@ -309,14 +316,14 @@ class PerformanceLogger:
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
-            logger.info(f"Metrics dumped to: {abs_path}")
+            logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
 
     @classmethod
     def log_request_summary(
         cls,
-        timings: "RequestMetrics",
+        metrics: "RequestMetrics",
         tag: str = "total_inference_time",
     ):
         """logs the stage metrics and total duration for a completed request
@@ -326,21 +333,21 @@ class PerformanceLogger:
         """
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}
-            for name, duration_ms in timings.stages.items()
+            for name, duration_ms in metrics.stages.items()
         ]
 
         memory_checkpoints = {
             name: snapshot.to_dict()
-            for name, snapshot in timings.memory_snapshots.items()
+            for name, snapshot in metrics.memory_snapshots.items()
         }
 
         record = RequestPerfRecord(
-            timings.request_id,
+            metrics.request_id,
             commit_hash=get_git_commit_hash(),
             tag="pipeline_stage_metrics",
             stages=formatted_stages,
-            steps=timings.steps,
-            total_duration_ms=timings.total_duration_ms,
+            steps=metrics.steps,
+            total_duration_ms=metrics.total_duration_ms,
             memory_snapshots=memory_checkpoints,
         )
 
