@@ -79,10 +79,14 @@ class TransformerLoader(ComponentLoader):
     ) -> Optional[dict]:
         # priority: model config.json → safetensors metadata → nunchaku config
         quant_config = get_quant_config(hf_config)
-        if quant_config is None:
-            quant_config = get_quant_config_from_safetensors_metadata(
-                safetensors_list[0]
-            )
+        if quant_config is None and server_args.transformer_weights_path:
+            # try to read quantization_config from the safetensors metadata header
+            for safetensors_file in safetensors_list:
+                quant_config = get_quant_config_from_safetensors_metadata(
+                    safetensors_file
+                )
+                if quant_config:
+                    break
         return quant_config
 
     def _resolve_target_param_dtype(
