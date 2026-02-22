@@ -81,13 +81,6 @@ def is_symmetric_memory_enabled():
         return False
 
 
-def _is_dynamo_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    if compiler is not None and hasattr(compiler, "is_dynamo_compiling"):
-        return compiler.is_dynamo_compiling()
-    return torch._dynamo.is_compiling()
-
-
 def set_graph_pool_id(graph_pool_id):
     global _graph_pool_id
     _graph_pool_id = graph_pool_id
@@ -217,6 +210,6 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
         or disabled
         or group_coordinator.world_size == 1
         # torch.cuda.use_mem_pool is skipped by Dynamo and cannot be traced.
-        or _is_dynamo_compiling()
+        or torch.compiler.is_dynamo_compiling()
     )
     return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()

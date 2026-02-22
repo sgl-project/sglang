@@ -69,13 +69,6 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
 
-def _is_dynamo_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    if compiler is not None and hasattr(compiler, "is_dynamo_compiling"):
-        return compiler.is_dynamo_compiling()
-    return torch._dynamo.is_compiling()
-
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.get_device_module().Stream
@@ -593,7 +586,7 @@ class GroupCoordinator:
             and self.is_symmetric_memory_enabled()
             # Direct pynccl calls rely on ctypes/C-extension objects and
             # contextmanager state transitions that Dynamo cannot trace.
-            and not _is_dynamo_compiling()
+            and not torch.compiler.is_dynamo_compiling()
         ):
             with self.pynccl_comm.change_state(
                 enable=True, stream=get_current_device_stream_fast()
