@@ -153,6 +153,9 @@ def process_file(
             and "txt_in" not in key
             and "time_in" not in key
             and "vector_in" not in key
+            and "adaLN_modulation" not in key
+            and "all_final_layer" not in key
+            and "feed_forward" not in key
             and "proj_out.weight" != key
         ):
             qw, s = quant_fp8(weights[key], strategy, block_size)

@@ -145,12 +145,6 @@ class TransformerLoader(ComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
-        if cls_name is None:
-            raise ValueError(
-                "Model config does not contain a _class_name attribute. "
-                "Only diffusers format is supported."
-            )
-
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         nunchaku_config = server_args.nunchaku_config
