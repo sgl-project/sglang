@@ -1689,6 +1689,65 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
 
         assert len(captured) == 0
 
+    def test_reset_removes_hooks(self, tmp_path):
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+        assert len(captured) > 0
+
+        d.reset()
+
+        d.configure(enable=True, dir=str(tmp_path), non_intrusive_mode="all")
+        with d.capture_output() as captured_after_reset:
+            model(x)
+        assert len(captured_after_reset) == 0, (
+            "Hooks should have been removed by reset(); "
+            f"got {list(captured_after_reset.keys())}"
+        )
+
+    def test_reset_then_reregister_no_duplication(self, tmp_path):
+        call_count = 0
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                nonlocal call_count
+                call_count += 1
+                return self.linear(x)
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+
+        d.register_non_intrusive_dumper(model)
+        d.reset()
+        d.configure(enable=True, dir=str(tmp_path), non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        with d.capture_output() as captured:
+            model(x)
+
+        for entry in captured.values():
+            assert entry["count"] == 1, (
+                "Each key should be dumped exactly once after reset+reregister; "
+                f"got count={entry['count']}"
+            )
+
 
 def _make_forward_batch():
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

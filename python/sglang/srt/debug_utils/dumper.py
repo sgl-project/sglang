@@ -201,6 +201,7 @@ class _Dumper:
     def __init__(self, *, config: DumperConfig):
         self._config = config
         self._state = _DumperState()
+        self._non_intrusive: Optional["_NonIntrusiveDumper"] = None
 
     # ------------------------------- public :: core ---------------------------------
 
@@ -281,7 +282,9 @@ class _Dumper:
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-        return _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        nid = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        self._non_intrusive = nid
+        return nid
 
     # ------------------------------- public :: secondary ---------------------------------
 
@@ -292,6 +295,9 @@ class _Dumper:
         self._config = self._config.with_defaults(**kwargs)
 
     def reset(self) -> None:
+        if self._non_intrusive is not None:
+            self._non_intrusive.remove()
+            self._non_intrusive = None
         self._state = _DumperState()
 
     @contextmanager
@@ -489,6 +495,9 @@ class _NonIntrusiveDumper:
     ):
         self._dumper = dumper
         self._mode = mode
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._root_module: Optional["torch.nn.Module"] = None
+        self._original_forward: Optional[Callable] = None
 
         for module_name, module in model.named_modules():
             if ctx := self._detect_module_ctx(module_name, module):
@@ -499,12 +508,24 @@ class _NonIntrusiveDumper:
                 module_name=module_name, is_root=is_root
             )
             hook = self._make_forward_hook(module_name=module_name, is_root=is_root)
-            _register_forward_hook_or_replace_fn(
+            if is_root:
+                self._root_module = module
+                self._original_forward = module.forward
+            self._handles += _register_forward_hook_or_replace_fn(
                 module,
                 pre_hook=pre_hook,
                 hook=hook,
                 mode="replace_fn" if is_root else "hook",
             )
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        if self._root_module is not None and self._original_forward is not None:
+            self._root_module.forward = self._original_forward
+            self._root_module = None
+            self._original_forward = None
 
     @classmethod
     def _detect_module_ctx(
@@ -519,12 +540,16 @@ class _NonIntrusiveDumper:
 
     def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
         clear_ctx = {k: None for k in ctx}
-        module.register_forward_pre_hook(
-            lambda _mod, _input, _ctx=ctx: self._dumper.set_ctx(**_ctx)
+        self._handles.append(
+            module.register_forward_pre_hook(
+                lambda _mod, _input, _ctx=ctx: self._dumper.set_ctx(**_ctx)
+            )
         )
-        module.register_forward_hook(
-            lambda _mod, _input, _output, _clear=clear_ctx: self._dumper.set_ctx(
-                **_clear
+        self._handles.append(
+            module.register_forward_hook(
+                lambda _mod, _input, _output, _clear=clear_ctx: self._dumper.set_ctx(
+                    **_clear
+                )
             )
         )
 
@@ -579,7 +604,7 @@ def _register_forward_hook_or_replace_fn(
     pre_hook,
     hook,
     mode: str,
-) -> None:
+) -> list["torch.utils.hooks.RemovableHandle"]:
     """Attach pre/post forward hooks to *module*.
 
     mode="hook"       — standard ``register_forward_pre_hook`` / ``register_forward_hook``
@@ -587,10 +612,14 @@ def _register_forward_hook_or_replace_fn(
     mode="replace_fn" — monkey-patch ``module.forward`` so hooks fire even when
                         callers invoke ``.forward()`` directly (as sglang does for the
                         root model).
+
+    Returns a list of :class:`RemovableHandle` objects (empty for ``replace_fn``).
     """
     if mode == "hook":
-        module.register_forward_pre_hook(pre_hook)
-        module.register_forward_hook(hook)
+        return [
+            module.register_forward_pre_hook(pre_hook),
+            module.register_forward_hook(hook),
+        ]
     elif mode == "replace_fn":
         original_forward = module.forward
 
@@ -602,6 +631,7 @@ def _register_forward_hook_or_replace_fn(
             return output
 
         module.forward = _wrapped
+        return []
     else:
         raise ValueError(f"Unknown mode {mode!r}")
 
