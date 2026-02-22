@@ -1,4 +1,3 @@
-# Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 """get_rope_index implementations for Qwen2-VL/Qwen3-VL, Qwen3-Omni, GLM4V, Ernie4.5."""
 
 from __future__ import annotations
@@ -144,9 +143,7 @@ def get_rope_index(
                 llm_grid_w = w_int // spatial_merge_size
                 text_len = ed - st
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 llm_pos_ids_list.append(
                     torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
@@ -189,9 +186,7 @@ def get_rope_index(
                 st = ed + llm_grid_t * llm_grid_h * llm_grid_w
             if st < len(input_tokens):
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 text_len = len(input_tokens) - st
                 llm_pos_ids_list.append(
@@ -209,9 +204,7 @@ def get_rope_index(
     else:
         s = input_ids.shape[1]
         position_ids = torch.arange(s)
-        position_ids = (
-            position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-        )
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
         max_position_ids = position_ids.amax(dim=0, keepdim=False)
         mrope_position_deltas = max_position_ids.amax(-1, keepdim=True) + 1 - s
         return position_ids, mrope_position_deltas
@@ -278,9 +271,7 @@ def get_rope_index_qwen3_omni(
             )
             for _ in range(multimodal_nums):
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 ed_vision_start = (
                     input_tokens.index(vision_start_token_id, st)
@@ -305,10 +296,7 @@ def get_rope_index_qwen3_omni(
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
                     st_idx += text_len
-                if (
-                    min_ed == ed_vision_start
-                    and ed_vision_start + 1 == ed_audio_start
-                ):
+                if min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start:
                     bos_len, eos_len = 2, 2
                 else:
                     bos_len, eos_len = 1, 1
@@ -386,8 +374,7 @@ def get_rope_index_qwen3_omni(
                     remain_videos -= 1
                 # Audio in Video
                 elif (
-                    min_ed == ed_vision_start
-                    and ed_vision_start + 1 == ed_audio_start
+                    min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start
                 ):
                     audio_len = _get_feat_extract_output_lengths(
                         audio_seqlens[audio_idx]
@@ -455,18 +442,14 @@ def get_rope_index_qwen3_omni(
                     remain_videos -= 1
                     remain_audios -= 1
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 llm_pos_ids_list.append(
                     torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx
                 )
             if st < len(input_tokens):
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 text_len = len(input_tokens) - st
                 llm_pos_ids_list.append(
@@ -486,12 +469,10 @@ def get_rope_index_qwen3_omni(
     else:
         s = input_ids.shape[1]
         position_ids = torch.arange(s)
-        position_ids = (
-            position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-        )
-        max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-            -1, keepdim=True
-        )[0]
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+        max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[
+            0
+        ]
         mrope_position_deltas = max_position_ids + 1 - s
         return position_ids, mrope_position_deltas
 
@@ -665,15 +646,11 @@ def get_rope_index_glm4v(
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             position_ids = (
-                position_ids.unsqueeze(0)
-                .expand(3, -1, -1)
-                .to(attention_mask.device)
+                position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
             )
             max_position_ids = position_ids.amax(dim=0, keepdim=False)
             mrope_position_deltas = (
-                max_position_ids.amax(-1, keepdim=True)
-                + 1
-                - attention_mask.shape[-1]
+                max_position_ids.amax(-1, keepdim=True) + 1 - attention_mask.shape[-1]
             )
         else:
             length = input_ids.shape[1]
@@ -746,9 +723,7 @@ def get_rope_index_ernie45(
             video_frame_num = 1
             for modality_type, start_idx, end_idx in input_type_group:
                 st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
+                    llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
 
                 if modality_type == "image":
@@ -843,11 +818,9 @@ def get_rope_index_ernie45(
     else:
         s = input_ids.shape[1]
         position_ids = torch.arange(s)
-        position_ids = (
-            position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-        )
-        max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-            -1, keepdim=True
-        )[0]
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+        max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[
+            0
+        ]
         mrope_position_deltas = max_position_ids + 1 - s
         return position_ids, mrope_position_deltas

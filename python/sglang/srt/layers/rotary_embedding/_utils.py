@@ -1,4 +1,3 @@
-# Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 """Primitive rotary embedding ops: _rotate_neox, _rotate_gptj, _apply_rotary_emb,
 apply_rotary_pos_emb variants."""
 

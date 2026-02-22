@@ -1,4 +1,3 @@
-# Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 """Phi3LongRoPE, FourierRoPE, DeepseekScaling, Llama3, Llama4Vision,
 DynamicNTKAlpha, DualChunkRotaryEmbedding."""
 
@@ -267,10 +266,16 @@ class FourierRotaryEmbedding(nn.Module):
             sin = torch.einsum("tD, Dd -> td", pos_sin, self.sin_coef.float())
             cos = torch.einsum("tD, Dd -> td", pos_cos, self.cos_coef.float())
         sin = F.pad(
-            input=sin, pad=(0, self.head_size // 2 - sin.size(-1)), mode="constant", value=1
+            input=sin,
+            pad=(0, self.head_size // 2 - sin.size(-1)),
+            mode="constant",
+            value=1,
         )
         cos = F.pad(
-            input=cos, pad=(0, self.head_size // 2 - cos.size(-1)), mode="constant", value=1
+            input=cos,
+            pad=(0, self.head_size // 2 - cos.size(-1)),
+            mode="constant",
+            value=1,
         )
         sin = torch.cat((sin, sin), dim=-1)
         cos = torch.cat((cos, cos), dim=-1)
@@ -297,7 +302,9 @@ class FourierRotaryEmbedding(nn.Module):
             dtype=query.dtype
         )
         cos, sin = cos_sin.chunk(2, dim=-1)
-        assert query.dim() == key.dim() == 3, "Expected query key (seq_len, heads, head_dim)"
+        assert (
+            query.dim() == key.dim() == 3
+        ), "Expected query key (seq_len, heads, head_dim)"
         assert cos.dim() <= 3 and sin.dim() <= 3
         need_reshape = False
         if cos.dim() == 3:
@@ -491,10 +498,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
         query_rot = torch_npu.npu_interleave_rope(
-            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim), cos, sin,
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
         )
         key_rot = torch_npu.npu_interleave_rope(
-            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim), cos, sin,
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
         )
         query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
         key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
