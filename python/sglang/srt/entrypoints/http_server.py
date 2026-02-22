@@ -156,7 +156,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
-from sglang.utils import get_exception_traceback
+from sglang.utils import _prebind_listening_socket, get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -1889,74 +1889,80 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    tokenizer_manager, template_manager, scheduler_infos, port_args = (
-        _launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
-    )
-
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-
-    # Set global states
-    set_global_state(
-        _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
-            scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
-        )
-    )
-
-    if server_args.enable_metrics:
-        add_prometheus_track_response_middleware(app)
-
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
-    if server_args.tokenizer_worker_num == 1:
-        # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_kwargs = dict(
-            server_args=server_args,
-            launch_callback=launch_callback,
-            execute_warmup_func=execute_warmup_func,
-        )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            server_args.api_key
-            or server_args.admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
-            )
-    else:
-        # If it is multi-tokenizer mode, we need to write the arguments to shared memory
-        # for other worker processes to read.
-        app.is_single_tokenizer_mode = False
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
-        )
+    # Reserve the HTTP port before launching subprocesses to fail fast if port is unavailable.
+    # This prevents wasting time loading models only to discover port conflicts later.
+    reserved_socket = _prebind_listening_socket(server_args.host, server_args.port)
 
     try:
+        # Launch subprocesses
+        tokenizer_manager, template_manager, scheduler_infos, port_args = (
+            _launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=init_tokenizer_manager_func,
+                run_scheduler_process_func=run_scheduler_process_func,
+                run_detokenizer_process_func=run_detokenizer_process_func,
+            )
+        )
+
+        # Parse info got from the schedulers
+        remote_instance_transfer_engine_info = (
+            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                scheduler_infos
+            )
+        )
+
+        # Set global states
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=template_manager,
+                scheduler_info=scheduler_infos[0],
+                remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
+            )
+        )
+
+        if server_args.enable_metrics:
+            add_prometheus_track_response_middleware(app)
+
+        # Pass additional arguments to the lifespan function.
+        # They will be used for additional initialization setups.
+        if server_args.tokenizer_worker_num == 1:
+            # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
+            app.is_single_tokenizer_mode = True
+            app.server_args = server_args
+            app.warmup_thread_kwargs = dict(
+                server_args=server_args,
+                launch_callback=launch_callback,
+                execute_warmup_func=execute_warmup_func,
+            )
+
+            # Add api key authorization
+            # This is only supported in single tokenizer mode.
+            #
+            # Backward compatibility:
+            # - api_key only: behavior matches legacy (all endpoints require api_key)
+            # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+            #   admin_api_key is not configured.
+            if (
+                server_args.api_key
+                or server_args.admin_api_key
+                or app_has_admin_force_endpoints(app)
+            ):
+                from sglang.srt.utils.auth import add_api_key_middleware
+
+                add_api_key_middleware(
+                    app,
+                    api_key=server_args.api_key,
+                    admin_api_key=server_args.admin_api_key,
+                )
+        else:
+            # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+            # for other worker processes to read.
+            app.is_single_tokenizer_mode = False
+            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, scheduler_infos[0]
+            )
+
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
@@ -1965,8 +1971,7 @@ def launch_server(
             # Default case, one tokenizer process
             uvicorn.run(
                 app,
-                host=server_args.host,
-                port=server_args.port,
+                fd=reserved_socket.fileno(),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
@@ -1985,8 +1990,7 @@ def launch_server(
 
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
+                fd=reserved_socket.fileno(),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
@@ -1994,6 +1998,10 @@ def launch_server(
                 workers=server_args.tokenizer_worker_num,
             )
     finally:
+        # Close the reserved socket after uvicorn exits or on any error
+        # This ensures the port is released even if initialization fails
+        reserved_socket.close()
+
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
