@@ -66,6 +66,22 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        if (
+            isinstance(self.kv_cache, NSATokenToKVPool)
+            and server_args.hicache_storage_backend == "mooncake"
+            and server_args.hicache_mem_layout
+            not in ["page_first", "page_first_direct"]
+        ):
+            server_args.hicache_mem_layout = (
+                "page_first_direct"
+                if server_args.hicache_io_backend == "direct"
+                else "page_first"
+            )
+            logger.warning(
+                "Mooncake storage backend with NSA requires page_first layout, "
+                f"switching to {server_args.hicache_mem_layout}."
+            )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
