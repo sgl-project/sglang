@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
+from sglang.jit_kernel.fused_store_index_cache import (
+    can_use_nsa_fused_store,
+    fused_store_index_k_cache,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -670,16 +674,24 @@ class Indexer(MultiPlatformOp):
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
+
+        if can_use_nsa_fused_store():
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            fused_store_index_k_cache(key, buf, forward_batch.out_cache_loc)
+        else:
+            # Fallback
+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=forward_batch.out_cache_loc,
+                index_k=k_fp8,
+                index_k_scale=k_scale,
+            )
 
         # MHA doesn't need topk_indices
         if not return_indices:
@@ -928,6 +940,48 @@ class Indexer(MultiPlatformOp):
         topk_indices = torch.cat(topk_indices_list, dim=0)
         return topk_indices
 
+    def _store_index_k_cache(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key_bf16: torch.Tensor,
+        *,
+        act_quant=None,  # fallback only
+    ) -> None:
+        """
+        Store NSA indexer K cache for current step.
+
+        Preferred: fused_store_index_k_cache(key_bf16, cache_u8, out_cache_loc_i64)
+        Fallback : act_quant(key_bf16) + token_to_kv_pool.set_index_k_scale_buffer(...)
+        """
+
+        # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
+        if can_use_nsa_fused_store() and _is_cuda and (not _is_fp8_fnuz):
+            if forward_batch.token_to_kv_pool.page_size == 64:
+                # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
+                cache_u8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=layer_id
+                )
+                fused_store_index_k_cache(
+                    key_bf16, cache_u8, forward_batch.out_cache_loc
+                )
+                return
+
+        # Fallback: original path
+        assert act_quant is not None
+        k_fp8, k_scale = act_quant(key_bf16, self.block_size, self.scale_fmt)
+
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+
+        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+            layer_id=layer_id,
+            loc=out_loc,
+            index_k=k_fp8,
+            index_k_scale=k_scale,
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -985,6 +1039,9 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
 
+        buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -994,7 +1051,12 @@ class Indexer(MultiPlatformOp):
             )
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key_bf16=key,
+                    act_quant=act_quant,
+                )
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         else:
@@ -1008,11 +1070,21 @@ class Indexer(MultiPlatformOp):
 
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 with torch.cuda.stream(self.alt_stream):
-                    k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                    self._store_index_k_cache(
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        key_bf16=key,
+                        act_quant=act_quant,
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+                self._store_index_k_cache(
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    key_bf16=key,
+                    act_quant=act_quant,
+                )
 
             # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
             # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
@@ -1047,19 +1119,6 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             weights = self._get_logits_head_gate(x_for_gate, q_scale)
-
-        # k_fp8: (seq_len, head_dim) fp8_e4m3fn
-        # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
-        # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
-        # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        if not forward_batch.out_cache_loc.is_contiguous():
-            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
