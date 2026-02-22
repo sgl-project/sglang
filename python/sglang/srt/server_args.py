@@ -1688,7 +1688,7 @@ class ServerArgs:
                 "Qwen3MoeForCausalLM",
                 "KimiK25ForConditionalGeneration",
             ]
-            and (is_sm90_supported() or is_sm100_supported())
+            and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
             and not self.enable_dp_attention
             and self.nnodes == 1
             and not is_h20_device
@@ -1704,7 +1704,7 @@ class ServerArgs:
         sm100_default_attention_backend: str = None,
     ):
         if (
-            is_sm100_supported()
+            (is_sm100_supported() or is_sm120_supported())
             and self.attention_backend is None
             and sm100_default_attention_backend is not None
         ):
@@ -1820,7 +1820,7 @@ class ServerArgs:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     self.attention_backend = "fa3"
-                elif is_sm100_supported():
+                elif is_sm100_supported() or is_sm120_supported():
                     self.attention_backend = "flashinfer"
                 elif is_hip():
                     head_num = model_config.get_num_kv_heads(self.tp_size)
@@ -1875,9 +1875,9 @@ class ServerArgs:
             self.attention_backend == "trtllm_mla"
             or self.decode_attention_backend == "trtllm_mla"
         ):
-            if not is_blackwell_supported():
+            if not is_sm100_supported():
                 raise ValueError(
-                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
+                    "TRTLLM MLA backend is only supported on SM100 Blackwell GPUs. Please use a different backend."
                 )
 
             if self.page_size not in [32, 64]:
@@ -2308,7 +2308,9 @@ class ServerArgs:
                         )
                     else:
                         self.decode_attention_backend = (
-                            "flashinfer" if is_sm100_supported() else "triton"
+                            "flashinfer"
+                            if is_sm100_supported() or is_sm120_supported()
+                            else "triton"
                         )
                 else:
                     # If user explicitly requested FA3 decode, fall back to direct IO.
