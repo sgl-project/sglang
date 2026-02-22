@@ -1075,6 +1075,8 @@ class MooncakeKVManager(CommonKVManager):
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
             # add further chunks into the transfer queue.
+            if is_last and bootstrap_room in self.request_status:
+                self.update_status(bootstrap_room, KVPoll.Success)
             return
 
         # NOTE(shangming): sharding according to the dst_infos to make sure
