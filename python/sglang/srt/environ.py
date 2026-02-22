@@ -12,7 +12,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
     By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
     for those.  Pass ``allow_sglang=True`` only for special env vars that
-    intentionally bypass ``environ.py`` (e.g. ``SGLANG_DUMPER_*``).
+    intentionally bypass ``environ.py``.
     """
     if not allow_sglang:
         for key in env_vars:
