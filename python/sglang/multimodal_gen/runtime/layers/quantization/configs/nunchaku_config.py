@@ -22,6 +22,7 @@ def is_nunchaku_available() -> bool:
     try:
         import nunchaku  # noqa
 
+        logger.debug("Nunchaku package detected")
         return True
     except Exception:
         return False
