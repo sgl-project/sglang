@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import (
+    ceil_div,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
@@ -101,12 +102,12 @@ def _set_kv_buffer_impl(
     row_bytes = row_dim * store_dtype.itemsize
     if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
-            k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
+            k,
+            v,
+            k_cache,
+            v_cache,
             indices,
-            row_bytes=row_bytes,
+            row_dim=row_dim,
         )
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -659,6 +660,56 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = kv_size_GB
 
+    LAYER_FIRST_LAYOUT = "LNBHD"
+    PAGE_FIRST_LAYOUT = "NBLHD"
+
+    def get_supported_layouts(self) -> List[str]:
+        """Return the supported layout of the KV cache."""
+        return [self.LAYER_FIRST_LAYOUT]  # by default, layer first must be supported
+
+    def check_layout(self, layout: str) -> None:
+        is_valid_layout = len(layout) == 5 and all(c in "LNBHD" for c in layout)
+        supported_layouts = self.get_supported_layouts()
+        if not is_valid_layout or layout not in supported_layouts:
+            raise ValueError(
+                f"Invalid device memory layout {layout}, "
+                f"supported options: {supported_layouts}."
+            )
+
+    @staticmethod
+    def resolve_layout(layout: str, default_layout: str = "layer_first") -> str:
+        COMMON_MAPPING = {
+            "layer_first": KVCache.LAYER_FIRST_LAYOUT,
+            "page_first": KVCache.PAGE_FIRST_LAYOUT,
+        }
+        layout = default_layout if layout == "auto" else layout
+        return COMMON_MAPPING.get(layout, layout)
+
+    @staticmethod
+    def get_layout_mapping(
+        layout: str,
+        *,
+        layer_num: int,
+        page_num: int,
+        page_size: int,
+        head_num: int,
+        head_dim: int,
+    ) -> Tuple[List[int], List[int]]:
+        mapping = {
+            "L": (layer_num, 0),
+            "N": (page_num, 1),
+            "B": (page_size, 2),
+            "H": (head_num, 3),
+            "D": (head_dim, 4),
+        }
+        dim_list: List[int] = []
+        order_list = [-1] * 5
+        for new_idx, c in enumerate(layout):
+            dim, old_idx = mapping[c]
+            dim_list.append(dim)
+            order_list[old_idx] = new_idx
+        return dim_list, order_list
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -714,6 +765,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        layout: str = "auto",
     ):
         super().__init__(
             size,
@@ -725,6 +777,9 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        self.layout = self.resolve_layout(layout)
+        self.check_layout(self.layout)
+
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -798,31 +853,42 @@ class MHATokenToKVPool(KVCache):
             num_stages=2,
         )
 
+    def get_supported_layouts(self) -> List[str]:
+        return [self.PAGE_FIRST_LAYOUT, self.LAYER_FIRST_LAYOUT]
+
     def _create_buffers(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        num_pages = 1 + ceil_div(self.size, self.page_size)
+        dims, orders = self.get_layout_mapping(
+            self.layout,
+            layer_num=self.layer_num,
+            page_num=num_pages,
+            page_size=self.page_size,
+            head_num=self.head_num,
+            head_dim=-1,  # special marker, to be replaced by k/v head_dim
+        )
+        k_dims = [d if d != -1 else self.head_dim for d in dims]
+        v_dims = [d if d != -1 else self.v_head_dim for d in dims]
+        del dims  # avoid misuse
+
+        def create_cache(dims: List[int]) -> torch.Tensor:
+            cache = torch.zeros(dims, dtype=self.store_dtype, device=self.device)
+            # make the desired order by permutation
+            cache = cache.permute(orders)
+            # Now cache in dimension: (layer_num, page_num, page_size, head_num, head_dim)
+            # we flatten the (page_num, page_size) into (num_tokens) for easier indexing
+            return cache.flatten(start_dim=1, end_dim=2)
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                self._k_storage = create_cache(k_dims)
+                self._v_storage = create_cache(v_dims)
+            self.k_buffer = [self._k_storage[i] for i in range(self.layer_num)]
+            self.v_buffer = [self._v_storage[i] for i in range(self.layer_num)]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -844,6 +910,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _clear_buffers(self):
+        del self._k_storage
+        del self._v_storage
         del self.k_buffer
         del self.v_buffer
 
