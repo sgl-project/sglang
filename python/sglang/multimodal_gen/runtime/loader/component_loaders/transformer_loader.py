@@ -134,6 +134,8 @@ class TransformerLoader(ComponentLoader):
 
         # 3. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
+        component_name = _normalize_component_type(component_name)
+        server_args.model_paths[component_name] = component_model_path
         if component_name in ("transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
         elif component_name in ("audio_dit",):
@@ -149,9 +151,6 @@ class TransformerLoader(ComponentLoader):
                 "Model config does not contain a _class_name attribute. "
                 "Only diffusers format is supported."
             )
-
-        component_name = _normalize_component_type(component_name)
-        server_args.model_paths[component_name] = component_model_path
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
