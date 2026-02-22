@@ -496,6 +496,9 @@ class _NonIntrusiveDumper:
         self._dumper = dumper
         self._mode = mode
         self._handles: list = []
+        self._kwarg_rename: dict[str, str] = {}
+        for plugin in _plugins:
+            self._kwarg_rename.update(plugin.kwarg_rename_map())
 
         for module_name, module in model.named_modules():
             if ctx := self._detect_module_ctx(module_name, module):
@@ -545,27 +548,33 @@ class _NonIntrusiveDumper:
         )
 
     def _make_forward_pre_hook(self, *, module_name: str, is_root: bool):
-        def _hook(_module, input):
-            for i, item in enumerate(input):
-                self._dump_value(module_name, item, role=f"inputs.{i}", is_root=is_root)
+        rename = self._kwarg_rename
+
+        def _hook(_module, args, kwargs):
+            for i, item in enumerate(args):
+                self._dump_value(module_name, item, sub_name=f"inputs.{i}", is_root=is_root)
+            for name, value in kwargs.items():
+                effective_name = rename.get(name, name)
+                self._dump_value(module_name, value, sub_name=f"inputs.{effective_name}", is_root=is_root)
 
         return _hook
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
             if output is not None:
-                self._dump_value(module_name, output, role="output", is_root=False)
+                self._dump_value(module_name, output, sub_name="output", is_root=False)
 
         return _hook
 
-    def _dump_value(self, module_name: str, value, role: str, *, is_root: bool) -> None:
+    def _dump_value(self, module_name: str, value: Any, sub_name: str, *, is_root: bool) -> None:
         for key, tensor in self._convert_value(
             value, skip_forward_batch=(not is_root)
         ).items():
-            if key in self._CORE_FIELDS:
-                self._dumper.dump(key, tensor)
+            effective_key = key or sub_name.rsplit(".", 1)[-1]
+            if effective_key in self._CORE_FIELDS:
+                self._dumper.dump(effective_key, tensor)
             elif self._mode == "all":
-                parts = [p for p in (module_name, role, key) if p]
+                parts = [p for p in (module_name, sub_name, key) if p]
                 self._dumper.dump(self._NAME_PREFIX + ".".join(parts), tensor)
 
     @staticmethod
@@ -609,7 +618,7 @@ def _register_forward_hook_or_replace_fn(
     """
     if mode == "hook":
         return [
-            module.register_forward_pre_hook(pre_hook),
+            module.register_forward_pre_hook(pre_hook, with_kwargs=True),
             module.register_forward_hook(hook),
         ]
     elif mode == "replace_fn":
@@ -617,7 +626,7 @@ def _register_forward_hook_or_replace_fn(
 
         @functools.wraps(original_forward)
         def _wrapped(*args, **kwargs):
-            pre_hook(module, args)
+            pre_hook(module, args, kwargs)
             output = original_forward(*args, **kwargs)
             hook(module, args, output)
             return output
@@ -1058,6 +1067,9 @@ class _FrameworkPlugin(ABC):
         """Return 0-indexed layer_id, or None if not detectable."""
         ...
 
+    def kwarg_rename_map(self) -> dict[str, str]:
+        return {}
+
 
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
@@ -1192,6 +1204,9 @@ class _MegatronPlugin(_FrameworkPlugin):
         if hasattr(module, "layer_number"):
             return module.layer_number - 1
         return None
+
+    def kwarg_rename_map(self) -> dict[str, str]:
+        return {"position_ids": "positions"}
 
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
