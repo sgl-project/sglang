@@ -481,6 +481,7 @@ class _Dumper:
 class _NonIntrusiveDumper:
     _NAME_PREFIX = "non_intrusive__"
     _CORE_FIELDS: frozenset[str] = frozenset({"input_ids", "positions"})
+    _LAYER_NAME_RE = re.compile(r"(?:.+\.)?layers\.(\d+)$")
 
     def __init__(
         self,
@@ -492,12 +493,39 @@ class _NonIntrusiveDumper:
         self._mode = mode
 
         for module_name, module in model.named_modules():
+            if ctx := self._detect_module_ctx(module_name, module):
+                self._register_ctx_hooks(module, ctx=ctx)
+
             module.register_forward_hook(
                 self._make_forward_hook(
                     module_name=module_name,
                     is_root=(module_name == ""),
                 )
             )
+
+    @classmethod
+    def _detect_module_ctx(
+        cls, module_name: str, module: "torch.nn.Module"
+    ) -> Optional[dict]:
+        if cls._LAYER_NAME_RE.fullmatch(module_name):
+            # Megatron
+            if hasattr(module, "layer_number"):
+                return {"layer_id": module.layer_number - 1}
+            # SGLang
+            if hasattr(module, "layer_id"):
+                return {"layer_id": module.layer_id}
+        return None
+
+    def _register_ctx_hooks(self, module: "torch.nn.Module", *, ctx: dict) -> None:
+        clear_ctx = {k: None for k in ctx}
+        module.register_forward_pre_hook(
+            lambda _mod, _input, _ctx=ctx: self._dumper.set_ctx(**_ctx)
+        )
+        module.register_forward_hook(
+            lambda _mod, _input, _output, _clear=clear_ctx: self._dumper.set_ctx(
+                **_clear
+            )
+        )
 
     def _make_forward_hook(self, *, module_name: str, is_root: bool):
         def _hook(_module, input, output):
