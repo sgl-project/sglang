@@ -9,11 +9,15 @@ import torch
 from decord import VideoReader, cpu, gpu
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+)
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -255,9 +259,113 @@ class InternVLProcessor(BaseMultimodalProcessor):
         frames_per_video = max(1, max_total_frames // max(num_videos, 1))
         return max(1, min(int(requested), int(frames_per_video)))
 
+    @staticmethod
+    def _has_special_format(image_data, video_data):
+        """Check if any input items use processor_output or precomputed_embedding format."""
+        for data in list(image_data or []) + list(video_data or []):
+            if isinstance(data, dict) and data.get("format") in (
+                "processor_output",
+                "precomputed_embedding",
+            ):
+                return True
+        return False
+
+    async def _process_special_format(
+        self, image_data, video_data, input_text, request_obj, **kwargs
+    ):
+        """Handle processor_output and precomputed_embedding input formats.
+
+        Delegates to the base class process_and_combine_mm_data which has
+        built-in support for these formats.
+        """
+        # When user provides input_ids directly, input_text may be a list of ints
+        if isinstance(input_text, list):
+            user_input_ids = input_text
+            prompt = ""
+        else:
+            user_input_ids = None
+            prompt = input_text or ""
+
+        # When the prompt is empty (user provided input_ids directly),
+        # load_mm_data can't match multimodal tokens to data items.
+        # Build BaseMultiModalProcessorOutput directly from the dict items.
+        if not prompt and (image_data or video_data):
+            images = [d for d in (image_data or []) if isinstance(d, dict)]
+            videos = [d for d in (video_data or []) if isinstance(d, dict)]
+
+            # Raise if raw (non-dict) images/videos were silently filtered out.
+            # InternVL cannot process raw images without a text prompt because
+            # dynamic tiling and placeholder expansion require the prompt string.
+            raw_img_dropped = len(image_data or []) - len(images)
+            raw_vid_dropped = len(video_data or []) - len(videos)
+            if raw_img_dropped > 0 or raw_vid_dropped > 0:
+                raise ValueError(
+                    f"[internvl] Cannot process raw images/videos with pre-tokenized "
+                    f"input_ids. Provide multimodal data in 'processor_output' or "
+                    f"'precomputed_embedding' format, or use a text prompt instead. "
+                    f"(raw images dropped: {raw_img_dropped}, "
+                    f"raw videos dropped: {raw_vid_dropped})"
+                )
+
+            base_output = BaseMultiModalProcessorOutput(
+                input_text=prompt,
+                images=images,
+                videos=videos,
+            )
+        else:
+            base_output = self.load_mm_data(
+                prompt=prompt,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=True,
+            )
+
+        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
+
+        # If user provided input_ids directly, use those and recompute offsets
+        if user_input_ids is not None:
+            input_ids_tensor = torch.tensor(user_input_ids, dtype=torch.long)
+            for mm_item in mm_items:
+                if (
+                    mm_item.modality == Modality.VIDEO
+                    and self.video_token_id is not None
+                ):
+                    mm_token_id = self.video_token_id
+                else:
+                    mm_token_id = self.img_context_token_id
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=input_ids_tensor,
+                    mm_token_id=mm_token_id,
+                )
+
+        return {
+            "input_ids": input_ids_tensor.flatten().tolist(),
+            "mm_items": mm_items,
+            "im_start_id": self.img_start_token_id,
+            "im_end_id": self.img_end_token_id,
+            "im_token_id": self.img_context_token_id,
+            "video_token_id": self.video_token_id,
+        }
+
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+        video_data = getattr(request_obj, "video_data", None) or []
+
+        # Handle processor_output and precomputed_embedding formats
+        if isinstance(input_text, list) or self._has_special_format(
+            image_data, video_data
+        ):
+            return await self._process_special_format(
+                image_data=image_data,
+                video_data=video_data,
+                input_text=input_text,
+                request_obj=request_obj,
+                **kwargs,
+            )
 
         is_internlm2 = self.llm_arch == "InternLM2ForCausalLM"
 
