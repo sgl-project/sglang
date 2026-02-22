@@ -30,6 +30,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -212,6 +214,8 @@ class DataParallelController:
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
+                (BatchTokenizedGenerateReqInput, self.dispatching_with_trace),
+                (BatchTokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
