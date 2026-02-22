@@ -5404,6 +5404,9 @@ class ServerArgs:
                         self.lora_target_modules.discard("embed_tokens")
                         self.lora_target_modules.discard("lm_head")
 
+                    # TODO: find creative solution to differentiate between MoE gate_proj, up_proj, and down_proj and non-MoE gate_proj, up_proj, and down_proj here so we do not have to do
+                    # it later in LoRA Manager
+
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules

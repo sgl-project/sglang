@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -28,7 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
+from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -297,9 +298,43 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
+                # Hack for FusedMoE layer
+                if isinstance(module, FusedMoEWithLoRA) and all(
+                    x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+                ):
+                    gate_up_a = self.memory_pool.get_tensor(
+                        target_module="gate_up_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    )
+                    gate_up_b = self.memory_pool.get_tensor(
+                        target_module="gate_up_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    )
+                    down_a = self.memory_pool.get_tensor(
+                        target_module="down_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    )
+                    down_b = self.memory_pool.get_tensor(
+                        target_module="down_proj_moe",
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    )
+
+                    module.set_lora_info(
+                        gate_up_lora_a_weights=gate_up_a,
+                        gate_up_lora_b_weights=gate_up_b,
+                        down_lora_a_weights=down_a,
+                        down_lora_b_weights=down_b,
+                    )
+                    continue
+
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
+
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
@@ -350,6 +385,7 @@ class LoRAManager:
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
+
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -555,6 +591,7 @@ class LoRAManager:
         self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
+        """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
@@ -613,6 +650,7 @@ class LoRAManager:
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
+            # Check if module should be wrapped with LoRA
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(
@@ -633,6 +671,24 @@ class LoRAManager:
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
+                layer_id = get_layer_id(module_name)
+                self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                    module_name, module
+                )
+                continue
+
+            # Temporarily workaround for FusedMoE layer
+            if isinstance(module, FusedMoE) and all(
+                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+            ):
+
+                if self.lora_backend.name != "triton":
+                    logger.warning(
+                        "Current LoRA backend does not support LoRA on MoE layers; "
+                        "skipping MoE layer."
+                    )
+                    continue
+
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
