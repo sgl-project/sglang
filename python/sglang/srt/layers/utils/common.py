@@ -2,6 +2,7 @@ import logging
 import re
 
 import torch
+from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,22 @@ def pad_or_narrow_weight(
     return torch.zeros(
         pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
     )
+
+
+def copy_or_rebind_param(
+    module: torch.nn.Module, name: str, new_value: torch.Tensor
+) -> None:
+    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
+    new_value = new_value.detach()
+    param = getattr(module, name, None)
+    if isinstance(param, Parameter):
+        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
+            param.data.copy_(new_value)
+        else:
+            param.data = new_value
+        param.requires_grad_(False)
+    else:
+        setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
 class PPMissingLayer(torch.nn.Identity):
