@@ -1195,6 +1195,7 @@ class HybridLinearKVPool(KVCache):
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
+        enable_kv_cache_copy: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
@@ -1233,6 +1234,7 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
 
@@ -1263,6 +1265,14 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.use_mla:
+            raise NotImplementedError(
+                "move_kv_cache is not supported for MLA attention"
+                "Speculative decoding with topk > 1 and page_size > 1 is not supported for MLA models."
+            )
+        self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
