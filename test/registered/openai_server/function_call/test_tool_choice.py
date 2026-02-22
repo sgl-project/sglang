@@ -889,6 +889,7 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
+@unittest.skipIf(is_hip(), "Disabled for AMD: LFM2-8B-A1B OOMs on single MI325 GPU")
 class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2-MoE model"""
 

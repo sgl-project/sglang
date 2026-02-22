@@ -146,7 +146,7 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
         else mori.ops.EpDispatchCombineKernelType.InterNodeV1
     )
 
-    return {
+    configs = {
         # TODO(billishyahao): need to tune different configs for intra node async
         # Also could be tuned for different AMD platform
         EpMode.INTRA_NODE: EpDispatchConfig(
@@ -161,13 +161,17 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
             block_num=64,
             rdma_block_num=32,
         ),
-        EpMode.LOW_LATENCY: EpDispatchConfig(
+    }
+
+    if hasattr(mori.ops.EpDispatchCombineKernelType, "AsyncLL"):
+        configs[EpMode.LOW_LATENCY] = EpDispatchConfig(
             kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL,
             warp_num_per_block=8,
             block_num=64,
             rdma_block_num=32,
-        ),
-    }
+        )
+
+    return configs
 
 
 # init_mori_op only needs do once in model initial stage
@@ -195,14 +199,24 @@ def init_mori_op(
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = deepep_mode.enable_low_latency()
+
+    dispatch_configs = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)
+
     if async_mode:
-        mode = EpMode.LOW_LATENCY
+        if EpMode.LOW_LATENCY in dispatch_configs:
+            mode = EpMode.LOW_LATENCY
+        else:
+            logger.warning(
+                "MORI LOW_LATENCY mode requested but not supported by the installed "
+                "mori package (missing AsyncLL kernel). Falling back to %s mode.",
+                mode.value,
+            )
 
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=} {mode=}"
     )
 
-    cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
+    cfg = dispatch_configs[mode]
 
     kernel_type = cfg.kernel_type
     warp_num_per_block = cfg.warp_num_per_block
