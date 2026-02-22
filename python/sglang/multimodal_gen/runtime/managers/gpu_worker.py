@@ -5,7 +5,7 @@ import gc
 import multiprocessing as mp
 import os
 import time
-from typing import List, Union
+from typing import List, Union, Any, Optional, Dict
 
 import torch
 from setproctitle import setproctitle
@@ -88,6 +88,8 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+
+        self._sleeping:bool = False
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -421,7 +423,80 @@ class GPUWorker:
                 iter_materialized_weights(module)
             )
         return checksums
+    
+    def release_memory_occupation(self, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+        logger.info(f"[SLEEP] GPUWorker.release_memory_occupation rank={self.rank} tags={tags}")
+        if self._sleeping:
+            return {"note": "already sleeping"}
 
+        tags = tags or ["weights", "cache"]
+
+        # 1) Offload / unload modules at the pipeline level
+        if self.pipeline is not None:
+            if hasattr(self.pipeline, "sleep"):
+                self.pipeline.sleep(tags=tags)
+            else:
+                # Most conservative fallback: move all accessible modules to CPU
+                for name in [
+                    "transformer", "transformer_2",
+                    "video_dit", "video_dit_2", "audio_dit",
+                    "vae", "text_encoder", "text_encoder_2", "image_encoder"
+                ]:
+                    try:
+                        m = self.pipeline.get_module(name)
+                        if m is not None and hasattr(m, "to"):
+                            m.to("cpu")
+                    except Exception:
+                        pass
+
+        # 2) Clear CUDA allocator and Python GC
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        self._sleeping = True
+        return {"released": True, "tags": tags}
+
+
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+        logger.info(f"[WAKE ] GPUWorker.resume_memory_occupation rank={self.rank} tags={tags}")
+        if not self._sleeping:
+            return {"note": "already awake"}
+
+        tags = tags or ["weights"]
+
+        if self.pipeline is not None:
+            if hasattr(self.pipeline, "wake"):
+                self.pipeline.wake(tags=tags)
+            else:
+                for name in [
+                    "transformer", "transformer_2",
+                    "video_dit", "video_dit_2", "audio_dit",
+                    "vae", "text_encoder", "text_encoder_2", "image_encoder"
+                ]:
+                    try:
+                        m = self.pipeline.get_module(name)
+                        if m is not None and hasattr(m, "to"):
+                            m.to("cuda")
+                    except Exception:
+                        pass
+
+            # Warmup note:
+            # Your server already has a warmup mechanism
+            # (e.g., inserting a warmup request into the waiting queue).
+            # For this MVP, we do NOT warm up inside the worker;
+            # warmup is deferred to the scheduler or the user's next request.
+            # If worker-side warmup is required, a request must be constructed
+            # and pipeline.forward should be explicitly invoked.
+
+        self._sleeping = False
+        return {"resumed": True, "tags": tags}
 
 OOM_MSG = f"""
 OOM detected. Possible solutions:
