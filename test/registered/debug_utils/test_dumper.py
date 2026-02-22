@@ -911,7 +911,9 @@ class TestKvFilter:
 
 class TestDumpModel:
     def test_grad_basic(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_grad=True, enable_model_value=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
         model = torch.nn.Linear(4, 2)
         x = torch.randn(3, 4)
         y = model(x).sum()
@@ -925,7 +927,9 @@ class TestDumpModel:
         )
 
     def test_value_basic(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
         model = torch.nn.Linear(4, 2, bias=False)
 
         d.dump_model(model, name_prefix="model")
@@ -936,7 +940,9 @@ class TestDumpModel:
         )
 
     def test_no_grad_skipped(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_grad=True, enable_model_value=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
         model = torch.nn.Linear(4, 2)
 
         d.dump_model(model, name_prefix="model")
@@ -945,7 +951,9 @@ class TestDumpModel:
         assert len(filenames) == 0
 
     def test_filter(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=True, filter="weight")
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=True, filter="weight"
+        )
         model = torch.nn.Linear(4, 2)
         x = torch.randn(3, 4)
         y = model(x).sum()
@@ -960,7 +968,9 @@ class TestDumpModel:
         )
 
     def test_grad_file_content(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_grad=True, enable_model_value=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
         model = torch.nn.Linear(4, 2, bias=False)
         x = torch.ones(1, 4)
         y = model(x).sum()
@@ -972,7 +982,9 @@ class TestDumpModel:
         assert torch.equal(_load_dump(path)["value"], model.weight.grad)
 
     def test_disable_model_grad(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
         model = torch.nn.Linear(4, 2)
         x = torch.randn(3, 4)
         y = model(x).sum()
@@ -984,7 +996,9 @@ class TestDumpModel:
         assert all("grad" not in f for f in filenames)
 
     def test_parameter_saved_as_parameter(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
         model = torch.nn.Linear(4, 2, bias=False)
 
         d.dump_model(model, name_prefix="p")
@@ -999,7 +1013,9 @@ class TestDumpModel:
             def __reduce_ex__(self, protocol):
                 raise RuntimeError("not pickleable")
 
-        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
         model = torch.nn.Linear(4, 2, bias=False)
         model.weight = BadParam(model.weight.data)
 
@@ -1012,7 +1028,9 @@ class TestDumpModel:
         assert torch.equal(loaded["value"], model.weight.data)
 
     def test_disable_model_value(self, tmp_path):
-        d = _make_test_dumper(tmp_path, enable_model_grad=True, enable_model_value=False)
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
         model = torch.nn.Linear(4, 2, bias=False)
         x = torch.ones(1, 4)
         y = model(x).sum()
