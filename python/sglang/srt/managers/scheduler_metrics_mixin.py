@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -52,6 +52,7 @@ class PrefillStats:
     new_token_ratio: float
     running_bs: int
     num_new_seqs: int  # len(can_run_list)
+    num_running_reqs_by_priority: Optional[dict[int, int]] = None
 
 
 class KvMetrics:
@@ -118,6 +119,8 @@ class SchedulerMetricsMixin:
                 "pp_rank": pp_rank,
                 "moe_ep_rank": self.moe_ep_rank,
             }
+            if self.enable_priority_scheduling:
+                labels["priority"] = ""
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
             if self.server_args.extra_metric_labels:
@@ -255,6 +258,9 @@ class SchedulerMetricsMixin:
             )
 
             self.stats.num_running_reqs = prefill_stats.running_bs
+            self.stats.num_running_reqs_by_priority = (
+                prefill_stats.num_running_reqs_by_priority
+            )
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -263,6 +269,9 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs_by_priority = self._count_reqs_by_priority(
+                self.waiting_queue
+            )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -278,8 +287,16 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
                 )
+                self.stats.num_prefill_prealloc_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_prefill_bootstrap_queue.queue
+                    )
+                )
                 self.stats.num_prefill_inflight_queue_reqs = len(
                     self.disagg_prefill_inflight_queue
+                )
+                self.stats.num_prefill_inflight_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(self.disagg_prefill_inflight_queue)
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -290,8 +307,18 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
                 )
+                self.stats.num_decode_prealloc_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_decode_prealloc_queue.queue
+                    )
+                )
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
+                )
+                self.stats.num_decode_transfer_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_decode_transfer_queue.queue
+                    )
                 )
 
             # Others
@@ -416,6 +443,9 @@ class SchedulerMetricsMixin:
         if self.enable_metrics:
             # Basics
             self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_running_reqs_by_priority = self._count_reqs_by_priority(
+                batch.reqs
+            )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
@@ -426,6 +456,9 @@ class SchedulerMetricsMixin:
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs_by_priority = self._count_reqs_by_priority(
+                self.waiting_queue
+            )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -445,17 +478,34 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
                 )
+                self.stats.num_prefill_prealloc_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_prefill_bootstrap_queue.queue
+                    )
+                )
                 self.stats.num_prefill_inflight_queue_reqs = len(
                     self.disagg_prefill_inflight_queue
+                )
+                self.stats.num_prefill_inflight_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(self.disagg_prefill_inflight_queue)
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
                 )
+                self.stats.num_decode_prealloc_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_decode_prealloc_queue.queue
+                    )
+                )
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
-
+                self.stats.num_decode_transfer_queue_reqs_by_priority = (
+                    self._count_reqs_by_priority(
+                        self.disagg_decode_transfer_queue.queue
+                    )
+                )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
             (
@@ -769,3 +819,8 @@ class SchedulerMetricsMixin:
             ),
         ):
             yield
+
+    def _count_reqs_by_priority(self, reqs):
+        if not self.enable_priority_scheduling:
+            return None
+        return dict(Counter(req.priority for req in reqs))
