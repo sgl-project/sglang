@@ -118,6 +118,8 @@ class FutureMap:
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+        if self.spec_algo.is_ngram():
+            return
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
@@ -149,8 +151,12 @@ class FutureMap:
             return start <= stop
 
     def store_to_map(
-        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
+        self,
+        future_indices: FutureIndices,
+        batch_result: GenerationBatchResult,
     ):
+        if self.spec_algo.is_ngram():
+            return
         if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
