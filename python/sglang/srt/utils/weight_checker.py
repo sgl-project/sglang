@@ -22,6 +22,8 @@ class WeightChecker:
             self._snapshot()
         elif action == "reset_tensors":
             self._reset_tensors()
+        elif action == "reset_tensors_without_buffers":
+            self._reset_tensors(skip_buffers=True)
         elif action == "compare":
             self._compare()
         else:
@@ -36,8 +38,8 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self):
-        for name, param in self._model_state():
+    def _reset_tensors(self, skip_buffers: bool = False):
+        for name, param in self._model_state(skip_buffers=skip_buffers):
             param.copy_(_random_like(param))
 
     def _compare(self):
@@ -48,10 +50,11 @@ class WeightChecker:
             actual_tensors=_postprocess_tensors(dict(self._model_state())),
         )
 
-    def _model_state(self):
+    def _model_state(self, skip_buffers: bool = False):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
         yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        if not skip_buffers:
+            yield from self._model_runner.model.named_buffers()
 
 
 def _check_tensors(
