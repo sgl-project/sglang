@@ -774,90 +774,108 @@ class NemotronHForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in updated_weights:
-            if is_mtp:
-                if "mtp" not in name:
-                    continue
-
-                name = name.replace("mtp.layers.", "model.layers.")
-
-                if "embeddings" in name:
-                    name = name.replace("embeddings", "model.embed_tokens")
-                    if name.startswith("backbone."):
-                        name = name.replace("backbone.", "")
-
-            if not is_mtp and "mtp" in name:
-                continue
-
-            if "scale" in name:
-                if name not in params_dict:
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
+            try:
+                if is_mtp:
+                    if "mtp" not in name:
                         continue
 
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+                    name = name.replace("mtp.layers.", "model.layers.")
 
-            if "embed_tokens" in name and not self.pp_group.is_first_rank:
-                continue
+                    if "embeddings" in name:
+                        name = name.replace("embeddings", "model.embed_tokens")
+                        if name.startswith("backbone."):
+                            name = name.replace("backbone.", "")
 
-            if (
-                "norm_f" in name or "lm_head" in name
-            ) and not self.pp_group.is_last_rank:
-                continue
+                if not is_mtp and "mtp" in name:
+                    continue
 
-            for param_name, weight_name, shard_id in self.stacked_params_mapping:
-                if weight_name not in name:
+                if "scale" in name:
+                    if name not in params_dict:
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+
+                if "embed_tokens" in name and not self.pp_group.is_first_rank:
                     continue
-                if name not in params_dict:
+
+                if (
+                    "norm_f" in name or "lm_head" in name
+                ) and not self.pp_group.is_last_rank:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+
+                for param_name, weight_name, shard_id in self.stacked_params_mapping:
                     if weight_name not in name:
                         continue
-                    is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
-                    param = params_dict[name_mapped]
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    name = name_mapped
-                    break
-                else:
-                    if is_expert_weight:
-                        continue
+                    name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    is_expert_weight = False
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        is_expert_weight = True
+                        name_mapped = name.replace(weight_name, param_name)
+                        param = params_dict[name_mapped]
+                        param.weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
                         )
-                        weight_loader(param, loaded_weight)
+                        name = name_mapped
+                        break
                     else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                        if is_expert_weight:
+                            continue
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name in params_dict.keys():
+                            param = params_dict[name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                        else:
+                            logger.warning(f"Parameter {name} not found in params_dict")
+            except Exception as e:
+                logger.error(
+                    f"Error loading weight for {name}: {e} type(loaded_weight): {type(loaded_weight)} is_mtp: {is_mtp} quant_config: {self.quant_config}"
+                )
+                try:
+                    logger.info(
+                        f"mapped name is {name_mapped}, also. wn {weight_name}, pn {param_name}"
+                    )
+                    logger.info(
+                        f"param is {param} with dtype {param.dtype} and shape {param.shape}"
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    f"dtype is {loaded_weight.dtype} shape is {loaded_weight.shape}"
+                )
+                raise e
 
 
 EntryClass = [NemotronHForCausalLM]

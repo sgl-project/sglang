@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from collections.abc import Iterable
 
 import torch
@@ -112,6 +113,9 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         return hidden_states, residual
 
 
+logger = logging.getLogger(__name__)
+
+
 class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
     def __init__(
         self,
@@ -130,6 +134,10 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
+        t = config.dtype if hasattr(config, "dtype") else torch.bfloat16
+
+        logger.info(f"config is {config},pdtype = {t} ")
+        logger.info(f"has start projections: {has_start_projections}")
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -297,7 +305,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         self.model = NemotronHMultiTokenPredictor(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
+            prefix=add_prefix("mtp", prefix),
         )
 
         self.lm_head = ParallelLMHead(
