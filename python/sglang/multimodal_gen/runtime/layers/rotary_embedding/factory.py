@@ -5,8 +5,8 @@ from typing import Any
 
 import torch
 
-from ._base import LinearScalingRotaryEmbedding, RotaryEmbedding
-from ._mrope import NDRotaryEmbedding, _to_tuple
+from .base import LinearScalingRotaryEmbedding, RotaryEmbedding
+from .mrope import NDRotaryEmbedding, _to_tuple
 
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 _ND_ROPE_CACHE: "OrderedDict[tuple, NDRotaryEmbedding]" = OrderedDict()
