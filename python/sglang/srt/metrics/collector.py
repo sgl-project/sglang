@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+
 import dataclasses
 import logging
 import os
@@ -276,8 +277,10 @@ class DPCooperationInfo:
     @staticmethod
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
+            # Count ranks that are doing any extend-like work.
+            # With overlap scheduling, prefill can appear as MIXED rather than EXTEND.
             num_prefill_ranks=sum(
-                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+                1 for mode in forward_modes if ForwardMode(mode).is_extend()
             ),
         )
 
@@ -849,6 +852,16 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
+        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
+        # If more Info metrics are needed, we can create a common _log_info function.
+        self.cache_config_info = Gauge(
+            name="sglang:cache_config_info",
+            documentation="Cache configuration information.",
+            labelnames=["page_size", "num_pages"],
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -934,6 +947,8 @@ class SchedulerMetricsCollector:
             ("prefill_cache", prefill_cache_tokens),
             ("decode", decode_tokens),
         ]:
+            if delta == 0:
+                continue
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
             if dp_cooperation_info is not None:
                 self.dp_cooperation_realtime_tokens_total.labels(
@@ -1065,6 +1080,9 @@ class SchedulerMetricsCollector:
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
+        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
 
 
 class TokenizerMetricsCollector:

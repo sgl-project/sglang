@@ -855,7 +855,9 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        env = env.copy()
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -2000,6 +2002,56 @@ async def send_concurrent_generate_requests_with_custom_params(
         req.update(c)
         tasks.append(asyncio.create_task(async_generate_with_priority(req)))
     return await asyncio.gather(*tasks)
+
+
+def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
+    """Spawn ``world_size`` processes, initialise torch.distributed in each,
+    run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
+    """
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    port = find_available_port(29500)
+
+    processes = []
+    for rank in range(world_size):
+        p = ctx.Process(
+            target=_distributed_worker,
+            args=(rank, world_size, backend, port, func, result_queue, kwargs),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    errors = [result_queue.get() for _ in range(world_size)]
+    errors = [e for e in errors if e]
+    if errors:
+        raise AssertionError("\n".join(errors))
+
+
+def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwargs):
+    import traceback
+
+    import torch.distributed as dist
+
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        func(rank, **kwargs)
+        result_queue.put(None)
+    except Exception as e:
+        result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
+    finally:
+        dist.destroy_process_group()
 
 
 class CustomTestCase(unittest.TestCase):

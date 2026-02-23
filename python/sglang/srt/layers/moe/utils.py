@@ -10,7 +10,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -189,10 +188,6 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        log_info_on_rank0(
-            logger,
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
-        )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 
