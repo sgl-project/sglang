@@ -123,26 +123,28 @@ def _add_duplicate_index(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def find_row(df, conditions: Dict[str, Any]):
-    df_sub = df.filter(
-        functools.reduce(
-            lambda a, b: a & b,
-            [
-                (
-                    pl.col(col)
-                    == _cast_to_polars_dtype(conditions[col], df.schema[col])
-                    if conditions[col] is not None
-                    else pl.col(col).is_null()
-                )
-                for col in conditions.keys()
-                if col in df.columns
-            ],
+def filter_rows(df: pl.DataFrame, conditions: Dict[str, Any]) -> list[dict]:
+    """Filter a polars DataFrame by column conditions, returning all matching rows."""
+    filter_exprs = [
+        (
+            pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col])
+            if conditions[col] is not None
+            else pl.col(col).is_null()
         )
-    )
-    if len(df_sub) > 1:
-        print(f"find_row find ambiguous results: {df_sub=}")
+        for col in conditions
+        if col in df.columns
+    ]
+    if not filter_exprs:
+        return []
+    return df.filter(functools.reduce(lambda a, b: a & b, filter_exprs)).to_dicts()
+
+
+def find_row(df: pl.DataFrame, conditions: Dict[str, Any]):
+    rows = filter_rows(df, conditions)
+    if len(rows) > 1:
+        print(f"find_row find ambiguous results: {rows=}")
         return None
-    return df_sub.to_dicts()[0] if len(df_sub) > 0 else None
+    return rows[0] if rows else None
 
 
 def _cast_to_polars_dtype(value, target_dtype):
