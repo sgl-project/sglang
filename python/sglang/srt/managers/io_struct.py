@@ -1592,6 +1592,7 @@ class ConfigureLoggingReq(BaseReq):
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    streaming: Optional[bool] = None
 
 
 @dataclass

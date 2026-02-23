@@ -1077,7 +1077,8 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # When the server is idle, do self-check and re-init some states
+                # When the server is idle, do self-check and re-init some states.
+                # Skip if there are any streaming sessions (latency sensitive).
                 self.self_check_during_idle()
 
             # Update last_batch
@@ -2861,7 +2862,7 @@ class Scheduler(
             return OpenSessionReqOutput(session_id, False)
         else:
             self.sessions[session_id] = Session(
-                recv_req.capacity_of_str_len, session_id
+                recv_req.capacity_of_str_len, session_id, streaming=bool(recv_req.streaming)
             )
             return OpenSessionReqOutput(session_id, True)
 
@@ -2871,6 +2872,19 @@ class Scheduler(
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
+            session = self.sessions[session_id]
+            # For streaming sessions, need to release the lock upon close.
+            if session.streaming and session.req_nodes:
+                assert len(session.req_nodes) == 1
+                req = next(iter(session.req_nodes.values())).req
+                if req.finished():
+                    is_insert = not req.skip_cache_finished
+                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                else:
+                    # Request is still running. Detach it from the session so it gets
+                    # cleaned up later on finish, like normal requests.
+                    req.session = None
+                    req.session_id = None
             del self.sessions[session_id]
 
     def maybe_sleep_on_idle(self):

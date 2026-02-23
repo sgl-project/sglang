@@ -315,6 +315,14 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        if any(s.streaming for s in self.sessions.values()):
+            # Disable if there are any streaming sessions open. This is because:
+            # - We want to avoid blocking new streaming session requests (which
+            #   are latency-sensitive) on the idle memory check.
+            # - In between streaming session requests, we hold onto kv memory but
+            #   the request is not part of the scheduler's running batch. The
+            #   memory checker doesn't currently handle this case.
+            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

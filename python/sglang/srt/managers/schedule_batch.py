@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -525,7 +526,7 @@ class Req:
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
-        session_id: Optional[str] = None,
+        session: Optional["Session"] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
@@ -557,7 +558,12 @@ class Req:
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
-        self.session_id = session_id
+        self.session = session
+        self.session_id = session.session_id if session else None
+        # skip cache insertion after prefill
+        self.skip_cache_unfinished = False
+        # skip cache insertion after decode
+        self.skip_cache_finished = False
         self.input_embeds = input_embeds
 
         # For req-level memory management
@@ -887,27 +893,35 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self if tree_cache.supports_mamba() else None,
-                    cow_mamba=tree_cache.supports_mamba(),
+            if self.session and self.session.streaming and self.req_pool_idx is not None:
+                # This request is in a streaming session and inherited its kv prefix from
+                # the previous request in the session. Skip radix match (slow) and reuse.
+                prefix_len = min(self.kv_committed_len, max_prefix_len)
+                self.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                    self.req_pool_idx, :prefix_len
+                ].to(dtype=torch.int64)
+            else:
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                        req=self if tree_cache.supports_mamba() else None,
+                        cow_mamba=tree_cache.supports_mamba(),
+                    )
                 )
-            )
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            self.cache_protected_len = len(self.prefix_indices)
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                    self.mamba_branching_seqlen,
+                ) = (
+                    match_result.device_indices,
+                    match_result.last_device_node,
+                    match_result.last_host_node,
+                    match_result.host_hit_length,
+                    match_result.mamba_branching_seqlen,
+                )
+                self.cache_protected_len = len(self.prefix_indices)
 
         if (
             self.is_retracted
@@ -1118,6 +1132,25 @@ class Req:
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+
+    def inherit_kv_states(self, req: Req):
+        # KV states
+        self.req_pool_idx = req.req_pool_idx
+        self.kv_committed_len = req.kv_committed_len
+        self.kv_allocated_len = req.kv_allocated_len
+        self.last_node = req.last_node
+        self.cache_protected_len = req.cache_protected_len
+        self.swa_uuid_for_lock = req.swa_uuid_for_lock
+        self.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Mamba states
+        self.mamba_pool_idx = req.mamba_pool_idx
+        self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
+        self.mamba_next_track_idx = req.mamba_next_track_idx
+        self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
+        self.mamba_branching_seqlen = req.mamba_branching_seqlen
+        # Detach to prevent double-free of pool slots
+        req.req_pool_idx = None
+        req.mamba_pool_idx = None
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

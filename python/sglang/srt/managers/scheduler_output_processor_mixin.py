@@ -46,6 +46,15 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def maybe_release_kv_cache(self: Scheduler, req: Req):
+        if req.session and req.session.streaming:
+            # For streaming sessions, hold onto the kv prefix so the next request
+            # can inherit it (low-overhead) without radix match (high-overhead).
+            assert req.session.req_nodes[req.rid].req is req
+        else:
+            is_insert = not req.skip_cache_finished
+            release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -59,7 +68,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                self.maybe_release_kv_cache(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -151,11 +160,11 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self.maybe_release_kv_cache(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not req.skip_cache_unfinished:
+                            self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -285,8 +294,8 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                    else:
+                        self.maybe_release_kv_cache(req)
+                    elif not req.skip_cache_unfinished:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
@@ -371,11 +380,12 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
+                    self.maybe_release_kv_cache(req)
                     req.time_stats.completion_time = time.perf_counter()
                     break
 
-                self.tree_cache.cache_unfinished_req(req)
+                if not req.skip_cache_unfinished:
+                    self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -461,9 +471,9 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self.maybe_release_kv_cache(req)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    self.maybe_release_kv_cache(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 

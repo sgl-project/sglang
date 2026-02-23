@@ -489,6 +489,10 @@ class SWARadixCache(BasePrefixCache):
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
+        if req.session and req.session.streaming:
+            # For streaming sessions, only the prompt of the first request is cached, so we need to use
+            # cache_protected_len instead of prefix_indices length.
+            old_prefix_len = req.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
@@ -553,6 +557,10 @@ class SWARadixCache(BasePrefixCache):
             # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
+        if req.session and req.session.streaming:
+            # For streaming sessions, only the prompt of the first request is cached, so we need to use
+            # cache_protected_len instead of prefix_indices length.
+            old_prefix_len = req.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
