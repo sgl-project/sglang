@@ -1,5 +1,4 @@
 import functools
-from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
@@ -43,16 +42,3 @@ def calc_rel_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
 
-
-def load_object(path: Path) -> Optional[torch.Tensor]:
-    from sglang.srt.debug_utils.dump_loader import ValueWithMeta
-
-    loaded = ValueWithMeta.load(path)
-    x = loaded.value
-
-    if x is None:
-        return None
-    if not isinstance(x, torch.Tensor):
-        print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
-        return None
-    return x.cuda()
