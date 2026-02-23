@@ -206,9 +206,9 @@ class DiffGenerator:
                         size=(req.height, req.width, req.num_frames),
                         generation_time=timer.duration,
                         peak_memory_mb=output_batch.peak_memory_mb,
-                        timings=(
-                            output_batch.timings.to_dict()
-                            if output_batch.timings
+                        metrics=(
+                            output_batch.metrics.to_dict()
+                            if output_batch.metrics
                             else {}
                         ),
                         trajectory_latents=output_batch.trajectory_latents,
@@ -297,7 +297,7 @@ class DiffGenerator:
         if not results:
             return
         if self.server_args.warmup:
-            total_duration_ms = results[0].timings.get("total_duration_ms", 0)
+            total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
                 total_duration_ms / 1000.0,

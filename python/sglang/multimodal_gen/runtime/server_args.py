@@ -287,8 +287,11 @@ class ServerArgs:
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
-    # VAE parameters
-    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
+    # Component path overrides (key = model_index.json component name, value = path)
+    component_paths: dict[str, str] = field(default_factory=dict)
+
+    # path to pre-quantized transformer weights (single .safetensors or directory).
+    transformer_weights_path: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -400,15 +403,19 @@ class ServerArgs:
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
         ncfg.validate()
-        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
-            # if nunchaku is not applied
+
+        # propagate the path to server_args
+        if ncfg.transformer_weights_path:
+            self.transformer_weights_path = ncfg.transformer_weights_path
+
+        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
             self.nunchaku_config = None
         else:
             self.nunchaku_config = NunchakuConfig(
                 precision=self.nunchaku_config.quantization_precision,
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                quantized_model_path=self.nunchaku_config.quantized_model_path,
+                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
             )
 
     def _adjust_offload(self):
@@ -623,13 +630,6 @@ class ServerArgs:
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
-        parser.add_argument(
-            "--vae-path",
-            type=str,
-            default=ServerArgs.vae_path,
-            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
-        )
-
         # attention
         parser.add_argument(
             "--attention-backend",
@@ -963,24 +963,66 @@ class ServerArgs:
             f"(started from port {original_port})"
         )
 
+    @staticmethod
+    def _extract_component_paths(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """
+        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        """
+        component_paths: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            if key_part.startswith("--") and key_part.endswith("-path"):
+                component = key_part[2:-5].replace("-", "_")
+                if "=" in arg:
+                    component_paths[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_paths[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+
+        # canonicalize and validate
+        for component, path in component_paths.items():
+            path = os.path.expanduser(path)
+            component_paths[component] = path
+        return component_paths, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
+
+        # extract dynamic --<component>-path from unknown args
+        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        if remaining:
+            raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
+
         provided_args = cls.get_provided_args(args, unknown_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
-            # Provided args override config file args
             provided_args = {**config_args, **provided_args}
 
-        # Handle special cases
-        # if "tp_size" in provided_args:
-        #     provided_args["tp"] = provided_args.pop("tp_size")
+        if dynamic_paths:
+            existing = dict(provided_args.get("component_paths") or {})
+            existing.update(dynamic_paths)
+            provided_args["component_paths"] = existing
 
         return cls.from_dict(provided_args)
 
@@ -989,6 +1031,10 @@ class ServerArgs:
         """Create a ServerArgs object from a dictionary."""
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
+
+        component_paths = dict(kwargs.get("component_paths") or {})
+        if component_paths:
+            server_args_kwargs["component_paths"] = component_paths
 
         for attr in attrs:
             if attr == "pipeline_config":
@@ -1239,8 +1285,8 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
+    raw_args, unknown_args = parser.parse_known_args(argv)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
 
 
