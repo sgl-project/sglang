@@ -334,10 +334,8 @@ def expand_topk_with_shared_expert(
         valid_mask, topk_ids + old_ranks, topk_ids
     )
 
-    # Shared expert column (always local)
     shared_id = source_rank * new_epr + old_epr
     expanded_topk_ids[:, topk] = torch.where(has_valid, shared_id, LOCAL_SHARED_MARKER)
-    # Weights: copy routed, add shared weight column
     expanded_topk_weights = torch.empty(
         num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )

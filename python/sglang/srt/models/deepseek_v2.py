@@ -730,8 +730,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
-        # Shared experts: skip when fused into MoE or when waterfill is enabled.
-        # Waterfill fuses shared expert via weight loading name-remap.
+        # Shared experts: skip when fused into MoE or waterfill-dispatched.
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
