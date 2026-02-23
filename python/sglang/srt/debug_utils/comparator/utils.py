@@ -45,15 +45,13 @@ def calc_rel_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def load_object(path: Path) -> Optional[torch.Tensor]:
-    try:
-        x = torch.load(path, weights_only=False)
-    except Exception as e:
-        print(f"Skip load {path} since error {e}")
+    from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+    loaded = ValueWithMeta.load(path)
+    x = loaded.value
+
+    if x is None:
         return None
-
-    if isinstance(x, dict) and "value" in x:
-        x = x["value"]
-
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
