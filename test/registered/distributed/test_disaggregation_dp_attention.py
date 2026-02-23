@@ -103,6 +103,12 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
 
         self.assertGreater(metrics["accuracy"], 0.60)
 
+
+class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
+    LOAD_BALANCE_METHOD = "round_robin"
+    # TODO: add test for other load balance methods
+    # TODO: add a balancedness metric
+
     def test_bench_serving(self):
         args = get_benchmark_args(
             base_url=f"http://{self.base_host}:{self.lb_port}",
@@ -112,16 +118,12 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             random_input_len=4096,
             random_output_len=1024,
             request_rate=float("inf"),
-            max_concurrency=128,
+            max_concurrency=256,
         )
         result = run_benchmark(args)
 
         self.assertGreater(result["output_throughput"], 0)
         self.assertGreater(result["completed"], 0)
-
-
-class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
-    LOAD_BALANCE_METHOD = "round_robin"
 
 
 if __name__ == "__main__":
