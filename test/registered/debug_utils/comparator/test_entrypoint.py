@@ -82,6 +82,7 @@ class TestEntrypoint:
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path)
+        capsys.readouterr()
 
         run(args)
 
@@ -94,6 +95,7 @@ class TestEntrypoint:
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, filter="tensor_a")
+        capsys.readouterr()
 
         run(args)
 
@@ -107,6 +109,7 @@ class TestEntrypoint:
             baseline_names=["tensor_a"],
         )
         args = _make_args(baseline_path, target_path)
+        capsys.readouterr()
 
         run(args)
 
@@ -117,6 +120,7 @@ class TestEntrypoint:
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
         args = _make_args(baseline_path, target_path, start_step=1, end_step=1)
+        capsys.readouterr()
 
         run(args)
 
@@ -132,6 +136,7 @@ class TestEntrypointJsonl:
     def test_jsonl_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, output_format="json")
+        capsys.readouterr()
 
         run(args)
 
@@ -157,6 +162,7 @@ class TestEntrypointJsonl:
             baseline_names=["tensor_a"],
         )
         args = _make_args(baseline_path, target_path, output_format="json")
+        capsys.readouterr()
 
         run(args)
 
@@ -172,6 +178,7 @@ class TestEntrypointJsonl:
     def test_jsonl_all_lines_are_valid_json(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
         args = _make_args(baseline_path, target_path, output_format="json")
+        capsys.readouterr()
 
         run(args)
 
