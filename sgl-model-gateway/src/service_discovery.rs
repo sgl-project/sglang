@@ -15,16 +15,16 @@ use kube::{
     Client,
 };
 use rustls;
+use smg_mesh::service::{
+    gossip::{NodeState, NodeStatus},
+    ClusterState,
+};
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
     core::Job,
-    mesh::service::{
-        gossip::{NodeState, NodeStatus},
-        ClusterState,
-    },
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };

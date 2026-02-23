@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -186,7 +187,7 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
+        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
