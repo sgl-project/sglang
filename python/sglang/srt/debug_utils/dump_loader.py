@@ -1,10 +1,50 @@
 import functools
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import polars as pl
 import torch
+
+
+def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
+    stem = Path(path).stem
+    result: Dict[str, Any] = {}
+    for kv in stem.split("___"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            result[k] = v
+    if "rank" in result:
+        result["rank"] = int(result["rank"])
+    return result
+
+
+@dataclass
+class ValueWithMeta:
+    value: Any
+    meta: Dict[str, Any]
+
+    @staticmethod
+    def load(path: Path) -> "ValueWithMeta":
+        path = Path(path)
+        meta_from_filename = parse_meta_from_filename(path)
+        meta_from_filename["filename"] = path.name
+
+        try:
+            raw = torch.load(path, weights_only=False, map_location="cpu")
+        except Exception as e:
+            print(f"Skip load {path} since error {e}")
+            return ValueWithMeta(value=None, meta=meta_from_filename)
+
+        value, meta_from_embedded = _unwrap_dict_format(raw)
+        return ValueWithMeta(value=value, meta=meta_from_filename | meta_from_embedded)
+
+
+def _unwrap_dict_format(obj: Any) -> Tuple[Any, Dict[str, Any]]:
+    if isinstance(obj, dict) and "value" in obj and "meta" in obj and len(obj) == 2:
+        return obj["value"], obj["meta"]
+    return obj, {}
 
 
 class DumpLoader:
@@ -50,10 +90,7 @@ def read_meta(directory):
     rows = []
     for p in directory.glob("*.pt"):
         try:
-            full_kwargs = {}
-            for kv in p.stem.split("___"):
-                k, v = kv.split("=")
-                full_kwargs[k] = v
+            full_kwargs = parse_meta_from_filename(p)
             rows.append(
                 {
                     "filename": str(p.name),
