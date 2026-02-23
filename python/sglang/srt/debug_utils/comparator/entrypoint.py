@@ -19,7 +19,12 @@ from sglang.srt.debug_utils.comparator.unshard import (
     execute_unshard_plan,
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.dump_loader import ValueWithMeta, find_row, read_meta
+from sglang.srt.debug_utils.dump_loader import (
+    ValueWithMeta,
+    filter_rows,
+    find_row,
+    read_meta,
+)
 
 
 def main() -> None:
@@ -74,6 +79,16 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
+def _skip(
+    name: str,
+    reason: str,
+    counts: dict[str, int],
+    output_format: str,
+) -> None:
+    counts["skipped"] += 1
+    print_record(SkipRecord(name=name, reason=reason), output_format=output_format)
+
+
 def _process_logical_tensor(
     *,
     row: dict,
@@ -83,7 +98,8 @@ def _process_logical_tensor(
     counts: dict[str, int],
     logical_key_cols: list[str],
 ) -> None:
-    target_rows = _filter_by_logical_key(df_target, row, logical_key_cols)
+    target_conditions = {k: row[k] for k in logical_key_cols}
+    target_rows = filter_rows(df_target, conditions=target_conditions)
     first_target_path = Path(args.target_path) / target_rows[0]["filename"]
 
     first_target = ValueWithMeta.load(first_target_path)
@@ -121,32 +137,24 @@ def _process_with_dims(
     first_target: ValueWithMeta,
 ) -> None:
     name = row["name"]
+    fmt = args.output_format
 
     target_tensor = _unshard_side(
         rows=target_rows,
         base_path=Path(args.target_path),
         dims_str=dims_str,
-        side_name="target",
         tensor_name=name,
         preloaded_first=first_target,
     )
     if target_tensor is None:
-        counts["skipped"] += 1
-        print_record(
-            SkipRecord(name=name, reason="target_unshard_failed"),
-            output_format=args.output_format,
-        )
+        _skip(name, "target_unshard_failed", counts, fmt)
         return
 
     baseline_conditions = {k: row[k] for k in logical_key_cols}
-    baseline_rows = _find_baseline_rows(df_baseline, baseline_conditions)
+    baseline_rows = filter_rows(df_baseline, conditions=baseline_conditions)
 
     if not baseline_rows:
-        counts["skipped"] += 1
-        print_record(
-            SkipRecord(name=name, reason="no_baseline"),
-            output_format=args.output_format,
-        )
+        _skip(name, "no_baseline", counts, fmt)
         return
 
     first_baseline_path = Path(args.baseline_path) / baseline_rows[0]["filename"]
@@ -158,26 +166,17 @@ def _process_with_dims(
             rows=baseline_rows,
             base_path=Path(args.baseline_path),
             dims_str=baseline_dims_str,
-            side_name="baseline",
             tensor_name=name,
             preloaded_first=first_baseline,
         )
     else:
         if len(baseline_rows) > 1:
-            counts["skipped"] += 1
-            print_record(
-                SkipRecord(name=name, reason="ambiguous_baseline_no_dims"),
-                output_format=args.output_format,
-            )
+            _skip(name, "ambiguous_baseline_no_dims", counts, fmt)
             return
         baseline_tensor = _extract_tensor(first_baseline)
 
     if baseline_tensor is None:
-        counts["skipped"] += 1
-        print_record(
-            SkipRecord(name=name, reason="baseline_load_failed"),
-            output_format=args.output_format,
-        )
+        _skip(name, "baseline_load_failed", counts, fmt)
         return
 
     _compare_and_record(
@@ -213,11 +212,7 @@ def _process_without_dims(
         )
 
         if row_baseline is None:
-            counts["skipped"] += 1
-            print_record(
-                SkipRecord(name=row["name"], reason="no_baseline"),
-                output_format=args.output_format,
-            )
+            _skip(row["name"], "no_baseline", counts, args.output_format)
             continue
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
@@ -226,11 +221,7 @@ def _process_without_dims(
         x_target = _load_tensor(path_target)
 
         if x_baseline is None or x_target is None:
-            counts["skipped"] += 1
-            print_record(
-                SkipRecord(name=row["name"], reason="load_failed"),
-                output_format=args.output_format,
-            )
+            _skip(row["name"], "load_failed", counts, args.output_format)
             continue
 
         _compare_and_record(
@@ -244,8 +235,8 @@ def _process_without_dims(
 
 def _compare_and_record(
     *,
-    x_baseline,
-    x_target,
+    x_baseline: torch.Tensor,
+    x_target: torch.Tensor,
     name: str,
     args: argparse.Namespace,
     counts: dict[str, int],
@@ -280,7 +271,6 @@ def _unshard_side(
     rows: list[dict],
     base_path: Path,
     dims_str: str,
-    side_name: str,
     tensor_name: str,
     preloaded_first: Optional[ValueWithMeta] = None,
 ) -> Optional[torch.Tensor]:
@@ -321,60 +311,8 @@ def _unshard_side(
 
 def _extract_tensor(item: ValueWithMeta) -> Optional[torch.Tensor]:
     value = item.value
-    if value is None:
-        return None
     if not isinstance(value, torch.Tensor):
         return None
-    return value
-
-
-def _filter_by_logical_key(
-    df: pl.DataFrame, row: dict, logical_key_cols: list[str]
-) -> list[dict]:
-    import functools
-
-    conditions = [
-        (
-            pl.col(col) == _cast_value(row[col], df.schema[col])
-            if row[col] is not None
-            else pl.col(col).is_null()
-        )
-        for col in logical_key_cols
-        if col in df.columns
-    ]
-    filtered = df.filter(functools.reduce(lambda a, b: a & b, conditions))
-    return filtered.to_dicts()
-
-
-def _find_baseline_rows(df_baseline: pl.DataFrame, conditions: dict) -> list[dict]:
-    import functools
-
-    filter_exprs = [
-        (
-            pl.col(col) == _cast_value(val, df_baseline.schema[col])
-            if val is not None
-            else pl.col(col).is_null()
-        )
-        for col, val in conditions.items()
-        if col in df_baseline.columns
-    ]
-
-    if not filter_exprs:
-        return []
-
-    filtered = df_baseline.filter(functools.reduce(lambda a, b: a & b, filter_exprs))
-    return filtered.to_dicts()
-
-
-def _cast_value(value, target_dtype):
-    if target_dtype in (pl.Int64, pl.Int32, pl.UInt64, pl.UInt32):
-        return int(value)
-    elif target_dtype in (pl.Float64, pl.Float32):
-        return float(value)
-    elif target_dtype == pl.Boolean:
-        return bool(value)
-    elif target_dtype == pl.String:
-        return str(value)
     return value
 
 
