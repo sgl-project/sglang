@@ -355,15 +355,19 @@ class DecodePreallocQueue:
     def _resolve_dp_rank(self, req: Req) -> Optional[int]:
         if req.data_parallel_rank is not None:
             return req.data_parallel_rank
+
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
             req.bootstrap_host is None
             and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
         ):
             return 0
+
+        # If the prefill server is configured to follow the bootstrap room
         bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
         if self.kv_manager.follow_bootstrap_room_table.get(bootstrap_addr, True):
             dp_size = self.kv_manager.prefill_dp_size_table.get(bootstrap_addr, 1)
             return req.bootstrap_room % dp_size
+
         return None
 
     def _create_receiver_and_enqueue(self, req: Req, dp_rank: int) -> None:
