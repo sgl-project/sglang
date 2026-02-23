@@ -4,7 +4,7 @@ set -euo pipefail
 ROCM_VERSION=${1:-}
 
 if [[ "${ROCM_VERSION}" == "700" ]]; then
-  IMAGE="rocm/pytorch:rocm7.0.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+  IMAGE="lmsysorg/sglang:v0.5.8.post1-rocm700-mi35x"
 elif [[ "${ROCM_VERSION}" == "720" ]]; then
   IMAGE="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
   echo "NOTE: The support to ROCM_VERSION='${ROCM_VERSION}' is coming soon." >&2
