@@ -61,8 +61,8 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
     defaults = dict(
         baseline_path=str(baseline_path),
         target_path=str(target_path),
-        start_id=0,
-        end_id=1000000,
+        start_step=0,
+        end_step=1000000,
         diff_threshold=1e-3,
         filter=None,
     )
@@ -113,7 +113,7 @@ class TestEntrypoint:
 
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
-        args = _make_args(baseline_path, target_path, start_id=1, end_id=1)
+        args = _make_args(baseline_path, target_path, start_step=1, end_step=1)
 
         run(args)
 

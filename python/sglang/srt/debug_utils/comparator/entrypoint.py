@@ -20,7 +20,7 @@ def main() -> None:
 def run(args: argparse.Namespace) -> None:
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
-        (pl.col("step") >= args.start_id) & (pl.col("step") <= args.end_id)
+        (pl.col("step") >= args.start_step) & (pl.col("step") <= args.end_step)
     )
     if args.filter:
         df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
@@ -84,8 +84,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-path", type=str)
     parser.add_argument("--target-path", type=str)
-    parser.add_argument("--start-id", type=int, default=0)
-    parser.add_argument("--end-id", type=int, default=1000000)
+    parser.add_argument("--start-step", type=int, default=0)
+    parser.add_argument("--end-step", type=int, default=1000000)
     parser.add_argument("--diff-threshold", type=float, default=1e-3)
     parser.add_argument(
         "--filter", type=str, default=None, help="Regex to filter filenames"
