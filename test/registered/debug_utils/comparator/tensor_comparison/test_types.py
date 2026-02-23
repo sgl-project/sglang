@@ -20,8 +20,14 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 
 def _make_stats(**overrides: float) -> TensorStats:
     defaults = dict(
-        mean=0.5, std=1.0, min=-2.0, max=3.0,
-        p1=-1.8, p5=-1.5, p95=2.5, p99=2.8,
+        mean=0.5,
+        std=1.0,
+        min=-2.0,
+        max=3.0,
+        p1=-1.8,
+        p5=-1.5,
+        p95=2.5,
+        p99=2.8,
     )
     defaults.update(overrides)
     return TensorStats(**defaults)
@@ -163,8 +169,11 @@ class TestJsonlLineTypes:
 
     def test_config_line_round_trip(self):
         original = ConfigLine(
-            baseline_path="/a", target_path="/b",
-            diff_threshold=0.01, start_step=5, end_step=50,
+            baseline_path="/a",
+            target_path="/b",
+            diff_threshold=0.01,
+            start_step=5,
+            end_step=50,
         )
         restored = ConfigLine.model_validate_json(original.model_dump_json())
         assert restored == original

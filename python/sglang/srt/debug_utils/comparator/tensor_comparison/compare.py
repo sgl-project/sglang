@@ -56,8 +56,8 @@ def compare_tensors(
 
         needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
         if needs_sample:
-            baseline_info.sample = get_truncated_value(x_baseline_f)
-            target_info.sample = get_truncated_value(x_target_f)
+            baseline_info.sample = str(get_truncated_value(x_baseline_f))
+            target_info.sample = str(get_truncated_value(x_target_f))
 
         if baseline_original_dtype != target_original_dtype:
             downcast_dtype = compute_smaller_dtype(

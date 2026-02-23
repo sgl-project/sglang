@@ -13,6 +13,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
     ConfigLine,
     SkipLine,
     SummaryLine,
+    TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import load_object
 from sglang.srt.debug_utils.dump_loader import find_row, read_meta
@@ -38,13 +39,15 @@ def run(args: argparse.Namespace) -> None:
     is_json = args.output_format == "json"
 
     if is_json:
-        print_jsonl(ConfigLine(
-            baseline_path=args.baseline_path,
-            target_path=args.target_path,
-            diff_threshold=args.diff_threshold,
-            start_step=args.start_step,
-            end_step=args.end_step,
-        ))
+        print_jsonl(
+            ConfigLine(
+                baseline_path=args.baseline_path,
+                target_path=args.target_path,
+                diff_threshold=args.diff_threshold,
+                start_step=args.start_step,
+                end_step=args.end_step,
+            )
+        )
     else:
         print("df_target", df_target)
         print("df_baseline", df_baseline)
@@ -122,16 +125,18 @@ def run(args: argparse.Namespace) -> None:
             print()
 
     if is_json:
-        print_jsonl(SummaryLine(
-            total=passed_count + failed_count + skipped_count,
-            passed=passed_count,
-            failed=failed_count,
-            skipped=skipped_count,
-        ))
+        print_jsonl(
+            SummaryLine(
+                total=passed_count + failed_count + skipped_count,
+                passed=passed_count,
+                failed=failed_count,
+                skipped=skipped_count,
+            )
+        )
 
 
 def _check_passed(
-    info: "TensorComparisonInfo",
+    info: TensorComparisonInfo,
     diff_threshold: float,
 ) -> bool:
     if info.diff is None:
