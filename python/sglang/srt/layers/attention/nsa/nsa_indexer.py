@@ -678,20 +678,12 @@ class Indexer(MultiPlatformOp):
         if not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
-        if can_use_nsa_fused_store():
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
-            fused_store_index_k_cache(key, buf, forward_batch.out_cache_loc)
-        else:
-            # Fallback
-            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=forward_batch.out_cache_loc,
-                index_k=k_fp8,
-                index_k_scale=k_scale,
-            )
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
 
         # MHA doesn't need topk_indices
         if not return_indices:
@@ -944,32 +936,42 @@ class Indexer(MultiPlatformOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        key_bf16: torch.Tensor,
+        key: torch.Tensor,
         *,
         act_quant=None,  # fallback only
     ) -> None:
         """
         Store NSA indexer K cache for current step.
 
-        Preferred: fused_store_index_k_cache(key_bf16, cache_u8, out_cache_loc_i64)
-        Fallback : act_quant(key_bf16) + token_to_kv_pool.set_index_k_scale_buffer(...)
+        Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
+        Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
-        if can_use_nsa_fused_store() and _is_cuda and (not _is_fp8_fnuz):
-            if forward_batch.token_to_kv_pool.page_size == 64:
-                # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-                cache_u8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                    layer_id=layer_id
-                )
-                fused_store_index_k_cache(
-                    key_bf16, cache_u8, forward_batch.out_cache_loc
-                )
-                return
+        if (
+            _is_cuda
+            and (not _is_fp8_fnuz)
+            and can_use_nsa_fused_store(
+                key.dtype,
+                forward_batch.out_cache_loc.dtype,
+                forward_batch.token_to_kv_pool.page_size,
+            )
+        ):
+            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            fused_store_index_k_cache(
+                key,
+                buf,
+                forward_batch.out_cache_loc,
+                forward_batch.token_to_kv_pool.page_size,
+            )
+            return
 
         # Fallback: original path
         assert act_quant is not None
-        k_fp8, k_scale = act_quant(key_bf16, self.block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
         out_loc = forward_batch.out_cache_loc
         if not out_loc.is_contiguous():
@@ -1039,9 +1041,6 @@ class Indexer(MultiPlatformOp):
                 return_indices,
             )
 
-        buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1054,7 +1053,7 @@ class Indexer(MultiPlatformOp):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key_bf16=key,
+                    key=key,
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
@@ -1073,7 +1072,7 @@ class Indexer(MultiPlatformOp):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
                         layer_id=layer_id,
-                        key_bf16=key,
+                        key=key,
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
@@ -1082,7 +1081,7 @@ class Indexer(MultiPlatformOp):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
-                    key_bf16=key,
+                    key=key,
                     act_quant=act_quant,
                 )
 
