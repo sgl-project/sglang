@@ -411,6 +411,8 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 if _is_hip:
+                    if self.tms_cudagraph:
+                        return self.all_reduce_unreg(input)
                     return self.all_reduce_reg(input)
                 else:
                     return self.all_reduce(input, registered=not self.tms_cudagraph)
