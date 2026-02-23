@@ -52,6 +52,147 @@ class ExpertDistributionMetrics:
         self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
 
 
+@dataclass
+class GathererTensorAddress:
+    offset: int
+    length: int
+    shape: tuple
+    dtype: torch.dtype
+
+
+@torch.jit.script
+def cast_tensor_to_int32(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.int64:
+        x = tensor.to(torch.int64)
+        low = (x & 0xFFFFFFFF).to(torch.int32)
+        high = ((x >> 32) & 0xFFFFFFFF).to(torch.int32)
+        packed = torch.stack((low, high), dim=-1)
+        return packed.reshape(-1)
+    else:
+        return tensor.to(torch.int32, non_blocking=True)
+
+
+@torch.jit.script
+def cast_tensor_from_int32(
+    tensor: torch.Tensor, original_dtype: torch.dtype
+) -> torch.Tensor:
+    if original_dtype == torch.int64:
+        low = tensor[0::2].to(torch.int64) & 0xFFFFFFFF
+        high = tensor[1::2].to(torch.int64) & 0xFFFFFFFF
+        return low | (high << 32)
+    else:
+        return tensor.to(original_dtype, non_blocking=True)
+
+
+class ExpertRecorderBuffer:
+    def __init__(
+        self,
+        buffer_size_mb: int,
+        device: torch.device = torch.device("cpu"),
+    ):
+        # buffer copy stream
+        self._log_stream = torch.cuda.Stream()
+        # clone done event to synchronize with the copy stream
+        self._log_ready = torch.cuda.Event()
+        # buffer to store the recorded tensors, using int32 as the universal
+        self._buffer = torch.zeros(
+            buffer_size_mb * 1024 * 1024 // torch.int32.itemsize,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=True,
+        )
+        # pointer to the current write position in the buffer
+        self._write_ptr = 0
+        # flag to indicate if the buffer is full
+        # (i.e. no more records can be stored until reset)
+        self._is_full = False
+
+    def store(self, tensor: torch.Tensor) -> GathererTensorAddress:
+        assert tensor.is_cuda, "Input tensor must be on CUDA device"
+
+        if self._is_full:
+            return None
+
+        # protective contiguous clone
+        t = tensor.clone(memory_format=torch.contiguous_format).view(-1)
+        t.record_stream(self._log_stream)  # keep tensor alive
+
+        # make sure previous copy is done
+        self._log_ready.record(torch.cuda.current_stream())
+
+        # backup tensor to buffer asynchronously
+        with torch.cuda.stream(self._log_stream):
+            # report event
+            self._log_ready.wait(self._log_stream)
+
+            # cast tensor if needed
+            if t.dtype != self._buffer.dtype:
+                t = cast_tensor_to_int32(t)
+
+            # compute dimensions
+            length = t.numel()
+
+            # compute buffer slice
+            start = self._write_ptr
+            end = start + length
+
+            # buffer size check
+            if end <= self._buffer.numel():
+                self._buffer[start:end].copy_(t, non_blocking=True)
+                self._write_ptr = end
+            else:
+                # notice the user
+                logger.info(
+                    "ExpertRecorder's buffer is full. Further records will be dropped until reset."
+                )
+                self._is_full = True
+
+        if self._is_full:
+            return None
+
+        # return address and metadata needed for reconstruction
+        return GathererTensorAddress(
+            offset=start,
+            length=length,
+            shape=tuple(tensor.shape),
+            dtype=tensor.dtype,
+        )
+
+    def get(self, address: GathererTensorAddress):
+        t = self._buffer[address.offset : address.offset + address.length]
+
+        # cast tensor if needed
+        if address.dtype != self._buffer.dtype:
+            t = cast_tensor_from_int32(t, address.dtype)
+
+        # Reshape to original dimensions
+        return t.reshape(address.shape).clone()
+
+    def synchronize(self):
+        self._log_stream.synchronize()
+
+    def is_full(self):
+        return self._is_full
+
+    def reset(self):
+        self._write_ptr = 0
+        self._is_full = False
+
+
+def init_recorder_buffer(
+    server_args: ServerArgs,
+) -> Optional[ExpertRecorderBuffer]:
+    if server_args.expert_distribution_recorder_mode == "per_token_buffered":
+        # preallocate a large pinned CPU buffer
+        buffer_size_mb = server_args.expert_distribution_recorder_buffer_size
+        # adjust buffer size
+        if buffer_size_mb is None or buffer_size_mb <= 0:
+            buffer_size_mb = 1024  # default to 1GB
+        return ExpertRecorderBuffer(buffer_size_mb)
+    else:
+        return None
+
+
 class ExpertDistributionRecorder(ABC):
     """Global expert distribution recording"""
 
@@ -144,11 +285,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        self._buffer = init_recorder_buffer(server_args)
         self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank
+            server_args, expert_location_metadata, rank, self._buffer
         )
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
+            k: _SinglePassGatherer.init_new(
+                server_args, expert_location_metadata, rank, self._buffer
+            )
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -301,11 +445,19 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        buffer: Optional[ExpertRecorderBuffer] = None,
     ) -> "_SinglePassGatherer":
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
+
+        if server_args.expert_distribution_recorder_mode == "per_token_buffered":
+            gatherer = _BufferedDetailSinglePassGatherer(
+                server_args, expert_location_metadata, rank
+            )
+            gatherer.set_buffer(buffer)
+            return gatherer
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
@@ -357,6 +509,98 @@ class _SinglePassGatherer(ABC):
 
     def collect(self) -> Dict:
         raise NotImplementedError
+
+
+class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
+    # DeepSeek V3 has this value; should generalize later
+    _TOP_K_NUM = 8
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        expert_location_metadata: ExpertLocationMetadata,
+        rank: int,
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._metadata: Optional[Dict[str, Any]] = None
+        self._num_tokens = 0
+        self._topk_ids_of_layer = torch.zeros(
+            (
+                expert_location_metadata.num_layers,
+                # TODO determine the max number
+                server_args.chunked_prefill_size * 8,
+                self._TOP_K_NUM,
+            ),
+            dtype=torch.int32,
+            device=server_args.device,
+        )
+        self._misc_objects: List[Dict[str, Any]] = []
+        self._data = None
+        assert (
+            not server_args.enable_two_batch_overlap
+        ), "DetailSinglePassGatherer does not support TBO yet"
+        # TODO assert shared experts fusion is disabled, o/w data is wrong
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        assert self._metadata is None
+        self._num_tokens = forward_batch.input_ids.shape[0]
+        self._metadata = dict(
+            # TODO pr-chain
+            # rids=forward_batch.rids,
+            input_ids=self._data.store(forward_batch.input_ids),
+            positions=self._data.store(forward_batch.positions),
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            forward_mode=forward_batch.forward_mode.value,
+        )
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
+            topk_ids
+        )
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        self._misc_objects.append(
+            dict(
+                layer_id=layer_idx,
+                num_tokens_per_rank=self._data.store(num_tokens_per_rank),
+                num_tokens_per_rdma_rank=self._data.store(num_tokens_per_rdma_rank),
+                num_tokens_per_expert=self._data.store(num_tokens_per_expert),
+            )
+        )
+
+    def set_buffer(self, buffer: ExpertRecorderBuffer):
+        self._data = buffer
+
+    def reset(self):
+        self._topk_ids_of_layer[...] = -1
+        self._misc_objects.clear()
+        self._metadata = None
+
+    def collect(self) -> Dict:
+        num_tokens = self._num_tokens
+
+        global_physical_count = _convert_per_token_to_global_physical_count(
+            num_tokens,
+            num_layers=self._expert_location_metadata.num_layers,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            _topk_ids_of_layer=self._topk_ids_of_layer,
+        )
+
+        return dict(
+            **self._metadata,
+            topk_ids_of_layer=self._data.store(
+                self._topk_ids_of_layer[:, :num_tokens, :]
+            ),
+            misc_objects=self._misc_objects,
+            global_physical_count=self._data.store(global_physical_count),
+        )
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
@@ -616,9 +860,10 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        buffer: Optional[ExpertRecorderBuffer] = None,
     ) -> "_Accumulator":
         return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank
+            server_args, expert_location_metadata, rank, buffer
         )
 
     @staticmethod
@@ -628,6 +873,7 @@ class _Accumulator(ABC):
             "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
+            "per_token_buffered": _BufferedDetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(
@@ -635,10 +881,12 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        buffer: Optional[ExpertRecorderBuffer] = None,
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._data = buffer
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -775,6 +1023,72 @@ class _DequeCollection:
 
     def mean(self) -> Dict[int, float]:
         return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+
+
+class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._records = []
+
+        # ensure buffer is set correctly
+        assert self._data is not None
+
+    def get_single_pass_gatherer_keys(self):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
+        return super().get_single_pass_gatherer_keys()
+
+    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
+        if False:  # TODO `server_args.enable_two_batch_overlap`
+            return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
+        return super().get_single_pass_gatherer_key(debug_name)
+
+    def append(
+        self,
+        forward_pass_id: int,
+        gatherer_key: str,
+        single_pass_data: Dict,
+        outputs: Dict[str, Any],
+    ):
+        if self._data.is_full():
+            return  # drop potential broken records
+
+        super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+
+        self._records.append(
+            dict(
+                forward_pass_id=forward_pass_id,
+                rank=self._rank,
+                gatherer_key=gatherer_key,
+                **single_pass_data,
+            )
+        )
+
+    def reset(self):
+        super().reset()
+        self._records.clear()
+        self._data.reset()
+
+    def dump(self, output_mode: _OutputMode):
+        assert output_mode == "file"
+
+        # ensure all data is written to the buffer
+        self._data.synchronize()
+
+        for record in self._records:
+            # convert all GathererTensorAddress in record to actual tensors
+            for k, v in record.items():
+                if isinstance(v, GathererTensorAddress):
+                    record[k] = self._data.get(v)
+
+        output = dict(
+            records=self._records,
+            # NOTE: This may change during recording, so here we say it is the "last" one
+            last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+        _dump_to_file(
+            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+        )
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):

@@ -565,7 +565,7 @@ class ServerArgs:
     eplb_rebalance_layers_per_chunk: Optional[int] = None
     eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "stat_approx", "per_pass", "per_token"]
+        Literal["stat", "stat_approx", "per_pass", "per_token", "per_token_buffered"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
