@@ -33,12 +33,8 @@ class TestUtils(CustomTestCase):
         from sglang.srt.debug_utils.comparator.utils import try_unify_shape
 
         target = torch.Size([3, 4])
-        self.assertEqual(
-            try_unify_shape(torch.randn(1, 1, 3, 4), target).shape, target
-        )
-        self.assertEqual(
-            try_unify_shape(torch.randn(2, 3, 4), target).shape, (2, 3, 4)
-        )
+        self.assertEqual(try_unify_shape(torch.randn(1, 1, 3, 4), target).shape, target)
+        self.assertEqual(try_unify_shape(torch.randn(2, 3, 4), target).shape, (2, 3, 4))
 
     def test_compute_smaller_dtype(self):
         from sglang.srt.debug_utils.comparator.utils import compute_smaller_dtype

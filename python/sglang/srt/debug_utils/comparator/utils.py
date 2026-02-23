@@ -20,17 +20,13 @@ def compute_smaller_dtype(
     return info_dict.get((dtype_a, dtype_b)) or info_dict.get((dtype_b, dtype_a))
 
 
-def try_unify_shape(
-    x: torch.Tensor, target_shape: torch.Size
-) -> torch.Tensor:
+def try_unify_shape(x: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     x_shape = x.shape
     num_dim_to_remove = len(x_shape) - len(target_shape)
     if (x_shape[num_dim_to_remove:] == target_shape) and all(
         val == 1 for val in x_shape[:num_dim_to_remove]
     ):
-        return functools.reduce(
-            lambda a, _: a.squeeze(0), range(num_dim_to_remove), x
-        )
+        return functools.reduce(lambda a, _: a.squeeze(0), range(num_dim_to_remove), x)
 
     return x
 

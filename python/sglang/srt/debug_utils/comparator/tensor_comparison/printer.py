@@ -1,14 +1,11 @@
 from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
     DiffInfo,
     TensorComparisonInfo,
-    TensorInfo,
     TensorStats,
 )
 
 
-def print_comparison(
-    info: TensorComparisonInfo, diff_threshold: float
-) -> None:
+def print_comparison(info: TensorComparisonInfo, diff_threshold: float) -> None:
     baseline = info.baseline
     target = info.target
 
@@ -56,9 +53,7 @@ def print_comparison(
         print(f"x_target(sample)={target.sample}")
 
 
-def _print_stats_comparison(
-    baseline: TensorStats, target: TensorStats
-) -> None:
+def _print_stats_comparison(baseline: TensorStats, target: TensorStats) -> None:
     stat_names = ["mean", "std", "min", "max", "p1", "p5", "p95", "p99"]
     for stat_name in stat_names:
         value_baseline = getattr(baseline, stat_name)
@@ -71,9 +66,7 @@ def _print_stats_comparison(
         )
 
 
-def _print_diff(
-    diff: DiffInfo, diff_threshold: float, prefix_text: str = ""
-) -> None:
+def _print_diff(diff: DiffInfo, diff_threshold: float, prefix_text: str = "") -> None:
     print(
         prefix_text
         + "\t".join(

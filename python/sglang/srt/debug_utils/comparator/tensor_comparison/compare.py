@@ -91,24 +91,30 @@ def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
         std=torch.std(x).item(),
         min=torch.min(x).item(),
         max=torch.max(x).item(),
-        p1=functools.partial(torch.quantile, q=0.01)(x).item()
-        if include_quantiles
-        else None,
-        p5=functools.partial(torch.quantile, q=0.05)(x).item()
-        if include_quantiles
-        else None,
-        p95=functools.partial(torch.quantile, q=0.95)(x).item()
-        if include_quantiles
-        else None,
-        p99=functools.partial(torch.quantile, q=0.99)(x).item()
-        if include_quantiles
-        else None,
+        p1=(
+            functools.partial(torch.quantile, q=0.01)(x).item()
+            if include_quantiles
+            else None
+        ),
+        p5=(
+            functools.partial(torch.quantile, q=0.05)(x).item()
+            if include_quantiles
+            else None
+        ),
+        p95=(
+            functools.partial(torch.quantile, q=0.95)(x).item()
+            if include_quantiles
+            else None
+        ),
+        p99=(
+            functools.partial(torch.quantile, q=0.99)(x).item()
+            if include_quantiles
+            else None
+        ),
     )
 
 
-def _compute_diff(
-    x_baseline: torch.Tensor, x_target: torch.Tensor
-) -> DiffInfo:
+def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = argmax_coord(raw_abs_diff)
 
