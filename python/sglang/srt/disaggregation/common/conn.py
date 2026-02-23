@@ -52,6 +52,13 @@ class PrefillServerInfo:
     page_size: Optional[int]
     follow_bootstrap_room: bool
 
+    def __post_init__(self):
+        self.attn_tp_size = int(self.attn_tp_size)
+        self.dp_size = int(self.dp_size)
+        self.pp_size = int(self.pp_size)
+        self.page_size = int(self.page_size) if self.page_size is not None else None
+        self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+
 
 class CommonKVManager(BaseKVManager):
     def __init__(
