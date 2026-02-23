@@ -17,6 +17,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,6 +25,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=60, suite="stage-b-test-large-1-gpu")
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -452,6 +455,7 @@ class TestSessionControl(unittest.TestCase):
         rid = None
         outputs_from_session = []
 
+        prev_kv_len = 0
         for turn_idx, chunk_ids in enumerate(chunks_ids):
             response = requests.post(
                 self.base_url + "/generate",
@@ -468,21 +472,22 @@ class TestSessionControl(unittest.TestCase):
             ).json()
             rid = response["meta_info"]["id"]
             outputs_from_session.append(response["text"])
+            cached = response["meta_info"]["cached_tokens"]
+            prompt_tokens = response["meta_info"]["prompt_tokens"]
+            completion_tokens = response["meta_info"]["completion_tokens"]
 
             if turn_idx == 0:
                 # Turn 1 should have no cache hit (cache was flushed).
-                self.assertEqual(
-                    response["meta_info"]["cached_tokens"],
-                    0,
-                    "Turn 1 should have 0 cached tokens (clean start)",
-                )
+                self.assertEqual(cached, 0, "Turn 1 should have 0 cached tokens (clean start)")
             else:
-                # Assertion 3: turns 2+ should not perform cache matching.
+                # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
+                # not radix tree matching). cached_tokens reflects the inherited prefix.
                 self.assertEqual(
-                    response["meta_info"]["cached_tokens"],
-                    0,
-                    f"Turn {turn_idx + 1}: streaming sessions skip cache matching",
+                    cached,
+                    prev_kv_len,
+                    f"Turn {turn_idx + 1}: should inherit {prev_kv_len} KV tokens from previous turn",
                 )
+            prev_kv_len = prompt_tokens + completion_tokens
 
         # Close the session before checking cache/memory state.
         ret = requests.post(
@@ -530,7 +535,7 @@ class TestSessionControl(unittest.TestCase):
         # SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE is True by default;
         # the scheduler will crash if it detects a leak during idle.
         time.sleep(2)
-        health_resp = requests.get(self.base_url + "/health_generate")
+        health_resp = requests.get(self.base_url + "/health")
         self.assertEqual(
             health_resp.status_code,
             200,
