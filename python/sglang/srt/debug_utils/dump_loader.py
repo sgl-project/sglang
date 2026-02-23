@@ -8,6 +8,9 @@ import polars as pl
 import torch
 
 
+_TYPED_FIELDS: list[tuple[str, type]] = [("rank", int)]
+
+
 def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
     stem = Path(path).stem
     result: Dict[str, Any] = {}
@@ -15,8 +18,9 @@ def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
         if "=" in kv:
             k, v = kv.split("=", 1)
             result[k] = v
-    if "rank" in result:
-        result["rank"] = int(result["rank"])
+    for field, converter in _TYPED_FIELDS:
+        if field in result:
+            result[field] = converter(result[field])
     return result
 
 
@@ -29,23 +33,24 @@ class ValueWithMeta:
     def load(path: Path) -> "ValueWithMeta":
         path = Path(path)
         meta_from_filename = parse_meta_from_filename(path)
-        meta_from_filename["filename"] = path.name
 
         try:
             raw = torch.load(path, weights_only=False, map_location="cpu")
         except Exception as e:
             print(f"Skip load {path} since error {e}")
-            return ValueWithMeta(value=None, meta=meta_from_filename)
+            return ValueWithMeta(value=None, meta={**meta_from_filename, "filename": path.name})
 
         value, meta_from_embedded = _unwrap_dict_format(raw)
-        return ValueWithMeta(value=value, meta=meta_from_filename | meta_from_embedded)
+        return ValueWithMeta(
+            value=value,
+            meta={**meta_from_filename, **meta_from_embedded, "filename": path.name},
+        )
 
 
 def _unwrap_dict_format(obj: Any) -> Tuple[Any, Dict[str, Any]]:
     if isinstance(obj, dict) and "value" in obj:
         meta = obj.get("meta", {})
-        if not isinstance(meta, dict):
-            meta = {}
+        assert isinstance(meta, dict), f"Expected meta to be dict, got {type(meta)}"
         return obj["value"], meta
     return obj, {}
 
