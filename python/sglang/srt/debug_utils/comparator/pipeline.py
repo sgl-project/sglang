@@ -1,0 +1,209 @@
+import argparse
+from pathlib import Path
+from typing import Optional
+
+import polars as pl
+import torch
+
+from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonRecord,
+    SkipRecord,
+    print_record,
+)
+from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
+from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
+from sglang.srt.debug_utils.dump_loader import (
+    ValueWithMeta,
+    filter_rows,
+    find_row,
+    read_meta,
+)
+
+
+def process_logical_tensor(
+    *,
+    row: dict,
+    df_target: pl.DataFrame,
+    df_baseline: pl.DataFrame,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+    logical_key_cols: list[str],
+) -> None:
+    target_conditions = {k: row[k] for k in logical_key_cols}
+    target_rows = filter_rows(df_target, conditions=target_conditions)
+    first_target_path = Path(args.target_path) / target_rows[0]["filename"]
+
+    first_target = ValueWithMeta.load(first_target_path)
+    dims_str = first_target.meta.get("dims")
+
+    if dims_str is not None:
+        _process_with_unshard(
+            name=row["name"],
+            dims_str=dims_str,
+            target_rows=target_rows,
+            first_target=first_target,
+            df_baseline=df_baseline,
+            logical_key_cols=logical_key_cols,
+            row=row,
+            args=args,
+            counts=counts,
+        )
+    else:
+        _process_per_rank(
+            target_rows=target_rows,
+            df_baseline=df_baseline,
+            args=args,
+            counts=counts,
+        )
+
+
+def _process_with_unshard(
+    *,
+    name: str,
+    dims_str: str,
+    target_rows: list[dict],
+    first_target: ValueWithMeta,
+    df_baseline: pl.DataFrame,
+    logical_key_cols: list[str],
+    row: dict,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+) -> None:
+    fmt = args.output_format
+
+    target_tensor = load_and_unshard(
+        rows=target_rows,
+        base_path=Path(args.target_path),
+        dims_str=dims_str,
+        preloaded_first=first_target,
+    )
+    if target_tensor is None:
+        _skip(name, "target_unshard_failed", counts, fmt)
+        return
+
+    baseline_rows = filter_rows(
+        df_baseline, conditions={k: row[k] for k in logical_key_cols}
+    )
+    if not baseline_rows:
+        _skip(name, "no_baseline", counts, fmt)
+        return
+
+    first_baseline_path = Path(args.baseline_path) / baseline_rows[0]["filename"]
+    first_baseline = ValueWithMeta.load(first_baseline_path)
+    baseline_dims_str = first_baseline.meta.get("dims")
+
+    if baseline_dims_str is not None:
+        baseline_tensor = load_and_unshard(
+            rows=baseline_rows,
+            base_path=Path(args.baseline_path),
+            dims_str=baseline_dims_str,
+            preloaded_first=first_baseline,
+        )
+    else:
+        if len(baseline_rows) > 1:
+            _skip(name, "ambiguous_baseline_no_dims", counts, fmt)
+            return
+        baseline_tensor = _as_tensor(first_baseline.value)
+
+    if baseline_tensor is None:
+        _skip(name, "baseline_load_failed", counts, fmt)
+        return
+
+    _compare_and_record(
+        x_baseline=baseline_tensor,
+        x_target=target_tensor,
+        name=name,
+        args=args,
+        counts=counts,
+    )
+
+
+def _process_per_rank(
+    *,
+    target_rows: list[dict],
+    df_baseline: pl.DataFrame,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+) -> None:
+    for row in target_rows:
+        name = row["name"]
+        path_target = Path(args.target_path) / row["filename"]
+
+        row_baseline = find_row(
+            df_baseline,
+            conditions=dict(
+                step=row["step"],
+                **{
+                    k: v
+                    for k, v in row.items()
+                    if k not in ["step", "dump_index", "filename"]
+                },
+            ),
+        )
+        if row_baseline is None:
+            _skip(name, "no_baseline", counts, args.output_format)
+            continue
+
+        path_baseline = Path(args.baseline_path) / row_baseline["filename"]
+
+        x_baseline = _load_tensor(path_baseline)
+        x_target = _load_tensor(path_target)
+
+        if x_baseline is None or x_target is None:
+            _skip(name, "load_failed", counts, args.output_format)
+            continue
+
+        _compare_and_record(
+            x_baseline=x_baseline,
+            x_target=x_target,
+            name=name,
+            args=args,
+            counts=counts,
+        )
+
+
+def _compare_and_record(
+    *,
+    x_baseline: torch.Tensor,
+    x_target: torch.Tensor,
+    name: str,
+    args: argparse.Namespace,
+    counts: dict[str, int],
+) -> None:
+    info = compare_tensors(
+        x_baseline=x_baseline,
+        x_target=x_target,
+        name=name,
+        diff_threshold=args.diff_threshold,
+    )
+
+    if info.diff is not None and info.diff.passed:
+        counts["passed"] += 1
+    else:
+        counts["failed"] += 1
+
+    print_record(
+        ComparisonRecord(**info.model_dump()),
+        output_format=args.output_format,
+    )
+
+
+def _load_tensor(path: Path) -> Optional[torch.Tensor]:
+    loaded = ValueWithMeta.load(path)
+    return _as_tensor(loaded.value)
+
+
+def _as_tensor(value: object) -> Optional[torch.Tensor]:
+    if not isinstance(value, torch.Tensor):
+        return None
+    return value
+
+
+def _skip(
+    name: str,
+    reason: str,
+    counts: dict[str, int],
+    output_format: str,
+) -> None:
+    counts["skipped"] += 1
+    print_record(SkipRecord(name=name, reason=reason), output_format=output_format)
