@@ -13,7 +13,7 @@
 # ==============================================================================
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/nemotron_h.py
 
-"""NemotronH model configuration"""
+"""Nemotron3 model configuration"""
 
 import regex as re
 from transformers.configuration_utils import PretrainedConfig
@@ -33,18 +33,18 @@ MLP = "-"
 MOE = "E"
 
 
-class NemotronHConfig(PretrainedConfig):
+class Nemotron3Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a
-    [`NemotronHModel`]. It is used to instantiate a NemotronH model according
+    [`Nemotron3Model`]. It is used to instantiate a Nemotron3 model according
     to the specified arguments, defining the model architecture. Instantiating
     a configuration with the defaults will yield a similar configuration to
     that of the NemotronH-v0.1 model.
     Args:
         vocab_size (`int`, *optional*, defaults to 131072):
-            Vocabulary size of the NemotronH model. Defines the number of
+            Vocabulary size of the Nemotron3 model. Defines the number of
             different tokens that can be represented by the `inputs_ids`
-            passed when calling [`NemotronHModel`]
+            passed when calling [`Nemotron3Model`]
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be
             tied. Note that this is only relevant if the model has an output
@@ -148,7 +148,7 @@ class NemotronHConfig(PretrainedConfig):
             Whether to rescale the pre-normalization residual connections.
     """
 
-    model_type = "nemotron_h"
+    model_type = "nemotron_3"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -314,7 +314,7 @@ class NemotronHConfig(PretrainedConfig):
         )
 
 
-class Nemotron3Config(NemotronHConfig):
-    """Configuration alias for newer Nemotron-3 checkpoints."""
+class NemotronHConfig(Nemotron3Config):
+    """This is a stub for backward compatibility."""
 
-    model_type = "nemotron_3"
+    model_type = "nemotron_h"

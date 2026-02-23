@@ -19,7 +19,7 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
+from sglang.srt.configs.nano_nemotron_vl import Nemotron3_Nano_VL_V2_Config
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -34,7 +34,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.nemotron_3 import Nemotron3ForCausalLM
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.multimodal.evs import EVS, EVSConfig
 from sglang.srt.utils import add_prefix
@@ -42,21 +42,21 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-class NemotronH_Nano_VL_V2(EVS):
+class Nemotron3_Nano_VL_V2(EVS):
     @staticmethod
-    def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
+    def create_evs_config(config: Nemotron3_Nano_VL_V2_Config):
         return EVSConfig(video_pruning_rate=config.video_pruning_rate)
 
     def __init__(
         self,
-        config: NemotronH_Nano_VL_V2_Config,
+        config: Nemotron3_Nano_VL_V2_Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(config)
 
         self.downsample_ratio = config.downsample_ratio
-        self.language_model = NemotronHForCausalLM(
+        self.language_model = Nemotron3ForCausalLM(
             config=config.llm_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
@@ -221,4 +221,10 @@ class NemotronH_Nano_VL_V2(EVS):
         self.vision_model.load_weights(vision_weights)
 
 
-EntryClass = [NemotronH_Nano_VL_V2]
+class NemotronH_Nano_VL_V2(Nemotron3_Nano_VL_V2):
+    """This is a stub for backward compatibility."""
+
+    pass
+
+
+EntryClass = [Nemotron3_Nano_VL_V2, NemotronH_Nano_VL_V2]

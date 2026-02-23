@@ -17,7 +17,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs import Nemotron3Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
@@ -28,19 +28,19 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.nemotron_h import (
-    NemotronHAttentionDecoderLayer,
-    NemotronHForCausalLM,
-    NemotronHMoEDecoderLayer,
+from sglang.srt.models.nemotron_3 import (
+    Nemotron3AttentionDecoderLayer,
+    Nemotron3ForCausalLM,
+    Nemotron3MoEDecoderLayer,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 
-class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
+class Nemotron3MTPAttentionDecoderLayer(Nemotron3AttentionDecoderLayer):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -112,10 +112,10 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         return hidden_states, residual
 
 
-class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
+class Nemotron3MTPMoEDecoderLayer(Nemotron3MoEDecoderLayer):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -186,10 +186,10 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         return hidden_states, residual
 
 
-class NemotronHMultiTokenPredictor(nn.Module):
+class Nemotron3MultiTokenPredictor(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -203,7 +203,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
         self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
         assert (
             self.num_mtp_layers == 1
-        ), "Only one MTP layer is supported for NemotronH-MTP"
+        ), "Only one MTP layer is supported for Nemotron3-MTP"
 
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
@@ -239,9 +239,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
             )
 
             if char == "*":
-                self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(**common_kwargs)
+                self.layers[str(i)] = Nemotron3MTPAttentionDecoderLayer(**common_kwargs)
             elif char == "E":
-                self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)
+                self.layers[str(i)] = Nemotron3MTPMoEDecoderLayer(**common_kwargs)
             else:
                 raise NotImplementedError(
                     f"Pattern char '{char}' in {self.pattern_str} not implemented"
@@ -275,10 +275,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
         return hidden_states
 
 
-class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+class Nemotron3ForCausalLMMTP(Nemotron3ForCausalLM):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -294,7 +294,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         # doesn't use Mamba2AttnBackend (MTP has no Mamba layers)
         config.hybrid_override_pattern = config.mtp_hybrid_override_pattern
 
-        self.model = NemotronHMultiTokenPredictor(
+        self.model = Nemotron3MultiTokenPredictor(
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -337,8 +337,10 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         super().load_weights(weights, is_mtp=True)
 
 
-class Nemotron3ForCausalLMMTP(NemotronHForCausalLMMTP):
-    """Compatibility class for Nemotron-3 draft architecture naming."""
+class NemotronHForCausalLMMTP(Nemotron3ForCausalLMMTP):
+    """This is a stub for backward compatibility."""
+
+    pass
 
 
 EntryClass = [Nemotron3ForCausalLMMTP, NemotronHForCausalLMMTP]

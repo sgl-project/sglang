@@ -39,8 +39,8 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
+    Nemotron3_Nano_VL_V2_Config,
+    Nemotron3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
@@ -1595,17 +1595,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
-            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+        if isinstance(config, Nemotron3Config) and self.is_draft_worker:
+            # Nemotron3 MTP draft models have no Mamba layers (pattern like "*E")
             # so they shouldn't use HybridLinearAttnBackend
             pattern = getattr(config, "mtp_hybrid_override_pattern", None)
             if pattern is not None and "M" not in pattern:
                 return None
         if isinstance(
-            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+            config, FalconH1Config | Nemotron3Config | Lfm2Config | Lfm2MoeConfig
         ):
             return config
-        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+        if isinstance(config, Nemotron3_Nano_VL_V2_Config):
             return config.llm_config
 
         if isinstance(config, GraniteMoeHybridConfig):

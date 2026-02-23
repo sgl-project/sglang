@@ -113,7 +113,7 @@ class EVS(torch.nn.Module, ABC):
     On initialization, if video_pruning_rate > 0, this mixin replaces the model's
     get_video_feature() method with a wrapper that applies EVS pruning.
 
-    Example: See `NemotronH_Nano_VL_V2`
+    Example: See `Nemotron3_Nano_VL_V2`
     """
 
     @staticmethod

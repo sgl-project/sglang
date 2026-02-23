@@ -17,7 +17,7 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.nemotron_3 import Nemotron3Config
 from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
@@ -30,8 +30,8 @@ def float_triplet(seq: Any):
     return a, b, c
 
 
-class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
-    model_type = "NemotronH_Nano_VL_V2"
+class Nemotron3_Nano_VL_V2_Config(PretrainedConfig):
+    model_type = "Nemotron3_Nano_VL_V2"
     is_composition = True
 
     def __init__(
@@ -60,12 +60,12 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
 
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
         if llm_config is not None:
-            self.llm_config = NemotronHConfig(**llm_config)
+            self.llm_config = Nemotron3Config(**llm_config)
             assert isinstance(vision_config, dict), "vision_config must be a dictionary"
             self.raw_vision_config = vision_config
         else:
             assert vision_config is None
-            self.llm_config = NemotronHConfig()
+            self.llm_config = Nemotron3Config()
             self.raw_vision_config = {}
 
         # Assign configuration values
@@ -112,3 +112,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             image_size=image_size,
         )
         return radio_config
+
+
+class NemotronH_Nano_VL_V2_Config(Nemotron3_Nano_VL_V2_Config):
+    """This is a stub for backward compatibility."""
+
+    model_type = "Nemotron3_Nano_VL_V2"

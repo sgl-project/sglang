@@ -336,11 +336,7 @@ class ModelConfig:
             "NemotronHForCausalLM",
             "Nemotron3ForCausalLM",
         ]:
-            self.hf_config.architectures[0] = (
-                "NemotronHForCausalLMMTP"
-                if self.hf_config.architectures[0] == "NemotronHForCausalLM"
-                else "Nemotron3ForCausalLMMTP"
-            )
+            self.hf_config.architectures[0] = "Nemotron3ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):
@@ -1239,7 +1235,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
-    "NemotronH_Nano_VL_V2",
+    "Nemotron3_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",

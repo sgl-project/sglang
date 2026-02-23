@@ -18,8 +18,11 @@ from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
-from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
-from sglang.srt.configs.nemotron_h import Nemotron3Config, NemotronHConfig
+from sglang.srt.configs.nano_nemotron_vl import (
+    Nemotron3_Nano_VL_V2_Config,
+    NemotronH_Nano_VL_V2_Config,
+)
+from sglang.srt.configs.nemotron_3 import Nemotron3Config, NemotronHConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
@@ -59,6 +62,7 @@ __all__ = [
     "Nemotron3Config",
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
+    "Nemotron3_Nano_VL_V2_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",

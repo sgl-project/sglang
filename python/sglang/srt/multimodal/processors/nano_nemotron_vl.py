@@ -18,8 +18,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
-from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from sglang.srt.configs.nano_nemotron_vl import Nemotron3_Nano_VL_V2_Config
+from sglang.srt.models.nano_nemotron_vl import Nemotron3_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
 from sglang.srt.multimodal.processors.base_processor import (
@@ -38,12 +38,12 @@ MAX_FRAMES = 128
 
 
 class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
-    models = [NemotronH_Nano_VL_V2]
+    models = [Nemotron3_Nano_VL_V2]
 
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
         self.evs = EVSProcessor(
-            hf_config, {NemotronH_Nano_VL_V2_Config: NemotronH_Nano_VL_V2}
+            hf_config, {Nemotron3_Nano_VL_V2_Config: Nemotron3_Nano_VL_V2}
         )
         Image.MAX_IMAGE_PIXELS = None
         self.image_size = hf_config.image_size

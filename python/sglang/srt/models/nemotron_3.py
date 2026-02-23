@@ -13,7 +13,7 @@
 # ==============================================================================
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/nemotron_h.py
 
-"""Inference-only NemotronH model."""
+"""Inference-only Nemotron3 model."""
 
 from collections.abc import Iterable
 from typing import Optional, Union
@@ -21,8 +21,8 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.configs import Nemotron3Config
+from sglang.srt.configs.nemotron_3 import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
@@ -74,10 +74,10 @@ from sglang.utils import logger
 _is_cuda = is_cuda()
 
 
-class NemotronHMLP(nn.Module):
+class Nemotron3MLP(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
@@ -120,10 +120,10 @@ def _get_or_create_alt_stream(device_module):
     return _alt_stream
 
 
-class NemotronHMoE(nn.Module):
+class Nemotron3MoE(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -180,7 +180,7 @@ class NemotronHMoE(nn.Module):
             is_gated=False,
         )
         if config.n_shared_experts:
-            self.shared_experts = NemotronHMLP(
+            self.shared_experts = Nemotron3MLP(
                 config,
                 intermediate_size=config.moe_shared_expert_intermediate_size
                 * config.n_shared_experts,
@@ -282,10 +282,10 @@ class NemotronHMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class NemotronHMLPDecoderLayer(nn.Module):
+class Nemotron3MLPDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -303,7 +303,7 @@ class NemotronHMLPDecoderLayer(nn.Module):
         else:
             intermediate_size = config.intermediate_size
 
-        self.mixer = NemotronHMLP(
+        self.mixer = Nemotron3MLP(
             config,
             intermediate_size=intermediate_size,
             quant_config=quant_config,
@@ -330,17 +330,17 @@ class NemotronHMLPDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class NemotronHMoEDecoderLayer(nn.Module):
+class Nemotron3MoEDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
 
-        self.mixer = NemotronHMoE(
+        self.mixer = Nemotron3MoE(
             config,
             layer_idx=layer_idx,
             quant_config=quant_config,
@@ -366,10 +366,10 @@ class NemotronHMoEDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class NemotronHMambaDecoderLayer(nn.Module):
+class Nemotron3MambaDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -418,10 +418,10 @@ class NemotronHMambaDecoderLayer(nn.Module):
         return output, residual
 
 
-class NemotronHAttention(nn.Module):
+class Nemotron3Attention(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -487,17 +487,17 @@ class NemotronHAttention(nn.Module):
         return output
 
 
-class NemotronHAttentionDecoderLayer(nn.Module):
+class Nemotron3AttentionDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
 
-        self.mixer = NemotronHAttention(
+        self.mixer = Nemotron3Attention(
             config,
             layer_idx,
             quant_config,
@@ -526,24 +526,24 @@ class NemotronHAttentionDecoderLayer(nn.Module):
 
 
 Layers = (
-    NemotronHAttentionDecoderLayer
-    | NemotronHMLPDecoderLayer
-    | NemotronHMambaDecoderLayer
-    | NemotronHMoEDecoderLayer
+    Nemotron3AttentionDecoderLayer
+    | Nemotron3MLPDecoderLayer
+    | Nemotron3MambaDecoderLayer
+    | Nemotron3MoEDecoderLayer
 )
 ALL_DECODER_LAYER_TYPES: dict[str, type[Layers]] = {
-    ATTENTION: NemotronHAttentionDecoderLayer,
-    MLP: NemotronHMLPDecoderLayer,
-    MAMBA: NemotronHMambaDecoderLayer,
-    MOE: NemotronHMoEDecoderLayer,
+    ATTENTION: Nemotron3AttentionDecoderLayer,
+    MLP: Nemotron3MLPDecoderLayer,
+    MAMBA: Nemotron3MambaDecoderLayer,
+    MOE: Nemotron3MoEDecoderLayer,
 }
 
 
-class NemotronHModel(nn.Module):
+class Nemotron3Model(nn.Module):
     def __init__(
         self,
         *,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -622,7 +622,7 @@ class NemotronHModel(nn.Module):
         return hidden_states
 
 
-class NemotronHForCausalLM(nn.Module):
+class Nemotron3ForCausalLM(nn.Module):
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
         ("qkv_proj", "q_proj", "q"),
@@ -650,7 +650,7 @@ class NemotronHForCausalLM(nn.Module):
     def __init__(
         self,
         *,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -704,11 +704,11 @@ class NemotronHForCausalLM(nn.Module):
 
     def _init_model(
         self,
-        config: NemotronHConfig,
+        config: Nemotron3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        return NemotronHModel(
+        return Nemotron3Model(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -934,11 +934,10 @@ class NemotronHForCausalLM(nn.Module):
         return True
 
 
-class Nemotron3ForCausalLM(NemotronHForCausalLM):
-    """Compatibility class for Nemotron-3 architecture naming."""
+class NemotronHForCausalLM(Nemotron3ForCausalLM):
+    """This is a stub for backward compatibility."""
+
+    pass
 
 
-EntryClass = [
-    Nemotron3ForCausalLM,
-    NemotronHForCausalLM,
-]
+EntryClass = [Nemotron3ForCausalLM, NemotronHForCausalLM]
