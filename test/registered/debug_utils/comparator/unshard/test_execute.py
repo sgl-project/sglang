@@ -4,12 +4,9 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.dims import parse_dims
-from sglang.srt.debug_utils.comparator.unshard import (
-    AxisInfo,
-    UnshardPlan,
-    execute_unshard_plan,
-)
+from sglang.srt.debug_utils.comparator.unshard.execute import execute_unshard_plan
 from sglang.srt.debug_utils.comparator.unshard.plan import compute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo, UnshardPlan
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)

@@ -13,12 +13,12 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison import compare_tensors
-from sglang.srt.debug_utils.comparator.unshard import (
-    compute_unshard_plan,
-    execute_unshard_plan,
+from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
+from sglang.srt.debug_utils.comparator.unshard.execute import execute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
     normalize_parallel_info,
 )
+from sglang.srt.debug_utils.comparator.unshard.plan import compute_unshard_plan
 from sglang.srt.debug_utils.dump_loader import (
     ValueWithMeta,
     filter_rows,
