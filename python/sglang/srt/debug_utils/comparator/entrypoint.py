@@ -285,12 +285,6 @@ def _unshard_side(
             loaded.append(ValueWithMeta.load(path))
 
     parallel_infos = [normalize_parallel_info(item.meta) for item in loaded]
-    world_ranks = [item.meta.get("rank", i) for i, item in enumerate(loaded)]
-
-    try:
-        world_ranks_int = [int(r) for r in world_ranks]
-    except (TypeError, ValueError):
-        world_ranks_int = list(range(len(loaded)))
 
     plan = compute_unshard_plan(
         dim_specs=dim_specs,
@@ -299,14 +293,14 @@ def _unshard_side(
         dims_str=dims_str,
     )
 
-    tensors_by_world_rank: dict[int, torch.Tensor] = {}
-    for world_rank, item in zip(world_ranks_int, loaded):
+    tensors_by_index: dict[int, torch.Tensor] = {}
+    for i, item in enumerate(loaded):
         tensor = _extract_tensor(item)
         if tensor is None:
             return None
-        tensors_by_world_rank[world_rank] = tensor
+        tensors_by_index[i] = tensor
 
-    return execute_unshard_plan(plan, tensors_by_world_rank)
+    return execute_unshard_plan(plan, tensors_by_index)
 
 
 def _extract_tensor(item: ValueWithMeta) -> Optional[torch.Tensor]:
