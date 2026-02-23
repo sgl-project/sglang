@@ -2,6 +2,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
     DiffInfo,
     TensorComparisonInfo,
     TensorStats,
+    _StrictBase,
 )
 
 
@@ -83,3 +84,7 @@ def _print_diff(diff: DiffInfo, diff_threshold: float, prefix_text: str = "") ->
         f"baseline={diff.baseline_at_max} "
         f"target={diff.target_at_max}"
     )
+
+
+def print_jsonl(line: _StrictBase) -> None:
+    print(line.model_dump_json())
