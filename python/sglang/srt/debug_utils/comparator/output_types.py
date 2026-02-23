@@ -1,5 +1,7 @@
 from abc import abstractmethod
-from typing import Literal
+from typing import Annotated, Literal, Union
+
+from pydantic import Discriminator, TypeAdapter
 
 from sglang.srt.debug_utils.comparator.tensor_comparison.formatter import (
     format_comparison,
@@ -59,6 +61,17 @@ class SummaryRecord(_OutputRecord):
             f"Summary: {self.passed} passed, {self.failed} failed, "
             f"{self.skipped} skipped (total {self.total})"
         )
+
+
+AnyRecord = Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord]
+
+_any_record_adapter: TypeAdapter[AnyRecord] = TypeAdapter(
+    Annotated[AnyRecord, Discriminator("type")]
+)
+
+
+def parse_record_json(json_str: str | bytes) -> AnyRecord:
+    return _any_record_adapter.validate_json(json_str)
 
 
 def print_record(record: _OutputRecord, output_format: str) -> None:

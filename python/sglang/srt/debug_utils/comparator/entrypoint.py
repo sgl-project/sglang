@@ -1,4 +1,5 @@
 import argparse
+from collections import defaultdict
 from pathlib import Path
 
 import polars as pl
@@ -42,9 +43,7 @@ def run(args: argparse.Namespace) -> None:
         output_format=args.output_format,
     )
 
-    passed_count = 0
-    failed_count = 0
-    skipped_count = 0
+    counts: dict[str, int] = defaultdict(int)
 
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
@@ -63,7 +62,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
         if row_baseline is None:
-            skipped_count += 1
+            counts["skipped"] += 1
             print_record(
                 SkipRecord(name=row["name"], reason="no_baseline"),
                 output_format=args.output_format,
@@ -76,7 +75,7 @@ def run(args: argparse.Namespace) -> None:
         x_target = load_object(path_target)
 
         if x_baseline is None or x_target is None:
-            skipped_count += 1
+            counts["skipped"] += 1
             print_record(
                 SkipRecord(name=row["name"], reason="load_failed"),
                 output_format=args.output_format,
@@ -91,9 +90,9 @@ def run(args: argparse.Namespace) -> None:
         )
 
         if info.diff is not None and info.diff.passed:
-            passed_count += 1
+            counts["passed"] += 1
         else:
-            failed_count += 1
+            counts["failed"] += 1
 
         print_record(
             ComparisonRecord(**info.model_dump()),
@@ -102,10 +101,10 @@ def run(args: argparse.Namespace) -> None:
 
     print_record(
         SummaryRecord(
-            total=passed_count + failed_count + skipped_count,
-            passed=passed_count,
-            failed=failed_count,
-            skipped=skipped_count,
+            total=sum(counts.values()),
+            passed=counts["passed"],
+            failed=counts["failed"],
+            skipped=counts["skipped"],
         ),
         output_format=args.output_format,
     )
@@ -123,7 +122,6 @@ def _parse_args() -> argparse.Namespace:
         "--filter", type=str, default=None, help="Regex to filter filenames"
     )
     parser.add_argument(
-        "-o",
         "--output-format",
         type=str,
         choices=["text", "json"],

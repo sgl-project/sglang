@@ -1,4 +1,3 @@
-import json
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -8,10 +7,13 @@ import torch
 
 from sglang.srt.debug_utils.comparator.entrypoint import run
 from sglang.srt.debug_utils.comparator.output_types import (
+    AnyRecord,
     ComparisonRecord,
     ConfigRecord,
     SkipRecord,
     SummaryRecord,
+    _OutputRecord,
+    parse_record_json,
 )
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -78,6 +80,10 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
     return Namespace(**defaults)
 
 
+def _parse_jsonl(output: str) -> list[AnyRecord]:
+    return [parse_record_json(line) for line in output.strip().splitlines()]
+
+
 class TestEntrypoint:
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
@@ -128,10 +134,6 @@ class TestEntrypoint:
         assert "Summary:" in output
 
 
-def _parse_jsonl(output: str) -> list[dict]:
-    return [json.loads(line) for line in output.strip().splitlines()]
-
-
 class TestEntrypointJsonl:
     def test_jsonl_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
@@ -140,20 +142,16 @@ class TestEntrypointJsonl:
 
         run(args)
 
-        lines = _parse_jsonl(capsys.readouterr().out)
-        assert lines[0]["type"] == "config"
-        ConfigRecord.model_validate(lines[0])
+        records = _parse_jsonl(capsys.readouterr().out)
+        assert isinstance(records[0], ConfigRecord)
 
-        comparisons = [line for line in lines if line["type"] == "comparison"]
+        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 2
-        for c in comparisons:
-            ComparisonRecord.model_validate(c)
 
-        summary = lines[-1]
-        assert summary["type"] == "summary"
-        SummaryRecord.model_validate(summary)
-        assert summary["total"] == 2
-        assert summary["skipped"] == 0
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.skipped == 0
 
     def test_jsonl_skip(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(
@@ -166,26 +164,24 @@ class TestEntrypointJsonl:
 
         run(args)
 
-        lines = _parse_jsonl(capsys.readouterr().out)
-        skips = [line for line in lines if line["type"] == "skip"]
+        records = _parse_jsonl(capsys.readouterr().out)
+        skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 1
-        SkipRecord.model_validate(skips[0])
-        assert skips[0]["reason"] == "no_baseline"
+        assert skips[0].reason == "no_baseline"
 
-        summary = lines[-1]
-        assert summary["skipped"] == 1
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.skipped == 1
 
-    def test_jsonl_all_lines_are_valid_json(self, tmp_path, capsys):
+    def test_jsonl_all_valid_records(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
         args = _make_args(baseline_path, target_path, output_format="json")
         capsys.readouterr()
 
         run(args)
 
-        output = capsys.readouterr().out
-        for line in output.strip().splitlines():
-            parsed = json.loads(line)
-            assert "type" in parsed
+        records = _parse_jsonl(capsys.readouterr().out)
+        assert all(isinstance(r, _OutputRecord) for r in records)
 
 
 if __name__ == "__main__":
