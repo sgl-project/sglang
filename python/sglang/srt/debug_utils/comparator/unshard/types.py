@@ -31,8 +31,6 @@ class UnshardStep(_FrozenBase):
 
 
 class UnshardPlan(_FrozenBase):
-    tensor_name: str
-    dims_str: str
     replicated_axes: dict[str, AxisInfo] = {}
     steps: list[UnshardStep] = []
     pick_world_ranks: frozenset[int]

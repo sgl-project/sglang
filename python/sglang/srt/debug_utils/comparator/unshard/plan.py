@@ -13,8 +13,6 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 def compute_unshard_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[str, AxisInfo]],
-    tensor_name: str = "",
-    dims_str: str = "",
 ) -> UnshardPlan:
     """Compute an unshard plan from dim specs and per-rank parallel info.
 
@@ -94,8 +92,6 @@ def compute_unshard_plan(
         )
 
     return UnshardPlan(
-        tensor_name=tensor_name,
-        dims_str=dims_str,
         replicated_axes=replicated_axes,
         steps=steps,
         pick_world_ranks=frozenset(pick),

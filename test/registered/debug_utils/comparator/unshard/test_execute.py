@@ -60,8 +60,6 @@ class TestExecuteUnshardPlan:
 
     def test_no_steps_multiple_tensors_raises(self) -> None:
         plan = UnshardPlan(
-            tensor_name="",
-            dims_str="",
             steps=[],
             pick_world_ranks=frozenset({0, 1}),
         )

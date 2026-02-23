@@ -143,7 +143,6 @@ def _process_with_dims(
         rows=target_rows,
         base_path=Path(args.target_path),
         dims_str=dims_str,
-        tensor_name=name,
         preloaded_first=first_target,
     )
     if target_tensor is None:
@@ -166,7 +165,6 @@ def _process_with_dims(
             rows=baseline_rows,
             base_path=Path(args.baseline_path),
             dims_str=baseline_dims_str,
-            tensor_name=name,
             preloaded_first=first_baseline,
         )
     else:
@@ -271,7 +269,6 @@ def _unshard_side(
     rows: list[dict],
     base_path: Path,
     dims_str: str,
-    tensor_name: str,
     preloaded_first: Optional[ValueWithMeta] = None,
 ) -> Optional[torch.Tensor]:
     dim_specs = parse_dims(dims_str)
@@ -289,8 +286,6 @@ def _unshard_side(
     plan = compute_unshard_plan(
         dim_specs=dim_specs,
         parallel_infos=parallel_infos,
-        tensor_name=tensor_name,
-        dims_str=dims_str,
     )
 
     tensors_by_index: dict[int, torch.Tensor] = {}
