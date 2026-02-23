@@ -20,6 +20,7 @@ register_cuda_ci(est_time=155, suite="stage-c-test-8-gpu-h20")
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     PREFILL_DP_SIZE = 4
     DECODE_DP_SIZE = 4
+    LOAD_BALANCE_METHOD = "auto"
 
     @classmethod
     def setUpClass(cls):
@@ -50,6 +51,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--dp",
             str(cls.PREFILL_DP_SIZE),
             "--enable-dp-attention",
+            "--load-balance-method",
+            cls.LOAD_BALANCE_METHOD,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -72,6 +75,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--enable-dp-attention",
             "--base-gpu-id",
             str(cls.PREFILL_DP_SIZE),
+            "--load-balance-method",
+            cls.LOAD_BALANCE_METHOD,
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -95,6 +100,10 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+
+class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
+    LOAD_BALANCE_METHOD = "round_robin"
 
 
 if __name__ == "__main__":
