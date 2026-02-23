@@ -129,7 +129,6 @@ def _add_duplicate_index(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def filter_rows(df: pl.DataFrame, conditions: Dict[str, Any]) -> list[dict]:
-    """Filter a polars DataFrame by column conditions, returning all matching rows."""
     filter_exprs = [
         (
             pl.col(col) == _cast_to_polars_dtype(conditions[col], df.schema[col])

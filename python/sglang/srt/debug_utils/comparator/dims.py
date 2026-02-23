@@ -43,7 +43,6 @@ for _enum_cls, _field in _MODIFIER_FIELDS:
 
 
 def parse_dim(token: str) -> DimSpec:
-    """Parse a single dim token like 'h(tp,partial)' -> DimSpec."""
     match = _DIM_PATTERN.match(token)
     if match is None:
         raise ValueError(f"Invalid dim token: {token!r}")
