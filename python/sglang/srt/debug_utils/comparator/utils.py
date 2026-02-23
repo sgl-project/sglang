@@ -3,6 +3,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+from pydantic import BaseModel, ConfigDict
+
+
+class _StrictBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 def argmax_coord(x: torch.Tensor) -> Tuple[int, ...]:

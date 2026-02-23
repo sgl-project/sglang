@@ -1,5 +1,4 @@
 import argparse
-from collections import defaultdict
 from pathlib import Path
 
 import polars as pl
@@ -43,7 +42,7 @@ def run(args: argparse.Namespace) -> None:
         output_format=args.output_format,
     )
 
-    counts: dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
 
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
@@ -100,12 +99,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
     print_record(
-        SummaryRecord(
-            total=sum(counts.values()),
-            passed=counts["passed"],
-            failed=counts["failed"],
-            skipped=counts["skipped"],
-        ),
+        SummaryRecord(total=sum(counts.values()), **counts),
         output_format=args.output_format,
     )
 

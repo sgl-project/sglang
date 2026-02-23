@@ -1,10 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
-
-
-class _StrictBase(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+from sglang.srt.debug_utils.comparator.utils import _StrictBase
 
 
 class TensorStats(_StrictBase):

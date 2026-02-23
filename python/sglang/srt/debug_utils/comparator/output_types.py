@@ -8,8 +8,8 @@ from sglang.srt.debug_utils.comparator.tensor_comparison.formatter import (
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
     TensorComparisonInfo,
-    _StrictBase,
 )
+from sglang.srt.debug_utils.comparator.utils import _StrictBase
 
 
 class _OutputRecord(_StrictBase):
@@ -63,11 +63,13 @@ class SummaryRecord(_OutputRecord):
         )
 
 
-AnyRecord = Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord]
+AnyRecord = Annotated[
+    Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord],
+    Discriminator("type"),
+]
 
-_any_record_adapter: TypeAdapter[AnyRecord] = TypeAdapter(
-    Annotated[AnyRecord, Discriminator("type")]
-)
+
+_any_record_adapter = TypeAdapter(AnyRecord)
 
 
 def parse_record_json(json_str: str | bytes) -> AnyRecord:
