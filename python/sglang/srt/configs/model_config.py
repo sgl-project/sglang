@@ -332,8 +332,15 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
-            self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "NemotronHForCausalLM",
+            "Nemotron3ForCausalLM",
+        ]:
+            self.hf_config.architectures[0] = (
+                "NemotronHForCausalLMMTP"
+                if self.hf_config.architectures[0] == "NemotronHForCausalLM"
+                else "Nemotron3ForCausalLMMTP"
+            )
             self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):

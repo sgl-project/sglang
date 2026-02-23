@@ -1526,7 +1526,10 @@ class ServerArgs:
                 model_arch=model_arch,
                 support_mamba_cache=False,
             )
-        elif model_arch in ["NemotronHForCausalLM"]:
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "Nemotron3ForCausalLM",
+        ]:
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
@@ -1552,7 +1555,7 @@ class ServerArgs:
                 sm100_default_attention_backend="flashinfer",
             )
             assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
+                f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
             )
         elif model_arch in [

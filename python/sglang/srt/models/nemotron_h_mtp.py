@@ -337,4 +337,8 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         super().load_weights(weights, is_mtp=True)
 
 
-EntryClass = [NemotronHForCausalLMMTP]
+class Nemotron3ForCausalLMMTP(NemotronHForCausalLMMTP):
+    """Compatibility class for Nemotron-3 draft architecture naming."""
+
+
+EntryClass = [Nemotron3ForCausalLMMTP, NemotronHForCausalLMMTP]

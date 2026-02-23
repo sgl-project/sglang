@@ -312,3 +312,9 @@ class NemotronHConfig(PretrainedConfig):
         return Mamba2CacheParams(
             shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
         )
+
+
+class Nemotron3Config(NemotronHConfig):
+    """Configuration alias for newer Nemotron-3 checkpoints."""
+
+    model_type = "nemotron_3"

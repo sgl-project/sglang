@@ -794,6 +794,10 @@ class NemotronHForCausalLM(nn.Module):
                     if name is None:
                         continue
 
+            if self._is_batched_expert_weight(name, loaded_weight):
+                if self._load_batched_expert_weights(name, loaded_weight, params_dict):
+                    continue
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -859,5 +863,82 @@ class NemotronHForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+    @staticmethod
+    def _get_batched_projection_type(name: str) -> Optional[str]:
+        if ".experts.down_proj" in name:
+            return "down_proj"
+        if ".experts.up_proj" in name:
+            return "up_proj"
+        return None
 
-EntryClass = [NemotronHForCausalLM]
+    @staticmethod
+    def _map_batched_weight_name(name: str, projection_type: str) -> Optional[str]:
+        if projection_type == "down_proj":
+            return (
+                name.replace(".experts.down_proj.weight", ".experts.w2_weight")
+                if ".experts.down_proj.weight" in name
+                else (
+                    name.replace(".experts.down_proj", ".experts.w2_weight")
+                    if ".experts.down_proj" in name
+                    else None
+                )
+            )
+        if projection_type == "up_proj":
+            return (
+                name.replace(".experts.up_proj.weight", ".experts.w13_weight")
+                if ".experts.up_proj.weight" in name
+                else (
+                    name.replace(".experts.up_proj", ".experts.w13_weight")
+                    if ".experts.up_proj" in name
+                    else None
+                )
+            )
+        return None
+
+    def _is_batched_expert_weight(self, name: str, loaded_weight: torch.Tensor) -> bool:
+        projection_type = self._get_batched_projection_type(name)
+        if projection_type is None:
+            return False
+        # New Nemotron3 format stores all experts in a single tensor.
+        return (
+            loaded_weight.ndim >= 3
+            and loaded_weight.shape[0] == self.config.n_routed_experts
+        )
+
+    def _load_batched_expert_weights(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+    ) -> bool:
+        projection_type = self._get_batched_projection_type(name)
+        if projection_type is None:
+            return False
+
+        mapped_name = self._map_batched_weight_name(name, projection_type)
+        if mapped_name is None or mapped_name not in params_dict:
+            return False
+
+        shard_id = "w2" if projection_type == "down_proj" else "w1"
+        param = params_dict[mapped_name]
+        weight_loader = param.weight_loader
+        for expert_id in range(self.config.n_routed_experts):
+            weight_loader(
+                param,
+                loaded_weight[expert_id],
+                mapped_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
+        return True
+
+
+class Nemotron3ForCausalLM(NemotronHForCausalLM):
+    """Compatibility class for Nemotron-3 architecture naming."""
+
+
+EntryClass = [
+    Nemotron3ForCausalLM,
+    NemotronHForCausalLM,
+]
