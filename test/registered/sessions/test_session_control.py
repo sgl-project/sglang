@@ -478,7 +478,9 @@ class TestSessionControl(unittest.TestCase):
 
             if turn_idx == 0:
                 # Turn 1 should have no cache hit (cache was flushed).
-                self.assertEqual(cached, 0, "Turn 1 should have 0 cached tokens (clean start)")
+                self.assertEqual(
+                    cached, 0, "Turn 1 should have 0 cached tokens (clean start)"
+                )
             else:
                 # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
                 # not radix tree matching). cached_tokens reflects the inherited prefix.
