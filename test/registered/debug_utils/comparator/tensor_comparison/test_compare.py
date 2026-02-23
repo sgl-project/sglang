@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import (
     QUANTILE_NUMEL_THRESHOLD,
+    SAMPLE_DIFF_THRESHOLD,
     _compute_diff,
     _compute_tensor_stats,
     compare_tensors,
@@ -20,10 +21,18 @@ class TestComputeTensorStats:
         stats = _compute_tensor_stats(x)
 
         assert stats.mean == pytest.approx(3.0, abs=1e-4)
+        assert stats.std == pytest.approx(1.5811, abs=1e-3)
         assert stats.min == pytest.approx(1.0, abs=1e-4)
         assert stats.max == pytest.approx(5.0, abs=1e-4)
-        assert stats.p1 is not None
-        assert stats.p99 is not None
+
+    def test_quantile_values(self):
+        x = torch.linspace(0.0, 100.0, steps=1000)
+        stats = _compute_tensor_stats(x)
+
+        assert stats.p1 == pytest.approx(1.0, abs=0.5)
+        assert stats.p5 == pytest.approx(5.0, abs=0.5)
+        assert stats.p95 == pytest.approx(95.0, abs=0.5)
+        assert stats.p99 == pytest.approx(99.0, abs=0.5)
 
     def test_large_tensor_skips_quantiles(self):
         x = torch.randn(QUANTILE_NUMEL_THRESHOLD + 1)
@@ -56,7 +65,14 @@ class TestComputeDiff:
         assert diff.max_diff_coord == (3, 7)
         assert diff.baseline_at_max == pytest.approx(1.0, abs=1e-4)
         assert diff.target_at_max == pytest.approx(1.5, abs=1e-4)
-        assert diff.mean_abs_diff > 0.0
+        assert diff.mean_abs_diff == pytest.approx(0.5 / 100, abs=1e-4)
+
+    def test_rel_diff_value(self):
+        x = torch.tensor([1.0, 0.0])
+        y = torch.tensor([0.0, 1.0])
+        diff = _compute_diff(x_baseline=x, x_target=y)
+
+        assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
 
 
 class TestCompareTensors:
@@ -92,6 +108,42 @@ class TestCompareTensors:
         assert info.diff is not None
         assert info.diff_downcast is not None
         assert info.downcast_dtype == torch.bfloat16
+
+    def test_shape_unification(self):
+        torch.manual_seed(0)
+        core = torch.randn(4, 8)
+        x = core.unsqueeze(0).unsqueeze(0)  # [1, 1, 4, 8]
+        y = core.clone()  # [4, 8]
+
+        info = compare_tensors(x_baseline=x, x_target=y, name="unify")
+
+        assert info.baseline.shape == torch.Size([1, 1, 4, 8])
+        assert info.unified_shape == torch.Size([4, 8])
+        assert info.shape_mismatch is False
+        assert info.diff is not None
+        assert info.diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
+
+    def test_sample_generated_when_large_diff(self):
+        x = torch.zeros(5, 5)
+        y = torch.ones(5, 5)
+
+        info = compare_tensors(x_baseline=x, x_target=y, name="big_diff")
+
+        assert info.diff is not None
+        assert info.diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
+        assert info.baseline.sample is not None
+        assert info.target.sample is not None
+
+    def test_no_sample_when_small_diff(self):
+        x = torch.ones(5, 5)
+        y = x + 1e-5
+
+        info = compare_tensors(x_baseline=x, x_target=y, name="tiny_diff")
+
+        assert info.diff is not None
+        assert info.diff.max_abs_diff < SAMPLE_DIFF_THRESHOLD
+        assert info.baseline.sample is None
+        assert info.target.sample is None
 
 
 if __name__ == "__main__":

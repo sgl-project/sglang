@@ -27,8 +27,28 @@ class TestCalcRelDiff:
         ).item()
         assert result == pytest.approx(1.0, abs=1e-5)
 
+    def test_similar_tensors(self):
+        x = torch.tensor([1.0, 2.0, 3.0])
+        y = torch.tensor([1.01, 2.01, 3.01])
+        result = calc_rel_diff(x, y).item()
+        assert 0.0 < result < 0.01
+
+    def test_negated_tensors(self):
+        x = torch.tensor([1.0, 2.0])
+        result = calc_rel_diff(x, -x).item()
+        assert result == pytest.approx(2.0, abs=1e-5)
+
 
 class TestArgmaxCoord:
+    def test_1d_tensor(self):
+        x = torch.tensor([0.0, 0.0, 5.0, 0.0])
+        assert argmax_coord(x) == (2,)
+
+    def test_2d_tensor(self):
+        x = torch.zeros(3, 4)
+        x[1, 2] = 10.0
+        assert argmax_coord(x) == (1, 2)
+
     def test_3d_tensor(self):
         x = torch.zeros(2, 3, 4)
         x[1, 2, 3] = 10.0
@@ -44,6 +64,19 @@ class TestTryUnifyShape:
         target = torch.Size([3, 4])
         assert try_unify_shape(torch.randn(2, 3, 4), target).shape == (2, 3, 4)
 
+    def test_same_shape_noop(self):
+        target = torch.Size([3, 4])
+        x = torch.randn(3, 4)
+        result = try_unify_shape(x, target)
+        assert result.shape == target
+        assert result.data_ptr() == x.data_ptr()
+
+    def test_trailing_dims_mismatch(self):
+        target = torch.Size([5, 6])
+        x = torch.randn(1, 3, 4)
+        result = try_unify_shape(x, target)
+        assert result.shape == (1, 3, 4)
+
 
 class TestComputeSmallerDtype:
     def test_float32_bfloat16(self):
@@ -55,12 +88,23 @@ class TestComputeSmallerDtype:
     def test_same_dtype_returns_none(self):
         assert compute_smaller_dtype(torch.float32, torch.float32) is None
 
+    def test_unknown_pair_returns_none(self):
+        assert compute_smaller_dtype(torch.int32, torch.int64) is None
+
 
 class TestLoadObject:
     def test_load_tensor(self, tmp_path):
         path = tmp_path / "tensor.pt"
         torch.save(torch.randn(5, 5), path)
         assert load_object(path).shape == (5, 5)
+
+    def test_load_dict_with_value_key(self, tmp_path):
+        path = tmp_path / "wrapped.pt"
+        tensor = torch.randn(3, 3)
+        torch.save({"value": tensor}, path)
+        result = load_object(path)
+        assert result is not None
+        assert result.shape == (3, 3)
 
     def test_non_tensor_returns_none(self, tmp_path):
         path = tmp_path / "tensor.pt"
