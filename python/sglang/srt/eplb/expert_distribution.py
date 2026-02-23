@@ -417,10 +417,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
         self._metadata = dict(
-            # TODO pr-chain
-            # rids=forward_batch.rids,
-            input_ids=forward_batch.input_ids.cpu().tolist(),
-            positions=forward_batch.positions.cpu().tolist(),
+            rids=forward_batch.rids,
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
             forward_mode=forward_batch.forward_mode.value,
         )
@@ -468,7 +467,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
         return dict(
             **self._metadata,
-            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
+            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :],
             misc_objects=self._misc_objects,
             global_physical_count=global_physical_count,
         )
@@ -824,7 +823,10 @@ class _DequeCollection:
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._records = []
+        self._record_collection = _StagingRecordCollection(
+            envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_MAX_BYTES.get(),
+            get_device_namespace().device,
+        )
 
     def get_single_pass_gatherer_keys(self):
         return super().get_single_pass_gatherer_keys()
@@ -840,33 +842,24 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         outputs: Dict[str, Any],
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
-
-        def _process_object(obj):
-            if isinstance(obj, torch.Tensor):
-                return obj.cpu().clone()
-            return obj
-
-        single_pass_data_processed = {
-            k: _process_object(v) for k, v in single_pass_data.items()
-        }
-
-        self._records.append(
+        self._record_collection.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                **single_pass_data_processed,
+                **single_pass_data,
             )
         )
 
     def reset(self):
         super().reset()
-        self._records.clear()
+        self._record_collection.reset()
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
+
         output = dict(
-            records=self._records,
+            records=self._record_collection.get_records(),
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
@@ -970,6 +963,70 @@ def _dump_to_file(name, data):
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
+
+
+class _StagingRecordCollection:
+    def __init__(self, max_bytes: int, device: str):
+        self._max_bytes = max_bytes
+        self._device_module = torch.get_device_module(device)
+        self._copy_stream = self._device_module.Stream()
+        self._async = max_bytes >= 0 and torch.device(device).type == "cuda"
+        self._num_bytes = 0
+        self._num_dropped = 0
+        self._records: List[Dict[str, Any]] = []
+        logger.info(
+            "Expert distribution staging: %s (device=%s)",
+            "async" if self._async else "sync",
+            device,
+        )
+
+    def append(self, record: Dict[str, Any]):
+        tensors = [(k, v) for k, v in record.items() if isinstance(v, torch.Tensor)]
+        num_bytes = sum(v.numel() * v.element_size() for _, v in tensors)
+        if self._max_bytes >= 0 and self._num_bytes + num_bytes > self._max_bytes:
+            self._num_dropped += 1
+            return  # Staging memory budget is exhausted.
+        self._num_bytes += num_bytes
+        self._records.append(self._stage_record(record, tensors))
+
+    def get_records(self) -> List[Dict[str, Any]]:
+        # Ensure the async copies of the current records have completed.
+        if self._async and self._records:
+            self._copy_stream.synchronize()
+        logger.info(
+            "Expert distribution staging: %s records, %.1f MiB staged, "
+            "dropped %s (over budget)",
+            len(self._records),
+            self._num_bytes / (1024**2),
+            self._num_dropped,
+        )
+        return list(self._records)
+
+    def reset(self):
+        self._records.clear()
+        self._num_bytes = 0
+        self._num_dropped = 0
+
+    def _stage_record(
+        self, record: Dict[str, Any], tensors: List[Tuple[str, torch.Tensor]]
+    ) -> Dict[str, Any]:
+        if not self._async:
+            for k, v in tensors:
+                record[k] = v.cpu().clone()
+        else:
+            srcs: List[Tuple[str, torch.Tensor]] = []
+            for k, v in tensors:
+                src = v.clone(memory_format=torch.contiguous_format)
+                if src.device.type != "cpu":
+                    src.record_stream(self._copy_stream)
+                srcs.append((k, src))
+            self._copy_stream.wait_stream(self._device_module.current_stream())
+            with self._device_module.stream(self._copy_stream):
+                for k, src in srcs:
+                    dst = torch.empty(src.shape, dtype=src.dtype, pin_memory=True)
+                    dst.copy_(src, non_blocking=True)
+                    record[k] = dst
+        return record
 
 
 class _Buffer:

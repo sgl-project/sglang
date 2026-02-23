@@ -1141,6 +1141,8 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    # Negative = unlimited records, with async staging disabled
+    SGLANG_EXPERT_DISTRIBUTION_RECORDER_MAX_BYTES = EnvInt(2 * 1024**3)
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
