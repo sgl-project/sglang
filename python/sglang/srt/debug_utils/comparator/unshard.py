@@ -135,7 +135,9 @@ def compute_unshard_plan(
                 axis=spec.parallel,
                 dim_index=dim_idx,
                 fn=_get_unshard_fn(spec),
-                world_ranks_by_axis_rank=[rank_to_world[i] for i in range(expected_size)],
+                world_ranks_by_axis_rank=[
+                    rank_to_world[i] for i in range(expected_size)
+                ],
             )
         )
 
@@ -185,9 +187,7 @@ def execute_unshard_plan(
         new_tensors: dict[int, torch.Tensor] = {}
         for members in groups.values():
             ordered = [
-                members[wr]
-                for wr in step.world_ranks_by_axis_rank
-                if wr in members
+                members[wr] for wr in step.world_ranks_by_axis_rank if wr in members
             ]
             if not ordered:
                 continue
