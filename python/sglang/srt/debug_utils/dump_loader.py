@@ -7,7 +7,6 @@ from typing import Any, Dict, Tuple
 import polars as pl
 import torch
 
-
 _TYPED_FIELDS: list[tuple[str, type]] = [("rank", int)]
 
 
@@ -38,7 +37,9 @@ class ValueWithMeta:
             raw = torch.load(path, weights_only=False, map_location="cpu")
         except Exception as e:
             print(f"Skip load {path} since error {e}")
-            return ValueWithMeta(value=None, meta={**meta_from_filename, "filename": path.name})
+            return ValueWithMeta(
+                value=None, meta={**meta_from_filename, "filename": path.name}
+            )
 
         value, meta_from_embedded = _unwrap_dict_format(raw)
         return ValueWithMeta(
