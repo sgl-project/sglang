@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class PrefillParallelInfo:
+class PrefillServerInfo:
     attn_tp_size: int
     dp_size: int
     pp_size: int
@@ -102,7 +102,7 @@ class CommonKVManager(BaseKVManager):
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
-            self.prefill_info_table: Dict[str, PrefillParallelInfo] = {}
+            self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -464,14 +464,14 @@ class CommonKVReceiver(BaseKVReceiver):
     @staticmethod
     def _fetch_prefill_parallel_info(
         bootstrap_addr: str,
-    ) -> Optional[PrefillParallelInfo]:
+    ) -> Optional[PrefillServerInfo]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                return PrefillParallelInfo(**data)
+                return PrefillServerInfo(**data)
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
@@ -649,7 +649,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             and int(prefill_dp_rank) == -1
             and int(target_pp_rank) == -1
         ):
-            info = PrefillParallelInfo(
+            info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,
                 dp_size=self.dp_size,
                 pp_size=self.pp_size,
