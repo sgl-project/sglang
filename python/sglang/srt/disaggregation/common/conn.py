@@ -416,7 +416,6 @@ class CommonKVReceiver(BaseKVReceiver):
             prefill_dp_rank is not None
         ), "prefill_dp_rank must be resolved before creating receiver"
         self.prefill_dp_rank = prefill_dp_rank
-        self.target_dp_group = self.prefill_dp_rank
         self._setup_bootstrap_infos()
 
     def _setup_bootstrap_infos(self):
@@ -466,11 +465,11 @@ class CommonKVReceiver(BaseKVReceiver):
         assert len(self.bootstrap_infos) > 0
 
     def _get_bootstrap_info_from_server(
-        self, engine_rank, target_dp_group, target_pp_rank
+        self, engine_rank, prefill_dp_rank, target_pp_rank
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&prefill_dp_rank={prefill_dp_rank}&target_pp_rank={target_pp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -489,7 +488,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], bool]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
             response = requests.get(url)
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
@@ -667,14 +666,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_get(self, request: web.Request):
         engine_rank = request.query.get("engine_rank")
-        target_dp_group = request.query.get("target_dp_group")
+        prefill_dp_rank = request.query.get("prefill_dp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
-        if not engine_rank or not target_dp_group or not target_pp_rank:
+        if not engine_rank or not prefill_dp_rank or not target_pp_rank:
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
 
         if (
             int(engine_rank) == -1
-            and int(target_dp_group) == -1
+            and int(prefill_dp_rank) == -1
             and int(target_pp_rank) == -1
         ):
             prefill_parallel_info = {
@@ -692,7 +691,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         # Find corresponding prefill info
         async with self.lock:
-            bootstrap_info = self.prefill_port_table[int(target_dp_group)][
+            bootstrap_info = self.prefill_port_table[int(prefill_dp_rank)][
                 int(engine_rank)
             ][int(target_pp_rank)]
 
