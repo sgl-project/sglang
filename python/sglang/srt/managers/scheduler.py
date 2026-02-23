@@ -61,6 +61,9 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.mamba.ops import (
+    initialize_mamba_selective_state_update_backend,
+)
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
     get_attention_cp_group,
@@ -87,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -356,6 +361,9 @@ class Scheduler(
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
 
+        # Init mamba backend
+        self.init_mamba_backend()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -488,6 +496,9 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+
+    def init_mamba_backend(self) -> None:
+        initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
         # For the MM models, check the text_config for MoE settings
@@ -1073,6 +1084,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (DumperControlReqInput, self.handle_dumper_control),
             ]
         )
 
@@ -1917,9 +1929,7 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-                new_batch, log_stats=False
-            )
+            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1934,9 +1944,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-            ret, need_sync=need_mlp_sync
-        )
+        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
@@ -2095,8 +2103,6 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                self.maybe_release_mamba_cache(req)
-
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -2193,25 +2199,6 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
-
-    def maybe_release_mamba_cache(self, req: Req) -> None:
-        """Release mamba slot if allocated via COW but scheduling failed.
-
-        Without this, the slot remains held by a waiting request, causing
-        check_memory() to detect a "memory leak" and crash the server.
-        The next schedule round will re-allocate safely via match_prefix().
-
-        Note: In disaggregation DECODE mode, mamba state is transferred from PREFILL and
-        is not recoverable if freed, so we do not free it here. To avoid false-positive
-        leak checks in this situation, self_check_during_idle skips memory checking when
-        the waiting queue is not empty.
-        """
-        if (
-            req.mamba_pool_idx is not None
-            and self.disaggregation_mode != DisaggregationMode.DECODE
-        ):
-            self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
-            req.mamba_pool_idx = None
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -2975,6 +2962,28 @@ class Scheduler(
         freeze_gc("Scheduler")
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
+
+    def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        from sglang.srt.debug_utils.dumper import dumper
+
+        try:
+            response: list = []
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                response = dumper._http_manager.handle_request(
+                    method=recv_req.method, body=recv_req.body
+                )
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=True, response=response), recv_req
+            )
+        except Exception as e:
+            print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=False, response=[], error=str(e)),
+                recv_req,
+            )
 
     # placeholder for override
     def update_cache_from_scheduler(

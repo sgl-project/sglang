@@ -54,7 +54,7 @@ python -m sglang.test.run_eval \
 ```
 
 ```{tip}
-For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-r1`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
+For reasoning models, add `--thinking-mode <mode>` (e.g., `qwen3`, `deepseek-v3`). You may skip it if the model has forced thinking enabled.
 ```
 
 **HumanEval**

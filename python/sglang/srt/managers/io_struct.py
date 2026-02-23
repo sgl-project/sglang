@@ -1309,6 +1309,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Tensor metadata
+    manifest: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1966,6 +1968,19 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class DumperControlReqInput(BaseReq):
+    method: str
+    body: Dict[str, Any]
+
+
+@dataclass
+class DumperControlReqOutput(BaseReq):
+    success: bool
+    response: List[Dict[str, Any]]
+    error: str = ""
 
 
 def _check_all_req_types():

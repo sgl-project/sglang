@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+
 import logging
 import math
 import re
@@ -785,9 +786,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=None,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
 
@@ -803,7 +804,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("model", prefix),
+                prefix=add_prefix("model.language_model", prefix),
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
@@ -1109,7 +1110,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                    name = name.replace(r"model.visual.", r"visual.")
 
                 try:
                     # Skip loading extra bias for GPTQ models.

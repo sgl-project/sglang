@@ -30,6 +30,7 @@ class EngineBase(ABC):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
+        priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass
