@@ -3,7 +3,7 @@ import sys
 import pytest
 
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
-from sglang.srt.debug_utils.comparator.unshard import AxisInfo, UnshardPlan
+from sglang.srt.debug_utils.comparator.unshard import AxisInfo
 from sglang.srt.debug_utils.comparator.unshard.plan import compute_unshard_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,9 +13,7 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 class TestComputeUnshardPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
-        parallel_infos = [
-            {"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
-        ]
+        parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
         plan = compute_unshard_plan(dim_specs, parallel_infos)
 
         assert len(plan.steps) == 1

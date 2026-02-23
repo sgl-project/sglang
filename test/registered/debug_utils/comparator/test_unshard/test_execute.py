@@ -21,9 +21,7 @@ class TestExecuteUnshardPlan:
         shards = list(full_tensor.chunk(4, dim=1))
 
         dim_specs = parse_dims("b h(tp) d")
-        parallel_infos = [
-            {"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
-        ]
+        parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
         plan = compute_unshard_plan(dim_specs, parallel_infos)
         tensors_by_rank = {i: shards[i] for i in range(4)}
 

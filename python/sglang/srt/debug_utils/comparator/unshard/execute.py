@@ -23,17 +23,13 @@ def execute_unshard_plan(
     sequentially. Concatenation order is strictly by axis_rank.
     """
     filtered = {
-        wr: t
-        for wr, t in tensors_by_world_rank.items()
-        if wr in plan.pick_world_ranks
+        wr: t for wr, t in tensors_by_world_rank.items() if wr in plan.pick_world_ranks
     }
 
     if not plan.steps:
         if len(filtered) == 1:
             return next(iter(filtered.values()))
-        raise ValueError(
-            f"No unshard steps but got {len(filtered)} tensors"
-        )
+        raise ValueError(f"No unshard steps but got {len(filtered)} tensors")
 
     axis_rank_lookup: dict[int, dict[int, int]] = {
         id(step): {wr: i for i, wr in enumerate(step.world_ranks_by_axis_rank)}
@@ -58,9 +54,7 @@ def execute_unshard_plan(
         new_tensors: dict[int, torch.Tensor] = {}
         for members in groups.values():
             ordered = [
-                members[wr]
-                for wr in step.world_ranks_by_axis_rank
-                if wr in members
+                members[wr] for wr in step.world_ranks_by_axis_rank if wr in members
             ]
             if not ordered:
                 continue
@@ -74,9 +68,7 @@ def execute_unshard_plan(
         current_tensors = new_tensors
 
     if len(current_tensors) != 1:
-        raise ValueError(
-            f"Expected 1 tensor after unshard, got {len(current_tensors)}"
-        )
+        raise ValueError(f"Expected 1 tensor after unshard, got {len(current_tensors)}")
 
     return next(iter(current_tensors.values()))
 

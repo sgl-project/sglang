@@ -75,9 +75,7 @@ def compute_unshard_plan(
             rank_to_world.setdefault(ainfo.axis_rank, world_rank)
 
         if expected_size is None:
-            raise ValueError(
-                f"No parallel_info found for sharded axis {axis_name!r}"
-            )
+            raise ValueError(f"No parallel_info found for sharded axis {axis_name!r}")
 
         if set(rank_to_world.keys()) != set(range(expected_size)):
             raise ValueError(
