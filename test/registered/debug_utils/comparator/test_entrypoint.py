@@ -12,6 +12,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="default", nightly=True)
 
 
+def _make_dumper(directory: Path) -> _Dumper:
+    return _Dumper(
+        config=DumperConfig(enable=True, dir=str(directory), enable_http_server=False)
+    )
+
+
 def _create_dumps(
     tmp_path: Path,
     tensor_names: list[str],
@@ -34,16 +40,12 @@ def _create_dumps(
     baseline_tensor = torch.randn(10, 10)
     target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
 
-    dumper_baseline = _Dumper(
-        config=DumperConfig(enable=True, dir=str(d_baseline), enable_http_server=False)
-    )
+    dumper_baseline = _make_dumper(d_baseline)
     for name in baseline_names:
         dumper_baseline.dump(name, baseline_tensor)
     dumper_baseline.step()
 
-    dumper_target = _Dumper(
-        config=DumperConfig(enable=True, dir=str(d_target), enable_http_server=False)
-    )
+    dumper_target = _make_dumper(d_target)
     for name in tensor_names:
         dumper_target.dump(name, target_tensor)
     dumper_target.step()
@@ -119,9 +121,7 @@ class TestEntrypoint:
 
         exp_paths = []
         for d in [d_baseline, d_target]:
-            dumper = _Dumper(
-                config=DumperConfig(enable=True, dir=str(d), enable_http_server=False)
-            )
+            dumper = _make_dumper(d)
             dumper.dump("t", tensor)
             dumper.step()
             dumper.dump("t", tensor)

@@ -22,10 +22,10 @@ def _make_stats(
     std: float = 1.0,
     min: float = -2.0,
     max: float = 2.0,
-    p1: float = -1.8,
-    p5: float = -1.5,
-    p95: float = 1.5,
-    p99: float = 1.8,
+    p1: float | None = -1.8,
+    p5: float | None = -1.5,
+    p95: float | None = 1.5,
+    p99: float | None = 1.8,
 ) -> TensorStats:
     return TensorStats(
         mean=mean, std=std, min=min, max=max, p1=p1, p5=p5, p95=p95, p99=p99
@@ -47,18 +47,28 @@ def _make_diff(
     )
 
 
+def _make_tensor_info(
+    shape: torch.Size = torch.Size([4, 8]),
+    dtype: torch.dtype = torch.float32,
+    stats: TensorStats | None = None,
+    sample: str | None = None,
+) -> TensorInfo:
+    return TensorInfo(
+        shape=shape,
+        dtype=dtype,
+        stats=stats if stats is not None else _make_stats(),
+        sample=sample,
+    )
+
+
 class TestPrintComparison:
     def test_normal(self, capsys):
         info = TensorComparisonInfo(
             name="test",
-            baseline=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
+            baseline=_make_tensor_info(
                 stats=_make_stats(mean=0.1, std=1.0, min=-2.0, max=2.0),
             ),
-            target=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
+            target=_make_tensor_info(
                 stats=_make_stats(mean=0.1001, std=1.0001, min=-2.0001, max=2.0001),
             ),
             unified_shape=torch.Size([4, 8]),
@@ -89,16 +99,8 @@ class TestPrintComparison:
     def test_shape_mismatch(self, capsys):
         info = TensorComparisonInfo(
             name="mismatch",
-            baseline=TensorInfo(
-                shape=torch.Size([3, 4]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-            ),
-            target=TensorInfo(
-                shape=torch.Size([5, 6]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-            ),
+            baseline=_make_tensor_info(shape=torch.Size([3, 4])),
+            target=_make_tensor_info(shape=torch.Size([5, 6])),
             unified_shape=torch.Size([3, 4]),
             shape_mismatch=True,
         )
@@ -124,16 +126,8 @@ class TestPrintComparison:
     def test_with_downcast(self, capsys):
         info = TensorComparisonInfo(
             name="downcast",
-            baseline=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-            ),
-            target=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.bfloat16,
-                stats=_make_stats(),
-            ),
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(dtype=torch.bfloat16),
             unified_shape=torch.Size([4, 8]),
             shape_mismatch=False,
             diff=_make_diff(rel_diff=0.002, max_abs_diff=0.005, mean_abs_diff=0.001),
@@ -170,16 +164,8 @@ class TestPrintComparison:
     def test_with_shape_unification(self, capsys):
         info = TensorComparisonInfo(
             name="unify",
-            baseline=TensorInfo(
-                shape=torch.Size([1, 1, 4, 8]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-            ),
-            target=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-            ),
+            baseline=_make_tensor_info(shape=torch.Size([1, 1, 4, 8])),
+            target=_make_tensor_info(),
             unified_shape=torch.Size([4, 8]),
             shape_mismatch=False,
             diff=_make_diff(),
@@ -210,18 +196,8 @@ class TestPrintComparison:
     def test_with_samples(self, capsys):
         info = TensorComparisonInfo(
             name="samples",
-            baseline=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-                sample="tensor([0.1, 0.2, ...])",
-            ),
-            target=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=_make_stats(),
-                sample="tensor([0.1, 0.3, ...])",
-            ),
+            baseline=_make_tensor_info(sample="tensor([0.1, 0.2, ...])"),
+            target=_make_tensor_info(sample="tensor([0.1, 0.3, ...])"),
             unified_shape=torch.Size([4, 8]),
             shape_mismatch=False,
             diff=_make_diff(),
@@ -250,28 +226,12 @@ class TestPrintComparison:
         )
 
     def test_none_quantiles(self, capsys):
-        stats_no_quantiles = TensorStats(
-            mean=0.0,
-            std=1.0,
-            min=-2.0,
-            max=2.0,
-            p1=None,
-            p5=None,
-            p95=None,
-            p99=None,
-        )
+        stats_no_quantiles = _make_stats(p1=None, p5=None, p95=None, p99=None)
+
         info = TensorComparisonInfo(
             name="no_quantiles",
-            baseline=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=stats_no_quantiles,
-            ),
-            target=TensorInfo(
-                shape=torch.Size([4, 8]),
-                dtype=torch.float32,
-                stats=stats_no_quantiles,
-            ),
+            baseline=_make_tensor_info(stats=stats_no_quantiles),
+            target=_make_tensor_info(stats=stats_no_quantiles),
             unified_shape=torch.Size([4, 8]),
             shape_mismatch=False,
             diff=_make_diff(),
