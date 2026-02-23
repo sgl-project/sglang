@@ -24,6 +24,8 @@ class KVArgs:
     state_data_lens: List[int]
     state_item_lens: List[int]
     state_type: str  # "none", "mamba", "swa"
+    # for mamba state different tp slice transfer
+    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
     ib_device: str
     ib_traffic_class: str
     gpu_id: int

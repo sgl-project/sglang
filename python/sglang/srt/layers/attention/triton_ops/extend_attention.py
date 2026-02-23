@@ -64,7 +64,15 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
     else:
-        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
+        if _is_cuda and CUDA_CAPABILITY[0] == 12:
+            # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
+            if Lq <= 128:
+                BLOCK_M, BLOCK_N = (64, 128)
+            elif Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
+            else:
+                BLOCK_M, BLOCK_N = (32, 32)
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
