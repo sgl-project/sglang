@@ -36,7 +36,7 @@ _REDUCTION_VALUES = {e.value for e in Reduction}
 
 def parse_dims(dims_str: str) -> list[DimSpec]:
     """Parse 'b s(cp,zigzag) h(tp) d' -> list[DimSpec]."""
-    if not dims_str or not dims_str.strip():
+    if not dims_str.strip():
         raise ValueError("dims string must not be empty")
 
     tokens = dims_str.strip().split()
@@ -59,7 +59,7 @@ def parse_dims(dims_str: str) -> list[DimSpec]:
             continue
 
         parts = [p.strip() for p in paren_content.split(",")]
-        if not parts or parts == [""]:
+        if parts == [""]:
             raise ValueError(f"Empty parentheses in dim token: {token!r}")
 
         parallel = _parse_parallel_axis(parts[0], token)
