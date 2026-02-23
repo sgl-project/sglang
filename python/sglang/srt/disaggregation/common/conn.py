@@ -557,7 +557,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self._setup_routes()
         self.pp_size = None
         self.attn_tp_size = None
-        self.dp_size = None
+        self.dp_size = dp_size
         self.page_size = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.prefill_port_table: Dict[
