@@ -52,9 +52,6 @@ class CommonKVManager(BaseKVManager):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
-        self.disaggregation_decode_enable_fake_auto = (
-            server_args.disaggregation_decode_enable_fake_auto
-        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port

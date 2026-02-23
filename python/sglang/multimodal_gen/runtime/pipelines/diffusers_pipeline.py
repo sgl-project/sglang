@@ -136,7 +136,7 @@ class DiffusersExecutionStage(PipelineStage):
 
             result = self._convert_to_tensor(data)
             if result is not None:
-                logger.info(
+                logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
                     result.shape,
@@ -225,7 +225,7 @@ class DiffusersExecutionStage(PipelineStage):
         # Ensure correct shape for downstream processing
         output = self._fix_output_shape(output)
 
-        logger.info("Final output tensor shape: %s", output.shape)
+        logger.debug("Final output tensor shape: %s", output.shape)
         return output
 
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
@@ -333,6 +333,9 @@ class DiffusersExecutionStage(PipelineStage):
         if not batch.image_path:
             return None
 
+        if isinstance(batch.image_path, list):
+            batch.image_path = batch.image_path[0]
+
         try:
             if batch.image_path.startswith(("http://", "https://")):
                 response = requests.get(batch.image_path, timeout=30)
@@ -388,7 +391,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
 
         original_model_path = model_path  # Keep original for custom_pipeline
-        model_path = maybe_download_model(model_path)
+        model_path = maybe_download_model(model_path, force_diffusers_model=True)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
@@ -585,7 +588,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
         self.is_video_pipeline = any(ind in pipe_class_name for ind in video_indicators)
-        logger.info(
+        logger.debug(
             "Detected pipeline type: %s",
             "video" if self.is_video_pipeline else "image",
         )
@@ -601,8 +604,7 @@ class DiffusersPipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Create the execution stage wrapping the diffusers pipeline."""
         self.add_stage(
-            stage_name="diffusers_execution",
-            stage=DiffusersExecutionStage(self.diffusers_pipe),
+            DiffusersExecutionStage(self.diffusers_pipe), "diffusers_execution"
         )
 
     def initialize_pipeline(self, server_args: ServerArgs):
@@ -617,11 +619,18 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.initialize_pipeline(self.server_args)
         self.create_pipeline_stages(self.server_args)
 
-    def add_stage(self, stage_name: str, stage: PipelineStage):
+    def add_stage(
+        self, stage: PipelineStage, stage_name: str | None = None
+    ) -> "DiffusersPipeline":
         """Add a stage to the pipeline."""
+        if stage_name is None:
+            stage_name = self._infer_stage_name(stage)
+        if stage_name in self._stage_name_mapping:
+            raise ValueError(f"Duplicate stage name detected: {stage_name}")
+
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
-        setattr(self, stage_name, stage)
+        return self
 
     @property
     def stages(self) -> list[PipelineStage]:
