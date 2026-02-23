@@ -102,8 +102,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             torch.empty(
                 num_experts,
                 (
-                    2 * intermediate_size_per_partition \
-                    if not padded_for_mfma \
+                    2 * intermediate_size_per_partition
+                    if not padded_for_mfma
                     else w13_inter_dim_padded
                 ),
                 hidden_size // 2,
@@ -120,8 +120,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 num_experts,
                 hidden_size,
                 (
-                    intermediate_size_per_partition // 2 \
-                    if not padded_for_mfma \
+                    intermediate_size_per_partition // 2
+                    if not padded_for_mfma
                     else w2_inter_dim_padded
                 ),
                 dtype=params_dtype,
@@ -137,8 +137,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             torch.ones(
                 num_experts,
                 (
-                    2 * intermediate_size_per_partition \
-                    if not padded_for_mfma \
+                    2 * intermediate_size_per_partition
+                    if not padded_for_mfma
                     else w13_inter_dim_padded
                 ),
                 hidden_size // OCP_MX_BLOCK_SIZE,
