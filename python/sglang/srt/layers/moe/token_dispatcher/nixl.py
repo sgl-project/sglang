@@ -387,11 +387,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                     else {}
                 ),
             )
-            torch.cuda.synchronize()
             if self._mask_buffer is not None:
                 buffer.query_mask_buffer(self._mask_buffer)
                 self.active_ranks.copy_(1 - self._mask_buffer)
-            torch.cuda.synchronize()
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

@@ -2225,8 +2225,8 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "nixl":
             self.ep_size = self.tp_size
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled because moe_a2a_backend=`nixl`")
+            #self.disable_cuda_graph = True
+            #logger.warning("Cuda graph is disabled because moe_a2a_backend=`nixl`")
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
