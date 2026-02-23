@@ -223,7 +223,24 @@ class _Dumper:
         self._state.step += 1
         print(f"[Dumper] [{time.time()}] step={self._state.step}")
 
-    def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
+    def dump(
+        self,
+        name: str,
+        value,
+        save: bool = True,
+        dims: Optional[str] = None,
+        dims_grad: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        value_meta: dict = {}
+        grad_meta: dict = {}
+        if dims is not None:
+            value_meta["dims"] = dims
+            grad_meta["dims"] = dims
+        if dims_grad is not None:
+            value_meta["dims_grad"] = dims_grad
+            grad_meta["dims"] = dims_grad
+
         self._dump_inner(
             name=name,
             value=value,
@@ -234,6 +251,8 @@ class _Dumper:
             enable_future_grad=self._config.enable_grad,
             value_tag="Dumper.Value",
             grad_tag="Dumper.Grad",
+            value_meta_only_fields=value_meta,
+            grad_meta_only_fields=grad_meta,
         )
 
     def dump_model(
@@ -336,6 +355,8 @@ class _Dumper:
         enable_future_grad: bool,
         value_tag: str,
         grad_tag: str,
+        value_meta_only_fields: Optional[dict] = None,
+        grad_meta_only_fields: Optional[dict] = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -359,6 +380,7 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
+                meta_only_fields=value_meta_only_fields or {},
             )
 
         if (
@@ -371,6 +393,7 @@ class _Dumper:
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
+                meta_only_fields=grad_meta_only_fields or {},
             )
 
         if enable_future_grad:
@@ -379,6 +402,7 @@ class _Dumper:
                 tensor=value,
                 extra_kwargs=extra_kwargs,
                 save=save,
+                meta_only_fields=grad_meta_only_fields or {},
             )
 
     def _register_dump_grad_hook(
@@ -388,6 +412,7 @@ class _Dumper:
         tensor,
         extra_kwargs: dict,
         save: bool,
+        meta_only_fields: Optional[dict] = None,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
@@ -396,6 +421,7 @@ class _Dumper:
 
         captured_step = self._state.step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
+        captured_meta_only = meta_only_fields or {}
 
         def grad_hook(grad: torch.Tensor) -> None:
             self._dump_single(
@@ -404,6 +430,7 @@ class _Dumper:
                 value=grad,
                 save=save,
                 step=captured_step,
+                meta_only_fields=captured_meta_only,
             )
 
         tensor.register_hook(grad_hook)
@@ -416,6 +443,7 @@ class _Dumper:
         value,
         save: bool,
         step: Optional[int] = None,
+        meta_only_fields: Optional[dict] = None,
     ) -> None:
         self._ensure_exp_name()
         self._state.dump_index += 1
@@ -445,7 +473,11 @@ class _Dumper:
         if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value,
-                "meta": dict(**full_kwargs, **self._static_meta),
+                "meta": dict(
+                    **full_kwargs,
+                    **self._static_meta,
+                    **(meta_only_fields or {}),
+                ),
             }
 
             if capturing:
