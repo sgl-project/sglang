@@ -19,24 +19,21 @@ def execute_unshard_plan(
 ) -> torch.Tensor:
     """Execute an unshard plan on actual tensor data.
 
-    Filters input tensors by plan.pick_world_ranks, then applies steps
-    sequentially. Concatenation order is strictly by axis_rank.
+    Concatenation order is strictly by axis_rank (not world_rank).
     """
-    filtered = {
-        wr: t for wr, t in tensors_by_world_rank.items() if wr in plan.pick_world_ranks
-    }
-
     if not plan.steps:
-        if len(filtered) == 1:
-            return next(iter(filtered.values()))
-        raise ValueError(f"No unshard steps but got {len(filtered)} tensors")
+        if len(tensors_by_world_rank) == 1:
+            return next(iter(tensors_by_world_rank.values()))
+        raise ValueError(
+            f"No unshard steps but got {len(tensors_by_world_rank)} tensors"
+        )
 
     axis_rank_lookup: dict[int, dict[int, int]] = {
         id(step): {wr: i for i, wr in enumerate(step.world_ranks_by_axis_rank)}
         for step in plan.steps
     }
 
-    current_tensors = dict(filtered)
+    current_tensors = dict(tensors_by_world_rank)
 
     for step in plan.steps:
         groups: dict[tuple, dict[int, torch.Tensor]] = defaultdict(dict)

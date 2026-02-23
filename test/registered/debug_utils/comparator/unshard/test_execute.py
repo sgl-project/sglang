@@ -59,53 +59,9 @@ class TestExecuteUnshardPlan:
         assert torch.allclose(result, tensor)
 
     def test_no_steps_multiple_tensors_raises(self) -> None:
-        plan = UnshardPlan(
-            steps=[],
-            pick_world_ranks=frozenset({0, 1}),
-        )
+        plan = UnshardPlan(steps=[])
         with pytest.raises(ValueError, match="No unshard steps"):
             execute_unshard_plan(plan, {0: torch.randn(2), 1: torch.randn(2)})
-
-    def test_tp_with_replicated_cp(self) -> None:
-        """TP=2, CP=2. dims="b h(tp) d" means CP is replicated.
-
-        pick_world_ranks filters to cp_rank=0 ranks only.
-        """
-        full_tensor = torch.randn(2, 8, 4)
-        shards = list(full_tensor.chunk(2, dim=1))
-
-        parallel_infos = [
-            {
-                "tp": AxisInfo(axis_rank=0, axis_size=2),
-                "cp": AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                "tp": AxisInfo(axis_rank=1, axis_size=2),
-                "cp": AxisInfo(axis_rank=0, axis_size=2),
-            },
-            {
-                "tp": AxisInfo(axis_rank=0, axis_size=2),
-                "cp": AxisInfo(axis_rank=1, axis_size=2),
-            },
-            {
-                "tp": AxisInfo(axis_rank=1, axis_size=2),
-                "cp": AxisInfo(axis_rank=1, axis_size=2),
-            },
-        ]
-        dim_specs = parse_dims("b h(tp) d")
-        plan = compute_unshard_plan(dim_specs, parallel_infos)
-
-        assert plan.pick_world_ranks == frozenset({0, 1})
-
-        tensors_by_rank = {
-            0: shards[0],
-            1: shards[1],
-            2: shards[0],
-            3: shards[1],
-        }
-
-        result = execute_unshard_plan(plan, tensors_by_rank)
-        assert torch.allclose(result, full_tensor)
 
 
 if __name__ == "__main__":

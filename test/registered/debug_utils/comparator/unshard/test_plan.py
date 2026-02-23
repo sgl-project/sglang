@@ -21,21 +21,6 @@ class TestComputeUnshardPlan:
         assert step.axis == ParallelAxis.TP
         assert step.params.dim == 2
         assert step.world_ranks_by_axis_rank == [0, 1, 2, 3]
-        assert plan.pick_world_ranks == frozenset({0, 1, 2, 3})
-
-    def test_replicated_axes(self) -> None:
-        dim_specs = parse_dims("b s h(tp) d")
-        parallel_infos = [
-            {
-                "tp": AxisInfo(axis_rank=i % 2, axis_size=2),
-                "cp": AxisInfo(axis_rank=i // 2, axis_size=2),
-            }
-            for i in range(4)
-        ]
-        plan = compute_unshard_plan(dim_specs, parallel_infos)
-        assert "cp" in plan.replicated_axes
-        assert plan.replicated_axes["cp"].axis_size == 2
-        assert plan.pick_world_ranks == frozenset({0, 1})
 
     def test_inconsistent_axis_size_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")

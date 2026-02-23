@@ -2,7 +2,6 @@ from typing import Optional
 
 from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering
 from sglang.srt.debug_utils.comparator.unshard.types import (
-    AxisInfo,
     ConcatParams,
     UnshardParams,
     UnshardPlan,
@@ -27,35 +26,12 @@ def compute_unshard_plan(
         if spec.parallel is not None:
             sharded_axes[spec.parallel.value] = (dim_idx, spec)
 
-    all_axis_names = {k for pinfo in parallel_infos for k in pinfo}
-
-    replicated_axes: dict[str, AxisInfo] = {}
-    for axis_name in all_axis_names:
-        if axis_name not in sharded_axes:
-            for pinfo in parallel_infos:
-                if axis_name in pinfo:
-                    replicated_axes[axis_name] = AxisInfo(
-                        axis_rank=0, axis_size=pinfo[axis_name].axis_size
-                    )
-                    break
-
-    pick = set(range(len(parallel_infos)))
-    for axis_name in replicated_axes:
-        pick = {
-            wr
-            for wr in pick
-            if axis_name not in parallel_infos[wr]
-            or parallel_infos[wr][axis_name].axis_rank == 0
-        }
-
     steps: list[UnshardStep] = []
     for axis_name, (dim_idx, spec) in sharded_axes.items():
         expected_size: Optional[int] = None
         rank_to_world: dict[int, int] = {}
 
         for world_rank, pinfo in enumerate(parallel_infos):
-            if world_rank not in pick:
-                continue
             if axis_name not in pinfo:
                 continue
 
@@ -91,11 +67,7 @@ def compute_unshard_plan(
             )
         )
 
-    return UnshardPlan(
-        replicated_axes=replicated_axes,
-        steps=steps,
-        pick_world_ranks=frozenset(pick),
-    )
+    return UnshardPlan(steps=steps)
 
 
 def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnshardParams:
