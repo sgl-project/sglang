@@ -32,7 +32,7 @@ def run(args: argparse.Namespace) -> None:
 
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
-        baseline_step = row["step"] - args.start_id + args.baseline_start_id
+        baseline_step = row["step"]
 
         row_baseline = find_row(
             df_baseline,
@@ -86,7 +86,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-path", type=str)
     parser.add_argument("--start-id", type=int, default=0)
     parser.add_argument("--end-id", type=int, default=1000000)
-    parser.add_argument("--baseline-start-id", type=int, default=0)
     parser.add_argument("--diff-threshold", type=float, default=1e-3)
     parser.add_argument(
         "--filter", type=str, default=None, help="Regex to filter filenames"

@@ -60,7 +60,6 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         target_path=str(target_path),
         start_id=0,
         end_id=1000000,
-        baseline_start_id=0,
         diff_threshold=1e-3,
         filter=None,
     )
