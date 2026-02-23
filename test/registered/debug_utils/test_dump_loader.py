@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 import polars as pl
 import pytest
@@ -62,12 +61,9 @@ class TestAddDuplicateIndex:
             }
         )
         result = _add_duplicate_index(df)
-        assert (
-            result.filter(pl.col("name") == "a")
-            .sort("dump_index")["duplicate_index"]
-            .to_list()
-            == [0, 1]
-        )
+        assert result.filter(pl.col("name") == "a").sort("dump_index")[
+            "duplicate_index"
+        ].to_list() == [0, 1]
 
 
 class TestValueWithMeta:

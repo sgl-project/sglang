@@ -41,4 +41,3 @@ def calc_rel_diff(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-

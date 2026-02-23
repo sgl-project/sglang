@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 import polars as pl
+import torch
 
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
@@ -11,8 +12,6 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
-import torch
-
 from sglang.srt.debug_utils.comparator.tensor_comparison import compare_tensors
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta, find_row, read_meta
 
