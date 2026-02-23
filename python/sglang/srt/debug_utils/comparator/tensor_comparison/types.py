@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 
-@dataclass(frozen=True)
+@dataclass
 class TensorStats:
     mean: float
     std: float
@@ -16,7 +16,7 @@ class TensorStats:
     p99: Optional[float] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class TensorInfo:
     shape: torch.Size
     dtype: torch.dtype
@@ -24,7 +24,7 @@ class TensorInfo:
     sample: Optional[str] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class DiffInfo:
     rel_diff: float
     max_abs_diff: float
@@ -34,7 +34,7 @@ class DiffInfo:
     target_at_max: float
 
 
-@dataclass(frozen=True)
+@dataclass
 class TensorComparisonInfo:
     name: str
     baseline: TensorInfo

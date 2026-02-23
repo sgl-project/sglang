@@ -25,15 +25,24 @@ def compare_tensors(
     x_target: torch.Tensor,
     name: str = "",
 ) -> TensorComparisonInfo:
-    baseline_stats = _compute_tensor_stats(x_baseline.float())
-    target_stats = _compute_tensor_stats(x_target.float())
-    baseline_shape = x_baseline.shape
-    baseline_dtype = x_baseline.dtype
-    target_shape = x_target.shape
-    target_dtype = x_target.dtype
+    baseline_info = TensorInfo(
+        shape=x_baseline.shape,
+        dtype=x_baseline.dtype,
+        stats=_compute_tensor_stats(x_baseline.float()),
+        sample=None,
+    )
+    target_info = TensorInfo(
+        shape=x_target.shape,
+        dtype=x_target.dtype,
+        stats=_compute_tensor_stats(x_target.float()),
+        sample=None,
+    )
 
     x_baseline = try_unify_shape(x_baseline, target_shape=x_target.shape)
     unified_shape = x_baseline.shape
+
+    baseline_original_dtype = x_baseline.dtype
+    target_original_dtype = x_target.dtype
 
     x_baseline_f = x_baseline.float()
     x_target_f = x_target.float()
@@ -43,18 +52,19 @@ def compare_tensors(
     diff: Optional[DiffInfo] = None
     diff_downcast: Optional[DiffInfo] = None
     downcast_dtype: Optional[torch.dtype] = None
-    baseline_sample: Optional[str] = None
-    target_sample: Optional[str] = None
 
     if not shape_mismatch:
         diff = _compute_diff(x_baseline=x_baseline_f, x_target=x_target_f)
 
-        if diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD:
-            baseline_sample = get_truncated_value(x_baseline_f)
-            target_sample = get_truncated_value(x_target_f)
+        needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
+        if needs_sample:
+            baseline_info.sample = get_truncated_value(x_baseline_f)
+            target_info.sample = get_truncated_value(x_target_f)
 
-        if baseline_dtype != target_dtype:
-            downcast_dtype = compute_smaller_dtype(baseline_dtype, target_dtype)
+        if baseline_original_dtype != target_original_dtype:
+            downcast_dtype = compute_smaller_dtype(
+                baseline_original_dtype, target_original_dtype
+            )
             if downcast_dtype is not None:
                 diff_downcast = _compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
@@ -63,18 +73,8 @@ def compare_tensors(
 
     return TensorComparisonInfo(
         name=name,
-        baseline=TensorInfo(
-            shape=baseline_shape,
-            dtype=baseline_dtype,
-            stats=baseline_stats,
-            sample=baseline_sample,
-        ),
-        target=TensorInfo(
-            shape=target_shape,
-            dtype=target_dtype,
-            stats=target_stats,
-            sample=target_sample,
-        ),
+        baseline=baseline_info,
+        target=target_info,
         unified_shape=unified_shape,
         shape_mismatch=shape_mismatch,
         diff=diff,
