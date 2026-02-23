@@ -599,6 +599,12 @@ class PipelineConfig:
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        if vae_path is None:
+            component_paths = kwargs.get(
+                prefix_with_dot + "component_paths"
+            ) or kwargs.get("component_paths")
+            if isinstance(component_paths, dict):
+                vae_path = component_paths.get("vae")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (

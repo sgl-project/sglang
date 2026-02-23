@@ -229,21 +229,31 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            weight = self.weights_proj.weight
+            out = torch.empty(
+                (x.shape[0], weight.shape[0]),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+            return out
+
         if _is_hip:
             x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        return weights.float()
+
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    def _project_and_scale_head_gates(self, x: torch.Tensor):
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
-        weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
