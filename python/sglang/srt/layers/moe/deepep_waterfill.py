@@ -349,34 +349,6 @@ def expand_topk_with_shared_expert(
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
 
-def compute_static_rank_load(
-    logical_count: Tensor,
-    physical_to_logical_map: Tensor,
-    world_size: int,
-) -> Tensor:
-    """Compute per-layer static rank load [num_layers, world_size] from EPLB statistics."""
-    num_layers, num_physical_experts = physical_to_logical_map.shape
-    num_logical_experts = logical_count.shape[-1]
-    experts_per_rank = num_physical_experts // world_size
-
-    device = physical_to_logical_map.device
-    logical_count = logical_count.to(device=device, dtype=torch.float64)
-    physical_to_logical_map = physical_to_logical_map.to(device=device).long()
-    ones = torch.ones(
-        num_layers, num_physical_experts, dtype=torch.float64, device=device
-    )
-    replica_counts = torch.zeros(
-        num_layers, num_logical_experts, dtype=torch.float64, device=device
-    )
-    replica_counts.scatter_add_(1, physical_to_logical_map, ones)
-    replica_counts = replica_counts.clamp(min=1.0)
-    physical_load = torch.gather(logical_count, 1, physical_to_logical_map)
-    physical_replica = torch.gather(replica_counts, 1, physical_to_logical_map)
-    physical_load = physical_load / physical_replica
-
-    return physical_load.view(num_layers, world_size, experts_per_rank).sum(dim=2)
-
-
 class DeepEPWaterfillBalancer:
     """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
@@ -403,23 +375,21 @@ class DeepEPWaterfillBalancer:
         self._eplb_map_data_ptr = None
 
     def update_static_weights(self):
-        """Update static weights if EPLB layout changes."""
+        """Update static weights from EPLB metadata if layout changes."""
         if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
             return
-
+        from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
         from sglang.srt.server_args import get_global_server_args
 
         init_loc = getattr(get_global_server_args(), "init_expert_location", "trivial")
         if not init_loc or init_loc == "trivial":
             return
-
         metadata = get_global_expert_location_metadata()
         if metadata is None:
             return
-
         cur_ptr = metadata.physical_to_logical_map.data_ptr()
-        if self._eplb_map_data_ptr == cur_ptr and self.has_static_weights():
+        if self._eplb_map_data_ptr == cur_ptr and self.static_rank_load is not None:
             return
 
         try:
@@ -432,29 +402,29 @@ class DeepEPWaterfillBalancer:
             elif logical_count_raw.dim() != 2:
                 return
 
-            all_rank_load = compute_static_rank_load(
-                logical_count_raw,
-                metadata.physical_to_logical_map,
-                self.world_size,
+            # Convert logical counts to per-physical-expert load (accounting for replicas),
+            # then sum per rank using sglang's existing compute_gpu_physical_count.
+            phy_map = metadata.physical_to_logical_map.long()
+            device = phy_map.device
+            lc = logical_count_raw.to(device=device, dtype=torch.float64)
+            n_layers, n_phy = phy_map.shape
+            ones = torch.ones(n_layers, n_phy, dtype=torch.float64, device=device)
+            replicas = torch.zeros(
+                n_layers, lc.shape[-1], dtype=torch.float64, device=device
             )
+            replicas.scatter_add_(1, phy_map, ones).clamp_(min=1.0)
+            phy_load = torch.gather(lc, 1, phy_map) / torch.gather(replicas, 1, phy_map)
+            rank_load = compute_gpu_physical_count(
+                phy_load.unsqueeze(0), self.world_size
+            ).squeeze(0)
 
-            if self.layer_id < all_rank_load.shape[0]:
-                layer_load = all_rank_load[self.layer_id]
+            if self.layer_id < rank_load.shape[0]:
+                layer_load = rank_load[self.layer_id]
                 if layer_load.sum() > 0:
-                    self.set_static_weights(layer_load)
+                    self.static_rank_load = layer_load.to(dtype=torch.float64)
                     self._eplb_map_data_ptr = cur_ptr
         except Exception:
             pass
-
-    def has_static_weights(self) -> bool:
-        return self.static_rank_load is not None
-
-    def set_static_weights(self, static_rank_load: Tensor) -> None:
-        """Replace static per-rank load weights (e.g. after EPLB rebalance)."""
-        assert static_rank_load.shape == (
-            self.world_size,
-        ), f"Expected ({self.world_size},), got {static_rank_load.shape}"
-        self.static_rank_load = static_rank_load.to(dtype=torch.float64)
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""
@@ -490,8 +460,6 @@ class DeepEPWaterfillBalancer:
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert."""
         num_tokens = topk_ids.shape[0]
-        device = topk_ids.device
-
         if num_tokens == 0:
             return _empty_expanded(topk_ids, topk_weights)
 
@@ -513,7 +481,7 @@ class DeepEPWaterfillBalancer:
         )
         topk = topk_ids.shape[1]
 
-        if self.has_static_weights():
+        if self.static_rank_load is not None:
             allow_all_ranks = True
             target_total = 0
         else:
@@ -548,7 +516,7 @@ class DeepEPWaterfillBalancer:
         from sglang.srt.distributed import get_moe_ep_group
 
         local_routed_counts = self.count_local_routed(topk_output.topk_ids)
-        if self.has_static_weights():
+        if self.static_rank_load is not None:
             global_routed_counts, local_tokens_per_rank = local_routed_counts, None
         else:
             group = get_moe_ep_group().device_group
