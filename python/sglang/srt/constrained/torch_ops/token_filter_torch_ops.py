@@ -15,7 +15,6 @@
 
 from typing import List
 
-import numpy as np
 import torch
 
 
@@ -39,7 +38,9 @@ def set_token_filter_torch(
             new_value = current_value | (1 << bit_idx)
         else:
             new_value = current_value & (~(1 << bit_idx) & 0xFFFFFFFF)
-        vocab_mask[batch_idx, element_idx] = np.int32(new_value)
+        vocab_mask[batch_idx, element_idx] = torch.tensor(
+            new_value, dtype=torch.int64
+        ).to(torch.int32)
 
 
 def demo_test():
