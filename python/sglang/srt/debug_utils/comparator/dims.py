@@ -59,9 +59,7 @@ def parse_dim(token: str) -> DimSpec:
             raise ValueError(f"Unknown modifier {part!r} in dim spec: {token!r}")
         field_name, enum_value = _MODIFIER_LOOKUP[part]
         if field_name in fields:
-            raise ValueError(
-                f"Multiple {field_name} values in dim token: {token!r}"
-            )
+            raise ValueError(f"Multiple {field_name} values in dim token: {token!r}")
         fields[field_name] = enum_value
 
     return DimSpec(name=name, **fields)
