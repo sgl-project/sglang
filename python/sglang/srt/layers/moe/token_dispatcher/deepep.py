@@ -191,35 +191,26 @@ class DeepEPBuffer:
         if deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
-        elif deepep_mode == DeepEPMode.LOW_LATENCY:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
+        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+
             rank = torch.distributed.get_rank(group)
+            world_size = group.size()
 
-            base = num_experts // group.size()
-            remainder = num_experts % group.size()
+            # Compute local_num_experts (shared logic)
+            base = num_experts // world_size
+            remainder = num_experts % world_size
+            local_num_experts = base + 1 if rank < remainder else base
 
-            if rank < remainder:
-                local_num_experts = base + 1
-            else:
-                local_num_experts = base
+            if deepep_mode == DeepEPMode.LOW_LATENCY:
+                # In LOW_LATENCY, use exact per-rank experts
+                num_qps_per_rank = local_num_experts
 
-            num_qps_per_rank = local_num_experts
-
-        elif deepep_mode == DeepEPMode.AUTO:
-            # low-latency and normal mode all need run
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
-            base = num_experts // group.size()
-            remainder = num_experts % group.size()
-
-            if rank < remainder:
-                local_num_experts = base + 1
-            else:
-                local_num_experts = base
-
-            num_qps_per_rank = max(
-                DeepEPConfig.get_instance().num_sms, local_num_experts
-            )
-
+            elif deepep_mode == DeepEPMode.AUTO:
+                # In AUTO mode, ensure at least one QP per SM
+                num_qps_per_rank = max(
+                    DeepEPConfig.get_instance().num_sms,
+                    local_num_experts,
+                )
         else:
             raise NotImplementedError
 
