@@ -3,12 +3,6 @@ on:
   push:
     tags:
       - 'v[0-9]+.*'
-  pull_request:
-    branches:
-      - 'main'
-    paths:
-      - '.github/workflows/release-docker-npu.yml'
-      - 'docker/npu.Dockerfile'
   workflow_dispatch:
     inputs:
       version:
@@ -58,8 +52,6 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            VERSION="0.0.0"
           else
             # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
             VERSION="${GITHUB_REF_NAME#v}"
