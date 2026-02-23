@@ -26,20 +26,18 @@ def compare_tensors(
     name: str = "",
 ) -> TensorComparisonInfo:
     baseline_info = TensorInfo(
-        shape=x_baseline.shape,
-        dtype=x_baseline.dtype,
+        shape=list(x_baseline.shape),
+        dtype=str(x_baseline.dtype),
         stats=_compute_tensor_stats(x_baseline.float()),
-        sample=None,
     )
     target_info = TensorInfo(
-        shape=x_target.shape,
-        dtype=x_target.dtype,
+        shape=list(x_target.shape),
+        dtype=str(x_target.dtype),
         stats=_compute_tensor_stats(x_target.float()),
-        sample=None,
     )
 
     x_baseline = try_unify_shape(x_baseline, target_shape=x_target.shape)
-    unified_shape = x_baseline.shape
+    unified_shape = list(x_baseline.shape)
 
     baseline_original_dtype = x_baseline.dtype
     target_original_dtype = x_target.dtype
@@ -79,7 +77,7 @@ def compare_tensors(
         shape_mismatch=shape_mismatch,
         diff=diff,
         diff_downcast=diff_downcast,
-        downcast_dtype=downcast_dtype,
+        downcast_dtype=str(downcast_dtype) if downcast_dtype is not None else None,
     )
 
 
@@ -109,7 +107,7 @@ def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
         rel_diff=calc_rel_diff(x_target, x_baseline).item(),
         max_abs_diff=raw_abs_diff.max().item(),
         mean_abs_diff=raw_abs_diff.mean().item(),
-        max_diff_coord=max_diff_coord,
+        max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
     )

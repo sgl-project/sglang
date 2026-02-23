@@ -1,5 +1,3 @@
-from dataclasses import fields
-
 from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
     DiffInfo,
     TensorComparisonInfo,
@@ -56,8 +54,7 @@ def print_comparison(info: TensorComparisonInfo, diff_threshold: float) -> None:
 
 
 def _print_stats_comparison(baseline: TensorStats, target: TensorStats) -> None:
-    stat_names = [f.name for f in fields(TensorStats)]
-    for stat_name in stat_names:
+    for stat_name in TensorStats.model_fields:
         value_baseline = getattr(baseline, stat_name)
         value_target = getattr(target, stat_name)
         if value_baseline is None or value_target is None:
