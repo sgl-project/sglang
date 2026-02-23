@@ -65,8 +65,9 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
         a += f" --ring-degree {server_args.ring_degree}"
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
-    if server_args.warmup:
-        a += " --warmup"
+
+    # default warmup
+    a += " --warmup"
 
     for extra_arg in server_args.extras:
         a += f" {extra_arg}"
