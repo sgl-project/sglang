@@ -4,7 +4,7 @@ import gc
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import diffusers
 import torch
@@ -22,13 +22,18 @@ from transformers import (
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.registry import _CONFIG_REGISTRY, get_model_info
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    destroy_model_parallel,
+    get_data_parallel_world_size,
     get_local_torch_device,
+    get_sequence_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
@@ -38,31 +43,17 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.accuracy_adapters import (
-    ComponentAdapter,
-    get_adapter,
-)
 from sglang.multimodal_gen.test.server.accuracy_config import ComponentType
+from sglang.multimodal_gen.test.server.accuracy_hooks import (
+    HookCall,
+    resolve_native_profile,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 
 DEFAULT_TIMESTEP = 500.0
 MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98"))
-
-MASTER_ADDR = os.getenv("MASTER_ADDR", "127.0.0.1")
-MASTER_PORT = os.getenv("MASTER_PORT", "29505")
-
-if "WORLD_SIZE" not in os.environ:
-    os.environ.update(
-        {
-            "MASTER_ADDR": MASTER_ADDR,
-            "MASTER_PORT": MASTER_PORT,
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-        }
-    )
 
 
 @dataclass(frozen=True)
@@ -220,37 +211,59 @@ def _build_pipeline_config(case: DiffusionTestCase, hub_id: str):
     return pipeline_config
 
 
+def _ensure_distributed_env_defaults() -> None:
+    if "WORLD_SIZE" in os.environ:
+        return
+    os.environ.update(
+        {
+            "MASTER_ADDR": os.getenv("MASTER_ADDR", "127.0.0.1"),
+            "MASTER_PORT": os.getenv("MASTER_PORT", "29505"),
+            "RANK": "0",
+            "LOCAL_RANK": "0",
+            "WORLD_SIZE": "1",
+        }
+    )
+
+
 def _init_parallel(
     case: DiffusionTestCase, component: ComponentType, num_gpus: int
 ) -> None:
-    if model_parallel_is_initialized():
-        return
     model_path = case.server_args.model_path.lower()
-    if component == ComponentType.TEXT_ENCODER:
-        tp_size, sp_size = 1, 1
-        enable_cfg = False
-        dp_size = max(1, num_gpus)
-    elif component == ComponentType.TRANSFORMER and (
+    cfg_parallel = bool(case.server_args.cfg_parallel)
+    is_transformer = component == ComponentType.TRANSFORMER
+    is_text_encoder = component == ComponentType.TEXT_ENCODER
+    is_zimage_transformer = is_transformer and (
         "zimage" in model_path or "z-image" in model_path
-    ):
-        tp_size, sp_size = 1, 1
-        enable_cfg = False
-        dp_size = max(1, num_gpus)
-    elif component == ComponentType.TRANSFORMER and "wan" in model_path:
+    )
+    is_wan_transformer = is_transformer and "wan" in model_path
+
+    if is_text_encoder:
+        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), False
+    elif is_zimage_transformer:
+        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), False
+    elif is_wan_transformer:
         # Force SP=1 for accuracy comparisons against Diffusers to avoid SP-aware rotary mismatch.
-        tp_size, sp_size = 1, 1
-        enable_cfg = case.server_args.cfg_parallel or False
-        dp_size = max(1, num_gpus)
+        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), cfg_parallel
     else:
         tp_size, sp_size = num_gpus, 1
-        if case.server_args.cfg_parallel:
+        if cfg_parallel:
             tp_size = max(1, num_gpus // 2)
-        if component == ComponentType.TRANSFORMER and (
-            "video" in case.server_args.modality or "wan" in model_path
-        ):
+        if is_transformer and "video" in case.server_args.modality:
             tp_size, sp_size = 1, num_gpus
-        enable_cfg = case.server_args.cfg_parallel or False
+        enable_cfg = cfg_parallel
         dp_size = 1
+
+    if model_parallel_is_initialized():
+        current_tp = get_tensor_model_parallel_world_size()
+        current_sp = get_sequence_parallel_world_size()
+        current_dp = get_data_parallel_world_size()
+        if current_tp == tp_size and current_sp == sp_size and current_dp == dp_size:
+            return
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        destroy_model_parallel()
+
+    _ensure_distributed_env_defaults()
 
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=tp_size,
@@ -258,6 +271,8 @@ def _init_parallel(
         enable_cfg_parallel=enable_cfg,
         dp_size=dp_size,
     )
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def _build_server_args(
@@ -579,14 +594,23 @@ def _copy_tensor(
     return False
 
 
-def _iter_named_params(module: nn.Module) -> Iterable[Tuple[str, torch.Tensor]]:
-    for name, param in module.named_parameters():
-        yield name, param
+class _ForwardCapture:
+    def __init__(self, module: nn.Module):
+        self._module = module
+        self._handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self.output: Any = None
 
+    def __enter__(self) -> "_ForwardCapture":
+        def _hook(_: nn.Module, __: tuple[Any, ...], output: Any) -> None:
+            self.output = output
 
-def _iter_named_buffers(module: nn.Module) -> Iterable[Tuple[str, torch.Tensor]]:
-    for name, buf in module.named_buffers():
-        yield name, buf
+        self._handle = self._module.register_forward_hook(_hook)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+        self._handle = None
 
 
 class AccuracyEngine:
@@ -621,18 +645,9 @@ class AccuracyEngine:
             if r.ndim == 5 and r.shape[2] == 1:
                 r = r.squeeze(2)
             if t.shape != r.shape:
-                if t.numel() == r.numel():
-                    logger.warning(
-                        "[%s] Shape mismatch %s vs %s; reshaping by numel equality.",
-                        name,
-                        list(t.shape),
-                        list(r.shape),
-                    )
-                    t = t.reshape(r.shape)
-                else:
-                    raise RuntimeError(
-                        f"Accuracy shape mismatch for {name}: {list(t.shape)} vs {list(r.shape)}"
-                    )
+                raise RuntimeError(
+                    f"Accuracy shape mismatch for {name}: {list(t.shape)} vs {list(r.shape)}"
+                )
 
         cos_sim = torch.nn.functional.cosine_similarity(
             t.reshape(-1), r.reshape(-1), dim=0
@@ -680,7 +695,7 @@ class AccuracyEngine:
 
         matched = 0
         total = 0
-        for name, tensor in _iter_named_params(target):
+        for name, tensor in target.named_parameters():
             total += 1
             src_tensor = None
             for cand in _generate_name_candidates(name, reverse_mapping):
@@ -697,7 +712,7 @@ class AccuracyEngine:
             if _copy_tensor(tensor, src_tensor, tp_world, rank):
                 matched += 1
 
-        for name, tensor in _iter_named_buffers(target):
+        for name, tensor in target.named_buffers():
             src_tensor = None
             for cand in _generate_name_candidates(name, reverse_mapping):
                 if cand in lookup:
@@ -717,12 +732,50 @@ class AccuracyEngine:
             )
 
     @staticmethod
+    def _execute_with_native_hook(call: HookCall) -> Any:
+        with _ForwardCapture(call.module) as capture:
+            call.module(*call.args, **call.kwargs)
+        return capture.output
+
+    @staticmethod
+    def _apply_output_transforms(tensor: torch.Tensor, call: HookCall) -> torch.Tensor:
+        if call.negate_output:
+            return -tensor
+        return tensor
+
+    @staticmethod
+    def run_component_pair_native(
+        case: DiffusionTestCase,
+        component: ComponentType,
+        sgl_model: nn.Module,
+        ref_model: nn.Module,
+        device: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if component == ComponentType.TEXT_ENCODER:
+            raise ValueError("Text encoder path is not migrated to native hooks yet")
+        resolved_profile = resolve_native_profile(component.value)
+
+        inputs = resolved_profile.build_inputs(case, sgl_model, device, ref_model)
+        sgl_call = resolved_profile.prepare_sglang_call(sgl_model, inputs)
+        ref_call = resolved_profile.prepare_reference_call(ref_model, inputs)
+
+        with torch.no_grad():
+            sgl_raw = AccuracyEngine._execute_with_native_hook(sgl_call)
+            ref_raw = AccuracyEngine._execute_with_native_hook(ref_call)
+
+        sgl_out = resolved_profile.normalize_sglang_output(sgl_raw)
+        ref_out = resolved_profile.normalize_reference_output(ref_raw)
+        sgl_out = AccuracyEngine._apply_output_transforms(sgl_out, sgl_call)
+        ref_out = AccuracyEngine._apply_output_transforms(ref_out, ref_call)
+        return sgl_out, ref_out
+
+    @staticmethod
     def load_component_pair(
         case: DiffusionTestCase,
         component: ComponentType,
         library: str,
         num_gpus: int,
-    ) -> Tuple[nn.Module, nn.Module, str, Optional[ComponentAdapter]]:
+    ) -> Tuple[nn.Module, nn.Module, str]:
         """Load SGLang + reference components and align weights for accuracy checks."""
         spec = COMPONENT_SPECS[component]
         if library != spec.reference_library:
@@ -768,7 +821,6 @@ class AccuracyEngine:
         sgl_args.pipeline_config = pipeline_config
         set_global_server_args(sgl_args)
 
-        adapter = get_adapter(case.id, component.value)
         device = get_local_torch_device()
 
         sgl_component = _load_sglang_component(
@@ -803,4 +855,4 @@ class AccuracyEngine:
                 current_timestep=int(DEFAULT_TIMESTEP), attn_metadata=None
             )
 
-        return sgl_component.eval(), ref_component.eval(), str(device), adapter
+        return sgl_component.eval(), ref_component.eval(), str(device)

@@ -21,17 +21,17 @@ class TestAccuracy1GPU_B:
             pytest.skip(get_skip_reason(case, ComponentType.VAE))
         AccuracyEngine.clear_memory()
 
-        sgl, ref, device, adapter = AccuracyEngine.load_component_pair(
+        sgl, ref, device = AccuracyEngine.load_component_pair(
             case, ComponentType.VAE, "diffusers", 1
         )
 
-        with torch.no_grad():
-            assert (
-                adapter is not None
-            ), "VAE test requires an adapter for reliable input generation"
-            inputs = adapter.generate_inputs(case, sgl, device, ref)
-            sgl_out = adapter.run_sglang(sgl, inputs)
-            ref_out = adapter.run_reference(ref, inputs)
+        sgl_out, ref_out = AccuracyEngine.run_component_pair_native(
+            case,
+            ComponentType.VAE,
+            sgl,
+            ref,
+            device,
+        )
 
         AccuracyEngine.check_accuracy(
             sgl_out,
@@ -46,17 +46,17 @@ class TestAccuracy1GPU_B:
         if should_skip_component(case, ComponentType.TRANSFORMER):
             pytest.skip(get_skip_reason(case, ComponentType.TRANSFORMER))
         AccuracyEngine.clear_memory()
-        sgl, ref, device, adapter = AccuracyEngine.load_component_pair(
+        sgl, ref, device = AccuracyEngine.load_component_pair(
             case, ComponentType.TRANSFORMER, "diffusers", 1
         )
 
-        with torch.no_grad():
-            assert (
-                adapter is not None
-            ), "Transformer test requires an adapter for reliable inputs"
-            inputs = adapter.generate_inputs(case, sgl, device, ref)
-            sgl_out = adapter.run_sglang(sgl, inputs)
-            ref_out = adapter.run_reference(ref, inputs)
+        sgl_out, ref_out = AccuracyEngine.run_component_pair_native(
+            case,
+            ComponentType.TRANSFORMER,
+            sgl,
+            ref,
+            device,
+        )
 
         AccuracyEngine.check_accuracy(
             sgl_out,
@@ -74,7 +74,7 @@ class TestAccuracy1GPU_B:
         if "wan" not in case.id:
             pytest.skip("Skipping encoder test for this variant in Set B")
 
-        sgl, ref, device, _ = AccuracyEngine.load_component_pair(
+        sgl, ref, device = AccuracyEngine.load_component_pair(
             case, ComponentType.TEXT_ENCODER, "transformers", 1
         )
 

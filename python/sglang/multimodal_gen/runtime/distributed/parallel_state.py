@@ -1122,6 +1122,16 @@ def init_vae_group(
 
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
+    global _DIT
+    if _DIT is not None:
+        torch.distributed.destroy_process_group(_DIT)
+    _DIT = None
+
+    global _VAE
+    if _VAE is not None:
+        torch.distributed.destroy_process_group(_VAE)
+    _VAE = None
+
     global _TP
     if _TP:
         _TP.destroy()
@@ -1131,6 +1141,16 @@ def destroy_model_parallel() -> None:
     if _SP:
         _SP.destroy()
     _SP = None
+
+    global _PP
+    if _PP:
+        _PP.destroy()
+    _PP = None
+
+    global _CFG
+    if _CFG:
+        _CFG.destroy()
+    _CFG = None
 
     global _DP
     if _DP:
