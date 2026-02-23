@@ -11,10 +11,10 @@ register_cpu_ci(est_time=30, suite="default", nightly=True)
 
 
 class TestEntrypoint(CustomTestCase):
-    def test_main(self):
+    def test_run(self):
         from argparse import Namespace
 
-        from sglang.srt.debug_utils.comparator.entrypoint import main
+        from sglang.srt.debug_utils.comparator.entrypoint import run
         from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
@@ -45,7 +45,7 @@ class TestEntrypoint(CustomTestCase):
                 diff_threshold=1e-3,
                 filter=None,
             )
-            main(args)
+            run(args)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,23 @@
+import argparse
 from pathlib import Path
 
+import polars as pl
 
-def main(args) -> None:
-    import polars as pl
+from sglang.srt.debug_utils.comparator.tensor_comparison import (
+    compare_tensors,
+    print_comparison,
+)
+from sglang.srt.debug_utils.comparator.utils import load_object
+from sglang.srt.debug_utils.dump_loader import find_row, read_meta
+from sglang.srt.debug_utils.dumper import get_truncated_value
 
-    from sglang.srt.debug_utils.comparator.tensor_comparison import (
-        compare_tensors,
-        print_comparison,
-    )
-    from sglang.srt.debug_utils.comparator.utils import load_object
-    from sglang.srt.debug_utils.dump_loader import find_row, read_meta
-    from sglang.srt.debug_utils.dumper import get_truncated_value
 
+def main() -> None:
+    args = _parse_args()
+    run(args)
+
+
+def run(args: argparse.Namespace) -> None:
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
         (pl.col("step") >= args.start_id) & (pl.col("step") <= args.end_id)
@@ -71,3 +77,18 @@ def main(args) -> None:
         )
         print_comparison(info=info, diff_threshold=args.diff_threshold)
         print()
+
+
+def _parse_args() -> argparse.Namespace:
+    # python -m sglang.srt.debug_utils.comparator --baseline-path ... --target-path ...
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline-path", type=str)
+    parser.add_argument("--target-path", type=str)
+    parser.add_argument("--start-id", type=int, default=0)
+    parser.add_argument("--end-id", type=int, default=1000000)
+    parser.add_argument("--baseline-start-id", type=int, default=0)
+    parser.add_argument("--diff-threshold", type=float, default=1e-3)
+    parser.add_argument(
+        "--filter", type=str, default=None, help="Regex to filter filenames"
+    )
+    return parser.parse_args()
