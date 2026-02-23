@@ -44,6 +44,8 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    # Per-rank load derived from logical_count + physical_to_logical_map (num_layers, ep_size)
+    rank_load: Optional[torch.Tensor] = None
 
     # -------------------------------- properties ------------------------------------
 
@@ -531,6 +533,28 @@ class ModelConfigForExpertLocation:
             return None
 
 
+def _compute_rank_load(logical_count_raw, physical_to_logical_map, ep_size):
+    """Compute per-rank load (num_layers, ep_size) from logical counts and EPLB mapping."""
+    from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
+
+    if not isinstance(logical_count_raw, torch.Tensor):
+        logical_count_raw = torch.tensor(logical_count_raw)
+    if logical_count_raw.dim() == 3:
+        logical_count_raw = logical_count_raw.float().mean(dim=0)
+    elif logical_count_raw.dim() != 2:
+        return None
+
+    phy_map = physical_to_logical_map.long()
+    device = phy_map.device
+    lc = logical_count_raw.to(device=device, dtype=torch.float64)
+    n_layers, n_phy = phy_map.shape
+    ones = torch.ones(n_layers, n_phy, dtype=torch.float64, device=device)
+    replicas = torch.zeros(n_layers, lc.shape[-1], dtype=torch.float64, device=device)
+    replicas.scatter_add_(1, phy_map, ones).clamp_(min=1.0)
+    phy_load = torch.gather(lc, 1, phy_map) / torch.gather(replicas, 1, phy_map)
+    return compute_gpu_physical_count(phy_load.unsqueeze(0), ep_size).squeeze(0)
+
+
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -564,9 +588,16 @@ def compute_initial_expert_location_metadata(
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
-        return ExpertLocationMetadata.init_by_eplb(
+        metadata = ExpertLocationMetadata.init_by_eplb(
             server_args, model_config, logical_count=data_dict["logical_count"]
         )
+        if metadata is not None:
+            metadata.rank_load = _compute_rank_load(
+                data_dict["logical_count"],
+                metadata.physical_to_logical_map,
+                server_args.ep_size,
+            )
+        return metadata
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"

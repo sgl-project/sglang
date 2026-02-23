@@ -378,53 +378,19 @@ class DeepEPWaterfillBalancer:
         """Update static weights from EPLB metadata if layout changes."""
         if os.environ.get("SGLANG_DISABLE_STATIC_WATERFILL", "0") == "1":
             return
-        from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-        from sglang.srt.server_args import get_global_server_args
 
-        init_loc = getattr(get_global_server_args(), "init_expert_location", "trivial")
-        if not init_loc or init_loc == "trivial":
-            return
         metadata = get_global_expert_location_metadata()
-        if metadata is None:
+        if metadata is None or metadata.rank_load is None:
             return
         cur_ptr = metadata.physical_to_logical_map.data_ptr()
         if self._eplb_map_data_ptr == cur_ptr and self.static_rank_load is not None:
             return
-
-        try:
-            data_dict = torch.load(init_loc, weights_only=True)
-            logical_count_raw = data_dict["logical_count"]
-            if not isinstance(logical_count_raw, torch.Tensor):
-                logical_count_raw = torch.tensor(logical_count_raw)
-            if logical_count_raw.dim() == 3:
-                logical_count_raw = logical_count_raw.float().mean(dim=0)
-            elif logical_count_raw.dim() != 2:
-                return
-
-            # Convert logical counts to per-physical-expert load (accounting for replicas),
-            # then sum per rank using sglang's existing compute_gpu_physical_count.
-            phy_map = metadata.physical_to_logical_map.long()
-            device = phy_map.device
-            lc = logical_count_raw.to(device=device, dtype=torch.float64)
-            n_layers, n_phy = phy_map.shape
-            ones = torch.ones(n_layers, n_phy, dtype=torch.float64, device=device)
-            replicas = torch.zeros(
-                n_layers, lc.shape[-1], dtype=torch.float64, device=device
-            )
-            replicas.scatter_add_(1, phy_map, ones).clamp_(min=1.0)
-            phy_load = torch.gather(lc, 1, phy_map) / torch.gather(replicas, 1, phy_map)
-            rank_load = compute_gpu_physical_count(
-                phy_load.unsqueeze(0), self.world_size
-            ).squeeze(0)
-
-            if self.layer_id < rank_load.shape[0]:
-                layer_load = rank_load[self.layer_id]
-                if layer_load.sum() > 0:
-                    self.static_rank_load = layer_load.to(dtype=torch.float64)
-                    self._eplb_map_data_ptr = cur_ptr
-        except Exception:
-            pass
+        if self.layer_id < metadata.rank_load.shape[0]:
+            layer_load = metadata.rank_load[self.layer_id]
+            if layer_load.sum() > 0:
+                self.static_rank_load = layer_load.to(dtype=torch.float64)
+                self._eplb_map_data_ptr = cur_ptr
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""
