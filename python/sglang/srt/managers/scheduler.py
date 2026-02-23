@@ -2942,7 +2942,9 @@ class Scheduler(
             return OpenSessionReqOutput(session_id, False)
         else:
             self.sessions[session_id] = Session(
-                recv_req.capacity_of_str_len, session_id, streaming=bool(recv_req.streaming)
+                recv_req.capacity_of_str_len,
+                session_id,
+                streaming=bool(recv_req.streaming),
             )
             return OpenSessionReqOutput(session_id, True)
 

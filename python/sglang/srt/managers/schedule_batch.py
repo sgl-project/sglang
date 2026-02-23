@@ -907,7 +907,11 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            if self.session and self.session.streaming and self.req_pool_idx is not None:
+            if (
+                self.session
+                and self.session.streaming
+                and self.req_pool_idx is not None
+            ):
                 # This request is in a streaming session and inherited its kv prefix from
                 # the previous request in the session. Skip radix match (slow) and reuse.
                 prefix_len = min(self.kv_committed_len, max_prefix_len)

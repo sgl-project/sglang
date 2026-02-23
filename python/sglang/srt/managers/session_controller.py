@@ -88,7 +88,9 @@ class Session:
             # Streaming sessions: only simple appends allowed; reject otherwise.
             if session_params.replace:
                 abort = True
-                abort_message = "Streaming sessions do not support replace."
+                abort_message = (
+                    "Streaming sessions do not support replace."
+                )
             elif session_params.drop_previous_output:
                 abort = True
                 abort_message = "Streaming sessions do not support drop_previous_output."
@@ -127,7 +129,11 @@ class Session:
 
         if last_req is not None:
             # trim bos token if it is an append
-            if tokenizer is not None and req.input_ids and req.input_ids[0] == tokenizer.bos_token_id:
+            if (
+                tokenizer is not None
+                and req.input_ids
+                and req.input_ids[0] == tokenizer.bos_token_id
+            ):
                 req.input_ids = req.input_ids[1:]
 
             input_ids = (
