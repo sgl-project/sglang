@@ -42,8 +42,11 @@ class ValueWithMeta:
 
 
 def _unwrap_dict_format(obj: Any) -> Tuple[Any, Dict[str, Any]]:
-    if isinstance(obj, dict) and "value" in obj and "meta" in obj and len(obj) == 2:
-        return obj["value"], obj["meta"]
+    if isinstance(obj, dict) and "value" in obj:
+        meta = obj.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        return obj["value"], meta
     return obj, {}
 
 
