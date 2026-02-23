@@ -498,13 +498,13 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.cuda_graph_runner_for_draft_extend.get_last_runner()
             )
             assign_hidden_states_pool_triton(
-                last_cuda_graph_runner.hidden_states,
-                last_cuda_graph_runner.req_pool_indices,
+                last_cuda_graph_runner.buffers.hidden_states,
+                last_cuda_graph_runner.buffers.req_pool_indices,
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
-                last_cuda_graph_runner.extend_seq_lens,
-                last_cuda_graph_runner.extend_start_loc,
+                last_cuda_graph_runner.buffers.extend_seq_lens,
+                last_cuda_graph_runner.buffers.extend_start_loc,
             )
 
         # Reorganize the spec info for the next batch

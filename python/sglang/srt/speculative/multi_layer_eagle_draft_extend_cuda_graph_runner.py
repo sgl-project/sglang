@@ -18,7 +18,7 @@ import bisect
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -613,8 +613,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.runners = [None] * self.speculative_num_steps
             return
 
-        self.runners = []
-        buffer_len_list = []
+        self.runners: List[Optional[MultiLayerEagleDraftExtendCudaGraphRunner]] = []
+        buffer_len_list: List[int] = []
 
         # 1. Capture loop
         for step in range(self.speculative_num_steps):
