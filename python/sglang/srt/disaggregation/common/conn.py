@@ -412,12 +412,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        if prefill_dp_rank is not None:
-            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
-            self.prefill_dp_rank = prefill_dp_rank
-        else:
-            self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
-
+        assert (
+            prefill_dp_rank is not None
+        ), "prefill_dp_rank must be resolved before creating receiver"
+        self.prefill_dp_rank = prefill_dp_rank
         self.target_dp_group = self.prefill_dp_rank
         self._setup_bootstrap_infos()
 
