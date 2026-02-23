@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -10,6 +11,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    get_benchmark_args,
     popen_launch_pd_server,
     try_cached_model,
 )
@@ -100,6 +102,22 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["accuracy"], 0.60)
+
+    def test_bench_serving(self):
+        args = get_benchmark_args(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=1000,
+            random_input_len=4096,
+            random_output_len=1024,
+            request_rate=float("inf"),
+            max_concurrency=128,
+        )
+        result = run_benchmark(args)
+
+        self.assertGreater(result["output_throughput"], 0)
+        self.assertGreater(result["completed"], 0)
 
 
 class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
