@@ -314,35 +314,31 @@ class CommonKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = None
             return
 
-        prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
-        self.prefill_attn_tp_size = prefill_info.attn_tp_size
-        self.prefill_dp_size = prefill_info.dp_size
-        self.prefill_pp_size = prefill_info.pp_size
-        self.prefill_page_size = prefill_info.page_size
+        self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
 
         # Handling for PD with different TP sizes per DP rank
-        if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
+        if self.kv_mgr.attn_tp_size == self.prefill_info.attn_tp_size:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             )
             self.required_dst_info_num = 1
             self.required_prefill_response_num = 1 * (
-                self.prefill_pp_size // self.kv_mgr.pp_size
+                self.prefill_info.pp_size // self.kv_mgr.pp_size
             )
             self.target_tp_ranks = [self.target_tp_rank]
-        elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
+        elif self.kv_mgr.attn_tp_size > self.prefill_info.attn_tp_size:
             if not self.kv_mgr.is_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
-            ) // (self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size)
+            ) // (self.kv_mgr.attn_tp_size // self.prefill_info.attn_tp_size)
             self.required_dst_info_num = (
-                self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
+                self.kv_mgr.attn_tp_size // self.prefill_info.attn_tp_size
             )
             self.required_prefill_response_num = 1 * (
-                self.prefill_pp_size // self.kv_mgr.pp_size
+                self.prefill_info.pp_size // self.kv_mgr.pp_size
             )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
@@ -355,9 +351,9 @@ class CommonKVReceiver(BaseKVReceiver):
                 rank
                 for rank in range(
                     (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size)
-                    * (self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
+                    * (self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size),
                     (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size + 1)
-                    * (self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
+                    * (self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size),
                 )
             ]
 
@@ -368,23 +364,23 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             if self.kv_mgr.is_mla_backend:
                 self.required_prefill_response_num = (
-                    self.prefill_pp_size // self.kv_mgr.pp_size
+                    self.prefill_info.pp_size // self.kv_mgr.pp_size
                 )
             else:
                 self.required_prefill_response_num = (
-                    self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-                ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
+                    self.prefill_info.attn_tp_size // self.kv_mgr.attn_tp_size
+                ) * (self.prefill_info.pp_size // self.kv_mgr.pp_size)
 
         # Decode pp size should be equal to prefill pp size or 1
         assert (
-            self.kv_mgr.pp_size == self.prefill_pp_size or self.kv_mgr.pp_size == 1
+            self.kv_mgr.pp_size == self.prefill_info.pp_size or self.kv_mgr.pp_size == 1
         ), (
-            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_pp_size}) or 1",
+            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_info.pp_size}) or 1",
         )
-        if self.prefill_pp_size == self.kv_mgr.pp_size:
+        if self.prefill_info.pp_size == self.kv_mgr.pp_size:
             self.target_pp_ranks = [self.kv_mgr.pp_rank]
         else:
-            self.target_pp_ranks = [rank for rank in range(self.prefill_pp_size)]
+            self.target_pp_ranks = [rank for rank in range(self.prefill_info.pp_size)]
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
