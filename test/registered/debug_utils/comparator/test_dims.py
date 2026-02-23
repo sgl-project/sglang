@@ -86,15 +86,15 @@ class TestParseDims:
             parse_dims("h h")
 
     def test_unknown_token_in_parens_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unknown token"):
+        with pytest.raises(ValueError, match="Unknown modifier"):
             parse_dims("h(tp,foobar)")
 
     def test_empty_parens_raises(self) -> None:
         with pytest.raises(ValueError, match="Invalid dim token"):
             parse_dims("h()")
 
-    def test_invalid_parallel_axis_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unknown parallel axis"):
+    def test_invalid_modifier_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown modifier"):
             parse_dims("h(xyz)")
 
     def test_nested_parens_raises(self) -> None:

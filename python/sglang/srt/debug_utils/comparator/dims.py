@@ -28,10 +28,18 @@ class DimSpec:
     reduction: Optional[Reduction] = None
 
 
-_DIM_PATTERN = re.compile(r"^([a-zA-Z_]\w*)(?:\(([^)]+)\))?$")
+_DIM_PATTERN = re.compile(r"^(?P<name>[a-zA-Z_]\w*)(?:\((?P<modifiers>[^)]+)\))?$")
 
-_ORDERING_VALUES = {e.value for e in Ordering}
-_REDUCTION_VALUES = {e.value for e in Reduction}
+_MODIFIER_FIELDS: list[tuple[type[Enum], str]] = [
+    (ParallelAxis, "parallel"),
+    (Ordering, "ordering"),
+    (Reduction, "reduction"),
+]
+
+_MODIFIER_LOOKUP: dict[str, tuple[str, Enum]] = {}
+for _enum_cls, _field in _MODIFIER_FIELDS:
+    for _member in _enum_cls:
+        _MODIFIER_LOOKUP[_member.value] = (_field, _member)
 
 
 def parse_dims(dims_str: str) -> list[DimSpec]:
@@ -39,66 +47,36 @@ def parse_dims(dims_str: str) -> list[DimSpec]:
     if not dims_str.strip():
         raise ValueError("dims string must not be empty")
 
-    tokens = dims_str.strip().split()
-    seen_names: set[str] = set()
     result: list[DimSpec] = []
 
-    for token in tokens:
+    for token in dims_str.strip().split():
         match = _DIM_PATTERN.match(token)
         if match is None:
             raise ValueError(f"Invalid dim token: {token!r}")
 
-        name = match.group(1)
-        if name in seen_names:
-            raise ValueError(f"Duplicate dim name: {name!r}")
-        seen_names.add(name)
+        name = match.group("name")
+        modifiers_str = match.group("modifiers")
 
-        paren_content = match.group(2)
-        if paren_content is None:
+        if modifiers_str is None:
             result.append(DimSpec(name=name))
             continue
 
-        parts = [p.strip() for p in paren_content.split(",")]
-        if parts == [""]:
-            raise ValueError(f"Empty parentheses in dim token: {token!r}")
+        fields: dict[str, Enum] = {}
+        for part in (p.strip() for p in modifiers_str.split(",")):
+            if part not in _MODIFIER_LOOKUP:
+                raise ValueError(f"Unknown modifier {part!r} in dim spec: {token!r}")
+            field_name, enum_value = _MODIFIER_LOOKUP[part]
+            if field_name in fields:
+                raise ValueError(
+                    f"Multiple {field_name} values in dim token: {token!r}"
+                )
+            fields[field_name] = enum_value
 
-        parallel = _parse_parallel_axis(parts[0], token)
-        ordering: Optional[Ordering] = None
-        reduction: Optional[Reduction] = None
+        result.append(DimSpec(name=name, **fields))
 
-        for part in parts[1:]:
-            if part in _ORDERING_VALUES:
-                if ordering is not None:
-                    raise ValueError(
-                        f"Multiple ordering values in dim token: {token!r}"
-                    )
-                ordering = Ordering(part)
-            elif part in _REDUCTION_VALUES:
-                if reduction is not None:
-                    raise ValueError(
-                        f"Multiple reduction values in dim token: {token!r}"
-                    )
-                reduction = Reduction(part)
-            else:
-                raise ValueError(f"Unknown token {part!r} in dim spec: {token!r}")
-
-        result.append(
-            DimSpec(
-                name=name,
-                parallel=parallel,
-                ordering=ordering,
-                reduction=reduction,
-            )
-        )
+    names = [spec.name for spec in result]
+    if len(names) != len(set(names)):
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(f"Duplicate dim names: {duplicates}")
 
     return result
-
-
-def _parse_parallel_axis(value: str, context: str) -> ParallelAxis:
-    try:
-        return ParallelAxis(value)
-    except ValueError:
-        valid = [e.value for e in ParallelAxis]
-        raise ValueError(
-            f"Unknown parallel axis {value!r} in {context!r}. Valid: {valid}"
-        ) from None
