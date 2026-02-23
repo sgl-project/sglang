@@ -1041,6 +1041,7 @@ class BatchStrOutput(
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+
     # Logprobs
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]

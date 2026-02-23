@@ -524,6 +524,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         dtype=hidden_states.dtype,
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
