@@ -53,6 +53,7 @@ class TestComputeDiff:
         assert diff.rel_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.mean_abs_diff == pytest.approx(0.0, abs=1e-5)
+        assert diff.passed is True
 
     def test_known_offset(self):
         x = torch.ones(10, 10)
@@ -66,6 +67,7 @@ class TestComputeDiff:
         assert diff.baseline_at_max == pytest.approx(1.0, abs=1e-4)
         assert diff.target_at_max == pytest.approx(1.5, abs=1e-4)
         assert diff.mean_abs_diff == pytest.approx(0.5 / 100, abs=1e-4)
+        assert diff.passed is False
 
     def test_rel_diff_value(self):
         x = torch.tensor([1.0, 0.0])
@@ -73,6 +75,7 @@ class TestComputeDiff:
         diff = _compute_diff(x_baseline=x, x_target=y)
 
         assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
+        assert diff.passed is False
 
 
 class TestCompareTensors:

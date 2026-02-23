@@ -35,6 +35,7 @@ def _make_diff(
     rel_diff: float = 0.0001,
     max_abs_diff: float = 0.0005,
     mean_abs_diff: float = 0.0002,
+    passed: bool = True,
 ) -> DiffInfo:
     return DiffInfo(
         rel_diff=rel_diff,
@@ -43,6 +44,7 @@ def _make_diff(
         max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
+        passed=passed,
     )
 
 

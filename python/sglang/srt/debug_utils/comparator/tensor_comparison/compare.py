@@ -24,6 +24,7 @@ def compare_tensors(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     name: str = "",
+    diff_threshold: float = 1e-3,
 ) -> TensorComparisonInfo:
     baseline_info = TensorInfo(
         shape=list(x_baseline.shape),
@@ -52,7 +53,11 @@ def compare_tensors(
     downcast_dtype: Optional[torch.dtype] = None
 
     if not shape_mismatch:
-        diff = _compute_diff(x_baseline=x_baseline_f, x_target=x_target_f)
+        diff = _compute_diff(
+            x_baseline=x_baseline_f,
+            x_target=x_target_f,
+            diff_threshold=diff_threshold,
+        )
 
         needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
         if needs_sample:
@@ -67,6 +72,7 @@ def compare_tensors(
                 diff_downcast = _compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
+                    diff_threshold=diff_threshold,
                 )
 
     return TensorComparisonInfo(
@@ -99,15 +105,28 @@ def _quantile_or_none(x: torch.Tensor, *, q: float, include: bool) -> Optional[f
     return torch.quantile(x, q).item() if include else None
 
 
-def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
+def _compute_diff(
+    x_baseline: torch.Tensor,
+    x_target: torch.Tensor,
+    diff_threshold: float = 1e-3,
+) -> DiffInfo:
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = argmax_coord(raw_abs_diff)
 
+    rel_diff = calc_rel_diff(x_target, x_baseline).item()
+    max_abs_diff = raw_abs_diff.max().item()
+    mean_abs_diff = raw_abs_diff.mean().item()
+
     return DiffInfo(
-        rel_diff=calc_rel_diff(x_target, x_baseline).item(),
-        max_abs_diff=raw_abs_diff.max().item(),
-        mean_abs_diff=raw_abs_diff.mean().item(),
+        rel_diff=rel_diff,
+        max_abs_diff=max_abs_diff,
+        mean_abs_diff=mean_abs_diff,
         max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
+        passed=(
+            rel_diff <= diff_threshold
+            and max_abs_diff <= diff_threshold
+            and mean_abs_diff <= diff_threshold
+        ),
     )

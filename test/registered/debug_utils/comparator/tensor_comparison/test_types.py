@@ -41,6 +41,7 @@ def _make_diff(**overrides) -> DiffInfo:
         max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
+        passed=True,
     )
     defaults.update(overrides)
     return DiffInfo(**defaults)
