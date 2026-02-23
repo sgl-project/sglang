@@ -184,5 +184,110 @@ class TestEntrypointJsonl:
         assert all(isinstance(r, _OutputRecord) for r in records)
 
 
+class TestValueWithMeta:
+    def test_load_dict_format(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=hidden.pt"
+        tensor = torch.randn(4, 8)
+        torch.save({"value": tensor, "meta": {"custom": "field"}}, path)
+
+        from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+        loaded = ValueWithMeta.load(path)
+        assert torch.allclose(loaded.value, tensor)
+        assert loaded.meta["custom"] == "field"
+        assert loaded.meta["name"] == "hidden"
+        assert loaded.meta["rank"] == 0
+
+    def test_load_bare_tensor(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=bare.pt"
+        tensor = torch.randn(3, 3)
+        torch.save(tensor, path)
+
+        from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+        loaded = ValueWithMeta.load(path)
+        assert torch.allclose(loaded.value, tensor)
+        assert loaded.meta["name"] == "bare"
+
+    def test_load_corrupted_file(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=bad.pt"
+        path.write_text("not a valid pt file")
+
+        from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+        loaded = ValueWithMeta.load(path)
+        assert loaded.value is None
+        assert loaded.meta["name"] == "bad"
+
+
+class TestDumperDims:
+    def test_dims_in_meta_not_filename(self, tmp_path) -> None:
+        dumper = _make_dumper(tmp_path)
+        tensor = torch.randn(4, 8)
+        dumper.dump("hidden", tensor, dims="b h(tp)")
+        dumper.step()
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        pt_files = list(exp_dir.glob("*.pt"))
+        assert len(pt_files) == 1
+
+        assert "dims" not in pt_files[0].stem
+
+        data = torch.load(pt_files[0], weights_only=False)
+        assert "dims" in data["meta"]
+        assert data["meta"]["dims"] == "b h(tp)"
+
+    def test_dims_grad_override(self, tmp_path) -> None:
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(tmp_path),
+                enable_http_server=False,
+                enable_grad=True,
+            )
+        )
+
+        tensor = torch.randn(4, 8, requires_grad=True)
+        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp,partial)")
+        dumper.step()
+
+        tensor.backward(torch.ones_like(tensor))
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        pt_files = sorted(exp_dir.glob("*.pt"))
+        assert len(pt_files) == 2
+
+        value_file = [f for f in pt_files if "grad__" not in f.stem][0]
+        grad_file = [f for f in pt_files if "grad__" in f.stem][0]
+
+        value_data = torch.load(value_file, weights_only=False)
+        assert value_data["meta"]["dims"] == "b h(tp)"
+        assert value_data["meta"]["dims_grad"] == "b h(tp,partial)"
+
+        grad_data = torch.load(grad_file, weights_only=False)
+        assert grad_data["meta"]["dims"] == "b h(tp,partial)"
+
+    def test_dims_grad_inherits(self, tmp_path) -> None:
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(tmp_path),
+                enable_http_server=False,
+                enable_grad=True,
+            )
+        )
+
+        tensor = torch.randn(4, 8, requires_grad=True)
+        dumper.dump("hidden", tensor, dims="b h(tp)")
+        dumper.step()
+
+        tensor.backward(torch.ones_like(tensor))
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        grad_file = [f for f in exp_dir.glob("*.pt") if "grad__" in f.stem][0]
+        grad_data = torch.load(grad_file, weights_only=False)
+        assert grad_data["meta"]["dims"] == "b h(tp)"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
