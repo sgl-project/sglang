@@ -9,6 +9,10 @@ class _StrictBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _FrozenBase(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
 def argmax_coord(x: torch.Tensor) -> Tuple[int, ...]:
     flat_idx = x.argmax()
     return tuple(idx.item() for idx in torch.unravel_index(flat_idx, x.shape))

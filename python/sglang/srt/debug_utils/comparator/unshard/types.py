@@ -2,21 +2,16 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
-
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.utils import _FrozenBase
 
 
-class _PlanBase(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class AxisInfo(_PlanBase):
+class AxisInfo(_FrozenBase):
     axis_rank: int
     axis_size: int
 
 
-class ConcatParams(_PlanBase):
+class ConcatParams(_FrozenBase):
     op: Literal["concat"] = "concat"
     dim: int
 
@@ -29,13 +24,13 @@ class ConcatParams(_PlanBase):
 UnshardParams = ConcatParams
 
 
-class UnshardStep(_PlanBase):
+class UnshardStep(_FrozenBase):
     axis: ParallelAxis
     params: UnshardParams
     world_ranks_by_axis_rank: list[int]
 
 
-class UnshardPlan(_PlanBase):
+class UnshardPlan(_FrozenBase):
     tensor_name: str
     dims_str: str
     replicated_axes: dict[str, AxisInfo] = {}
