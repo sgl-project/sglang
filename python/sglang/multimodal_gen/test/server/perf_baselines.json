@@ -320,7 +320,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 513.58,
-                "ImageVAEEncodingStage": 0.0,
                 "LatentPreparationStage": 0.46,
                 "TimestepPreparationStage": 2.38,
                 "DenoisingStage": 52187.62,
