@@ -787,28 +787,26 @@ def run_benchmark_internal(
         else:
             tokenizer = get_tokenizer(tokenizer_path)
 
+        # Get token capacity
         internal_state = server_info.get("internal_states", [{}])
-        dp_size = internal_state[0].get("dp_size", None) or 1
+        skip_token_capacity_threshold = (
+            internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
+        )
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state[0].get(
             "effective_max_running_requests_per_dp", -1
         )
-
-        # Get token capacity
-        skip_token_capacity_threshold = 0
-
-        for i in range(dp_size):
-            skip_token_capacity_threshold += (
-                internal_state[i]
-                .get("memory_usage", {})
-                .get("token_capacity", 1000000000)
-            )
-
+        dp_size = server_info.get("dp_size", None) or 1
         assert (
             max_running_requests_per_dp > 0
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
         skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+
+        print(f"{max_running_requests_per_dp=}")
+        print(f"{dp_size=}")
+        print(f"{skip_max_running_requests_threshold=}")
+        print(f"{skip_token_capacity_threshold=}")
 
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
@@ -816,11 +814,6 @@ def run_benchmark_internal(
         gsp_question_len=bench_args.gsp_question_len,
         gsp_output_len=bench_args.gsp_output_len,
     )
-
-    print(f"{max_running_requests_per_dp=}")
-    print(f"{dp_size=}")
-    print(f"{skip_max_running_requests_threshold=}")
-    print(f"{skip_token_capacity_threshold=}")
 
     # Warmup
     if not bench_args.skip_warmup:

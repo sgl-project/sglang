@@ -368,6 +368,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    # TODO: modeling of flux different from official flux, so weights can't be loaded
+    # consider opting for a different quantized hf-repo
+    # DiffusionTestCase(
+    #     "flux_image_t2i_override_transformer_weights_path_fp8",
+    #     DiffusionServerArgs(
+    #         model_path="black-forest-labs/FLUX.1-dev", modality="image",
+    #         extras=["--transformer-weights-path black-forest-labs/FLUX.1-dev-FP8"]
+    #     ),
+    #     T2I_sampling_params,
+    # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
         DiffusionServerArgs(
