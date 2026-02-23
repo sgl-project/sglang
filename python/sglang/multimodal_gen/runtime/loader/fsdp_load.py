@@ -334,7 +334,7 @@ def load_model_from_full_model_state_dict(
 
     if skipped_checkpoint_keys:
         logger.warning(
-            "Checkpoint keys not loaded (no matching model parameter)",
+            "Checkpoint keys not loaded (no matching model parameter) %s",
             (
                 skipped_checkpoint_keys[:20]
                 if len(skipped_checkpoint_keys) > 20
