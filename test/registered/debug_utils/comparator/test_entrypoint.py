@@ -23,10 +23,12 @@ def _create_dumps(
     tensor_names: list[str],
     *,
     baseline_names: list[str] | None = None,
+    num_steps: int = 1,
 ) -> tuple[Path, Path]:
     """Create baseline and target dump directories with given tensor names.
 
     If baseline_names is None, uses the same names as tensor_names.
+    Each step dumps all names with the same tensor (different per baseline/target).
     """
     if baseline_names is None:
         baseline_names = tensor_names
@@ -40,20 +42,19 @@ def _create_dumps(
     baseline_tensor = torch.randn(10, 10)
     target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
 
-    dumper_baseline = _make_dumper(d_baseline)
-    for name in baseline_names:
-        dumper_baseline.dump(name, baseline_tensor)
-    dumper_baseline.step()
+    exp_paths: list[Path] = []
+    for d, names, tensor in [
+        (d_baseline, baseline_names, baseline_tensor),
+        (d_target, tensor_names, target_tensor),
+    ]:
+        dumper = _make_dumper(d)
+        for _ in range(num_steps):
+            for name in names:
+                dumper.dump(name, tensor)
+            dumper.step()
+        exp_paths.append(d / dumper._config.exp_name)
 
-    dumper_target = _make_dumper(d_target)
-    for name in tensor_names:
-        dumper_target.dump(name, target_tensor)
-    dumper_target.step()
-
-    return (
-        d_baseline / dumper_baseline._config.exp_name,
-        d_target / dumper_target._config.exp_name,
-    )
+    return exp_paths[0], exp_paths[1]
 
 
 def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace:
@@ -111,31 +112,8 @@ class TestEntrypoint:
         assert "since no baseline" in output
 
     def test_step_range(self, tmp_path, capsys):
-        d_baseline = tmp_path / "baseline"
-        d_target = tmp_path / "target"
-        d_baseline.mkdir()
-        d_target.mkdir()
-
-        torch.manual_seed(42)
-        tensor = torch.randn(10, 10)
-
-        exp_paths = []
-        for d in [d_baseline, d_target]:
-            dumper = _make_dumper(d)
-            dumper.dump("t", tensor)
-            dumper.step()
-            dumper.dump("t", tensor)
-            dumper.step()
-            dumper.dump("t", tensor)
-            dumper.step()
-            exp_paths.append(d / dumper._config.exp_name)
-
-        args = _make_args(
-            exp_paths[0],
-            exp_paths[1],
-            start_id=1,
-            end_id=1,
-        )
+        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
+        args = _make_args(baseline_path, target_path, start_id=1, end_id=1)
 
         run(args)
 

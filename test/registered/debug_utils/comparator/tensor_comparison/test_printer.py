@@ -61,6 +61,10 @@ def _make_tensor_info(
     )
 
 
+# Snapshot strings below are intentionally spelled out in full per test.
+# The shared skeleton (stats block, diff block) looks duplicated, but keeping
+# each test self-contained makes failures immediately readable without chasing
+# helper functions.  Do not extract common fragments.
 class TestPrintComparison:
     def test_normal(self, capsys):
         info = TensorComparisonInfo(

@@ -1,4 +1,3 @@
-import functools
 from typing import Optional
 
 import torch
@@ -91,27 +90,15 @@ def _compute_tensor_stats(x: torch.Tensor) -> TensorStats:
         std=torch.std(x).item(),
         min=torch.min(x).item(),
         max=torch.max(x).item(),
-        p1=(
-            functools.partial(torch.quantile, q=0.01)(x).item()
-            if include_quantiles
-            else None
-        ),
-        p5=(
-            functools.partial(torch.quantile, q=0.05)(x).item()
-            if include_quantiles
-            else None
-        ),
-        p95=(
-            functools.partial(torch.quantile, q=0.95)(x).item()
-            if include_quantiles
-            else None
-        ),
-        p99=(
-            functools.partial(torch.quantile, q=0.99)(x).item()
-            if include_quantiles
-            else None
-        ),
+        p1=_quantile_or_none(x, q=0.01, include=include_quantiles),
+        p5=_quantile_or_none(x, q=0.05, include=include_quantiles),
+        p95=_quantile_or_none(x, q=0.95, include=include_quantiles),
+        p99=_quantile_or_none(x, q=0.99, include=include_quantiles),
     )
+
+
+def _quantile_or_none(x: torch.Tensor, *, q: float, include: bool) -> Optional[float]:
+    return torch.quantile(x, q).item() if include else None
 
 
 def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
