@@ -96,6 +96,7 @@ class CommonKVManager(BaseKVManager):
             self.prefill_dp_size_table: Dict[str, int] = {}
             self.prefill_pp_size_table: Dict[str, int] = {}
             self.prefill_page_size_table: Dict[str, Optional[int]] = {}
+            self.follow_bootstrap_room_table: Dict[str, bool] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -131,41 +132,14 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
-            "bootstrap_room": -1,
             "page_size": self.kv_args.page_size,
+            "load_balance_method": self.server_args.load_balance_method,
         }
 
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
                 logger.debug("Prefill successfully registered to bootstrap server.")
-            else:
-                logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
-            )
-
-    def register_prefill_dp_rank(self, bootstrap_room: int, bootstrap_addr: str):
-        """Register request's prefill dp rank to bootstrap server via HTTP POST."""
-
-        url = f"http://{bootstrap_addr}/route"
-        payload = {
-            "role": "Prefill",
-            "attn_dp_rank": self.attn_dp_rank,
-            "rank_ip": self.local_ip,
-            "rank_port": self.rank_port,
-            "bootstrap_room": bootstrap_room,
-        }
-
-        try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                logger.debug(
-                    "Prefill dp rank successfully registered to bootstrap server."
-                )
             else:
                 logger.error(
                     f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
@@ -234,12 +208,27 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        # TODO: do not register prefill dp rank if prefill server's load balance method is 'follow_bootstrap_room'
-        # If prefill server's load balance method is not 'follow_bootstrap_room', register prefill dp rank.
-        if self.kv_mgr.server_args.dp_size > 1:
-            self.kv_mgr.register_prefill_dp_rank(
-                self.bootstrap_room, self.bootstrap_server_url
-            )
+        if (
+            self.kv_mgr.server_args.dp_size > 1
+            and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
+        ):
+            self._register_prefill_dp_rank()
+
+    def _register_prefill_dp_rank(self):
+        """Register this request's prefill dp_rank to the bootstrap server."""
+        url = f"http://{self.bootstrap_server_url}/register_dp_rank"
+        payload = {
+            "bootstrap_room": self.bootstrap_room,
+            "dp_rank": self.kv_mgr.attn_dp_rank,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code != 200:
+                logger.error(
+                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to register prefill dp_rank: {e}")
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
@@ -283,6 +272,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.prefill_dp_size,
                 self.prefill_pp_size,
                 self.prefill_page_size,
+                follow_bootstrap_room,
             ) = self._get_prefill_parallel_info_from_server()
             if (
                 self.prefill_attn_tp_size is None
@@ -309,7 +299,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     raise RuntimeError(error_msg)
 
             logger.debug(
-                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size}"
+                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size} follow_bootstrap_room:{follow_bootstrap_room}"
             )
             self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = (
                 self.prefill_attn_tp_size
@@ -322,6 +312,9 @@ class CommonKVReceiver(BaseKVReceiver):
             )
             self.kv_mgr.prefill_page_size_table[self.bootstrap_addr] = (
                 self.prefill_page_size
+            )
+            self.kv_mgr.follow_bootstrap_room_table[self.bootstrap_addr] = (
+                follow_bootstrap_room
             )
         else:
             self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
@@ -407,15 +400,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        # It router has not assigned prefill_dp_rank to each request, we will try to fetch it from bootstrap server.
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
             self.prefill_dp_rank = prefill_dp_rank
         else:
-            self.should_notify_dp_rank = True
+            self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
 
-        if not self.should_notify_dp_rank:
-            self._setup_bootstrap_infos()
+        self.target_dp_group = self.prefill_dp_rank
+        self._setup_bootstrap_infos()
 
     def _setup_bootstrap_infos(self):
         # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, and target_tp_rank
@@ -468,7 +460,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={-1}&engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -484,10 +476,10 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _get_prefill_parallel_info_from_server(
         self,
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], bool]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={-1}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
             response = requests.get(url)
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
@@ -496,32 +488,39 @@ class CommonKVReceiver(BaseKVReceiver):
                     int(prefill_parallel_info["prefill_dp_size"]),
                     int(prefill_parallel_info["prefill_pp_size"]),
                     int(prefill_parallel_info["prefill_page_size"]),
+                    bool(prefill_parallel_info.get("follow_bootstrap_room", True)),
                 )
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None, None, None, None
+                return None, None, None, None, True
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None, None, None, None
+            return None, None, None, None, True
 
-    def _get_prefill_dp_rank_from_server(self, bootstrap_room):
-        """Fetch request's prefill dp rank info from the bootstrap server."""
+    @staticmethod
+    def query_prefill_dp_ranks(
+        bootstrap_addr: str, bootstrap_rooms: List[int]
+    ) -> Dict[str, int]:
+        """Batch query prefill dp_ranks for given bootstrap_rooms."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?bootstrap_room={bootstrap_room}&engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
-            response = requests.get(url, timeout=5)
+            url = f"http://{bootstrap_addr}/query_dp_ranks"
+            response = requests.post(
+                url,
+                json={"bootstrap_rooms": bootstrap_rooms},
+                timeout=5,
+            )
             if response.status_code == 200:
-                bootstrap_table = response.json()
-                return bootstrap_table
+                return response.json()
             else:
                 logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                    f"Failed to query dp_ranks: {response.status_code}, {response.text}"
                 )
-                return None
+                return {}
         except Exception as e:
-            logger.error(f"Error fetching prefill info from bootstrap: {e}")
-            return None
+            logger.error(f"Error querying dp_ranks from bootstrap: {e}")
+            return {}
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
@@ -553,7 +552,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, host: str, port: int, dp_size: int):
+    def __init__(self, host: str, port: int, dp_size: int = 1):
         self.host = host
         self.port = port
         self.app = web.Application()
@@ -564,11 +563,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.attn_tp_size = None
         self.dp_size = None
         self.page_size = None
+        self.follow_bootstrap_room: Optional[bool] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
-        self.prefill_dp_rank_table: Dict[int, Dict[str, Union[str, int, float]]] = {}
-        self.should_notify_dp_rank = dp_size > 1
+        self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -582,6 +581,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
+        self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
+        self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
@@ -601,26 +602,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
         role = data["role"]
-        rank_ip = data["rank_ip"]
-        rank_port = int(data["rank_port"])
-        bootstrap_room = int(data["bootstrap_room"])
-        attn_dp_rank = data["attn_dp_rank"]
-
-        # Use real bootstrap_room id to put prefill dp rank
-        if bootstrap_room != -1:
-            async with self.lock:
-                self.prefill_dp_rank_table[bootstrap_room] = {
-                    "dp_rank": attn_dp_rank,
-                    "rank_port": rank_port,
-                    "rank_ip": rank_ip,
-                    "timestamp": time.time(),
-                }
-            logger.debug(f"register bootstrap_room table {bootstrap_room=}")
-            return web.Response(text="OK", status=200)
-
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
         attn_dp_size = data["attn_dp_size"]
+        attn_dp_rank = data["attn_dp_rank"]
         pp_size = data["pp_size"]
         pp_rank = data["pp_rank"]
         system_dp_size = data["system_dp_size"]
@@ -640,6 +625,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.page_size is None and page_size is not None:
             self.page_size = page_size
+
+        if self.follow_bootstrap_room is None:
+            load_balance_method = data.get(
+                "load_balance_method", "follow_bootstrap_room"
+            )
+            self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
         if role == "Prefill":
             if system_dp_size == 1:
@@ -665,18 +656,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.Response(text="OK", status=200)
 
     async def _handle_route_get(self, request: web.Request):
-        bootstrap_room = request.query.get("bootstrap_room")
-        # Use real bootstrap_room id to get prefill dp rank
-        if int(bootstrap_room) != -1:
-            return web.json_response(self.prefill_dp_rank_table, status=200)
-
         engine_rank = request.query.get("engine_rank")
         target_dp_group = request.query.get("target_dp_group")
         target_pp_rank = request.query.get("target_pp_rank")
         if not engine_rank or not target_dp_group or not target_pp_rank:
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
 
-        # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
         if (
             int(engine_rank) == -1
             and int(target_dp_group) == -1
@@ -687,6 +672,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
                 "prefill_page_size": self.page_size,
+                "follow_bootstrap_room": (
+                    self.follow_bootstrap_room
+                    if self.follow_bootstrap_room is not None
+                    else True
+                ),
             }
             return web.json_response(prefill_parallel_info, status=200)
 
@@ -701,32 +691,46 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         else:
             return web.Response(text="Bootstrap info not Found", status=404)
 
+    async def _handle_register_dp_rank(self, request: web.Request):
+        data = await request.json()
+        bootstrap_room = int(data["bootstrap_room"])
+        dp_rank = int(data["dp_rank"])
+        async with self.lock:
+            self.room_to_dp_rank[bootstrap_room] = {
+                "dp_rank": dp_rank,
+                "timestamp": time.time(),
+            }
+        logger.debug(f"Registered dp_rank={dp_rank} for {bootstrap_room=}")
+        return web.Response(text="OK", status=200)
+
+    async def _handle_query_dp_ranks(self, request: web.Request):
+        data = await request.json()
+        bootstrap_rooms = data["bootstrap_rooms"]
+        result = {}
+        async with self.lock:
+            for room in bootstrap_rooms:
+                room_int = int(room)
+                if room_int in self.room_to_dp_rank:
+                    result[str(room_int)] = self.room_to_dp_rank[room_int]["dp_rank"]
+        return web.json_response(result, status=200)
+
     async def _cleanup_expired_entries(self):
-        """Remove entries older than cleanup interval from prefill_dp_rank_table."""
+        """Remove entries older than cleanup interval from room_to_dp_rank."""
         while True:
             await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
-            expired_keys = [
-                key
-                for key, value in self.prefill_dp_rank_table.items()
-                if current_time - value["timestamp"] > self.entry_cleanup_interval
-            ]
+            async with self.lock:
+                expired_keys = [
+                    key
+                    for key, value in self.room_to_dp_rank.items()
+                    if current_time - value["timestamp"] > self.entry_cleanup_interval
+                ]
+                for key in expired_keys:
+                    del self.room_to_dp_rank[key]
             if expired_keys:
-                start_time = time.time()
-                async with self.lock:
-                    for key in expired_keys:
-                        if key in self.prefill_dp_rank_table:
-                            del self.prefill_dp_rank_table[key]
-                consumed_time = time.time() - start_time
-                # Check if cleanup took longer than 1ms
-                if consumed_time > 0.001:
-                    logger.warning(
-                        f"Cleaned up {len(expired_keys)} expired entries from prefill_dp_rank_table. It takes too long {consumed_time=} secs"
-                    )
-                else:
-                    logger.debug(
-                        f"Cleaned up {len(expired_keys)} expired entries from prefill_dp_rank_table"
-                    )
+                logger.debug(
+                    f"Cleaned up {len(expired_keys)} expired entries from room_to_dp_rank"
+                )
 
     def _run_server(self):
         try:
@@ -734,9 +738,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            # Schedule the cleanup task for prefill_dp_rank_table
-            if self.should_notify_dp_rank:
-                self._loop.create_task(self._cleanup_expired_entries())
+            self._loop.create_task(self._cleanup_expired_entries())
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:

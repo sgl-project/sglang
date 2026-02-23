@@ -64,11 +64,6 @@ class BaseKVManager(ABC):
         """Register to the bootstrap server."""
         ...
 
-    @abstractmethod
-    def register_prefill_dp_rank(self):
-        """Register to the prefill dp rank."""
-        ...
-
 
 class BaseKVSender(ABC):
 

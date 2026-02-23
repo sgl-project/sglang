@@ -237,6 +237,7 @@ class DecodePreallocQueue:
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
+        self.pending_reqs: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
 
@@ -324,31 +325,49 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            # Auto enable FAKE mode if configured
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-                req.bootstrap_host is None
-                and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
-            ):
-                kv_receiver_class = get_kv_class(
-                    TransferBackend.FAKE, KVClassType.RECEIVER
-                )
-            else:
-                kv_receiver_class = get_kv_class(
-                    self.transfer_backend, KVClassType.RECEIVER
-                )
+            dp_rank = self._resolve_dp_rank(req)
+            if dp_rank is None:
+                self.pending_reqs.append(req)
+                return
+            self._create_receiver_and_enqueue(req, dp_rank)
 
-            kv_receiver = kv_receiver_class(
-                mgr=self.kv_manager,
-                bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
-                bootstrap_room=req.bootstrap_room,
-                prefill_dp_rank=req.data_parallel_rank,
+    def _resolve_dp_rank(self, req: Req) -> Optional[int]:
+        if req.data_parallel_rank is not None:
+            return req.data_parallel_rank
+        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+            req.bootstrap_host is None
+            and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            return 0
+        bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+        if self.kv_manager.follow_bootstrap_room_table.get(bootstrap_addr, True):
+            dp_size = self.kv_manager.prefill_dp_size_table.get(bootstrap_addr, 1)
+            return req.bootstrap_room % dp_size
+        return None
+
+    def _create_receiver_and_enqueue(self, req: Req, dp_rank: int) -> None:
+        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+            req.bootstrap_host is None
+            and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
+        else:
+            kv_receiver_class = get_kv_class(
+                self.transfer_backend, KVClassType.RECEIVER
             )
 
-            req.add_latency(RequestStage.DECODE_PREPARE)
-            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
-            self.queue.append(
-                DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
-            )
+        kv_receiver = kv_receiver_class(
+            mgr=self.kv_manager,
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_room=req.bootstrap_room,
+            prefill_dp_rank=dp_rank,
+        )
+
+        req.add_latency(RequestStage.DECODE_PREPARE)
+        trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
+        self.queue.append(
+            DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
+        )
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -444,17 +463,47 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _resolve_pending_reqs(self) -> None:
+        """Batch-resolve dp_ranks for pending requests and create receivers."""
+        if not self.pending_reqs:
+            return
+
+        rooms_to_query: List[int] = []
+        bootstrap_addr = None
+        for req in self.pending_reqs:
+            if req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
+                rooms_to_query.append(req.bootstrap_room)
+                if bootstrap_addr is None:
+                    bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+
+        room_to_rank: dict = {}
+        if rooms_to_query and bootstrap_addr:
+            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+
+            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                bootstrap_addr, rooms_to_query
+            )
+
+        remaining = []
+        for req in self.pending_reqs:
+            room_key = str(req.bootstrap_room)
+            if room_key in room_to_rank:
+                dp_rank = int(room_to_rank[room_key])
+                self._create_receiver_and_enqueue(req, dp_rank)
+            else:
+                remaining.append(req)
+        self.pending_reqs = remaining
+
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
         preallocated_reqs = []
         indices_to_remove = set()
-        bootstrap_table = None
-        data_parallel_rank = None
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -478,30 +527,6 @@ class DecodePreallocQueue:
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if decode_req.kv_receiver.should_notify_dp_rank:
-                if hasattr(decode_req.kv_receiver, "_get_prefill_dp_rank_from_server"):
-                    if bootstrap_table is None:
-                        bootstrap_table = (
-                            decode_req.kv_receiver._get_prefill_dp_rank_from_server(
-                                decode_req.req.bootstrap_room
-                            )
-                        )
-
-                # Do not check warmup requests with FAKE_BOOTSTRAP_HOST
-                if decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
-                    if (
-                        bootstrap_table
-                        and str(decode_req.req.bootstrap_room) in bootstrap_table
-                    ):
-                        data_parallel_rank = bootstrap_table[
-                            str(decode_req.req.bootstrap_room)
-                        ]["dp_rank"]
-                    else:
-                        logger.debug(
-                            f"bootstrap info for {decode_req.req.bootstrap_room} {decode_req.req.bootstrap_host} not found"
-                        )
-                        continue
-
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -597,10 +622,7 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                data_parallel_rank,
+                page_indices, decode_req.metadata_buffer_index, state_indices
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
