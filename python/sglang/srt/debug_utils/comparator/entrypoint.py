@@ -63,9 +63,9 @@ def run(args: argparse.Namespace) -> None:
     ]
     logical_groups = df_target.unique(subset=logical_key_cols)
 
-    for row in logical_groups.iter_rows(named=True):
+    for logical_group in logical_groups.iter_rows(named=True):
         _process_logical_tensor(
-            row=row,
+            row=logical_group,
             df_target=df_target,
             df_baseline=df_baseline,
             args=args,
