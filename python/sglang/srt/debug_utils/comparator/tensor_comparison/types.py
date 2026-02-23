@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -44,33 +44,3 @@ class TensorComparisonInfo(_StrictBase):
     diff: Optional[DiffInfo] = None
     diff_downcast: Optional[DiffInfo] = None
     downcast_dtype: Optional[str] = None
-
-
-# --------------- JSONL line types ---------------
-
-
-class ConfigLine(_StrictBase):
-    type: Literal["config"] = "config"
-    baseline_path: str
-    target_path: str
-    diff_threshold: float
-    start_step: int
-    end_step: int
-
-
-class SkipLine(_StrictBase):
-    type: Literal["skip"] = "skip"
-    name: str
-    reason: str
-
-
-class ComparisonLine(TensorComparisonInfo):
-    type: Literal["comparison"] = "comparison"
-
-
-class SummaryLine(_StrictBase):
-    type: Literal["summary"] = "summary"
-    total: int
-    passed: int
-    failed: int
-    skipped: int

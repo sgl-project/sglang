@@ -3,12 +3,14 @@ import sys
 
 import pytest
 
+from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonRecord,
+    ConfigRecord,
+    SkipRecord,
+    SummaryRecord,
+)
 from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
-    ComparisonLine,
-    ConfigLine,
     DiffInfo,
-    SkipLine,
-    SummaryLine,
     TensorComparisonInfo,
     TensorInfo,
     TensorStats,
@@ -101,6 +103,12 @@ class TestDiffInfoRoundTrip:
         data = diff.model_dump()
         assert data["max_diff_coord"] == [0, 5, 10]
 
+    def test_passed_field(self):
+        diff_pass = _make_diff(passed=True)
+        diff_fail = _make_diff(passed=False)
+        assert diff_pass.passed is True
+        assert diff_fail.passed is False
+
 
 class TestTensorInfoRoundTrip:
     def test_round_trip(self):
@@ -155,39 +163,39 @@ class TestTensorComparisonInfoRoundTrip:
         assert restored.diff_downcast is not None
 
 
-class TestJsonlLineTypes:
-    def test_config_line(self):
-        line = ConfigLine(
+class TestRecordTypes:
+    def test_config_record(self):
+        record = ConfigRecord(
             baseline_path="/tmp/baseline",
             target_path="/tmp/target",
             diff_threshold=1e-3,
             start_step=0,
             end_step=100,
         )
-        parsed = json.loads(line.model_dump_json())
+        parsed = json.loads(record.model_dump_json())
         assert parsed["type"] == "config"
         assert parsed["baseline_path"] == "/tmp/baseline"
 
-    def test_config_line_round_trip(self):
-        original = ConfigLine(
+    def test_config_record_round_trip(self):
+        original = ConfigRecord(
             baseline_path="/a",
             target_path="/b",
             diff_threshold=0.01,
             start_step=5,
             end_step=50,
         )
-        restored = ConfigLine.model_validate_json(original.model_dump_json())
+        restored = ConfigRecord.model_validate_json(original.model_dump_json())
         assert restored == original
 
-    def test_skip_line(self):
-        line = SkipLine(name="attention", reason="no_baseline")
-        parsed = json.loads(line.model_dump_json())
+    def test_skip_record(self):
+        record = SkipRecord(name="attention", reason="no_baseline")
+        parsed = json.loads(record.model_dump_json())
         assert parsed["type"] == "skip"
         assert parsed["name"] == "attention"
         assert parsed["reason"] == "no_baseline"
 
-    def test_comparison_line_inherits_fields(self):
-        line = ComparisonLine(
+    def test_comparison_record_inherits_fields(self):
+        record = ComparisonRecord(
             name="hidden_states",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
@@ -195,33 +203,33 @@ class TestJsonlLineTypes:
             shape_mismatch=False,
             diff=_make_diff(),
         )
-        parsed = json.loads(line.model_dump_json())
+        parsed = json.loads(record.model_dump_json())
         assert parsed["type"] == "comparison"
         assert parsed["name"] == "hidden_states"
         assert "baseline" in parsed
         assert "diff" in parsed
 
-    def test_comparison_line_round_trip(self):
-        original = ComparisonLine(
+    def test_comparison_record_round_trip(self):
+        original = ComparisonRecord(
             name="mlp",
             baseline=_make_tensor_info(),
             target=_make_tensor_info(),
             unified_shape=[4, 8],
             shape_mismatch=False,
         )
-        restored = ComparisonLine.model_validate_json(original.model_dump_json())
+        restored = ComparisonRecord.model_validate_json(original.model_dump_json())
         assert restored == original
 
-    def test_summary_line(self):
-        line = SummaryLine(total=100, passed=95, failed=3, skipped=2)
-        parsed = json.loads(line.model_dump_json())
+    def test_summary_record(self):
+        record = SummaryRecord(total=100, passed=95, failed=3, skipped=2)
+        parsed = json.loads(record.model_dump_json())
         assert parsed["type"] == "summary"
         assert parsed["total"] == 100
         assert parsed["passed"] == 95
 
-    def test_summary_line_round_trip(self):
-        original = SummaryLine(total=10, passed=8, failed=1, skipped=1)
-        restored = SummaryLine.model_validate_json(original.model_dump_json())
+    def test_summary_record_round_trip(self):
+        original = SummaryRecord(total=10, passed=8, failed=1, skipped=1)
+        restored = SummaryRecord.model_validate_json(original.model_dump_json())
         assert restored == original
 
 

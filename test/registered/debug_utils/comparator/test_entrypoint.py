@@ -7,11 +7,11 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.entrypoint import run
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
-    ComparisonLine,
-    ConfigLine,
-    SkipLine,
-    SummaryLine,
+from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonRecord,
+    ConfigRecord,
+    SkipRecord,
+    SummaryRecord,
 )
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,12 +86,9 @@ class TestEntrypoint:
         run(args)
 
         output = capsys.readouterr().out
-        assert "df_target" in output
-        assert "df_baseline" in output
-        assert output.count("Check:") == 2
-        assert "tensor_a" in output
-        assert "tensor_b" in output
+        assert "Config:" in output
         assert "rel_diff" in output
+        assert "Summary:" in output
         assert "Skip" not in output
 
     def test_filter(self, tmp_path, capsys):
@@ -101,8 +98,7 @@ class TestEntrypoint:
         run(args)
 
         output = capsys.readouterr().out
-        assert output.count("Check:") == 1
-        assert "tensor_a" in output
+        assert "rel_diff" in output
 
     def test_no_baseline_skip(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(
@@ -115,9 +111,8 @@ class TestEntrypoint:
         run(args)
 
         output = capsys.readouterr().out
-        assert output.count("Check:") == 1
         assert "Skip:" in output
-        assert "since no baseline" in output
+        assert "no_baseline" in output
 
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
@@ -126,7 +121,7 @@ class TestEntrypoint:
         run(args)
 
         output = capsys.readouterr().out
-        assert output.count("Check:") == 1
+        assert "Summary:" in output
 
 
 def _parse_jsonl(output: str) -> list[dict]:
@@ -142,16 +137,16 @@ class TestEntrypointJsonl:
 
         lines = _parse_jsonl(capsys.readouterr().out)
         assert lines[0]["type"] == "config"
-        ConfigLine.model_validate(lines[0])
+        ConfigRecord.model_validate(lines[0])
 
-        comparisons = [l for l in lines if l["type"] == "comparison"]
+        comparisons = [line for line in lines if line["type"] == "comparison"]
         assert len(comparisons) == 2
         for c in comparisons:
-            ComparisonLine.model_validate(c)
+            ComparisonRecord.model_validate(c)
 
         summary = lines[-1]
         assert summary["type"] == "summary"
-        SummaryLine.model_validate(summary)
+        SummaryRecord.model_validate(summary)
         assert summary["total"] == 2
         assert summary["skipped"] == 0
 
@@ -166,9 +161,9 @@ class TestEntrypointJsonl:
         run(args)
 
         lines = _parse_jsonl(capsys.readouterr().out)
-        skips = [l for l in lines if l["type"] == "skip"]
+        skips = [line for line in lines if line["type"] == "skip"]
         assert len(skips) == 1
-        SkipLine.model_validate(skips[0])
+        SkipRecord.model_validate(skips[0])
         assert skips[0]["reason"] == "no_baseline"
 
         summary = lines[-1]

@@ -3,21 +3,16 @@ from pathlib import Path
 
 import polars as pl
 
-from sglang.srt.debug_utils.comparator.tensor_comparison import (
-    compare_tensors,
-    print_comparison,
-    print_jsonl,
+from sglang.srt.debug_utils.comparator.output_types import (
+    ComparisonRecord,
+    ConfigRecord,
+    SkipRecord,
+    SummaryRecord,
+    print_record,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
-    ComparisonLine,
-    ConfigLine,
-    SkipLine,
-    SummaryLine,
-    TensorComparisonInfo,
-)
+from sglang.srt.debug_utils.comparator.tensor_comparison import compare_tensors
 from sglang.srt.debug_utils.comparator.utils import load_object
 from sglang.srt.debug_utils.dump_loader import find_row, read_meta
-from sglang.srt.debug_utils.dumper import get_truncated_value
 
 
 def main() -> None:
@@ -36,21 +31,16 @@ def run(args: argparse.Namespace) -> None:
 
     df_baseline = read_meta(args.baseline_path)
 
-    is_json = args.output_format == "json"
-
-    if is_json:
-        print_jsonl(
-            ConfigLine(
-                baseline_path=args.baseline_path,
-                target_path=args.target_path,
-                diff_threshold=args.diff_threshold,
-                start_step=args.start_step,
-                end_step=args.end_step,
-            )
-        )
-    else:
-        print("df_target", df_target)
-        print("df_baseline", df_baseline)
+    print_record(
+        ConfigRecord(
+            baseline_path=args.baseline_path,
+            target_path=args.target_path,
+            diff_threshold=args.diff_threshold,
+            start_step=args.start_step,
+            end_step=args.end_step,
+        ),
+        output_format=args.output_format,
+    )
 
     passed_count = 0
     failed_count = 0
@@ -74,77 +64,50 @@ def run(args: argparse.Namespace) -> None:
 
         if row_baseline is None:
             skipped_count += 1
-            if is_json:
-                print_jsonl(SkipLine(name=row["name"], reason="no_baseline"))
-            else:
-                print(f"Skip: target={str(path_target)} since no baseline")
-                x_target = load_object(path_target)
-                if x_target is not None:
-                    print(f"x_target(sample)={get_truncated_value(x_target)}")
+            print_record(
+                SkipRecord(name=row["name"], reason="no_baseline"),
+                output_format=args.output_format,
+            )
             continue
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
-
-        if not is_json:
-            print(
-                f"Check:\n"
-                f"target={str(path_target)} (duplicate_index={row['duplicate_index']})\n"
-                f"baseline={str(path_baseline)} (duplicate_index={row_baseline['duplicate_index']})"
-            )
 
         x_baseline = load_object(path_baseline)
         x_target = load_object(path_target)
 
         if x_baseline is None or x_target is None:
             skipped_count += 1
-            if is_json:
-                print_jsonl(SkipLine(name=row["name"], reason="load_failed"))
-            else:
-                print(
-                    f"Skip comparison because of None: "
-                    f"x_baseline={x_baseline}, x_target={x_target}"
-                )
+            print_record(
+                SkipRecord(name=row["name"], reason="load_failed"),
+                output_format=args.output_format,
+            )
             continue
 
         info = compare_tensors(
             x_baseline=x_baseline,
             x_target=x_target,
             name=row["name"],
+            diff_threshold=args.diff_threshold,
         )
 
-        is_passed = _check_passed(info=info, diff_threshold=args.diff_threshold)
-        if is_passed:
+        if info.diff is not None and info.diff.passed:
             passed_count += 1
         else:
             failed_count += 1
 
-        if is_json:
-            print_jsonl(ComparisonLine(**info.model_dump()))
-        else:
-            print_comparison(info=info, diff_threshold=args.diff_threshold)
-            print()
-
-    if is_json:
-        print_jsonl(
-            SummaryLine(
-                total=passed_count + failed_count + skipped_count,
-                passed=passed_count,
-                failed=failed_count,
-                skipped=skipped_count,
-            )
+        print_record(
+            ComparisonRecord(**info.model_dump()),
+            output_format=args.output_format,
         )
 
-
-def _check_passed(
-    info: TensorComparisonInfo,
-    diff_threshold: float,
-) -> bool:
-    if info.diff is None:
-        return False
-    return (
-        info.diff.rel_diff <= diff_threshold
-        and info.diff.max_abs_diff <= diff_threshold
-        and info.diff.mean_abs_diff <= diff_threshold
+    print_record(
+        SummaryRecord(
+            total=passed_count + failed_count + skipped_count,
+            passed=passed_count,
+            failed=failed_count,
+            skipped=skipped_count,
+        ),
+        output_format=args.output_format,
     )
 
 
