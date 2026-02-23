@@ -58,6 +58,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION="${DOCKER_METADATA_OUTPUT_VERSION}"
           else
             # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
             VERSION="${GITHUB_REF_NAME#v}"
