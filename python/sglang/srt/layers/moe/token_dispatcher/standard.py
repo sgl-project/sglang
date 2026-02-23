@@ -93,6 +93,12 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
+        self.local_expert_start = getattr(moe_runner_config, "local_expert_start", 0)
+        self.local_expert_end = getattr(
+            moe_runner_config,
+            "local_expert_end",
+            self.local_expert_start + self.num_local_routed_experts,
+        )
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -149,13 +155,13 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device="cuda"
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
-                    * self.num_local_routed_experts
+                    self.local_expert_start : self.local_expert_end
                 ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device="cuda"
+                    0,
+                    self.num_local_routed_experts,
+                    dtype=torch.int32,
+                    device="cuda",
                 )
-
                 if self.num_local_shared_experts > 0:
                     self.local_expert_mapping[-self.num_local_shared_experts :] = (
                         torch.arange(

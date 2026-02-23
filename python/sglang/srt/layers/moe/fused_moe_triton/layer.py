@@ -216,10 +216,27 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
-        self.num_local_experts = (
-            num_experts - num_fused_shared_experts
-        ) // self.moe_ep_size + num_fused_shared_experts
+
+        # total routed experts (exclude shared experts)
+        num_routed_experts = num_experts - num_fused_shared_experts
+
+        # base experts per rank
+        base = num_routed_experts // self.moe_ep_size
+        remainder = num_routed_experts % self.moe_ep_size
+
+        # compute local routed experts and start offset
+        if self.moe_ep_rank < remainder:
+            local_routed_experts = base + 1
+            self.local_expert_start = self.moe_ep_rank * (base + 1)
+        else:
+            local_routed_experts = base
+            self.local_expert_start = (
+                remainder * (base + 1) + (self.moe_ep_rank - remainder) * base
+            )
+        self.local_expert_end = self.local_expert_start + local_routed_experts
+
+        # include shared experts on every rank (same as original logic)
+        self.num_local_experts = local_routed_experts + num_fused_shared_experts
 
         self.expert_mask_gpu = None
 
@@ -270,6 +287,8 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            local_expert_start=self.local_expert_start,
+            local_expert_end=self.local_expert_end,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

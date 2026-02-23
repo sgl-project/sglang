@@ -176,7 +176,7 @@ class DeepEPBuffer:
                 )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
-            assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_experts != -1
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -193,13 +193,33 @@ class DeepEPBuffer:
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
         elif deepep_mode == DeepEPMode.LOW_LATENCY:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
-            num_qps_per_rank = num_experts // group.size()
+            rank = torch.distributed.get_rank(group)
+
+            base = num_experts // group.size()
+            remainder = num_experts % group.size()
+
+            if rank < remainder:
+                local_num_experts = base + 1
+            else:
+                local_num_experts = base
+
+            num_qps_per_rank = local_num_experts
+
         elif deepep_mode == DeepEPMode.AUTO:
             # low-latency and normal mode all need run
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            base = num_experts // group.size()
+            remainder = num_experts % group.size()
+
+            if rank < remainder:
+                local_num_experts = base + 1
+            else:
+                local_num_experts = base
+
             num_qps_per_rank = max(
-                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+                DeepEPConfig.get_instance().num_sms, local_num_experts
             )
+
         else:
             raise NotImplementedError
 
