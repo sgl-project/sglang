@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
-import msgpack
+import msgspec
 import numpy as np
 import numpy.typing as npt
 from mori.cpp import TransferStatus
@@ -50,13 +50,13 @@ def _pack_mem_desc_list(mems: List[MemoryDesc]) -> bytes:
     if not mems:
         return b""
     packed_descs = [mem.pack() for mem in mems]
-    return msgpack.packb(packed_descs, use_bin_type=True)
+    return msgspec.msgpack.encode(packed_descs)
 
 
 def _unpack_mem_desc_list(blob: bytes) -> List[MemoryDesc]:
     if not blob:
         return []
-    desc_blobs = msgpack.unpackb(blob, raw=False)
+    desc_blobs = msgspec.msgpack.decode(blob)
     return [MemoryDesc.unpack(b) for b in desc_blobs]
 
 

@@ -5,7 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import (
+    DPCooperationInfo,
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
@@ -93,9 +94,6 @@ class SchedulerMetricsMixin:
         self.kv_transfer_alloc_ms: float = 0.0
         self.kv_transfer_total_mb: float = 0.0
 
-        # Only for `log_prefill_stats` to pass information to `log_prefill_stats_late`
-        self.temp_prefill_info: Optional[Dict] = None
-
         self.stats = SchedulerStats()
 
         # Metrics
@@ -163,17 +161,12 @@ class SchedulerMetricsMixin:
         self: Scheduler,
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
+        dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = prefill_stats.log_input_tokens
-
-        assert self.temp_prefill_info is None
-        self.temp_prefill_info = dict(
-            adder_log_input_tokens=prefill_stats.log_input_tokens,
-            adder_log_hit_tokens=prefill_stats.log_hit_tokens,
-        )
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid_swa:
@@ -249,6 +242,12 @@ class SchedulerMetricsMixin:
         logger.info(msg)
 
         if self.enable_metrics:
+            self.metrics_collector.increment_realtime_tokens(
+                prefill_compute_tokens=prefill_stats.log_input_tokens,
+                prefill_cache_tokens=prefill_stats.log_hit_tokens,
+                dp_cooperation_info=dp_cooperation_info,
+            )
+
             # Basics
             total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
             cache_hit_rate = (
@@ -301,19 +300,6 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
-
-    def log_prefill_stats_late(self: Scheduler, batch: Optional[ScheduleBatch]):
-        """This should be called after `batch` has gathered enough metadata."""
-
-        info = self.temp_prefill_info
-        self.temp_prefill_info = None
-
-        if self.enable_metrics and batch is not None and info is not None:
-            self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=info["adder_log_input_tokens"],
-                prefill_cache_tokens=info["adder_log_hit_tokens"],
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
 
     def log_decode_stats(
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None

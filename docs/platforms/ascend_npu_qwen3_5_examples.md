@@ -8,9 +8,9 @@ The dependencies required for the NPU runtime environment have been integrated i
 
 ```{code-block} bash
 #Atlas 800 A3
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-qwen35
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-qwen3.5
 #Atlas 800 A2
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-910b-qwen35
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-910b-qwen3.5
 
 #start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
@@ -21,7 +21,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/avinci1  \
+--device=/dev/davinci1:/dev/davinci1  \
 --device=/dev/davinci2:/dev/davinci2  \
 --device=/dev/davinci3:/dev/davinci3  \
 --device=/dev/davinci4:/dev/davinci4  \

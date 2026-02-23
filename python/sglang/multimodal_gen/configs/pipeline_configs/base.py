@@ -352,6 +352,9 @@ class PipelineConfig:
 
         # Pad to next multiple of SP degree if needed
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            logger.debug(
+                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            )
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
                 (*latents.shape[:2], pad_len, *latents.shape[3:]),
@@ -760,6 +763,49 @@ class ImagePipelineConfig(PipelineConfig):
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         return latents, batch_size, channels, height, width
+
+
+@dataclass
+class SpatialImagePipelineConfig(ImagePipelineConfig):
+    """Base config for spatial image pipelines (e.g. GLM-Image) with 4D latents (B, C, H', W').
+
+    Overrides shard_latents_for_sp / gather_latents_for_sp to shard along the height dimension
+    so that each SP rank gets (B, C, H'_local, W') instead of using the token-style (B, S, C) path.
+    """
+
+    def shard_latents_for_sp(self, batch, latents):
+        # 4D latents (B, C, H', W') -> shard along H' (dim=2); otherwise fall back to base (B, S, C)
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return latents, False
+        if latents.dim() != 4:
+            return super().shard_latents_for_sp(batch, latents)
+
+        # (B, C, H', W')
+        _, _, h_lat, w_lat = latents.shape
+        if h_lat % sp_world_size != 0:
+            pad_len = sp_world_size - (h_lat % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], latents.shape[1], pad_len, latents.shape[3]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=2)
+            h_lat = latents.shape[2]
+        rank_in_sp_group = get_sp_parallel_rank()
+        chunk_size = h_lat // sp_world_size
+        h0 = rank_in_sp_group * chunk_size
+        h1 = h0 + chunk_size
+        sharded = latents[:, :, h0:h1, :].contiguous()
+        return sharded, True
+
+    def gather_latents_for_sp(self, latents):
+        if get_sp_world_size() <= 1:
+            return latents
+        if latents.dim() != 4:
+            return super().gather_latents_for_sp(latents)
+        # Gather along dim=2 (H') to match shard_latents_for_sp
+        return sequence_model_parallel_all_gather(latents, dim=2)
 
 
 @dataclass

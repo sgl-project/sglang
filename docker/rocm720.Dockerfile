@@ -94,7 +94,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="20920706a9004018dbd87c7387f207d08d0e05af"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -156,7 +156,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi \
+     && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
 # -----------------------
 # Build vLLM
