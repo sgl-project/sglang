@@ -7,6 +7,7 @@ on:
     branches:
       - 'main'
     paths:
+      - '.github/workflows/release-docker-npu.yml'
       - 'docker/npu.Dockerfile'
   workflow_dispatch:
     inputs:
