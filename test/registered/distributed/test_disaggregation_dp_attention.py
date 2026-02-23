@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=155, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=580, suite="stage-c-test-8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
@@ -122,8 +122,8 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         )
         result = run_benchmark(args)
 
-        self.assertGreater(result["output_throughput"], 0)
-        self.assertGreater(result["completed"], 0)
+        self.assertLess(result["mean_tpot_ms"], 20)
+        self.assertEqual(result["completed"], 1000)
 
 
 if __name__ == "__main__":
