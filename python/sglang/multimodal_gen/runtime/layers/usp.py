@@ -71,11 +71,14 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
+    # Move the dimension to be split (h_global) to dim 0 for all_to_all_single
     if head_dim == 1:
         b, h_global, s_local, d = x.shape
+        # Shape transition: [b, h_global, s_local, d] -> [h_global, b, s_local, d]
         permute_order = (1, 0, 2, 3)
     else:  # head_dim == 2
         b, s_local, h_global, d = x.shape
+        # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
     assert (
@@ -88,9 +91,12 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = _usp_all_to_all_single(x)
     x = x.reshape(world_size, h_local, b, s_local, d)
 
+    # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
     if head_dim == 1:
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
     else:  # head_dim == 2
+        # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
 
     return x
@@ -121,11 +127,14 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
+    # Move the dimension to be split (s_global) to dim 0 for all_to_all_single
     if head_dim == 1:
         b, h_local, s_global, d = x.shape
+        # Shape transition: [b, h_local, s_global, d] -> [s_global, b, h_local, d]
         permute_order = (2, 0, 1, 3)
     else:  # head_dim == 2
         b, s_global, h_local, d = x.shape
+        # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
     assert (
@@ -138,9 +147,12 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = _usp_all_to_all_single(x)
     x = x.reshape(world_size, s_local, b, h_local, d)
 
+    # Reorder dims to place 'world_size' adjacent to 'h_local' to merge them into 'h_global'
     if head_dim == 1:
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, world_size, h_local, s_local, d]
         x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, h_global, s_local, d)
     else:  # head_dim == 2
+        # Shape transition: [world_size, s_local, b, h_local, d] -> [b, s_local, world_size, h_local, d]
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
 
     return x
