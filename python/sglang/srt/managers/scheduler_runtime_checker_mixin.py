@@ -322,6 +322,8 @@ class SchedulerRuntimeCheckerMixin:
             # - In between streaming session requests, we hold onto kv memory but
             #   the request is not part of the scheduler's running batch. The
             #   memory checker doesn't currently handle this case.
+            self.new_token_ratio = self.init_new_token_ratio
+            self.maybe_sleep_on_idle()
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
