@@ -79,16 +79,6 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
-def _skip(
-    name: str,
-    reason: str,
-    counts: dict[str, int],
-    output_format: str,
-) -> None:
-    counts["skipped"] += 1
-    print_record(SkipRecord(name=name, reason=reason), output_format=output_format)
-
-
 def _process_logical_tensor(
     *,
     row: dict,
@@ -303,6 +293,16 @@ def _extract_tensor(item: ValueWithMeta) -> Optional[torch.Tensor]:
     if not isinstance(value, torch.Tensor):
         return None
     return value
+
+
+def _skip(
+    name: str,
+    reason: str,
+    counts: dict[str, int],
+    output_format: str,
+) -> None:
+    counts["skipped"] += 1
+    print_record(SkipRecord(name=name, reason=reason), output_format=output_format)
 
 
 def _parse_args() -> argparse.Namespace:
