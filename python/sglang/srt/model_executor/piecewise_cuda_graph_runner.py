@@ -260,7 +260,7 @@ class PiecewiseCudaGraphRunner:
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
         )
-        self.buffers.build()
+        self.buffers.share_buffers()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers

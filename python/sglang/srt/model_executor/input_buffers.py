@@ -11,7 +11,7 @@ _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 @dataclass
 class ForwardInputBuffers:
 
-    def _build_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
+    def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 
         buffer_size = new_buffer.size()
         buffer_stride = new_buffer.stride()
@@ -30,7 +30,7 @@ class ForwardInputBuffers:
         _forward_input_buffer_pool[name] = new_buffer
         return new_buffer.as_strided(buffer_size, buffer_stride)
 
-    def build(self):
+    def share_buffers(self):
 
         for f in fields(self):
             name = f.name
@@ -43,7 +43,7 @@ class ForwardInputBuffers:
                     assert isinstance(
                         sub_buffer, torch.Tensor
                     ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
-                    new_buffer = self._build_one_buffer(
+                    new_buffer = self._share_one_buffer(
                         f"{name}.{sub_name}", sub_buffer
                     )
                     buffer[sub_name] = new_buffer
@@ -51,5 +51,5 @@ class ForwardInputBuffers:
                 assert isinstance(
                     buffer, torch.Tensor
                 ), f"Field {name} is expected to be a torch.Tensor or a dict of torch.Tensor, but got {type(buffer)}."
-                new_buffer = self._build_one_buffer(name, buffer)
+                new_buffer = self._share_one_buffer(name, buffer)
                 setattr(self, name, new_buffer)

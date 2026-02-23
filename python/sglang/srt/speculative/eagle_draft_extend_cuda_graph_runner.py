@@ -210,7 +210,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
-        self.buffers.build()
+        self.buffers.share_buffers()
 
         # Capture
         try:
