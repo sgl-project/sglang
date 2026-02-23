@@ -493,21 +493,14 @@ class DecodePreallocQueue:
         if not self.pending_reqs:
             return
 
-        rooms_to_query: List[int] = []
-        bootstrap_addr = None
-        for req in self.pending_reqs:
-            if req.bootstrap_host != FAKE_BOOTSTRAP_HOST:
-                rooms_to_query.append(req.bootstrap_room)
-                if bootstrap_addr is None:
-                    bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
+        bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
+        rooms_to_query = [req.bootstrap_room for req in self.pending_reqs]
 
-        room_to_rank: dict = {}
-        if rooms_to_query and bootstrap_addr:
-            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+        from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 
-            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                bootstrap_addr, rooms_to_query
-            )
+        room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+            bootstrap_addr, rooms_to_query
+        )
 
         remaining = []
         for req in self.pending_reqs:
