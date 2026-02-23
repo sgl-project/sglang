@@ -500,12 +500,17 @@ class DecodePreallocQueue:
 
         bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
 
+        # If a request is following the bootstrap room,
+        # we need get the prefill info before resolving the dp_rank,
+        # which is a conflict with the lazy resolve logic in CommonKVReceiver,
+        # so we need to ensure the parallel info before resolving the dp_rank
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
             return
 
         resolved = []
         need_query = []
         for req in self.pending_reqs:
+            # NOTE: we need resolve it again because we may ensure the parallel info here
             dp_rank = self._resolve_dp_rank(req)
             if dp_rank is not None:
                 resolved.append((req, dp_rank))
