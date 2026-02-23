@@ -556,7 +556,9 @@ def popen_with_error_check(command: list[str]):
             return
 
         if process.returncode != 0:
-            raise Exception(f"{shlex.join(command)} exited with code {process.returncode}")
+            raise Exception(
+                f"{shlex.join(command)} exited with code {process.returncode}"
+            )
 
     t = threading.Thread(target=_run_and_check, daemon=True)
     t.start()
