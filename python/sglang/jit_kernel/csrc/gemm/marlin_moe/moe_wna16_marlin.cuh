@@ -862,29 +862,188 @@ void moe_wna16_marlin_gemm(
     bool is_zp_float) {
   using namespace host;
 
+  // ops.cu:891-892
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
+  int pack_factor = 32 / b_q_type.size_bits();
 
-  // Verify device
+  // ops.cu:894-897
+  if (moe_block_size != 8) {
+    RuntimeCheck(moe_block_size % 16 == 0, "unsupported moe_block_size=", moe_block_size);
+    RuntimeCheck(moe_block_size >= 16 && moe_block_size <= 64, "unsupported moe_block_size=", moe_block_size);
+  }
+
+  // ops.cu:899-901 — Verify A
+  RuntimeCheck(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0), ", size_m = ", size_m);
+  RuntimeCheck(a.size(1) == size_k, "Shape mismatch: a.size(1) = ", a.size(1), ", size_k = ", size_k);
+
+  // ops.cu:903-925 — Verify B
+  RuntimeCheck(
+      size_k % device::marlin::tile_size == 0,
+      "size_k = ", size_k,
+      " is not divisible by tile_size = ", device::marlin::tile_size);
+  RuntimeCheck(
+      (size_k / device::marlin::tile_size) == b_q_weight.size(1),
+      "Shape mismatch: b_q_weight.size(1) = ", b_q_weight.size(1),
+      ", size_k = ", size_k,
+      ", tile_size = ", device::marlin::tile_size);
+  RuntimeCheck(
+      b_q_weight.size(2) % device::marlin::tile_size == 0,
+      "b_q_weight.size(2) = ", b_q_weight.size(2),
+      " is not divisible by tile_size = ", device::marlin::tile_size);
+  int64_t actual_size_n = (b_q_weight.size(2) / device::marlin::tile_size) * pack_factor;
+  RuntimeCheck(size_n == actual_size_n, "size_n = ", size_n, ", actual_size_n = ", actual_size_n);
+
+  // ops.cu:927-935 — Verify device and strides
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
-
-  // Basic tensor verification
   TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
-  TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(c);
 
-  // Early return for zero-size M
-  if (size_m == 0) return;
+  device.verify(b_q_weight.device());
+  RuntimeCheck(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
 
+  device.verify(b_scales.device());
+  RuntimeCheck(b_scales.is_contiguous(), "b_scales is not contiguous");
+
+  // ops.cu:939-945 — thread_k, thread_n, sms
+  int thread_k = -1;
+  int thread_n = -1;
+  int sms = -1;
   DLDevice dl_device = device.unwrap();
   int dev = dl_device.device_id;
   cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
-
-  int sms = -1;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
-  // thread_k/thread_n: auto config
-  int thread_k = -1;
-  int thread_n = -1;
+  // ops.cu:947-960 — Alloc c / Verify c
+  // SKIP: allocation done in Python
+  // ops.cu:953-957 — shape checks on c (always, since c is pre-allocated)
+  device.verify(c.device());
+  RuntimeCheck(c.is_contiguous(), "c is not contiguous");
+  RuntimeCheck(
+      c.size(0) == size_m * top_k, "Shape mismatch: c.size(0) = ", c.size(0), ", size_m * topk = ", size_m * top_k);
+  RuntimeCheck(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1), ", size_n = ", size_n);
+
+  // ops.cu:962-973 — Alloc c_tmp
+  // SKIP: allocation done in Python
+
+  // ops.cu:975-982 — Detect groupsize: b_scales rank and dims
+  RuntimeCheck(b_scales.dim() == 3, "b_scales rank = ", b_scales.dim(), " is not 3");
+  RuntimeCheck(b_scales.size(2) == size_n, "b_scales dim 2 = ", b_scales.size(2), " is not size_n = ", size_n);
+  RuntimeCheck(b_scales.size(1) == num_groups, "b_scales dim 1 = ", b_scales.size(1), " is not num_groups = ", num_groups);
+
+  // ops.cu:984-1007 — g_idx, perm: Optional unwrap + validate
+  // SKIP: Optional unwrap done in Python (empty tensors passed when absent)
+  // JIT equivalent of `g_idx_or_none.has_value() && perm_or_none.has_value()`
+  if (g_idx.size(g_idx.dim() - 1) > 0 && perm.size(perm.dim() - 1) > 0) {
+    device.verify(g_idx.device());
+    RuntimeCheck(g_idx.is_contiguous(), "g_idx is not contiguous");
+    device.verify(perm.device());
+    RuntimeCheck(perm.is_contiguous(), "perm is not contiguous");
+
+    int64_t g_idx_last = g_idx.size(g_idx.dim() - 1);
+    int64_t perm_last = perm.size(perm.dim() - 1);
+    RuntimeCheck(
+        (g_idx_last == 0 && perm_last == 0) || (g_idx_last == size_k && perm_last == size_k),
+        "Unexpected g_idx.size(-1) = ", g_idx_last,
+        " and perm.size(-1) = ", perm_last,
+        ", where size_k = ", size_k);
+  }
+  // ops.cu:1008 — has_act_order derivation: SKIP (passed as param)
+
+  // ops.cu:1010-1029 — Verify group_size consistency
+  if (has_act_order) {
+    // SKIP: a_tmp allocation done in Python
+    if (is_k_full) {
+      RuntimeCheck(num_groups > 1, "For act_order, num_groups must be > 1");
+      RuntimeCheck(size_k % num_groups == 0, "size_k = ", size_k, ", is not divisible by num_groups = ", num_groups);
+    }
+  } else {
+    if (num_groups > 1) {
+      RuntimeCheck(size_k % num_groups == 0, "size_k = ", size_k, ", is not divisible by b_scales.size(1) = ", num_groups);
+    }
+  }
+
+  // ops.cu:1031-1040 — global_scale
+  // SKIP: Optional unwrap done in Python
+  int64_t global_scale_size = global_scale.size(0);
+  if (global_scale_size > 0) {
+    RuntimeCheck(b_q_type == kFE2M1f && group_size == 16, "global_scale can only be used for nvfp4 format.");
+  } else {
+    RuntimeCheck(
+        !(b_q_type == kFE2M1f && group_size == 16),
+        "the global_scale parameter must be passed for nvfp4 format.");
+  }
+
+  // ops.cu:1042-1052 — b_bias
+  // SKIP: Optional unwrap done in Python
+  if (has_bias) {
+    device.verify(b_bias.device());
+    RuntimeCheck(b_bias.is_contiguous(), "b_bias is not contiguous");
+    RuntimeCheck(b_bias.size(1) == size_n, "b_bias.size(0) != size_n");
+    RuntimeCheck(b_bias.stride(1) == 1, "b_bias.stride(1) != 1");
+  }
+
+  // ops.cu:1054-1061 — b_zeros Optional unwrap
+  // SKIP: Optional unwrap done in Python
+  // ops.cu:1062 — has_zp derivation: SKIP (passed as param)
+
+  // ops.cu:1063-1076 — Verify b_q_type vs has_zp
+  if (has_zp) {
+    device.verify(b_zeros.device());
+    RuntimeCheck(b_zeros.is_contiguous(), "b_zeros is not contiguous");
+    RuntimeCheck(
+        b_q_type == kU4 || b_q_type == kU8,
+        "b_q_type must be u4 or u8 when has_zp = True. Got = ", b_q_type.str());
+  } else {
+    RuntimeCheck(
+        b_q_type == kU4B8 || b_q_type == kU8B128 || b_q_type == kFE4M3fn || b_q_type == kFE2M1f,
+        "b_q_type must be uint4b8, uint8b128, float8_e4m3fn or "
+        "float4_e2m1f when "
+        "has_zp = False. Got = ", b_q_type.str());
+  }
+
+  // ops.cu:1078-1083
+  if (has_zp && is_zp_float) {
+    RuntimeCheck(
+        std::is_same<scalar_t, fp16_t>::value,
+        "Computation type must be float16 (half) when using float zero "
+        "points.");
+  }
+
+  // ops.cu:1085-1104 — Verify b_zeros
+  if (has_zp) {
+    RuntimeCheck(b_zeros.dim() == 3, "b_zeros rank = ", b_zeros.dim(), " is not 3");
+    if (is_zp_float) {
+      RuntimeCheck(b_zeros.size(2) == size_n, "b_zeros dim 2 = ", b_zeros.size(2), " is not size_n = ", size_n);
+      RuntimeCheck(
+          num_groups == b_zeros.size(1), "b_zeros dim 1 = ", b_zeros.size(1), " is not num_groups = ", num_groups);
+      RuntimeCheck(num_groups != -1, "num_groups must be != -1");
+    } else {
+      RuntimeCheck(
+          b_zeros.size(1) == num_groups, "b_zeros dim 1 = ", b_zeros.size(1), " is not num_groups = ", num_groups);
+      RuntimeCheck(
+          b_zeros.size(2) == size_n / pack_factor,
+          "b_zeros dim 2 = ", b_zeros.size(2),
+          " is not size_n / pack_factor = ", size_n / pack_factor);
+    }
+  }
+
+  // ops.cu:1106-1121 — Verify workspace size
+  RuntimeCheck(
+      size_n % device::marlin::min_thread_n == 0,
+      "size_n = ", size_n,
+      ", is not divisible by min_thread_n = ", device::marlin::min_thread_n);
+
+  int64_t max_n_tiles = size_n / device::marlin::min_thread_n;
+  int64_t min_workspace_size = std::min(
+      max_n_tiles * (sorted_token_ids.size(0) / moe_block_size),
+      static_cast<int64_t>(sms) * 4);
+  RuntimeCheck(
+      workspace.size(0) >= min_workspace_size,
+      "workspace.numel = ", workspace.size(0),
+      " is below min_workspace_size = ", min_workspace_size);
+
+  // Early return for zero-size M (moved after all validation)
+  if (size_m == 0) return;
 
   device::marlin_moe::marlin_mm<scalar_t>(
       a.data_ptr(),
