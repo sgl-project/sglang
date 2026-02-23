@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple, Optional
 
@@ -23,20 +24,19 @@ def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
     Returns e.g. {"tp": AxisInfo(axis_rank=0, axis_size=4), ...}
     for every axis whose size > 1.
     """
-    found: list[tuple[str, dict]] = []
+    info: Optional[dict] = None
     for key in _PARALLEL_INFO_KEYS:
-        if key in meta and isinstance(meta[key], dict) and meta[key]:
-            found.append((key, meta[key]))
+        value = meta.get(key)
+        if isinstance(value, dict) and value:
+            if info is not None:
+                raise ValueError(
+                    f"Meta contains multiple parallel_info keys among {_PARALLEL_INFO_KEYS}"
+                )
+            info = value
 
-    if len(found) > 1:
-        raise ValueError(
-            f"Meta contains multiple parallel_info keys: {[k for k, _ in found]}"
-        )
-
-    if not found:
+    if info is None:
         return {}
 
-    _source_key, info = found[0]
     result: dict[str, AxisInfo] = {}
     for prefix in _AXIS_PREFIXES:
         rank_key = f"{prefix}_rank"
@@ -82,14 +82,12 @@ def compute_unshard_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axes: dict[str, tuple[int, Optional[DimSpec]]] = {}
+    sharded_axes: dict[str, tuple[int, DimSpec]] = {}
     for dim_idx, spec in enumerate(dim_specs):
         if spec.parallel is not None:
             sharded_axes[spec.parallel.value] = (dim_idx, spec)
 
-    all_axis_names: set[str] = set()
-    for pinfo in parallel_infos:
-        all_axis_names.update(pinfo.keys())
+    all_axis_names = {k for pinfo in parallel_infos for k in pinfo}
 
     replicated_axes: dict[str, AxisInfo] = {}
     for axis_name in all_axis_names:
@@ -121,10 +119,7 @@ def compute_unshard_plan(
                     f"at world_rank={world_rank}"
                 )
 
-            if ainfo.axis_rank in rank_to_world:
-                pass
-            else:
-                rank_to_world[ainfo.axis_rank] = world_rank
+            rank_to_world.setdefault(ainfo.axis_rank, world_rank)
 
         if expected_size is None:
             raise ValueError(f"No parallel_info found for sharded axis {axis_name!r}")
@@ -135,16 +130,12 @@ def compute_unshard_plan(
                 f"got {sorted(rank_to_world.keys())}, expected 0..{expected_size - 1}"
             )
 
-        world_ranks_by_axis_rank = [rank_to_world[i] for i in range(expected_size)]
-
-        fn = _get_unshard_fn(spec)
-
         steps.append(
             UnshardStep(
                 axis=spec.parallel,
                 dim_index=dim_idx,
-                fn=fn,
-                world_ranks_by_axis_rank=world_ranks_by_axis_rank,
+                fn=_get_unshard_fn(spec),
+                world_ranks_by_axis_rank=[rank_to_world[i] for i in range(expected_size)],
             )
         )
 
@@ -171,45 +162,40 @@ def execute_unshard_plan(
             f"No unshard steps but got {len(tensors_by_world_rank)} tensors"
         )
 
+    axis_rank_lookup: dict[int, dict[int, int]] = {
+        id(s): {wr: i for i, wr in enumerate(s.world_ranks_by_axis_rank)}
+        for s in plan.steps
+    }
+
     current_tensors = dict(tensors_by_world_rank)
 
     for step in plan.steps:
-        new_tensors: dict[int, torch.Tensor] = {}
-        processed_axis_ranks: set[int] = set()
+        groups: dict[tuple, dict[int, torch.Tensor]] = defaultdict(dict)
 
-        groups: dict[tuple, list[tuple[int, torch.Tensor]]] = {}
         for world_rank, tensor in current_tensors.items():
-            group_key_parts = []
-            for other_step in plan.steps:
-                if other_step is step:
-                    continue
-                if world_rank in other_step.world_ranks_by_axis_rank:
-                    idx = other_step.world_ranks_by_axis_rank.index(world_rank)
-                    group_key_parts.append((other_step.axis.value, idx))
-                else:
-                    group_key_parts.append((other_step.axis.value, -1))
-            group_key = tuple(sorted(group_key_parts))
+            group_key = tuple(
+                sorted(
+                    (s.axis.value, axis_rank_lookup[id(s)].get(world_rank, -1))
+                    for s in plan.steps
+                    if s is not step
+                )
+            )
+            groups[group_key][world_rank] = tensor
 
-            if group_key not in groups:
-                groups[group_key] = []
-            groups[group_key].append((world_rank, tensor))
-
-        for group_key, members in groups.items():
-            ordered: list[tuple[int, torch.Tensor]] = []
-            for axis_rank, target_world_rank in enumerate(
-                step.world_ranks_by_axis_rank
-            ):
-                for world_rank, tensor in members:
-                    if world_rank == target_world_rank:
-                        ordered.append((world_rank, tensor))
-                        break
-
+        new_tensors: dict[int, torch.Tensor] = {}
+        for members in groups.values():
+            ordered = [
+                members[wr]
+                for wr in step.world_ranks_by_axis_rank
+                if wr in members
+            ]
             if not ordered:
                 continue
 
-            tensors_ordered = [t for _, t in ordered]
-            merged = step.fn(tensors_ordered, step.dim_index)
-            representative_rank = ordered[0][0]
+            merged = step.fn(ordered, step.dim_index)
+            representative_rank = next(
+                wr for wr in step.world_ranks_by_axis_rank if wr in members
+            )
             new_tensors[representative_rank] = merged
 
         current_tensors = new_tensors
