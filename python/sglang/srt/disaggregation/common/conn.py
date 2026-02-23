@@ -102,6 +102,34 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+        """Fetch and cache prefill parallel info if not yet available.
+        Returns True if info is available (cached or freshly fetched).
+        """
+        if bootstrap_addr in self.prefill_dp_size_table:
+            return True
+        info = CommonKVReceiver._fetch_prefill_parallel_info(bootstrap_addr)
+        if info is None:
+            return False
+        tp_size, dp_size, pp_size, page_size, follow_bootstrap_room = info
+
+        if page_size is not None and page_size != self.kv_args.page_size:
+            raise RuntimeError(
+                f"Page size mismatch: prefill server has page_size={page_size}, "
+                f"but decode server has page_size={self.kv_args.page_size}. "
+                f"Both servers must use the same --page-size value."
+            )
+
+        self.prefill_attn_tp_size_table[bootstrap_addr] = tp_size
+        self.prefill_dp_size_table[bootstrap_addr] = dp_size
+        self.prefill_pp_size_table[bootstrap_addr] = pp_size
+        self.prefill_page_size_table[bootstrap_addr] = page_size
+        self.follow_bootstrap_room_table[bootstrap_addr] = follow_bootstrap_room
+        logger.debug(
+            f"Prefill parallel info for [{bootstrap_addr}]: DP={dp_size} TP={tp_size} PP={pp_size} page_size={page_size} follow_bootstrap_room={follow_bootstrap_room}"
+        )
+        return True
+
     def register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
@@ -278,69 +306,23 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
-        if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
-            (
-                self.prefill_attn_tp_size,
-                self.prefill_dp_size,
-                self.prefill_pp_size,
-                self.prefill_page_size,
-                follow_bootstrap_room,
-            ) = self._get_prefill_parallel_info_from_server()
-            if (
-                self.prefill_attn_tp_size is None
-                or self.prefill_dp_size is None
-                or self.prefill_pp_size is None
-            ):
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
-                )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                self.bootstrap_infos = None
-                return
+        if not self.kv_mgr.ensure_parallel_info(self.bootstrap_addr):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.bootstrap_infos = None
+            return
 
-            if self.prefill_page_size is not None:
-                decode_page_size = self.kv_mgr.kv_args.page_size
-                if self.prefill_page_size != decode_page_size:
-                    error_msg = (
-                        f"Page size mismatch: prefill server has page_size={self.prefill_page_size}, "
-                        f"but decode server has page_size={decode_page_size}. "
-                        f"Both servers must use the same --page-size value."
-                    )
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-
-            logger.debug(
-                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size} follow_bootstrap_room:{follow_bootstrap_room}"
-            )
-            self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = (
-                self.prefill_attn_tp_size
-            )
-            self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
-                self.prefill_dp_size
-            )
-            self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr] = (
-                self.prefill_pp_size
-            )
-            self.kv_mgr.prefill_page_size_table[self.bootstrap_addr] = (
-                self.prefill_page_size
-            )
-            self.kv_mgr.follow_bootstrap_room_table[self.bootstrap_addr] = (
-                follow_bootstrap_room
-            )
-        else:
-            self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
-                self.bootstrap_addr
-            ]
-            self.prefill_dp_size = self.kv_mgr.prefill_dp_size_table[
-                self.bootstrap_addr
-            ]
-            self.prefill_pp_size = self.kv_mgr.prefill_pp_size_table[
-                self.bootstrap_addr
-            ]
-            self.prefill_page_size = self.kv_mgr.prefill_page_size_table.get(
-                self.bootstrap_addr
-            )
+        self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
+            self.bootstrap_addr
+        ]
+        self.prefill_dp_size = self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr]
+        self.prefill_pp_size = self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr]
+        self.prefill_page_size = self.kv_mgr.prefill_page_size_table.get(
+            self.bootstrap_addr
+        )
 
         # Handling for PD with different TP sizes per DP rank
         if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
@@ -483,30 +465,35 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
             return None
 
-    def _get_prefill_parallel_info_from_server(
-        self,
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], bool]:
-        """Fetch the prefill parallel info from the bootstrap server."""
+    @staticmethod
+    def _fetch_prefill_parallel_info(
+        bootstrap_addr: str,
+    ) -> Optional[Tuple[int, int, int, int, bool]]:
+        """Fetch the prefill parallel info from the bootstrap server.
+
+        Returns (attn_tp_size, dp_size, pp_size, page_size, follow_bootstrap_room)
+        or None on failure.
+        """
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
-            response = requests.get(url)
+            url = f"http://{bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
+            response = requests.get(url, timeout=5)
             if response.status_code == 200:
-                prefill_parallel_info = response.json()
+                info = response.json()
                 return (
-                    int(prefill_parallel_info["prefill_attn_tp_size"]),
-                    int(prefill_parallel_info["prefill_dp_size"]),
-                    int(prefill_parallel_info["prefill_pp_size"]),
-                    int(prefill_parallel_info["prefill_page_size"]),
-                    bool(prefill_parallel_info.get("follow_bootstrap_room", True)),
+                    int(info["prefill_attn_tp_size"]),
+                    int(info["prefill_dp_size"]),
+                    int(info["prefill_pp_size"]),
+                    int(info["prefill_page_size"]),
+                    bool(info.get("follow_bootstrap_room", True)),
                 )
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None, None, None, None, True
+                return None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None, None, None, None, True
+            return None
 
     @staticmethod
     def query_prefill_dp_ranks(

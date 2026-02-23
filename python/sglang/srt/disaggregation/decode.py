@@ -362,11 +362,16 @@ class DecodePreallocQueue:
         ):
             return 0
 
-        # If the prefill server is configured to follow the bootstrap room
         bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
-        if self.kv_manager.follow_bootstrap_room_table.get(bootstrap_addr, True):
-            dp_size = self.kv_manager.prefill_dp_size_table.get(bootstrap_addr, 1)
-            return req.bootstrap_room % dp_size
+
+        if bootstrap_addr not in self.kv_manager.prefill_dp_size_table:
+            return None
+
+        if self.kv_manager.follow_bootstrap_room_table[bootstrap_addr]:
+            return (
+                req.bootstrap_room
+                % self.kv_manager.prefill_dp_size_table[bootstrap_addr]
+            )
 
         return None
 
@@ -494,23 +499,39 @@ class DecodePreallocQueue:
             return
 
         bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
-        rooms_to_query = [req.bootstrap_room for req in self.pending_reqs]
 
-        from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
+            return
 
-        room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-            bootstrap_addr, rooms_to_query
-        )
-
-        remaining = []
+        resolved = []
+        need_query = []
         for req in self.pending_reqs:
-            room_key = str(req.bootstrap_room)
-            if room_key in room_to_rank:
-                dp_rank = int(room_to_rank[room_key])
-                self._create_receiver_and_enqueue(req, dp_rank)
+            dp_rank = self._resolve_dp_rank(req)
+            if dp_rank is not None:
+                resolved.append((req, dp_rank))
             else:
-                remaining.append(req)
-        self.pending_reqs = remaining
+                need_query.append(req)
+
+        if need_query:
+            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+
+            rooms = [req.bootstrap_room for req in need_query]
+            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                bootstrap_addr, rooms
+            )
+            remaining = []
+            for req in need_query:
+                room_key = str(req.bootstrap_room)
+                if room_key in room_to_rank:
+                    resolved.append((req, int(room_to_rank[room_key])))
+                else:
+                    remaining.append(req)
+            self.pending_reqs = remaining
+        else:
+            self.pending_reqs = []
+
+        for req, dp_rank in resolved:
+            self._create_receiver_and_enqueue(req, dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -1134,7 +1155,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
-            alloc_reqs = (
+            transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(alloc_reqs)
+            self.waiting_queue.extend(transferred_reqs)
