@@ -114,7 +114,7 @@ class CommonKVManager(BaseKVManager):
         """
         if bootstrap_addr in self.prefill_info_table:
             return True
-        info = CommonKVReceiver._fetch_prefill_parallel_info(bootstrap_addr)
+        info = self._fetch_prefill_server_info(bootstrap_addr)
         if info is None:
             return False
 
@@ -128,6 +128,26 @@ class CommonKVManager(BaseKVManager):
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    @staticmethod
+    def _fetch_prefill_server_info(
+        bootstrap_addr: str,
+    ) -> Optional[PrefillServerInfo]:
+        """Fetch the prefill server info from the bootstrap server."""
+        try:
+            url = f"http://{bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return PrefillServerInfo(**data)
+            else:
+                logger.error(
+                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching prefill server info from bootstrap: {e}")
+            return None
 
     def register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
@@ -455,26 +475,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 return None
         except Exception as e:
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
-            return None
-
-    @staticmethod
-    def _fetch_prefill_parallel_info(
-        bootstrap_addr: str,
-    ) -> Optional[PrefillServerInfo]:
-        """Fetch the prefill parallel info from the bootstrap server."""
-        try:
-            url = f"http://{bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&target_pp_rank={-1}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                return PrefillServerInfo(**data)
-            else:
-                logger.error(
-                    f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
-                )
-                return None
-        except Exception as e:
-            logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
             return None
 
     @staticmethod
