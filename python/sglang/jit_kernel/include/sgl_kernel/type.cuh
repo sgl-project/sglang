@@ -63,6 +63,19 @@ SGL_REGISTER_DTYPE_TRAIT(
 SGL_REGISTER_DTYPE_TRAIT(
     bf16x2_t, void, SGL_REGISTER_TYPE_END; SGL_REGISTER_FROM_FUNCTION(fp32x2_t, __float22bfloat162_rn););
 
+#ifndef USE_ROCM
+SGL_REGISTER_DTYPE_TRAIT(
+    fp8_e4m3_t, fp8x2_e4m3_t, SGL_REGISTER_TYPE_END; SGL_DEVICE static self_t from(const bf16_t& x) {
+      self_t r;
+      r.__x = __nv_cvt_bfloat16raw_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+      return r;
+    } SGL_DEVICE static self_t from(const fp16_t& x) {
+      self_t r;
+      r.__x = __nv_cvt_halfraw_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+      return r;
+    });
+#endif
+
 #undef SGL_REGISTER_DTYPE_TRAIT
 #undef SGL_REGISTER_FROM_FUNCTION
 
@@ -93,49 +106,3 @@ constexpr float kFP8E4M3Max = 224.0f;
 constexpr float kFP8E4M3Max = 448.0f;
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM
-
-// ---------------------------------------------------------------------------
-// FP8 cast helpers (used by elementwise kernels)
-// ---------------------------------------------------------------------------
-
-template <typename T>
-struct ConvertToFP8 {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(T value) {
-    return 0;
-  }
-};
-
-template <>
-struct ConvertToFP8<__nv_bfloat16> {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(__nv_bfloat16 value) {
-    return __nv_cvt_bfloat16raw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
-  }
-};
-
-template <>
-struct ConvertToFP8<__half> {
-  static __device__ __nv_fp8_storage_t convert_to_fp8(__half value) {
-    return __nv_cvt_halfraw_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
-  }
-};
-
-template <typename T>
-struct ConvertFromFloat {
-  static __device__ T convert_from_float(float value) {
-    return 0;
-  }
-};
-
-template <>
-struct ConvertFromFloat<__nv_bfloat16> {
-  static __device__ __nv_bfloat16 convert_from_float(float value) {
-    return __float2bfloat16(value);
-  }
-};
-
-template <>
-struct ConvertFromFloat<__half> {
-  static __device__ __half convert_from_float(float value) {
-    return __float2half(value);
-  }
-};
