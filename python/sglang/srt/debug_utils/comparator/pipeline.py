@@ -67,12 +67,12 @@ def _compute_plans(
 ) -> tuple[list[Plan], list[Plan]]:
     """This function deliberately takes metadata, since plan computation must never inspect actual tensor data."""
     return (
-        _compute_single_plan(baseline_metas),
-        _compute_single_plan(target_metas),
+        _compute_plans_for_group(baseline_metas),
+        _compute_plans_for_group(target_metas),
     )
 
 
-def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
+def _compute_plans_for_group(metas: list[dict[str, Any]]) -> list[Plan]:
     if not metas or len(metas) == 1:
         return []
 
