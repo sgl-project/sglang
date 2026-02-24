@@ -24,7 +24,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.hardware_backend.nup.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     fused_moe_npu,
 )
 from sglang.srt.layers.activation import SiluAndMul

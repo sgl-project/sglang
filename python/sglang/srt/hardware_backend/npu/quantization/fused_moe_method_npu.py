@@ -177,7 +177,7 @@ def fused_moe_npu(
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[w1],
+        weight=[w1.permute(0, 2, 1)],
         bias=None,
         split_item=2,
         group_list_type=0,
@@ -197,7 +197,7 @@ def fused_moe_npu(
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[w2],
+        weight=[w2.permute(0, 2, 1)],
         bias=None,
         split_item=2,
         group_list_type=0,
