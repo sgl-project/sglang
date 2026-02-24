@@ -2551,6 +2551,9 @@ class ServerArgs:
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
+            assert (
+                self.disaggregation_transfer_backend != "fake"
+            ), "Prefill server does not support 'fake' as the transfer backend"
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
             if self.disaggregation_decode_dp is None:
