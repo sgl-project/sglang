@@ -40,21 +40,21 @@ def run(args: argparse.Namespace) -> None:
 
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
 
-    logical_key_cols = [
+    logical_tensor_key_cols = [
         c
         for c in df_target.columns
         if c not in {"rank", "dump_index", "filename", "duplicate_index"}
     ]
-    logical_groups = df_target.unique(subset=logical_key_cols)
+    logical_tensor_keys = df_target.unique(subset=logical_tensor_key_cols)
 
-    for logical_group in logical_groups.iter_rows(named=True):
+    for tensor_key in logical_tensor_keys.iter_rows(named=True):
         process_logical_tensor(
-            row=logical_group,
+            tensor_key=tensor_key,
             df_target=df_target,
             df_baseline=df_baseline,
             args=args,
             counts=counts,
-            logical_key_cols=logical_key_cols,
+            logical_tensor_key_cols=logical_tensor_key_cols,
         )
 
     print_record(

@@ -22,14 +22,14 @@ from sglang.srt.debug_utils.dump_loader import (
 
 def process_logical_tensor(
     *,
-    row: dict,
+    tensor_key: dict,
     df_target: pl.DataFrame,
     df_baseline: pl.DataFrame,
     args: argparse.Namespace,
     counts: dict[str, int],
-    logical_key_cols: list[str],
+    logical_tensor_key_cols: list[str],
 ) -> None:
-    target_conditions = {k: row[k] for k in logical_key_cols}
+    target_conditions = {k: tensor_key[k] for k in logical_tensor_key_cols}
     target_rows = filter_rows(df_target, conditions=target_conditions)
     first_target_path = Path(args.target_path) / target_rows[0]["filename"]
 
@@ -38,13 +38,13 @@ def process_logical_tensor(
 
     if dims_str is not None:
         _process_with_unshard(
-            name=row["name"],
+            name=tensor_key["name"],
             dims_str=dims_str,
             target_rows=target_rows,
             first_target=first_target,
             df_baseline=df_baseline,
-            logical_key_cols=logical_key_cols,
-            row=row,
+            logical_tensor_key_cols=logical_tensor_key_cols,
+            tensor_key=tensor_key,
             args=args,
             counts=counts,
         )
@@ -64,8 +64,8 @@ def _process_with_unshard(
     target_rows: list[dict],
     first_target: ValueWithMeta,
     df_baseline: pl.DataFrame,
-    logical_key_cols: list[str],
-    row: dict,
+    logical_tensor_key_cols: list[str],
+    tensor_key: dict,
     args: argparse.Namespace,
     counts: dict[str, int],
 ) -> None:
@@ -82,7 +82,7 @@ def _process_with_unshard(
         return
 
     baseline_rows = filter_rows(
-        df_baseline, conditions={k: row[k] for k in logical_key_cols}
+        df_baseline, conditions={k: tensor_key[k] for k in logical_tensor_key_cols}
     )
     if not baseline_rows:
         _skip(name, "no_baseline", counts, fmt)
