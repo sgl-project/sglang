@@ -14,6 +14,7 @@
 """
 OpenAI-compatible transcription endpoint handler for Whisper models.
 """
+
 from __future__ import annotations
 
 import io
