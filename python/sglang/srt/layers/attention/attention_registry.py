@@ -195,15 +195,24 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             LightningAttentionBackend,
             Mamba2AttnBackend,
         )
-        from sglang.srt.utils import is_blackwell, is_npu
+        from sglang.srt.utils import is_blackwell, is_npu, is_sm120_supported
 
         check_environments()
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
-                assert (
-                    runner.server_args.attention_backend == "triton"
-                    or runner.server_args.attention_backend == "trtllm_mha"
-                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                if is_sm120_supported():
+                    # SM12x (consumer Blackwell, e.g. RTX 5090, DGX Spark): trtllm_mha has
+                    # no SM12x cubins so it cannot be used here; triton and flashinfer both
+                    # support the full attention layers on SM12x.
+                    assert runner.server_args.attention_backend in (
+                        "triton",
+                        "flashinfer",
+                    ), "triton or flashinfer backend are the only supported backends on SM12x GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend flashinfer to specify the backend."
+                else:
+                    assert (
+                        runner.server_args.attention_backend == "triton"
+                        or runner.server_args.attention_backend == "trtllm_mha"
+                    ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
