@@ -69,6 +69,8 @@ class SkipRecord(_OutputRecord):
 
     @property
     def category(self) -> str:
+        if self.align_warnings:
+            return "failed"
         return "skipped"
 
     def _format_body(self) -> str:

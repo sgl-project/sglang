@@ -175,7 +175,12 @@ class TestExecuteUnshardPlan:
             pass
 
         with pytest.raises(ValueError, match="Unsupported unshard"):
-            _apply_unshard(_FakeParams(), [torch.randn(2, 2)], axis=ParallelAxis.TP)
+            _apply_unshard(
+                _FakeParams(),
+                [torch.randn(2, 2)],
+                axis=ParallelAxis.TP,
+                group_index=0,
+            )
 
     def test_cp_tp_ep_three_axis_concat(self) -> None:
         """CP=2 + TP=2 + EP=2: three-step unshard reconstructs original tensor."""

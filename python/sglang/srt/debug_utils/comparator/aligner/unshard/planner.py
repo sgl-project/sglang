@@ -35,16 +35,14 @@ def compute_unshard_plan(
     }
     sharded_axes: set[ParallelAxis] = set(sharded_axis_infos)
 
-    all_axes: set[ParallelAxis] = set()
-    for info in parallel_infos:
-        all_axes.update(info.keys())
+    all_axes: set[ParallelAxis] = {axis for info in parallel_infos for axis in info}
     replicated_axes: set[ParallelAxis] = all_axes - sharded_axes
 
     if not sharded_axes and not replicated_axes:
         return []
 
     _validate(
-        validated_axes=sharded_axes | replicated_axes,
+        axes_to_validate=sharded_axes | replicated_axes,
         parallel_infos=parallel_infos,
     )
 
@@ -82,14 +80,14 @@ def compute_unshard_plan(
 
 def _validate(
     *,
-    validated_axes: set[ParallelAxis],
+    axes_to_validate: set[ParallelAxis],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> None:
     """Check that every rank has all axes, sizes are consistent, and ranks are complete."""
     axis_sizes: dict[ParallelAxis, int] = {}
 
     for world_rank, parallel_info in enumerate(parallel_infos):
-        for axis in validated_axes:
+        for axis in axes_to_validate:
             if axis not in parallel_info:
                 raise ValueError(
                     f"world_rank={world_rank} missing parallel_info for "
