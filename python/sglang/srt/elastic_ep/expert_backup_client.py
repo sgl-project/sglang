@@ -34,6 +34,7 @@ class ExpertBackupClient:
         self.engine_num = server_args.nnodes
         self.engine_rank = server_args.node_rank
         self.recv_list = [None] * self.engine_num
+        self.ready_sockets = [None] * self.engine_num
         self.model_runner = model_runner
         self.moe_ep_size = model_runner.moe_ep_size
         self.model_config = model_runner.model_config
@@ -57,6 +58,13 @@ class ExpertBackupClient:
                 f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{10000 + i * 2 + 1}"
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
+
+            # Synchronization channel to notify the manager when this client is ready.
+            self.ready_sockets[i] = context.socket(zmq.PUSH)
+            self.ready_sockets[i].connect(
+                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{10000 + i * 2}"
+            )
+            self.ready_sockets[i].send_pyobj(UpdateExpertBackupReq())
 
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()

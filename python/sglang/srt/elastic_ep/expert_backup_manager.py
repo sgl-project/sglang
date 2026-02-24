@@ -50,18 +50,13 @@ class ExpertBackupManager:
         self.send_to_expert_backup_client.bind(
             f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}"
         )
+        # Synchronization socket to avoid PUB/SUB slow joiner issues.
+        self.recv_from_expert_backup_client = context.socket(zmq.PULL)
+        self.recv_from_expert_backup_client.bind(
+            f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2}"
+        )
         self.backup_weights_from_disk()
         self.start_transfer_server()
-        back_req = BackupDramReq(
-            rank=self.engine_rank,
-            weight_pointer_map=self.weight_pointer_map,
-            session_id=self.session_id,
-            buffer_size=self.continuous_buffer.numel()
-            * self.continuous_buffer.element_size(),
-        )
-        while True:
-            self.send_to_expert_backup_client.send_pyobj(back_req)
-            time.sleep(10)
 
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
@@ -140,6 +135,24 @@ class ExpertBackupManager:
         if ret_value != 0:
             raise RuntimeError("Mooncake memory registration failed.")
 
+    def event_loop(self):
+        # Block until all expert backup clients have reported readiness, to avoid
+        # losing the initial PUB message due to slow joiners.
+        num_ready_clients = 0
+
+        while num_ready_clients < self.server_args.tp_size:
+            self.recv_from_expert_backup_client.recv_pyobj()
+            num_ready_clients += 1
+
+        back_req = BackupDramReq(
+            rank=self.engine_rank,
+            weight_pointer_map=self.weight_pointer_map,
+            session_id=self.session_id,
+            buffer_size=self.continuous_buffer.numel()
+            * self.continuous_buffer.element_size(),
+        )
+        self.send_to_expert_backup_client.send_pyobj(back_req)
+
 
 def run_expert_backup_manager_process(
     server_args: ServerArgs,
@@ -158,6 +171,7 @@ def run_expert_backup_manager_process(
         ),
     )
     manager = ExpertBackupManager(server_args, port_args)
+    manager.event_loop()
 
 
 def run_expert_backup_manager(
