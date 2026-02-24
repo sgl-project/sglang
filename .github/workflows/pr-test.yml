@@ -1333,6 +1333,13 @@ jobs:
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
 
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            inclusionAI/Ring-2.5-1T:8
+
       - name: Run test
         timeout-minutes: 30
         run: |
@@ -1479,6 +1486,12 @@ jobs:
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8
 
       - name: Run test
         timeout-minutes: 45
