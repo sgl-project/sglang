@@ -18,7 +18,8 @@ from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
-    component_name_to_loader_cls, get_memory_usage_of_component,
+    component_name_to_loader_cls,
+    get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
