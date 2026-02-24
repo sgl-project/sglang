@@ -21,7 +21,7 @@ from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_jso
 class RandomDataset(BaseDataset):
     input_len: int
     output_len: int
-    num_prompts: int
+    num_requests: int
     range_ratio: float
     dataset_path: str
     return_text: bool
@@ -32,7 +32,7 @@ class RandomDataset(BaseDataset):
         return cls(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
+            num_requests=args.num_prompts,
             range_ratio=args.random_range_ratio,
             dataset_path=args.dataset_path,
             return_text=not getattr(args, "tokenize_prompt", False),
@@ -45,7 +45,7 @@ class RandomDataset(BaseDataset):
         return sample_random_requests(
             input_len=self.input_len,
             output_len=self.output_len,
-            num_prompts=self.num_prompts,
+            num_prompts=self.num_requests,
             range_ratio=self.range_ratio,
             tokenizer=tokenizer,
             dataset_path=self.dataset_path,
