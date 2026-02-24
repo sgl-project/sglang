@@ -384,12 +384,14 @@ def _create_rank_dump(
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_dumper_module, "_get_rank", lambda: rank)
 
-        dumper = _Dumper(config=DumperConfig(
-            enable=True,
-            dir=str(directory),
-            exp_name=_FIXED_EXP_NAME,
-            enable_http_server=False,
-        ))
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
 
         static_meta: dict = {"world_rank": rank, "world_size": 1}
         if parallel_info is not None:
