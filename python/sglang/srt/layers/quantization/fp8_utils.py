@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
@@ -60,6 +61,8 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    _is_gfx95_supported = is_gfx95_supported()
+
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
