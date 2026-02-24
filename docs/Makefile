@@ -44,17 +44,22 @@ markdown:
 	echo "Exporting docs to Markdown..."; \
 	mkdir -p "$(BUILDDIR)/html/markdown"; \
 	\
-	# 1) Copy .md and .rst files under subdirectories only (exclude root-level files) \
-	find $(SOURCEDIR) -mindepth 2 -path "*/_build/*" -prune -o \( -name "*.md" -o -name "*.rst" \) -print0 | \
+	# 1) Copy .md and .rst files as-is; additionally convert .rst -> .md \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o \( -name "*.md" -o -name "*.rst" \) -print0 | \
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		SRC="{}"; \
 		REL_DIR=$$(dirname "$$SRC"); \
 		OUT_DIR="$(BUILDDIR)/html/markdown/$$REL_DIR"; \
 		mkdir -p "$$OUT_DIR"; \
 		cp -f "$$SRC" "$$OUT_DIR/"; \
+		case "$$SRC" in \
+		  *.rst) \
+			BASE=$$(basename "$$SRC" .rst); \
+			pandoc -f rst -t gfm "$$SRC" -o "$$OUT_DIR/$$BASE.md" ;; \
+		esac \
 		' || exit 1; \
 	\
-	# 2) Convert .ipynb -> .md (all notebooks, including root if any) \
+	# 2) Convert .ipynb -> .md \
 	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
 		parallel -0 -j3 --halt soon,fail=1 ' \
 		NB_SRC="{}"; \
@@ -70,6 +75,7 @@ markdown:
 		' || exit 1; \
 	\
 	echo "Markdown artifacts written to: $(BUILDDIR)/html/markdown"
+
 
 
 # Serve documentation with auto-build and live reload

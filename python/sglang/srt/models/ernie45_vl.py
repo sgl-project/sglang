@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
