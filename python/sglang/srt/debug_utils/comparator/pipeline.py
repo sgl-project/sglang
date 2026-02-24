@@ -93,13 +93,7 @@ def _extract_tensors(
     if not loaded:
         return None
 
-    tensors: list[torch.Tensor] = []
-    for item in loaded:
-        if not isinstance(item.value, torch.Tensor):
-            return None
-        tensors.append(item.value)
-
-    return tensors
+    return [value for item in loaded if isinstance(value := item.value, torch.Tensor)]
 
 
 def _execute_plans(
