@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# AutoencoderDC (DC-AE) VAE wrapper for SANA image generation.
+#
+# DC-AE is architecturally different from standard VAEs (e.g. Flux/SD's
+# AutoencoderKL): it uses a deep compression encoder with residual blocks
+# and achieves 32x spatial compression. Because of this unique architecture,
+# we delegate to diffusers' AutoencoderDC rather than reimplementing it.
+#
+# The wrapper pattern here (lazy init + state_dict passthrough) follows the
+# same approach as other wrapped models in the codebase — see the scheduler
+# wrapper for a similar pattern.
+#
+# Weight loading flow (via VAELoader.load_customized):
+#   1. VAELoader reads vae/config.json → calls vae_config.update_model_arch(hf_dict)
+#      which sets ALL HF config keys (encoder_block_types, decoder_block_types, etc.)
+#      as dynamic attributes on vae_config.arch_config via setattr.
+#   2. VAELoader calls vae_config.post_init() → sets vae_scale_factor.
+#   3. VAELoader creates our wrapper: AutoencoderDC(vae_config).
+#   4. VAELoader loads safetensors → calls our load_state_dict().
+#   5. _ensure_inner_model() collects the full HF config from arch_config attributes,
+#      creates the diffusers model with the correct architecture, and loads weights.
+
+from typing import Dict, Iterable, Optional, Set, Tuple
+
+import torch
+from torch import nn
+
+from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+class AutoencoderDC(nn.Module):
+    """Deep Compression Autoencoder wrapper for sglang.
+
+    Wraps diffusers' AutoencoderDC to conform to the framework's VAE interface.
+    The inner model is created lazily on first use, which allows the wrapper to
+    be instantiated before weights are available.
+    """
+
+    def __init__(self, config: SanaVAEConfig = None, **kwargs):
+        super().__init__()
+        self._config = config
+        self._inner_model = None
+        self._loaded_state_dict: dict[str, torch.Tensor] = {}
+
+    def _ensure_inner_model(self, state_dict: Optional[Dict[str, torch.Tensor]] = None):
+        if self._inner_model is not None:
+            return
+
+        from diffusers import AutoencoderDC as DiffusersAutoencoderDC
+
+        device = "cpu"
+        state_to_load = state_dict if state_dict is not None else self._loaded_state_dict
+        if state_to_load:
+            first_tensor = next(iter(state_to_load.values()))
+            device = first_tensor.device
+
+        # Build the full HF config dict from arch_config. The framework's
+        # VAELoader calls update_model_arch(hf_config_dict) before creating
+        # this wrapper, which sets ALL keys from the HF config.json
+        # (encoder_block_types, decoder_block_types, etc.) as dynamic
+        # attributes on arch_config via setattr. We collect them all here
+        # so that DiffusersAutoencoderDC.from_config() builds the correct
+        # architecture instead of falling back to defaults.
+        hf_config = {}
+        if self._config is not None:
+            arch = self._config.arch_config
+            for key, value in vars(arch).items():
+                if not key.startswith("_") and not callable(value):
+                    hf_config[key] = value
+
+        self._inner_model = DiffusersAutoencoderDC.from_config(hf_config)
+
+        if state_to_load:
+            missing, unexpected = self._inner_model.load_state_dict(
+                state_to_load, strict=False
+            )
+            if missing:
+                logger.warning(
+                    "AutoencoderDC missing keys when loading: %d keys", len(missing)
+                )
+            if unexpected:
+                logger.debug(
+                    "AutoencoderDC unexpected keys when loading: %d keys",
+                    len(unexpected),
+                )
+            if state_dict is None:
+                self._loaded_state_dict.clear()
+
+        self._inner_model = self._inner_model.to(device)
+
+    @property
+    def config(self):
+        if self._inner_model is not None:
+            return self._inner_model.config
+        return self._config
+
+    @property
+    def dtype(self):
+        if self._inner_model is not None:
+            return next(self._inner_model.parameters()).dtype
+        return torch.float32
+
+    @property
+    def device(self):
+        if self._inner_model is not None:
+            return next(self._inner_model.parameters()).device
+        return torch.device("cpu")
+
+    def encode(self, x: torch.Tensor, **kwargs):
+        self._ensure_inner_model()
+        return self._inner_model.encode(x, **kwargs)
+
+    def decode(self, z: torch.Tensor, **kwargs):
+        self._ensure_inner_model()
+        return self._inner_model.decode(z, **kwargs)
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        self._ensure_inner_model()
+        return self._inner_model(x, **kwargs)
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """Intercept load_state_dict to route weights into the inner diffusers model."""
+        self._ensure_inner_model(state_dict=state_dict)
+
+    def state_dict(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        self._ensure_inner_model()
+        return self._inner_model.state_dict(*args, **kwargs)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        """Buffer weights for deferred loading. The inner model is built lazily."""
+        loaded_params: Set[str] = set()
+        for name, weight in weights:
+            self._loaded_state_dict[name] = weight
+            loaded_params.add(name)
+        return loaded_params
+
+    def to(self, *args, **kwargs):
+        if self._inner_model is not None:
+            self._inner_model = self._inner_model.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
+
+
+EntryClass = AutoencoderDC

@@ -28,6 +28,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "Flux2KleinPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
+    "SanaPipelineConfig",
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
     "WanT2V480PConfig",

@@ -1,0 +1,412 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# SANA Transformer (DiT) for text-to-image generation.
+# Adapted from diffusers SanaTransformer2DModel.
+#
+# Key architectural choices:
+#   - Linear attention (O(N) vs O(N^2)) for self-attention, enabling high-res generation
+#   - Standard SDPA cross-attention for text conditioning
+#   - GLU-MBConv feed-forward with depthwise conv for local spatial mixing
+#   - AdaLN-Single for timestep conditioning (shared across all blocks)
+#   - No positional embeddings — spatial info comes from the conv-based patch embed
+#     and the depthwise conv in GLUMBConv
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
+
+from sglang.multimodal_gen.configs.models.dits.sana import SanaConfig
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+class SanaCombinedTimestepSizeEmbeddings(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+
+    def forward(self, timestep, hidden_dtype=None):
+        timesteps_proj = self.time_proj(timestep)
+        if hidden_dtype is not None:
+            timesteps_proj = timesteps_proj.to(dtype=hidden_dtype)
+        timesteps_emb = self.timestep_embedder(timesteps_proj)
+        return timesteps_emb
+
+
+class SanaAdaLayerNormSingle(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.emb = SanaCombinedTimestepSizeEmbeddings(embedding_dim)
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=True)
+
+    def forward(self, timestep, hidden_dtype=None):
+        embedded_timestep = self.emb(timestep, hidden_dtype=hidden_dtype)
+        out = self.linear(self.silu(embedded_timestep))
+        return out, embedded_timestep
+
+
+class SanaModulatedNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, x, temb):
+        x = self.norm(x)
+        scale = self.linear(F.silu(temb))
+        x = x * (1 + scale.unsqueeze(1))
+        return x
+
+
+class GLUMBConv(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features=None):
+        super().__init__()
+        out_features = out_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features * 2, bias=True)
+        self.dwconv = nn.Conv2d(
+            hidden_features,
+            hidden_features,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_features,
+            bias=True,
+        )
+        self.act = nn.GELU(approximate="tanh")
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, x, height, width):
+        x = self.fc1(x)
+        x, gate = x.chunk(2, dim=-1)
+
+        B, _, C = x.shape
+        x = x.view(B, height, width, C).permute(0, 3, 1, 2).contiguous()
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1).view(B, height * width, C)
+
+        x = self.act(x) * gate
+        x = self.fc2(x)
+        return x
+
+
+class SanaLinearAttention(nn.Module):
+    """Linear attention with O(N*D^2) complexity instead of O(N^2*D).
+
+    Uses the kernel trick: ReLU(Q) @ (ReLU(K)^T @ V) avoids materializing
+    the full N x N attention matrix. This is the core efficiency trick that
+    enables SANA to generate high-resolution images without quadratic cost.
+
+    The normalizer Q @ sum(K) prevents attention weights from diverging.
+    """
+
+    def __init__(self, query_dim, num_heads, head_dim, qk_norm_dim, bias=False):
+        super().__init__()
+        inner_dim = num_heads * head_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.to_k = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.to_v = nn.Linear(query_dim, inner_dim, bias=bias)
+        # to_out[1] is Identity (placeholder for dropout); kept for weight-loading
+        # compatibility with diffusers checkpoints.
+        self.to_out = nn.ModuleList(
+            [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
+        )
+
+        # RMSNorm across the full (num_heads * head_dim) dimension before head split
+        self.norm_q = RMSNorm(qk_norm_dim)
+        self.norm_k = RMSNorm(qk_norm_dim)
+
+    def forward(self, hidden_states):
+        B, S, _ = hidden_states.shape
+
+        query = self.to_q(hidden_states)
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Linear attention kernel: φ(Q) @ (φ(K)^T @ V) with φ = ReLU
+        query = F.relu(query)
+        key = F.relu(key)
+
+        kv = torch.matmul(key.transpose(-2, -1), value)    # (B, H, D, D)
+        qkv = torch.matmul(query, kv)                      # (B, H, S, D)
+
+        key_sum = key.sum(dim=-2, keepdim=True)             # (B, H, 1, D)
+        normalizer = torch.matmul(query, key_sum.transpose(-2, -1)).clamp(min=1e-6)
+        hidden_states = qkv / normalizer
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
+        hidden_states = self.to_out[0](hidden_states)
+        return hidden_states
+
+
+class SanaCrossAttention(nn.Module):
+    def __init__(self, query_dim, cross_attention_dim, num_heads, head_dim, bias=False):
+        super().__init__()
+        inner_dim = num_heads * head_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_out = nn.ModuleList(
+            [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
+        )
+
+        self.norm_q = RMSNorm(head_dim)
+        self.norm_k = RMSNorm(head_dim)
+
+    def forward(self, hidden_states, encoder_hidden_states):
+        B, S, _ = hidden_states.shape
+        T = encoder_hidden_states.shape[1]
+
+        query = self.to_q(hidden_states)
+        key = self.to_k(encoder_hidden_states)
+        value = self.to_v(encoder_hidden_states)
+
+        query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        hidden_states = F.scaled_dot_product_attention(query, key, value)
+        hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
+        hidden_states = self.to_out[0](hidden_states)
+        return hidden_states
+
+
+class SanaTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_attention_heads,
+        attention_head_dim,
+        num_cross_attention_heads,
+        cross_attention_head_dim,
+        cross_attention_dim,
+        mlp_ratio,
+        norm_eps,
+        attention_bias=False,
+    ):
+        super().__init__()
+        hidden_features = int(dim * mlp_ratio)
+
+        self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
+
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        self.attn1 = SanaLinearAttention(
+            query_dim=dim,
+            num_heads=num_attention_heads,
+            head_dim=attention_head_dim,
+            qk_norm_dim=num_attention_heads * attention_head_dim,
+            bias=attention_bias,
+        )
+
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps)
+        self.attn2 = SanaCrossAttention(
+            query_dim=dim,
+            cross_attention_dim=cross_attention_dim,
+            num_heads=num_cross_attention_heads,
+            head_dim=cross_attention_head_dim,
+            bias=attention_bias,
+        )
+
+        self.ff = GLUMBConv(in_features=dim, hidden_features=hidden_features)
+
+    def forward(self, hidden_states, encoder_hidden_states, timestep, height, width):
+        batch_size = hidden_states.shape[0]
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+        ).chunk(6, dim=1)
+
+        shift_msa = shift_msa.squeeze(1)
+        scale_msa = scale_msa.squeeze(1)
+        gate_msa = gate_msa.squeeze(1)
+        shift_mlp = shift_mlp.squeeze(1)
+        scale_mlp = scale_mlp.squeeze(1)
+        gate_mlp = gate_mlp.squeeze(1)
+
+        # Self-attention with AdaLN modulation
+        norm_hidden = self.norm1(hidden_states)
+        norm_hidden = (
+            norm_hidden * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        )
+        attn_output = self.attn1(norm_hidden)
+        hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
+
+        # Cross-attention (no modulation)
+        norm_hidden = self.norm2(hidden_states)
+        attn_output = self.attn2(norm_hidden, encoder_hidden_states)
+        hidden_states = hidden_states + attn_output
+
+        # Feed-forward with AdaLN modulation
+        norm_hidden = (
+            hidden_states * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        )
+        ff_output = self.ff(norm_hidden, height, width)
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
+
+        return hidden_states
+
+
+class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+
+    _fsdp_shard_conditions = [
+        lambda n, m: isinstance(m, SanaTransformerBlock),
+    ]
+    _compile_conditions = [
+        lambda n, m: isinstance(m, SanaTransformerBlock),
+    ]
+    # Mirrors the mapping in SanaArchConfig; the weight loader checks
+    # the model class first, so this must be present here too.
+    param_names_mapping = {r"^transformer\.(.*)$": r"\1"}
+    reverse_param_names_mapping = {}
+
+    def __init__(self, config: SanaConfig, hf_config=None, **kwargs):
+        super().__init__(config, hf_config=hf_config or {}, **kwargs)
+
+        arch = config.arch_config
+        self.out_channels = arch.out_channels
+        self.patch_size = arch.patch_size
+        self.inner_dim = arch.num_attention_heads * arch.attention_head_dim
+
+        self.hidden_size = self.inner_dim
+        self.num_attention_heads = arch.num_attention_heads
+        self.num_channels_latents = arch.num_channels_latents
+
+        # ModuleDict wrapper matches the diffusers weight key "patch_embed.proj.*"
+        self.patch_embed = nn.ModuleDict(
+            {
+                "proj": nn.Conv2d(
+                    arch.in_channels,
+                    self.inner_dim,
+                    kernel_size=arch.patch_size,
+                    stride=arch.patch_size,
+                    bias=True,
+                ),
+            }
+        )
+
+        # Single shared timestep embedding for all blocks (AdaLN-Single pattern)
+        self.time_embed = SanaAdaLayerNormSingle(self.inner_dim)
+
+        # Projects Gemma2 hidden_size (2304) -> DiT inner_dim (2240)
+        self.caption_projection = PixArtAlphaTextProjection(
+            in_features=arch.caption_channels,
+            hidden_size=self.inner_dim,
+        )
+
+        self.caption_norm = RMSNorm(self.inner_dim)
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                SanaTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=arch.num_attention_heads,
+                    attention_head_dim=arch.attention_head_dim,
+                    num_cross_attention_heads=arch.num_cross_attention_heads,
+                    cross_attention_head_dim=arch.cross_attention_head_dim,
+                    cross_attention_dim=arch.cross_attention_dim,
+                    mlp_ratio=arch.mlp_ratio,
+                    norm_eps=arch.norm_eps,
+                    attention_bias=False,
+                )
+                for _ in range(arch.num_layers)
+            ]
+        )
+
+        # Final output modulation table: 2 vectors (shift, scale) learned per model
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(2, self.inner_dim) / self.inner_dim**0.5
+        )
+
+        self.norm_out = SanaModulatedNorm(self.inner_dim, eps=arch.norm_eps)
+
+        self.proj_out = nn.Linear(
+            self.inner_dim,
+            arch.patch_size * arch.patch_size * self.out_channels,
+            bias=True,
+        )
+
+        self.layer_names = ["transformer_blocks"]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        guidance: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size, channels, height, width = hidden_states.shape
+        p = self.patch_size
+        post_patch_height = height // p
+        post_patch_width = width // p
+
+        hidden_states = self.patch_embed["proj"](hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        timestep_emb, embedded_timestep = self.time_embed(
+            timestep, hidden_dtype=hidden_states.dtype
+        )
+
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states.view(
+            batch_size, -1, hidden_states.shape[-1]
+        )
+        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
+
+        for block in self.transformer_blocks:
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_emb,
+                post_patch_height,
+                post_patch_width,
+            )
+
+        # Final output: AdaLN modulation + linear projection + unpatchify
+        shift, scale = (
+            self.scale_shift_table[None] + embedded_timestep[:, None]
+        ).chunk(2, dim=1)
+
+        hidden_states = self.norm_out(hidden_states, temb=embedded_timestep)
+        hidden_states = hidden_states * (1 + scale) + shift
+        hidden_states = self.proj_out(hidden_states)
+
+        # Unpatchify: (B, H'*W', p*p*C_out) -> (B, C_out, H, W)
+        hidden_states = hidden_states.reshape(
+            batch_size, post_patch_height, post_patch_width, p, p, self.out_channels
+        )
+        hidden_states = hidden_states.permute(0, 5, 1, 3, 2, 4)
+        hidden_states = hidden_states.reshape(
+            batch_size, self.out_channels, height, width
+        )
+
+        return hidden_states
+
+
+EntryClass = SanaTransformer2DModel
