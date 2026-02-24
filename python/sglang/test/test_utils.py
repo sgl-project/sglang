@@ -303,6 +303,66 @@ def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
     return pred
 
 
+def call_generate_openai_compatible(
+    prompt,
+    temperature,
+    max_tokens,
+    stop=None,
+    n=1,
+    top_p=None,
+    regex=None,
+    max_len=None,
+    url=None,
+    model=None,
+    api_key=None,
+):
+    assert url is not None
+    assert model is not None
+
+    if regex is not None:
+        raise ValueError(
+            "Regex-constrained generation is not supported for openai-compatible backend."
+        )
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "n": n,
+    }
+    if stop is not None:
+        payload["stop"] = stop
+    if top_p is not None:
+        payload["top_p"] = top_p
+
+    # Ignore max_len to keep compatibility with existing benchmark call sites.
+    _ = max_len
+
+    response = requests.post(f"{url}/chat/completions", headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    obj = response.json()
+    choices = obj["choices"]
+
+    def _extract_text(choice):
+        message = choice["message"]["content"]
+        if isinstance(message, list):
+            text_parts = []
+            for item in message:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            return "".join(text_parts)
+        return message or ""
+
+    if n == 1:
+        return _extract_text(choices[0])
+    return [_extract_text(choice) for choice in choices]
+
+
 def call_generate_guidance(
     prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
 ):
@@ -391,11 +451,30 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "guidance",
             "srt-raw",
             "llama.cpp",
+            "openai-compatible",
         ],
     )
     parser.add_argument("--n-ctx", type=int, default=4096)
     parser.add_argument(
         "--model-path", type=str, default="meta-llama/Llama-2-7b-chat-hf"
+    )
+    parser.add_argument(
+        "--openai-base-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible base URL including /v1, e.g. http://127.0.0.1:30000/v1",
+    )
+    parser.add_argument(
+        "--openai-model",
+        type=str,
+        default=None,
+        help="Model name for openai-compatible chat/completions",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help="API key for openai-compatible endpoint (falls back to OPENAI_API_KEY)",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
     args = parser.parse_args()
@@ -407,6 +486,7 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
             "lightllm": 22000,
             "srt-raw": 30000,
             "gserver": 9988,
+            "openai-compatible": 30000,
         }
         args.port = default_port.get(args.backend, None)
     return args
@@ -474,6 +554,29 @@ def _get_call_generate(args: argparse.Namespace):
         call_generate = partial(call_generate_guidance, model=model)
         call_generate("Hello,", 1.0, 8, ".")
         return call_generate
+    elif args.backend == "openai-compatible":
+        base_url = args.openai_base_url
+        if base_url is None:
+            base_url = f"{args.host}:{args.port}/v1"
+        base_url = base_url.rstrip("/")
+
+        model = args.openai_model
+        if model is None:
+            raise ValueError(
+                "--openai-model is required when --backend openai-compatible is used"
+            )
+
+        api_key = (
+            args.openai_api_key
+            if args.openai_api_key is not None
+            else os.getenv("OPENAI_API_KEY", "")
+        )
+        return partial(
+            call_generate_openai_compatible,
+            url=base_url,
+            model=model,
+            api_key=api_key,
+        )
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
 

@@ -40,6 +40,21 @@ python -m lightllm.server.api_server --tokenizer_mode auto --model_dir ~/model_w
 python3 bench_other.py --num-questions 200 --backend lightllm
 ```
 
+### Benchmark OpenAI-compatible endpoint
+```
+python3 bench_other.py \
+  --backend openai-compatible \
+  --openai-base-url http://127.0.0.1:30000/v1 \
+  --openai-model meta-llama/Llama-2-7b-chat-hf \
+  --openai-api-key dummy \
+  --num-questions 200 \
+  --num-shots 8 \
+  --parallel 64 \
+  --top-p 1.0
+```
+
+If your endpoint does not require auth, `--openai-api-key` can be omitted.
+
 
 ### Benchmark guidance
 ```

@@ -71,15 +71,23 @@ def main(args):
 
     states = [None] * len(labels)
 
+    def get_generate_kwargs(stop):
+        kwargs = {
+            "temperature": 0,
+            "max_tokens": 512,
+            "stop": stop,
+        }
+        if args.backend == "openai-compatible":
+            kwargs["top_p"] = args.top_p
+        return kwargs
+
     # Run requests
     if args.backend != "lmql":
         # Use thread pool
         def get_one_answer(i):
             answer = call_generate(
                 prompt=few_shot_examples + questions[i],
-                temperature=0,
-                max_tokens=256,
-                stop=["Question", "Assistant:", "<|separator|>"],
+                **get_generate_kwargs(["Question", "Assistant:", "<|separator|>"]),
             )
             states[i] = answer
 
@@ -105,9 +113,7 @@ def main(args):
                     tasks.append(
                         call_generate(
                             few_shot_examples + q,
-                            temperature=0,
-                            max_tokens=256,
-                            stop="Question",
+                            **get_generate_kwargs("Question"),
                         )
                     )
                 rets = await asyncio.gather(*tasks)
@@ -155,6 +161,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--platinum",
         action="store_true",
