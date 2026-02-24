@@ -21,7 +21,7 @@ def normalize_parallel_info(meta: dict) -> dict[ParallelAxis, AxisInfo]:
     if info is None:
         return {}
 
-    result: dict[str, AxisInfo] = {}
+    result: dict[ParallelAxis, AxisInfo] = {}
     for axis in ParallelAxis:
         axis_rank = info.get(f"{axis.value}_rank")
         axis_size = info.get(f"{axis.value}_size")
