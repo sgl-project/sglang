@@ -244,7 +244,7 @@ class MinimalA2AAttnOp(DistributedAttention):
             SparseLinearAttentionBackend,
             SageSparseLinearAttentionBackend,
         ):
-            logger.warning(
+            logger.warning_once(
                 "TurboWan now only supports `sla_attn` or `sage_sla_attn` and has been automatically set to attention_type. Please set --attention-backend to `sla_attn` or `sage_sla_attn`."
             )
             if attention_type == "sagesla":

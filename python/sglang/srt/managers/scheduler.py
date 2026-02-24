@@ -1532,7 +1532,10 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if recv_req.bootstrap_room is None:
+                if (
+                    recv_req.bootstrap_room is None
+                    and self.transfer_backend != TransferBackend.FAKE
+                ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
@@ -2972,7 +2975,7 @@ class Scheduler(
                 not torch.distributed.is_initialized()
                 or torch.distributed.get_rank() == 0
             ):
-                response = dumper._handle_http_control_request(
+                response = dumper._http_manager.handle_request(
                     method=recv_req.method, body=recv_req.body
                 )
             self.send_to_tokenizer.send_output(

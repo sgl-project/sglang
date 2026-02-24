@@ -136,6 +136,14 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
+
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
+            quant_method.process_weights_after_loading(module)
+
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
@@ -238,7 +246,8 @@ def load_model_from_full_model_state_dict(
     """
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
-    sharded_sd = {}
+
+    # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
@@ -250,12 +259,14 @@ def load_model_from_full_model_state_dict(
     # sort parameter names to ensure all ranks process parameters in the same order
     sorted_param_names = sorted(custom_param_sd.keys())
 
-    requires_grad = False
+    sharded_sd = {}
+    skipped_checkpoint_keys: list[str] = []
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
         full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
+
         if meta_sharded_param is None:
             # For FSDP models, ensure all ranks process parameters consistently
             if strict or is_fsdp_model:
@@ -263,12 +274,17 @@ def load_model_from_full_model_state_dict(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
             else:
-                logger.warning(
-                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
-                )
+                skipped_checkpoint_keys.append(target_param_name)
                 continue
 
-        target_dtype = param_dtype if param_dtype else full_tensor.dtype
+        # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
+        # for non-quantized models meta dtype equals param_dtype anyway
+        if meta_sharded_param is None:
+            # for nunchaku, some scales are patched later
+            target_dtype = full_tensor.dtype
+        else:
+            target_dtype = meta_sharded_param.dtype
+
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
@@ -323,6 +339,22 @@ def load_model_from_full_model_state_dict(
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
+
+    if skipped_checkpoint_keys:
+        logger.warning(
+            "Checkpoint keys not loaded (no matching model parameter) %s",
+            (
+                skipped_checkpoint_keys[:20]
+                if len(skipped_checkpoint_keys) > 20
+                else skipped_checkpoint_keys
+            ),
+        )
+        if len(skipped_checkpoint_keys) > 20:
+            logger.warning(
+                "... and %d more skipped keys.",
+                len(skipped_checkpoint_keys) - 20,
+            )
+
     # parameters in nn.Module that doesn't exist in safetensor files
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:
@@ -349,6 +381,7 @@ def load_model_from_full_model_state_dict(
             )
 
         meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
 
         if "wcscales" in new_param_name or "wtscale" in new_param_name:
             init_like = torch.ones_like
@@ -357,13 +390,13 @@ def load_model_from_full_model_state_dict(
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             sharded_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = init_like(
-                meta_sharded_param, device=device, dtype=param_dtype
+                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
             )
             sharded_tensor = distribute_tensor(
                 full_tensor,
