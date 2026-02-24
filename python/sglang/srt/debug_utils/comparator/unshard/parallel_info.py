@@ -5,8 +5,6 @@ from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo
 
 _PARALLEL_INFO_KEYS = ("sglang_parallel_info", "megatron_parallel_info")
 
-_AXIS_PREFIXES = [e.value for e in ParallelAxis]
-
 
 def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
     """Extract unified parallel info from dump meta."""
@@ -24,11 +22,11 @@ def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
         return {}
 
     result: dict[str, AxisInfo] = {}
-    for prefix in _AXIS_PREFIXES:
-        axis_rank = info.get(f"{prefix}_rank")
-        axis_size = info.get(f"{prefix}_size")
+    for axis in ParallelAxis:
+        axis_rank = info.get(f"{axis.value}_rank")
+        axis_size = info.get(f"{axis.value}_size")
         if axis_size > 1:
-            result[prefix] = AxisInfo(
+            result[axis] = AxisInfo(
                 axis_rank=axis_rank,
                 axis_size=axis_size,
             )
