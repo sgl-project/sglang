@@ -1,13 +1,9 @@
-"""dLLM post-processing kernels."""
+"""dLLM low-confidence kernels."""
 
-from sglang.srt.dllm.kernels.post_process import (
-    dllm_post_process,
-    dllm_post_process_fused,
-    dllm_post_process_pytorch,
+from sglang.srt.dllm.kernels.low_confidence_utils import (
+    calculate_low_confidence_score,
 )
 
 __all__ = [
-    "dllm_post_process",
-    "dllm_post_process_fused",
-    "dllm_post_process_pytorch",
+    "calculate_low_confidence_score",
 ]

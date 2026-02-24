@@ -6,10 +6,20 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.kernels.post_process import dllm_post_process_fused
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import support_triton
+
+try:
+    from sglang.srt.dllm.kernels.low_confidence_utils import (
+        calculate_low_confidence_score,
+    )
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
 
 
 class LowConfidence(DllmAlgorithm):
@@ -20,8 +30,8 @@ class LowConfidence(DllmAlgorithm):
     ):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
-        self.use_triton_post_process = config.algorithm_config.get(
-            "use_triton_post_process", True
+        self.disable_fused_triton_algorithm = config.algorithm_config.get(
+            "disable_fused_triton_algorithm", False
         )
 
     def run(
@@ -30,12 +40,15 @@ class LowConfidence(DllmAlgorithm):
         forward_batch: ForwardBatch,
     ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         batch_size = forward_batch.batch_size
-        # Here, the forward_batch full logits contains all the blocks
-        # such as [dllm_block_size * batch_size, hidden_size]
         start_list = []
         mask_index = forward_batch.input_ids == self.mask_id
+        attn_backend = get_global_server_args().attention_backend
+        use_fused_kernel = (
+            not self.disable_fused_triton_algorithm
+            and _TRITON_AVAILABLE
+            and support_triton(attn_backend)
+        )
 
-        # Fast path: if there is no mask token, forward and save kv cache
         if torch.sum(mask_index).item() == 0:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -43,7 +56,6 @@ class LowConfidence(DllmAlgorithm):
             next_token_ids = []
             return logits_output, next_token_ids, can_run_cuda_graph
 
-        # Calculate start positions for each block
         for block_id in range(batch_size):
             block_start = block_id * self.block_size
             block_end = block_start + self.block_size
@@ -67,15 +79,14 @@ class LowConfidence(DllmAlgorithm):
                     curr_block_start:curr_block_end,
                 ]
 
-                if self.use_triton_post_process:
-                    dllm_post_process_fused(
+                if use_fused_kernel:
+                    calculate_low_confidence_score(
                         curr_logits,
                         block_input_ids,
                         self.mask_id,
                         self.threshold,
                     )
                 else:
-                    # PyTorch fallback
                     block_mask_index = block_input_ids == self.mask_id
                     if torch.sum(block_mask_index).item() == 0:
                         continue
@@ -99,15 +110,12 @@ class LowConfidence(DllmAlgorithm):
 
                     block_input_ids[transfer_index] = x[transfer_index]
 
-            # Check once per iteration (single sync) whether any masks remain
             mask_count = (forward_batch.input_ids == self.mask_id).sum().item()
             if mask_count == 0:
                 break
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        # Here next token ids is tricky to implement the dynamic lengths,
-        # so we return a list of tensors
         next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)

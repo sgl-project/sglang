@@ -1,10 +1,48 @@
-"""Fused Triton kernels for dLLM post-processing."""
-
-from typing import Tuple
-
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import get_device_sm, is_hip
+
+_AUTOTUNE_BLOCK_V_OPTIONS = (1024, 2048, 4096, 8192)
+_AUTOTUNE_NUM_WARPS_OPTIONS = (4, 8)
+_FALLBACK_BLOCK_V_SMALL_THRESHOLD = 2048
+_FALLBACK_BLOCK_V_MEDIUM_THRESHOLD = 8192
+_FALLBACK_BLOCK_V_MEDIUM = 2048
+_FALLBACK_BLOCK_V_LARGE = 4096
+
+_IS_HIP = is_hip()
+_DEVICE_SM = get_device_sm()
+
+
+def _get_num_stages_options():
+    if _IS_HIP:
+        return (2,)
+    if _DEVICE_SM >= 120:
+        return (2, 3, 4)
+    if _DEVICE_SM >= 90:
+        return (2, 4)
+    return (2, 3)
+
+
+def _get_fallback_num_warps():
+    if _IS_HIP:
+        return 4
+    if _DEVICE_SM >= 90:
+        return 8
+    return 4
+
+
+_AUTOTUNE_NUM_STAGES_OPTIONS = _get_num_stages_options()
+_FALLBACK_NUM_WARPS = _get_fallback_num_warps()
+
+
+def _select_fallback_block_v(vocab_size: int) -> int:
+    if vocab_size <= _FALLBACK_BLOCK_V_SMALL_THRESHOLD:
+        return triton.next_power_of_2(vocab_size)
+    if vocab_size <= _FALLBACK_BLOCK_V_MEDIUM_THRESHOLD:
+        return _FALLBACK_BLOCK_V_MEDIUM
+    return _FALLBACK_BLOCK_V_LARGE
 
 
 @triton.jit
@@ -22,9 +60,6 @@ def _dllm_post_process_kernel(
     logits_stride,
     BLOCK_V: tl.constexpr,
 ):
-    """Fused softmax + argmax + threshold transfer for each masked position.
-    Unmasked positions are skipped. Uses online softmax for numerical stability.
-    """
     row_idx = tl.program_id(0)
 
     if row_idx >= block_size:
@@ -32,18 +67,15 @@ def _dllm_post_process_kernel(
 
     row_start = row_idx * logits_stride
 
-    # Load current input_id
     input_id = tl.load(input_ids_ptr + row_idx)
     is_masked = input_id == mask_id
 
-    # Skip non-masked positions
     if not is_masked:
         tl.store(transfer_out_ptr + row_idx, 0)
         tl.store(confidence_out_ptr + row_idx, -float("inf"))
         tl.store(argmax_out_ptr + row_idx, input_id)
         return
 
-    # Online softmax + argmax in single pass
     max_val = -float("inf")
     exp_sum = 0.0
     argmax_idx = 0
@@ -91,9 +123,6 @@ def _dllm_fallback_kernel(
     num_transfers_ptr,
     block_size,
 ):
-    """If no transfers occurred, force-accept the highest-confidence position.
-    Single-thread kernel (grid=1), exits immediately when num_transfers > 0.
-    """
     num_transfers = tl.load(num_transfers_ptr)
     if num_transfers > 0:
         return
@@ -114,31 +143,22 @@ def _dllm_fallback_kernel(
 
 _dllm_post_process_kernel_autotuned = triton.autotune(
     configs=[
-        triton.Config({"BLOCK_V": 1024}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_V": 2048}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_V": 4096}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_V": 8192}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_V": 8192}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_V": bv}, num_warps=nw, num_stages=ns)
+        for bv in _AUTOTUNE_BLOCK_V_OPTIONS
+        for nw in _AUTOTUNE_NUM_WARPS_OPTIONS
+        for ns in _AUTOTUNE_NUM_STAGES_OPTIONS
     ],
     key=["vocab_size"],
 )(_dllm_post_process_kernel)
 
 
-def dllm_post_process_fused(
+def calculate_low_confidence_score(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
     mask_id: int,
     threshold: float,
     autotune: bool = True,
 ) -> None:
-    """Fused dLLM post-processing. Modifies input_ids in-place: masked positions
-    whose argmax probability exceeds *threshold* are replaced with the predicted
-    token. A fallback kernel guarantees at least one transfer per call.
-    """
     block_size, vocab_size = logits.shape
     device = logits.device
 
@@ -164,12 +184,7 @@ def dllm_post_process_fused(
             logits.stride(0),
         )
     else:
-        if vocab_size <= 2048:
-            BLOCK_V = triton.next_power_of_2(vocab_size)
-        elif vocab_size <= 8192:
-            BLOCK_V = 2048
-        else:
-            BLOCK_V = 4096
+        BLOCK_V = _select_fallback_block_v(vocab_size)
 
         _dllm_post_process_kernel[grid](
             logits,
@@ -184,10 +199,9 @@ def dllm_post_process_fused(
             vocab_size,
             logits.stride(0),
             BLOCK_V=BLOCK_V,
-            num_warps=4,
+            num_warps=_FALLBACK_NUM_WARPS,
         )
 
-    # Fallback: exits immediately if num_transfers > 0
     _dllm_fallback_kernel[(1,)](
         input_ids,
         confidence,
@@ -196,44 +210,3 @@ def dllm_post_process_fused(
         num_transfers_dev,
         block_size,
     )
-
-
-dllm_post_process = dllm_post_process_fused
-
-
-def dllm_post_process_pytorch(
-    logits: torch.Tensor,
-    input_ids: torch.Tensor,
-    mask_id: int,
-    threshold: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Reference PyTorch implementation for correctness verification."""
-    import torch.nn.functional as F
-
-    block_mask_index = input_ids == mask_id
-
-    x = torch.argmax(logits, dim=-1)
-
-    probs = F.softmax(logits.float(), dim=-1)
-    p = torch.squeeze(
-        torch.gather(probs, dim=-1, index=torch.unsqueeze(x, -1)),
-        -1,
-    )
-
-    x = torch.where(block_mask_index, x, input_ids)
-    confidence = torch.where(
-        block_mask_index, p, torch.tensor(-float("inf"), device=logits.device)
-    )
-
-    transfer_index = confidence > threshold
-
-    num_transfers = transfer_index.sum().item()
-    if num_transfers == 0:
-        _, select_index = torch.topk(confidence, k=1)
-        transfer_index[select_index] = True
-        num_transfers = 1
-
-    input_ids = input_ids.clone()
-    input_ids[transfer_index] = x[transfer_index]
-
-    return input_ids, transfer_index, confidence, num_transfers
