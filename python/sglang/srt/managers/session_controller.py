@@ -11,6 +11,7 @@
 # ==============================================================================
 
 import logging
+import time
 import uuid
 from typing import Dict, Optional
 
@@ -70,14 +71,23 @@ class Session:
         capacity_of_str_len: int,
         session_id: Optional[str] = None,
         streaming: bool = False,
+        timeout: Optional[float] = None,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
+        self.timeout = timeout
+        self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
+
+    def is_timed_out(self) -> bool:
+        if self.timeout is None:
+            return False
+        return time.monotonic() - self.last_active_time > self.timeout
 
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer, vocab_size: int):
         assert req.session_params is not None
+        self.last_active_time = time.monotonic()
         session_params = req.session_params
 
         last_req_node = None

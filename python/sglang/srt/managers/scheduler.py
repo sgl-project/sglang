@@ -756,6 +756,7 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
+        self._last_reap_sessions: float = 0.0
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1363,7 +1364,10 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-
+        now = time.monotonic()
+        if now - self._last_reap_sessions > 1.0:  # reap sessions every second
+            self._last_reap_sessions = now
+            self.reap_timed_out_sessions()
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -2945,29 +2949,40 @@ class Scheduler(
                 recv_req.capacity_of_str_len,
                 session_id,
                 streaming=bool(recv_req.streaming),
+                timeout=recv_req.timeout,
             )
             return OpenSessionReqOutput(session_id, True)
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        # handle error
         session_id = recv_req.session_id
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
-            session = self.sessions[session_id]
-            # For streaming sessions, need to release the lock upon close.
-            if session.streaming and session.req_nodes:
-                assert len(session.req_nodes) == 1
-                req = next(iter(session.req_nodes.values())).req
-                if req.finished():
-                    is_insert = not req.skip_cache_finished
-                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
-                else:
-                    # Request is still running. Detach it from the session so it gets
-                    # cleaned up later on finish, like normal requests.
-                    req.session = None
-                    req.session_id = None
-            del self.sessions[session_id]
+            self._close_session(session_id)
+
+    def _close_session(self, session_id: str):
+        session = self.sessions[session_id]
+        # For streaming sessions, need to release the lock upon close.
+        if session.streaming and session.req_nodes:
+            assert len(session.req_nodes) == 1
+            req = next(iter(session.req_nodes.values())).req
+            if req.finished():
+                is_insert = not req.skip_cache_finished
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            else:
+                # Request is still running. Detach it from the session so it gets
+                # cleaned up later on finish, like normal requests.
+                req.session = None
+                req.session_id = None
+        del self.sessions[session_id]
+
+    def reap_timed_out_sessions(self):
+        timed_out = [
+            sid for sid, session in self.sessions.items() if session.is_timed_out()
+        ]
+        for sid in timed_out:
+            logger.info(f"Session {sid} timed out, closing.")
+            self._close_session(sid)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
