@@ -163,8 +163,6 @@ def warmup_one_model(model, tp, port):
         "--port",
         str(port),
         "--trust-remote-code",
-        "--mem-fraction-static",
-        "0.7",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
     ]
