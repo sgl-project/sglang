@@ -313,7 +313,7 @@ class TestEntrypointGroupingRaw:
         assert "failed" in output.lower()
 
     def test_duplicate_dump_pairing(self, tmp_path, capsys):
-        """Same tensor dumped twice pairs by duplicate_index: 0th↔0th, 1st↔1st."""
+        """Same name dumped twice (different values) pairs by duplicate_index: 0th↔0th, 1st↔1st."""
         torch.manual_seed(42)
         tensor_v0 = torch.randn(4, 4)
         tensor_v1 = torch.randn(4, 4)
