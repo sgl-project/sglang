@@ -16,23 +16,19 @@ def load_and_unshard(
     *,
     rows: list[dict],
     base_path: Path,
-    dims_str: str,
-    preloaded_first: Optional[ValueWithMeta] = None,
 ) -> Optional[torch.Tensor]:
     """Load all rank tensors for one side and unshard them.
 
-    Returns None if any tensor fails to load.
+    Reads dims from the first file's embedded metadata.
+    Returns None if dims is missing or any tensor fails to load.
     """
+    loaded = [ValueWithMeta.load(base_path / row["filename"]) for row in rows]
+
+    dims_str = loaded[0].meta.get("dims")
+    if dims_str is None:
+        return None
+
     dim_specs = parse_dims(dims_str)
-    loaded: list[ValueWithMeta] = []
-
-    for i, row in enumerate(rows):
-        if i == 0 and preloaded_first is not None:
-            loaded.append(preloaded_first)
-        else:
-            path = base_path / row["filename"]
-            loaded.append(ValueWithMeta.load(path))
-
     parallel_infos = [normalize_parallel_info(item.meta) for item in loaded]
 
     plan = compute_unshard_plan(

@@ -25,45 +25,22 @@ def process_smart(
     name = target_rows[0]["name"]
     fmt = args.output_format
 
-    first_target_path = Path(args.target_path) / target_rows[0]["filename"]
-    first_target = ValueWithMeta.load(first_target_path)
-    dims_str = first_target.meta.get("dims")
-
-    if dims_str is None:
-        _skip(name, "missing_dims", counts, fmt)
-        return
-
     target_tensor = load_and_unshard(
         rows=target_rows,
         base_path=Path(args.target_path),
-        dims_str=dims_str,
-        preloaded_first=first_target,
     )
     if target_tensor is None:
-        _skip(name, "target_unshard_failed", counts, fmt)
+        _skip(name, "target_load_failed", counts, fmt)
         return
 
     if not baseline_rows:
         _skip(name, "no_baseline", counts, fmt)
         return
 
-    first_baseline_path = Path(args.baseline_path) / baseline_rows[0]["filename"]
-    first_baseline = ValueWithMeta.load(first_baseline_path)
-    baseline_dims_str = first_baseline.meta.get("dims")
-
-    if baseline_dims_str is not None:
-        baseline_tensor = load_and_unshard(
-            rows=baseline_rows,
-            base_path=Path(args.baseline_path),
-            dims_str=baseline_dims_str,
-            preloaded_first=first_baseline,
-        )
-    else:
-        if len(baseline_rows) > 1:
-            _skip(name, "ambiguous_baseline_no_dims", counts, fmt)
-            return
-        baseline_tensor = _as_tensor(first_baseline.value)
-
+    baseline_tensor = _load_baseline(
+        baseline_rows=baseline_rows,
+        base_path=Path(args.baseline_path),
+    )
     if baseline_tensor is None:
         _skip(name, "baseline_load_failed", counts, fmt)
         return
@@ -75,6 +52,21 @@ def process_smart(
         args=args,
         counts=counts,
     )
+
+
+def _load_baseline(
+    *,
+    baseline_rows: list[dict],
+    base_path: Path,
+) -> Optional[torch.Tensor]:
+    result = load_and_unshard(rows=baseline_rows, base_path=base_path)
+    if result is not None:
+        return result
+
+    if len(baseline_rows) == 1:
+        return _load_tensor(base_path / baseline_rows[0]["filename"])
+
+    return None
 
 
 def process_per_rank(

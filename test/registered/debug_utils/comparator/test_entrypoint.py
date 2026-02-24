@@ -262,7 +262,7 @@ class TestEntrypointUnshard:
         records = _parse_jsonl(capsys.readouterr().out)
         skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 2
-        assert all(s.reason == "missing_dims" for s in skips)
+        assert all(s.reason == "target_load_failed" for s in skips)
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 2
