@@ -180,7 +180,9 @@ class Gemma2Attention(nn.Module):
             (seq_len, seq_len), device=hidden_states.device, dtype=torch.float32
         )
         causal = torch.triu(
-            torch.ones((seq_len, seq_len), device=hidden_states.device, dtype=torch.bool),
+            torch.ones(
+                (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
+            ),
             diagonal=1,
         )
         attn_mask = attn_mask.masked_fill(causal, float("-inf"))
@@ -192,7 +194,9 @@ class Gemma2Attention(nn.Module):
 
         if attention_mask is not None:
             key_pad = ~attention_mask.to(torch.bool)
-            attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
+            attn_mask = attn_mask[None, None, :, :].expand(
+                batch_size, 1, seq_len, seq_len
+            )
             attn_mask = attn_mask.masked_fill(
                 key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
                 float("-inf"),
@@ -216,7 +220,9 @@ class Gemma2Attention(nn.Module):
         # negligible. A custom attention kernel would be needed for full fidelity.
 
         attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(
+            batch_size, seq_len, self.num_heads * self.head_dim
+        )
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -250,9 +256,15 @@ class Gemma2DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = Gemma2RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
-        self.post_attention_layernorm = Gemma2RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma2RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma2RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
+        self.post_attention_layernorm = Gemma2RMSNorm(
+            self.hidden_size, eps=arch.rms_norm_eps
+        )
+        self.pre_feedforward_layernorm = Gemma2RMSNorm(
+            self.hidden_size, eps=arch.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = Gemma2RMSNorm(
+            self.hidden_size, eps=arch.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -386,7 +398,7 @@ class Gemma2Model(nn.Module):
             # HF Gemma2Model stores weights as model.layers.X... / model.embed_tokens...
             # Strip "model." prefix if present to match our naming
             if name.startswith("model."):
-                name = name[len("model."):]
+                name = name[len("model.") :]
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

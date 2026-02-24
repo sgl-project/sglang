@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sampling parameters for SANA image generation (T2I)."""
+
 from dataclasses import dataclass
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 
 
 @dataclass

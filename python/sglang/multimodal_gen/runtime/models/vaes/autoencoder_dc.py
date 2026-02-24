@@ -32,7 +32,9 @@ class AutoencoderDC(nn.Module):
         from diffusers import AutoencoderDC as DiffusersAutoencoderDC
 
         device = "cpu"
-        state_to_load = state_dict if state_dict is not None else self._loaded_state_dict
+        state_to_load = (
+            state_dict if state_dict is not None else self._loaded_state_dict
+        )
         if state_to_load:
             first_tensor = next(iter(state_to_load.values()))
             device = first_tensor.device

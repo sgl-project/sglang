@@ -10,7 +10,9 @@
 # and only adapts the interface for sglang's denoising stage.
 
 import torch
-from diffusers import DPMSolverMultistepScheduler as DiffusersDPMSolverMultistepScheduler
+from diffusers import (
+    DPMSolverMultistepScheduler as DiffusersDPMSolverMultistepScheduler,
+)
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 

@@ -79,9 +79,7 @@ class GLUMBConv(nn.Module):
             1,
             groups=hidden_channels * 2,
         )
-        self.conv_point = nn.Conv2d(
-            hidden_channels, out_channels, 1, 1, 0, bias=False
-        )
+        self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
 
     def forward(self, hidden_states):
         hidden_states = self.conv_inverted(hidden_states)
@@ -134,10 +132,10 @@ class SanaLinearAttention(nn.Module):
         query = F.relu(query)
         key = F.relu(key)
 
-        kv = torch.matmul(key.transpose(-2, -1), value)    # (B, H, D, D)
-        qkv = torch.matmul(query, kv)                      # (B, H, S, D)
+        kv = torch.matmul(key.transpose(-2, -1), value)  # (B, H, D, D)
+        qkv = torch.matmul(query, kv)  # (B, H, S, D)
 
-        key_sum = key.sum(dim=-2, keepdim=True)             # (B, H, 1, D)
+        key_sum = key.sum(dim=-2, keepdim=True)  # (B, H, 1, D)
         normalizer = torch.matmul(query, key_sum.transpose(-2, -1)).clamp(min=1e-6)
         hidden_states = qkv / normalizer
 
@@ -219,9 +217,7 @@ class SanaTransformerBlock(nn.Module):
             bias=True,
         )
 
-        self.ff = GLUMBConv(
-            in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio
-        )
+        self.ff = GLUMBConv(in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio)
 
     def forward(self, hidden_states, encoder_hidden_states, timestep, height, width):
         batch_size = hidden_states.shape[0]

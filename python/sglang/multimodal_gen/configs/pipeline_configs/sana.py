@@ -34,9 +34,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 )
 
 
-def sana_postprocess_text(
-    outputs: BaseEncoderOutput, _text_inputs
-) -> torch.Tensor:
+def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     # SANA uses the final hidden state from Gemma2 directly as text conditioning.
     # No intermediate-layer extraction or masking needed (unlike QwenImage/ZImage).
     return outputs.last_hidden_state
@@ -65,9 +63,7 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
         default_factory=lambda: (Gemma2Config(),)
     )
 
-    text_encoder_precisions: tuple[str, ...] = field(
-        default_factory=lambda: ("bf16",)
-    )
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (preprocess_text,),
