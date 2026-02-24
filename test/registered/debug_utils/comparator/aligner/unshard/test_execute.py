@@ -438,6 +438,27 @@ class TestVerifyReplicatedGroup:
         assert len(warnings) == 1
         assert torch.allclose(result[0], tensor_a)
 
+    def test_atol_boundary_within(self) -> None:
+        """Difference exactly at atol (1e-6) → torch.allclose passes → no warning."""
+        baseline = torch.zeros(4)
+        other = torch.full((4,), 1e-6)
+
+        warnings = _verify_replicated_group(
+            [baseline, other], axis=ParallelAxis.TP, group_index=0,
+        )
+        assert warnings == []
+
+    def test_atol_boundary_exceeded(self) -> None:
+        """Difference just above atol (1e-6 + 1e-9) → torch.allclose fails → warning."""
+        baseline = torch.zeros(4)
+        other = torch.full((4,), 1e-6 + 1e-9)
+
+        warnings = _verify_replicated_group(
+            [baseline, other], axis=ParallelAxis.TP, group_index=0,
+        )
+        assert len(warnings) == 1
+        assert warnings[0].differing_index == 1
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
