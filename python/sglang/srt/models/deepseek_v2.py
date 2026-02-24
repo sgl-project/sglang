@@ -1783,7 +1783,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if _is_hip:
+            if _use_aiter:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
