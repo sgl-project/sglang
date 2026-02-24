@@ -123,12 +123,16 @@ def _execute_plans(
 
     current = tensors
     for plan in plans:
-        if isinstance(plan, UnshardPlan):
-            current = execute_unshard_plan(plan, current)
-        elif isinstance(plan, ReorderPlan):
-            current = execute_reorder_plan(plan, current)
-        else:
-            raise NotImplementedError(f"Unknown {plan=}")
+        current = _execute_plan(current, plan)
 
     assert len(current) == 1
     return current[0]
+
+
+def _execute_plan(tensors, plan):
+    if isinstance(plan, UnshardPlan):
+        return execute_unshard_plan(plan, tensors)
+    elif isinstance(plan, ReorderPlan):
+        return execute_reorder_plan(plan, tensors)
+    else:
+        raise NotImplementedError(f"Unknown {plan=}")
