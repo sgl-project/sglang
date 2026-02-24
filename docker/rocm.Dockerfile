@@ -214,10 +214,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+RUN python3 -m pip install --no-cache-dir maturin \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && /bin/bash -lc 'ulimit -n 8192 && cargo build --release' \
-    && python3 -m pip install --no-cache-dir . \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cache
 
 # -----------------------

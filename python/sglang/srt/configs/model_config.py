@@ -545,6 +545,17 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "WhisperForConditionalGeneration" in self.hf_config.architectures:
+            # Whisper has unique layer ID scheme:
+            # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
+            # - Decoder self-attention: encoder_layers to encoder_layers+decoder_layers-1 (uses KV cache)
+            # - Decoder cross-attention: encoder_layers+decoder_layers to encoder_layers+2*decoder_layers-1
+            # Even though cross-attention doesn't save KV cache, attention backend needs buffer to exist
+            encoder_layers = getattr(self.hf_text_config, "encoder_layers", 0)
+            decoder_layers = getattr(
+                self.hf_text_config, "decoder_layers", self.num_hidden_layers
+            )
+            self.num_attention_layers = encoder_layers + 2 * decoder_layers
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -1247,6 +1258,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
@@ -1285,11 +1297,17 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_local_attention_model(model_architectures: List[str]):
