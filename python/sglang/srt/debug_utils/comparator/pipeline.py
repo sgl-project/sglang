@@ -105,6 +105,8 @@ def _execute_plans(
             return None
         return tensors[0]
 
+    assert len(plans) <= 1, "multi-plan not supported yet"
+
     for plan in plans:
         if isinstance(plan, UnshardPlan):
             # TODO: incorrect `tensors_by_world_rank` if multi UnshardPlan
