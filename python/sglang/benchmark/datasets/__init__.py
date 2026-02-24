@@ -1,8 +1,12 @@
+from typing import Dict, Tuple, Type
+
 from sglang.benchmark.datasets.common import (
     ASSISTANT_SUFFIX,
     MOONCAKE_DATASET_URL,
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
+    BaseDatasetArgs,
+    BaseDatasetLoader,
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
@@ -53,7 +57,7 @@ from sglang.benchmark.datasets.sharegpt import (
     sample_sharegpt_requests,
 )
 
-DATASET_MAPPING = {
+DATASET_MAPPING: Dict[str, Tuple[Type[BaseDatasetArgs], BaseDatasetLoader]] = {
     "sharegpt": (ShareGPTArgs, ShareGPTDatasetLoader()),
     "custom": (CustomArgs, CustomDatasetLoader()),
     "openai": (OpenAIArgs, OpenAIDatasetLoader()),
