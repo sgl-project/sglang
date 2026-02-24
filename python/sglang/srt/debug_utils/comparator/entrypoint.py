@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import polars as pl
 
@@ -56,7 +57,9 @@ def run(args: argparse.Namespace) -> None:
             name=tensor_group_key["name"],
             baseline_filenames=[r["filename"] for r in baseline_rows],
             target_filenames=[r["filename"] for r in target_rows],
-            args=args,
+            baseline_path=Path(args.baseline_path),
+            target_path=Path(args.target_path),
+            diff_threshold=args.diff_threshold,
         )
         counts[record.category] += 1
         print_record(record, output_format=args.output_format)

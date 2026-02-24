@@ -25,10 +25,12 @@ def process_tensor_group(
     name: str,
     baseline_filenames: list[str],
     target_filenames: list[str],
-    args: argparse.Namespace,
+    baseline_path: Path,
+    target_path: Path,
+    diff_threshold: float,
 ) -> ComparisonRecord | SkipRecord:
-    b_tensors = _load_tensors(baseline_filenames, Path(args.baseline_path))
-    t_tensors = _load_tensors(target_filenames, Path(args.target_path))
+    b_tensors = _load_tensors(baseline_filenames, baseline_path)
+    t_tensors = _load_tensors(target_filenames, target_path)
 
     b_plans, t_plans = _compute_plans(
         baseline_metas=[item.meta for item in b_tensors],
@@ -50,7 +52,7 @@ def process_tensor_group(
         x_baseline=b_tensor,
         x_target=t_tensor,
         name=name,
-        diff_threshold=args.diff_threshold,
+        diff_threshold=diff_threshold,
     )
 
     return ComparisonRecord(**info.model_dump())
