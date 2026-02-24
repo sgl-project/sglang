@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
@@ -230,6 +231,10 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(last_node.key), 2)
         self.assertEqual(last_node.key.token_ids[0], 60)
         self.assertEqual(last_node.key.token_ids[1], 70)
+
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+        tree.sanity_check()
 
     def test_swa_radix_cache_eagle(self):
         # args

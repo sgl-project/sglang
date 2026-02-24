@@ -13,3 +13,5 @@ Ascend NPUs
    ascend_npu_qwen_best_practice.md
    mindspore_backend.md
    ascend_contribution_guide.md
+   ascend_npu_qwen3_5_examples.md
+   ascend_npu_glm5_examples.md

@@ -102,7 +102,7 @@ class DmdDenoisingStage(DenoisingStage):
                 with StageProfiler(
                     f"denoising_step_{i}",
                     logger=logger,
-                    timings=batch.timings,
+                    metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
                     t_int = int(t.item())
@@ -119,6 +119,7 @@ class DmdDenoisingStage(DenoisingStage):
                         )
                     else:
                         current_model = self.transformer
+                        self._manage_device_placement(current_model, None, server_args)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)

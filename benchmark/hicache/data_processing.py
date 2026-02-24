@@ -11,13 +11,13 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import (
+from sglang.benchmark.datasets import (
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
-    download_and_cache_hf_file,
     gen_prompt,
     get_gen_prefix_cache_path,
 )
+from sglang.benchmark.utils import download_and_cache_hf_file
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64

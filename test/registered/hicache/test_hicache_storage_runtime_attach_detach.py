@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
+from sglang.utils import wait_for_http_ready
 
 register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 
@@ -68,17 +69,15 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     @classmethod
-    def _wait_for_server_ready(cls, base_url: str, timeout: int = 60) -> bool:
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                code, _body = cls._http_get(f"{base_url}/health", timeout=5)
-                if code == 200:
-                    return True
-            except Exception:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
+    def _wait_for_server_ready(
+        cls, base_url: str, timeout: int = 60, process=None
+    ) -> bool:
+        wait_for_http_ready(
+            url=f"{base_url}/health",
+            timeout=timeout,
+            process=process,
+        )
+        return True
 
     @staticmethod
     def _http_get(url: str, timeout: int = 10, headers: dict | None = None):
@@ -204,7 +203,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             env=self.env,
         )
         try:
-            self._wait_for_server_ready(self.base_url)
+            self._wait_for_server_ready(self.base_url, process=process1)
 
             code_info, _body_info = self._http_get(
                 f"{self.base_url}/hicache/storage-backend", timeout=10
@@ -234,7 +233,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             env=self.env,
         )
         try:
-            self._wait_for_server_ready(base_url2)
+            self._wait_for_server_ready(base_url2, process=process2)
 
             # 1) Initially disabled (but unauthorized without admin key)
             code_info2_unauth, _ = self._http_get(
