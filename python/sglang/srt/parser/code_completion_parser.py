@@ -13,7 +13,6 @@
 # ==============================================================================
 """Completion templates."""
 
-
 import dataclasses
 import logging
 from enum import auto

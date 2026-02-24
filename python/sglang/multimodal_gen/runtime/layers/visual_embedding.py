@@ -12,7 +12,10 @@ from diffusers.models.embeddings import (
 from diffusers.models.embeddings import (
     CombinedTimestepTextProjEmbeddings as _CombinedTimestepTextProjEmbeddings,
 )
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
+from diffusers.models.embeddings import (
+    PixArtAlphaTextProjection,
+    TimestepEmbedding,
+)
 from diffusers.models.embeddings import Timesteps as _Timesteps
 from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
