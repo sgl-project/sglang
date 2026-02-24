@@ -67,43 +67,41 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        # No new tokens will be generated while all requests are in the prefill stage.
-        if not result.next_token_ids:
-            return
+        if result.next_token_ids:
+            self.token_to_kv_pool_allocator.free_group_begin()
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+            for idx in range(batch.batch_size()):
+                req = batch.reqs[idx]
 
-        for idx in range(batch.batch_size()):
-            req = batch.reqs[idx]
+                next_token_ids = result.next_token_ids[idx].tolist()
+                new_tokens = len(next_token_ids)
+                if new_tokens == 0:
+                    continue
 
-            next_token_ids = result.next_token_ids[idx].tolist()
-            new_tokens = len(next_token_ids)
-            if new_tokens == 0:
-                continue
+                req.fill_ids[-new_tokens:] = next_token_ids[:]
+                self.num_generated_tokens += new_tokens
 
-            req.fill_ids[-new_tokens:] = next_token_ids[:]
-            self.num_generated_tokens += new_tokens
+                req.output_ids.extend(next_token_ids)
+                req.check_finished(new_accepted_len=new_tokens)
 
-            req.output_ids.extend(next_token_ids)
-            req.check_finished(new_accepted_len=new_tokens)
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
 
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                req.time_stats.completion_time = time.perf_counter()
-
-        self.stream_output(batch.reqs, batch.return_logprob)
-        self.token_to_kv_pool_allocator.free_group_end()
+            self.stream_output(batch.reqs, batch.return_logprob)
+            self.token_to_kv_pool_allocator.free_group_end()
 
         if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
-        max_dllm_capacity = self.server_args.max_running_requests - len(
+        max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
         )
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))

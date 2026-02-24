@@ -308,6 +308,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
+            "BailingMoeV2_5ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
         if (
@@ -482,6 +483,25 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+        elif (
+            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
+            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.head_dim = self.hf_text_config.head_dim
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            # Handle rope scaling with yarn
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -525,6 +545,17 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "WhisperForConditionalGeneration" in self.hf_config.architectures:
+            # Whisper has unique layer ID scheme:
+            # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
+            # - Decoder self-attention: encoder_layers to encoder_layers+decoder_layers-1 (uses KV cache)
+            # - Decoder cross-attention: encoder_layers+decoder_layers to encoder_layers+2*decoder_layers-1
+            # Even though cross-attention doesn't save KV cache, attention backend needs buffer to exist
+            encoder_layers = getattr(self.hf_text_config, "encoder_layers", 0)
+            decoder_layers = getattr(
+                self.hf_text_config, "decoder_layers", self.num_hidden_layers
+            )
+            self.num_attention_layers = encoder_layers + 2 * decoder_layers
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -1172,6 +1203,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
@@ -1226,6 +1258,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
@@ -1264,11 +1297,17 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_local_attention_model(model_architectures: List[str]):
