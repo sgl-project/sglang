@@ -29,6 +29,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
+from sglang.multimodal_gen.runtime.loader.weights_updater import (
+    WeightsUpdater,
+    get_updatable_modules,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -39,13 +44,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    OffloadableDiTMixin,
+    iter_materialized_weights,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import PerformanceLogger
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    PerformanceLogger,
+    capture_memory_snapshot,
+)
 
 logger = init_logger(__name__)
 
@@ -124,33 +135,41 @@ class GPUWorker:
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
             # enable layerwise offload if possible
-            for dit in filter(
-                None,
-                [
-                    self.pipeline.get_module("transformer"),
-                    self.pipeline.get_module("transformer_2"),
-                    self.pipeline.get_module("video_dit"),
-                    self.pipeline.get_module("video_dit_2"),
-                    self.pipeline.get_module("audio_dit"),
-                ],
-            ):
-                if isinstance(dit, OffloadableDiTMixin):
-                    dit.configure_layerwise_offload(self.server_args)
-                else:
-                    logger.info(
-                        f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                    )
+            for module_name in [
+                "transformer",
+                "transformer_2",
+                "video_dit",
+                "video_dit_2",
+                "audio_dit",
+            ]:
+                dit = self.pipeline.get_module(module_name)
+                if dit:
+                    if isinstance(dit, OffloadableDiTMixin):
+                        dit.configure_layerwise_offload(self.server_args)
+                    else:
+                        logger.info(
+                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                        )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-        peak_memory_gb = peak_memory_bytes / (1024**3)
+        final_snapshot = capture_memory_snapshot()
+        if output_batch.metrics:
+            output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
+
+        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
+        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
+        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
+
+        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_gb = peak_reserved_bytes / (1024**3)
+        peak_allocated_gb = peak_allocated_bytes / (1024**3)
+
         remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
+            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
         suggested_args = set()
@@ -173,8 +192,13 @@ class GPUWorker:
         suggested_args_str = (
             ", ".join(sorted(suggested_args)) if suggested_args else "None"
         )
+
+        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
+
         logger.info(
-            f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
+            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
+            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
             f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
@@ -193,6 +217,11 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            # capture memory baseline before forward
+            if self.rank == 0 and req.metrics:
+                baseline_snapshot = capture_memory_snapshot()
+                req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
+
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
@@ -201,7 +230,7 @@ class GPUWorker:
                     output=result.output,
                     audio=getattr(result, "audio", None),
                     audio_sample_rate=getattr(result, "audio_sample_rate", None),
-                    timings=result.timings,
+                    metrics=result.metrics,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
                     noise_pred=getattr(result, "noise_pred", None),
@@ -210,11 +239,18 @@ class GPUWorker:
             else:
                 output_batch = result
 
+            # capture memory after forward (peak)
+            if self.rank == 0 and output_batch.metrics:
+                peak_snapshot = capture_memory_snapshot()
+                output_batch.metrics.record_memory_snapshot(
+                    "after_forward", peak_snapshot
+                )
+
             if self.rank == 0 and not req.suppress_logs:
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.timings.total_duration_ms = duration_ms
+            output_batch.metrics.total_duration_ms = duration_ms
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
@@ -236,11 +272,13 @@ class GPUWorker:
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
             )
+            if isinstance(e, _oom_exceptions()):
+                logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
@@ -342,18 +380,69 @@ class GPUWorker:
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        flush_cache: bool = True,
+        target_modules: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        """Update model weights from disk inplace without restarting the server."""
+        if not self.pipeline:
+            return False, "Pipeline is not initialized"
+
+        updater = WeightsUpdater(self.pipeline)
+        success, message = updater.update_weights_from_disk(
+            model_path,
+            flush_cache=flush_cache,
+            target_modules=target_modules,
+        )
+        if success:
+            self.server_args.model_path = model_path
+            self.pipeline.model_path = model_path
+        return success, message
+
+    def get_weights_checksum(
+        self, module_names: list[str] | None = None
+    ) -> dict[str, str]:
+        """Compute SHA-256 checksum of each module's weights."""
+        if not self.pipeline:
+            return {"error": "Pipeline is not initialized"}
+
+        all_modules = get_updatable_modules(self.pipeline)
+        names = module_names if module_names is not None else list(all_modules.keys())
+
+        checksums: dict[str, str] = {}
+        for name in names:
+            module = all_modules.get(name)
+            if module is None:
+                checksums[name] = "not_found"
+                continue
+            checksums[name] = compute_weights_checksum(
+                iter_materialized_weights(module)
+            )
+        return checksums
+
 
 OOM_MSG = f"""
 OOM detected. Possible solutions:
   - If the OOM occurs during loading:
     1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
   - If the OOM occurs during runtime:
-    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    2. Enable SP and/or TP
+    1. Enable SP and/or TP (in a multi-GPU setup)
+    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     3. Opt for a sparse-attention backend
     4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    5. Enable quantization (e.g. nunchaku)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
+
+
+def _oom_exceptions():
+    # torch.OutOfMemoryError exists only in some PyTorch builds
+    types = [torch.cuda.OutOfMemoryError]
+    if hasattr(torch, "OutOfMemoryError"):
+        types.append(torch.OutOfMemoryError)
+    return tuple(types)
 
 
 def run_scheduler_process(
@@ -403,7 +492,7 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except torch.OutOfMemoryError as _e:
+    except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise
     finally:

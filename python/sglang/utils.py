@@ -531,15 +531,13 @@ def wait_for_server(
         headers={"Authorization": "Bearer None"},
     )
     time.sleep(5)
-    print_highlight(
-        """\n
+    print_highlight("""\n
         NOTE: Typically, the server runs in a separate terminal.
         In this notebook, we run the server and notebook code together, so their outputs are combined.
         To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
         To reduce the log length, we set the log level to warning for the server, the default log level is info.
         We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-        """
-    )
+        """)
 
 
 class TypeBasedDispatcher:

@@ -157,7 +157,9 @@ def get_oss_repo(dry_run):
     """
     gh_token = os.getenv("GH_TOKEN")
     if not gh_token:
-        print("⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation.")
+        print(
+            "⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation."
+        )
         if not dry_run:
             return
 
@@ -359,7 +361,9 @@ def create_pull_request(oss_root, branch_name, title, body, dry_run):
     """Create a pull request in the OSS repo using the GitHub CLI."""
     gh_token = os.getenv("GH_TOKEN")
     if not gh_token:
-        print("⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation.")
+        print(
+            "⚠️ Warning: GH_TOKEN environment variable not set. Skipping PR creation."
+        )
         if not dry_run:
             return
 
