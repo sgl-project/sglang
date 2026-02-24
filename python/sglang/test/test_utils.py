@@ -343,7 +343,7 @@ def call_generate_openai_compatible(
     # Ignore max_len to keep compatibility with existing benchmark call sites.
     _ = max_len
 
-    response = requests.post(f"{url}/chat/completions", headers=headers, json=payload)
+    response = requests.post(f"{url}/chat/completions", headers=headers, json=payload, timeout=600)
     assert response.status_code == 200, response.text
     obj = response.json()
     choices = obj["choices"]
