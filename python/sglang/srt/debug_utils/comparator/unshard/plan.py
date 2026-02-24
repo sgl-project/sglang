@@ -2,6 +2,7 @@ from typing import Optional
 
 from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering
 from sglang.srt.debug_utils.comparator.unshard.types import (
+    AxisInfo,
     ConcatParams,
     UnshardParams,
     UnshardPlan,
