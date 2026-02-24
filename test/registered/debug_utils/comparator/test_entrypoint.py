@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import sglang.srt.debug_utils.dumper as _dumper_module
 from sglang.srt.debug_utils.comparator.entrypoint import run
 from sglang.srt.debug_utils.comparator.output_types import (
     AnyRecord,
@@ -19,6 +20,8 @@ from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="default", nightly=True)
+
+_FIXED_EXP_NAME = "test"
 
 # Each test has a one-line docstring describing the scenario it covers.
 
@@ -126,7 +129,7 @@ class TestEntrypointGroupingLogical:
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
 
-        _create_tp_sharded_dumps(
+        baseline_path = _create_tp_sharded_dumps(
             baseline_dir,
             full_tensor=full_baseline,
             name="hidden",
@@ -134,7 +137,7 @@ class TestEntrypointGroupingLogical:
             shard_dim=1,
             dims_str="b h(tp)",
         )
-        _create_tp_sharded_dumps(
+        target_path = _create_tp_sharded_dumps(
             target_dir,
             full_tensor=full_target,
             name="hidden",
@@ -143,7 +146,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
         comp = _assert_single_comparison_passed(records)
@@ -163,7 +166,7 @@ class TestEntrypointGroupingLogical:
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
 
-        _create_tp_sharded_dumps(
+        baseline_path = _create_tp_sharded_dumps(
             baseline_dir,
             full_tensor=full_baseline,
             name="hidden",
@@ -171,7 +174,7 @@ class TestEntrypointGroupingLogical:
             shard_dim=1,
             dims_str="b h(tp)",
         )
-        _create_tp_sharded_dumps(
+        target_path = _create_tp_sharded_dumps(
             target_dir,
             full_tensor=full_target,
             name="hidden",
@@ -180,7 +183,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
         _assert_single_comparison_passed(records)
@@ -194,16 +197,11 @@ class TestEntrypointGroupingLogical:
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
 
-        _save_dump_file(
-            baseline_dir,
-            step=0,
-            rank=0,
-            dump_index=1,
-            name="hidden",
-            tensor=full_tensor,
+        baseline_path = _create_rank_dump(
+            baseline_dir, rank=0, name="hidden", tensor=full_tensor
         )
 
-        _create_tp_sharded_dumps(
+        target_path = _create_tp_sharded_dumps(
             target_dir,
             full_tensor=target_full,
             name="hidden",
@@ -212,7 +210,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
         _assert_single_comparison_passed(records)
@@ -225,24 +223,11 @@ class TestEntrypointGroupingLogical:
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
 
-        _save_dump_file(
-            baseline_dir,
-            step=0,
-            rank=0,
-            dump_index=1,
-            name="hidden",
-            tensor=full_tensor[:, :4],
-        )
-        _save_dump_file(
-            baseline_dir,
-            step=0,
-            rank=1,
-            dump_index=2,
-            name="hidden",
-            tensor=full_tensor[:, 4:],
-        )
+        for rank, shard in [(0, full_tensor[:, :4]), (1, full_tensor[:, 4:])]:
+            _create_rank_dump(baseline_dir, rank=rank, name="hidden", tensor=shard)
+        baseline_path = baseline_dir / _FIXED_EXP_NAME
 
-        _create_tp_sharded_dumps(
+        target_path = _create_tp_sharded_dumps(
             target_dir,
             full_tensor=full_tensor,
             name="hidden",
@@ -251,7 +236,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(baseline_dir, target_dir)
+        args = _make_args(baseline_path, target_path)
 
         records = _run_and_parse(args, capsys)
         skips = [r for r in records if isinstance(r, SkipRecord)]
@@ -286,7 +271,9 @@ class TestEntrypointGroupingLogical:
                 dims_str="b h(tp)",
             )
 
-        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
+        baseline_path = baseline_dir / _FIXED_EXP_NAME
+        target_path = target_dir / _FIXED_EXP_NAME
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
         summary = records[-1]
@@ -385,33 +372,35 @@ def _parse_jsonl(output: str) -> list[AnyRecord]:
     return [parse_record_json(line) for line in output.strip().splitlines()]
 
 
-def _save_dump_file(
+def _create_rank_dump(
     directory: Path,
     *,
-    step: int,
     rank: int,
-    dump_index: int,
     name: str,
     tensor: torch.Tensor,
     dims: str | None = None,
-    parallel_info_key: str = "sglang_parallel_info",
     parallel_info: dict | None = None,
-    extra_tags: dict | None = None,
-) -> None:
-    """Directly create a dump .pt file with full control over metadata."""
-    tags = {"step": step, "rank": rank, "dump_index": dump_index, "name": name}
-    if extra_tags:
-        tags.update(extra_tags)
+) -> Path:
+    """Create a dump file via the real dumper, as if running on the given rank."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
 
-    filename = "___".join(f"{k}={v}" for k, v in tags.items()) + ".pt"
-    meta = dict(**tags)
-    if dims is not None:
-        meta["dims"] = dims
-    if parallel_info is not None:
-        meta[parallel_info_key] = parallel_info
+        dumper = _Dumper(config=DumperConfig(
+            enable=True,
+            dir=str(directory),
+            exp_name=_FIXED_EXP_NAME,
+            enable_http_server=False,
+        ))
 
-    directory.mkdir(parents=True, exist_ok=True)
-    torch.save({"value": tensor, "meta": meta}, directory / filename)
+        static_meta: dict = {"world_rank": rank, "world_size": 1}
+        if parallel_info is not None:
+            static_meta["sglang_parallel_info"] = parallel_info
+        dumper.__dict__["_static_meta"] = static_meta
+
+        dumper.dump(name, tensor, dims=dims)
+        dumper.step()
+
+    return directory / _FIXED_EXP_NAME
 
 
 def _create_tp_sharded_dumps(
@@ -422,21 +411,19 @@ def _create_tp_sharded_dumps(
     tp_size: int,
     shard_dim: int,
     dims_str: str,
-    step: int = 0,
-) -> None:
-    """Create TP-sharded dump files from a full tensor."""
+) -> Path:
+    """Create TP-sharded dump files from a full tensor via the real dumper."""
     shards = list(full_tensor.chunk(tp_size, dim=shard_dim))
     for tp_rank in range(tp_size):
-        _save_dump_file(
+        _create_rank_dump(
             directory,
-            step=step,
             rank=tp_rank,
-            dump_index=tp_rank + 1,
             name=name,
             tensor=shards[tp_rank],
             dims=dims_str,
             parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
         )
+    return directory / _FIXED_EXP_NAME
 
 
 if __name__ == "__main__":
