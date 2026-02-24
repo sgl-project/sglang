@@ -18,8 +18,7 @@ from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
-    component_name_to_loader_cls,
-    get_memory_usage_of_component,
+    component_name_to_loader_cls, get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -136,7 +135,6 @@ class ComponentLoader(ABC):
                 is_on_gpu = False
                 component_device = "unknown"
 
-            # log with device-specific info
             if is_on_gpu:
                 logger.info(
                     f"Loaded %s: %s ({source} version). model size: %.2f GB, consumed GPU: %.2f GB, avail GPU mem: %.2f GB",
