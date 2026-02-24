@@ -600,6 +600,40 @@ class OpenAIServingChat(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
+    @staticmethod
+    def _find_suffix_prefix_overlap(lhs: List[int], rhs: List[int]) -> int:
+        """Find max k where lhs[-k:] == rhs[:k]."""
+        max_overlap = min(len(lhs), len(rhs))
+        for overlap in range(max_overlap, 0, -1):
+            if lhs[-overlap:] == rhs[:overlap]:
+                return overlap
+        return 0
+
+    def _merge_stream_output_ids(
+        self,
+        accumulated_ids: List[int],
+        chunk_output_ids: List[int],
+    ) -> None:
+        """Merge stream output ids that can be either cumulative or incremental."""
+        if not chunk_output_ids:
+            return
+
+        if not accumulated_ids:
+            accumulated_ids.extend(chunk_output_ids)
+            return
+
+        # Common cumulative case: current chunk starts from request start.
+        if (
+            len(chunk_output_ids) >= len(accumulated_ids)
+            and chunk_output_ids[: len(accumulated_ids)] == accumulated_ids
+        ):
+            accumulated_ids.extend(chunk_output_ids[len(accumulated_ids) :])
+            return
+
+        # Generic overlap merge (also handles duplicate incremental chunks).
+        overlap = self._find_suffix_prefix_overlap(accumulated_ids, chunk_output_ids)
+        accumulated_ids.extend(chunk_output_ids[overlap:])
+
     async def _generate_chat_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -624,6 +658,8 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        prompt_token_ids = None
+        completion_token_ids_by_index = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -636,6 +672,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                if prompt_token_ids is None:
+                    prompt_token_ids = content["meta_info"].get(
+                        "prompt_token_ids", None
+                    )
+                output_ids = content.get("output_ids", [])
+                acc_ids = completion_token_ids_by_index.setdefault(index, [])
+                self._merge_stream_output_ids(acc_ids, output_ids)
+                # Keep token ids aligned with final completion length (e.g., stop trim).
+                final_len = completion_tokens[index]
+                if len(acc_ids) > final_len:
+                    del acc_ids[final_len:]
 
                 # Handle logprobs
                 finish_reason = content["meta_info"]["finish_reason"]
@@ -823,20 +870,36 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            sglext_kwargs = {}
             if request.return_routed_experts and routed_experts:
                 # Get first non-None routed_experts value
                 first_routed_experts = next(
                     (v for v in routed_experts.values() if v is not None), None
                 )
                 if first_routed_experts is not None:
-                    routed_experts_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+                    sglext_kwargs["routed_experts"] = first_routed_experts
+
+            if request.return_token_ids:
+                completion_token_ids = [
+                    completion_token_ids_by_index.get(i, []) for i in range(request.n)
+                ]
+                sglext_kwargs["completion_token_ids"] = completion_token_ids
+                if prompt_token_ids is not None:
+                    sglext_kwargs["prompt_token_ids"] = prompt_token_ids
+                sglext_kwargs["tokenizer_info"] = {
+                    "model": request.model,
+                    "weight_version": content["meta_info"]["weight_version"],
+                }
+
+            if sglext_kwargs:
+                sglext_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(**sglext_kwargs),
+                )
+                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -903,11 +966,24 @@ class OpenAIServingChat(OpenAIServingBase):
             first_ret, request
         )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
-            response_sglext = SglExt(
-                routed_experts=routed_experts,
-                cached_tokens_details=cached_tokens_details,
+        sglext_kwargs = {}
+        if routed_experts:
+            sglext_kwargs["routed_experts"] = routed_experts
+        if cached_tokens_details:
+            sglext_kwargs["cached_tokens_details"] = cached_tokens_details
+        if request.return_token_ids:
+            sglext_kwargs["prompt_token_ids"] = first_ret["meta_info"].get(
+                "prompt_token_ids", []
             )
+            sglext_kwargs["completion_token_ids"] = [
+                ret_item.get("output_ids", []) for ret_item in ret
+            ]
+            sglext_kwargs["tokenizer_info"] = {
+                "model": request.model,
+                "weight_version": first_ret["meta_info"]["weight_version"],
+            }
+        if sglext_kwargs:
+            response_sglext = SglExt(**sglext_kwargs)
 
         for idx, ret_item in enumerate(ret):
             # Process logprobs
