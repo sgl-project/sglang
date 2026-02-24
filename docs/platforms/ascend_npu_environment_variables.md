@@ -1,6 +1,6 @@
 # Environment Variables
 
-SGLang supports various environment variables related to Ascend Npu that can be used to configure its runtime behavior.
+SGLang supports various environment variables related to Ascend NPU that can be used to configure its runtime behavior.
 This document provides a list of commonly used environment variables and aims to stay updated over time.
 
 ## Directly Used in SGLang
