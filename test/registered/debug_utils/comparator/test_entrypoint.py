@@ -115,7 +115,7 @@ class TestEntrypointGroupingLogical:
     """Test `--grouping logical` scenarios"""
 
     def test_no_dims_single_rank(self, tmp_path, capsys):
-        """Single-rank dumps without dims: load_and_unshard returns raw tensor."""
+        """Single-rank dumps without dims"""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path)
         capsys.readouterr()
