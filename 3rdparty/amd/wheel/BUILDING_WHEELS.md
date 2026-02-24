@@ -4,23 +4,31 @@ Building and releasing sgl-kernel as a wheel is a part of the release workflow. 
 
 # sglang
 
-The patch, `wheel.patch`, describes the difference from the go-to practice `python/pyproject_other.toml` file, to one that enables a wheel build.  This section maintains the build process in short term, and is planned to be automated in the future.
+`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel.  It extends `python/pyproject_other.toml` with two ROCm-version extras (`rocm700`, `rocm720`) that pin the matching torch/triton/torchaudio/torchvision/sgl-kernel wheels, and renames the package to `amd-sglang`.
 
 ## Operation
 
 ```
-$ git clone https://github.com/sgl-project/sglang.git && cd sglang/3rdparty/amd/wheel/sglang
-$ cp ../../../../python/pyproject_other.toml ./pyproject.toml
-$ patch -p1 < wheel.patch
-$ cp 3rdparty/amd/wheel/sglang/pyproject.toml python/ && cd ../../../../python
-$ python -m build
+$ git clone https://github.com/sgl-project/sglang.git && cd sglang
+$ cp 3rdparty/amd/wheel/sglang/pyproject.toml python/pyproject.toml
+$ cd python && python -m build
 ```
 
 ## Installation (Experimental)
 
+ROCm 7.0.0:
 ```
-pip install "amd-sglang[all-hip,diffusion-hip]" -i https://pypi.amd.com/rocm-7.0.0/simple  --extra-index-url https://pypi.org/simple
+pip install "amd-sglang[all-hip,rocm700]" -i https://pypi.amd.com/rocm-7.0.0/simple --extra-index-url https://pypi.org/simple
 ```
+
+ROCm 7.2.0:
+```
+pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
+```
+
+## Resolving Triton
+
+Triton 3.5.1 has a known issue in the ROCm 7.2.0 environment.  Replace the installation following the [ROCm docker recipe](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L472).
 
 ## Resolving AITER
 

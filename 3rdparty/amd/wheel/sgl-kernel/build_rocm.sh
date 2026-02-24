@@ -7,8 +7,6 @@ if [[ "${ROCM_VERSION}" == "700" ]]; then
   IMAGE="lmsysorg/sglang:v0.5.8.post1-rocm700-mi35x"
 elif [[ "${ROCM_VERSION}" == "720" ]]; then
   IMAGE="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
-  echo "NOTE: The support to ROCM_VERSION='${ROCM_VERSION}' is coming soon." >&2
-  exit 1
 else
   echo "ERROR: Unsupported ROCM_VERSION='${ROCM_VERSION}'. Only '700' and '720' are supported." >&2
   exit 1
@@ -29,7 +27,9 @@ docker run --rm \
   bash -c "
   # Install torch, triton, and friends, depending on the ROCm version
   if [[ "${ROCM_VERSION}" == "700" ]]; then
-    pip install https://download.pytorch.org/whl/rocm7.0/torch-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/triton_rocm-3.6.0-cp310-cp310-linux_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchaudio-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchvision-0.25.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl
+    ${PYTHON_ROOT_PATH}/pip install https://download.pytorch.org/whl/rocm7.0/torch-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/triton_rocm-3.6.0-cp310-cp310-linux_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchaudio-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchvision-0.25.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl
+  elif [[ "${ROCM_VERSION}" == "720" ]]; then
+    ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl
   fi
   # Install CMake (version >= 3.26) - Robust Installation
   export CMAKE_VERSION_MAJOR=3.31
