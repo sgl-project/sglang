@@ -20,6 +20,9 @@ class ReorderPlan(_FrozenBase):
     params: ReorderParams
 
 
+_ALLOWED_ZIGZAG_DIM_NAMES: set[str] = {"s"}
+
+
 def compute_reorder_plans(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
@@ -32,6 +35,15 @@ def compute_reorder_plans(
             and spec.ordering != Ordering.NATURAL
             and spec.parallel is not None
         ):
+            if spec.name not in _ALLOWED_ZIGZAG_DIM_NAMES:
+                raise ValueError(
+                    f"Zigzag ordering is only supported on sequence dims "
+                    f"(bshd/sbhd format, dim name must be one of "
+                    f"{sorted(_ALLOWED_ZIGZAG_DIM_NAMES)}), "
+                    f"but got dim name {spec.name!r} in {spec}"
+                )
+
+            assert spec.ordering == Ordering.ZIGZAG
             axis_size: int = parallel_infos[0][spec.parallel].axis_size
             plans.append(
                 ReorderPlan(

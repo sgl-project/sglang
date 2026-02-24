@@ -76,6 +76,20 @@ class TestComputeReorderPlans:
         assert plans[0].params.dim == 1
         assert plans[0].params.cp_size == 2
 
+    def test_compute_reorder_plans_non_seq_dim_raises(self) -> None:
+        """Zigzag on non-sequence dim (e.g. t(cp,zigzag)) raises ValueError."""
+        dim_specs = parse_dims("t(cp,zigzag) h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="only supported on sequence dims"):
+            compute_reorder_plans(
+                dim_specs=dim_specs, parallel_infos=parallel_infos
+            )
+
     def test_compute_reorder_plans_natural(self) -> None:
         """s(cp) and s(cp,natural) produce no reorder plans."""
         for dims_str in ["b s(cp) h(tp)", "b s(cp,natural) h(tp)"]:
