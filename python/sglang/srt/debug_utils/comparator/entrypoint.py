@@ -16,8 +16,7 @@ from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
 
 MatchMode = Literal["smart", "per-rank"]
 
-_NON_KEY_COLS_SMART = {"rank", "dump_index", "filename", "duplicate_index"}
-_NON_KEY_COLS_PER_RANK = {"dump_index", "filename", "duplicate_index"}
+_NON_KEY_COLS = {"dump_index", "filename", "duplicate_index"}
 
 
 def main() -> None:
@@ -50,9 +49,7 @@ def run(args: argparse.Namespace) -> None:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
     match_mode: MatchMode = args.match_mode
 
-    non_key_cols = (
-        _NON_KEY_COLS_SMART if match_mode == "smart" else _NON_KEY_COLS_PER_RANK
-    )
+    non_key_cols = _NON_KEY_COLS | ({"rank"} if match_mode == "smart" else set())
     key_cols = [c for c in df_target.columns if c not in non_key_cols]
     unique_keys = df_target.unique(subset=key_cols)
 
