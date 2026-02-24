@@ -82,9 +82,8 @@ def _compute_plans_for_group(metas: list[dict[str, Any]]) -> list[Plan]:
 
     dim_specs = parse_dims(dims_str)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
-    plan = compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
 
-    return [plan] if plan is not None else []
+    return compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
 
 
 def _extract_tensors(
@@ -105,15 +104,12 @@ def _execute_plans(
             return None
         return tensors[0]
 
-    assert len(plans) <= 1, "multi-plan not supported yet"
-
+    current = tensors
     for plan in plans:
         if isinstance(plan, UnshardPlan):
-            # TODO: incorrect `tensors_by_world_rank` if multi UnshardPlan
-            tensors = execute_unshard_plan(
-                plan, tensors_by_world_rank=dict(enumerate(tensors))
-            )
+            current = execute_unshard_plan(plan, current)
         else:
             raise NotImplementedError(f"Unknown {plan=}")
 
-    return tensors
+    assert len(current) == 1
+    return current[0]

@@ -27,7 +27,7 @@ UnshardParams = ConcatParams
 class UnshardPlan(_FrozenBase):
     axis: ParallelAxis
     params: UnshardParams
-    world_ranks_by_axis_rank: list[int]
+    groups: list[list[int]]
 
 
 # Union of all plan types. Future pipeline components (e.g. reduction,
