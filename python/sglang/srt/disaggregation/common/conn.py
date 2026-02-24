@@ -86,7 +86,7 @@ class CommonKVManager(BaseKVManager):
         self.attn_dp_rank = get_attention_dp_rank()
         # For MLA + CP prefill, a single authoritative CP rank per attn-TP rank
         # is enough because KV is already rebuilt to full sequence on each CP rank.
-        self.should_register_prefill = not (
+        self.skip_register_prefill = (
             disaggregation_mode == DisaggregationMode.PREFILL
             and is_mla_backend
             and self.attn_cp_size > 1
@@ -115,7 +115,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if self.should_register_prefill:
+            if not self.skip_register_prefill:
                 self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
@@ -308,13 +308,13 @@ class CommonKVSender(BaseKVSender):
         initial_status = KVPoll.Bootstrapping
         if (
             self.kv_mgr.disaggregation_mode == DisaggregationMode.PREFILL
-            and not self.kv_mgr.should_register_prefill
+            and self.kv_mgr.skip_register_prefill
         ):
             # Non-authoritative CP ranks are dummy participants.
             initial_status = KVPoll.WaitingForInput
         self.kv_mgr.update_status(self.bootstrap_room, initial_status)
         if (
-            self.kv_mgr.should_register_prefill
+            not self.kv_mgr.skip_register_prefill
             and self.kv_mgr.server_args.dp_size > 1
             and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
         ):
