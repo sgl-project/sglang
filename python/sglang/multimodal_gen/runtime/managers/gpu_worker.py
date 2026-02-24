@@ -232,14 +232,27 @@ class GPUWorker:
             # Inject step_emit_fn for real-time streaming (dynamic attribute, not pickled)
             if req.stream_steps and self.streaming_push_fn is not None:
                 push_fn = self.streaming_push_fn
+                server_args = self.server_args
+                # Capture decode function once to avoid repeated get_stage calls per step
+                decoding_stage = (
+                    self.pipeline.get_stage("decoding_stage")
+                    if req.stream_decode_latents
+                    else None
+                )
 
                 def step_emit_fn(step_index, total_steps, latents, timestep, is_final):
+                    frames = None
+                    if decoding_stage is not None:
+                        frames = decoding_stage.decode(
+                            latents, server_args
+                        )  # returns CPU float32
                     partial = PartialOutputBatch(
                         request_id=req.request_id,
                         step_index=step_index,
                         total_steps=total_steps,
                         timestep=timestep,
-                        latents=latents,
+                        latents=latents.cpu(),  # move to CPU here
+                        frames=frames,
                         is_final=is_final,
                     )
                     push_fn(partial)

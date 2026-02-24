@@ -142,6 +142,7 @@ class Req:
     # Streaming parameters (step_emit_fn is set dynamically in gpu_worker, NOT pickled)
     stream_steps: bool = False
     stream_every_n_steps: int = 5
+    stream_decode_latents: bool = False  # decode and stream pixel frames at each step
 
     # TeaCache parameters
     teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
@@ -353,4 +354,7 @@ class PartialOutputBatch:
     total_steps: int
     timestep: int
     latents: torch.Tensor | None = None  # CPU tensor, raw latents
+    frames: torch.Tensor | None = (
+        None  # CPU float32, decoded pixel frames [B,C,T,H,W] or [B,C,H,W]
+    )
     is_final: bool = False

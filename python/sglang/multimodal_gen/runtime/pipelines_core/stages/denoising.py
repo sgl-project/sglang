@@ -1109,7 +1109,7 @@ class DenoisingStage(PipelineStage):
                                 batch.step_emit_fn(
                                     step_index=i,
                                     total_steps=num_timesteps,
-                                    latents=latents.detach().cpu(),
+                                    latents=latents.detach(),  # GPU tensor — closure moves to CPU
                                     timestep=t_int,
                                     is_final=is_last_step,
                                 )

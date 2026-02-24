@@ -281,6 +281,7 @@ class DiffGenerator:
         self,
         sampling_params_kwargs: dict | None = None,
         stream_every_n_steps: int = 5,
+        stream_decode_latents: bool = False,
     ) -> Generator[Any, None, None]:
         """
         Stream intermediate latents during diffusion generation.
@@ -288,6 +289,13 @@ class DiffGenerator:
         Yields PartialOutputBatch at each emitted step. The final yielded
         PartialOutputBatch has is_final=True. The raw OutputBatch from the
         scheduler is discarded (use generate() if you need it).
+
+        Args:
+            sampling_params_kwargs: Sampling parameters including prompt.
+            stream_every_n_steps: Emit a partial result every N denoising steps.
+            stream_decode_latents: If True, decode latents to pixel-space frames at each
+                emitted step. Adds VAE decode overhead per step (~100ms for images,
+                ~2s for video). Only practical for image models or few-step video models.
         """
         sampling_params_kwargs = sampling_params_kwargs or {}
         prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
@@ -305,6 +313,7 @@ class DiffGenerator:
             )
             req.stream_steps = True
             req.stream_every_n_steps = stream_every_n_steps
+            req.stream_decode_latents = stream_decode_latents
 
             yield from sync_scheduler_client.generate_streaming([req])
 
