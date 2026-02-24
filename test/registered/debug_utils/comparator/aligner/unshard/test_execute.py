@@ -6,11 +6,15 @@ import torch
 from sglang.srt.debug_utils.comparator.aligner.unshard.executor import (
     _apply_unshard,
     execute_unshard_plan,
+    verify_replicated_groups,
 )
 from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
     compute_unshard_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.types import AxisInfo
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
+    AxisInfo,
+    PickParams,
+)
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -29,9 +33,10 @@ class TestExecuteUnshardPlan:
         plans = compute_unshard_plan(dim_specs, parallel_infos)
         assert len(plans) == 1
 
-        result = execute_unshard_plan(plans[0], shards)
+        result, warnings = execute_unshard_plan(plans[0], shards)
         assert len(result) == 1
         assert torch.allclose(result[0], full_tensor)
+        assert warnings == []
 
     def test_scrambled_world_ranks_correct_result(self) -> None:
         full_tensor = torch.randn(4, 8)
@@ -54,9 +59,10 @@ class TestExecuteUnshardPlan:
             shards[1],  # world_rank=3, axis_rank=1
         ]
 
-        result = execute_unshard_plan(plans[0], tensors_ordered_by_world_rank)
+        result, warnings = execute_unshard_plan(plans[0], tensors_ordered_by_world_rank)
         assert len(result) == 1
         assert torch.allclose(result[0], full_tensor)
+        assert warnings == []
 
     def test_single_step_reduces_tensor_count(self) -> None:
         """8 tensors with 2 groups of 4 produce 2 output tensors."""
@@ -85,10 +91,10 @@ class TestExecuteUnshardPlan:
             for tp_rank in range(4):
                 tensors.append(source[tp_rank])
 
-        intermediate = execute_unshard_plan(plans[0], tensors)
+        intermediate, _ = execute_unshard_plan(plans[0], tensors)
         assert len(intermediate) == 4
 
-        final = execute_unshard_plan(plans[1], intermediate)
+        final, _ = execute_unshard_plan(plans[1], intermediate)
         assert len(final) == 1
 
     def test_cp_tp_concat(self) -> None:
@@ -116,7 +122,7 @@ class TestExecuteUnshardPlan:
 
         current = tensors
         for plan in plans:
-            current = execute_unshard_plan(plan, current)
+            current, _ = execute_unshard_plan(plan, current)
 
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
@@ -157,7 +163,7 @@ class TestExecuteUnshardPlan:
 
         current = tensors
         for plan in plans:
-            current = execute_unshard_plan(plan, current)
+            current, _ = execute_unshard_plan(plan, current)
 
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
@@ -169,7 +175,7 @@ class TestExecuteUnshardPlan:
             pass
 
         with pytest.raises(ValueError, match="Unsupported unshard"):
-            _apply_unshard(_FakeParams(), [torch.randn(2, 2)])
+            _apply_unshard(_FakeParams(), [torch.randn(2, 2)], axis=ParallelAxis.TP)
 
     def test_cp_tp_ep_three_axis_concat(self) -> None:
         """CP=2 + TP=2 + EP=2: three-step unshard reconstructs original tensor."""
@@ -205,7 +211,7 @@ class TestExecuteUnshardPlan:
 
         current = tensors
         for plan in plans:
-            current = execute_unshard_plan(plan, current)
+            current, _ = execute_unshard_plan(plan, current)
 
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
@@ -253,10 +259,191 @@ class TestExecuteUnshardPlan:
 
         current = tensors
         for plan in plans:
-            current = execute_unshard_plan(plan, current)
+            current, _ = execute_unshard_plan(plan, current)
 
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
+
+
+class TestPickOperation:
+    def test_pick_single_group(self) -> None:
+        """PickParams picks the first tensor from a single group."""
+        tensor = torch.randn(4, 8)
+        dim_specs = parse_dims("h d")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+        assert isinstance(plans[0].params, PickParams)
+
+        result, warnings = execute_unshard_plan(plans[0], [tensor, tensor.clone()])
+        assert len(result) == 1
+        assert torch.allclose(result[0], tensor)
+        assert warnings == []
+
+    def test_pick_multiple_groups(self) -> None:
+        """PickParams with multiple groups picks one from each."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
+        assert len(pick_plans) == 1
+        assert pick_plans[0].axis == ParallelAxis.CP
+
+        tensor = torch.randn(4)
+        tensors = [tensor.clone() for _ in range(4)]
+
+        result, warnings = execute_unshard_plan(pick_plans[0], tensors)
+        assert len(result) == 2
+        assert warnings == []
+
+    def test_replicated_tp_sharded_cp_e2e(self) -> None:
+        """CP2 TP2, dims='b s(cp) d': replicated TP pick + sharded CP concat round-trip."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+        cp_chunks = list(full_tensor.chunk(2, dim=1))
+
+        tensors: list[torch.Tensor] = []
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for tp_rank in range(2):
+                tensors.append(cp_chunks[cp_rank].clone())
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                    }
+                )
+
+        dim_specs = parse_dims("b s(cp) d")
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 2
+
+        current = tensors
+        for plan in plans:
+            current, _ = execute_unshard_plan(plan, current)
+
+        assert len(current) == 1
+        assert torch.allclose(current[0], full_tensor)
+
+    def test_fully_replicated_e2e(self) -> None:
+        """CP2 TP2, dims='b h d': fully replicated → 2 pick steps → 1 tensor."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        tensors: list[torch.Tensor] = []
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for tp_rank in range(2):
+                tensors.append(full_tensor.clone())
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                    }
+                )
+
+        dim_specs = parse_dims("b h d")
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 2
+        assert all(isinstance(p.params, PickParams) for p in plans)
+
+        current = tensors
+        for plan in plans:
+            current, _ = execute_unshard_plan(plan, current)
+
+        assert len(current) == 1
+        assert torch.allclose(current[0], full_tensor)
+
+
+class TestVerifyReplicatedGroups:
+    def test_warns_on_mismatch(self) -> None:
+        """verify_replicated_groups produces warning when replicas differ."""
+        dim_specs = parse_dims("h d")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+        assert isinstance(plans[0].params, PickParams)
+
+        tensor_a = torch.ones(4)
+        tensor_b = torch.ones(4) + 0.1
+
+        warnings = verify_replicated_groups(plan=plans[0], tensors=[tensor_a, tensor_b])
+        assert len(warnings) == 1
+        assert warnings[0].axis == "tp"
+        assert warnings[0].group_index == 0
+        assert warnings[0].max_abs_diff == pytest.approx(0.1, abs=1e-5)
+
+    def test_no_warn_when_identical(self) -> None:
+        """verify_replicated_groups produces no warning for identical replicas."""
+        dim_specs = parse_dims("h d")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+
+        tensor = torch.randn(4, 8)
+        warnings = verify_replicated_groups(
+            plan=plans[0], tensors=[tensor, tensor.clone()]
+        )
+        assert warnings == []
+
+    def test_no_warn_for_concat_plan(self) -> None:
+        """verify_replicated_groups returns empty for non-PickParams plans."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+
+        tensors = [torch.randn(4), torch.randn(4)]
+        warnings = verify_replicated_groups(plan=plans[0], tensors=tensors)
+        assert warnings == []
+
+    def test_execute_returns_warnings(self) -> None:
+        """execute_unshard_plan returns warnings for replicated mismatch."""
+        dim_specs = parse_dims("h d")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+
+        tensor_a = torch.zeros(4)
+        tensor_b = torch.ones(4)
+
+        result, warnings = execute_unshard_plan(plans[0], [tensor_a, tensor_b])
+        assert len(result) == 1
+        assert len(warnings) == 1
+        assert torch.allclose(result[0], tensor_a)
 
 
 if __name__ == "__main__":

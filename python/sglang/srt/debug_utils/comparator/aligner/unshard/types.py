@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal, Union
+
+from pydantic import Field
 
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
@@ -16,7 +18,14 @@ class ConcatParams(_FrozenBase):
     dim: int
 
 
-UnshardParams = ConcatParams
+class PickParams(_FrozenBase):
+    op: Literal["pick"] = "pick"
+
+
+UnshardParams = Annotated[
+    Union[ConcatParams, PickParams],
+    Field(discriminator="op"),
+]
 
 
 class UnshardPlan(_FrozenBase):
