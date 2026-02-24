@@ -40,7 +40,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    PartialOutputBatch,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
@@ -72,6 +75,7 @@ class GPUWorker:
         rank: int,
         master_port: int,
         server_args: ServerArgs,
+        streaming_push_fn=None,
     ):
         self.local_rank = local_rank
         self.rank = rank
@@ -79,6 +83,7 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.streaming_push_fn = streaming_push_fn
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -223,6 +228,24 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
+
+            # Inject step_emit_fn for real-time streaming (dynamic attribute, not pickled)
+            if req.stream_steps and self.streaming_push_fn is not None:
+                push_fn = self.streaming_push_fn
+
+                def step_emit_fn(step_index, total_steps, latents, timestep, is_final):
+                    partial = PartialOutputBatch(
+                        request_id=req.request_id,
+                        step_index=step_index,
+                        total_steps=total_steps,
+                        timestep=timestep,
+                        latents=latents,
+                        is_final=is_final,
+                    )
+                    push_fn(partial)
+
+                req.step_emit_fn = step_emit_fn
+
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):

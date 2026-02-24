@@ -336,6 +336,7 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    streaming_port: int | None = None
 
     output_path: str | None = "outputs/"
 
@@ -497,6 +498,8 @@ class ServerArgs:
             random.randint(0, 100) if self.scheduler_port == 5555 else 0
         )
         self.scheduler_port = self.settle_port(initial_scheduler_port)
+        if self.streaming_port is None:
+            self.streaming_port = self.settle_port(self.scheduler_port + 1)
         initial_master_port = (
             self.master_port
             if self.master_port is not None
@@ -847,6 +850,12 @@ class ServerArgs:
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--streaming-port",
+            type=int,
+            default=ServerArgs.streaming_port,
+            help="Port for the ZMQ PUB streaming socket (real-time diffusion). Auto-assigned if not set.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -933,6 +942,11 @@ class ServerArgs:
         if scheduler_host is None or scheduler_host == "localhost":
             scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
+
+    @property
+    def streaming_endpoint(self) -> str:
+        """ZMQ PUB endpoint for real-time diffusion streaming."""
+        return f"tcp://127.0.0.1:{self.streaming_port}"
 
     def settle_port(
         self, port: int, port_inc: int = 42, max_attempts: int = 100

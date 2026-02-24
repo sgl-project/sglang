@@ -11,7 +11,7 @@ diffusion models.
 import multiprocessing as mp
 import os
 import time
-from typing import Any, List, Union
+from typing import Any, Generator, List, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -273,6 +273,36 @@ class DiffGenerator:
         if not results:
             return None
         return results[0] if len(results) == 1 else results
+
+    def generate_streaming(
+        self,
+        sampling_params_kwargs: dict | None = None,
+        stream_every_n_steps: int = 5,
+    ) -> Generator[Any, None, None]:
+        """
+        Stream intermediate latents during diffusion generation.
+
+        Yields PartialOutputBatch at each emitted step. The final yielded
+        PartialOutputBatch has is_final=True. The raw OutputBatch from the
+        scheduler is discarded (use generate() if you need it).
+        """
+        sampling_params_kwargs = sampling_params_kwargs or {}
+        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
+        )
+
+        for p in prompts:
+            sampling_params.prompt = p
+            req = prepare_request(
+                server_args=self.server_args, sampling_params=sampling_params
+            )
+            req.stream_steps = True
+            req.stream_every_n_steps = stream_every_n_steps
+
+            yield from sync_scheduler_client.generate_streaming([req])
 
     def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
         """Collect prompts from the argument or from a prompt file."""

@@ -1,5 +1,5 @@
 import pickle
-from typing import Any
+from typing import Any, Generator
 
 import zmq
 import zmq.asyncio
@@ -85,6 +85,41 @@ class SchedulerClient:
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
+
+    def generate_streaming(self, batch: Any) -> Generator[Any, None, Any]:
+        """
+        Sends a streaming request and yields PartialOutputBatch objects as they arrive.
+        The final PartialOutputBatch has is_final=True.
+        After the generator is exhausted, the final OutputBatch is available via
+        the generator's return value (StopIteration.value).
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+            PartialOutputBatch,
+        )
+
+        req = batch[0] if isinstance(batch, list) else batch
+        sub_socket = self.context.socket(zmq.SUB)
+        sub_socket.setsockopt(zmq.LINGER, 0)
+        sub_socket.setsockopt_string(zmq.SUBSCRIBE, req.request_id)
+        sub_socket.setsockopt(zmq.RCVTIMEO, 6_000_000)  # 100 minutes
+        sub_socket.connect(self.server_args.streaming_endpoint)
+
+        try:
+            self.scheduler_socket.send_pyobj(batch)
+
+            while True:
+                try:
+                    topic, payload = sub_socket.recv_multipart(zmq.NOBLOCK)
+                    partial: PartialOutputBatch = pickle.loads(payload)
+                    yield partial
+                    if partial.is_final:
+                        break
+                except zmq.Again:
+                    pass  # No streaming message yet; keep polling
+
+            return self.scheduler_socket.recv_pyobj()
+        finally:
+            sub_socket.close()
 
     def ping(self) -> bool:
         """

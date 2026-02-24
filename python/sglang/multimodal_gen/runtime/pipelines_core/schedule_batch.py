@@ -139,6 +139,10 @@ class Req:
 
     is_warmup: bool = False
 
+    # Streaming parameters (step_emit_fn is set dynamically in gpu_worker, NOT pickled)
+    stream_steps: bool = False
+    stream_every_n_steps: int = 5
+
     # TeaCache parameters
     teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
 
@@ -335,3 +339,18 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+
+@dataclass
+class PartialOutputBatch:
+    """
+    Intermediate output emitted during the denoising loop for real-time streaming.
+    Published via ZMQ PUB socket with topic = request_id.
+    """
+
+    request_id: str
+    step_index: int
+    total_steps: int
+    timestep: int
+    latents: torch.Tensor | None = None  # CPU tensor, raw latents
+    is_final: bool = False

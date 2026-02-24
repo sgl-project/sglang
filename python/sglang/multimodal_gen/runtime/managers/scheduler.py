@@ -28,7 +28,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    PartialOutputBatch,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -72,14 +75,30 @@ class Scheduler:
                 self.context, zmq.ROUTER, endpoint, True
             )
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+
+            # PUB socket for real-time streaming of intermediate latents
+            self.streaming_socket = self.context.socket(zmq.PUB)
+            streaming_endpoint = server_args.streaming_endpoint
+            self.streaming_socket.bind(streaming_endpoint)
+            logger.info(f"Streaming socket bound at {streaming_endpoint}")
+
+            def streaming_push_fn(partial_batch: PartialOutputBatch):
+                topic = partial_batch.request_id.encode()
+                self.streaming_socket.send_multipart(
+                    [topic, pickle.dumps(partial_batch)]
+                )
+
         else:
             self.receiver = None
+            self.streaming_socket = None
+            streaming_push_fn = None
 
         worker = GPUWorker(
             local_rank=gpu_id,
             master_port=port_args.master_port,
             rank=gpu_id,
             server_args=server_args,
+            streaming_push_fn=streaming_push_fn,
         )
         self.worker = worker
         self.task_pipes_to_slaves = task_pipes_to_slaves
@@ -419,6 +438,8 @@ class Scheduler:
 
         if self.receiver is not None:
             self.receiver.close()
+        if self.streaming_socket is not None:
+            self.streaming_socket.close()
         self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:

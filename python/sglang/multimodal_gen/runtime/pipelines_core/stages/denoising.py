@@ -1102,6 +1102,18 @@ class DenoisingStage(PipelineStage):
                             trajectory_timesteps.append(t_host)
                             trajectory_latents.append(latents)
 
+                        # Emit streaming partial result if requested
+                        if getattr(batch, "step_emit_fn", None) is not None:
+                            is_last_step = i == num_timesteps - 1
+                            if is_last_step or (i % batch.stream_every_n_steps == 0):
+                                batch.step_emit_fn(
+                                    step_index=i,
+                                    total_steps=num_timesteps,
+                                    latents=latents.detach().cpu(),
+                                    timestep=t_int,
+                                    is_final=is_last_step,
+                                )
+
                         # Update progress bar
                         if i == num_timesteps - 1 or (
                             (i + 1) > num_warmup_steps
