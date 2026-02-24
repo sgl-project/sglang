@@ -57,7 +57,6 @@ def run(args: argparse.Namespace) -> None:
             baseline_filenames=[r["filename"] for r in baseline_rows],
             target_filenames=[r["filename"] for r in target_rows],
             args=args,
-            counts=counts,
         )
         counts[record.category] += 1
         print_record(record, output_format=args.output_format)
