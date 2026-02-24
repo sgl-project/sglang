@@ -885,7 +885,12 @@ class ServerArgs:
 
     def _handle_npu_backends(self):
         if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+            from sglang.srt.hardware_backend.npu.utils import (
+                init_npu_backend,
+                set_default_server_args,
+            )
+
+            init_npu_backend()
 
             set_default_server_args(self)
 
