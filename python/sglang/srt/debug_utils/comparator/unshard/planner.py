@@ -26,23 +26,23 @@ def compute_unshard_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded: dict[ParallelAxis, tuple[int, DimSpec]] = {
+    sharded_axis_infos: dict[ParallelAxis, tuple[int, DimSpec]] = {
         spec.parallel: (dim_idx, spec)
         for dim_idx, spec in enumerate(dim_specs)
         if spec.parallel is not None
     }
-    if not sharded:
+    if not sharded_axis_infos:
         return []
 
-    _validate(sharded_axes=set(sharded), parallel_infos=parallel_infos)
+    _validate(sharded_axes=set(sharded_axis_infos), parallel_infos=parallel_infos)
 
     current_coords: _CoordsList = [
-        {axis: info[axis].axis_rank for axis in sharded}
+        {axis: info[axis].axis_rank for axis in sharded_axis_infos}
         for info in parallel_infos
     ]
 
     plans: list[UnshardPlan] = []
-    for axis, (dim_index, spec) in sharded.items():
+    for axis, (dim_index, spec) in sharded_axis_infos.items():
         result = _group_and_project(
             current_coords=current_coords,
             target_axis=axis,
