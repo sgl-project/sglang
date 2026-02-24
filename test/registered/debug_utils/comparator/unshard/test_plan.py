@@ -14,13 +14,12 @@ class TestComputeUnshardPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
         parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
-        plan = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
 
-        assert len(plan.steps) == 1
-        step = plan.steps[0]
-        assert step.axis == ParallelAxis.TP
-        assert step.params.dim == 2
-        assert step.world_ranks_by_axis_rank == [0, 1, 2, 3]
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.TP
+        assert plans[0].params.dim == 2
+        assert plans[0].world_ranks_by_axis_rank == [0, 1, 2, 3]
 
     def test_inconsistent_axis_size_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
@@ -51,8 +50,8 @@ class TestComputeUnshardPlan:
             {"tp": AxisInfo(axis_rank=3, axis_size=4)},
             {"tp": AxisInfo(axis_rank=1, axis_size=4)},
         ]
-        plan = compute_unshard_plan(dim_specs, parallel_infos)
-        assert plan.steps[0].world_ranks_by_axis_rank == [1, 3, 0, 2]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert plans[0].world_ranks_by_axis_rank == [1, 3, 0, 2]
 
 
 if __name__ == "__main__":

@@ -6,16 +6,16 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
     ConcatParams,
     UnshardParams,
     UnshardPlan,
-    UnshardStep,
 )
 
 
 def compute_unshard_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[str, AxisInfo]],
-) -> UnshardPlan:
-    """Compute an unshard plan from dim specs and per-rank parallel info.
+) -> list[UnshardPlan]:
+    """Compute unshard plans from dim specs and per-rank parallel info.
 
+    Returns one UnshardPlan per sharded axis.
     Pure computation — does not load tensor data.
     Validates axis_size consistency and axis_rank coverage.
     """
@@ -27,7 +27,7 @@ def compute_unshard_plan(
         if spec.parallel is not None:
             sharded_axes[spec.parallel.value] = (dim_idx, spec)
 
-    steps: list[UnshardStep] = []
+    plans: list[UnshardPlan] = []
     for axis_name, (dim_idx, spec) in sharded_axes.items():
         expected_size: Optional[int] = None
         rank_to_world: dict[int, int] = {}
@@ -58,8 +58,8 @@ def compute_unshard_plan(
                 f"got {sorted(rank_to_world.keys())}, expected 0..{expected_size - 1}"
             )
 
-        steps.append(
-            UnshardStep(
+        plans.append(
+            UnshardPlan(
                 axis=spec.parallel,
                 params=_resolve_unshard_params(spec=spec, dim_index=dim_idx),
                 world_ranks_by_axis_rank=[
@@ -68,7 +68,7 @@ def compute_unshard_plan(
             )
         )
 
-    return UnshardPlan(steps=steps)
+    return plans
 
 
 def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnshardParams:

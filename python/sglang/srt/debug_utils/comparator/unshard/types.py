@@ -24,11 +24,12 @@ class ConcatParams(_FrozenBase):
 UnshardParams = ConcatParams
 
 
-class UnshardStep(_FrozenBase):
+class UnshardPlan(_FrozenBase):
     axis: ParallelAxis
     params: UnshardParams
     world_ranks_by_axis_rank: list[int]
 
 
-class UnshardPlan(_FrozenBase):
-    steps: list[UnshardStep] = []
+# Union of all plan types. Future pipeline components (e.g. reduction,
+# reordering) will add their own plan types here.
+Plan = UnshardPlan

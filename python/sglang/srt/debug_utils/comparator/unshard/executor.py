@@ -5,7 +5,6 @@ import torch
 from sglang.srt.debug_utils.comparator.unshard.types import (
     ConcatParams,
     UnshardPlan,
-    UnshardStep,
 )
 
 
@@ -14,36 +13,36 @@ def unshard_concat(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
 
 
 def execute_unshard_plan(
-    plan: UnshardPlan,
+    plans: list[UnshardPlan],
     tensors_by_world_rank: dict[int, torch.Tensor],
 ) -> torch.Tensor:
-    """Execute an unshard plan on actual tensor data.
+    """Execute unshard plans on actual tensor data.
 
     Concatenation order is strictly by axis_rank (not world_rank).
     """
-    if not plan.steps:
+    if not plans:
         if len(tensors_by_world_rank) == 1:
             return next(iter(tensors_by_world_rank.values()))
         raise ValueError(
-            f"No unshard steps but got {len(tensors_by_world_rank)} tensors"
+            f"No unshard plans but got {len(tensors_by_world_rank)} tensors"
         )
 
     axis_rank_lookup: dict[int, dict[int, int]] = {
-        id(step): {wr: i for i, wr in enumerate(step.world_ranks_by_axis_rank)}
-        for step in plan.steps
+        id(plan): {wr: i for i, wr in enumerate(plan.world_ranks_by_axis_rank)}
+        for plan in plans
     }
 
     current_tensors = dict(tensors_by_world_rank)
 
-    for step in plan.steps:
+    for plan in plans:
         groups: dict[tuple, dict[int, torch.Tensor]] = defaultdict(dict)
 
         for world_rank, tensor in current_tensors.items():
             group_key = tuple(
                 sorted(
-                    (s.axis.value, axis_rank_lookup[id(s)].get(world_rank, -1))
-                    for s in plan.steps
-                    if s is not step
+                    (p.axis.value, axis_rank_lookup[id(p)].get(world_rank, -1))
+                    for p in plans
+                    if p is not plan
                 )
             )
             groups[group_key][world_rank] = tensor
@@ -51,14 +50,14 @@ def execute_unshard_plan(
         new_tensors: dict[int, torch.Tensor] = {}
         for members in groups.values():
             ordered = [
-                members[wr] for wr in step.world_ranks_by_axis_rank if wr in members
+                members[wr] for wr in plan.world_ranks_by_axis_rank if wr in members
             ]
             if not ordered:
                 continue
 
-            merged = _execute_step(step, ordered)
+            merged = _apply_unshard(plan, ordered)
             representative_rank = next(
-                wr for wr in step.world_ranks_by_axis_rank if wr in members
+                wr for wr in plan.world_ranks_by_axis_rank if wr in members
             )
             new_tensors[representative_rank] = merged
 
@@ -70,10 +69,10 @@ def execute_unshard_plan(
     return next(iter(current_tensors.values()))
 
 
-def _execute_step(
-    step: UnshardStep, ordered_tensors: list[torch.Tensor]
+def _apply_unshard(
+    plan: UnshardPlan, ordered_tensors: list[torch.Tensor]
 ) -> torch.Tensor:
-    params = step.params
+    params = plan.params
     if isinstance(params, ConcatParams):
         return unshard_concat(ordered_tensors, dim=params.dim)
     # Phase 2: ReduceSumParams, CpZigzagParams

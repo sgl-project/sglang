@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
     normalize_parallel_info,
 )
 from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.types import UnshardPlan
+from sglang.srt.debug_utils.comparator.unshard.types import Plan, UnshardPlan
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 
@@ -31,13 +31,13 @@ def process_tensor_group(
     b_tensors = _load_tensors(baseline_filenames, Path(args.baseline_path))
     t_tensors = _load_tensors(target_filenames, Path(args.target_path))
 
-    b_plan, t_plan = _compute_plans(
+    b_plans, t_plans = _compute_plans(
         baseline_metas=[item.meta for item in b_tensors],
         target_metas=[item.meta for item in t_tensors],
     )
 
-    b_tensor = _execute_plan(b_tensors, b_plan)
-    t_tensor = _execute_plan(t_tensors, t_plan)
+    b_tensor = _execute_plans(b_tensors, b_plans)
+    t_tensor = _execute_plans(t_tensors, t_plans)
     del b_tensors, t_tensors
 
     if b_tensor is None or t_tensor is None:
@@ -68,7 +68,7 @@ def _compute_plans(
     *,
     baseline_metas: list[dict[str, Any]],
     target_metas: list[dict[str, Any]],
-) -> tuple[Optional[UnshardPlan], Optional[UnshardPlan]]:
+) -> tuple[list[Plan], list[Plan]]:
     """Compute plans for both sides from metadata only.
 
     This function deliberately takes metadata dicts, not tensors or
@@ -84,27 +84,27 @@ def _compute_plans(
     )
 
 
-def _compute_single_plan(metas: list[dict[str, Any]]) -> Optional[UnshardPlan]:
+def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
     if not metas or len(metas) == 1:
-        return None
+        return []
 
     dims_str = metas[0].get("dims")
     if dims_str is None:
-        return None
+        return []
 
     dim_specs = parse_dims(dims_str)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
     return compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
 
 
-def _execute_plan(
+def _execute_plans(
     loaded: list[ValueWithMeta],
-    plan: Optional[UnshardPlan],
+    plans: list[Plan],
 ) -> Optional[torch.Tensor]:
     if not loaded:
         return None
 
-    if plan is None:
+    if not plans:
         if len(loaded) != 1:
             return None
         value = loaded[0].value
@@ -112,10 +112,12 @@ def _execute_plan(
             return None
         return value
 
+    unshard_plans = [p for p in plans if isinstance(p, UnshardPlan)]
+
     tensors_by_index: dict[int, torch.Tensor] = {}
     for i, item in enumerate(loaded):
         if not isinstance(item.value, torch.Tensor):
             return None
         tensors_by_index[i] = item.value
 
-    return execute_unshard_plan(plan, tensors_by_index)
+    return execute_unshard_plan(unshard_plans, tensors_by_index)
