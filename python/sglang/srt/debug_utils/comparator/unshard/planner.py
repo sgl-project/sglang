@@ -102,7 +102,9 @@ def _group_and_project(
     target_axis: ParallelAxis,
 ) -> _GroupResult:
     """Group tensors by other-axes coords, sort within group by target_axis rank."""
-    # buckets[other_axes_coords] = [(axis_rank, tensor_index), ...]
+    # buckets[coords_excluding_target] = [(axis_rank, tensor_index), ...]
+    # e.g. when target_axis=CP: buckets[{(TP,0)}] = [(0, 1), (1, 3)]
+    #   means tensor 1 (CP rank 0) and tensor 3 (CP rank 1) share TP rank 0
     buckets: dict[frozenset, list[tuple[int, int]]] = defaultdict(list)
 
     for idx, coords in enumerate(current_coords):
