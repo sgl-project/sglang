@@ -25,14 +25,12 @@ def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
 
     result: dict[str, AxisInfo] = {}
     for prefix in _AXIS_PREFIXES:
-        rank_key = f"{prefix}_rank"
-        size_key = f"{prefix}_size"
-        if rank_key in info and size_key in info:
-            axis_size = info[size_key]
-            if axis_size > 1:
-                result[prefix] = AxisInfo(
-                    axis_rank=info[rank_key],
-                    axis_size=axis_size,
-                )
+        axis_rank = info.get(f"{prefix}_rank")
+        axis_size = info.get(f"{prefix}_size")
+        if axis_size > 1:
+            result[prefix] = AxisInfo(
+                axis_rank=axis_rank,
+                axis_size=axis_size,
+            )
 
     return result
