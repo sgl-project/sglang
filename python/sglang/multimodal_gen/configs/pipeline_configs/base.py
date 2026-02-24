@@ -352,6 +352,9 @@ class PipelineConfig:
 
         # Pad to next multiple of SP degree if needed
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            logger.debug(
+                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            )
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
                 (*latents.shape[:2], pad_len, *latents.shape[3:]),
@@ -596,6 +599,12 @@ class PipelineConfig:
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        if vae_path is None:
+            component_paths = kwargs.get(
+                prefix_with_dot + "component_paths"
+            ) or kwargs.get("component_paths")
+            if isinstance(component_paths, dict):
+                vae_path = component_paths.get("vae")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (

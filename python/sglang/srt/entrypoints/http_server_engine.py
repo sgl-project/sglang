@@ -108,6 +108,7 @@ class HttpServerEngineAdapter(EngineBase):
         token_ids_logprob=None,
         lora_path=None,
         custom_logit_processor=None,
+        priority=None,
     ):
         payload = {
             "text": prompt,
@@ -120,6 +121,7 @@ class HttpServerEngineAdapter(EngineBase):
             "token_ids_logprob": token_ids_logprob,
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
+            "priority": priority,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}

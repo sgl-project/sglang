@@ -72,7 +72,7 @@ global_workspace_buffer = None
 
 # Control whether to use fused metadata copy kernel (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
-_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get()
+_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
 # Control whether to verify fused metadata copy against individual copies (default: disabled)
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification

@@ -46,12 +46,17 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
     _launch_subprocesses,
     init_tokenizer_manager,
@@ -88,6 +93,9 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.openai.serving_transcription import (
+    OpenAIServingTranscription,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -99,6 +107,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -292,9 +301,17 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
     )
+    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
+        _global_state.tokenizer_manager
+    )
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+
+    # Initialize Anthropic-compatible serving handler
+    fast_api_app.state.anthropic_serving = AnthropicServing(
+        fast_api_app.state.openai_serving_chat
+    )
 
     # Launch tool server
     tool_server = None
@@ -616,6 +633,22 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+# Do not import `dumper.py` to avoid dependency
+if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
+
+    @app.api_route("/dumper/{method}", methods=["POST"])
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
+    async def _dumper_control_handler(method: str, request: Request):
+        body_bytes = await request.body()
+        body = await request.json() if body_bytes else {}
+        obj = DumperControlReqInput(method=method, body=body)
+        results = await _global_state.tokenizer_manager.dumper_control(obj)
+        if any(not r.success for r in results):
+            errors = [r.error for r in results if not r.success]
+            return ORJSONResponse(status_code=400, content={"error": errors})
+        return [x for result in results for x in result.response]
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -1391,6 +1424,38 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     )
 
 
+@app.post("/v1/audio/transcriptions")
+async def openai_v1_audio_transcriptions(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(default="default"),
+    language: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    temperature: float = Form(default=0.0),
+    stream: bool = Form(default=False),
+):
+    """OpenAI-compatible audio transcription endpoint."""
+    if response_format not in ["json", "text"]:
+        return ORJSONResponse(
+            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            status_code=400,
+        )
+
+    audio_data = await file.read()
+
+    return (
+        await raw_request.app.state.openai_serving_transcription.create_transcription(
+            audio_data=audio_data,
+            model=model,
+            language=language,
+            response_format=response_format,
+            temperature=temperature,
+            stream=stream,
+            raw_request=raw_request,
+        )
+    )
+
+
 @app.get("/v1/models", response_class=ORJSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
@@ -1536,6 +1601,29 @@ async def ollama_tags(raw_request: Request):
 async def ollama_show(request: OllamaShowRequest, raw_request: Request):
     """Ollama-compatible show model info endpoint."""
     return raw_request.app.state.ollama_serving.get_show(request.model)
+
+
+##### Anthropic-compatible API endpoints #####
+
+
+@app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_messages(
+    request: AnthropicMessagesRequest, raw_request: Request
+):
+    """Anthropic-compatible Messages API endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_messages(
+        request, raw_request
+    )
+
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_count_tokens(
+    request: AnthropicCountTokensRequest, raw_request: Request
+):
+    """Anthropic-compatible token counting endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_count_tokens(
+        request, raw_request
+    )
 
 
 ## SageMaker API

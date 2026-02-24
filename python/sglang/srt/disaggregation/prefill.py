@@ -23,11 +23,12 @@ import logging
 import time
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -134,7 +135,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-    def _init_kv_manager(self) -> BaseKVManager:
+    def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
@@ -197,10 +198,8 @@ class PrefillBootstrapQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
-        kv_manager_class: Type[BaseKVManager] = get_kv_class(
-            self.transfer_backend, KVClassType.MANAGER
-        )
-        kv_manager: BaseKVManager = kv_manager_class(
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
@@ -212,10 +211,12 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
-            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
-        else:
-            kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        backend = (
+            TransferBackend.FAKE
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+            else self.transfer_backend
+        )
+        kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
         dest_tp_ranks = [self.tp_rank]
 
