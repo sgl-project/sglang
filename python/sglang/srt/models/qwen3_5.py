@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -317,8 +318,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+
+        linear_attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, quant_config, alt_stream, prefix
+            config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -457,13 +464,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
+
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=attn_quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -473,7 +486,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=attn_quant_config,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -1154,9 +1167,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "_k_scale",
             ".v_scale",
             "_v_scale",
-            ".weight_scale",
             "_weight_scale",
-            ".input_scale",
             "_input_scale",
         )
 
@@ -1203,7 +1214,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                if name.endswith("experts.gate_up_proj") or name.endswith(
+                    "experts.down_proj"
+                ):
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
@@ -1273,7 +1286,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 num_experts,
                             )
                     else:
-                        # Skip loading extra parameters for GPTQ/modelopt models.
+                        # Skip loading extra parameters for GPTQ models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
                             and name_mapped not in params_dict

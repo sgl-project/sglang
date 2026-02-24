@@ -659,12 +659,14 @@ class GrpcRequestManager:
             }
 
             # Accumulate logprobs (following tokenizer_manager pattern)
-            if state.obj.return_logprob:
+            # Use getattr for safe access - not all request types have return_logprob
+            # (e.g., TokenizedEmbeddingReqInput)
+            if getattr(state.obj, "return_logprob", False):
                 self._convert_logprob_style(state, batch_out, i)
 
             # Send input logprobs based if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and state.obj.logprob_start_len >= 0
                 and state.input_token_logprobs_val
             ):
@@ -688,7 +690,7 @@ class GrpcRequestManager:
 
             # Send output logprobs if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and batch_out.output_token_logprobs_val
                 and i < len(batch_out.output_token_logprobs_val)
             ):
@@ -983,8 +985,8 @@ class GrpcRequestManager:
 
         self.event_loop = loop
 
-        # We cannot add signal handler when the grpc manager is not in
-        # the main thread due to the CPython limitation.
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = GrpcSignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
@@ -992,12 +994,7 @@ class GrpcRequestManager:
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
             )
-        else:
-            logger.warning(
-                "Signal handler is not added because the grpc request manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "grpc request manager when SIGTERM is received."
-            )
+
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )

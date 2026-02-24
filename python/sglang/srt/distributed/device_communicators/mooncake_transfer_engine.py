@@ -257,6 +257,9 @@ class MooncakeTransferEngine:
     def get_engine(self):
         return self.engine.get_engine()
 
+    def get_ib_device(self):
+        return self.ib_device
+
 
 def init_mooncake_transfer_engine(
     hostname: str,
