@@ -414,26 +414,159 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return alloc_full_indices
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, swa_evicted_count: int = 0):
+        """Free full-attention and SWA KV slots.
+
+        SWA layers only attend to a sliding window, so as a request grows the
+        scheduler calls _evict_swa() to reclaim SWA slots for tokens that have
+        fallen outside the window.  _evict_swa() zeros their entries in
+        full_to_swa_index_mapping to mark them as already freed.
+
+        When the request eventually finishes, free() is called for ALL of its
+        full-attention indices (evicted + live).  We must NOT pass the
+        already-evicted indices to free_swa() because their mapping value is 0,
+        and 0 is the dummy/padding slot reserved by the allocator - freeing it
+        would put it back in the free-page list and corrupt future allocations.
+
+        swa_evicted_count is the number of tokens at the START of free_index
+        whose SWA slots were already freed mid-request.  We skip them by
+        slicing with a plain Python int (CPU metadata, zero GPU sync), avoiding
+        the alternative of a boolean-mask gather which forces a CPU-GPU sync to
+        determine the output tensor shape.
+        """
         if free_index.numel() == 0:
             return
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
+            self.free_swa(free_index[swa_evicted_count:])
         else:
-            self.free_group.append(free_index)
+            # Store swa_evicted_count alongside the indices so free_group_end
+            # can replay both full and SWA frees with the correct split.
+            self.free_group.append((free_index, swa_evicted_count))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def free_swa(self, free_index: torch.Tensor):
+    @staticmethod
+    def _page_select(entry_lens, page_size, device):
+        """Build a selection index tensor for batched paged free.
+
+        Problem: PagedTokenToKVPoolAllocator.free() extracts page indices via
+        (free_index // page_size)[::page_size], which assumes the input is a
+        single contiguous allocation where every page contributes exactly
+        page_size consecutive elements.  When free_group_end concatenates
+        free_index tensors from multiple finished requests, sub-page tails
+        (e.g. 3 tokens from the last partial page) break this uniform stride
+        and cause the [::page_size] step to skip pages, leaking them.
+
+        Solution: build a per-page stride array from the known entry lengths.
+        Full pages contribute stride = page_size, sub-page residuals contribute
+        stride = residual length.  An exclusive cumsum over this array gives the
+        offset of the first element of each page in the concatenated tensor.
+        Passing this as page_select to free() replaces the [::page_size] stride.
+
+        Example with page_size=128, entries of length [256, 3, 384]:
+          Entry 0 (256): 2 full pages  -> strides [128, 128]
+          Entry 1 (3):   0 full + tail -> strides [3]
+          Entry 2 (384): 3 full pages  -> strides [128, 128, 128]
+
+          strides        = [128, 128,   3, 128, 128, 128]
+          cumsum         = [128, 256, 259, 387, 515, 643]
+          cumsum - strides = [  0, 128, 256, 259, 387, 515]  <- selection indices
+
+        These indices pick position 0 (page 0 of entry 0), 128 (page 1 of
+        entry 0), 256 (residual of entry 1), 259 (page 0 of entry 2), etc.
+        Each picked position is the first element of its page, so
+        (combined // page_size)[sel] gives the correct page IDs.
+
+        The strides array is built on CPU from Python ints (tensor.numel() is
+        always CPU), transferred to GPU via pinned memory + non_blocking copy,
+        and cumsummed on GPU.  No GPU-to-CPU sync.
+        """
+        strides = []
+        for length in entry_lens:
+            num_full_pages = length // page_size
+            residual = length % page_size
+            strides.extend([page_size] * num_full_pages)
+            if residual > 0:
+                strides.append(residual)
+        if not strides:
+            return None
+        strides_tensor = torch.tensor(strides, dtype=torch.int64, pin_memory=True)
+        strides_gpu = strides_tensor.to(device, non_blocking=True)
+        # Exclusive cumsum: cumsum gives end-of-block offsets, subtracting
+        # the stride itself gives start-of-block (first element of each page).
+        return strides_gpu.cumsum(0) - strides_gpu
+
+    def free_group_end(self):
+        """Flush deferred free() calls from the free_group batch.
+
+        During extend/decode output processing, free() calls are deferred via
+        free_group_begin/end to avoid interleaving frees with still-running
+        kernels.  Each deferred entry stores (free_index, swa_evicted_count).
+
+        We concatenate all entries and make one batched free() call per
+        allocator (full and SWA), using _page_select to handle the paged
+        stride correctly across entries with different lengths.  SWA entries
+        are sliced by swa_evicted_count to exclude already-evicted tokens
+        whose mapping was zeroed by _evict_swa mid-request.
+        """
+        self.is_not_in_free_group = True
+        if self.free_group:
+            # Full-attention: cat all free_index tensors and free in one call.
+            full_parts = [free_index for free_index, _ in self.free_group]
+            combined_full = torch.cat(full_parts)
+            # page_select avoids torch.unique for paged allocators (page_size>1);
+            # TokenToKVPoolAllocator (page_size=1) doesn't need it.
+            if self.page_size > 1:
+                full_page_select = self._page_select(
+                    [free_index.numel() for free_index in full_parts],
+                    self.page_size,
+                    combined_full.device,
+                )
+                self.full_attn_allocator.free(combined_full, page_select=full_page_select)
+            else:
+                self.full_attn_allocator.free(combined_full)
+
+            # SWA: slice off already-evicted prefix per entry, cat the live
+            # portions, look up SWA indices via the mapping, and free in one call.
+            swa_live_parts = [
+                free_index[swa_evicted_count:]
+                for free_index, swa_evicted_count in self.free_group
+                if swa_evicted_count < free_index.numel()
+            ]
+            if swa_live_parts:
+                swa_live_full = torch.cat(swa_live_parts)
+                if self.page_size > 1:
+                    swa_page_select = self._page_select(
+                        [part.numel() for part in swa_live_parts],
+                        self.page_size,
+                        swa_live_full.device,
+                    )
+                    self.free_swa(swa_live_full, page_select=swa_page_select)
+                else:
+                    self.free_swa(swa_live_full)
+
+    def free_swa(self, free_index: torch.Tensor, page_select: torch.Tensor = None):
+        """Free SWA slots corresponding to the given full-pool indices.
+
+        Args:
+            free_index: full-pool indices whose SWA mapping is still live.
+            page_select: optional selection indices for the paged SWA allocator,
+                as returned by _page_select(). Passed through to
+                swa_attn_allocator.free() to handle batched sub-page entries.
+        """
         swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        # PagedTokenToKVPoolAllocator (page_size>1) accepts page_select;
+        # TokenToKVPoolAllocator (page_size=1) does not.
+        if page_select is not None:
+            self.swa_attn_allocator.free(swa_indices, page_select=page_select)
+        else:
+            self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[free_index] = swa_indices.zero_()
 
     def backup_state(self):
         return [

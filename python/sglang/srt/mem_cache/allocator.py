@@ -499,12 +499,25 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, page_select: torch.Tensor = None):
+        """Free token slots back to the pool.
+
+        Args:
+            free_index: token-level indices to free.
+            page_select: optional pre-computed selection indices into free_index
+                that pick one representative per page. When multiple entries with
+                sub-page tails are batched, the caller can build this via cumsum
+                over per-entry strides to avoid the GPU sync from torch.unique.
+                If None, uses torch.unique (correct but causes a GPU sync).
+        """
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            if page_select is not None:
+                free_page_indices = (free_index // self.page_size)[page_select]
+            else:
+                free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
