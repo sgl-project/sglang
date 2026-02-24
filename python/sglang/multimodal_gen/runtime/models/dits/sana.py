@@ -50,43 +50,47 @@ class SanaModulatedNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.linear = nn.Linear(dim, dim)
 
-    def forward(self, x, temb):
+    def forward(self, x, temb, scale_shift_table):
         x = self.norm(x)
-        scale = self.linear(F.silu(temb))
-        x = x * (1 + scale.unsqueeze(1))
+        shift, scale = (scale_shift_table[None] + temb[:, None]).chunk(2, dim=1)
+        x = x * (1 + scale) + shift
         return x
 
 
 class GLUMBConv(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features=None):
+    """Gated Linear Unit with Multi-Branch Convolution.
+
+    Matches the HuggingFace Diffusers implementation: all spatial ops use
+    Conv2d, and gating is applied after the depthwise conv (not before).
+    The caller reshapes between (B, S, C) and (B, C, H, W) as needed.
+    """
+
+    def __init__(self, in_channels, out_channels, expand_ratio=2.5):
         super().__init__()
-        out_features = out_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features * 2, bias=True)
-        self.dwconv = nn.Conv2d(
-            hidden_features,
-            hidden_features,
-            kernel_size=3,
-            padding=1,
-            groups=hidden_features,
-            bias=True,
+        hidden_channels = int(expand_ratio * in_channels)
+        self.nonlinearity = nn.SiLU()
+        self.conv_inverted = nn.Conv2d(in_channels, hidden_channels * 2, 1, 1, 0)
+        self.conv_depth = nn.Conv2d(
+            hidden_channels * 2,
+            hidden_channels * 2,
+            3,
+            1,
+            1,
+            groups=hidden_channels * 2,
         )
-        self.act = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+        self.conv_point = nn.Conv2d(
+            hidden_channels, out_channels, 1, 1, 0, bias=False
+        )
 
-    def forward(self, x, height, width):
-        x = self.fc1(x)
-        x, gate = x.chunk(2, dim=-1)
-
-        B, _, C = x.shape
-        x = x.view(B, height, width, C).permute(0, 3, 1, 2).contiguous()
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1).view(B, height * width, C)
-
-        x = self.act(x) * gate
-        x = self.fc2(x)
-        return x
+    def forward(self, hidden_states):
+        hidden_states = self.conv_inverted(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.conv_depth(hidden_states)
+        hidden_states, gate = torch.chunk(hidden_states, 2, dim=1)
+        hidden_states = hidden_states * self.nonlinearity(gate)
+        hidden_states = self.conv_point(hidden_states)
+        return hidden_states
 
 
 class SanaLinearAttention(nn.Module):
@@ -156,8 +160,8 @@ class SanaCrossAttention(nn.Module):
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
 
-        self.norm_q = RMSNorm(head_dim)
-        self.norm_k = RMSNorm(head_dim)
+        self.norm_q = RMSNorm(inner_dim)
+        self.norm_k = RMSNorm(inner_dim)
 
     def forward(self, hidden_states, encoder_hidden_states):
         B, S, _ = hidden_states.shape
@@ -167,12 +171,12 @@ class SanaCrossAttention(nn.Module):
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         value = value.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        query = self.norm_q(query)
-        key = self.norm_k(key)
 
         hidden_states = F.scaled_dot_product_attention(query, key, value)
         hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
@@ -194,7 +198,6 @@ class SanaTransformerBlock(nn.Module):
         attention_bias=False,
     ):
         super().__init__()
-        hidden_features = int(dim * mlp_ratio)
 
         self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
 
@@ -216,7 +219,9 @@ class SanaTransformerBlock(nn.Module):
             bias=attention_bias,
         )
 
-        self.ff = GLUMBConv(in_features=dim, hidden_features=hidden_features)
+        self.ff = GLUMBConv(
+            in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio
+        )
 
     def forward(self, hidden_states, encoder_hidden_states, timestep, height, width):
         batch_size = hidden_states.shape[0]
@@ -225,26 +230,20 @@ class SanaTransformerBlock(nn.Module):
             self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
 
-        shift_msa = shift_msa.squeeze(1)
-        scale_msa = scale_msa.squeeze(1)
-        gate_msa = gate_msa.squeeze(1)
-        shift_mlp = shift_mlp.squeeze(1)
-        scale_mlp = scale_mlp.squeeze(1)
-        gate_mlp = gate_mlp.squeeze(1)
         norm_hidden = self.norm1(hidden_states)
-        norm_hidden = (
-            norm_hidden * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        )
+        norm_hidden = norm_hidden * (1 + scale_msa) + shift_msa
         attn_output = self.attn1(norm_hidden)
-        hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
-        norm_hidden = self.norm2(hidden_states)
-        attn_output = self.attn2(norm_hidden, encoder_hidden_states)
+        hidden_states = hidden_states + gate_msa * attn_output
+
+        attn_output = self.attn2(hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
-        norm_hidden = (
-            hidden_states * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        )
-        ff_output = self.ff(norm_hidden, height, width)
-        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
+
+        norm_hidden = self.norm2(hidden_states)
+        norm_hidden = norm_hidden * (1 + scale_mlp) + shift_mlp
+        norm_hidden = norm_hidden.unflatten(1, (height, width)).permute(0, 3, 1, 2)
+        ff_output = self.ff(norm_hidden)
+        ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
+        hidden_states = hidden_states + gate_mlp * ff_output
 
         return hidden_states
 
@@ -355,12 +354,9 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 post_patch_height,
                 post_patch_width,
             )
-        shift, scale = (
-            self.scale_shift_table[None] + embedded_timestep[:, None]
-        ).chunk(2, dim=1)
-
-        hidden_states = self.norm_out(hidden_states, temb=embedded_timestep)
-        hidden_states = hidden_states * (1 + scale) + shift
+        hidden_states = self.norm_out(
+            hidden_states, embedded_timestep, self.scale_shift_table
+        )
         hidden_states = self.proj_out(hidden_states)
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_height, post_patch_width, p, p, self.out_channels

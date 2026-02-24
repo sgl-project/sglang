@@ -42,9 +42,6 @@ class SanaArchConfig(DiTArchConfig):
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^transformer\.(.*)$": r"\1",
-            r"^(.*\.ff\.)conv_depth\.(.*)$": r"\1dwconv.\2",
-            r"^(.*\.ff\.)conv_inverted\.(.*)$": r"\1fc1.\2",
-            r"^(.*\.ff\.)conv_point\.(.*)$": r"\1fc2.\2",
         }
     )
 
