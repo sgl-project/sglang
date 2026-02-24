@@ -51,28 +51,21 @@ def compute_unshard_plan(
         for info in parallel_infos
     ]
 
+    axis_params: list[tuple[ParallelAxis, UnshardParams]] = [
+        (axis, PickParams())
+        for axis in sorted(replicated_axes, key=lambda a: a.value)
+    ] + [
+        (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
+        for axis, (dim_index, spec) in sharded_axis_infos.items()
+    ]
+
     plans: list[UnshardPlan] = []
-
-    for axis in sorted(replicated_axes, key=lambda a: a.value):
+    for axis, params in axis_params:
         result = _group_and_project(
             current_coords=current_coords,
             target_axis=axis,
         )
-        plans.append(UnshardPlan(axis=axis, params=PickParams(), groups=result.groups))
-        current_coords = result.projected_coords
-
-    for axis, (dim_index, spec) in sharded_axis_infos.items():
-        result = _group_and_project(
-            current_coords=current_coords,
-            target_axis=axis,
-        )
-        plans.append(
-            UnshardPlan(
-                axis=axis,
-                params=_resolve_unshard_params(spec=spec, dim_index=dim_index),
-                groups=result.groups,
-            )
-        )
+        plans.append(UnshardPlan(axis=axis, params=params, groups=result.groups))
         current_coords = result.projected_coords
 
     return plans
