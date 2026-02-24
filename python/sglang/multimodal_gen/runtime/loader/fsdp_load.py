@@ -139,9 +139,10 @@ def maybe_load_fsdp_model(
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None and hasattr(quant_method, "process_weights_after_loading"):
+        if quant_method is not None and hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
             quant_method.process_weights_after_loading(module)
-
 
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
