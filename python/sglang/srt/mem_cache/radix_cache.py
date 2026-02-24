@@ -35,6 +35,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -462,7 +463,7 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
@@ -500,7 +501,7 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
@@ -522,7 +523,7 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        (new_indices, new_last_node) = (
+        new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
@@ -822,6 +823,7 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
+                        medium=MEDIUM_GPU,
                     )
                 )
 
@@ -843,7 +845,9 @@ class RadixCache(BasePrefixCache):
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                )
 
                 page_index += 1
 

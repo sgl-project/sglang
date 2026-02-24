@@ -20,6 +20,10 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
@@ -483,10 +487,10 @@ class GlmImageTransformerBlock(nn.Module):
 
         # 2. Feedforward
         self.norm2 = ScaleResidualLayerNormScaleShift(
-            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+            dim, eps=1e-5, elementwise_affine=False
         )
         self.norm2_context = ScaleResidualLayerNormScaleShift(
-            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+            dim, eps=1e-5, elementwise_affine=False
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
@@ -806,6 +810,18 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         prior_embedding = self.prior_token_embedding(prior_token_id)
         prior_embedding[prior_token_drop] *= 0.0
         prior_hidden_states = self.prior_projector(prior_embedding)
+        # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
+        # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).
+        if (
+            get_sp_world_size() > 1
+            and prior_hidden_states.shape[1] != hidden_states.shape[1]
+        ):
+            rank = get_sp_parallel_rank()
+            sp_world_size = get_sp_world_size()
+            chunk = prior_hidden_states.shape[1] // sp_world_size
+            prior_hidden_states = prior_hidden_states[
+                :, rank * chunk : (rank + 1) * chunk, :
+            ]
         hidden_states = hidden_states + prior_hidden_states
 
         temb = self.time_condition_embed(

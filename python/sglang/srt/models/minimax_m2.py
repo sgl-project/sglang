@@ -16,6 +16,7 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -442,9 +443,14 @@ class MiniMaxM2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -475,9 +481,14 @@ class MiniMaxM2MoE(nn.Module):
     def op_dispatch_b(self, state):
         """Dispatch B operation for TBO - complete async dispatch"""
         if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
@@ -896,7 +907,12 @@ class MiniMaxM2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                with get_global_expert_distribution_recorder().with_current_layer(i):
+                ctx = (
+                    nullcontext()
+                    if get_global_server_args().enable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     if i in self.layers_to_capture:
                         aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
