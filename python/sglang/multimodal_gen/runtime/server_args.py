@@ -139,7 +139,7 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
 
     # Sequences/Sets -> list
     if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x) for x in obj]
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
 
     # Functions / Callables -> qualified name
     try:
