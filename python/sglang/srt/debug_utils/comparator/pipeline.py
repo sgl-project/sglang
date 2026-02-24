@@ -29,20 +29,14 @@ def process_smart(
         rows=target_rows,
         base_path=Path(args.target_path),
     )
-    if target_tensor is None:
-        _skip(name, "target_load_failed", counts, fmt)
-        return
-
-    if not baseline_rows:
-        _skip(name, "no_baseline", counts, fmt)
-        return
-
     baseline_tensor = _load_baseline(
-        baseline_rows=baseline_rows,
+        rows=baseline_rows,
         base_path=Path(args.baseline_path),
     )
-    if baseline_tensor is None:
-        _skip(name, "baseline_load_failed", counts, fmt)
+
+    if target_tensor is None or baseline_tensor is None:
+        reason = "target_load_failed" if target_tensor is None else "baseline_load_failed"
+        _skip(name, reason, counts, fmt)
         return
 
     _compare_and_record(
@@ -56,15 +50,18 @@ def process_smart(
 
 def _load_baseline(
     *,
-    baseline_rows: list[dict],
+    rows: list[dict],
     base_path: Path,
 ) -> Optional[torch.Tensor]:
-    result = load_and_unshard(rows=baseline_rows, base_path=base_path)
+    if not rows:
+        return None
+
+    result = load_and_unshard(rows=rows, base_path=base_path)
     if result is not None:
         return result
 
-    if len(baseline_rows) == 1:
-        return _load_tensor(base_path / baseline_rows[0]["filename"])
+    if len(rows) == 1:
+        return _load_tensor(base_path / rows[0]["filename"])
 
     return None
 
