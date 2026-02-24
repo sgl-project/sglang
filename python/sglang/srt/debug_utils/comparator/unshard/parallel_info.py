@@ -6,7 +6,7 @@ from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo
 _PARALLEL_INFO_KEYS = ("sglang_parallel_info", "megatron_parallel_info")
 
 
-def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
+def normalize_parallel_info(meta: dict) -> dict[ParallelAxis, AxisInfo]:
     """Extract unified parallel info from dump meta."""
     info: Optional[dict] = None
     for key in _PARALLEL_INFO_KEYS:
