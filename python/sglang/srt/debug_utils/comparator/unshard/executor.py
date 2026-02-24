@@ -6,10 +6,6 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 )
 
 
-def unshard_concat(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
-    return torch.cat(tensors, dim=dim)
-
-
 def execute_unshard_plan(
     plan: UnshardPlan,
     tensors_by_world_rank: dict[int, torch.Tensor],
@@ -31,6 +27,10 @@ def _apply_unshard(
 ) -> torch.Tensor:
     params = plan.params
     if isinstance(params, ConcatParams):
-        return unshard_concat(ordered_tensors, dim=params.dim)
+        return _unshard_concat(ordered_tensors, dim=params.dim)
     # Phase 2: ReduceSumParams, CpZigzagParams
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
+
+
+def _unshard_concat(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
+    return torch.cat(tensors, dim=dim)
