@@ -1,7 +1,7 @@
 from typing import Optional, Union
 
+import flashinfer.sampling
 import torch
-from flashinfer.sampling import get_sampling_module
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
 
@@ -152,11 +152,13 @@ def top_p_sampling_from_probs(
     This function expects float32 inputs, and the output is int32.
 
     """
-    if check_nan:
-        if torch.any(torch.isnan(probs)):
-            raise ValueError("Input probs contains NaN.")
-    return get_sampling_module().top_p_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator
+    return flashinfer.sampling.top_p_sampling_from_probs(
+        probs,
+        top_p,
+        indices,
+        deterministic,
+        generator,
+        check_nan,
     )
 
 
@@ -220,30 +222,16 @@ def top_k_top_p_sampling_from_probs(
     This function expects float32 inputs, and the output is int32.
 
     """
-    if filter_apply_order == "top_k_first":
-        renorm_probs = top_k_renorm_probs(probs, top_k)
-        return top_p_sampling_from_probs(
-            renorm_probs,
-            top_p,
-            indices,
-            deterministic,
-            check_nan=check_nan,
-            generator=generator,
-        )
-    elif filter_apply_order == "joint":
-        if check_nan:
-            if torch.any(torch.isnan(probs)):
-                raise ValueError("Input probs contains NaN.")
-        return get_sampling_module().top_k_top_p_sampling_from_probs(
-            probs,
-            indices,
-            *_to_tensor_scalar_tuple(top_k),
-            *_to_tensor_scalar_tuple(top_p),
-            deterministic,
-            generator,
-        )
-    else:
-        raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+    return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs,
+        top_k,
+        top_p,
+        indices,
+        filter_apply_order,
+        deterministic,
+        generator,
+        check_nan,
+    )
 
 
 def min_p_sampling_from_probs(
@@ -295,11 +283,13 @@ def min_p_sampling_from_probs(
     ----
     This function expects float32 inputs, and the output is int32.
     """
-    if check_nan:
-        if torch.any(torch.isnan(probs)):
-            raise ValueError("Input probs contains NaN.")
-    return get_sampling_module().min_p_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
+    return flashinfer.sampling.min_p_sampling_from_probs(
+        probs,
+        min_p,
+        indices,
+        deterministic,
+        generator,
+        check_nan,
     )
 
 
@@ -433,29 +423,13 @@ def top_k_top_p_sampling_from_logits(
     This function expects float32 inputs, and the output is int32.
 
     """
-    if filter_apply_order == "top_k_first":
-        masked_logits = top_k_mask_logits(logits, top_k)
-        probs = torch.softmax(masked_logits, dim=-1)
-        return top_p_sampling_from_probs(
-            probs,
-            top_p,
-            indices,
-            deterministic,
-            check_nan=check_nan,
-            generator=generator,
-        )
-    elif filter_apply_order == "joint":
-        probs = torch.softmax(logits, dim=-1)
-        if check_nan:
-            if torch.any(torch.isnan(probs)):
-                raise ValueError("Input probs contains NaN.")
-        return get_sampling_module().top_k_top_p_sampling_from_probs(
-            probs,
-            indices,
-            *_to_tensor_scalar_tuple(top_k),
-            *_to_tensor_scalar_tuple(top_p),
-            deterministic,
-            generator,
-        )
-    else:
-        raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+    return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits,
+        top_k,
+        top_p,
+        indices,
+        filter_apply_order,
+        deterministic,
+        generator,
+        check_nan,
+    )
