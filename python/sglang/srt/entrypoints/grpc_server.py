@@ -21,11 +21,11 @@ from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
@@ -325,7 +325,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 token_ids_logprob=None,
             )
             # Set disaggregation params if needed
-            if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_req.bootstrap_room = 0
         else:
@@ -1087,7 +1087,7 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
             }
 
             # Set disaggregation params if needed
-            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 warmup_request_kwargs["disaggregated_params"] = (
                     sglang_scheduler_pb2.DisaggregatedParams(
                         bootstrap_host=FAKE_BOOTSTRAP_HOST,

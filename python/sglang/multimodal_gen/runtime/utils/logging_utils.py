@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/logger.py
 """Logging configuration for sglang.multimodal_gen."""
+
 import argparse
 import contextlib
 import datetime
@@ -148,7 +149,10 @@ def _log_process_aware(
     if should_log:
         # stacklevel=3 to show the original caller's location,
         # as this function is called by the patched methods.
-        logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
+        if "stacklevel" in kwargs:
+            logger_self.log(level, msg, *args, **kwargs)
+        else:
+            logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
 
 
 class _SGLDiffusionLogger(Logger):
@@ -370,6 +374,12 @@ def configure_logger(server_args, prefix: str = ""):
     root.setLevel(getattr(logging, server_args.log_level.upper()))
 
     set_uvicorn_logging_configs()
+
+
+@lru_cache(maxsize=1)
+def get_log_level() -> int:
+    root = logging.getLogger()
+    return root.level
 
 
 def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):

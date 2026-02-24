@@ -24,6 +24,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     different_prompts: bool = False
+    seed: Optional[int] = None
     temperature: float = 0.0
     max_new_tokens: int = 512
     frequency_penalty: float = 0.0
@@ -51,6 +52,7 @@ class BenchArgs:
             action="store_true",
             default=BenchArgs.different_prompts,
         )
+        parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
@@ -127,6 +129,7 @@ def send_one_prompt(args: BenchArgs):
         "text": prompt,
         "image_data": image_data,
         "sampling_params": {
+            "sampling_seed": args.seed,
             "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,

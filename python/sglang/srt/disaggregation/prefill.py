@@ -351,7 +351,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
+        batch = self.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             trace_event_batch("schedule", batch.reqs)

@@ -12,14 +12,8 @@ if TYPE_CHECKING:
 
 def may_get_weight_block_size(model_config, load_config):
     from sglang.srt.model_loader.loader import _get_quantization_config
-    from sglang.srt.model_loader.utils import get_model_architecture
 
-    model_class, _ = get_model_architecture(model_config)
-    packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
-
-    quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping
-    )
+    quant_config = _get_quantization_config(model_config, load_config)
 
     if quant_config is not None and hasattr(quant_config, "weight_block_size"):
         return getattr(quant_config, "weight_block_size")

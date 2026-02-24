@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 
@@ -10,18 +10,30 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
-from sglang.srt.layers.quantization.modelslim.modelslim_moe import ModelSlimMoEMethod
 from sglang.srt.layers.quantization.modelslim.schemes import (
-    ModelSlimScheme,
     ModelSlimW4A4Int4,
+    ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
+    ModelSlimW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
+    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+    from sglang.srt.layers.quantization.modelslim.schemes import (
+        ModelSlimLinearScheme,
+        ModelSlimMoEScheme,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -150,17 +162,20 @@ class ModelSlimConfig(QuantizationConfig):
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
-            scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
+            scheme = self.get_linear_scheme(
+                layer=layer, layer_name=prefix_in_quant_config
+            )
             layer.scheme = scheme
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return ModelSlimMoEMethod.get_moe_method(self, layer, prefix)
+            layer.scheme = self.get_moe_scheme(layer, prefix)
+            return ModelSlimFusedMoEMethod(self)
         return None
 
     def _get_scheme_from_parts(
         self,
         layer_name: str,
-    ) -> ModelSlimScheme:
+    ) -> ModelSlimLinearScheme:
 
         quant_type = self.quant_description.get(layer_name + ".weight", "")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
@@ -173,9 +188,9 @@ class ModelSlimConfig(QuantizationConfig):
             )
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
-    def get_scheme(
+    def get_linear_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[ModelSlimScheme]:
+    ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
@@ -188,11 +203,51 @@ class ModelSlimConfig(QuantizationConfig):
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 
+    def get_moe_scheme(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> Optional[ModelSlimMoEScheme]:
+        # TODO: @dsikka: refactor this to use schemes as other kernels
+        # are supported + check if the layer is being ignored.
+
+        prefix_in_quant_config = prefix + ".0.down_proj.weight"
+        is_moe_w4a8_dynamic = (
+            self.quant_description.get(prefix_in_quant_config, "STATIC")
+            == "W4A8_DYNAMIC"
+        )
+        is_moe_w8a8_dynamic = (
+            self.quant_description.get(prefix_in_quant_config, "STATIC")
+            == "W8A8_DYNAMIC"
+        )
+        if is_moe_w4a8_dynamic:
+            logger.info_once("Using ModelSlimW4A8Int8MoE")
+            return ModelSlimW4A8Int8MoE(self)
+        elif is_moe_w8a8_dynamic:
+            logger.info_once("Using ModelSlimW8A8Int8MoE")
+            return ModelSlimW8A8Int8MoE(self)
+        else:
+            logger.warning(
+                f"Unsupported FusedMoe modelslim scheme: "
+                f"{self.quant_description.get(prefix_in_quant_config.strip())} "
+                f"in layer: {prefix}"
+            )
+            return None
+
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        if not hasattr(self, "_quant_description_normalized"):
+            quant_description = {}
+            for prefix_, value in self.quant_description.items():
+                prefix_ = prefix_.replace("language_model.", "")
+                if "visual" in prefix_:
+                    prefix_ = prefix_.replace("model.", "")
+                quant_description[prefix_] = value
+            self.quant_description = quant_description
+            self._quant_description_normalized = True
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)
@@ -242,7 +297,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the ModelSlimScheme associated with each layer to create
+        Use the ModelSlimLinearScheme associated with the layer to create
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
@@ -264,7 +319,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ):
         """
-        Use the output of create_weights and the CompressedTensorsScheme
+        Use the output of create_weights and the ModelSlimLinearScheme
         associated with the layer to apply the forward pass with the
         layer input.  See LinearMethodBase for param details
 
@@ -274,3 +329,74 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
+
+
+class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
+
+    def __init__(self, quantization_config: ModelSlimConfig):
+        self.quantization_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Use the ModelSlimMoEScheme associated with the layer to create
+        the necessary parameters for the layer. See FusedMoEMethodBase for param
+        details
+        """
+        layer.scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        return layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """
+        Use the output of create_weights and the ModelSlimMoEScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See FusedMoEMethodBase for param details
+
+        """
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return layer.scheme.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
