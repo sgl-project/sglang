@@ -58,7 +58,6 @@ def run(args: argparse.Namespace) -> None:
             target_filenames=[r["filename"] for r in target_rows],
             args=args,
             counts=counts,
-            grouping=grouping,
         )
 
     print_record(
