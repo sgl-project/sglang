@@ -9,12 +9,7 @@ _AXIS_PREFIXES = [e.value for e in ParallelAxis]
 
 
 def normalize_parallel_info(meta: dict) -> dict[str, AxisInfo]:
-    """Extract unified parallel info from dump meta.
-
-    Looks for sglang_parallel_info or megatron_parallel_info in meta.
-    Returns e.g. {"tp": AxisInfo(axis_rank=0, axis_size=4), ...}
-    for every axis whose size > 1.
-    """
+    """Extract unified parallel info from dump meta."""
     info: Optional[dict] = None
     for key in _PARALLEL_INFO_KEYS:
         value = meta.get(key)
