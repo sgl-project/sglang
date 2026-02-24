@@ -31,6 +31,7 @@ class AttentionBackendEnum(enum.Enum):
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
+    SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     SLA_ATTN = enum.auto()
@@ -39,6 +40,17 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def is_sparse(self) -> bool:
+        return self in {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SLA_ATTN,
+            AttentionBackendEnum.SAGE_SLA_ATTN,
+        }
 
 
 class PlatformEnum(enum.Enum):

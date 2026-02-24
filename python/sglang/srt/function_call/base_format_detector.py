@@ -186,7 +186,7 @@ class BaseFormatDetector(ABC):
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
 
-                (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
+                obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
 
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
