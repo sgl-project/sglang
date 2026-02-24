@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import numpy.typing as npt
 import requests
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -234,9 +233,6 @@ class MooncakeKVManager(CommonKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
-
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1095,25 +1091,6 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
-
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -1242,11 +1219,6 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    _ctx = zmq.Context()
-    _socket_cache = {}
-    _socket_locks = {}
-    _global_lock = threading.Lock()
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
