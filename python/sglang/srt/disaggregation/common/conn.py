@@ -261,7 +261,7 @@ class CommonKVManager(BaseKVManager):
 class CommonKVSender(BaseKVSender):
     def __init__(
         self,
-        mgr: BaseKVManager,
+        mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
         dest_tp_ranks: List[int],
@@ -322,7 +322,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def __init__(
         self,
-        mgr: BaseKVManager,
+        mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
