@@ -40,30 +40,12 @@ def process(
         _skip(name, reason, counts, fmt)
         return
 
-    _compare_and_record(
+    info = compare_tensors(
         x_baseline=baseline_tensor,
         x_target=target_tensor,
         name=name,
-        args=args,
-        counts=counts,
-    )
-
-
-def _compare_and_record(
-    *,
-    x_baseline: torch.Tensor,
-    x_target: torch.Tensor,
-    name: str,
-    args: argparse.Namespace,
-    counts: dict[str, int],
-) -> None:
-    info = compare_tensors(
-        x_baseline=x_baseline,
-        x_target=x_target,
-        name=name,
         diff_threshold=args.diff_threshold,
     )
-
     if info.diff is not None and info.diff.passed:
         counts["passed"] += 1
     else:
