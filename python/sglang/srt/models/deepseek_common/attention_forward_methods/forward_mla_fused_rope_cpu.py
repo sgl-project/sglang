@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.utils import (
+    _is_cpu,
+    _is_cpu_amx_available,
+)
 from sglang.srt.utils import BumpAllocator, use_intel_amx_backend
 
 if TYPE_CHECKING:
@@ -12,6 +17,46 @@ if TYPE_CHECKING:
 
 
 class DeepseekMLACpuForwardMixin:
+
+    def init_mla_fused_rope_cpu_forward(self: DeepseekV2AttentionMLA):
+        assert hasattr(self, "has_fused_proj") and hasattr(self, "is_packed_weight")
+
+        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
+        # which requires self.w_kc and self.w_vc to be packed.
+        # If not, we will use torch.bmm and weight shouldn't be packed in this case
+        if self.has_fused_proj and _is_cpu and _is_cpu_amx_available:
+            self.quant_method = PackWeightMethod(
+                weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+            )
+
+        self.qkv_proj_with_rope_is_int8 = (
+            self.has_fused_proj
+            and not self.is_packed_weight
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+        )
+        self.qkv_proj_with_rope_is_fp8 = (
+            self.has_fused_proj
+            and not self.is_packed_weight
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+        )
+
+        self.weight_block_size = None
+        if self.qkv_proj_with_rope_is_fp8 and _is_cpu and _is_cpu_amx_available:
+            assert getattr(
+                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
+            ) == getattr(self.q_b_proj.quant_method, "block_quant", False)
+            use_block_quant = getattr(
+                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
+            )
+
+            if use_block_quant:
+                assert (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                    == self.q_b_proj.quant_method.quant_config.weight_block_size
+                )
+                self.weight_block_size = (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                )
 
     def forward_absorb_fused_mla_rope_cpu_prepare(
         self: DeepseekV2AttentionMLA,

@@ -145,7 +145,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -160,10 +159,6 @@ if _use_aiter_gfx95:
 
 if _is_cuda:
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    pass
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -1237,35 +1232,20 @@ class DeepseekV2AttentionMLA(
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
 
-        self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged
-        )
-
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
-        self.rocm_fused_decode_mla = get_bool_env_var(
-            "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
-        )
 
-        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
-        # which requires self.w_kc and self.w_vc to be packed.
-        # If not, we will use torch.bmm and weight shouldn't be packed in this case
-        has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        if has_fused_proj and _is_cpu and _is_cpu_amx_available:
-            self.quant_method = PackWeightMethod(
-                weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
-            )
-
-        is_packed_weight = (
-            has_fused_proj
+        self.has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
+        self.is_packed_weight = (
+            self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
         self.use_min_latency_fused_a_gemm = (
-            has_fused_proj
-            and not is_packed_weight
+            self.has_fused_proj
+            and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
@@ -1273,36 +1253,10 @@ class DeepseekV2AttentionMLA(
             and 90 <= _device_sm < 120
         )
 
-        self.qkv_proj_with_rope_is_int8 = (
-            has_fused_proj
-            and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
-        )
-        self.qkv_proj_with_rope_is_fp8 = (
-            has_fused_proj
-            and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
-        )
-
-        self.weight_block_size = None
-        if self.qkv_proj_with_rope_is_fp8 and _is_cpu and _is_cpu_amx_available:
-            assert getattr(
-                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
-            ) == getattr(self.q_b_proj.quant_method, "block_quant", False)
-            use_block_quant = getattr(
-                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
-            )
-
-            if use_block_quant:
-                assert (
-                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                    == self.q_b_proj.quant_method.quant_config.weight_block_size
-                )
-                self.weight_block_size = (
-                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                )
-
         self.init_mha_forward()
+        self.init_mla_forward()
+        self.init_mla_fused_rope_rocm_forward()
+        self.init_mla_fused_rope_cpu_forward()
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1472,25 +1426,6 @@ class DeepseekV2AttentionMLA(
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
-
-    def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
-        """
-        Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
-        """
-        if self.current_attention_backend == "nsa":
-            return (
-                get_global_server_args().nsa_decode_backend == "trtllm"
-                or get_global_server_args().nsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
-
-        return (
-            self.current_attention_backend == "trtllm_mla"
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-            )
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
-        )
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange

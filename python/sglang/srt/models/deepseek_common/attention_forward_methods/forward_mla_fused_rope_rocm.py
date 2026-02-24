@@ -11,7 +11,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -26,6 +26,11 @@ if _is_hip:
 
 
 class DeepseekMLARocmForwardMixin:
+
+    def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
+        self.rocm_fused_decode_mla = get_bool_env_var(
+            "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
+        )
 
     def forward_absorb_fused_mla_rope_prepare(
         self: DeepseekV2AttentionMLA,

@@ -23,6 +23,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_gfx95,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
@@ -49,6 +50,11 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMLAForwardMixin:
+
+    def init_mla_forward(self: DeepseekV2AttentionMLA):
+        self.flashinfer_mla_disable_ragged = (
+            get_global_server_args().flashinfer_mla_disable_ragged
+        )
 
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
@@ -459,3 +465,24 @@ class DeepseekMLAForwardMixin:
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
+
+    def _fuse_rope_for_trtllm_mla(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        """
+        Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
+        """
+        if self.current_attention_backend == "nsa":
+            return (
+                get_global_server_args().nsa_decode_backend == "trtllm"
+                or get_global_server_args().nsa_prefill_backend == "trtllm"
+            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+
+        return (
+            self.current_attention_backend == "trtllm_mla"
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
