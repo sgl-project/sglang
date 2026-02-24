@@ -351,11 +351,11 @@ def call_generate_openai_compatible(
     def _extract_text(choice):
         message = choice["message"]["content"]
         if isinstance(message, list):
-            text_parts = []
-            for item in message:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            return "".join(text_parts)
+            return "".join(
+                item.get("text", "")
+                for item in message
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
         return message or ""
 
     if n == 1:
