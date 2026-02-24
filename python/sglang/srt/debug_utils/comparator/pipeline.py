@@ -36,12 +36,12 @@ def process_tensor_group(
         target_metas=[item.meta for item in t_tensors],
     )
 
-    b_indexed = _extract_tensors(b_tensors)
-    t_indexed = _extract_tensors(t_tensors)
+    b_extracted = _extract_tensors(b_tensors)
+    t_extracted = _extract_tensors(t_tensors)
     del b_tensors, t_tensors
 
-    b_tensor = _execute_plans(b_indexed, b_plans) if b_indexed is not None else None
-    t_tensor = _execute_plans(t_indexed, t_plans) if t_indexed is not None else None
+    b_tensor = _execute_plans(b_extracted, b_plans) if b_extracted is not None else None
+    t_tensor = _execute_plans(t_extracted, t_plans) if t_extracted is not None else None
 
     if b_tensor is None or t_tensor is None:
         reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
@@ -94,27 +94,28 @@ def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
 
 def _extract_tensors(
     loaded: list[ValueWithMeta],
-) -> Optional[dict[int, torch.Tensor]]:
+) -> Optional[list[torch.Tensor]]:
     if not loaded:
         return None
 
-    tensors: dict[int, torch.Tensor] = {}
-    for i, item in enumerate(loaded):
+    tensors: list[torch.Tensor] = []
+    for item in loaded:
         if not isinstance(item.value, torch.Tensor):
             return None
-        tensors[i] = item.value
+        tensors.append(item.value)
 
     return tensors
 
 
 def _execute_plans(
-    tensors_by_index: dict[int, torch.Tensor],
+    tensors: list[torch.Tensor],
     plans: list[Plan],
 ) -> Optional[torch.Tensor]:
     if not plans:
-        if len(tensors_by_index) != 1:
+        if len(tensors) != 1:
             return None
-        return next(iter(tensors_by_index.values()))
+        return tensors[0]
 
     unshard_plans = [p for p in plans if isinstance(p, UnshardPlan)]
-    return execute_unshard_plan(unshard_plans, tensors_by_index)
+    tensors_by_world_rank = dict(enumerate(tensors))
+    return execute_unshard_plan(unshard_plans, tensors_by_world_rank)
