@@ -68,9 +68,7 @@ class ChunkCache(BasePrefixCache):
                 req.req_pool_idx, : req.tp_seq_len
             ]
         else:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : ids_len
-            ]
+            kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :ids_len]
         return kv_indices
 
     def insert(self, params: InsertParams) -> InsertResult:

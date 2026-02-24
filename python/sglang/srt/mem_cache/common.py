@@ -465,16 +465,18 @@ def alloc_for_extend(
         ]
 
         if get_global_server_args().enable_kv_storage_optimization_mla:
-            tp_out_loc, out_cache_loc = alloc_paged_token_slots_extend_for_mla_kvcache_split(
-                batch=batch,
-                tree_cache=batch.tree_cache,
-                prefix_lens=prefix_lens_device,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=batch.seq_lens,
-                seq_lens_cpu=batch.seq_lens_cpu,
-                last_loc=torch.cat(last_loc),
-                split_kv_size=batch.split_kv_size,
-                split_kv_rank=batch.split_kv_rank,
+            tp_out_loc, out_cache_loc = (
+                alloc_paged_token_slots_extend_for_mla_kvcache_split(
+                    batch=batch,
+                    tree_cache=batch.tree_cache,
+                    prefix_lens=prefix_lens_device,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                    last_loc=torch.cat(last_loc),
+                    split_kv_size=batch.split_kv_size,
+                    split_kv_rank=batch.split_kv_rank,
+                )
             )
             tp_seq_lens = torch.tensor(
                 [req.tp_seq_len for req in batch.reqs],
