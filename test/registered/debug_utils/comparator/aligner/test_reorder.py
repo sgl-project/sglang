@@ -86,9 +86,7 @@ class TestComputeReorderPlans:
             },
         ]
         with pytest.raises(ValueError, match="only supported on sequence dims"):
-            compute_reorder_plans(
-                dim_specs=dim_specs, parallel_infos=parallel_infos
-            )
+            compute_reorder_plans(dim_specs=dim_specs, parallel_infos=parallel_infos)
 
     def test_compute_reorder_plans_natural(self) -> None:
         """s(cp) and s(cp,natural) produce no reorder plans."""
