@@ -161,7 +161,9 @@ class SanaCrossAttention(nn.Module):
         self.norm_q = RMSNorm(inner_dim)
         self.norm_k = RMSNorm(inner_dim)
 
-    def forward(self, hidden_states, encoder_hidden_states):
+    def forward(
+        self, hidden_states, encoder_hidden_states, encoder_attention_mask=None
+    ):
         B, S, _ = hidden_states.shape
         T = encoder_hidden_states.shape[1]
 
@@ -176,7 +178,14 @@ class SanaCrossAttention(nn.Module):
         key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         value = value.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value)
+        attn_mask = None
+        if encoder_attention_mask is not None:
+            attn_mask = encoder_attention_mask.bool()
+            attn_mask = attn_mask[:, None, None, :].expand(B, self.num_heads, S, T)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask
+        )
         hidden_states = hidden_states.transpose(1, 2).reshape(B, S, -1)
         hidden_states = self.to_out[0](hidden_states)
         return hidden_states
@@ -219,7 +228,15 @@ class SanaTransformerBlock(nn.Module):
 
         self.ff = GLUMBConv(in_channels=dim, out_channels=dim, expand_ratio=mlp_ratio)
 
-    def forward(self, hidden_states, encoder_hidden_states, timestep, height, width):
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        height,
+        width,
+        encoder_attention_mask=None,
+    ):
         batch_size = hidden_states.shape[0]
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -231,7 +248,9 @@ class SanaTransformerBlock(nn.Module):
         attn_output = self.attn1(norm_hidden)
         hidden_states = hidden_states + gate_msa * attn_output
 
-        attn_output = self.attn2(hidden_states, encoder_hidden_states)
+        attn_output = self.attn2(
+            hidden_states, encoder_hidden_states, encoder_attention_mask
+        )
         hidden_states = hidden_states + attn_output
 
         norm_hidden = self.norm2(hidden_states)
@@ -322,6 +341,7 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         encoder_hidden_states: torch.Tensor = None,
         timestep: torch.LongTensor = None,
         guidance: torch.Tensor = None,
+        encoder_attention_mask: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         batch_size, channels, height, width = hidden_states.shape
@@ -336,6 +356,9 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             timestep, hidden_dtype=hidden_states.dtype
         )
 
+        if isinstance(encoder_attention_mask, (list, tuple)):
+            encoder_attention_mask = encoder_attention_mask[0]
+
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(
             batch_size, -1, hidden_states.shape[-1]
@@ -349,6 +372,7 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 timestep_emb,
                 post_patch_height,
                 post_patch_width,
+                encoder_attention_mask=encoder_attention_mask,
             )
         hidden_states = self.norm_out(
             hidden_states, embedded_timestep, self.scale_shift_table

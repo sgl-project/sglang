@@ -92,6 +92,3 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     def post_denoising_loop(self, latents, batch):
         return latents
-
-    def post_decoding(self, frames, server_args):
-        return (frames - 0.5) * 2
