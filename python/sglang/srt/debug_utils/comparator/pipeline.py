@@ -105,10 +105,9 @@ def _execute_plans(
             return None
         return tensors[0]
 
-    unshard_plans = [p for p in plans if isinstance(p, UnshardPlan)]
-    assert (
-        len(unshard_plans) <= 1
-    ), f"Expected at most 1 unshard plan, got {len(unshard_plans)}"
+    for plan in plans:
+        if isinstance(plan, UnshardPlan):
+            # TODO: incorrect `tensors_by_world_rank` if multi UnshardPlan
+            tensors = execute_unshard_plan(plan, tensors_by_world_rank=dict(enumerate(tensors)))
 
-    tensors_by_world_rank = dict(enumerate(tensors))
-    return execute_unshard_plan(unshard_plans[0], tensors_by_world_rank)
+    return tensors
