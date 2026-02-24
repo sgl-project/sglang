@@ -95,12 +95,7 @@ class SchedulerMetricsMixin:
         self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
-
-        # Metrics
-        self.current_scheduler_metrics_enabled = (
-            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
-        )
-
+        self.stats.max_total_num_tokens = self.max_total_num_tokens
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
                 engine_type = "prefill"

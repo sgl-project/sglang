@@ -98,9 +98,9 @@ sglang:prompt_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 8.1289
 # HELP sglang:generation_tokens_total Number of generation tokens processed.
 # TYPE sglang:generation_tokens_total counter
 sglang:generation_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.557572e+06
-# HELP sglang:token_usage The token usage
-# TYPE sglang:token_usage gauge
-sglang:token_usage{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28
+# HELP sglang:kv_cache_usage_perc KV cache usage percentage (0-1).
+# TYPE sglang:kv_cache_usage_perc gauge
+sglang:kv_cache_usage_perc{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28
 # HELP sglang:cache_hit_rate The cache hit rate
 # TYPE sglang:cache_hit_rate gauge
 sglang:cache_hit_rate{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.007507552643049313
@@ -140,9 +140,9 @@ sglang:func_latency_seconds_count{name="generate_request"} 14007.0
 # HELP sglang:num_running_reqs The number of running requests
 # TYPE sglang:num_running_reqs gauge
 sglang:num_running_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 162.0
-# HELP sglang:num_used_tokens The number of used tokens
-# TYPE sglang:num_used_tokens gauge
-sglang:num_used_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 123859.0
+# HELP sglang:kv_cache_used_tokens Used KV cache tokens.
+# TYPE sglang:kv_cache_used_tokens gauge
+sglang:kv_cache_used_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 123859.0
 # HELP sglang:gen_throughput The generate throughput (token/s)
 # TYPE sglang:gen_throughput gauge
 sglang:gen_throughput{model_name="meta-llama/Llama-3.1-8B-Instruct"} 86.50814177726902

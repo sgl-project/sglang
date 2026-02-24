@@ -202,6 +202,7 @@ class SchedulerStats:
     # Basics
     num_running_reqs: int = 0
     num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
     token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
@@ -212,8 +213,6 @@ class SchedulerStats:
     num_grammar_queue_reqs: int = 0
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
-
-    max_total_num_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -310,14 +309,14 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
         self.num_used_tokens = Gauge(
-            name="sglang:num_used_tokens",
-            documentation="The number of used tokens.",
+            name="sglang:kv_cache_used_tokens",
+            documentation="Used KV cache tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.token_usage = Gauge(
-            name="sglang:token_usage",
-            documentation="The token usage.",
+            name="sglang:kv_cache_usage_perc",
+            documentation="KV cache usage percentage (0-1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -377,8 +376,8 @@ class SchedulerMetricsCollector:
         )
 
         self.max_total_num_tokens = Gauge(
-            name="sglang:max_total_num_tokens",
-            documentation="Maximum total number of tokens in the KV cache pool.",
+            name="sglang:kv_cache_total_tokens",
+            documentation="Total KV cache token capacity.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
