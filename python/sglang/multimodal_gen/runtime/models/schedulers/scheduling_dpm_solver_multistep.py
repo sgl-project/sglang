@@ -82,9 +82,17 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self.timesteps = self._inner.timesteps
         self.order = solver_order
         self._flow_shift = flow_shift
+        self._begin_index: int | None = None
 
     def set_shift(self, shift: float) -> None:
         self._flow_shift = shift
+
+    def set_begin_index(self, begin_index: int = 0) -> None:
+        self._begin_index = begin_index
+
+    @property
+    def begin_index(self) -> int | None:
+        return self._begin_index
 
     def set_timesteps(self, num_inference_steps: int, device=None, **kwargs):
         self._inner.set_timesteps(num_inference_steps, device=device, **kwargs)

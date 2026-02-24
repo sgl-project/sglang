@@ -10,8 +10,6 @@ class SanaSamplingParams(SamplingParams):
     """Defaults for SANA 1.5 1024px variant.
 
     guidance_scale=4.5 enables standard classifier-free guidance.
-    The empty negative_prompt triggers the unconditional (null-text) branch
-    in CFG without injecting specific negative semantics.
     """
 
     data_type: DataType = DataType.IMAGE
@@ -20,4 +18,8 @@ class SanaSamplingParams(SamplingParams):
     num_inference_steps: int = 20
     height: int = 1024
     width: int = 1024
-    negative_prompt: str = ""
+    negative_prompt: str = (
+        "low quality, low resolution, blurry, overexposed, underexposed, "
+        "distorted, deformed, disfigured, bad anatomy, extra limbs, "
+        "watermark, text, signature, ugly, noisy, artifacts"
+    )
