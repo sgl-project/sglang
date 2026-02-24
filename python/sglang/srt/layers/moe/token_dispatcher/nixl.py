@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import logging
-import os
-from contextlib import nullcontext
 from enum import Enum, auto
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -23,12 +21,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.distributed.utils import get_global_tcp_store
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_npu
-
-_is_npu = is_npu()
-
-if TYPE_CHECKING:
-    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 try:
     from nixl_ep import Buffer
@@ -299,12 +292,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
     ):
-        use_nvfp4 = use_fp8 = False
-        input_global_scale = self.quant_config.get("input_global_scale", None) if self.quant_config else None
-        if input_global_scale is not None:
-            use_nvfp4 = True
-        elif not get_bool_env_var("SGLANG_NIXL_EP_BF16_DISPATCH"):
-            use_fp8 = True
+        use_fp8 = not get_bool_env_var("SGLANG_NIXL_EP_BF16_DISPATCH")
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
@@ -314,12 +302,6 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -344,15 +326,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
-        overlap_args = self.overlap_args
-        if overlap_args is not None:
-            overlap_args.stream.wait_stream(self.device_module.current_stream())
-
         hook() if self.return_recv_hook else event.current_stream_wait()
-
-        if overlap_args is not None:
-            self.device_module.current_stream().wait_stream(overlap_args.stream)
-
         return hidden_states
 
     def _combine_core(
@@ -362,34 +336,18 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        overlap_args = self.overlap_args
 
-        ctx = nullcontext()
-        if overlap_args is not None:
-            overlap_args.stream.wait_event(overlap_args.wait_event)
-            ctx = torch.cuda.stream(overlap_args.stream)
-
-        with ctx:
-            combined_hidden_states, event, hook = buffer.combine(
-                x=hidden_states,
-                topk_idx=topk_ids,
-                topk_weights=topk_weights,
-                handle=self.handle,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(
-                        overlap=overlap_args.overlap,
-                        src_signals=overlap_args.signal,
-                        src_signal_expect_value=overlap_args.threshold,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
-            )
-            if self._mask_buffer is not None:
-                buffer.query_mask_buffer(self._mask_buffer)
-                self.active_ranks.copy_(1 - self._mask_buffer)
+        combined_hidden_states, event, hook = buffer.combine(
+            x=hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            handle=self.handle,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+        )
+        if self._mask_buffer is not None:
+            buffer.query_mask_buffer(self._mask_buffer)
+            self.active_ranks.copy_(1 - self._mask_buffer)
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
