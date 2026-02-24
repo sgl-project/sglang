@@ -126,6 +126,9 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 1000)
 
 
+@unittest.skip(
+    "Skip this test until new testing logic in mini-lb has been updated in docker image."
+)
 class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention):
     """Test external DP rank assignment via mini-lb --test-external-dp-routing.
 
