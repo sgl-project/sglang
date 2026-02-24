@@ -37,7 +37,6 @@
         "qwen_image_t2i": {
             "notes": "Single-image generation using the default prompt",
             "stages_ms": {
-                "ConditioningStage": 0.02,
                 "DecodingStage": 51.86,
                 "TextEncodingStage": 611.83,
                 "InputValidationStage": 0.05,
@@ -105,7 +104,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 693.2,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.84,
                 "LatentPreparationStage": 9.13,
                 "DenoisingStage": 24529.77,
@@ -169,7 +167,6 @@
         },
         "flux_image_t2i": {
             "stages_ms": {
-                "ConditioningStage": 0.01,
                 "DecodingStage": 32.72,
                 "TextEncodingStage": 51.96,
                 "InputValidationStage": 0.03,
@@ -239,7 +236,6 @@
                 "TimestepPreparationStage": 2.91,
                 "TextEncodingStage": 518.54,
                 "ImageVAEEncodingStage": 0.0,
-                "ConditioningStage": 0.02,
                 "InputValidationStage": 0.05,
                 "DenoisingStage": 24901.97,
                 "DecodingStage": 8.98
@@ -302,7 +298,6 @@
         },
         "flux_2_klein_image_t2i": {
             "stages_ms": {
-                "ConditioningStage": 0.01,
                 "DecodingStage": 9.27,
                 "TextEncodingStage": 92.17,
                 "InputValidationStage": 0.05,
@@ -321,12 +316,10 @@
             "expected_avg_denoise_ms": 38.25,
             "expected_median_denoise_ms": 35.95
         },
-        "flux_2_image_t2i_layerwise_offload": {
+        "layerwise_offload": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 513.58,
-                "ImageVAEEncodingStage": 0.0,
-                "ConditioningStage": 0.03,
                 "LatentPreparationStage": 0.46,
                 "TimestepPreparationStage": 2.38,
                 "DenoisingStage": 52187.62,
@@ -393,7 +386,6 @@
                 "InputValidationStage": 99.82,
                 "TextEncodingStage": 519.88,
                 "ImageVAEEncodingStage": 254.56,
-                "ConditioningStage": 0.01,
                 "LatentPreparationStage": 12.4,
                 "TimestepPreparationStage": 2.71,
                 "DenoisingStage": 54705.41,
@@ -459,7 +451,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.03,
                 "TextEncodingStage": 74.47,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.23,
                 "LatentPreparationStage": 6.17,
                 "DenoisingStage": 8400.49,
@@ -523,34 +514,56 @@
         },
         "zimage_image_t2i": {
             "stages_ms": {
-                "ConditioningStage": 0.01,
-                "DecodingStage": 33.93,
-                "TextEncodingStage": 409.74,
                 "InputValidationStage": 0.03,
-                "DenoisingStage": 808.69,
-                "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 1.33
+                "TextEncodingStage": 403.47,
+                "TimestepPreparationStage": 1.41,
+                "LatentPreparationStage": 0.11,
+                "DenoisingStage": 756.21,
+                "DecodingStage": 29.41
             },
             "denoise_step_ms": {
-                "0": 23.4,
-                "1": 28.26,
-                "2": 100.72,
-                "3": 100.48,
-                "4": 99.62,
-                "5": 99.83,
-                "6": 99.67,
-                "7": 99.3,
-                "8": 100.83
+                "0": 22.29,
+                "1": 75.04,
+                "2": 93.82,
+                "3": 93.34,
+                "4": 93.38,
+                "5": 93.58,
+                "6": 94.01,
+                "7": 93.97,
+                "8": 94.32
             },
-            "expected_e2e_ms": 1461.08,
-            "expected_avg_denoise_ms": 89.36,
-            "expected_median_denoise_ms": 99.67
+            "expected_e2e_ms": 1292.92,
+            "expected_avg_denoise_ms": 83.75,
+            "expected_median_denoise_ms": 93.58
+        },
+        "zimage_image_t2i_fp8": {
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 428.59,
+                "LatentPreparationStage": 0.14,
+                "TimestepPreparationStage": 47.26,
+                "DenoisingStage": 778.56,
+                "DecodingStage": 10.39
+            },
+            "denoise_step_ms": {
+                "0": 40.9,
+                "1": 61.08,
+                "2": 95.65,
+                "3": 95.83,
+                "4": 95.65,
+                "5": 96.09,
+                "6": 96.23,
+                "7": 96.04,
+                "8": 96.29
+            },
+            "expected_e2e_ms": 1370.28,
+            "expected_avg_denoise_ms": 85.97,
+            "expected_median_denoise_ms": 95.83
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 413.69,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.3,
                 "LatentPreparationStage": 0.11,
                 "DenoisingStage": 813.7,
@@ -575,7 +588,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "TextEncodingStage": 420.74,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.5,
                 "LatentPreparationStage": 0.12,
                 "DenoisingStage": 1304.07,
@@ -596,38 +608,12 @@
             "expected_avg_denoise_ms": 144.49,
             "expected_median_denoise_ms": 156.16
         },
-        "zimage_image_t2i_warmup": {
-            "stages_ms": {
-                "InputValidationStage": 0.02,
-                "TextEncodingStage": 456.16,
-                "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 0.98,
-                "LatentPreparationStage": 0.06,
-                "DenoisingStage": 889.42,
-                "DecodingStage": 37.81
-            },
-            "denoise_step_ms": {
-                "0": 16.49,
-                "1": 94.63,
-                "2": 109.65,
-                "3": 110.05,
-                "4": 109.39,
-                "5": 110.58,
-                "6": 109.52,
-                "7": 110.54,
-                "8": 115.24
-            },
-            "expected_e2e_ms": 1184.45,
-            "expected_avg_denoise_ms": 98.46,
-            "expected_median_denoise_ms": 109.65
-        },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
                 "LatentPreparationStage": 0.16,
                 "TimestepPreparationStage": 2.62,
                 "ImageEncodingStage": 1174.26,
                 "ImageVAEEncodingStage": 132.67,
-                "ConditioningStage": 0.01,
                 "InputValidationStage": 38.1,
                 "DenoisingStage": 38135.64,
                 "DecodingStage": 139.72
@@ -692,7 +678,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 675.95,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 3.21,
                 "LatentPreparationStage": 0.2,
                 "DenoisingStage": 5248.83,
@@ -758,74 +743,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "TextEncodingStage": 2237.78,
-                "ConditioningStage": 0.01,
-                "TimestepPreparationStage": 2.1,
-                "LatentPreparationStage": 0.84,
-                "DenoisingStage": 13041.23,
-                "DecodingStage": 1274.63,
-                "per_frame_generation": null
-            },
-            "denoise_step_ms": {
-                "0": 240.71,
-                "1": 248.13,
-                "2": 246.48,
-                "3": 247.87,
-                "4": 249.38,
-                "5": 246.76,
-                "6": 250.42,
-                "7": 250.81,
-                "8": 250.98,
-                "9": 249.9,
-                "10": 246.72,
-                "11": 249.79,
-                "12": 250.46,
-                "13": 249.19,
-                "14": 247.55,
-                "15": 250.12,
-                "16": 247.57,
-                "17": 247.21,
-                "18": 247.32,
-                "19": 247.42,
-                "20": 248.21,
-                "21": 247.19,
-                "22": 247.72,
-                "23": 247.45,
-                "24": 247.9,
-                "25": 247.87,
-                "26": 247.18,
-                "27": 247.65,
-                "28": 246.91,
-                "29": 248.26,
-                "30": 247.82,
-                "31": 247.73,
-                "32": 247.38,
-                "33": 247.84,
-                "34": 247.46,
-                "35": 247.52,
-                "36": 247.94,
-                "37": 248.76,
-                "38": 248.01,
-                "39": 247.45,
-                "40": 247.84,
-                "41": 248.33,
-                "42": 247.41,
-                "43": 248.16,
-                "44": 248.18,
-                "45": 248.44,
-                "46": 248.65,
-                "47": 247.73,
-                "48": 247.48,
-                "49": 247.54
-            },
-            "expected_e2e_ms": 18382.19,
-            "expected_avg_denoise_ms": 260.76,
-            "expected_median_denoise_ms": 247.84
-        },
-        "wan2_1_t2v_1.3b_teacache_enabled": {
-            "stages_ms": {
-                "InputValidationStage": 0.07,
-                "TextEncodingStage": 2237.78,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.1,
                 "LatentPreparationStage": 0.84,
                 "DenoisingStage": 13041.23,
@@ -892,7 +809,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "TextEncodingStage": 2237.78,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.1,
                 "LatentPreparationStage": 0.84,
                 "DenoisingStage": 13041.23,
@@ -959,7 +875,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.09,
                 "TextEncodingStage": 2480.54,
-                "ConditioningStage": 0.07,
                 "TimestepPreparationStage": 3.73,
                 "LatentPreparationStage": 1.34,
                 "DenoisingStage": 12514.88,
@@ -1026,7 +941,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "TextEncodingStage": 2700.44,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.82,
                 "LatentPreparationStage": 2.0,
                 "DenoisingStage": 11640.75,
@@ -1093,7 +1007,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 2508.95,
-                "ConditioningStage": 0.04,
                 "TimestepPreparationStage": 73.51,
                 "LatentPreparationStage": 1.34,
                 "DmdDenoisingStage": 1285.25,
@@ -1114,7 +1027,6 @@
             "stages_ms": {
                 "InputValidationStage": 96.27,
                 "TextEncodingStage": 2238.81,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.39,
                 "LatentPreparationStage": 27.62,
                 "DenoisingStage": 134069.79,
@@ -1184,7 +1096,6 @@
                 "ImageVAEEncodingStage": 304.56,
                 "TimestepPreparationStage": 2.94,
                 "LatentPreparationStage": 0.2,
-                "ConditioningStage": 0.01,
                 "DenoisingStage": 50724.5,
                 "DecodingStage": 601.02
             },
@@ -1301,7 +1212,6 @@
             "stages_ms": {
                 "InputValidationStage": 300.00,
                 "TextEncodingStage": 843.86,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 58.66,
                 "LatentPreparationStage": 28.55,
                 "DmdDenoisingStage": 499.34,
@@ -1321,7 +1231,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.34,
                 "TextEncodingStage": 550.63,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 44.28,
                 "LatentPreparationStage": 0.29,
                 "DenoisingStage": 9154.39,
@@ -1344,7 +1253,6 @@
             "stages_ms": {
                 "InputValidationStage": 18.45,
                 "TextEncodingStage": 3337.77,
-                "ConditioningStage": 0.03,
                 "TimestepPreparationStage": 2.9,
                 "LatentPreparationStage": 1.25,
                 "ImageVAEEncodingStage": 1655.89,
@@ -1402,7 +1310,6 @@
             "stages_ms": {
                 "InputValidationStage": 25.01,
                 "TextEncodingStage": 5198.6,
-                "ConditioningStage": 0.04,
                 "TimestepPreparationStage": 56.26,
                 "LatentPreparationStage": 1.4,
                 "ImageVAEEncodingStage": 1001.89,
@@ -1413,7 +1320,7 @@
             "denoise_step_ms": {
                 "0": 3042.56,
                 "1": 485.88,
-                "2": 477.59,
+                "2": 721.20,
                 "3": 475.58
             },
             "expected_e2e_ms": 11605.97,
@@ -1425,7 +1332,6 @@
                 "InputValidationStage": 38.23,
                 "TextEncodingStage": 3550.36,
                 "ImageEncodingStage": 3462.55,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.6,
                 "LatentPreparationStage": 9.73,
                 "ImageVAEEncodingStage": 2290.98,
@@ -1494,7 +1400,6 @@
                 "InputValidationStage": 53.67,
                 "TextEncodingStage": 2838,
                 "ImageEncodingStage": 3123.99,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 3.39,
                 "LatentPreparationStage": 8.41,
                 "ImageVAEEncodingStage": 2261.05,
@@ -1561,7 +1466,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "TextEncodingStage": 2575.3,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.99,
                 "LatentPreparationStage": 1.26,
                 "DenoisingStage": 156678.8406,
@@ -1618,7 +1522,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 2310.34,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.42,
                 "LatentPreparationStage": 27.7,
                 "DenoisingStage": 803631.52,
@@ -1685,7 +1588,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.09,
                 "TextEncodingStage": 2552.97,
-                "ConditioningStage": 0.03,
                 "TimestepPreparationStage": 1.99,
                 "LatentPreparationStage": 1.29,
                 "DenoisingStage": 154340.69,
@@ -1742,7 +1644,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 2467.44,
-                "ConditioningStage": 0.02,
                 "TimestepPreparationStage": 2.96,
                 "LatentPreparationStage": 1.87,
                 "DenoisingStage": 14859.47,
@@ -1810,7 +1711,6 @@
                 "InputValidationStage": 23.97,
                 "TextEncodingStage": 2485.39,
                 "ImageEncodingStage": 2372.07,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 2.6,
                 "LatentPreparationStage": 0.18,
                 "ImageVAEEncodingStage": 2500.13,
@@ -1879,7 +1779,6 @@
                 "InputValidationStage": 0.05,
                 "TextEncodingStage": 518.88,
                 "ImageVAEEncodingStage": 0.0,
-                "ConditioningStage": 0.01,
                 "LatentPreparationStage": 0.45,
                 "TimestepPreparationStage": 3.41,
                 "DenoisingStage": 26377.63,
@@ -1948,7 +1847,6 @@
                 "ImageVAEEncodingStage": 88.06,
                 "TimestepPreparationStage": 2.12,
                 "LatentPreparationStage": 0.14,
-                "ConditioningStage": 0.01,
                 "DenoisingStage": 23869.32,
                 "DecodingStage": 108.23
             },
@@ -2002,7 +1900,6 @@
             "stages_ms": {
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 411.12,
-                "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.44,
                 "LatentPreparationStage": 0.1,
                 "DenoisingStage": 1569.61,

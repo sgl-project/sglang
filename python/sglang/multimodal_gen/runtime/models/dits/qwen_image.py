@@ -15,6 +15,9 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.jit_kernel.diffusion.triton.scale_shift import (
+    fuse_scale_shift_gate_select01_kernel,
+)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -40,9 +43,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
-)
-from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    fuse_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -137,6 +137,8 @@ class FeedForward(nn.Module):
         mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
         activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
         bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict.
     """
 
     def __init__(
@@ -147,6 +149,8 @@ class FeedForward(nn.Module):
         activation_fn: str = "geglu",
         inner_dim=None,
         bias: bool = True,
+        quant_config=None,
+        prefix: str = "",
     ):
         super().__init__()
         if inner_dim is None:
@@ -154,9 +158,16 @@ class FeedForward(nn.Module):
         dim_out = dim_out if dim_out is not None else dim
 
         if activation_fn == "gelu":
-            act_fn = GELU(dim, inner_dim, bias=bias)
+            act_fn = GELU(dim, inner_dim, bias=bias, quant_config=None, prefix=prefix)
         if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+            act_fn = GELU(
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=None,
+                prefix=prefix,
+            )
         else:
             raise NotImplementedError(
                 f"activation_fn '{activation_fn}' is not supported."
@@ -166,7 +177,13 @@ class FeedForward(nn.Module):
         self.net.append(act_fn)
         self.net.append(nn.Identity())
         self.net.append(
-            RowParallelLinear(inner_dim, dim_out, bias=True, input_is_parallel=True)
+            RowParallelLinear(
+                inner_dim,
+                dim_out,
+                bias=True,
+                input_is_parallel=True,
+                quant_config=None,
+            )
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -823,6 +840,11 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
+        mod_quant_config = (
+            quant_config
+            if (quant_config is not None and quant_config.get_name() == "svdquant")
+            else None
+        )
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
@@ -831,7 +853,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 gather_output=True,
-                quant_config=quant_config,
+                quant_config=mod_quant_config,
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
@@ -860,7 +882,7 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 gather_output=True,
-                quant_config=quant_config,
+                quant_config=mod_quant_config,
                 prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
@@ -880,19 +902,33 @@ class QwenImageTransformerBlock(nn.Module):
             and quant_config.get_name() == "svdquant"
             and is_nunchaku_available()
         )
-        ff_class = (
-            diffusers.models.attention.FeedForward if nunchaku_enabled else FeedForward
-        )
-        self.img_mlp = ff_class(
-            dim=dim,
-            dim_out=dim,
-            activation_fn="gelu-approximate",
-        )
-        self.txt_mlp = ff_class(
-            dim=dim,
-            dim_out=dim,
-            activation_fn="gelu-approximate",
-        )
+        if nunchaku_enabled:
+            ff_class = diffusers.models.attention.FeedForward
+            self.img_mlp = ff_class(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+            )
+            self.txt_mlp = ff_class(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+            )
+        else:
+            self.img_mlp = FeedForward(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mlp",
+            )
+            self.txt_mlp = FeedForward(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="gelu-approximate",
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mlp",
+            )
 
         if nunchaku_enabled:
             nunchaku_kwargs = {
@@ -1122,6 +1158,29 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attn.to_qkv",
+                "attn.to_out",
+                "attn.add_qkv_proj",
+                "attn.to_add_out",
+                "img_mlp",
+                "txt_mlp",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
 
     def __init__(
         self,

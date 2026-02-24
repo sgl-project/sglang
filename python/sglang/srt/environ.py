@@ -12,7 +12,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
     By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
     for those.  Pass ``allow_sglang=True`` only for special env vars that
-    intentionally bypass ``environ.py`` (e.g. ``SGLANG_DUMPER_*``).
+    intentionally bypass ``environ.py``.
     """
     if not allow_sglang:
         for key in env_vars:
@@ -176,6 +176,8 @@ class Envs:
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
+    SGLANG_CUDA_COREDUMP = EnvBool(False)
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -257,6 +259,7 @@ class Envs:
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -574,6 +577,11 @@ _warn_deprecated_env_to_cli_flag(
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK",
     "Please use '--prefill-delayer-token-usage-low-watermark' instead.",
 )
+
+# Import cuda_coredump to trigger auto-injection of CUDA env vars
+# when SGLANG_CUDA_COREDUMP=1. Best-effort; for strict guarantees,
+# set CUDA_* env vars in the shell before launching Python.
+import sglang.srt.debug_utils.cuda_coredump  # noqa: F401, E402
 
 
 def example_with_exit_stack():

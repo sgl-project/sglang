@@ -82,6 +82,10 @@ rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.t
 pip install -e "python[all_musa]"
 ```
 
+## Platform-Specific: Ascend NPU
+
+For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend_npu.md).
+
 Quick test:
 
 ```bash
