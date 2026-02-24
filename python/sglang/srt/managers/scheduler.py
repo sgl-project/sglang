@@ -631,15 +631,6 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
-        if self.server_args.enable_mm_global_cache:
-            # TODO liusy
-            self.mm_global_cache = EmbeddingCacheController(
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                hidden_dim=self.model_config.hidden_size,
-                tp_group=self.tp_group,
-                all_rank_get=True,
-            )
 
         # Create cache
         params = CacheInitParams(
