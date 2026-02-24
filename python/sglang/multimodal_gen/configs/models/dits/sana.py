@@ -19,40 +19,32 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 @dataclass
 class SanaArchConfig(DiTArchConfig):
-    # Spatial patchify parameters — patch_size=1 means no spatial downsampling
-    # in the patch embedding; all spatial compression comes from the DC-AE (32x).
     patch_size: int = 1
     in_channels: int = 32
     out_channels: int = 32
-
     num_layers: int = 20
-
-    # Self-attention (linear attention) head configuration
     attention_head_dim: int = 32
     num_attention_heads: int = 70
-
-    # Cross-attention head configuration (text conditioning via Gemma2)
     num_cross_attention_heads: int = 20
     cross_attention_head_dim: int = 112
     cross_attention_dim: int = 2240
-
-    # Gemma2 hidden_size feeds into caption_projection
     caption_channels: int = 2304
 
     mlp_ratio: float = 2.5
     # "rms_norm_across_heads" applies RMSNorm over the full (num_heads * head_dim)
-    # dimension before reshaping into heads, not per-head — this is intentional
-    # and matches the diffusers SanaTransformer2DModel implementation.
+
     qk_norm: str = "rms_norm_across_heads"
     norm_elementwise_affine: bool = False
     norm_eps: float = 1e-6
     sample_size: int = 32
     guidance_embeds: bool = False
 
-    # HF checkpoints store weights under "transformer.*"; strip that prefix.
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^transformer\.(.*)$": r"\1",
+            r"^(.*\.ff\.)conv_depth\.(.*)$": r"\1dwconv.\2",
+            r"^(.*\.ff\.)conv_inverted\.(.*)$": r"\1fc1.\2",
+            r"^(.*\.ff\.)conv_point\.(.*)$": r"\1fc2.\2",
         }
     )
 

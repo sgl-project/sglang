@@ -1,15 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# SANA Transformer (DiT) for text-to-image generation.
-# Adapted from diffusers SanaTransformer2DModel.
-#
-# Key architectural choices:
-#   - Linear attention (O(N) vs O(N^2)) for self-attention, enabling high-res generation
-#   - Standard SDPA cross-attention for text conditioning
-#   - GLU-MBConv feed-forward with depthwise conv for local spatial mixing
-#   - AdaLN-Single for timestep conditioning (shared across all blocks)
-#   - No positional embeddings — spatial info comes from the conv-based patch embed
-#     and the depthwise conv in GLUMBConv
 
 import torch
 import torch.nn as nn
@@ -119,13 +108,9 @@ class SanaLinearAttention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
         self.to_k = nn.Linear(query_dim, inner_dim, bias=bias)
         self.to_v = nn.Linear(query_dim, inner_dim, bias=bias)
-        # to_out[1] is Identity (placeholder for dropout); kept for weight-loading
-        # compatibility with diffusers checkpoints.
         self.to_out = nn.ModuleList(
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
-
-        # RMSNorm across the full (num_heads * head_dim) dimension before head split
         self.norm_q = RMSNorm(qk_norm_dim)
         self.norm_k = RMSNorm(qk_norm_dim)
 
@@ -142,8 +127,6 @@ class SanaLinearAttention(nn.Module):
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         key = key.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         value = value.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Linear attention kernel: φ(Q) @ (φ(K)^T @ V) with φ = ReLU
         query = F.relu(query)
         key = F.relu(key)
 
@@ -248,21 +231,15 @@ class SanaTransformerBlock(nn.Module):
         shift_mlp = shift_mlp.squeeze(1)
         scale_mlp = scale_mlp.squeeze(1)
         gate_mlp = gate_mlp.squeeze(1)
-
-        # Self-attention with AdaLN modulation
         norm_hidden = self.norm1(hidden_states)
         norm_hidden = (
             norm_hidden * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         )
         attn_output = self.attn1(norm_hidden)
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
-
-        # Cross-attention (no modulation)
         norm_hidden = self.norm2(hidden_states)
         attn_output = self.attn2(norm_hidden, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
-
-        # Feed-forward with AdaLN modulation
         norm_hidden = (
             hidden_states * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         )
@@ -280,9 +257,7 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _compile_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]
-    # Mirrors the mapping in SanaArchConfig; the weight loader checks
-    # the model class first, so this must be present here too.
-    param_names_mapping = {r"^transformer\.(.*)$": r"\1"}
+    param_names_mapping = SanaConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):
@@ -297,7 +272,6 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.num_channels_latents
 
-        # ModuleDict wrapper matches the diffusers weight key "patch_embed.proj.*"
         self.patch_embed = nn.ModuleDict(
             {
                 "proj": nn.Conv2d(
@@ -309,11 +283,7 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 ),
             }
         )
-
-        # Single shared timestep embedding for all blocks (AdaLN-Single pattern)
         self.time_embed = SanaAdaLayerNormSingle(self.inner_dim)
-
-        # Projects Gemma2 hidden_size (2304) -> DiT inner_dim (2240)
         self.caption_projection = PixArtAlphaTextProjection(
             in_features=arch.caption_channels,
             hidden_size=self.inner_dim,
@@ -337,8 +307,6 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 for _ in range(arch.num_layers)
             ]
         )
-
-        # Final output modulation table: 2 vectors (shift, scale) learned per model
         self.scale_shift_table = nn.Parameter(
             torch.randn(2, self.inner_dim) / self.inner_dim**0.5
         )
@@ -387,8 +355,6 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 post_patch_height,
                 post_patch_width,
             )
-
-        # Final output: AdaLN modulation + linear projection + unpatchify
         shift, scale = (
             self.scale_shift_table[None] + embedded_timestep[:, None]
         ).chunk(2, dim=1)
@@ -396,8 +362,6 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         hidden_states = self.norm_out(hidden_states, temb=embedded_timestep)
         hidden_states = hidden_states * (1 + scale) + shift
         hidden_states = self.proj_out(hidden_states)
-
-        # Unpatchify: (B, H'*W', p*p*C_out) -> (B, C_out, H, W)
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_height, post_patch_width, p, p, self.out_channels
         )

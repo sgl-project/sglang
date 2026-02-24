@@ -1,25 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# AutoencoderDC (DC-AE) VAE wrapper for SANA image generation.
-#
-# DC-AE is architecturally different from standard VAEs (e.g. Flux/SD's
-# AutoencoderKL): it uses a deep compression encoder with residual blocks
-# and achieves 32x spatial compression. Because of this unique architecture,
-# we delegate to diffusers' AutoencoderDC rather than reimplementing it.
-#
-# The wrapper pattern here (lazy init + state_dict passthrough) follows the
-# same approach as other wrapped models in the codebase — see the scheduler
-# wrapper for a similar pattern.
-#
-# Weight loading flow (via VAELoader.load_customized):
-#   1. VAELoader reads vae/config.json → calls vae_config.update_model_arch(hf_dict)
-#      which sets ALL HF config keys (encoder_block_types, decoder_block_types, etc.)
-#      as dynamic attributes on vae_config.arch_config via setattr.
-#   2. VAELoader calls vae_config.post_init() → sets vae_scale_factor.
-#   3. VAELoader creates our wrapper: AutoencoderDC(vae_config).
-#   4. VAELoader loads safetensors → calls our load_state_dict().
-#   5. _ensure_inner_model() collects the full HF config from arch_config attributes,
-#      creates the diffusers model with the correct architecture, and loads weights.
 
 from typing import Dict, Iterable, Optional, Set, Tuple
 
@@ -57,19 +36,14 @@ class AutoencoderDC(nn.Module):
         if state_to_load:
             first_tensor = next(iter(state_to_load.values()))
             device = first_tensor.device
-
-        # Build the full HF config dict from arch_config. The framework's
-        # VAELoader calls update_model_arch(hf_config_dict) before creating
-        # this wrapper, which sets ALL keys from the HF config.json
-        # (encoder_block_types, decoder_block_types, etc.) as dynamic
-        # attributes on arch_config via setattr. We collect them all here
-        # so that DiffusersAutoencoderDC.from_config() builds the correct
-        # architecture instead of falling back to defaults.
         hf_config = {}
         if self._config is not None:
             arch = self._config.arch_config
             for key, value in vars(arch).items():
-                if not key.startswith("_") and not callable(value):
+                if key == "extra_attrs" and isinstance(value, dict):
+                    for ek, ev in value.items():
+                        hf_config[ek] = ev
+                elif not key.startswith("_") and not callable(value):
                     hf_config[key] = value
 
         self._inner_model = DiffusersAutoencoderDC.from_config(hf_config)
