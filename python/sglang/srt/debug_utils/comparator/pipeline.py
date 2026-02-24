@@ -40,8 +40,8 @@ def process_tensor_group(
     t_extracted = _extract_tensors(t_tensors)
     del b_tensors, t_tensors
 
-    b_tensor = _execute_plans(b_extracted, b_plans) if b_extracted is not None else None
-    t_tensor = _execute_plans(t_extracted, t_plans) if t_extracted is not None else None
+    b_tensor = _execute_plans(b_extracted, b_plans)
+    t_tensor = _execute_plans(t_extracted, t_plans)
 
     if b_tensor is None or t_tensor is None:
         reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
@@ -115,6 +115,9 @@ def _execute_plans(
     tensors: list[torch.Tensor],
     plans: list[Plan],
 ) -> Optional[torch.Tensor]:
+    if not tensors:
+        return None
+
     if not plans:
         if len(tensors) != 1:
             return None
