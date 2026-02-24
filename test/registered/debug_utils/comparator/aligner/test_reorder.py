@@ -20,11 +20,11 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 
 class TestZigzagToNatural:
     def test_zigzag_to_natural_cp2(self) -> None:
-        """cp_size=2: zigzag order [0,3,2,1] -> natural [0,1,2,3]."""
+        """cp_size=2: zigzag order [0,3,1,2] -> natural [0,1,2,3]."""
         natural = torch.arange(24).reshape(4, 6)
         chunks = list(natural.chunk(4, dim=0))
 
-        zigzag_order: list[int] = [0, 3, 2, 1]
+        zigzag_order: list[int] = [0, 3, 1, 2]
         zigzagged = torch.cat([chunks[i] for i in zigzag_order], dim=0)
 
         result = _reorder_zigzag_to_natural(zigzagged, dim=0, cp_size=2)
@@ -46,7 +46,7 @@ class TestZigzagToNatural:
         natural = torch.arange(48).reshape(3, 4, 4)
         chunks = list(natural.chunk(4, dim=1))
 
-        zigzag_order: list[int] = [0, 3, 2, 1]
+        zigzag_order: list[int] = [0, 3, 1, 2]
         zigzagged = torch.cat([chunks[i] for i in zigzag_order], dim=1)
 
         result = _reorder_zigzag_to_natural(zigzagged, dim=1, cp_size=2)
@@ -97,7 +97,7 @@ class TestCpZigzagTpE2E:
         # Shard: first split seq dim (dim=1) into CP=2 with zigzag ordering,
         # then split hidden dim (dim=2) into TP=2.
         natural_cp_chunks = list(full_tensor.chunk(4, dim=1))
-        zigzag_order: list[int] = [0, 3, 2, 1]
+        zigzag_order: list[int] = [0, 3, 1, 2]
         zigzagged = torch.cat([natural_cp_chunks[i] for i in zigzag_order], dim=1)
 
         cp_chunks = list(zigzagged.chunk(2, dim=1))
