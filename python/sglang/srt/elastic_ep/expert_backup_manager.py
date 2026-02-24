@@ -57,6 +57,23 @@ class ExpertBackupManager:
         self.backup_weights_from_disk()
         self.start_transfer_server()
 
+        # Block until all expert backup clients have reported readiness, to avoid
+        # losing the initial PUB message due to slow joiners.
+        num_ready_clients = 0
+
+        while num_ready_clients < self.server_args.tp_size:
+            self.recv_from_expert_backup_client.recv_pyobj()
+            num_ready_clients += 1
+
+        back_req = BackupDramReq(
+            rank=self.engine_rank,
+            weight_pointer_map=self.weight_pointer_map,
+            session_id=self.session_id,
+            buffer_size=self.continuous_buffer.numel()
+            * self.continuous_buffer.element_size(),
+        )
+        self.send_to_expert_backup_client.send_pyobj(back_req)
+
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
         loader = get_model_loader(load_config, self.model_config)
@@ -134,24 +151,6 @@ class ExpertBackupManager:
         if ret_value != 0:
             raise RuntimeError("Mooncake memory registration failed.")
 
-    def event_loop(self):
-        # Block until all expert backup clients have reported readiness, to avoid
-        # losing the initial PUB message due to slow joiners.
-        num_ready_clients = 0
-
-        while num_ready_clients < self.server_args.tp_size:
-            self.recv_from_expert_backup_client.recv_pyobj()
-            num_ready_clients += 1
-
-        back_req = BackupDramReq(
-            rank=self.engine_rank,
-            weight_pointer_map=self.weight_pointer_map,
-            session_id=self.session_id,
-            buffer_size=self.continuous_buffer.numel()
-            * self.continuous_buffer.element_size(),
-        )
-        self.send_to_expert_backup_client.send_pyobj(back_req)
-
 
 def run_expert_backup_manager_process(
     server_args: ServerArgs,
@@ -170,7 +169,6 @@ def run_expert_backup_manager_process(
         ),
     )
     manager = ExpertBackupManager(server_args, port_args)
-    manager.event_loop()
 
 
 def run_expert_backup_manager(
