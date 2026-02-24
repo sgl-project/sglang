@@ -13,48 +13,21 @@ from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_
 from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
-_LoadFn = Callable[[list[dict], Path], Optional[torch.Tensor]]
+LoadFn = Callable[[list[dict], Path], Optional[torch.Tensor]]
+
+_LOAD_FNS: dict[str, LoadFn] = {
+    "smart": load_and_unshard,
+    "per-rank": lambda rows, base_path: _load_single_tensor(rows, base_path),
+}
 
 
-def process_smart(
+def process(
     *,
     baseline_rows: list[dict],
     target_rows: list[dict],
     args: argparse.Namespace,
     counts: dict[str, int],
-) -> None:
-    _process(
-        baseline_rows=baseline_rows,
-        target_rows=target_rows,
-        args=args,
-        counts=counts,
-        load_fn=load_and_unshard,
-    )
-
-
-def process_per_rank(
-    *,
-    baseline_rows: list[dict],
-    target_rows: list[dict],
-    args: argparse.Namespace,
-    counts: dict[str, int],
-) -> None:
-    _process(
-        baseline_rows=baseline_rows,
-        target_rows=target_rows,
-        args=args,
-        counts=counts,
-        load_fn=_load_single_tensor,
-    )
-
-
-def _process(
-    *,
-    baseline_rows: list[dict],
-    target_rows: list[dict],
-    args: argparse.Namespace,
-    counts: dict[str, int],
-    load_fn: _LoadFn,
+    load_fn: LoadFn,
 ) -> None:
     name = (baseline_rows or target_rows)[0]["name"]
     fmt = args.output_format
