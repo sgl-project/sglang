@@ -61,6 +61,11 @@ class BaseKVManager(ABC):
         is_mla_backend: Optional[bool] = False,
     ): ...
 
+    @abstractmethod
+    def register_to_bootstrap(self):
+        """Register to the bootstrap server."""
+        ...
+
 
 class BaseKVSender(ABC):
 
@@ -158,4 +163,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, host: str, port: int): ...
+    def __init__(self, host: str, port: int, dp_size: int = 1): ...

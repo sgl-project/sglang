@@ -1,5 +1,11 @@
 name: Release Docker Images Nightly (NPU)
 on:
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/release-docker-npu-nightly.yml'
+      - 'docker/npu.Dockerfile'
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
