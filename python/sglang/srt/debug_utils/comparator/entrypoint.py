@@ -7,7 +7,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
-from sglang.srt.debug_utils.comparator.pipeline import process
+from sglang.srt.debug_utils.comparator.pipeline import process_tensor_group
 from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
 
 _NON_KEY_COLS = {"dump_index", "filename", "duplicate_index"}
@@ -52,7 +52,7 @@ def run(args: argparse.Namespace) -> None:
         baseline_rows = filter_rows(df_baseline, conditions=conditions)
         target_rows = filter_rows(df_target, conditions=conditions)
 
-        process(
+        process_tensor_group(
             baseline_rows=baseline_rows,
             target_rows=target_rows,
             args=args,

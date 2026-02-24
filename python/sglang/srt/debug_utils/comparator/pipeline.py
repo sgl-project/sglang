@@ -14,7 +14,7 @@ from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 
-def process(
+def process_tensor_group(
     *,
     baseline_rows: list[dict],
     target_rows: list[dict],
