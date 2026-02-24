@@ -310,16 +310,47 @@ class MooncakeStore(HiCacheStorage):
                     self.config.client_server_address,
                 )
             else:
-                # TODO(shangming): disable mooncake transfer engine reuse for hicache temporary
-                # Need to wait for the next mooncake release
+                try:
+                    from sglang.srt.distributed.parallel_state import (
+                        get_mooncake_transfer_engine,
+                    )
+
+                    self._shared_mooncake_transfer_engine = (
+                        get_mooncake_transfer_engine()
+                    )
+                except Exception:
+                    self._shared_mooncake_transfer_engine = None
+                    logger.debug("Failed to reuse initialized mooncake transfer engine")
+
+                # Only reuse the shared MooncakeTransferEngine when its
+                # configuration matches the one used by MooncakeStore.
+                if (
+                    self._shared_mooncake_transfer_engine is not None
+                    and device_name
+                    == self._shared_mooncake_transfer_engine.get_ib_device()
+                    and self.config.metadata_server == "P2PHANDSHAKE"
+                    and self.config.protocol == "rdma"
+                ):
+                    client_hostname = (
+                        self._shared_mooncake_transfer_engine.get_session_id()
+                    )
+                    transfer_engine = self._shared_mooncake_transfer_engine.get_engine()
+                    logger.info(
+                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
+                    )
+                else:
+                    client_hostname = self.config.local_hostname
+                    transfer_engine = None
+
                 ret_code = self.store.setup(
-                    self.config.local_hostname,
+                    client_hostname,
                     self.config.metadata_server,
                     per_tp_global_segment_size,
                     DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
                     self.config.protocol,
                     device_name,
                     self.config.master_server_address,
+                    transfer_engine,
                 )
             if ret_code:
                 raise RuntimeError(

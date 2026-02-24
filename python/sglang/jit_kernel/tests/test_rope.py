@@ -1,47 +1,20 @@
-import time
-
 import pytest
 import torch
 import triton
-import triton.language as tl
-from sgl_kernel import FusedSetKVBufferArg as FusedSetKVBufferArgKernel
-from sgl_kernel import (
-    apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace_kernel,
-)
-
-from sglang.jit_kernel.rope import FusedSetKVBufferArg as FusedSetKVBufferArgJit
-from sglang.jit_kernel.rope import (
-    apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace_jit,
-)
 
 DEVICE = "cuda"
+DTYPE = torch.bfloat16
+MAX_SEQ_LEN = 131072  # common seq length
+ROPE_BASE = 10000.0
+CACHE_SIZE = 1024 * 128
 
 
-@triton.jit
-def burn_kernel(out_ptr, iters: tl.constexpr):
-    pid = tl.program_id(0)
-    x = tl.full((), pid + 1, dtype=tl.uint32)
-
-    a = tl.full((), 1664525, dtype=tl.uint32)
-    c = tl.full((), 1013904223, dtype=tl.uint32)
-    sh = tl.full((), 13, dtype=tl.uint32)
-
-    for _ in range(iters):
-        x = x * a + c
-        x = x ^ (x >> sh)
-
-    if pid == 0:
-        tl.store(out_ptr, x)
-
-
-def triton_burn(ms: float, grid=(256,)):
-    iters = int(ms * 20000)
-    out = torch.empty((), device="cuda", dtype=torch.uint32)
-    burn_kernel[grid](out, iters=iters)
-    return out
-
-
-def create_cos_sin_cache(rotary_dim, max_position_embeddings, base, dtype):
+def create_cos_sin_cache(
+    rotary_dim: int,
+    max_position: int = MAX_SEQ_LEN,
+    base: float = ROPE_BASE,
+) -> torch.Tensor:
+    """Create cos/sin cache compatible with SGLang layout: [max_pos, rotary_dim]."""
     inv_freq = 1.0 / (
         base
         ** (
@@ -49,253 +22,223 @@ def create_cos_sin_cache(rotary_dim, max_position_embeddings, base, dtype):
             / rotary_dim
         )
     )
-
-    t = torch.arange(max_position_embeddings, dtype=torch.float32, device=DEVICE)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    t = torch.arange(max_position, dtype=torch.float32, device=DEVICE)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
     cos = freqs.cos()
     sin = freqs.sin()
-    cache = torch.cat((cos, sin), dim=-1)
+    cache = torch.cat((cos, sin), dim=-1)  # [max_pos, rotary_dim]
     return cache
 
 
-@pytest.mark.parametrize("bs", [1, 8])
-@pytest.mark.parametrize("seq_len", [1, 512])
-@pytest.mark.parametrize("num_qo_heads", [1, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 16])
-@pytest.mark.parametrize("head_dim", [64, 512])
-@pytest.mark.parametrize("rotary_dim", [64, 128])
-@pytest.mark.parametrize("interleave", [False, True])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+# ---------------------------------------------------------------------------
+# Implementation wrappers
+# ---------------------------------------------------------------------------
+
+
+def sglang_jit_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    from sglang.jit_kernel.rope import apply_rope_inplace
+
+    apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
+
+
+def flashinfer_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+
+    head_size = q.shape[-1]
+    # flashinfer expects [nnz, num_heads * head_size]
+    q_2d = q.view(q.shape[0], -1)
+    k_2d = k.view(k.shape[0], -1)
+    apply_rope_with_cos_sin_cache_inplace(
+        positions=positions,
+        query=q_2d,
+        key=k_2d,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+
+
+def torch_impl_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    # TODO: implement a pure-PyTorch reference for extra coverage
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Test parameters
+# ---------------------------------------------------------------------------
+
+BS_LIST = [2**x for x in range(12)]
+BS_LIST += [x + 1 for x in BS_LIST]  # odd sizes to stress non-aligned paths
+NUM_KV_HEADS_LIST = [1, 2, 8]
+GQA_RATIO = [1, 4, 8]
+ROPE_DIM_LIST = [64, 128, 256, 512]
+IS_NEOX_LIST = [False, True]
+DTYPE_LIST = [torch.bfloat16, torch.float16]
+
+
+@pytest.mark.parametrize("batch_size", BS_LIST)
+@pytest.mark.parametrize("gqa_ratio", GQA_RATIO)
+@pytest.mark.parametrize("num_kv_heads", NUM_KV_HEADS_LIST)
+@pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
 def test_rope(
-    bs,
-    seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    rotary_dim,
-    interleave: bool,
-    enable_pdl: bool,
-    save_kv_cache: bool,
+    batch_size: int,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    rope_dim: int,
+    is_neox: bool,
     dtype: torch.dtype,
 ) -> None:
-    if head_dim < rotary_dim:
-        pytest.skip(f"{head_dim=} < {rotary_dim=}")
-    if not save_kv_cache and enable_pdl:
-        pytest.skip(f"({save_kv_cache=}, {enable_pdl=}) is not allowed")
-
-    q = torch.randn(bs * seq_len, num_qo_heads * head_dim, device=DEVICE, dtype=dtype)
-    k = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
-    v = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
-
-    KV_POOL_SIZE = bs * seq_len * 2
-    k_buffer = torch.zeros(
-        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+    num_qo_heads = num_kv_heads * gqa_ratio
+    q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randint(
+        0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
     )
-    v_buffer = torch.zeros(
-        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
-    )
-    out_cache_loc = torch.randperm(KV_POOL_SIZE, dtype=torch.int64, device=DEVICE)[
-        : bs * seq_len
-    ].clone()
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
 
-    pos_ids = torch.arange(seq_len, device=DEVICE).repeat(bs)
+    q_fi, k_fi = q.clone(), k.clone()
+    q_jit, k_jit = q.clone(), k.clone()
 
-    max_seq_len = seq_len
-    base = 10000
-    cos_sin_cache = create_cos_sin_cache(rotary_dim, max_seq_len, base, dtype)
+    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
+    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
-    q_jit = q.clone()
-    k_jit = k.clone()
-    v_jit = v.clone()
-    k_buffer_jit = k_buffer.clone()
-    v_buffer_jit = v_buffer.clone()
-    out_cache_loc_jit = out_cache_loc.clone()
-    fused_set_kv_buffer_arg_jit = FusedSetKVBufferArgJit(
-        value=v_jit,
-        k_buffer=k_buffer_jit.view(k_buffer_jit.shape[0], -1),
-        v_buffer=v_buffer_jit.view(v_buffer_jit.shape[0], -1),
-        k_scale=None,
-        v_scale=None,
-        cache_loc=out_cache_loc_jit,
-    )
-
-    q_kernel = q.clone()
-    k_kernel = k.clone()
-    v_kernel = v.clone()
-    k_buffer_kernel = k_buffer.clone()
-    v_buffer_kernel = v_buffer.clone()
-    out_cache_loc_kernel = out_cache_loc.clone()
-    fused_set_kv_buffer_arg_kernel = FusedSetKVBufferArgKernel(
-        value=v_kernel,
-        k_buffer=k_buffer_kernel.view(k_buffer_kernel.shape[0], -1),
-        v_buffer=v_buffer_kernel.view(v_buffer_kernel.shape[0], -1),
-        k_scale=None,
-        v_scale=None,
-        cache_loc=out_cache_loc_kernel,
-    )
-
-    stream_jit = torch.cuda.Stream()
-    stream_kernel = torch.cuda.Stream()
-
-    triton_burn(10, grid=(1024,))
-    r = torch.randn_like(q)
-    r_jit, r_kernel = r.clone(), r.clone()
-    torch.cuda.synchronize()
-
-    with torch.cuda.stream(stream_jit):
-        # Test if rotary_embedding runs on stream_jit
-        triton_burn(10, grid=(1024,))
-        q_jit = q_jit + r_jit
-        apply_rope_with_cos_sin_cache_inplace_jit(
-            positions=pos_ids,
-            query=q_jit,
-            key=k_jit,
-            head_size=head_dim,
-            cos_sin_cache=cos_sin_cache,
-            is_neox=(not interleave),
-            fused_set_kv_buffer_arg=(
-                fused_set_kv_buffer_arg_jit if save_kv_cache else None
-            ),
-            enable_pdl=enable_pdl,
-        )
-
-    with torch.cuda.stream(stream_kernel):
-        triton_burn(10, grid=(1024,))
-        q_kernel = q_kernel + r_kernel
-        apply_rope_with_cos_sin_cache_inplace_kernel(
-            positions=pos_ids,
-            query=q_kernel,
-            key=k_kernel,
-            head_size=head_dim,
-            cos_sin_cache=cos_sin_cache,
-            is_neox=(not interleave),
-            fused_set_kv_buffer_arg=(
-                fused_set_kv_buffer_arg_kernel if save_kv_cache else None
-            ),
-            enable_pdl=enable_pdl,
-        )
-
-    torch.cuda.synchronize()
-
-    atol = 1e-3 if dtype != torch.float32 else 1e-6
-    rtol = 1e-3 if dtype != torch.float32 else 1e-6
-    torch.testing.assert_close(q_jit, q_kernel, atol=atol, rtol=rtol)
-    torch.testing.assert_close(k_jit, k_kernel, atol=atol, rtol=rtol)
-    torch.testing.assert_close(k_buffer_jit, k_buffer_kernel, atol=atol, rtol=rtol)
-    torch.testing.assert_close(v_buffer_jit, v_buffer_kernel, atol=atol, rtol=rtol)
+    atol = rtol = 1e-2
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("bs", [8])
-@pytest.mark.parametrize("seq_len", [256, 512, 1024])
-@pytest.mark.parametrize("num_qo_heads", [16])
-@pytest.mark.parametrize("num_kv_heads", [16])
-@pytest.mark.parametrize("head_dim", [64])
-@pytest.mark.parametrize("rotary_dim", [64])
-@pytest.mark.parametrize("interleave", [False])
-@pytest.mark.parametrize("enable_pdl", [False])
-@pytest.mark.parametrize("save_kv_cache", [False])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_bench_rope(
-    bs,
-    seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    rotary_dim,
-    interleave: bool,
-    enable_pdl: bool,
-    save_kv_cache: bool,
-    dtype: torch.dtype,
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_rope_position_dtypes(dtype: torch.dtype) -> None:
+    """Ensure both int32 and int64 position tensors work correctly."""
+    batch_size, num_qo_heads, num_kv_heads, rope_dim = 16384, 16, 2, 128
+    is_neox = True
+
+    q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=dtype)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    q_fi, k_fi = q.clone(), k.clone()
+    q_jit, k_jit = q.clone(), k.clone()
+
+    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+    sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
+
+    atol = rtol = 1e-2
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("batch_size", BS_LIST)
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("rope_dim", [64, 80, 96, 128])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
+    if head_dim < rope_dim:
+        pytest.skip("Invalid config: head_dim must be >= rope_dim.")
+    num_qo_heads, num_kv_heads = 8, 2
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    q_fi, k_fi = q.clone(), k.clone()
+    q_jit, k_jit = q.clone(), k.clone()
+    rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
+
+    flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
+    sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+
+    atol = rtol = 1e-2
+    triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("batch_size", BS_LIST)
+@pytest.mark.parametrize("gqa_ratio", GQA_RATIO)
+@pytest.mark.parametrize("num_kv_heads", NUM_KV_HEADS_LIST)
+@pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+def test_fused_rope_store(
+    batch_size: int,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    rope_dim: int,
+    is_neox: bool,
 ) -> None:
-    if head_dim < rotary_dim:
-        pytest.skip(f"{head_dim=} < {rotary_dim=}")
-    if not save_kv_cache and enable_pdl:
-        pytest.skip(f"({save_kv_cache=}, {enable_pdl=}) is not allowed")
+    """Test fused RoPE + KV cache store against separate RoPE + manual store."""
+    from sglang.jit_kernel.rope import apply_rope_inplace_with_kvcache
 
-    q = torch.randn(bs * seq_len, num_qo_heads * head_dim, device=DEVICE, dtype=dtype)
-    k = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
-    v = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
+    num_qo_heads = num_kv_heads * gqa_ratio
+    dtype = DTYPE
 
-    KV_POOL_SIZE = bs * seq_len * 2
-    k_buffer = torch.zeros(
-        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+    q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
+    v = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=dtype)
+    positions = torch.randint(
+        0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
     )
-    v_buffer = torch.zeros(
-        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+    out_loc = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[:batch_size]
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    row_size = num_kv_heads * rope_dim
+    k_cache_ref = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
+    v_cache_ref = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
+    k_cache_fused = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
+    v_cache_fused = torch.zeros(CACHE_SIZE, row_size, device=DEVICE, dtype=dtype)
+
+    # --- reference: separate RoPE then manual scatter ---
+    q_ref, k_ref = q.clone(), k.clone()
+    flashinfer_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+    k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
+    v_cache_ref[out_loc] = v.view(batch_size, -1)
+
+    # --- fused kernel ---
+    q_fused, k_fused = q.clone(), k.clone()
+    v_fused = v.clone()
+    apply_rope_inplace_with_kvcache(
+        q_fused,
+        k_fused,
+        v_fused,
+        k_cache_fused,
+        v_cache_fused,
+        cos_sin_cache,
+        positions,
+        out_loc,
+        is_neox=is_neox,
     )
-    out_cache_loc = torch.randperm(KV_POOL_SIZE, dtype=torch.int64, device=DEVICE)[
-        : bs * seq_len
-    ].clone()
 
-    pos_ids = torch.arange(seq_len, device=DEVICE).repeat(bs)
-
-    max_seq_len = seq_len
-    base = 10000
-    cos_sin_cache = create_cos_sin_cache(rotary_dim, max_seq_len, base, dtype)
-
-    q_jit = q.clone()
-    k_jit = k.clone()
-    v_jit = v.clone()
-    k_buffer_jit = k_buffer.clone()
-    v_buffer_jit = v_buffer.clone()
-    out_cache_loc_jit = out_cache_loc.clone()
-
-    q_kernel = q.clone()
-    k_kernel = k.clone()
-    v_kernel = v.clone()
-    k_buffer_kernel = k_buffer.clone()
-    v_buffer_kernel = v_buffer.clone()
-    out_cache_loc_kernel = out_cache_loc.clone()
-
-    jit_args = {
-        "positions": pos_ids,
-        "query": q_jit,
-        "key": k_jit,
-        "head_size": head_dim,
-        "cos_sin_cache": cos_sin_cache,
-        "is_neox": (not interleave),
-        "fused_set_kv_buffer_arg": None,
-        "enable_pdl": enable_pdl,
-    }
-    jit_time = bench_rope(
-        apply_rope_with_cos_sin_cache_inplace_jit,
-        jit_args,
+    atol = rtol = 1e-2
+    # q should match RoPE-only result
+    triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+    # k_cache should contain the rotated k
+    triton.testing.assert_close(
+        k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
     )
-    kernel_args = {
-        "positions": pos_ids,
-        "query": q_kernel,
-        "key": k_kernel,
-        "head_size": head_dim,
-        "cos_sin_cache": cos_sin_cache,
-        "is_neox": (not interleave),
-        "fused_set_kv_buffer_arg": None,
-        "enable_pdl": enable_pdl,
-    }
-    kernel_time = bench_rope(
-        apply_rope_with_cos_sin_cache_inplace_kernel,
-        kernel_args,
-    )
-    print(f"\nPerformance Test - Batch={bs}, SeqLen={seq_len}")
-    print(f"JIT: {jit_time*1000:.9f}ms, SGL: {kernel_time*1000:.9f}ms")
-    if kernel_time > 0:
-        speedup = kernel_time / jit_time if jit_time > 0 else float("inf")
-        print(f"Speedup (SGL/JIT): {speedup:.2f}x")
-
-
-def bench_rope(fn, args):
-    warmup = 10
-    iteration = 100
-    for _ in range(warmup):
-        fn(**args)
-    torch.cuda.synchronize()
-    start_time = time.time()
-    for _ in range(iteration):
-        fn(**args)
-    torch.cuda.synchronize()
-    return (time.time() - start_time) / iteration
+    # v_cache should be an exact copy
+    assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v"])

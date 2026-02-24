@@ -834,8 +834,16 @@ class PrefillAdder:
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
+        # NOTE: A request finishes in two phases:
+        #   1) check_finished + release_kv_cache  (in process_batch_result)
+        #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
+        # Preemption runs between these two phases (inside get_new_batch_prefill),
+        # so running_batch may still contain requests whose KV cache is already freed.
+        # We must skip them here to avoid a double-free on release_req.
         valid_running_reqs = (
-            r for r in self.running_batch.reqs if r not in self.preempt_list
+            r
+            for r in self.running_batch.reqs
+            if r not in self.preempt_list and not r.finished()
         )
 
         sorted_valid_running_reqs = sorted(

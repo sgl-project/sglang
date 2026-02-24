@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -17,7 +16,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
     BaseFinishReason,
     Req,
     RequestStage,
@@ -121,7 +119,14 @@ class SchedulerOutputProcessorMixin:
             for k, v in logits_output.customized_info.items():
                 if k not in req.customized_info:
                     req.customized_info[k] = []
-                req.customized_info[k].append(v[i])
+                # Copy the element so it doesn't retain the entire batch
+                # tensor/array via a view reference.
+                elem = v[i]
+                if isinstance(elem, torch.Tensor):
+                    elem = elem.clone()
+                elif hasattr(elem, "copy") and callable(elem.copy):
+                    elem = elem.copy()
+                req.customized_info[k].append(elem)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -163,19 +168,7 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
-            deadline = -1
-            if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
-                deadline = time.perf_counter() - timeout_ms / 1000.0
-
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if (
-                    not req.finished()
-                    and 0 < req.time_stats.forward_entry_time < deadline
-                ):
-                    req.to_finish = FINISH_ABORT(
-                        "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
-                    )
-
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
@@ -345,6 +338,7 @@ class SchedulerOutputProcessorMixin:
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def _resolve_spec_overlap_token_ids(
@@ -368,7 +362,10 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i] - 1
+
+            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
 
@@ -421,6 +418,7 @@ class SchedulerOutputProcessorMixin:
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def process_batch_result_decode(
@@ -455,19 +453,9 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
-        deadline = -1
-        if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
-            deadline = time.perf_counter() - timeout_ms / 1000.0
-
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
-
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
-                # req.set_finish_with_abort()
-                req.to_finish = FINISH_ABORT(
-                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
-                )
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
@@ -929,6 +917,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
+        spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
@@ -1059,6 +1048,7 @@ class SchedulerOutputProcessorMixin:
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_acceptance_histogram.append(req.spec_acceptance_histogram)
 
                 if return_logprob:
                     if (
@@ -1141,7 +1131,7 @@ class SchedulerOutputProcessorMixin:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
                             customized_info[k] = []
-                        customized_info[k].append(v)
+                        customized_info[k].append(v[send_token_offset:])
 
             if (
                 req.finished()
@@ -1160,6 +1150,7 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
+                    spec_acceptance_histogram=spec_acceptance_histogram,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
                     prefill_launch_delay=prefill_launch_delays,

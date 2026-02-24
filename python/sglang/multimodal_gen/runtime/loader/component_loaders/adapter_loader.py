@@ -31,7 +31,7 @@ class AdapterLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = get_diffusers_component_config(component_path=component_model_path)
 
         cls_name = config.pop("_class_name", None)
         if cls_name is None:

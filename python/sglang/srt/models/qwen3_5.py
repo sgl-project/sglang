@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -34,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
 # Distributed
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -316,8 +318,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+
+        linear_attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, quant_config, alt_stream, prefix
+            config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -328,25 +336,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
+            is_layer_sparse = True
+            is_previous_layer_sparse = True
+            is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
+            is_layer_sparse = False
+            is_previous_layer_sparse = False
+            is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
+            is_layer_sparse=is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -450,13 +464,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        attn_quant_config = (
+            None
+            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            else quant_config
+        )
+
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=attn_quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -466,7 +486,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=attn_quant_config,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -491,6 +511,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
+            is_layer_sparse = False
+            is_previous_layer_sparse = False
+            is_next_layer_sparse = False
         elif config.model_type == "qwen3_5_moe_text":
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
@@ -499,15 +522,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
+            is_layer_sparse = True
+            is_previous_layer_sparse = True
+            is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
+            is_layer_sparse=is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1141,9 +1167,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "_k_scale",
             ".v_scale",
             "_v_scale",
-            ".weight_scale",
             "_weight_scale",
-            ".input_scale",
             "_input_scale",
         )
 
@@ -1190,7 +1214,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                if name.endswith("experts.gate_up_proj") or name.endswith(
+                    "experts.down_proj"
+                ):
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
@@ -1260,7 +1286,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 num_experts,
                             )
                     else:
-                        # Skip loading extra parameters for GPTQ/modelopt models.
+                        # Skip loading extra parameters for GPTQ models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
                             and name_mapped not in params_dict
@@ -1305,6 +1331,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
 
         return loaded_params
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = getattr(config, "text_config", config)
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
