@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import numpy.typing as npt
 import requests
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -1220,11 +1219,6 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    _ctx = zmq.Context()
-    _socket_cache = {}
-    _socket_locks = {}
-    _global_lock = threading.Lock()
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
