@@ -10,15 +10,14 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
     ASSISTANT_SUFFIX,
-    BaseDatasetArgs,
-    BaseDatasetLoader,
+    BaseDataset,
     DatasetRow,
 )
 from sglang.benchmark.utils import remove_suffix
 
 
 @dataclass
-class CustomArgs(BaseDatasetArgs):
+class CustomDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
@@ -27,7 +26,7 @@ class CustomArgs(BaseDatasetArgs):
     apply_chat_template: bool
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "CustomArgs":
+    def from_args(cls, args: Namespace) -> "CustomDataset":
         assert not getattr(args, "tokenize_prompt", False)
         return cls(
             dataset_path=args.dataset_path,
@@ -38,22 +37,17 @@ class CustomArgs(BaseDatasetArgs):
             apply_chat_template=args.apply_chat_template,
         )
 
-
-class CustomDatasetLoader(BaseDatasetLoader):
     def load(
-        self,
-        config: CustomArgs,
-        tokenizer: PreTrainedTokenizerBase,
-        model_id=None,
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
         return sample_custom_requests(
-            dataset_path=config.dataset_path,
-            num_requests=config.num_requests,
+            dataset_path=self.dataset_path,
+            num_requests=self.num_requests,
             tokenizer=tokenizer,
-            fixed_output_len=config.fixed_output_len,
-            context_len=config.context_len,
-            prompt_suffix=config.prompt_suffix,
-            apply_chat_template=config.apply_chat_template,
+            fixed_output_len=self.fixed_output_len,
+            context_len=self.context_len,
+            prompt_suffix=self.prompt_suffix,
+            apply_chat_template=self.apply_chat_template,
         )
 
 

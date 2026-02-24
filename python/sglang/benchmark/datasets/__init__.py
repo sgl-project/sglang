@@ -1,35 +1,29 @@
-from typing import Dict, Tuple, Type
+from typing import Dict, Type
 
-from sglang.benchmark.datasets.common import (
-    BaseDatasetArgs,
-    BaseDatasetLoader,
-    DatasetRow,
-)
-from sglang.benchmark.datasets.custom import CustomArgs, CustomDatasetLoader
+from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
+from sglang.benchmark.datasets.custom import CustomDataset
 from sglang.benchmark.datasets.generated_shared_prefix import (
-    GeneratedSharedPrefixArgs,
-    GeneratedSharedPrefixDatasetLoader,
+    GeneratedSharedPrefixDataset,
 )
-from sglang.benchmark.datasets.image import ImageArgs, ImageDatasetLoader
-from sglang.benchmark.datasets.mmmu import MMMUArgs, MMMUDatasetLoader
-from sglang.benchmark.datasets.mooncake import MooncakeArgs, MooncakeDatasetLoader
-from sglang.benchmark.datasets.openai_dataset import OpenAIArgs, OpenAIDatasetLoader
-from sglang.benchmark.datasets.random import RandomArgs, RandomDatasetLoader
-from sglang.benchmark.datasets.sharegpt import ShareGPTArgs, ShareGPTDatasetLoader
+from sglang.benchmark.datasets.image import ImageDataset
+from sglang.benchmark.datasets.mmmu import MMMUDataset
+from sglang.benchmark.datasets.mooncake import MooncakeDataset
+from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
+from sglang.benchmark.datasets.random import RandomDataset
+from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
 
-DATASET_MAPPING: Dict[str, Tuple[Type[BaseDatasetArgs], BaseDatasetLoader]] = {
-    "sharegpt": (ShareGPTArgs, ShareGPTDatasetLoader()),
-    "custom": (CustomArgs, CustomDatasetLoader()),
-    "openai": (OpenAIArgs, OpenAIDatasetLoader()),
-    "random": (RandomArgs, RandomDatasetLoader(random_sample=True)),
-    "random-ids": (RandomArgs, RandomDatasetLoader(random_sample=False)),
-    "generated-shared-prefix": (
-        GeneratedSharedPrefixArgs,
-        GeneratedSharedPrefixDatasetLoader(),
-    ),
-    "mmmu": (MMMUArgs, MMMUDatasetLoader()),
-    "image": (ImageArgs, ImageDatasetLoader()),
-    "mooncake": (MooncakeArgs, MooncakeDatasetLoader()),
+DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
+    "sharegpt": ShareGPTDataset,
+    "custom": CustomDataset,
+    "openai": OpenAIDataset,
+    # TODO: "random" vs "random-ids" should be a flag (e.g. --random-source=sharegpt|integers),
+    # not two separate dataset names sharing the same class.
+    "random": RandomDataset,
+    "random-ids": RandomDataset,
+    "generated-shared-prefix": GeneratedSharedPrefixDataset,
+    "mmmu": MMMUDataset,
+    "image": ImageDataset,
+    "mooncake": MooncakeDataset,
 }
 
 
@@ -41,9 +35,9 @@ def get_dataset(args, tokenizer, model_id=None):
     if dataset_name not in DATASET_MAPPING:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    args_cls, loader = DATASET_MAPPING[dataset_name]
-    config = args_cls.from_args(args)
-    return loader.load(config=config, tokenizer=tokenizer, model_id=model_id)
+    dataset_cls = DATASET_MAPPING[dataset_name]
+    dataset = dataset_cls.from_args(args)
+    return dataset.load(tokenizer=tokenizer, model_id=model_id)
 
 
 __all__ = [

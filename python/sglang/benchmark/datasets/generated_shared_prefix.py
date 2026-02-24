@@ -13,8 +13,7 @@ from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
-    BaseDatasetArgs,
-    BaseDatasetLoader,
+    BaseDataset,
     DatasetRow,
     compute_random_lens,
     gen_prompt,
@@ -22,7 +21,7 @@ from sglang.benchmark.datasets.common import (
 
 
 @dataclass
-class GeneratedSharedPrefixArgs(BaseDatasetArgs):
+class GeneratedSharedPrefixDataset(BaseDataset):
     num_groups: int
     prompts_per_group: int
     system_prompt_len: int
@@ -36,7 +35,7 @@ class GeneratedSharedPrefixArgs(BaseDatasetArgs):
     gsp_ordered: bool
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixArgs":
+    def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
         assert not getattr(args, "tokenize_prompt", False)
         return cls(
             num_groups=args.gsp_num_groups,
@@ -52,23 +51,18 @@ class GeneratedSharedPrefixArgs(BaseDatasetArgs):
             gsp_ordered=getattr(args, "gsp_ordered", False),
         )
 
-
-class GeneratedSharedPrefixDatasetLoader(BaseDatasetLoader):
     def load(
-        self,
-        config: GeneratedSharedPrefixArgs,
-        tokenizer: PreTrainedTokenizerBase,
-        model_id=None,
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
         return sample_generated_shared_prefix_requests(
-            num_groups=config.num_groups,
-            prompts_per_group=config.prompts_per_group,
-            system_prompt_len=config.system_prompt_len,
-            question_len=config.question_len,
-            output_len=config.output_len,
-            range_ratio=config.range_ratio,
+            num_groups=self.num_groups,
+            prompts_per_group=self.prompts_per_group,
+            system_prompt_len=self.system_prompt_len,
+            question_len=self.question_len,
+            output_len=self.output_len,
+            range_ratio=self.range_ratio,
             tokenizer=tokenizer,
-            args=config,
+            args=self,
         )
 
 

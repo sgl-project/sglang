@@ -40,21 +40,17 @@ class DatasetRow:
 
 
 @dataclass
-class BaseDatasetArgs:
+class BaseDataset(ABC):
     @classmethod
-    def from_args(cls, args: Namespace) -> "BaseDatasetArgs":
-        raise NotImplementedError
+    @abstractmethod
+    def from_args(cls, args: Namespace) -> "BaseDataset": ...
 
-
-class BaseDatasetLoader(ABC):
     @abstractmethod
     def load(
         self,
-        config: BaseDatasetArgs,
         tokenizer: Any,
         model_id: Optional[str] = None,
-    ) -> List[Any]:
-        raise NotImplementedError
+    ) -> List[DatasetRow]: ...
 
 
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:

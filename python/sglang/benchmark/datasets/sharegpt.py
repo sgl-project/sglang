@@ -11,8 +11,7 @@ from sglang.benchmark.datasets.common import (
     ASSISTANT_SUFFIX,
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
-    BaseDatasetArgs,
-    BaseDatasetLoader,
+    BaseDataset,
     DatasetRow,
 )
 from sglang.benchmark.utils import (
@@ -23,7 +22,7 @@ from sglang.benchmark.utils import (
 
 
 @dataclass
-class ShareGPTArgs(BaseDatasetArgs):
+class ShareGPTDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
@@ -32,7 +31,7 @@ class ShareGPTArgs(BaseDatasetArgs):
     apply_chat_template: bool
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "ShareGPTArgs":
+    def from_args(cls, args: Namespace) -> "ShareGPTDataset":
         assert not getattr(args, "tokenize_prompt", False)
         return cls(
             dataset_path=args.dataset_path,
@@ -43,22 +42,17 @@ class ShareGPTArgs(BaseDatasetArgs):
             apply_chat_template=args.apply_chat_template,
         )
 
-
-class ShareGPTDatasetLoader(BaseDatasetLoader):
     def load(
-        self,
-        config: ShareGPTArgs,
-        tokenizer: PreTrainedTokenizerBase,
-        model_id=None,
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
         return sample_sharegpt_requests(
-            dataset_path=config.dataset_path,
-            num_requests=config.num_requests,
+            dataset_path=self.dataset_path,
+            num_requests=self.num_requests,
             tokenizer=tokenizer,
-            fixed_output_len=config.fixed_output_len,
-            context_len=config.context_len,
-            prompt_suffix=config.prompt_suffix,
-            apply_chat_template=config.apply_chat_template,
+            fixed_output_len=self.fixed_output_len,
+            context_len=self.context_len,
+            prompt_suffix=self.prompt_suffix,
+            apply_chat_template=self.apply_chat_template,
         )
 
 

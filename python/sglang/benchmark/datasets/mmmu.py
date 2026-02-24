@@ -8,41 +8,32 @@ import pybase64
 from datasets import load_dataset
 from transformers import AutoProcessor, AutoTokenizer
 
-from sglang.benchmark.datasets.common import (
-    BaseDatasetArgs,
-    BaseDatasetLoader,
-    DatasetRow,
-)
+from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.image import create_mm_data_row
 from sglang.benchmark.utils import get_processor
 
 
 @dataclass
-class MMMUArgs(BaseDatasetArgs):
+class MMMUDataset(BaseDataset):
     num_requests: int
     backend: str
     fixed_output_len: Optional[int]
-    random_sample: bool
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "MMMUArgs":
+    def from_args(cls, args: Namespace) -> "MMMUDataset":
         return cls(
             num_requests=args.num_prompts,
             backend=args.backend,
             fixed_output_len=args.random_output_len,
-            random_sample=True,
         )
 
-
-class MMMUDatasetLoader(BaseDatasetLoader):
-    def load(self, config: MMMUArgs, tokenizer=None, model_id=None) -> List[DatasetRow]:
+    def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
         processor = get_processor(model_id)
         return sample_mmmu_requests(
-            num_requests=config.num_requests,
+            num_requests=self.num_requests,
             processor=processor,
-            backend=config.backend,
-            fixed_output_len=config.fixed_output_len,
-            random_sample=config.random_sample,
+            backend=self.backend,
+            fixed_output_len=self.fixed_output_len,
         )
 
 

@@ -10,47 +10,41 @@ from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
     MOONCAKE_DATASET_URL,
-    BaseDatasetArgs,
-    BaseDatasetLoader,
+    BaseDataset,
     DatasetRow,
 )
 from sglang.benchmark.utils import download_and_cache_file
 
 
 @dataclass
-class MooncakeArgs(BaseDatasetArgs):
+class MooncakeDataset(BaseDataset):
     dataset_path: str
     mooncake_workload: str
-    num_prompts: int
+    num_requests: int
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "MooncakeArgs":
+    def from_args(cls, args: Namespace) -> "MooncakeDataset":
         return cls(
             dataset_path=args.dataset_path,
             mooncake_workload=args.mooncake_workload,
-            num_prompts=args.num_prompts,
+            num_requests=args.num_prompts,
         )
 
-
-class MooncakeDatasetLoader(BaseDatasetLoader):
-    def load(self, config: MooncakeArgs, tokenizer=None, model_id=None) -> List[Dict]:
-        # For mooncake, we don't generate the prompts here.
-        # We just load the raw trace data. The async generator will handle the rest.
-        if not config.dataset_path:
-            local_path = os.path.join("/tmp", config.mooncake_workload + "_trace.jsonl")
+    def load(self, tokenizer=None, model_id=None) -> List[Dict]:
+        if not self.dataset_path:
+            local_path = os.path.join("/tmp", self.mooncake_workload + "_trace.jsonl")
         else:
-            local_path = config.dataset_path
+            local_path = self.dataset_path
 
         if not os.path.exists(local_path):
             download_and_cache_file(
-                MOONCAKE_DATASET_URL[config.mooncake_workload], local_path
+                MOONCAKE_DATASET_URL[self.mooncake_workload], local_path
             )
 
         with open(local_path, "r") as f:
             all_requests_data = [json.loads(line) for line in f if line.strip()]
 
-        # Limit the number of requests based on --num-prompts
-        return all_requests_data[: config.num_prompts]
+        return all_requests_data[: self.num_requests]
 
 
 async def get_mooncake_request_over_time(

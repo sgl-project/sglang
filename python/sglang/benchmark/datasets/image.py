@@ -10,8 +10,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.benchmark.datasets.common import (
-    BaseDatasetArgs,
-    BaseDatasetLoader,
+    BaseDataset,
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
@@ -20,7 +19,7 @@ from sglang.benchmark.utils import get_processor
 
 
 @dataclass
-class ImageArgs(BaseDatasetArgs):
+class ImageDataset(BaseDataset):
     num_requests: int
     image_count: int
     input_len: int
@@ -33,7 +32,7 @@ class ImageArgs(BaseDatasetArgs):
     random_image_count: bool
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "ImageArgs":
+    def from_args(cls, args: Namespace) -> "ImageDataset":
         return cls(
             num_requests=args.num_prompts,
             image_count=args.image_count,
@@ -47,24 +46,20 @@ class ImageArgs(BaseDatasetArgs):
             random_image_count=args.random_image_count,
         )
 
-
-class ImageDatasetLoader(BaseDatasetLoader):
-    def load(
-        self, config: ImageArgs, tokenizer=None, model_id=None
-    ) -> List[DatasetRow]:
+    def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
         processor = get_processor(model_id)
         return sample_image_requests(
-            num_requests=config.num_requests,
-            image_count=config.image_count,
-            input_len=config.input_len,
-            output_len=config.output_len,
-            range_ratio=config.range_ratio,
+            num_requests=self.num_requests,
+            image_count=self.image_count,
+            input_len=self.input_len,
+            output_len=self.output_len,
+            range_ratio=self.range_ratio,
             processor=processor,
-            image_content=config.image_content,
-            image_format=config.image_format,
-            image_resolution=config.image_resolution,
-            backend=config.backend,
-            random_image_count=config.random_image_count,
+            image_content=self.image_content,
+            image_format=self.image_format,
+            image_resolution=self.image_resolution,
+            backend=self.backend,
+            random_image_count=self.random_image_count,
         )
 
 

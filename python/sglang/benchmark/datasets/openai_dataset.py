@@ -6,40 +6,31 @@ from typing import List, Optional
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import (
-    BaseDatasetArgs,
-    BaseDatasetLoader,
-    DatasetRow,
-)
+from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 
 
 @dataclass
-class OpenAIArgs(BaseDatasetArgs):
+class OpenAIDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
 
     @classmethod
-    def from_args(cls, args: Namespace) -> "OpenAIArgs":
+    def from_args(cls, args: Namespace) -> "OpenAIDataset":
         return cls(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
         )
 
-
-class OpenAIDatasetLoader(BaseDatasetLoader):
     def load(
-        self,
-        config: OpenAIArgs,
-        tokenizer: PreTrainedTokenizerBase,
-        model_id=None,
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
     ) -> List[DatasetRow]:
         return sample_openai_requests(
-            dataset_path=config.dataset_path,
-            num_requests=config.num_requests,
+            dataset_path=self.dataset_path,
+            num_requests=self.num_requests,
             tokenizer=tokenizer,
-            fixed_output_len=config.fixed_output_len,
+            fixed_output_len=self.fixed_output_len,
         )
 
 
