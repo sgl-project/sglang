@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Literal, Optional, Type, overload
 
 import numpy as np
 import torch
@@ -15,6 +15,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.common.conn import (
+        CommonKVBootstrapServer,
+        CommonKVManager,
+        CommonKVReceiver,
+        CommonKVSender,
+    )
     from sglang.srt.managers.schedule_batch import Req
 
 #########################
@@ -258,6 +265,28 @@ class KVClassType(Enum):
     SENDER = "sender"
     RECEIVER = "receiver"
     BOOTSTRAP_SERVER = "bootstrap_server"
+
+
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.KVARGS]
+) -> Type[KVArgs]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.MANAGER]
+) -> Type[CommonKVManager]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.SENDER]
+) -> Type[CommonKVSender]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.RECEIVER]
+) -> Type[CommonKVReceiver]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
+) -> Type[CommonKVBootstrapServer]: ...
 
 
 def get_kv_class(
