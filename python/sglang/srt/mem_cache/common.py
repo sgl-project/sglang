@@ -399,7 +399,7 @@ def alloc_paged_token_slots_extend_for_mla_kvcache_split(
         extend_num_tokens=extend_num_token,
     )
 
-    # padding -1 to origin input lenth, skip this loc-1 when set_kv_buffer
+    # padding -1 to origin input length, skip this loc-1 when set_kv_buffer
     len_sum = sum(l.item() for l in seq_lens)
     padded_out_loc = torch.full(
         (len_sum,), -1, dtype=tp_out_loc.dtype, device=batch.device
