@@ -75,16 +75,16 @@ url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
-reasoning-parser = "1.0.0"
-openai-protocol = { version = "1.0.0", features = ["axum"] }
-tool-parser = "1.0.0"
-llm-tokenizer = "1.0.0"
-smg-auth = "1.0.0"
-wfaas = "1.0.0"
-data-connector = "1.0.0"
-smg-mcp = "1.0.0"
-smg-wasm = "1.0.0"
-smg-mesh = "1.0.0"
+reasoning-parser = "~1.0.0"
+openai-protocol = { version = "~1.0.0", features = ["axum"] }
+tool-parser = "~1.0.0"
+llm-tokenizer = "~1.0.0"
+smg-auth = "~1.0.0"
+wfaas = "~1.0.0"
+data-connector = "~1.0.0"
+smg-mcp = "~1.0.0"
+smg-wasm = "~1.0.0"
+smg-mesh = "~1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
@@ -107,6 +107,7 @@ openmetrics-parser = "0.4.4"
 arc-swap = "1.7.1"
 
 # gRPC and Protobuf dependencies
+smg-grpc-client = "~1.0.0"
 tonic = { version = "0.14.2", features = ["gzip", "transport"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
@@ -124,7 +125,6 @@ sha2 = "0.10"
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
 
 [build-dependencies]
-tonic-prost-build = "0.14.2"
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 

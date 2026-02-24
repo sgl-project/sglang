@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     add_common_data_to_response,
+    adjust_output_quality,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -63,6 +64,7 @@ def _build_sampling_params_from_request(
     negative_prompt: Optional[str] = None,
     enable_teacache: Optional[bool] = None,
     num_frames: int = 1,
+    output_compression: Optional[int] = None,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -90,6 +92,11 @@ def _build_sampling_params_from_request(
         **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
+        **(
+            {"output_compression": output_compression}
+            if output_compression is not None
+            else {}
+        ),
     )
 
     if num_inference_steps is not None:
@@ -122,11 +129,16 @@ async def generations(
         true_cfg_scale=request.true_cfg_scale,
         negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
+        output_compression=request.output_compression,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+    if batch.output_compression is None:
+        batch.output_compression = adjust_output_quality(
+            request.output_quality, batch.data_type
+        )
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -217,6 +229,8 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    output_quality: Optional[str] = Form("default"),
+    output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
@@ -264,12 +278,16 @@ async def edits(
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
         num_frames=num_frames,
+        output_compression=output_compression,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-
+    if batch.output_compression is None:
+        batch.output_compression = adjust_output_quality(
+            output_quality, batch.data_type
+        )
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )

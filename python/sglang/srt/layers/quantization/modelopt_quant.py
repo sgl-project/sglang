@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 fp4_quantize = None
 try:
@@ -133,11 +134,7 @@ def fp4_gemm(
     fp4_backend = get_fp4_gemm_runner_backend()
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-        backend = (
-            fp4_backend.get_flashinfer_backend()
-            if not fp4_backend.is_auto()
-            else "cutlass"
-        )
+        backend = fp4_backend.get_flashinfer_backend()
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
@@ -157,6 +154,103 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
+
+# FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
+FP4_GEMM_ALIGNMENT = 32
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round up x to the nearest multiple of m."""
+    return (x + m - 1) // m * m
+
+
+def pad_nvfp4_weight(
+    weight: torch.Tensor,
+    n_alignment: int = FP4_GEMM_ALIGNMENT,
+    k_alignment: int = FP4_GEMM_ALIGNMENT,
+) -> tuple[torch.Tensor, int]:
+    """
+    Pad packed NVFP4 weights to satisfy alignment constraints for FP4 GEMM kernels.
+
+    Different backends have different alignment requirements:
+    - CUTLASS/cuDNN: N % 32 == 0, K % 32 == 0
+    - TRTLLM: N % 128 == 0 (for shuffle_matrix_sf_a), K padding handled separately
+
+    Args:
+        weight: Packed FP4 weight tensor of shape [N, K//2] (2 FP4 values per byte)
+        n_alignment: Required alignment for N dimension (default 32, use 128 for TRTLLM)
+        k_alignment: Required alignment for K dimension (default 32, use 0 to skip)
+
+    Returns:
+        Tuple of (padded_weight, weights_padding_cols) where weights_padding_cols
+        is the number of columns added for K-dimension padding (in bytes).
+    """
+    weight_current_rows = weight.shape[0]  # N dimension
+    weight_current_col_bytes = weight.shape[1]  # K//2 (packed)
+
+    # Calculate padding for N dimension (rows)
+    pad_rows = 0
+    if n_alignment > 0 and weight_current_rows % n_alignment != 0:
+        total_rows = round_up_to_multiple(weight_current_rows, n_alignment)
+        pad_rows = total_rows - weight_current_rows
+
+    # Calculate padding for K dimension (columns)
+    # 2 FP4 items are packed per byte in the input dimension
+    weight_current_col_elements = weight_current_col_bytes * 2
+    pad_cols_bytes = 0
+    if k_alignment > 0 and weight_current_col_elements % k_alignment != 0:
+        total_cols = round_up_to_multiple(weight_current_col_elements, k_alignment)
+        pad_cols = total_cols - weight_current_col_elements
+        # pad_cols is in elements, but padding is in bytes (2 elements per byte)
+        pad_cols_bytes = pad_cols // 2
+
+    # Apply padding in a single operation if needed
+    # For 2D tensor, pad argument is (pad_left, pad_right, pad_top, pad_bottom)
+    if pad_rows > 0 or pad_cols_bytes > 0:
+        weight = torch.nn.functional.pad(
+            weight, (0, pad_cols_bytes, 0, pad_rows)
+        ).contiguous()
+
+    return weight, pad_cols_bytes
+
+
+def pad_nvfp4_activation_for_cutlass(
+    x_fp4: torch.Tensor,
+    weights_padding_cols: int,
+) -> torch.Tensor:
+    """
+    Pad packed FP4 activations to match the K-dimension padding applied to weights.
+
+    Args:
+        x_fp4: Packed FP4 activation tensor
+        weights_padding_cols: Number of padding columns (in bytes) from weight padding
+
+    Returns:
+        Padded activation tensor
+    """
+    if weights_padding_cols > 0:
+        return torch.nn.functional.pad(x_fp4, (0, weights_padding_cols)).contiguous()
+    return x_fp4
+
+
+def slice_nvfp4_output(
+    out: torch.Tensor,
+    output_size: int,
+) -> torch.Tensor:
+    """
+    Slice the output tensor to remove padding in N dimension if weight was padded.
+
+    Args:
+        out: Output tensor from FP4 GEMM
+        output_size: Original output size before padding
+
+    Returns:
+        Sliced output tensor with padding removed
+    """
+    if out.shape[-1] != output_size:
+        return out[..., :output_size].contiguous()
+    return out
+
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
@@ -210,6 +304,22 @@ class ModelOptQuantConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
+        # Map excluded module patterns from HF layout to sglang layout.
+        # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
+        # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
+        if self.exclude_modules:
+            mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
+            expanded: List[str] = []
+            for name in mapped:
+                expanded.append(name)
+                if name.startswith("language_model."):
+                    expanded.append(name.removeprefix("language_model."))
+            # Preserve order, drop duplicates.
+            self.exclude_modules = list(dict.fromkeys(expanded))
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -1059,26 +1169,66 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
+
+        # Store original output size before any padding
+        layer.output_size_per_partition = layer.weight.shape[0]
+
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
             # shuffles ourselves.
+            #
+            # Alignment requirements:
+            #   - shuffle_matrix_a: weight.shape[0] (N) % 32 == 0
+            #   - shuffle_matrix_sf_a: scale.shape[0] (N) % 128 == 0, scale.shape[1] (K/16) % 4 == 0
+            # We pad N to multiple of 128 and K/16 to multiple of 4.
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
-            weight = layer.weight
+            # Pad weight N dimension to 128
+            weight, _ = pad_nvfp4_weight(
+                layer.weight.data, n_alignment=128, k_alignment=0
+            )
+            # Pad scale N dimension to match weight
             scale = layer.weight_scale
+            if scale.shape[0] != weight.shape[0]:
+                pad_n = weight.shape[0] - scale.shape[0]
+                scale = torch.nn.functional.pad(scale, (0, 0, 0, pad_n))
+
+            # Pad K dimension: scale K/16 must be multiple of 4
+            scale_k = scale.shape[1]  # K/16
+            weights_padding_cols = 0
+            if scale_k % 4 != 0:
+                padded_scale_k = round_up_to_multiple(scale_k, 4)
+                pad_scale_k = padded_scale_k - scale_k
+                # Pad scale K/16 dimension
+                scale = torch.nn.functional.pad(scale, (0, pad_scale_k, 0, 0))
+                # Pad weight K/2 dimension correspondingly (K/2 = K/16 * 8)
+                pad_weight_k = pad_scale_k * 8
+                weight = torch.nn.functional.pad(weight, (0, pad_weight_k, 0, 0))
+                # Store K padding for activation padding in apply()
+                weights_padding_cols = pad_weight_k
+
+            # Shuffle for TRTLLM layout
             epilogue_tile_m = 128
+            shuffled_scale_shape = scale.shape
             weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
             scale = (
                 shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
-                .reshape(scale.shape)
+                .reshape(shuffled_scale_shape)
                 .view(torch.float8_e4m3fn)
             )
 
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
+            layer.weights_padding_cols = weights_padding_cols
             return
+
+        # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
+        weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
+        layer.weights_padding_cols = weights_padding_cols
+        layer.weight = Parameter(weight, requires_grad=False)
+
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
         scale_ndim = scales.ndim
@@ -1086,9 +1236,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
-        round_up_multiple = lambda x, m: (x + m - 1) // m * m
-        M_padded = round_up_multiple(M, 128)
-        K_padded = round_up_multiple(K, 4)
+        M_padded = round_up_to_multiple(M, 128)
+        K_padded = round_up_to_multiple(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         batches, rows, cols = padded_scales.shape
@@ -1112,8 +1261,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output_dtype = x.dtype
         x_m, _ = x.shape
+
+        # Get original output size (before padding) and padded weight size
+        output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
-        output_shape = [x_m, w_n]
+        output_shape = [x_m, output_size]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -1123,11 +1275,16 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
+        # Pad activations to match weight K-dimension padding
+        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
+
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1137,6 +1294,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dtype,
             w_n,
         )
+
+        # Slice output to remove N-dimension padding
+        out = slice_nvfp4_output(out, output_size)
+
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)

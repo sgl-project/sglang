@@ -381,6 +381,7 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
+    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
 
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping

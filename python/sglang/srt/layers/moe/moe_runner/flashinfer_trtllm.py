@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.utils.common import (
+    is_cuda_alike,
     is_flashinfer_available,
     is_sm120_supported,
     next_power_of_2,
@@ -32,10 +33,13 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
-else:
+elif is_cuda_alike():
     from sgl_kernel import scaled_fp4_quant as fp4_quantize
+else:
+    fp4_quantize = None
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(

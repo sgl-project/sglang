@@ -489,7 +489,7 @@ async def health_generate(request: Request) -> Response:
         )
         if (
             _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL
+            != DisaggregationMode.NULL.value
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0

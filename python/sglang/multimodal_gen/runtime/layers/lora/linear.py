@@ -342,7 +342,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A.to(self.base_layer.weight)
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()

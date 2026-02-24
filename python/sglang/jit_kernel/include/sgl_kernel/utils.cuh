@@ -28,6 +28,15 @@ using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 using fp32x4_t = float4;
 #endif
 
+/*
+ * LDG Support
+ */
+#ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
+#else
+#define SGLANG_LDG(arg) *(arg)
+#endif
+
 namespace device {
 
 #define SGL_DEVICE __forceinline__ __device__

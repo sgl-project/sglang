@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+from sglang.utils import wait_for_http_ready
 
 register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
 register_amd_ci(est_time=526, suite="stage-b-test-large-2-gpu-amd")
@@ -53,7 +54,7 @@ class HiCacheStorageBaseMixin:
 
         # Launch server with HiCache enabled and cache report
         cls.process = cls._launch_server_with_hicache()
-        cls._wait_for_server_ready()
+        cls._wait_for_server_ready(process=cls.process)
 
         print(f"Test server launched successfully at {cls.base_url}")
         print(f"Cache directory: {cls.temp_dir}")
@@ -128,18 +129,14 @@ class HiCacheStorageBaseMixin:
         )
 
     @classmethod
-    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
+    def _wait_for_server_ready(cls, timeout: int = 60, process=None) -> bool:
         """Wait for server to be ready"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/health", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
+        wait_for_http_ready(
+            url=f"{cls.base_url}/health",
+            timeout=timeout,
+            process=process,
+        )
+        return True
 
     def send_request(
         self, prompt: str, max_tokens: int = 100, temperature: float = 0.0

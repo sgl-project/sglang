@@ -23,12 +23,12 @@ const metricTypes = {
 };
 
 // Chart.js default configuration for dark theme
-Chart.defaults.color = '#8b949e';
-Chart.defaults.borderColor = '#30363d';
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#1e293b';
 
 const chartColors = [
-    '#58a6ff', '#3fb950', '#d29922', '#f85149', '#a371f7',
-    '#79c0ff', '#56d364', '#e3b341', '#ff7b72', '#bc8cff'
+    '#22d3ee', '#34d399', '#fbbf24', '#f87171', '#a78bfa',
+    '#67e8f9', '#6ee7b7', '#fcd34d', '#fca5a5', '#c4b5fd'
 ];
 
 // Initialize the dashboard
@@ -53,7 +53,7 @@ async function init() {
 async function loadData() {
     // Try local server API first (if running server.py)
     try {
-        const response = await fetch('/api/metrics');
+        const response = await fetch('/api/metrics', { headers: getAuthHeaders() });
         if (response.ok) {
             const data = await response.json();
             if (data.length > 0 && data[0].results && data[0].results.length > 0) {
@@ -726,12 +726,13 @@ function getChartOptions(yAxisLabel) {
                 }
             },
             tooltip: {
-                backgroundColor: '#21262d',
-                borderColor: '#30363d',
+                backgroundColor: '#1a2332',
+                borderColor: 'rgba(148, 163, 184, 0.1)',
                 borderWidth: 1,
-                titleFont: { size: 13 },
-                bodyFont: { size: 12 },
-                padding: 12
+                titleFont: { size: 13, family: "'DM Sans', sans-serif" },
+                bodyFont: { size: 12, family: "'JetBrains Mono', monospace" },
+                padding: 14,
+                cornerRadius: 8
             }
         },
         scales: {
@@ -744,7 +745,7 @@ function getChartOptions(yAxisLabel) {
                     }
                 },
                 grid: {
-                    color: '#21262d'
+                    color: 'rgba(148, 163, 184, 0.06)'
                 }
             },
             y: {
@@ -753,7 +754,7 @@ function getChartOptions(yAxisLabel) {
                     text: yAxisLabel
                 },
                 grid: {
-                    color: '#21262d'
+                    color: 'rgba(148, 163, 184, 0.06)'
                 }
             }
         }
@@ -832,5 +833,109 @@ function formatNumber(num) {
     return num.toFixed(1);
 }
 
+// Authentication state
+let authToken = sessionStorage.getItem('dashboard_auth_token') || null;
+
+// Get auth headers for API requests
+function getAuthHeaders() {
+    const headers = {};
+    if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    return headers;
+}
+
+// Check if server requires authentication and show/hide login accordingly
+async function checkAuthAndInit() {
+    const loginOverlay = document.getElementById('login-overlay');
+    const dashboardContainer = document.getElementById('dashboard-container');
+
+    try {
+        const response = await fetch('/api/auth-check');
+        if (response.ok) {
+            const data = await response.json();
+            if (!data.auth_required) {
+                // No auth required - skip login, show dashboard directly
+                loginOverlay.style.display = 'none';
+                dashboardContainer.style.display = 'block';
+                init();
+                return;
+            }
+        }
+    } catch (e) {
+        // Server not available (e.g. static hosting) - skip login
+        loginOverlay.style.display = 'none';
+        dashboardContainer.style.display = 'block';
+        init();
+        return;
+    }
+
+    // Auth is required - check if we have a valid token from a previous session
+    if (authToken) {
+        try {
+            const testResponse = await fetch('/api/metrics', {
+                headers: getAuthHeaders()
+            });
+            if (testResponse.ok) {
+                loginOverlay.style.display = 'none';
+                dashboardContainer.style.display = 'block';
+                init();
+                return;
+            }
+        } catch (e) {
+            // Token invalid or expired
+        }
+        // Clear invalid token
+        authToken = null;
+        sessionStorage.removeItem('dashboard_auth_token');
+    }
+
+    // Show login form
+    loginOverlay.style.display = 'flex';
+    dashboardContainer.style.display = 'none';
+}
+
+// Handle login form submission
+async function handleLogin(event) {
+    event.preventDefault();
+
+    const username = document.getElementById('login-username').value;
+    const password = document.getElementById('login-password').value;
+    const errorEl = document.getElementById('login-error');
+    const loginBtn = document.getElementById('login-btn');
+
+    errorEl.textContent = '';
+    loginBtn.disabled = true;
+    loginBtn.textContent = 'Signing in...';
+
+    try {
+        const response = await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.token) {
+            authToken = data.token;
+            sessionStorage.setItem('dashboard_auth_token', authToken);
+
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('dashboard-container').style.display = 'block';
+            init();
+        } else {
+            errorEl.textContent = data.error || 'Invalid username or password';
+        }
+    } catch (e) {
+        errorEl.textContent = 'Unable to connect to server';
+    } finally {
+        loginBtn.disabled = false;
+        loginBtn.textContent = 'Sign In';
+    }
+
+    return false;
+}
+
 // Initialize on page load
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', checkAuthAndInit);

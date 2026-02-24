@@ -384,8 +384,6 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 self.page_size == 1
             ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
-        else:
-            logger.info(f"Mamba extra_buffer is enabled.")
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -433,11 +431,8 @@ class MambaRadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        key = params.key
-        cow_mamba = params.cow_mamba
-        req = params.req
-
-        if self.disable or len(key) == 0:
+        key = self._match_pre_processor(params)
+        if key is None:
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -448,39 +443,8 @@ class MambaRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node, mamba_branching_seqlen = self._match_prefix_helper(key)
-
-        # copy mamba state to req local space if cow is true
-        if cow_mamba and last_node.mamba_value is not None:
-            # for reqs without mamba cache
-            if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
-                if dst_index is None:
-                    self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = last_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-
-        if value:
-            value = torch.cat(value)
-        else:
-            value = torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-            mamba_branching_seqlen=mamba_branching_seqlen,
-        )
+        value, last_node, best_value_len = self._match_prefix_helper(key)
+        return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -940,7 +904,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, Optional[int]]:
+    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
@@ -978,9 +942,31 @@ class MambaRadixCache(BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
+        return value, best_last_node, best_value_len
+
+    def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
+        """Preprocess the key before matching."""
+        key = params.key
+
+        if self.disable or len(key) == 0:
+            return None
+
+        return key
+
+    def _match_post_processor(
+        self,
+        params: MatchPrefixParams,
+        value: List[torch.Tensor],
+        last_node: TreeNode,
+        best_value_len: int,
+    ) -> MatchResult:
+        """Post-process the matched result."""
+        cow_mamba = params.cow_mamba
+        req = params.req
+
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
-        node_update = best_last_node
+        node_update = last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
         self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
@@ -1008,7 +994,38 @@ class MambaRadixCache(BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
-        return value[:best_value_len], best_last_node, mamba_branching_seqlen
+        # Copy mamba state to req local space if cow is true
+        if cow_mamba and last_node.mamba_value is not None:
+            # for reqs without mamba cache
+            if req.mamba_pool_idx is None:
+                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                # try to alloc again, protect last_node from eviction
+                if dst_index is None:
+                    self.inc_lock_ref(last_node)
+                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                    self.dec_lock_ref(last_node)
+                    assert dst_index is not None, "Can not alloc mamba cache"
+                src_index = last_node.mamba_value
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                req.mamba_pool_idx = dst_index[0]
+            else:
+                src_index = last_node.mamba_value
+                dst_index = req.mamba_pool_idx.unsqueeze(0)
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+
+        value = value[:best_value_len]
+        if value:
+            value = torch.cat(value)
+        else:
+            value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+            mamba_branching_seqlen=mamba_branching_seqlen,
+        )
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child

@@ -25,12 +25,23 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
 )
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_dual_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_dual_transformer,
+    refresh_context_on_transformer,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_group,
     get_world_group,
+    get_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -44,7 +55,9 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.transformer_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -136,7 +149,9 @@ class DenoisingStage(PipelineStage):
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(mode=mode, fullgraph=False, dynamic=None)
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
+    def _maybe_enable_cache_dit(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
 
         This method should be called after the transformer is fully loaded
@@ -146,31 +161,32 @@ class DenoisingStage(PipelineStage):
         transformers with (potentially) different configurations.
 
         """
+        if isinstance(num_inference_steps, tuple):
+            num_high_noise_steps, num_low_noise_steps = num_inference_steps
+
+        # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            if self._cached_num_steps != num_inference_steps:
-                logger.warning(
-                    "num_inference_steps changed from %d to %d after cache-dit was enabled. "
-                    "Continuing with initial configuration (steps=%d).",
-                    self._cached_num_steps,
+            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+            scm_preset = None if scm_preset == "none" else scm_preset
+            if isinstance(num_inference_steps, tuple):
+                refresh_context_on_dual_transformer(
+                    self.transformer,
+                    self.transformer_2,
+                    num_high_noise_steps,
+                    num_low_noise_steps,
+                    scm_preset=scm_preset,
+                )
+            else:
+                refresh_context_on_transformer(
+                    self.transformer,
                     num_inference_steps,
-                    self._cached_num_steps,
+                    scm_preset=scm_preset,
                 )
             return
+
         # check if cache-dit is enabled in config
         if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
             return
-
-        from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-            CacheDitConfig,
-            enable_cache_on_dual_transformer,
-            enable_cache_on_transformer,
-            get_scm_mask,
-        )
-        from sglang.multimodal_gen.runtime.distributed import (
-            get_sp_group,
-            get_tp_group,
-            get_world_size,
-        )
 
         world_size = get_world_size()
         parallelized = world_size > 1
@@ -229,10 +245,22 @@ class DenoisingStage(PipelineStage):
         # cache-dit handles step count validation and scaling internally
         steps_computation_mask = get_scm_mask(
             preset=scm_preset,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             compute_bins=scm_compute_bins,
             cache_bins=scm_cache_bins,
         )
+
+        if isinstance(num_inference_steps, tuple):
+            steps_computation_mask_2 = get_scm_mask(
+                preset=scm_preset,
+                num_inference_steps=num_low_noise_steps,
+                compute_bins=scm_compute_bins,
+                cache_bins=scm_cache_bins,
+            )
 
         # build config for primary transformer (high-noise expert)
         primary_config = CacheDitConfig(
@@ -244,7 +272,11 @@ class DenoisingStage(PipelineStage):
             max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
             enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
             taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=(
+                num_inference_steps
+                if isinstance(num_inference_steps, int)
+                else num_high_noise_steps
+            ),
             # SCM fields
             steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_policy,
@@ -263,9 +295,9 @@ class DenoisingStage(PipelineStage):
                 max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
                 enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
                 taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=num_low_noise_steps,
                 # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask,
+                steps_computation_mask=steps_computation_mask_2,
                 steps_computation_policy=scm_policy,
             )
 
@@ -281,8 +313,9 @@ class DenoisingStage(PipelineStage):
                 tp_group=tp_group,
             )
             logger.info(
-                "cache-dit enabled on dual transformers (steps=%d)",
-                num_inference_steps,
+                "cache-dit enabled on dual transformers (steps=%d, %d)",
+                num_high_noise_steps,
+                num_low_noise_steps,
             )
         else:
             # single transformer
@@ -482,12 +515,21 @@ class DenoisingStage(PipelineStage):
         """
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
-        # NOTE: In warmup requests we may override req.num_inference_steps (e.g. set to 1)
-        # for latency amortization, but cache-dit needs the *original* total steps to
-        # initialize/refresh its context correctly.
-        cache_dit_num_inference_steps = batch.extra.get(
-            "cache_dit_num_inference_steps", batch.num_inference_steps
-        )
+
+        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
+        # Get timesteps and calculate warmup steps
+        timesteps = batch.timesteps
+        num_inference_steps = batch.num_inference_steps
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        if self.transformer_2 is not None:
+            assert boundary_timestep is not None, "boundary_timestep must be provided"
+            num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
+            num_low_noise_steps = num_inference_steps - num_high_noise_steps
+            cache_dit_num_inference_steps = (num_high_noise_steps, num_low_noise_steps)
+        else:
+            cache_dit_num_inference_steps = num_inference_steps
+
         if not server_args.model_loaded["transformer"]:
             # FIXME: reuse more code
             loader = TransformerLoader()
@@ -515,13 +557,6 @@ class DenoisingStage(PipelineStage):
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        # Get timesteps and calculate warmup steps
-        timesteps = batch.timesteps
-        if timesteps is None:
-            raise ValueError("Timesteps must be provided")
-        num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
         if len(image_embeds) > 0:
@@ -542,8 +577,6 @@ class DenoisingStage(PipelineStage):
             neg_prompt_embeds = batch.negative_prompt_embeds
             assert neg_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
-
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
 
         # specifically for Wan2_2_TI2V_5B_Config, not applicable for FastWan2_2_TI2V_5B_Config
         should_preprocess_for_wan_ti2v = (
@@ -813,6 +846,10 @@ class DenoisingStage(PipelineStage):
         if not server_args.dit_cpu_offload:
             return
 
+        # FSDP manages offloading internally
+        if server_args.use_fsdp_inference:
+            return
+
         # Offload the unused model if it's on CUDA
         if (
             model_to_offload is not None
@@ -1019,7 +1056,13 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(i, batch, server_args)
+                        attn_metadata = self._build_attn_metadata(
+                            i,
+                            batch,
+                            server_args,
+                            timestep_value=t_int,
+                            timesteps=timesteps_cpu,
+                        )
                         noise_pred = self._predict_noise_with_cfg(
                             current_model=current_model,
                             latent_model_input=latent_model_input,
@@ -1153,7 +1196,13 @@ class DenoisingStage(PipelineStage):
         return noise_cfg
 
     def _build_attn_metadata(
-        self, i: int, batch: Req, server_args: ServerArgs
+        self,
+        i: int,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        timestep_value: int | None = None,
+        timesteps: torch.Tensor | None = None,
     ) -> Any | None:
         """
         Build attention metadata for custom attention backends.
@@ -1181,6 +1230,92 @@ class DenoisingStage(PipelineStage):
                 VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
                 device=get_local_torch_device(),
             )
+        elif (
+            self.attn_backend.get_enum() == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+        ):
+            if timestep_value is None or timesteps is None:
+                raise ValueError(
+                    "timestep_value and timesteps must be provided for SVG2 attention metadata"
+                )
+
+            svg2_cfg = server_args.attention_backend_config or {}
+            num_layers = server_args.pipeline_config.dit_config.num_layers
+            if (
+                server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan"
+                and hasattr(server_args.pipeline_config.dit_config, "num_single_layers")
+            ):
+                num_layers += server_args.pipeline_config.dit_config.num_single_layers
+            first_layers_fp = svg2_cfg.get("svg2_first_layers_fp", 0.03)
+            if first_layers_fp <= 1.0:
+                first_layers_fp = math.floor(first_layers_fp * num_layers)
+            first_layers_fp = max(0, min(int(first_layers_fp), num_layers))
+
+            first_times_fp = svg2_cfg.get("svg2_first_times_fp", 0.2)
+            if first_times_fp <= 1.0:
+                num_fp_steps = math.floor(first_times_fp * len(timesteps))
+                if num_fp_steps > 0:
+                    first_times_fp = float(timesteps[num_fp_steps - 1].item() - 1)
+                else:
+                    first_times_fp = float(timesteps.max().item() + 1)
+
+            current_timestep = int(timestep_value)
+
+            cache = batch.extra.get("svg2_cache")
+            if cache is None:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (
+                    Svg2Cache,
+                )
+
+                cache = Svg2Cache()
+                batch.extra["svg2_cache"] = cache
+
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            if isinstance(patch_size, list):
+                patch_size = tuple(patch_size)
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+
+            context_length = 0
+            prompt_length = None
+            if server_args.pipeline_config.dit_config.prefix.lower() == "hunyuan":
+                prompt_embeds = server_args.pipeline_config.get_pos_prompt_embeds(batch)
+                if isinstance(prompt_embeds, list):
+                    text_embeds = prompt_embeds[0] if prompt_embeds else None
+                else:
+                    text_embeds = prompt_embeds
+                if isinstance(text_embeds, torch.Tensor) and text_embeds.ndim >= 2:
+                    context_length = int(text_embeds.shape[1])
+                if context_length > 0 and batch.prompt_attention_mask:
+                    mask = batch.prompt_attention_mask[0]
+                    if isinstance(mask, torch.Tensor):
+                        if mask.shape[-1] > context_length:
+                            mask = mask[:, -context_length:]
+                        prompt_length = int(mask[0].sum().item())
+                if prompt_length is None:
+                    prompt_length = context_length
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                raw_latent_shape=batch.raw_latent_shape,
+                patch_size=patch_size,
+                num_q_centroids=svg2_cfg.get("svg2_num_q_centroids", 300),
+                num_k_centroids=svg2_cfg.get("svg2_num_k_centroids", 1000),
+                top_p_kmeans=svg2_cfg.get("svg2_top_p_kmeans", 0.9),
+                min_kc_ratio=svg2_cfg.get("svg2_min_kc_ratio", 0.1),
+                kmeans_iter_init=svg2_cfg.get("svg2_kmeans_iter_init", 50),
+                kmeans_iter_step=svg2_cfg.get("svg2_kmeans_iter_step", 2),
+                zero_step_kmeans_init=svg2_cfg.get("svg2_zero_step_kmeans_init", False),
+                first_layers_fp=first_layers_fp,
+                first_times_fp=first_times_fp,
+                context_length=context_length,
+                prompt_length=prompt_length,
+                cache=cache,
+                calculate_density=False,  # only need density when doing head load balancing
+            )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
             moba_params = server_args.attention_backend_config.moba_config.copy()
             moba_params.update(
@@ -1196,9 +1331,8 @@ class DenoisingStage(PipelineStage):
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 

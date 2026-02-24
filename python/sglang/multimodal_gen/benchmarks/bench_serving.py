@@ -651,7 +651,21 @@ async def benchmark(args):
     except Exception as e:
         logger.info(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    task_name = model_info(args.model).pipeline_tag
+    if os.path.exists(args.model):
+        if args.task:
+            task_name = args.task
+        else:
+            config_path = os.path.join(args.model, "config.json")
+            if os.path.exists(config_path):
+                import json
+
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                task_name = config.get("pipeline_tag", "text-to-image")
+            else:
+                task_name = "text-to-image"  # fallback
+    else:
+        task_name = model_info(args.model).pipeline_tag
 
     if args.task != task_name:
         logger.warning(

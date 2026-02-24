@@ -37,6 +37,8 @@ class AttentionType(Enum):
 
     # Decoder attention between previous layer Q/K/V
     DECODER = "decoder"
+    # Decoder bidirectional attention between image tokens
+    DECODER_BIDIRECTIONAL = "decoder_bidirectional"
     # Encoder attention between previous layer Q/K/V
     ENCODER_ONLY = "encoder_only"
 

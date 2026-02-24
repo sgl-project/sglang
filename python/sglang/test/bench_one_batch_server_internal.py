@@ -109,6 +109,7 @@ class BenchArgs:
     append_to_github_summary: bool = True
     seed: int = 42
     cache_hit_rate: float = 0.0
+    backend: str = "sglang"
     server_args_for_metrics: Optional[List[str]] = None
 
     @staticmethod
@@ -192,6 +193,13 @@ class BenchArgs:
             default=BenchArgs.cache_hit_rate,
             help="Cache hit rate for benchmarking (0.0-1.0). "
             "0.0 means no cache hits (flush all), 0.4 means 40%% of input tokens are cached.",
+        )
+        parser.add_argument(
+            "--backend",
+            type=str,
+            default=BenchArgs.backend,
+            choices=["sglang", "vllm"],
+            help="Backend server type (sglang or vllm).",
         )
         parser.add_argument(
             "--server-args-for-metrics",
@@ -289,8 +297,10 @@ def _warmup_cache(
     cache_hit_rate: float,
     dataset_name: str = "random",
     image_data: Optional[List] = None,
+    backend: str = "sglang",
+    model_name: Optional[str] = None,
 ):
-    """Warm up the cache by sending prefix tokens to populate the radix cache.
+    """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
     Args:
         url: Server URL
@@ -299,6 +309,8 @@ def _warmup_cache(
         cache_hit_rate: Fraction of input tokens to cache (0.0-1.0)
         dataset_name: Name of the dataset (used to determine if image data should be included)
         image_data: Optional image data for VLM models
+        backend: Backend server type ("sglang" or "vllm")
+        model_name: Model name (required for vllm backend)
     """
     cached_token_len = int(input_len * cache_hit_rate)
     if cached_token_len <= 0:
@@ -310,21 +322,33 @@ def _warmup_cache(
     )
     # Create prefix input_ids for cache warming
     cache_warmup_input_ids = [ids[:cached_token_len] for ids in input_ids]
-    cache_warmup_payload = {
-        "input_ids": cache_warmup_input_ids,
-        "sampling_params": {
+
+    if backend == "vllm":
+        cache_warmup_payload = {
+            "model": model_name,
+            "prompt": cache_warmup_input_ids,
+            "max_tokens": 1,
             "temperature": 0.0,
-            "max_new_tokens": 1,  # Minimal output, just to populate cache
-            "ignore_eos": True,
-        },
-        "stream": False,
-    }
-    if dataset_name == "mmmu" and image_data is not None:
-        # include image data in cache warmup
-        cache_warmup_payload["image_data"] = image_data
+            "stream": False,
+        }
+        gen_url = url + "/v1/completions"
+    else:
+        cache_warmup_payload = {
+            "input_ids": cache_warmup_input_ids,
+            "sampling_params": {
+                "temperature": 0.0,
+                "max_new_tokens": 1,  # Minimal output, just to populate cache
+                "ignore_eos": True,
+            },
+            "stream": False,
+        }
+        if dataset_name == "mmmu" and image_data is not None:
+            # include image data in cache warmup
+            cache_warmup_payload["image_data"] = image_data
+        gen_url = url + "/generate"
 
     warmup_response = requests.post(
-        url + "/generate",
+        gen_url,
         json=cache_warmup_payload,
         timeout=DEFAULT_TIMEOUT,
     )
@@ -353,9 +377,16 @@ def run_one_case(
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
     cache_hit_rate: float = BenchArgs.cache_hit_rate,
+    backend: str = "sglang",
+    model_name: Optional[str] = None,
 ):
-    response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
+    if backend == "vllm":
+        # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
+        response = requests.post(url + "/reset_prefix_cache", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+    else:
+        response = requests.post(url + "/flush_cache", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
 
     # Load input token ids
     # TODO: reuse bench_serving.get_dataset ?
@@ -378,45 +409,62 @@ def run_one_case(
             return_text=False,
         )
 
-    # Load sampling parameters
-    use_structured_outputs = False
-    if use_structured_outputs:
-        texts = []
-        for _ in range(batch_size):
-            texts.append(
-                "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
-                * 50
-                + "Assistant:"
-            )
-        json_schema = "$$ANY$$"
-    else:
-        json_schema = None
-
-    payload = {
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": output_len,
-            "ignore_eos": True,
-            "json_schema": json_schema,
-            "stream_interval": stream_interval,
-        },
-        "return_logprob": return_logprob,
-        "stream": True,
-        **({"parallel_batch": parallel_batch} if parallel_batch else {}),
-    }
+    # Extract input_ids from requests
     if dataset_name == "mmmu":
-        # vlm
         input_ids = []
         # for vlms, tokenizer is an instance of AutoProcessor
         tokenizer = tokenizer.tokenizer
         for input_req in input_requests:
             input_ids += [tokenizer.encode(input_req.prompt)]
-        payload["image_data"] = [req.image_data for req in input_requests]
-
+        image_data = [req.image_data for req in input_requests]
     else:
         input_ids = [req.prompt for req in input_requests]
+        image_data = None
 
-    payload["input_ids"] = input_ids
+    # Build payload based on backend
+    if backend == "vllm":
+        payload = {
+            "model": model_name,
+            "prompt": input_ids,
+            "max_tokens": output_len,
+            "temperature": temperature,
+            "stream": True,
+            "ignore_eos": True,
+        }
+        if return_logprob:
+            payload["logprobs"] = 1
+        gen_url = url + "/v1/completions"
+    else:
+        # Load sampling parameters
+        use_structured_outputs = False
+        if use_structured_outputs:
+            texts = []
+            for _ in range(batch_size):
+                texts.append(
+                    "Human: What is the capital city of france? can you give as many trivial information as possible about that city? answer in json.\n"
+                    * 50
+                    + "Assistant:"
+                )
+            json_schema = "$$ANY$$"
+        else:
+            json_schema = None
+
+        payload = {
+            "sampling_params": {
+                "temperature": temperature,
+                "max_new_tokens": output_len,
+                "ignore_eos": True,
+                "json_schema": json_schema,
+                "stream_interval": stream_interval,
+            },
+            "return_logprob": return_logprob,
+            "stream": True,
+            **({"parallel_batch": parallel_batch} if parallel_batch else {}),
+        }
+        payload["input_ids"] = input_ids
+        if image_data is not None:
+            payload["image_data"] = image_data
+        gen_url = url + "/generate"
 
     # Warm up cache if cache_hit_rate > 0.0
     if cache_hit_rate > 0.0:
@@ -426,7 +474,9 @@ def run_one_case(
             input_len=input_len,
             cache_hit_rate=cache_hit_rate,
             dataset_name=dataset_name,
-            image_data=payload.get("image_data"),
+            image_data=image_data,
+            backend=backend,
+            model_name=model_name,
         )
 
     # Turn on profiler
@@ -447,7 +497,7 @@ def run_one_case(
     # Run the request
     tic = time.perf_counter()
     response = requests.post(
-        url + "/generate",
+        gen_url,
         json=payload,
         stream=True,
         timeout=DEFAULT_TIMEOUT,
@@ -456,21 +506,40 @@ def run_one_case(
 
     # Get the TTFT of the last request in the batch
     last_ttft = 0.0
-    for chunk in response.iter_lines(decode_unicode=False):
-        chunk = chunk.decode("utf-8")
-        if chunk and chunk.startswith("data:"):
-            if chunk == "data: [DONE]":
-                break
-            data = json.loads(chunk[5:].strip("\n"))
-            if "error" in data:
-                raise RuntimeError(f"Request has failed. {data}.")
+    if backend == "vllm":
+        # Parse OpenAI-compatible streaming format from vLLM
+        first_token_indices = set()
+        for chunk in response.iter_lines(decode_unicode=False):
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                data_str = chunk[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                data = json.loads(data_str)
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
+                for choice in data.get("choices", []):
+                    idx = choice["index"]
+                    if idx not in first_token_indices:
+                        first_token_indices.add(idx)
+                        if len(first_token_indices) == batch_size:
+                            last_ttft = time.perf_counter() - tic
+    else:
+        for chunk in response.iter_lines(decode_unicode=False):
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                if chunk == "data: [DONE]":
+                    break
+                data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
 
-            assert (
-                data["meta_info"]["finish_reason"] is None
-                or data["meta_info"]["finish_reason"]["type"] == "length"
-            )
-            if data["meta_info"]["completion_tokens"] == 1:
-                last_ttft = time.perf_counter() - tic
+                assert (
+                    data["meta_info"]["finish_reason"] is None
+                    or data["meta_info"]["finish_reason"]["type"] == "length"
+                )
+                if data["meta_info"]["completion_tokens"] == 1:
+                    last_ttft = time.perf_counter() - tic
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -478,12 +547,17 @@ def run_one_case(
     output_throughput = batch_size * output_len / (latency - last_ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
-    response = requests.get(url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    server_info = response.json()
-    internal_state = server_info.get("internal_states", [{}])
-    last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
-    acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
+    if backend == "vllm":
+        # vLLM does not expose these metrics via API
+        last_gen_throughput = -1
+        acc_length = -1
+    else:
+        response = requests.get(url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        server_info = response.json()
+        internal_state = server_info.get("internal_states", [{}])
+        last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
+        acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -638,35 +712,58 @@ def run_benchmark_internal(
     else:
         proc, base_url = launch_server_process(launch_server_func, server_args)
 
-    # Get tokenizer
-    response = requests.get(base_url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    server_info = response.json()
-    if "tokenizer_path" in server_info:
-        tokenizer_path = server_info["tokenizer_path"]
-    elif "prefill" in server_info:
-        tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
-    if bench_args.dataset_name == "mmmu":
-        # mmmu implies this is a MLLM
-        tokenizer = get_processor(tokenizer_path)
+    # Get tokenizer and server info
+    if bench_args.backend == "vllm":
+        # For vLLM, get model name from /v1/models endpoint
+        print(f"Connecting to vLLM server at {base_url}...")
+        response = requests.get(base_url + "/v1/models", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        model_list = response.json().get("data", [])
+        if not model_list:
+            raise RuntimeError("No models found on vLLM server via /v1/models")
+        model_name = model_list[0]["id"]
+        print(f"Found model: {model_name}")
+        print(f"Loading tokenizer for {model_name}...")
+        if bench_args.dataset_name == "mmmu":
+            tokenizer = get_processor(model_name)
+        else:
+            tokenizer = get_tokenizer(model_name)
+        print("Tokenizer loaded.")
+
+        server_info = {"model_name": model_name}
+        # vLLM does not expose token capacity or max running requests via API
+        skip_token_capacity_threshold = float("inf")
+        skip_max_running_requests_threshold = float("inf")
     else:
-        tokenizer = get_tokenizer(tokenizer_path)
+        model_name = None
+        response = requests.get(base_url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        server_info = response.json()
+        if "tokenizer_path" in server_info:
+            tokenizer_path = server_info["tokenizer_path"]
+        elif "prefill" in server_info:
+            tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
+        if bench_args.dataset_name == "mmmu":
+            # mmmu implies this is a MLLM
+            tokenizer = get_processor(tokenizer_path)
+        else:
+            tokenizer = get_tokenizer(tokenizer_path)
 
-    # Get token capacity
-    internal_state = server_info.get("internal_states", [{}])
-    skip_token_capacity_threshold = (
-        internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
-    )
+        # Get token capacity
+        internal_state = server_info.get("internal_states", [{}])
+        skip_token_capacity_threshold = (
+            internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
+        )
 
-    # Get effective max running requests
-    max_running_requests_per_dp = internal_state[0].get(
-        "effective_max_running_requests_per_dp", -1
-    )
-    dp_size = server_info.get("dp_size", None) or 1
-    assert (
-        max_running_requests_per_dp > 0
-    ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
-    skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+        # Get effective max running requests
+        max_running_requests_per_dp = internal_state[0].get(
+            "effective_max_running_requests_per_dp", -1
+        )
+        dp_size = server_info.get("dp_size", None) or 1
+        assert (
+            max_running_requests_per_dp > 0
+        ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+        skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
     # Warmup
     if not bench_args.skip_warmup:
@@ -688,6 +785,8 @@ def run_benchmark_internal(
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
                 parallel_batch=bench_args.parallel_batch,
+                backend=bench_args.backend,
+                model_name=model_name,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -721,6 +820,8 @@ def run_benchmark_internal(
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
                     cache_hit_rate=bench_args.cache_hit_rate,
+                    backend=bench_args.backend,
+                    model_name=model_name,
                 )
             )
 
@@ -761,6 +862,8 @@ def run_benchmark_internal(
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
+                            backend=bench_args.backend,
+                            model_name=model_name,
                         )
                     )
             except Exception as e:

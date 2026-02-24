@@ -43,6 +43,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -203,6 +204,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
 
     if require_gathered_buffer(server_args):
         mul_base *= get_attention_tp_size()
+
+    if mul_base % get_attention_cp_size() != 0:
+        mul_base *= get_attention_cp_size()
 
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
