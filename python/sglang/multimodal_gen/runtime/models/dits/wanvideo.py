@@ -220,7 +220,6 @@ class WanI2VCrossAttention(WanSelfAttention):
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
-        # VSA should not be in supported_attention_backends
         super().__init__(
             dim,
             num_heads,
@@ -314,6 +313,8 @@ class WanTransformerBlock(nn.Module):
         self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
+        self_attn_backends = supported_attention_backends
+
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=self.local_num_heads,
@@ -330,7 +331,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads=self.local_num_heads,
                 head_size=dim // num_heads,
                 causal=False,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=self_attn_backends,
                 prefix=f"{prefix}.attn1",
             )
 
@@ -358,6 +359,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -365,7 +369,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -374,7 +378,7 @@ class WanTransformerBlock(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -551,9 +555,10 @@ class WanTransformerBlock_VSA(nn.Module):
             dtype=torch.float32,
         )
 
-        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
-            supported_attention_backends.remove(AttentionBackendEnum.VIDEO_SPARSE_ATTN)
         # 2. Cross-attention
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         if added_kv_proj_dim is not None:
             # I2V
             self.attn2 = WanI2VCrossAttention(
@@ -561,7 +566,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         else:
             # T2V
@@ -570,7 +575,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 eps=eps,
-                supported_attention_backends=supported_attention_backends,
+                supported_attention_backends=cross_attn_backends,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,

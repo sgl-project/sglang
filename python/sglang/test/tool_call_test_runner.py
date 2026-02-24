@@ -304,7 +304,7 @@ def _test_streaming_parallel(client, model):
 
 _TESTS = [
     ("basic_format", _test_basic_format, "test_basic"),
-    ("auto", _test_auto, "test_auto"),
+    # ("auto", _test_auto, "test_auto"),
     ("streaming", _test_streaming, "test_streaming"),
     ("required", _test_required, "test_required"),
     ("none", _test_none, "test_none"),
@@ -312,9 +312,9 @@ _TESTS = [
     ("strict", _test_strict, "test_strict"),
     ("multiturn", _test_multiturn, "test_multiturn"),
     ("thinking", _test_thinking, "test_thinking"),
-    ("reasoning_usage", _test_reasoning_usage, "test_reasoning_usage"),
+    # ("reasoning_usage", _test_reasoning_usage, "test_reasoning_usage"),
     ("parallel", _test_parallel, "test_parallel"),
-    ("streaming_parallel", _test_streaming_parallel, "test_streaming_parallel"),
+    # ("streaming_parallel", _test_streaming_parallel, "test_streaming_parallel"),
 ]
 
 

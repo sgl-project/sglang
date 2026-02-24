@@ -215,7 +215,14 @@ class DeepseekMHAForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+            if (
+                self.use_nsa
+                and self.kv_cache_dtype == "fp8_e4m3"
+                and (
+                    not get_global_server_args().nsa_decode_backend == "trtllm"
+                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
+                )
+            ):
                 # FP8 path: dequantize NSA-specific FP8 format to BF16
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:

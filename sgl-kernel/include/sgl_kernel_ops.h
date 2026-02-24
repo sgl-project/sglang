@@ -937,15 +937,6 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     torch::Tensor& scale_factor);
 
 /*
- * From fast-hadamard-transform
- */
-torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
-
-/*
  * From flashmla
  */
 std::vector<at::Tensor> get_mla_decoding_metadata(

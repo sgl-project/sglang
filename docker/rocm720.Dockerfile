@@ -94,7 +94,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="20920706a9004018dbd87c7387f207d08d0e05af"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -104,6 +104,9 @@ USER root
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
+
+# Install AMD SMI Python package from ROCm distribution
+RUN cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .
 
 WORKDIR /sgl-workspace
 
@@ -156,7 +159,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi \
+     && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
 # -----------------------
 # Build vLLM
@@ -259,7 +263,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       libgtest-dev libgmock-dev \
       libprotobuf-dev protobuf-compiler libgflags-dev libsqlite3-dev \
       python3 python3-dev python3-setuptools python3-pip python3-apt \
-      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev \
+      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev vim \
       cmake ninja-build pkg-config libstdc++6 software-properties-common \
   && rm -rf /var/lib/apt/lists/*; \
   \
@@ -492,10 +496,7 @@ ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
-ENV VLLM_FP8_PADDING=1
-ENV VLLM_FP8_ACT_PADDING=1
-ENV VLLM_FP8_WEIGHT_PADDING=1
-ENV VLLM_FP8_REDUCE_CONV=1
+ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
