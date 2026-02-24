@@ -978,14 +978,11 @@ class Scheduler(
                 logger.info("KV return enabled — decode will send generated KV back to prefill")
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-                # Pre-allocate a budget of pages for receiving returned KV
-                budget = self.server_args.kv_return_budget_fraction
-                avail = self.token_to_kv_pool_allocator.available_size()
-                num_reserve_tokens = int(avail * budget)
+                # Pre-allocate all available pages for receiving returned KV
+                num_reserve_tokens = self.token_to_kv_pool_allocator.available_size()
                 logger.debug(
-                    "KV return budget: fraction=%.2f, available_tokens=%d, "
-                    "reserve_tokens=%d, page_size=%d",
-                    budget, avail, num_reserve_tokens,
+                    "KV return: available_tokens=%d, page_size=%d",
+                    num_reserve_tokens,
                     self.token_to_kv_pool_allocator.page_size,
                 )
                 if num_reserve_tokens > 0:
@@ -998,8 +995,8 @@ class Scheduler(
                         kv_mgr.kv_return_dst_pages = page_indices
                         self.kv_return_reserved_tokens = num_reserve_tokens
                         logger.info(
-                            "Pre-allocated %d pages (%d tokens) for KV return reception (%.0f%% budget)",
-                            len(page_indices), num_reserve_tokens, budget * 100,
+                            "Pre-allocated %d pages (%d tokens) for KV return reception",
+                            len(page_indices), num_reserve_tokens,
                         )
                     else:
                         import numpy as np

@@ -671,7 +671,6 @@ class ServerArgs:
 
     # KV return: transfer generated KV from decode back to prefill for prefix caching
     enable_kv_return: bool = False
-    kv_return_budget_fraction: float = 0.1  # fraction of prefill memory reserved for returned KV
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -2755,10 +2754,6 @@ class ServerArgs:
             if self.disaggregation_mode not in ("prefill", "decode"):
                 raise ValueError(
                     "--enable-kv-return requires --disaggregation-mode to be 'prefill' or 'decode'."
-                )
-            if not (0 < self.kv_return_budget_fraction < 1.0):
-                raise ValueError(
-                    "--kv-return-budget-fraction must be in range (0, 1.0)."
                 )
 
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
@@ -5011,12 +5006,6 @@ class ServerArgs:
             action="store_true",
             help="Enable KV return: transfer generated KV from decode back to prefill for prefix caching. "
             "Requires --disaggregation-mode prefill or decode.",
-        )
-        parser.add_argument(
-            "--kv-return-budget-fraction",
-            type=float,
-            default=ServerArgs.kv_return_budget_fraction,
-            help="Fraction of prefill KV memory reserved for receiving returned KV from decode (default: 0.1).",
         )
 
         # Encode prefill disaggregation
