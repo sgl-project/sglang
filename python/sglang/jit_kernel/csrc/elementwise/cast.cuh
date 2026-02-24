@@ -90,19 +90,19 @@ void downcast_fp8(
   auto input_num_tokens = SymbolicSize{"input_num_tokens"};
   auto head = SymbolicSize{"head"};
   auto dim = SymbolicSize{"dim"};
-  auto out_sl = SymbolicSize{"out_sl"};
+  auto output_num_tokens = SymbolicSize{"out_sl"};
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
 
   TensorMatcher({input_num_tokens, head, dim}).with_dtype<T>().with_device(device).verify(k);
   TensorMatcher({input_num_tokens, head, dim}).with_dtype<T>().with_device(device).verify(v);
-  TensorMatcher({out_sl, head, dim}).with_dtype<uint8_t>().with_device(device).verify(k_out);
-  TensorMatcher({out_sl, head, dim}).with_dtype<uint8_t>().with_device(device).verify(v_out);
+  TensorMatcher({output_num_tokens, head, dim}).with_dtype<uint8_t>().with_device(device).verify(k_out);
+  TensorMatcher({output_num_tokens, head, dim}).with_dtype<uint8_t>().with_device(device).verify(v_out);
   TensorMatcher({1}).with_dtype<float>().with_device(device).verify(k_scale);
   TensorMatcher({1}).with_dtype<float>().with_device(device).verify(v_scale);
   TensorMatcher({input_num_tokens}).with_dtype<int64_t>().with_device(device).verify(loc);
 
-  const int isl = static_cast<int>(input_num_tokens.unwrap());
+  const int num_tokens = static_cast<int>(input_num_tokens.unwrap());
   const int h = static_cast<int>(head.unwrap());
   const int d = static_cast<int>(dim.unwrap());
 
@@ -110,7 +110,7 @@ void downcast_fp8(
   const int num_vecs = h * d / kVecSize;
   const int grid_y = (num_vecs + kBlockSize - 1) / kBlockSize;
 
-  dim3 grid(isl, grid_y);
+  dim3 grid(num_tokens, grid_y);
   dim3 block(kBlockSize);
 
   const T max_fp8 = static_cast<T>(kFP8E4M3Max);
@@ -124,7 +124,7 @@ void downcast_fp8(
       static_cast<const float*>(v_scale.data_ptr()),
       static_cast<fp8_e4m3_t*>(k_out.data_ptr()),
       static_cast<fp8_e4m3_t*>(v_out.data_ptr()),
-      isl,
+      num_tokens,
       h,
       d,
       max_fp8,
