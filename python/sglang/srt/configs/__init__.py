@@ -22,6 +22,7 @@ from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
@@ -47,6 +48,7 @@ __all__ = [
     "Olmo3Config",
     "KimiLinearConfig",
     "KimiK25Config",
+    "Qwen3ASRConfig",
     "Qwen3NextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
