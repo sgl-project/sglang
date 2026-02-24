@@ -1,13 +1,13 @@
 from collections import defaultdict
 from typing import NamedTuple
 
-from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
 from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
     AxisInfo,
     ConcatParams,
     UnshardParams,
     UnshardPlan,
 )
+from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
 
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`

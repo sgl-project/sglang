@@ -9,8 +9,12 @@ from sglang.srt.debug_utils.comparator.aligner.reorder import (
     compute_reorder_plans,
     execute_reorder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.executor import execute_unshard_plan
-from sglang.srt.debug_utils.comparator.aligner.unshard.planner import compute_unshard_plan
+from sglang.srt.debug_utils.comparator.aligner.unshard.executor import (
+    execute_unshard_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
+    compute_unshard_plan,
+)
 from sglang.srt.debug_utils.comparator.aligner.unshard.types import AxisInfo
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
 from sglang.test.ci.ci_register import register_cpu_ci
