@@ -1535,7 +1535,7 @@ def init_distributed_environment(
     timeout: Optional[int] = None,
 ):
 
-    if backend == "nccl" and not torch.cuda.is_available():
+    if backend.lower() == "nccl" and not torch.cuda.is_available():
         # Use gloo backend for non-CUDA platforms (MPS, CPU)
         backend = "gloo"
         logger.info("Using gloo backend since CUDA is not available")
