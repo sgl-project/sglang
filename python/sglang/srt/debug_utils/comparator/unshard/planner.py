@@ -66,6 +66,7 @@ def _validate(
     sharded_axes: set[ParallelAxis],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> None:
+    """Check that every rank has all sharded axes, sizes are consistent, and ranks are complete."""
     axis_sizes: dict[ParallelAxis, int] = {}
 
     for world_rank, parallel_info in enumerate(parallel_infos):
@@ -101,6 +102,7 @@ def _group_and_project(
     target_axis: ParallelAxis,
 ) -> _GroupResult:
     """Group tensors by other-axes coords, sort within group by target_axis rank."""
+    # buckets[other_axes_coords] = [(axis_rank, tensor_index), ...]
     buckets: dict[frozenset, list[tuple[int, int]]] = defaultdict(list)
 
     for idx, coords in enumerate(current_coords):
