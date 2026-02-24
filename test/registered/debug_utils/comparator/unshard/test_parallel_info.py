@@ -2,6 +2,7 @@ import sys
 
 import pytest
 
+from sglang.srt.debug_utils.comparator.dims import ParallelAxis
 from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
     normalize_parallel_info,
 )
@@ -22,7 +23,7 @@ class TestNormalizeParallelInfo:
             }
         }
         result = normalize_parallel_info(meta)
-        assert result == {"tp": AxisInfo(axis_rank=2, axis_size=4)}
+        assert result == {ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4)}
 
     def test_megatron_info(self) -> None:
         meta = {
@@ -37,8 +38,8 @@ class TestNormalizeParallelInfo:
         }
         result = normalize_parallel_info(meta)
         assert result == {
-            "tp": AxisInfo(axis_rank=1, axis_size=2),
-            "cp": AxisInfo(axis_rank=0, axis_size=4),
+            ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=4),
         }
 
     def test_no_parallel_info(self) -> None:

@@ -13,7 +13,7 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 class TestComputeUnshardPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
-        parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
+        parallel_infos = [{ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
         plan = compute_unshard_plan(dim_specs, parallel_infos)
 
         assert plan is not None
@@ -24,15 +24,15 @@ class TestComputeUnshardPlan:
     def test_inconsistent_axis_size_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
         parallel_infos = [
-            {"tp": AxisInfo(axis_rank=0, axis_size=4)},
-            {"tp": AxisInfo(axis_rank=1, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
         ]
         with pytest.raises(ValueError, match="Inconsistent axis_size"):
             compute_unshard_plan(dim_specs, parallel_infos)
 
     def test_missing_axis_in_parallel_info_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
-        parallel_infos = [{"cp": AxisInfo(axis_rank=0, axis_size=2)}]
+        parallel_infos = [{ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2)}]
         with pytest.raises(ValueError, match="No parallel_info found"):
             compute_unshard_plan(dim_specs, parallel_infos)
 
@@ -45,10 +45,10 @@ class TestComputeUnshardPlan:
         """world_rank order != axis_rank order."""
         dim_specs = parse_dims("h(tp)")
         parallel_infos = [
-            {"tp": AxisInfo(axis_rank=2, axis_size=4)},
-            {"tp": AxisInfo(axis_rank=0, axis_size=4)},
-            {"tp": AxisInfo(axis_rank=3, axis_size=4)},
-            {"tp": AxisInfo(axis_rank=1, axis_size=4)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4)},
         ]
         plan = compute_unshard_plan(dim_specs, parallel_infos)
         assert plan is not None
@@ -64,12 +64,12 @@ class TestComputeUnshardPlan:
         dim_specs = parse_dims("h(tp) s(cp)")
         parallel_infos = [
             {
-                "tp": AxisInfo(axis_rank=0, axis_size=2),
-                "cp": AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
             },
             {
-                "tp": AxisInfo(axis_rank=1, axis_size=2),
-                "cp": AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
         with pytest.raises(NotImplementedError, match="Multi-axis unshard"):

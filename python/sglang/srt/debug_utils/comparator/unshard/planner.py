@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering
+from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering, ParallelAxis
 from sglang.srt.debug_utils.comparator.unshard.types import (
     AxisInfo,
     ConcatParams,
@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 
 def compute_unshard_plan(
     dim_specs: list[DimSpec],
-    parallel_infos: list[dict[str, AxisInfo]],
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> Optional[UnshardPlan]:
     """Compute an unshard plan from dim specs and per-rank parallel info.
 
@@ -23,15 +23,15 @@ def compute_unshard_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axes: dict[str, tuple[int, DimSpec]] = {}
+    sharded_axes: dict[ParallelAxis, tuple[int, DimSpec]] = {}
     for dim_idx, spec in enumerate(dim_specs):
         if spec.parallel is not None:
-            sharded_axes[spec.parallel.value] = (dim_idx, spec)
+            sharded_axes[spec.parallel] = (dim_idx, spec)
 
     if len(sharded_axes) > 1:
         raise NotImplementedError(
             f"Multi-axis unshard is not supported. "
-            f"Got {len(sharded_axes)} sharded axes: {sorted(sharded_axes.keys())}"
+            f"Got {len(sharded_axes)} sharded axes: {sorted(a.value for a in sharded_axes)}"
         )
 
     if not sharded_axes:
@@ -52,7 +52,7 @@ def compute_unshard_plan(
             expected_size = ainfo.axis_size
         elif ainfo.axis_size != expected_size:
             raise ValueError(
-                f"Inconsistent axis_size for {axis_name}: "
+                f"Inconsistent axis_size for {axis_name.value}: "
                 f"expected {expected_size}, got {ainfo.axis_size} "
                 f"at world_rank={world_rank}"
             )
@@ -60,11 +60,11 @@ def compute_unshard_plan(
         rank_to_world.setdefault(ainfo.axis_rank, world_rank)
 
     if expected_size is None:
-        raise ValueError(f"No parallel_info found for sharded axis {axis_name!r}")
+        raise ValueError(f"No parallel_info found for sharded axis {axis_name.value!r}")
 
     if set(rank_to_world.keys()) != set(range(expected_size)):
         raise ValueError(
-            f"axis_rank coverage for {axis_name} is incomplete: "
+            f"axis_rank coverage for {axis_name.value} is incomplete: "
             f"got {sorted(rank_to_world.keys())}, expected 0..{expected_size - 1}"
         )
 
