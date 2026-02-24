@@ -243,8 +243,16 @@ class GPUWorker:
                 def step_emit_fn(step_index, total_steps, latents, timestep, is_final):
                     frames = None
                     if decoding_stage is not None:
+                        # Unpack latents from the denoising-loop format
+                        # (e.g. packed [B, seq, hidden] for Flux) back to the
+                        # standard [B, C, ...] layout the VAE expects.
+                        decode_latents = (
+                            server_args.pipeline_config.post_denoising_loop(
+                                latents, req
+                            )
+                        )
                         frames = decoding_stage.decode(
-                            latents, server_args
+                            decode_latents, server_args
                         )  # returns CPU float32
                     partial = PartialOutputBatch(
                         request_id=req.request_id,

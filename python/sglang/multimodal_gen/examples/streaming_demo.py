@@ -50,7 +50,9 @@ def save_preview(frames: torch.Tensor, step: int, output_dir: str) -> None:
     if frames.ndim == 3:
         # Image: [C, H, W]
         img_np = (
-            (frames.permute(1, 2, 0).float().numpy() * 255).clip(0, 255).astype("uint8")
+            (frames.permute(1, 2, 0).cpu().float().numpy() * 255)
+            .clip(0, 255)
+            .astype("uint8")
         )
         path = os.path.join(output_dir, f"preview_step_{step:04d}.png")
         Image.fromarray(img_np).save(path)
@@ -59,7 +61,7 @@ def save_preview(frames: torch.Tensor, step: int, output_dir: str) -> None:
         # Video: [C, T, H, W] — save first frame as image
         first_frame = frames[:, 0]  # [C, H, W]
         img_np = (
-            (first_frame.permute(1, 2, 0).float().numpy() * 255)
+            (first_frame.permute(1, 2, 0).cpu().float().numpy() * 255)
             .clip(0, 255)
             .astype("uint8")
         )
@@ -94,6 +96,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of denoising steps (overrides model default if set)",
+    )
+    parser.add_argument(
         "--preview-dir",
         default="streaming_previews",
         help="Directory to save preview images when --decode-frames is set (default: streaming_previews)",
@@ -105,8 +113,12 @@ def main():
     decode_info = " (with pixel-space decode)" if args.decode_frames else ""
     print(f"Starting streaming generation{decode_info} for: {args.prompt!r}")
 
+    sampling_kwargs = {"prompt": args.prompt}
+    if args.num_inference_steps is not None:
+        sampling_kwargs["num_inference_steps"] = args.num_inference_steps
+
     for partial in gen.generate_streaming(
-        sampling_params_kwargs={"prompt": args.prompt},
+        sampling_params_kwargs=sampling_kwargs,
         stream_every_n_steps=args.stream_every_n_steps,
         stream_decode_latents=args.decode_frames,
     ):
