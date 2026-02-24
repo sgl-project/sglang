@@ -84,8 +84,8 @@ def _report_bandwidth(input_sl, head, dim, dtype):
     aot_fn = lambda: downcast_fp8_aot(k, v, k_out, v_out, k_scale, v_scale, loc)
     jit_fn = lambda: downcast_fp8_jit(k, v, k_out, v_out, k_scale, v_scale, loc)
 
-    aot_ms, _, _ = triton.testing.do_bench_cudagraph(aot_fn, quantiles=[0.5, 0.2, 0.8])
-    jit_ms, _, _ = triton.testing.do_bench_cudagraph(jit_fn, quantiles=[0.5, 0.2, 0.8])
+    aot_ms, _, _ = triton.testing.do_bench(aot_fn, quantiles=[0.5, 0.2, 0.8])
+    jit_ms, _, _ = triton.testing.do_bench(jit_fn, quantiles=[0.5, 0.2, 0.8])
 
     def fmt(ms):
         return f"{ms*1000:6.2f}us {total_bytes/(ms*1e-3)/1e9:6.0f}GB/s"

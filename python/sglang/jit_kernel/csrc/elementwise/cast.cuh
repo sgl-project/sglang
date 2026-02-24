@@ -22,12 +22,12 @@ constexpr int kBlockSize = 256;
 
 template <typename T>
 __global__ void fused_downcast_kernel(
-    const T* cache_k,
-    const T* cache_v,
-    const float* k_scale,
-    const float* v_scale,
-    fp8_e4m3_t* output_k,
-    fp8_e4m3_t* output_v,
+    const T* __restrict__ cache_k,
+    const T* __restrict__ cache_v,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
+    fp8_e4m3_t* __restrict__ output_k,
+    fp8_e4m3_t* __restrict__ output_v,
     const int input_num_tokens,
     const int head,
     const int dim,
@@ -35,7 +35,7 @@ __global__ void fused_downcast_kernel(
     const T min_fp8,
     const int64_t mult,
     const int64_t offset,
-    const int64_t* loc) {
+    const int64_t* __restrict__ loc) {
   using namespace device;
 
   constexpr int kVecSize = 16 / sizeof(T);
