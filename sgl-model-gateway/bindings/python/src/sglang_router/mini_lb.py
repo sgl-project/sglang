@@ -69,6 +69,10 @@ class MiniLoadBalancer:
             )
             self.enable_trace = False
 
+        self.test_external_dp_routing = router_args.test_external_dp_routing
+        self.prefill_dp_size = None
+        self.decode_dp_size = None
+
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
             "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
@@ -95,6 +99,32 @@ class MiniLoadBalancer:
             trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
+    async def _ensure_dp_sizes(self):
+        if self.prefill_dp_size is not None:
+            return
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.prefill_urls[0]}/server_info") as resp:
+                info = await resp.json()
+                self.prefill_dp_size = len(info.get("internal_states", [1]))
+            async with session.get(f"{self.decode_urls[0]}/server_info") as resp:
+                info = await resp.json()
+                self.decode_dp_size = len(info.get("internal_states", [1]))
+        logger.info(
+            f"[MiniLB] DP sizes: prefill={self.prefill_dp_size}, decode={self.decode_dp_size}"
+        )
+
+    def _fork_dp_requests(self, request):
+        p_rank = random.randint(0, self.prefill_dp_size - 1)
+        d_rank = random.randint(0, self.decode_dp_size - 1)
+
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["routed_dp_rank"] = p_rank
+        decode_req["routed_dp_rank"] = d_rank
+        decode_req["disagg_prefill_dp_rank"] = p_rank
+
+        return prefill_req, decode_req, d_rank
+
     def select_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
@@ -110,6 +140,16 @@ class MiniLoadBalancer:
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        expected_decode_dp_rank = None
+        if self.test_external_dp_routing:
+            await self._ensure_dp_sizes()
+            prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
+                modified_request
+            )
+        else:
+            prefill_req = modified_request
+            decode_req = modified_request
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -130,12 +170,12 @@ class MiniLoadBalancer:
             tasks = [
                 session.post(
                     f"{prefill_server}/{endpoint}",
-                    json=modified_request,
+                    json=prefill_req,
                     headers=headers,
                 ),
                 session.post(
                     f"{decode_server}/{endpoint}",
-                    json=modified_request,
+                    json=decode_req,
                     headers=headers,
                 ),
             ]
@@ -169,6 +209,16 @@ class MiniLoadBalancer:
                 )
                 trace_req_finish(bootstrap_room)
 
+            if expected_decode_dp_rank is not None:
+                actual = ret_json.get("meta_info", {}).get("dp_rank")
+                if actual != expected_decode_dp_rank:
+                    return ORJSONResponse(
+                        content={
+                            "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
+                        },
+                        status_code=500,
+                    )
+
             return ORJSONResponse(
                 content=ret_json,
                 status_code=decode_response.status,
@@ -178,6 +228,13 @@ class MiniLoadBalancer:
         self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        if self.test_external_dp_routing:
+            await self._ensure_dp_sizes()
+            prefill_req, decode_req, _ = self._fork_dp_requests(modified_request)
+        else:
+            prefill_req = modified_request
+            decode_req = modified_request
 
         async def stream_results():
             async with aiohttp.ClientSession(
@@ -202,12 +259,12 @@ class MiniLoadBalancer:
                 tasks = [
                     session.post(
                         f"{prefill_server}/{endpoint}",
-                        json=modified_request,
+                        json=prefill_req,
                         headers=headers,
                     ),
                     session.post(
                         f"{decode_server}/{endpoint}",
-                        json=modified_request,
+                        json=decode_req,
                         headers=headers,
                     ),
                 ]
