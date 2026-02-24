@@ -2360,9 +2360,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             bool: True if should dispatch to encoder, False otherwise
         """
         if obj.batch_size > 1:
-            raise ValueError(
-                "Batch request is not supported in epd disaggregation mode."
+            logger.warning(
+                "Batch request (batch_size=%d) is not supported in EPD disaggregation mode; skipping encoder dispatch.",
+                obj.batch_size,
             )
+            return False
         if not isinstance(obj, GenerateReqInput) or not obj.contains_mm_input():
             return False
 

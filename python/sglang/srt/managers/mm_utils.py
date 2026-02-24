@@ -489,7 +489,7 @@ def _merge_precomputed_and_computed(
     embedding: List[Optional[torch.Tensor]],
     computed_embedding: List[torch.Tensor],
     items_size: List[int],
-    has_precomputed: List[bool],
+    precomputed_mask: List[bool],
     prefix_length: List[int],
     request_skipped: List[bool],
 ) -> torch.Tensor:
@@ -518,7 +518,7 @@ def _merge_precomputed_and_computed(
         if items_size[i] == items_size[i + 1]:
             continue
         num_items = items_size[i + 1] - items_size[i]
-        if all(has_precomputed[item_idx : item_idx + num_items]):
+        if all(precomputed_mask[item_idx : item_idx + num_items]):
             item_idx += num_items
             continue
         if request_skipped[i]:
@@ -551,14 +551,14 @@ def _get_precomputed_embedding_with_mixed(
     embedding = _get_precomputed_embedding(
         items, prefix_length, extend_length, items_offset_list, allow_mixed=True
     )
-    has_precomputed = [item.precomputed_embeddings is not None for item in items]
+    precomputed_mask = [item.precomputed_embeddings is not None for item in items]
     filtered_data = _filter_non_precomputed_items(
         items,
         items_size,
         prefix_length,
         extend_length,
         items_offset_list,
-        has_precomputed,
+        precomputed_mask,
     )
     computed_embedding, input_ids = _get_chunked_prefill_embedding(
         data_embedding_func,
@@ -577,7 +577,7 @@ def _get_precomputed_embedding_with_mixed(
                 embedding,
                 computed_embedding,
                 items_size,
-                has_precomputed,
+                precomputed_mask,
                 prefix_length,
                 filtered_data["request_skipped"],
             ),
@@ -592,7 +592,7 @@ def _filter_non_precomputed_items(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-    has_precomputed: List[bool],
+    precomputed_mask: List[bool],
 ) -> Dict[str, Any]:
     """Filter out precomputed items and return data structures for non-precomputed items."""
     non_precomputed_items = []
@@ -617,9 +617,9 @@ def _filter_non_precomputed_items(
         request_skipped.append(skipped)
 
         # NOTE: within a request all items are either all precomputed or all not
-        has_precomputed_per_req = has_precomputed[items_size[i] : items_size[i + 1]]
-        all_precomputed = all(has_precomputed_per_req)
-        all_computed = not any(has_precomputed_per_req)
+        precomputed_mask_per_req = precomputed_mask[items_size[i] : items_size[i + 1]]
+        all_precomputed = all(precomputed_mask_per_req)
+        all_computed = not any(precomputed_mask_per_req)
         if not all_precomputed and not all_computed:
             raise NotImplementedError(
                 "Not implemented: Items in a request are neither all precomputed nor all computed!"
@@ -1057,11 +1057,11 @@ def get_embedding_and_mask(
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
     # 1. Get embedding - support mixed precomputed and non-precomputed embeddings
-    has_precomputed = [
+    precomputed_mask = [
         item.precomputed_embeddings is not None for item in embedding_items
     ]
 
-    if all(has_precomputed) or not any(has_precomputed):
+    if all(precomputed_mask) or not any(precomputed_mask):
         # all items have precomputed embeddings or no items have precomputed embeddings
         # keep the original behavior
         embedding = _get_precomputed_embedding(
