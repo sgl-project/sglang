@@ -360,10 +360,22 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             encoder_attention_mask = encoder_attention_mask[0]
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        if encoder_hidden_states.shape[0] != batch_size:
+            encoder_hidden_states = encoder_hidden_states.expand(
+                batch_size, -1, -1
+            ).contiguous()
         encoder_hidden_states = encoder_hidden_states.view(
             batch_size, -1, hidden_states.shape[-1]
         )
         encoder_hidden_states = self.caption_norm(encoder_hidden_states)
+
+        if (
+            encoder_attention_mask is not None
+            and encoder_attention_mask.shape[0] != batch_size
+        ):
+            encoder_attention_mask = encoder_attention_mask.expand(
+                batch_size, -1
+            ).contiguous()
 
         for block in self.transformer_blocks:
             hidden_states = block(
