@@ -18,11 +18,13 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcomman
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
-    RequestTimings,
+    RequestMetrics,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -58,28 +60,44 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, results):
+def maybe_dump_performance(
+    args: argparse.Namespace,
+    server_args,
+    prompt: str,
+    results: GenerationResult | list[GenerationResult] | None,
+):
     """dump performance if necessary"""
     if not (args.perf_dump_path and results):
         return
 
     if isinstance(results, list):
-        result = results[0] if results else {}
+        result = results[0] if results else None
     else:
         result = results
 
-    timings_dict = result.get("timings")
-    if not (args.perf_dump_path and timings_dict):
+    metrics_dict = result.metrics
+    if not (args.perf_dump_path and metrics_dict):
         return
 
-    timings = RequestTimings(request_id=timings_dict.get("request_id"))
-    timings.stages = timings_dict.get("stages", {})
-    timings.steps = timings_dict.get("steps", [])
-    timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
+    metrics = RequestMetrics(request_id=metrics_dict.get("request_id"))
+    metrics.stages = metrics_dict.get("stages", {})
+    metrics.steps = metrics_dict.get("steps", [])
+    metrics.total_duration_ms = metrics_dict.get("total_duration_ms", 0)
+
+    # restore memory snapshots from serialized dict
+    memory_snapshots_dict = metrics_dict.get("memory_snapshots", {})
+    for checkpoint_name, snapshot_dict in memory_snapshots_dict.items():
+        snapshot = MemorySnapshot(
+            allocated_mb=snapshot_dict.get("allocated_mb", 0.0),
+            reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
+            peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
+            peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+        )
+        metrics.memory_snapshots[checkpoint_name] = snapshot
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
-        timings=timings,
+        metrics=metrics,
         meta={
             "prompt": prompt,
             "model": server_args.model_path,
@@ -88,11 +106,11 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
     )
 
 
-def generate_cmd(args: argparse.Namespace):
+def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = ServerArgs.from_cli_args(args, unknown_args)
 
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
     sampling_params_kwargs["request_id"] = generate_request_id()
@@ -140,8 +158,10 @@ class GenerateSubcommand(CLISubcommand):
         """Get names of arguments for generate_video method"""
         return [field.name for field in dataclasses.fields(SamplingParams)]
 
-    def cmd(self, args: argparse.Namespace) -> None:
-        generate_cmd(args)
+    def cmd(
+        self, args: argparse.Namespace, unknown_args: list[str] | None = None
+    ) -> None:
+        generate_cmd(args, unknown_args)
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""

@@ -2,7 +2,7 @@ name: Release Docker Images Nightly (AMD)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 13 * * *'
+    - cron: '0 12 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
@@ -78,7 +78,7 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
   # Temporarily disable docker cache seeding until performant storage is in place
