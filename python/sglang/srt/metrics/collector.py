@@ -1410,7 +1410,7 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1424,6 +1424,26 @@ class StorageMetricsCollector:
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
             labelnames=labels.keys(),
+        )
+
+        self.prefetch_requests_total = Counter(
+            name="sglang:prefetch_requests_total",
+            documentation="Number of prefetch requests by status.",
+            labelnames=list(labels.keys()) + ["status"],
+        )
+
+        self.prefetch_io_queue_size = Gauge(
+            name="sglang:prefetch_io_queue_size",
+            documentation="Current size of prefetch I/O queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.prefetch_inflight = Gauge(
+            name="sglang:prefetch_inflight",
+            documentation="Number of in-flight prefetch I/O operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         bucket_io = [
@@ -1442,6 +1462,21 @@ class StorageMetricsCollector:
             10,
             50,
             100,
+        ]
+
+        bucket_prefetch_request_latency = [
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+            20,
+            30,
         ]
 
         self.histogram_prefetch_pgs = Histogram(
@@ -1472,6 +1507,56 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
+        self.histogram_prefetch_request_latency = Histogram(
+            name="sglang:prefetch_request_latency_seconds",
+            documentation="Histogram of end-to-end prefetch request latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_request_latency,
+        )
+
+        self.histogram_prefetch_pages_per_request = Histogram(
+            name="sglang:prefetch_pages_per_request",
+            documentation="Histogram of pages delivered per prefetch request.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_prefetch_queue_wait_seconds = Histogram(
+            name="sglang:prefetch_queue_wait_seconds",
+            documentation="Histogram of prefetch queue wait time in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_request_latency,
+        )
+
+        # Covers expected range from a few milliseconds to a few seconds.
+        bucket_prefetch_page_latency = [
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            3,
+            5,
+        ]
+        self.histogram_prefetch_page_io_latency = Histogram(
+            name="sglang:prefetch_page_io_latency_seconds",
+            documentation="Histogram of L3->L2 prefetch page I/O latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_page_latency,
+        )
+
+        self.histogram_prefetch_page_latency = Histogram(
+            name="sglang:prefetch_page_latency_seconds",
+            documentation="Histogram of end-to-end L3->L2 prefetch page latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_page_latency,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1479,6 +1564,48 @@ class StorageMetricsCollector:
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_prefetch_request(self, status: str):
+        self.prefetch_requests_total.labels(**self.labels, status=status).inc(1)
+
+    def set_prefetch_io_queue_size(self, queue_size: int):
+        self.prefetch_io_queue_size.labels(**self.labels).set(queue_size)
+
+    def set_prefetch_inflight(self, inflight: int):
+        self.prefetch_inflight.labels(**self.labels).set(max(0, inflight))
+
+    def log_prefetch_request_latency(self, latency_seconds: float):
+        if latency_seconds < 0:
+            return
+        self.histogram_prefetch_request_latency.labels(**self.labels).observe(
+            latency_seconds
+        )
+
+    def log_prefetch_pages_per_request(self, pages: int):
+        if pages <= 0:
+            return
+        self.histogram_prefetch_pages_per_request.labels(**self.labels).observe(pages)
+
+    def log_prefetch_queue_wait_seconds(self, wait_seconds: float):
+        if wait_seconds < 0:
+            return
+        self.histogram_prefetch_queue_wait_seconds.labels(**self.labels).observe(
+            wait_seconds
+        )
+
+    def log_prefetch_page_io_latency(self, page_latency_seconds: float, count: int = 1):
+        if count <= 0:
+            return
+        histogram = self.histogram_prefetch_page_io_latency.labels(**self.labels)
+        for _ in range(count):
+            histogram.observe(page_latency_seconds)
+
+    def log_prefetch_page_latency(self, page_latency_seconds: float, count: int = 1):
+        if count <= 0:
+            return
+        histogram = self.histogram_prefetch_page_latency.labels(**self.labels)
+        for _ in range(count):
+            histogram.observe(page_latency_seconds)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
