@@ -46,5 +46,5 @@ class TestTrinityMini(GSM8KAscendMixin, CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"]="1"
+    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"] = "1"
     unittest.main()
