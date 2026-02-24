@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -8,7 +7,6 @@ from sglang.srt.debug_utils.comparator.dims import parse_dims
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     SkipRecord,
-    print_record,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
 from sglang.srt.debug_utils.comparator.unshard.executor import execute_unshard_plan
@@ -112,7 +110,9 @@ def _execute_plans(
     for plan in plans:
         if isinstance(plan, UnshardPlan):
             # TODO: incorrect `tensors_by_world_rank` if multi UnshardPlan
-            tensors = execute_unshard_plan(plan, tensors_by_world_rank=dict(enumerate(tensors)))
+            tensors = execute_unshard_plan(
+                plan, tensors_by_world_rank=dict(enumerate(tensors))
+            )
         else:
             raise NotImplementedError(f"Unknown {plan=}")
 

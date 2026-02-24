@@ -13,7 +13,9 @@ register_cpu_ci(est_time=10, suite="default", nightly=True)
 class TestComputeUnshardPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
-        parallel_infos = [{ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
+        ]
         plan = compute_unshard_plan(dim_specs, parallel_infos)
 
         assert plan is not None
