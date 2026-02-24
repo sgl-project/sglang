@@ -38,9 +38,9 @@ def process_tensor_group(
         name=name,
         diff_threshold=args.diff_threshold,
     )
+
     k = "passed" if info.diff is not None and info.diff.passed else "failed"
     counts[k] += 1
-
     print_record(
         ComparisonRecord(**info.model_dump()),
         output_format=args.output_format,
