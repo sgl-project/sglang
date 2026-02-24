@@ -462,6 +462,16 @@ class SchedulerOutputProcessorMixin:
                             del pixel_values
                 self.maybe_collect_routed_experts(req)
 
+                # KV return: transfer generated-token KV back to prefill via
+                # NIXL RDMA before the pages are freed.  This must happen
+                # before release_kv_cache() below — once freed, the pages
+                # may be reused and the data is lost.  After the RDMA write
+                # completes, a ZMQ metadata message tells the prefill which
+                # token_ids map to which page slots, so it can insert them
+                # into its RadixCache for future prefix cache hits.
+                if self.server_args.enable_kv_return:
+                    self._try_kv_return(req)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
@@ -526,6 +536,126 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats_every_iteration(
                 batch, num_accepted_tokens=result.num_accepted_tokens
             )
+
+    def _try_kv_return(self, req: Req) -> None:
+        """Reverse KV transfer: decode → prefill, waits for completion.
+
+        Uses the existing NixlKVManager.send_kvcache() in the reverse direction.
+        Looks up prefill peer info from kv_manager.prefill_kv_return_info
+        (populated during bootstrap) and allocates destination pages from
+        the pre-allocated pool.
+
+        IMPORTANT: This blocks until the RDMA transfer completes so that the
+        source KV pages are not freed while the transfer is in flight.
+        """
+        import numpy as np
+
+        num_generated = len(req.output_ids)
+        logger.debug(
+            "KV return: _try_kv_return called for req %s (num_generated=%d)",
+            req.rid, num_generated,
+        )
+        if num_generated == 0:
+            return
+
+        kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
+        if not hasattr(kv_mgr, "prefill_kv_return_info") or not kv_mgr.prefill_kv_return_info:
+            logger.debug("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
+            return
+
+        # Use the first registered prefill peer (multi-prefill lookup is future work)
+        prefill_info = next(iter(kv_mgr.prefill_kv_return_info.values()))
+
+        try:
+            prompt_len = len(req.origin_input_ids)
+            seqlen = prompt_len + num_generated
+
+            # Extract KV indices for generated tokens from req_to_token_pool
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, prompt_len:seqlen]
+                .cpu()
+                .numpy()
+            )
+
+            # Convert to page-level indices
+            page_size = self.token_to_kv_pool_allocator.page_size
+            if page_size > 1:
+                num_pages = len(kv_indices) // page_size
+                if num_pages == 0:
+                    return
+                kv_indices = kv_indices[::page_size][:num_pages]
+            else:
+                num_pages = len(kv_indices)
+
+            # Allocate destination pages from the pre-allocated pool
+            pool = prefill_info["dst_page_pool"]
+            ptr = prefill_info["dst_page_ptr"]
+            if ptr + num_pages > len(pool):
+                logger.debug(
+                    "KV return: no dst pages left for req %s (need %d, have %d)",
+                    req.rid, num_pages, len(pool) - ptr,
+                )
+                return
+            dst_page_indices = np.array(pool[ptr:ptr + num_pages], dtype=np.int32)
+            prefill_info["dst_page_ptr"] = ptr + num_pages
+
+            logger.debug(
+                "KV return: starting transfer for req %s — %d pages, "
+                "dst_pool ptr=%d/%d, peer=%s",
+                req.rid, num_pages, ptr, len(pool), prefill_info["agent_name"],
+            )
+
+            notif = f"kv_return_{req.rid}"
+            t0 = time.time()
+            xfer_handle = kv_mgr.send_kvcache(
+                peer_name=prefill_info["agent_name"],
+                prefill_kv_indices=kv_indices,
+                dst_kv_ptrs=prefill_info["kv_ptrs"],
+                dst_kv_indices=dst_page_indices,
+                dst_gpu_id=prefill_info["gpu_id"],
+                notif=notif,
+            )
+
+            logger.debug(
+                "KV return: send_kvcache posted for req %s in %.1fms, waiting for completion",
+                req.rid, (time.time() - t0) * 1000,
+            )
+
+            # Wait for the RDMA transfer to complete before returning.
+            # The caller (process_batch_result_decode) will free the KV pages
+            # right after this method returns, so we must not return while the
+            # transfer engine is still reading from those pages.
+            timeout_s = 10.0
+            poll_interval = 0.001  # 1ms
+            elapsed = 0.0
+            while elapsed < timeout_s:
+                state = kv_mgr.agent.check_xfer_state(xfer_handle)
+                if state == "DONE":
+                    break
+                if state == "ERR":
+                    logger.warning("KV return transfer error for req %s", req.rid)
+                    return
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            if elapsed >= timeout_s:
+                logger.warning(
+                    "KV return transfer timed out for req %s after %.1fs",
+                    req.rid, timeout_s,
+                )
+                return
+
+            # Send metadata (token_ids + dst_page_indices) to prefill for RadixCache insertion
+            full_token_ids = list(req.origin_input_ids) + list(req.output_ids)
+            kv_mgr.send_kv_return_metadata(prefill_info, full_token_ids, dst_page_indices)
+
+            logger.info(
+                "KV return completed for req %s (%d tokens, %d pages, pool %d/%d used, %.1fms)",
+                req.rid, num_generated, num_pages, prefill_info["dst_page_ptr"],
+                len(pool), elapsed * 1000,
+            )
+        except Exception as e:
+            logger.warning("KV return failed for req %s: %s", req.rid, e)
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int

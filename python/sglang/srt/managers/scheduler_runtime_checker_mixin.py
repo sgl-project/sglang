@@ -150,14 +150,20 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        # KV return reserves a budget of pages for incoming RDMA writes from
+        # decode.  These pages are "in limbo" — allocated from the pool but not
+        # yet in the RadixCache tree.  The invariant is:
+        #   available + evictable == max_tokens - protected - kv_return_reserved
+        kv_return_reserved = getattr(self, "kv_return_reserved_tokens", 0)
         memory_leak = (available_size + evictable_size) != (
             # self.max_total_num_tokens
             # if not self.enable_hierarchical_cache
             # else self.max_total_num_tokens - protected_size
             self.max_total_num_tokens
             - protected_size
+            - kv_return_reserved
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_return_reserved=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -315,6 +321,13 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Process KV return insertions even when idle (prefill side)
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            self._process_kv_return_insertions()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

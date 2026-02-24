@@ -735,6 +735,9 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
+        # KV return: reverse transfer state (no separate classes — uses existing NixlKVManager)
+        self.kv_return_pending: Dict[str, list] = {}  # rid -> [xfer_handles]
+
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
@@ -967,6 +970,47 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+        # KV return: wire up existing NixlKVManager for reverse transfers
+        self.kv_return_reserved_tokens = 0
+        if self.server_args.enable_kv_return:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                logger.info("KV return enabled — decode will send generated KV back to prefill")
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+                # Pre-allocate a budget of pages for receiving returned KV
+                budget = self.server_args.kv_return_budget_fraction
+                avail = self.token_to_kv_pool_allocator.available_size()
+                num_reserve_tokens = int(avail * budget)
+                logger.debug(
+                    "KV return budget: fraction=%.2f, available_tokens=%d, "
+                    "reserve_tokens=%d, page_size=%d",
+                    budget, avail, num_reserve_tokens,
+                    self.token_to_kv_pool_allocator.page_size,
+                )
+                if num_reserve_tokens > 0:
+                    reserved = self.token_to_kv_pool_allocator.alloc(num_reserve_tokens)
+                    if reserved is not None:
+                        import numpy as np
+                        from sglang.srt.disaggregation.utils import kv_to_page_indices
+                        page_size = self.token_to_kv_pool_allocator.page_size
+                        page_indices = kv_to_page_indices(reserved.cpu().numpy(), page_size)
+                        kv_mgr.kv_return_dst_pages = page_indices
+                        self.kv_return_reserved_tokens = num_reserve_tokens
+                        logger.info(
+                            "Pre-allocated %d pages (%d tokens) for KV return reception (%.0f%% budget)",
+                            len(page_indices), num_reserve_tokens, budget * 100,
+                        )
+                    else:
+                        import numpy as np
+                        kv_mgr.kv_return_dst_pages = np.array([], dtype=np.int32)
+                        logger.warning("Failed to pre-allocate pages for KV return")
+                else:
+                    import numpy as np
+                    kv_mgr.kv_return_dst_pages = np.array([], dtype=np.int32)
+                if hasattr(kv_mgr, "start_kv_return_receiver"):
+                    kv_mgr.start_kv_return_receiver(self.tree_cache)
+                logger.info("KV return enabled — prefill will accept returned KV into RadixCache")
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -2450,9 +2494,126 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
+        # Drain KV return insertion queue on the prefill side (main thread only)
+        if self.server_args.enable_kv_return and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._process_kv_return_insertions()
+
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+
+    def _process_kv_return_insertions(self):
+        """Drain the KV return insertion queue and insert into RadixCache.
+
+        This is the final step of the KV return pipeline:
+
+            decode finish → NIXL RDMA write (data) → ZMQ metadata → this method
+
+        The decode worker RDMA-writes generated-token KV directly into
+        pre-allocated page slots on our GPU, then sends a ZMQ message with
+        (token_ids, dst_page_indices).  A background receiver thread pushes
+        those tuples into kv_return_insertion_queue.  We drain them HERE
+        on the scheduler's main thread because tree_cache.insert() is NOT
+        thread-safe.
+
+        The token_ids are the FULL sequence (prompt + generated) and the
+        dst_page_indices cover only the generated tokens. We first match the
+        prompt prefix in the tree to get its existing page indices, then
+        concatenate with the returned generated-token pages to form the
+        complete value tensor for insert().
+        """
+        import queue as queue_mod
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not hasattr(kv_mgr, "kv_return_insertion_queue"):
+            return
+
+        insertion_count = 0
+        while True:
+            try:
+                token_ids, dst_page_indices = kv_mgr.kv_return_insertion_queue.get_nowait()
+            except queue_mod.Empty:
+                break
+
+            # Convert returned page indices to torch.Tensor
+            gen_pages = torch.tensor(
+                dst_page_indices, dtype=torch.int64, device=self.device
+            )
+
+            # Match the existing prefix (prompt tokens) to get their page indices.
+            # RadixCache.insert() slices both key and value in lockstep, so we
+            # need the full value vector (prompt pages + generated pages).
+            radix_key = RadixKey(token_ids=token_ids, extra_key=None)
+            match_result = self.tree_cache.match_prefix(
+                MatchPrefixParams(key=radix_key)
+            )
+            prefix_indices = match_result.device_indices  # existing prompt pages
+
+            # If the tree already covers the full sequence (prompt + gen),
+            # this is a duplicate insertion (e.g., same prompt with temp=0).
+            # Free the orphaned gen pages back to the pool instead of leaking them.
+            num_gen_tokens = len(dst_page_indices)
+            expected_prompt_len = len(token_ids) - num_gen_tokens
+            if len(prefix_indices) >= len(token_ids):
+                logger.debug(
+                    "KV return: tree already has full sequence (%d tokens), "
+                    "freeing %d orphaned gen pages",
+                    len(token_ids), len(gen_pages),
+                )
+                self.token_to_kv_pool_allocator.free(gen_pages)
+                self.kv_return_reserved_tokens = max(
+                    0, self.kv_return_reserved_tokens - len(gen_pages)
+                )
+                insertion_count += 1
+                continue
+
+            # Build full value: existing prefix pages + returned generated pages
+            full_value = torch.cat([prefix_indices, gen_pages])
+
+            # Page-align the key to match what insert() expects
+            page_size = self.tree_cache.page_size
+            if page_size > 1:
+                aligned_len = len(full_value) // page_size * page_size
+                if aligned_len == 0:
+                    continue
+                insert_key = RadixKey(
+                    token_ids=token_ids[:aligned_len], extra_key=None
+                )
+                insert_value = full_value[:aligned_len]
+            else:
+                aligned_len = len(full_value)
+                if aligned_len > len(token_ids):
+                    # More pages than tokens shouldn't happen; truncate to token count
+                    aligned_len = len(token_ids)
+                insert_key = RadixKey(
+                    token_ids=token_ids[:aligned_len], extra_key=None
+                )
+                insert_value = full_value[:aligned_len]
+
+            self.tree_cache.insert(
+                InsertParams(key=insert_key, value=insert_value)
+            )
+            insertion_count += 1
+            # Pages inserted into RadixCache become evictable — reduce the
+            # reserved count so memory accounting stays balanced.
+            num_gen_pages = len(gen_pages)
+            self.kv_return_reserved_tokens = max(
+                0, self.kv_return_reserved_tokens - num_gen_pages
+            )
+            logger.debug(
+                "KV return insertion: %d tokens (%d prefix + %d gen), %d pages inserted, "
+                "reserved remaining: %d",
+                len(token_ids), len(prefix_indices), num_gen_pages, aligned_len,
+                self.kv_return_reserved_tokens,
+            )
+
+        if insertion_count > 0:
+            logger.info(
+                "Processed %d KV return insertions into RadixCache", insertion_count
+            )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:

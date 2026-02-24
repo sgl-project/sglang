@@ -365,6 +365,7 @@ def get_kv_class(
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import (
+            FakeKVBootstrapServer,
             FakeKVManager,
             FakeKVReceiver,
             FakeKVSender,
@@ -375,6 +376,7 @@ def get_kv_class(
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: FakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
 
