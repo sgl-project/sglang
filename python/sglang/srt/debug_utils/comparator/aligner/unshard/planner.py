@@ -51,7 +51,7 @@ def compute_unshard_plan(
         for info in parallel_infos
     ]
 
-    axis_params: list[tuple[ParallelAxis, UnshardParams]] = [
+    axis_and_params: list[tuple[ParallelAxis, UnshardParams]] = [
         (axis, PickParams())
         for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
@@ -60,7 +60,7 @@ def compute_unshard_plan(
     ]
 
     plans: list[UnshardPlan] = []
-    for axis, params in axis_params:
+    for axis, params in axis_and_params:
         result = _group_and_project(
             current_coords=current_coords,
             target_axis=axis,
