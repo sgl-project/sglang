@@ -10,7 +10,8 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 )
 
 
-# _CoordsList[tensor_index][axis] = rank of tensor `tensor_index` along `axis` (e.g. coords[2][TP] = 3)
+# _CoordsList[tensor_index][axis] = output axis rank of tensor `tensor_index` along `axis`
+# (e.g. coords[2][TP] = 3)
 _CoordsList = list[dict[ParallelAxis, int]]
 
 
