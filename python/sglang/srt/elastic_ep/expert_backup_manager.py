@@ -45,16 +45,20 @@ class ExpertBackupManager:
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
         context = zmq.Context(2)
-        self.recv_from_expert_backup_client = get_zmq_socket(
-            context,
-            zmq.PULL,
-            f"tcp://127.0.0.1:{10000 + server_args.node_rank * 2}",
-            True,
-        )
         self.send_to_expert_backup_client = context.socket(zmq.PUB)
         self.send_to_expert_backup_client.bind(
             f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}"
         )
+        self.backup_weights_from_disk()
+        self.start_transfer_server()
+        back_req = BackupDramReq(
+            _rank=self.engine_rank,
+            _map=self.weight_pointer_map,
+            session_id=self.session_id,
+            buffer_size=self.continuous_buffer.numel()
+            * self.continuous_buffer.element_size(),
+        )
+        self.send_to_expert_backup_client.send_pyobj(back_req)
 
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
@@ -139,35 +143,12 @@ class ExpertBackupManager:
         if ret_value != 0:
             raise RuntimeError("Mooncake memory registration failed.")
 
-    def event_loop(self):
-        while True:
-            while True:
-                try:
-                    recv_req = self.recv_from_expert_backup_client.recv_pyobj(
-                        zmq.NOBLOCK
-                    )
-                except zmq.ZMQError:
-                    break
-                logger.info("recv_req: %s", recv_req)
-                self.backup_weights_from_disk()
-                self.start_transfer_server()
-                back_req = BackupDramReq(
-                    _rank=self.engine_rank,
-                    _map=self.weight_pointer_map,
-                    session_id=self.session_id,
-                    buffer_size=self.continuous_buffer.numel()
-                    * self.continuous_buffer.element_size(),
-                )
-                self.send_to_expert_backup_client.send_pyobj(back_req)
-
-
 def run_expert_backup_manager_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
     set_global_server_args_for_scheduler(server_args)
     manager = ExpertBackupManager(server_args, port_args)
-    manager.event_loop()
 
 
 def run_expert_backup_manager(

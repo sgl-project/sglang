@@ -30,12 +30,6 @@ def extract_layer_and_expert_id(param_name):
 class ExpertBackupClient:
     def __init__(self, server_args: ServerArgs, model_runner):
         context = zmq.Context(2)
-        self.send_to_backup_manager = get_zmq_socket(
-            context,
-            zmq.PUSH,
-            f"tcp://127.0.0.1:{10000 + server_args.node_rank * 2}",
-            False,
-        )
         self.server_args = server_args
         self.engine_num = server_args.nnodes
         self.engine_rank = server_args.node_rank
@@ -50,7 +44,6 @@ class ExpertBackupClient:
         self.gpu_buffer = None
         self.buffer_size = 0
         self.use_backup = False
-
         local_ip = get_local_ip_auto()
         all_ips = [None] * get_world_size()
         torch.distributed.all_gather_object(
@@ -65,27 +58,20 @@ class ExpertBackupClient:
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
-        if get_world_rank() % (get_world_size() // server_args.nnodes) == 0:
-            self.send_to_backup_manager.send_pyobj(UpdateExpertBackupReq())
-
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
-
+    
     def _receive_loop(self):
         cnt = 0
-        while True:
-            for i in range(self.engine_num):
-                try:
-                    response = self.recv_list[i].recv_pyobj()
-                except zmq.ZMQError:
-                    continue
-                self.dram_map_list[response._rank] = response._map
-                self.session_id_list[response._rank] = response.session_id
-                self.buffer_size = max(self.buffer_size, response.buffer_size)
-                cnt += 1
-                if cnt == self.engine_num:
-                    self.use_backup = True
-                    self.start_transfer_client()
+        while cnt < self.engine_num:
+            response = self.recv_list[cnt].recv_pyobj() 
+            self.dram_map_list[response._rank] = response._map
+            self.session_id_list[response._rank] = response.session_id
+            self.buffer_size = max(self.buffer_size, response.buffer_size)
+            cnt += 1
+            
+        self.use_backup = True
+        self.start_transfer_client()
 
     def start_transfer_client(self):
         from mooncake.engine import TransferEngine
