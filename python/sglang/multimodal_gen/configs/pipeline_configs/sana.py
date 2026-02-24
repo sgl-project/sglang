@@ -91,6 +91,7 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
         return batch.negative_prompt_embeds[0]
 
     def post_denoising_loop(self, latents, batch):
-        # SANA DiT outputs (B, C, H, W) directly via its unpatchify step,
-        # so no post-processing is needed here (unlike Flux which un-packs tokens).
         return latents
+
+    def post_decoding(self, frames, server_args):
+        return (frames - 0.5) * 2
