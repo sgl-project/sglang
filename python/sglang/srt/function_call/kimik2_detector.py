@@ -40,11 +40,13 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
+            re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            re.DOTALL,
         )
 
         self._last_arguments = ""
@@ -87,7 +89,7 @@ class KimiK2Detector(BaseFormatDetector):
                 function_name = m.group("name")
                 function_idx = int(m.group("index"))
 
-                logger.info(f"function_name {function_name}")
+                logger.debug(f"function_name {function_name}")
 
                 tool_calls.append(
                     ToolCallItem(
