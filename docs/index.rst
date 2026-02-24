@@ -130,6 +130,7 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/post_training_integration.md
+   references/release_lookup
    references/learn_more.md
 
 .. toctree::
