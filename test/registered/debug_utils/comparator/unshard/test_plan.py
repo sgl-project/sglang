@@ -3,7 +3,7 @@ import sys
 import pytest
 
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
-from sglang.srt.debug_utils.comparator.unshard.plan import compute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
 from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 

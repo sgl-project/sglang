@@ -11,11 +11,11 @@ from sglang.srt.debug_utils.comparator.output_types import (
     print_record,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
-from sglang.srt.debug_utils.comparator.unshard.execute import execute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.executor import execute_unshard_plan
 from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.unshard.plan import compute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
 from sglang.srt.debug_utils.comparator.unshard.types import UnshardPlan
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
@@ -28,26 +28,27 @@ def process_tensor_group(
     args: argparse.Namespace,
     counts: dict[str, int],
 ) -> None:
-    baseline_loaded = _load_tensors(baseline_filenames, Path(args.baseline_path))
-    target_loaded = _load_tensors(target_filenames, Path(args.target_path))
+    b_tensors = _load_tensors(baseline_filenames, Path(args.baseline_path))
+    t_tensors = _load_tensors(target_filenames, Path(args.target_path))
 
-    baseline_plan, target_plan = _compute_plans(
-        baseline_metas=[item.meta for item in baseline_loaded],
-        target_metas=[item.meta for item in target_loaded],
+    b_plan, t_plan = _compute_plans(
+        baseline_metas=[item.meta for item in b_tensors],
+        target_metas=[item.meta for item in t_tensors],
     )
 
-    baseline_tensor = _execute_plan(baseline_loaded, baseline_plan)
-    target_tensor = _execute_plan(target_loaded, target_plan)
+    b_tensor = _execute_plan(b_tensors, b_plan)
+    t_tensor = _execute_plan(t_tensors, t_plan)
+    del b_tensors, t_tensors
 
-    if baseline_tensor is None or target_tensor is None:
-        reason = "baseline_load_failed" if baseline_tensor is None else "target_load_failed"
+    if b_tensor is None or t_tensor is None:
+        reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
         counts["skipped"] += 1
         print_record(SkipRecord(name=name, reason=reason), output_format=args.output_format)
         return
 
     info = compare_tensors(
-        x_baseline=baseline_tensor,
-        x_target=target_tensor,
+        x_baseline=b_tensor,
+        x_target=t_tensor,
         name=name,
         diff_threshold=args.diff_threshold,
     )
