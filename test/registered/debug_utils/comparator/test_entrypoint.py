@@ -27,11 +27,8 @@ class TestEntrypointGroupingRaw:
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, grouping="raw")
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         assert isinstance(records[0], ConfigRecord)
 
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
@@ -45,11 +42,8 @@ class TestEntrypointGroupingRaw:
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 1
 
@@ -60,11 +54,8 @@ class TestEntrypointGroupingRaw:
             baseline_names=["tensor_a"],
         )
         args = _make_args(baseline_path, target_path, grouping="raw")
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 1
         assert skips[0].reason == "baseline_load_failed"
@@ -78,11 +69,8 @@ class TestEntrypointGroupingRaw:
         args = _make_args(
             baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
         )
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 1
@@ -90,11 +78,8 @@ class TestEntrypointGroupingRaw:
     def test_all_valid_records(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
         args = _make_args(baseline_path, target_path, grouping="raw")
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         assert all(isinstance(r, _OutputRecord) for r in records)
 
     def test_text_output_smoke(self, tmp_path, capsys):
@@ -118,11 +103,8 @@ class TestEntrypointGroupingLogical:
         """Single-rank dumps without dims"""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path)
-        capsys.readouterr()
 
-        run(args)
-
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 2
         summary = records[-1]
@@ -155,13 +137,9 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(
-            baseline_dir, target_dir, diff_threshold=0.01
-        )
-        capsys.readouterr()
-        run(args)
+        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
 
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 1
         assert comparisons[0].name == "hidden"
@@ -198,13 +176,9 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(
-            baseline_dir, target_dir, diff_threshold=0.01
-        )
-        capsys.readouterr()
-        run(args)
+        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
 
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 1
         assert comparisons[0].diff is not None
@@ -237,10 +211,8 @@ class TestEntrypointGroupingLogical:
         )
 
         args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
-        capsys.readouterr()
-        run(args)
 
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
         assert len(comparisons) == 1
         assert comparisons[0].diff is not None
@@ -280,10 +252,8 @@ class TestEntrypointGroupingLogical:
         )
 
         args = _make_args(baseline_dir, target_dir)
-        capsys.readouterr()
-        run(args)
 
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 1
         assert skips[0].reason == "baseline_load_failed"
@@ -316,10 +286,8 @@ class TestEntrypointGroupingLogical:
             )
 
         args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
-        capsys.readouterr()
-        run(args)
 
-        records = _parse_jsonl(capsys.readouterr().out)
+        records = _run_and_parse(args, capsys)
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 2
@@ -389,6 +357,12 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
     )
     defaults.update(overrides)
     return Namespace(**defaults)
+
+
+def _run_and_parse(args: Namespace, capsys: pytest.CaptureFixture) -> list[AnyRecord]:
+    capsys.readouterr()
+    run(args)
+    return _parse_jsonl(capsys.readouterr().out)
 
 
 def _parse_jsonl(output: str) -> list[AnyRecord]:
