@@ -90,6 +90,7 @@ class AutoencoderDC(nn.Module):
 
     def decode(self, z: torch.Tensor, **kwargs):
         self._ensure_inner_model()
+        z = z.to(dtype=self.dtype)
         return self._inner_model.decode(z, **kwargs)
 
     def forward(self, x: torch.Tensor, **kwargs):
