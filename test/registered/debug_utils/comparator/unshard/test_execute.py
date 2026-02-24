@@ -160,7 +160,6 @@ class TestExecuteUnshardPlan:
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
 
-
     def test_unsupported_params_type_raises(self) -> None:
         """_apply_unshard raises ValueError for unknown params type."""
 
