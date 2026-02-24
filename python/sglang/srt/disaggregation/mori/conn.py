@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -195,6 +195,7 @@ class MoriKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
