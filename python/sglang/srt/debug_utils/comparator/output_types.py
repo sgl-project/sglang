@@ -38,12 +38,20 @@ class SkipRecord(_OutputRecord):
     name: str
     reason: str
 
+    @property
+    def category(self):
+        return "skipped"
+
     def to_text(self) -> str:
         return f"Skip: {self.name} ({self.reason})"
 
 
 class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
     type: Literal["comparison"] = "comparison"
+
+    @property
+    def category(self):
+        return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def to_text(self) -> str:
         return format_comparison(self)
