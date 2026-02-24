@@ -52,8 +52,7 @@ def compute_unshard_plan(
     ]
 
     axis_and_params: list[tuple[ParallelAxis, UnshardParams]] = [
-        (axis, PickParams())
-        for axis in sorted(replicated_axes, key=lambda a: a.value)
+        (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
         (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
         for axis, (dim_index, spec) in sharded_axis_infos.items()

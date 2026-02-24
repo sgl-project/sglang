@@ -389,7 +389,9 @@ class TestVerifyReplicatedGroup:
         tensor_b = torch.ones(4) + 0.1
 
         warnings = _verify_replicated_group(
-            [tensor_a, tensor_b], axis=ParallelAxis.TP, group_index=0,
+            [tensor_a, tensor_b],
+            axis=ParallelAxis.TP,
+            group_index=0,
         )
         assert len(warnings) == 1
         assert warnings[0].axis == "tp"
@@ -403,7 +405,9 @@ class TestVerifyReplicatedGroup:
         tensor = torch.randn(4, 8)
 
         warnings = _verify_replicated_group(
-            [tensor, tensor.clone()], axis=ParallelAxis.TP, group_index=0,
+            [tensor, tensor.clone()],
+            axis=ParallelAxis.TP,
+            group_index=0,
         )
         assert warnings == []
 
@@ -414,7 +418,9 @@ class TestVerifyReplicatedGroup:
         other_b = torch.ones(4) * 2
 
         warnings = _verify_replicated_group(
-            [baseline, other_a, other_b], axis=ParallelAxis.CP, group_index=1,
+            [baseline, other_a, other_b],
+            axis=ParallelAxis.CP,
+            group_index=1,
         )
         assert len(warnings) == 2
         assert warnings[0].differing_index == 1
@@ -444,7 +450,9 @@ class TestVerifyReplicatedGroup:
         other = torch.full((4,), 1e-6)
 
         warnings = _verify_replicated_group(
-            [baseline, other], axis=ParallelAxis.TP, group_index=0,
+            [baseline, other],
+            axis=ParallelAxis.TP,
+            group_index=0,
         )
         assert warnings == []
 
@@ -454,7 +462,9 @@ class TestVerifyReplicatedGroup:
         other = torch.full((4,), 1e-6 + 1e-9)
 
         warnings = _verify_replicated_group(
-            [baseline, other], axis=ParallelAxis.TP, group_index=0,
+            [baseline, other],
+            axis=ParallelAxis.TP,
+            group_index=0,
         )
         assert len(warnings) == 1
         assert warnings[0].differing_index == 1
