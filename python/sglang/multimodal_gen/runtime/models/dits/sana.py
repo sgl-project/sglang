@@ -216,7 +216,7 @@ class SanaTransformerBlock(nn.Module):
             cross_attention_dim=cross_attention_dim,
             num_heads=num_cross_attention_heads,
             head_dim=cross_attention_head_dim,
-            bias=attention_bias,
+            bias=True,
         )
 
         self.ff = GLUMBConv(
