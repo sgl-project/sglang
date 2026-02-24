@@ -16,59 +16,18 @@ def compute_unshard_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axes: dict[ParallelAxis, tuple[int, DimSpec]] = {}
-    for dim_idx, spec in enumerate(dim_specs):
-        if spec.parallel is not None:
-            sharded_axes[spec.parallel] = (dim_idx, spec)
-
+    sharded_axes = _extract_sharded_axes(dim_specs)
     if not sharded_axes:
         return []
 
-    coord_map: dict[int, dict[ParallelAxis, int]] = {}
-    axis_sizes: dict[ParallelAxis, int] = {}
-
-    for world_rank, pinfo in enumerate(parallel_infos):
-        coords: dict[ParallelAxis, int] = {}
-        for axis_name in sharded_axes:
-            if axis_name not in pinfo:
-                raise ValueError(
-                    f"world_rank={world_rank} missing parallel_info for "
-                    f"sharded axis {axis_name.value!r}"
-                )
-
-            ainfo = pinfo[axis_name]
-            coords[axis_name] = ainfo.axis_rank
-
-            if axis_name not in axis_sizes:
-                axis_sizes[axis_name] = ainfo.axis_size
-            elif ainfo.axis_size != axis_sizes[axis_name]:
-                raise ValueError(
-                    f"Inconsistent axis_size for {axis_name.value}: "
-                    f"expected {axis_sizes[axis_name]}, got {ainfo.axis_size} "
-                    f"at world_rank={world_rank}"
-                )
-
-        coord_map[world_rank] = coords
-
-    for axis_name, expected_size in axis_sizes.items():
-        seen_ranks = {coords[axis_name] for coords in coord_map.values()}
-        if seen_ranks != set(range(expected_size)):
-            raise ValueError(
-                f"axis_rank coverage for {axis_name.value} is incomplete: "
-                f"got {sorted(seen_ranks)}, expected 0..{expected_size - 1}"
-            )
-
-    current_indices = list(range(len(parallel_infos)))
-    current_coords: dict[int, dict[ParallelAxis, int]] = {
-        idx: dict(coord_map[idx]) for idx in current_indices
-    }
-    remaining_axes = list(sharded_axes.keys())
+    current_coords = _build_and_validate_coords(
+        sharded_axes=sharded_axes,
+        parallel_infos=parallel_infos,
+    )
 
     plans: list[UnshardPlan] = []
-    for axis_name in remaining_axes:
-        dim_idx, spec = sharded_axes[axis_name]
+    for axis_name, (dim_idx, spec) in sharded_axes.items():
         groups = _compute_groups(
-            current_indices=current_indices,
             current_coords=current_coords,
             target_axis=axis_name,
         )
@@ -79,40 +38,78 @@ def compute_unshard_plan(
             groups=groups,
         ))
 
-        new_indices: list[int] = []
-        new_coords: dict[int, dict[ParallelAxis, int]] = {}
-        for new_idx, group in enumerate(groups):
-            representative = group[0]
-            remaining = {
-                k: v for k, v in current_coords[representative].items()
-                if k != axis_name
-            }
-            new_coords[new_idx] = remaining
-            new_indices.append(new_idx)
-
-        current_indices = new_indices
-        current_coords = new_coords
+        current_coords = _project_coords(
+            groups=groups,
+            current_coords=current_coords,
+            removed_axis=axis_name,
+        )
 
     return plans
 
 
+def _extract_sharded_axes(
+    dim_specs: list[DimSpec],
+) -> dict[ParallelAxis, tuple[int, DimSpec]]:
+    result: dict[ParallelAxis, tuple[int, DimSpec]] = {}
+    for dim_idx, spec in enumerate(dim_specs):
+        if spec.parallel is not None:
+            result[spec.parallel] = (dim_idx, spec)
+    return result
+
+
+def _build_and_validate_coords(
+    *,
+    sharded_axes: dict[ParallelAxis, tuple[int, DimSpec]],
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+) -> dict[int, dict[ParallelAxis, int]]:
+    coords_by_index: dict[int, dict[ParallelAxis, int]] = {}
+    axis_sizes: dict[ParallelAxis, int] = {}
+
+    for world_rank, parallel_info in enumerate(parallel_infos):
+        coords: dict[ParallelAxis, int] = {}
+        for axis_name in sharded_axes:
+            if axis_name not in parallel_info:
+                raise ValueError(
+                    f"world_rank={world_rank} missing parallel_info for "
+                    f"sharded axis {axis_name.value!r}"
+                )
+
+            axis_info = parallel_info[axis_name]
+            coords[axis_name] = axis_info.axis_rank
+
+            if axis_name not in axis_sizes:
+                axis_sizes[axis_name] = axis_info.axis_size
+            elif axis_info.axis_size != axis_sizes[axis_name]:
+                raise ValueError(
+                    f"Inconsistent axis_size for {axis_name.value}: "
+                    f"expected {axis_sizes[axis_name]}, got {axis_info.axis_size} "
+                    f"at world_rank={world_rank}"
+                )
+
+        coords_by_index[world_rank] = coords
+
+    for axis_name, expected_size in axis_sizes.items():
+        seen_ranks = {coords[axis_name] for coords in coords_by_index.values()}
+        if seen_ranks != set(range(expected_size)):
+            raise ValueError(
+                f"axis_rank coverage for {axis_name.value} is incomplete: "
+                f"got {sorted(seen_ranks)}, expected 0..{expected_size - 1}"
+            )
+
+    return coords_by_index
+
+
 def _compute_groups(
-    current_indices: list[int],
+    *,
     current_coords: dict[int, dict[ParallelAxis, int]],
     target_axis: ParallelAxis,
 ) -> list[list[int]]:
     buckets: dict[tuple[tuple[ParallelAxis, int], ...], list[tuple[int, int]]] = defaultdict(list)
 
-    for idx in current_indices:
-        coords = current_coords[idx]
-        other_key = tuple(
-            sorted(
-                ((k, v) for k, v in coords.items() if k != target_axis),
-                key=lambda pair: pair[0].value,
-            )
-        )
+    for idx, coords in current_coords.items():
+        grouping_key = _coords_key_excluding(coords, excluded_axis=target_axis)
         axis_rank = coords[target_axis]
-        buckets[other_key].append((axis_rank, idx))
+        buckets[grouping_key].append((axis_rank, idx))
 
     groups: list[list[int]] = []
     for key in sorted(buckets.keys()):
@@ -121,6 +118,32 @@ def _compute_groups(
         groups.append([idx for _, idx in entries])
 
     return groups
+
+
+def _coords_key_excluding(
+    coords: dict[ParallelAxis, int],
+    *,
+    excluded_axis: ParallelAxis,
+) -> tuple[tuple[ParallelAxis, int], ...]:
+    return tuple(sorted(
+        ((k, v) for k, v in coords.items() if k != excluded_axis),
+        key=lambda pair: pair[0].value,
+    ))
+
+
+def _project_coords(
+    *,
+    groups: list[list[int]],
+    current_coords: dict[int, dict[ParallelAxis, int]],
+    removed_axis: ParallelAxis,
+) -> dict[int, dict[ParallelAxis, int]]:
+    return {
+        new_idx: {
+            k: v for k, v in current_coords[group[0]].items()
+            if k != removed_axis
+        }
+        for new_idx, group in enumerate(groups)
+    }
 
 
 def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnshardParams:
