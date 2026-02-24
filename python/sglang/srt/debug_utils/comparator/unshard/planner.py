@@ -15,6 +15,19 @@ class _ShardedAxis(NamedTuple):
     spec: DimSpec
 
 
+class _AxisCoord(NamedTuple):
+    axis: ParallelAxis
+    rank: int
+
+
+class _RankedIndex(NamedTuple):
+    axis_rank: int
+    tensor_index: int
+
+
+_CoordsKey = tuple[_AxisCoord, ...]
+
+
 def compute_unshard_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
@@ -113,18 +126,18 @@ def _compute_groups(
     current_coords: dict[int, dict[ParallelAxis, int]],
     target_axis: ParallelAxis,
 ) -> list[list[int]]:
-    buckets: dict[tuple[tuple[ParallelAxis, int], ...], list[tuple[int, int]]] = defaultdict(list)
+    buckets: dict[_CoordsKey, list[_RankedIndex]] = defaultdict(list)
 
     for idx, coords in current_coords.items():
         grouping_key = _coords_key_excluding(coords, excluded_axis=target_axis)
-        axis_rank = coords[target_axis]
-        buckets[grouping_key].append((axis_rank, idx))
+        buckets[grouping_key].append(
+            _RankedIndex(axis_rank=coords[target_axis], tensor_index=idx)
+        )
 
     groups: list[list[int]] = []
     for key in sorted(buckets.keys()):
-        entries = buckets[key]
-        entries.sort(key=lambda pair: pair[0])
-        groups.append([idx for _, idx in entries])
+        entries = sorted(buckets[key], key=lambda entry: entry.axis_rank)
+        groups.append([entry.tensor_index for entry in entries])
 
     return groups
 
@@ -133,10 +146,10 @@ def _coords_key_excluding(
     coords: dict[ParallelAxis, int],
     *,
     excluded_axis: ParallelAxis,
-) -> tuple[tuple[ParallelAxis, int], ...]:
+) -> _CoordsKey:
     return tuple(sorted(
-        ((k, v) for k, v in coords.items() if k != excluded_axis),
-        key=lambda pair: pair[0].value,
+        (_AxisCoord(axis=k, rank=v) for k, v in coords.items() if k != excluded_axis),
+        key=lambda coord: coord.axis.value,
     ))
 
 
