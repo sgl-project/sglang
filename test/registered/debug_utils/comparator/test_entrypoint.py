@@ -75,7 +75,7 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         diff_threshold=1e-3,
         filter=None,
         output_format="text",
-        match_mode="smart",
+        grouping="logical",
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -88,7 +88,7 @@ def _parse_jsonl(output: str) -> list[AnyRecord]:
 class TestEntrypointPerRank:
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, match_mode="per-rank")
+        args = _make_args(baseline_path, target_path, grouping="raw")
         capsys.readouterr()
 
         run(args)
@@ -102,7 +102,7 @@ class TestEntrypointPerRank:
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(
-            baseline_path, target_path, filter="tensor_a", match_mode="per-rank"
+            baseline_path, target_path, filter="tensor_a", grouping="raw"
         )
         capsys.readouterr()
 
@@ -117,7 +117,7 @@ class TestEntrypointPerRank:
             tensor_names=["tensor_a", "tensor_extra"],
             baseline_names=["tensor_a"],
         )
-        args = _make_args(baseline_path, target_path, match_mode="per-rank")
+        args = _make_args(baseline_path, target_path, grouping="raw")
         capsys.readouterr()
 
         run(args)
@@ -129,7 +129,7 @@ class TestEntrypointPerRank:
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
         args = _make_args(
-            baseline_path, target_path, start_step=1, end_step=1, match_mode="per-rank"
+            baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
         )
         capsys.readouterr()
 
@@ -143,7 +143,7 @@ class TestEntrypointJsonl:
     def test_jsonl_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(
-            baseline_path, target_path, output_format="json", match_mode="per-rank"
+            baseline_path, target_path, output_format="json", grouping="raw"
         )
         capsys.readouterr()
 
@@ -167,7 +167,7 @@ class TestEntrypointJsonl:
             baseline_names=["tensor_a"],
         )
         args = _make_args(
-            baseline_path, target_path, output_format="json", match_mode="per-rank"
+            baseline_path, target_path, output_format="json", grouping="raw"
         )
         capsys.readouterr()
 
@@ -185,7 +185,7 @@ class TestEntrypointJsonl:
     def test_jsonl_all_valid_records(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
         args = _make_args(
-            baseline_path, target_path, output_format="json", match_mode="per-rank"
+            baseline_path, target_path, output_format="json", grouping="raw"
         )
         capsys.readouterr()
 

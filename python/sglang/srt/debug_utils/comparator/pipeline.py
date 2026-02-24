@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -13,13 +13,6 @@ from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_
 from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
-LoadFn = Callable[[list[dict], Path], Optional[torch.Tensor]]
-
-_LOAD_FNS: dict[str, LoadFn] = {
-    "smart": load_and_unshard,
-    "per-rank": lambda rows, base_path: _load_single_tensor(rows, base_path),
-}
-
 
 def process(
     *,
@@ -27,12 +20,12 @@ def process(
     target_rows: list[dict],
     args: argparse.Namespace,
     counts: dict[str, int],
-    load_fn: LoadFn,
+    grouping: str,
 ) -> None:
     name = (baseline_rows or target_rows)[0]["name"]
 
-    baseline_tensor = load_fn(baseline_rows, Path(args.baseline_path))
-    target_tensor = load_fn(target_rows, Path(args.target_path))
+    baseline_tensor = load_tensor(baseline_rows, Path(args.baseline_path), grouping=grouping)
+    target_tensor = load_tensor(target_rows, Path(args.target_path), grouping=grouping)
 
     if baseline_tensor is None or target_tensor is None:
         reason = "baseline_load_failed" if baseline_tensor is None else "target_load_failed"
@@ -55,11 +48,24 @@ def process(
     )
 
 
-def _load_single_tensor(rows: list[dict], base_path: Path) -> Optional[torch.Tensor]:
-    if len(rows) != 1:
+def load_tensor(
+    rows: list[dict],
+    base_path: Path,
+    *,
+    grouping: str,
+) -> Optional[torch.Tensor]:
+    if not rows:
         return None
 
-    loaded = ValueWithMeta.load(base_path / rows[0]["filename"])
-    if not isinstance(loaded.value, torch.Tensor):
+    if grouping == "raw":
+        if len(rows) != 1:
+            return None
+        return _as_tensor(ValueWithMeta.load(base_path / rows[0]["filename"]).value)
+
+    return load_and_unshard(rows, base_path)
+
+
+def _as_tensor(value: object) -> Optional[torch.Tensor]:
+    if not isinstance(value, torch.Tensor):
         return None
-    return loaded.value
+    return value

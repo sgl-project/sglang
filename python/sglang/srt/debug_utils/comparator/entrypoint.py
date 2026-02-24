@@ -1,5 +1,4 @@
 import argparse
-from typing import Literal
 
 import polars as pl
 
@@ -8,10 +7,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
-from sglang.srt.debug_utils.comparator.pipeline import _LOAD_FNS, process
+from sglang.srt.debug_utils.comparator.pipeline import process
 from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
-
-MatchMode = Literal["smart", "per-rank"]
 
 _NON_KEY_COLS = {"dump_index", "filename", "duplicate_index"}
 
@@ -44,10 +41,9 @@ def run(args: argparse.Namespace) -> None:
     )
 
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
-    match_mode: MatchMode = args.match_mode
-    load_fn = _LOAD_FNS[match_mode]
+    grouping: str = args.grouping
 
-    non_key_cols = _NON_KEY_COLS | ({"rank"} if match_mode == "smart" else set())
+    non_key_cols = _NON_KEY_COLS | ({"rank"} if grouping == "logical" else set())
     key_cols = [c for c in df_target.columns if c not in non_key_cols]
     unique_keys = df_target.unique(subset=key_cols)
 
@@ -61,7 +57,7 @@ def run(args: argparse.Namespace) -> None:
             target_rows=target_rows,
             args=args,
             counts=counts,
-            load_fn=load_fn,
+            grouping=grouping,
         )
 
     print_record(
@@ -88,10 +84,10 @@ def _parse_args() -> argparse.Namespace:
         help="Output format: text (default) or json (JSONL, one JSON object per line)",
     )
     parser.add_argument(
-        "--match-mode",
+        "--grouping",
         type=str,
-        choices=["smart", "per-rank"],
-        default="smart",
-        help="Matching mode: smart (cross-rank unshard) or per-rank (rank-by-rank)",
+        choices=["logical", "raw"],
+        default="logical",
+        help="Grouping mode: logical (cross-rank unshard) or raw (rank-by-rank)",
     )
     return parser.parse_args()
