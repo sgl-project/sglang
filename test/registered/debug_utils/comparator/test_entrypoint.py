@@ -20,19 +20,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="default", nightly=True)
 
+# Each test has a one-line docstring describing the scenario it covers.
+
 
 class TestEntrypointGroupingRaw:
     """Test `--grouping raw` scenarios"""
 
     def test_run_basic(self, tmp_path, capsys):
+        """Two matching tensors produce ConfigRecord, 2 ComparisonRecords, and SummaryRecord."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, grouping="raw")
 
         records = _run_and_parse(args, capsys)
         assert isinstance(records[0], ConfigRecord)
 
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 2
+        assert len(_get_comparisons(records)) == 2
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -40,14 +42,15 @@ class TestEntrypointGroupingRaw:
         assert summary.skipped == 0
 
     def test_filter(self, tmp_path, capsys):
+        """--filter selects only the matching tensor, producing 1 ComparisonRecord."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
 
         records = _run_and_parse(args, capsys)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 1
+        assert len(_get_comparisons(records)) == 1
 
     def test_no_baseline_skip(self, tmp_path, capsys):
+        """Target tensor missing from baseline emits a SkipRecord with reason baseline_load_failed."""
         baseline_path, target_path = _create_dumps(
             tmp_path,
             tensor_names=["tensor_a", "tensor_extra"],
@@ -65,6 +68,7 @@ class TestEntrypointGroupingRaw:
         assert summary.skipped == 1
 
     def test_step_range(self, tmp_path, capsys):
+        """--start_step/--end_step restricts comparison to a single step out of three."""
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
         args = _make_args(
             baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
@@ -76,6 +80,7 @@ class TestEntrypointGroupingRaw:
         assert summary.total == 1
 
     def test_all_valid_records(self, tmp_path, capsys):
+        """Every emitted JSON record is a valid _OutputRecord subclass."""
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
         args = _make_args(baseline_path, target_path, grouping="raw")
 
@@ -83,6 +88,7 @@ class TestEntrypointGroupingRaw:
         assert all(isinstance(r, _OutputRecord) for r in records)
 
     def test_text_output_smoke(self, tmp_path, capsys):
+        """Text output format renders without errors and contains Config/Summary sections."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
         args = _make_args(
             baseline_path, target_path, output_format="text", grouping="raw"
@@ -100,19 +106,19 @@ class TestEntrypointGroupingLogical:
     """Test `--grouping logical` scenarios"""
 
     def test_no_dims_single_rank(self, tmp_path, capsys):
-        """Single-rank dumps without dims"""
+        """Single-rank dumps without dims fall back to raw loading."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path)
 
         records = _run_and_parse(args, capsys)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 2
+        assert len(_get_comparisons(records)) == 2
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 2
         assert summary.skipped == 0
 
     def test_tp_unshard_same_size(self, tmp_path, capsys):
+        """Both sides TP=2: shards are concatenated before comparison."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8)
         full_target = full_baseline + torch.randn(4, 8) * 0.001
@@ -140,11 +146,8 @@ class TestEntrypointGroupingLogical:
         args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 1
-        assert comparisons[0].name == "hidden"
-        assert comparisons[0].diff is not None
-        assert comparisons[0].diff.passed
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -152,6 +155,7 @@ class TestEntrypointGroupingLogical:
         assert summary.passed == 1
 
     def test_tp_unshard_different_sizes(self, tmp_path, capsys):
+        """Baseline TP=4 vs target TP=2: different shard counts are handled correctly."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8)
         full_target = full_baseline + torch.randn(4, 8) * 0.001
@@ -179,12 +183,10 @@ class TestEntrypointGroupingLogical:
         args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 1
-        assert comparisons[0].diff is not None
-        assert comparisons[0].diff.passed
+        _assert_single_comparison_passed(records)
 
     def test_one_side_dims_single_baseline(self, tmp_path, capsys):
+        """Baseline has no dims (single rank), target has TP shards: unshard target only."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
         target_full = full_tensor + torch.randn(4, 8) * 0.001
@@ -213,12 +215,10 @@ class TestEntrypointGroupingLogical:
         args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 1
-        assert comparisons[0].diff is not None
-        assert comparisons[0].diff.passed
+        _assert_single_comparison_passed(records)
 
     def test_ambiguous_baseline_no_dims(self, tmp_path, capsys):
+        """Multi-rank baseline without dims cannot be unsharded, so it is skipped."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
 
@@ -259,6 +259,7 @@ class TestEntrypointGroupingLogical:
         assert skips[0].reason == "baseline_load_failed"
 
     def test_summary_counts_unshard(self, tmp_path, capsys):
+        """Two TP-sharded tensors: summary counts total=2, passed=2, skipped=0."""
         torch.manual_seed(42)
         full_a = torch.randn(4, 8)
         full_b = torch.randn(4, 8)
@@ -294,6 +295,21 @@ class TestEntrypointGroupingLogical:
         assert summary.passed == 2
         assert summary.failed == 0
         assert summary.skipped == 0
+
+
+# --------------------------- Assertion helpers -------------------
+
+
+def _get_comparisons(records: list[AnyRecord]) -> list[ComparisonRecord]:
+    return [r for r in records if isinstance(r, ComparisonRecord)]
+
+
+def _assert_single_comparison_passed(records: list[AnyRecord]) -> ComparisonRecord:
+    comparisons = _get_comparisons(records)
+    assert len(comparisons) == 1
+    assert comparisons[0].diff is not None
+    assert comparisons[0].diff.passed
+    return comparisons[0]
 
 
 # --------------------------- Utils ------------------------------
