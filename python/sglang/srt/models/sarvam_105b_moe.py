@@ -1,4 +1,5 @@
 """Inference-only Sarvam MoE 105B model with MLA (Multi-head Latent Attention) for SGLang."""
+
 import logging
 from typing import Iterable, Tuple
 
@@ -71,7 +72,7 @@ class SarvamMLAForCausalLM(DeepseekV2ForCausalLM):
                 yield name, w
 
         super().load_weights(_center_bias(weights), is_nextn)
- 
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
