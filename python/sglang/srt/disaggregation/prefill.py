@@ -300,12 +300,12 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             if get_global_server_args().enable_kv_storage_optimization_mla:
-                size = get_attention_tp_size()
-                rank = get_attention_tp_rank()
+                tp_size = get_attention_tp_size()
+                tp_rank = get_attention_tp_rank()
                 page_size = self.token_to_kv_pool.page_size
                 total_page_num = (num_kv_indices + page_size - 1) // page_size
                 start_page, end_page = get_split_kv_page_range(
-                    size, rank, total_page_num
+                    tp_size, tp_rank, total_page_num
                 )
                 num_pages = end_page - start_page + 1
 

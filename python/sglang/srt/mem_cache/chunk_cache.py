@@ -59,13 +59,17 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
-    def process_split_kv_indices(self, req: Req, kv_indices):
+    def process_split_kv_indices(self, req: Req, ids_len):
         if (
             get_global_server_args().enable_kv_storage_optimization_mla
             and get_global_server_args().disaggregation_mode == "prefill"
         ):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.tp_seq_len
+            ]
+        else:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : ids_len
             ]
         return kv_indices
 
@@ -76,17 +80,11 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        kv_indices = self.process_split_kv_indices(req, kv_indices)
+        kv_indices = self.process_split_kv_indices(req, kv_committed_len)
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
-        ]
-        kv_indices = self.process_split_kv_indices(req, kv_indices)
+        kv_indices = self.process_split_kv_indices(req, len(req.fill_ids))
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 

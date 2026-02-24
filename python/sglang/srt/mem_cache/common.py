@@ -349,7 +349,7 @@ def alloc_req_slots(
 
 
 # For PD disaggregation prefill,aligned by page
-def alloc_tp_paged_token_slots_extend(
+def alloc_paged_token_slots_extend_for_mla_kvcache_split(
     batch: ScheduleBatch,
     tree_cache: BasePrefixCache,
     prefix_lens: torch.Tensor,
@@ -465,7 +465,7 @@ def alloc_for_extend(
         ]
 
         if get_global_server_args().enable_kv_storage_optimization_mla:
-            tp_out_loc, out_cache_loc = alloc_tp_paged_token_slots_extend(
+            tp_out_loc, out_cache_loc = alloc_paged_token_slots_extend_for_mla_kvcache_split(
                 batch=batch,
                 tree_cache=batch.tree_cache,
                 prefix_lens=prefix_lens_device,
