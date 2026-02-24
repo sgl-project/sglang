@@ -426,7 +426,7 @@ class TestEntrypointUnshard:
         records = _parse_jsonl(capsys.readouterr().out)
         skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 1
-        assert skips[0].reason == "ambiguous_baseline_no_dims"
+        assert skips[0].reason == "baseline_load_failed"
 
     def test_summary_counts_unshard(self, tmp_path, capsys):
         torch.manual_seed(42)
