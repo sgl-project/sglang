@@ -46,10 +46,8 @@ def process(
         name=name,
         diff_threshold=args.diff_threshold,
     )
-    if info.diff is not None and info.diff.passed:
-        counts["passed"] += 1
-    else:
-        counts["failed"] += 1
+    k = "passed" if info.diff is not None and info.diff.passed else "failed"
+    counts[k] += 1
 
     print_record(
         ComparisonRecord(**info.model_dump()),
