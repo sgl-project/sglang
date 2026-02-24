@@ -4,7 +4,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
-from ._utils import _apply_rotary_emb
+from .utils import _apply_rotary_emb
 
 
 @CustomOp.register("rotary_embedding")
