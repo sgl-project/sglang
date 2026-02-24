@@ -2042,6 +2042,24 @@
             "expected_median_denoise_ms": 268.51,
             "estimated_full_test_time_s": 122.7
         },
+        "qwen_image_t2i_cache_dit_config_diffusers_1gpu": {
+            "stages_ms": {
+                "DiffusersExecutionStage": 5070.86
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 5079.29,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
+        "qwen_image_t2i_cache_dit_config_diffusers_2gpu": {
+            "stages_ms": {
+                "DiffusersExecutionStage": 6981.05
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 6983.64,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "hunyuan3d_shape_gen": {
             "stages_ms": {
                 "Hunyuan3DShapeBeforeDenoisingStage": 544.59,
