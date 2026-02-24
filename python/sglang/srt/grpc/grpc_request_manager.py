@@ -659,12 +659,14 @@ class GrpcRequestManager:
             }
 
             # Accumulate logprobs (following tokenizer_manager pattern)
-            if state.obj.return_logprob:
+            # Use getattr for safe access - not all request types have return_logprob
+            # (e.g., TokenizedEmbeddingReqInput)
+            if getattr(state.obj, "return_logprob", False):
                 self._convert_logprob_style(state, batch_out, i)
 
             # Send input logprobs based if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and state.obj.logprob_start_len >= 0
                 and state.input_token_logprobs_val
             ):
@@ -688,7 +690,7 @@ class GrpcRequestManager:
 
             # Send output logprobs if available
             if (
-                state.obj.return_logprob
+                getattr(state.obj, "return_logprob", False)
                 and batch_out.output_token_logprobs_val
                 and i < len(batch_out.output_token_logprobs_val)
             ):

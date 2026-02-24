@@ -10,7 +10,7 @@ pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t
 
 To add a new testcase:
 1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
-2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/test_server_a.py -k my_new_test_case_id`
+2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
 
@@ -226,6 +226,7 @@ class DiffusionTestCase:
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
+    run_perf_check: bool = True
 
 
 def sample_step_indices(
@@ -293,6 +294,8 @@ class PerformanceSummary:
             all_denoise_steps=per_step,
         )
 
+
+SMALL_T2I_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 T2I_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
@@ -367,6 +370,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    # TODO: modeling of flux different from official flux, so weights can't be loaded
+    # consider opting for a different quantized hf-repo
+    # DiffusionTestCase(
+    #     "flux_image_t2i_override_transformer_weights_path_fp8",
+    #     DiffusionServerArgs(
+    #         model_path="black-forest-labs/FLUX.1-dev", modality="image",
+    #         extras=["--transformer-weights-path black-forest-labs/FLUX.1-dev-FP8"]
+    #     ),
+    #     T2I_sampling_params,
+    # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
         DiffusionServerArgs(
@@ -386,9 +399,9 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead
     DiffusionTestCase(
-        "flux_2_image_t2i_layerwise_offload",
+        "layerwise_offload",
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
+            model_path=SMALL_T2I_MODEL,
             modality="image",
             dit_layerwise_offload=True,
             dit_offload_prefetch_size=2,
@@ -398,6 +411,15 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(model_path="Tongyi-MAI/Z-Image-Turbo", modality="image"),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_fp8",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
+        ),
         T2I_sampling_params,
     ),
     # Multi-LoRA test case for Z-Image-Turbo
@@ -506,6 +528,16 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="black-forest-labs/FLUX.2-dev", modality="image"
         ),
         TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_t2i_customized_vae_path",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
     ),
     DiffusionTestCase(
         "fast_hunyuan_video",
