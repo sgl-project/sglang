@@ -945,7 +945,6 @@ def get_generate_fn(
         extra_body = dict(sampling_params.extras)
         if sampling_params.diffusers_kwargs:
             extra_body["diffusers_kwargs"] = sampling_params.diffusers_kwargs
-
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
