@@ -904,8 +904,11 @@ class MooncakeKVManager(CommonKVManager):
                                         endpoint, dst_port, room, status, local_rank
                                     )
                     else:
-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
-                        # Dummy request does not need to sync status to decode endpoint
+                        # Dummy request means the decode instance is not used,
+                        # so its status can be marked as success directly.
+                        # Keep the membership guard to avoid resurrecting a
+                        # request that has already been cleared concurrently.
+                        # Dummy request does not need to sync status to decode endpoint.
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
@@ -1070,7 +1073,9 @@ class MooncakeKVManager(CommonKVManager):
         if bootstrap_room not in self.transfer_infos:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
-            # add further chunks into the transfer queue.
+            # add further chunks into the transfer queue. We still guard on
+            # request_status membership to avoid recreating terminal status for
+            # requests that have already been cleared on this rank.
             if is_last and bootstrap_room in self.request_status:
                 self.update_status(bootstrap_room, KVPoll.Success)
             return

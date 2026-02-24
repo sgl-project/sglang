@@ -56,8 +56,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -66,8 +64,8 @@ logger = logging.getLogger(__name__)
 
 def poll_and_all_reduce_attn_groups(
     pollers,
-    attn_cp_cpu_group: ProcessGroup,
-    attn_tp_cpu_group: Optional[ProcessGroup] = None,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: Optional[dist.ProcessGroup] = None,
 ):
     # First sync across CP ranks (same attn_tp shard).
     polls = poll_and_all_reduce(pollers, attn_cp_cpu_group)
@@ -123,7 +121,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         gpu_id: int,
         bootstrap_port: int,
-        gloo_group: ProcessGroup,
+        gloo_group: dist.ProcessGroup,
         max_total_num_tokens: int,
         decode_tp_size: int,
         decode_dp_size: int,
