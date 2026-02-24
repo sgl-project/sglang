@@ -14,13 +14,13 @@ register_npu_ci(
 )
 
 
-
 class TestMiniMaxM2(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the cyankiwi/MiniMax-M2-BF16 model on the GSM8K dataset is no less than 0.9.
 
     [Test Category] Model
     [Test Target] cyankiwi/MiniMax-M2-BF16
     """
+
     model = MINIMAX_M2_WEIGHTS_PATH
     accuracy = 0.9
     other_args = [
@@ -42,5 +42,5 @@ class TestMiniMaxM2(GSM8KAscendMixin, CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"]="1"
+    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"] = "1"
     unittest.main()
