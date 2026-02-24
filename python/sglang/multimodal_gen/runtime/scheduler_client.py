@@ -1,4 +1,5 @@
 import pickle
+import time
 from typing import Any, Generator
 
 import zmq
@@ -97,25 +98,39 @@ class SchedulerClient:
             PartialOutputBatch,
         )
 
+        # 100-minute deadline matches the scheduler socket timeout
+        _STREAMING_TIMEOUT_S = 6_000
+
         req = batch[0] if isinstance(batch, list) else batch
         sub_socket = self.context.socket(zmq.SUB)
         sub_socket.setsockopt(zmq.LINGER, 0)
         sub_socket.setsockopt_string(zmq.SUBSCRIBE, req.request_id)
-        sub_socket.setsockopt(zmq.RCVTIMEO, 6_000_000)  # 100 minutes
         sub_socket.connect(self.server_args.streaming_endpoint)
+
+        poller = zmq.Poller()
+        poller.register(sub_socket, zmq.POLLIN)
 
         try:
             self.scheduler_socket.send_pyobj(batch)
 
+            deadline = time.monotonic() + _STREAMING_TIMEOUT_S
             while True:
-                try:
-                    topic, payload = sub_socket.recv_multipart(zmq.NOBLOCK)
-                    partial: PartialOutputBatch = pickle.loads(payload)
-                    yield partial
-                    if partial.is_final:
-                        break
-                except zmq.Again:
-                    pass  # No streaming message yet; keep polling
+                remaining_ms = (deadline - time.monotonic()) * 1000
+                if remaining_ms <= 0:
+                    raise TimeoutError(
+                        f"Streaming timed out after {_STREAMING_TIMEOUT_S}s "
+                        "waiting for is_final frame."
+                    )
+                # Block for up to 100 ms so the thread yields the GIL and
+                # other threads / signals can run between frames.
+                ready = dict(poller.poll(timeout=min(remaining_ms, 100)))
+                if sub_socket not in ready:
+                    continue
+                _, payload = sub_socket.recv_multipart()
+                partial: PartialOutputBatch = pickle.loads(payload)
+                yield partial
+                if partial.is_final:
+                    break
 
             return self.scheduler_socket.recv_pyobj()
         finally:

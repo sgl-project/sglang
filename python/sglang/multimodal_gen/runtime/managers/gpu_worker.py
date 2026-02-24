@@ -4,6 +4,8 @@
 import gc
 import multiprocessing as mp
 import os
+import queue
+import threading
 import time
 from typing import List, Union
 
@@ -240,34 +242,55 @@ class GPUWorker:
                     else None
                 )
 
-                def step_emit_fn(step_index, total_steps, latents, timestep, is_final):
-                    frames = None
-                    if decoding_stage is not None:
-                        # Unpack latents from the denoising-loop format
-                        # (e.g. packed [B, seq, hidden] for Flux) back to the
-                        # standard [B, C, ...] layout the VAE expects.
-                        decode_latents = (
-                            server_args.pipeline_config.post_denoising_loop(
-                                latents, req
+                _emit_queue = queue.SimpleQueue()
+
+                def _emit_worker():
+                    while True:
+                        item = _emit_queue.get()
+                        if item is None:  # sentinel → stop
+                            break
+                        step_index, total_steps, latents_gpu, timestep, is_final = item
+                        frames = None
+                        if decoding_stage is not None:
+                            # Unpack latents from the denoising-loop format
+                            # (e.g. packed [B, seq, hidden] for Flux) back to the
+                            # standard [B, C, ...] layout the VAE expects.
+                            decode_latents = (
+                                server_args.pipeline_config.post_denoising_loop(
+                                    latents_gpu, req
+                                )
                             )
+                            frames = decoding_stage.decode(
+                                decode_latents, server_args
+                            )  # returns CPU float32
+                        partial = PartialOutputBatch(
+                            request_id=req.request_id,
+                            step_index=step_index,
+                            total_steps=total_steps,
+                            timestep=timestep,
+                            latents=latents_gpu.cpu(),  # blocking copy, but off the hot path
+                            frames=frames,
+                            is_final=is_final,
                         )
-                        frames = decoding_stage.decode(
-                            decode_latents, server_args
-                        )  # returns CPU float32
-                    partial = PartialOutputBatch(
-                        request_id=req.request_id,
-                        step_index=step_index,
-                        total_steps=total_steps,
-                        timestep=timestep,
-                        latents=latents.cpu(),  # move to CPU here
-                        frames=frames,
-                        is_final=is_final,
+                        push_fn(partial)
+
+                _emit_thread = threading.Thread(target=_emit_worker, daemon=True)
+                _emit_thread.start()
+
+                def step_emit_fn(step_index, total_steps, latents, timestep, is_final):
+                    # clone() is a fast GPU→GPU copy that gives the worker its own
+                    # buffer, guarding against any in-place scheduler ops on the tensor.
+                    _emit_queue.put(
+                        (step_index, total_steps, latents.clone(), timestep, is_final)
                     )
-                    push_fn(partial)
 
                 req.step_emit_fn = step_emit_fn
 
             result = self.pipeline.forward(req, self.server_args)
+
+            if req.stream_steps and self.streaming_push_fn is not None:
+                _emit_queue.put(None)  # signal worker to stop
+                _emit_thread.join()  # wait for is_final to be published
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
