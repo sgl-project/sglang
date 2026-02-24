@@ -807,9 +807,16 @@ class MoriKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         transfer_infos = self.transfer_infos.get(bootstrap_room)
         if not transfer_infos:
-            raise RuntimeError(
-                f"No transfer info found for bootstrap_room={bootstrap_room}"
-            )
+            if not self.skip_register_prefill:
+                raise RuntimeError(
+                    f"No transfer info found for bootstrap_room={bootstrap_room}"
+                )
+            # Non-authoritative CP ranks can have no transfer_infos for this room.
+            # If this is the last chunk, finish the local sender as a no-op.
+            if is_last and bootstrap_room in self.request_status:
+                self.update_status(bootstrap_room, KVPoll.Success)
+                return [], []
+            return [], None
         result_statuses = []
         target_infos_snapshot: Optional[List[TransferInfo]] = None
         with self.transfer_lock:

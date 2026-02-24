@@ -750,6 +750,17 @@ class NixlKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
+        if bootstrap_room not in self.transfer_infos:
+            if not self.skip_register_prefill:
+                raise RuntimeError(
+                    f"No transfer info found for bootstrap_room={bootstrap_room}"
+                )
+            # Non-authoritative CP ranks can have no transfer_infos for this room.
+            # If this is the last chunk, finish the local sender as a no-op.
+            if is_last and bootstrap_room in self.request_status:
+                self.update_status(bootstrap_room, KVPoll.Success)
+            return []
+
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
         for req in reqs_to_be_processed:
