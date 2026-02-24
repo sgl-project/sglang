@@ -90,9 +90,6 @@ def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
 def _extract_tensors(
     loaded: list[ValueWithMeta],
 ) -> Optional[list[torch.Tensor]]:
-    if not loaded:
-        return None
-
     return [value for item in loaded if isinstance(value := item.value, torch.Tensor)]
 
 
