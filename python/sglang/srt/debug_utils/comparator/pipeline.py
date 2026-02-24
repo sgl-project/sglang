@@ -46,7 +46,9 @@ def process_tensor_group(
     if b_tensor is None or t_tensor is None:
         reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
         counts["skipped"] += 1
-        print_record(SkipRecord(name=name, reason=reason), output_format=args.output_format)
+        print_record(
+            SkipRecord(name=name, reason=reason), output_format=args.output_format
+        )
         return
 
     info = compare_tensors(
@@ -124,9 +126,9 @@ def _execute_plans(
         return tensors[0]
 
     unshard_plans = [p for p in plans if isinstance(p, UnshardPlan)]
-    assert len(unshard_plans) <= 1, (
-        f"Expected at most 1 unshard plan, got {len(unshard_plans)}"
-    )
+    assert (
+        len(unshard_plans) <= 1
+    ), f"Expected at most 1 unshard plan, got {len(unshard_plans)}"
 
     tensors_by_world_rank = dict(enumerate(tensors))
     return execute_unshard_plan(unshard_plans[0], tensors_by_world_rank)

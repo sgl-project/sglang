@@ -101,9 +101,7 @@ class TestEntrypointPerRank:
 
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(
-            baseline_path, target_path, filter="tensor_a", grouping="raw"
-        )
+        args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
         capsys.readouterr()
 
         run(args)

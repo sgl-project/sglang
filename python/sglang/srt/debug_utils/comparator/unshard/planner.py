@@ -71,9 +71,7 @@ def compute_unshard_plan(
     return UnshardPlan(
         axis=spec.parallel,
         params=_resolve_unshard_params(spec=spec, dim_index=dim_idx),
-        world_ranks_by_axis_rank=[
-            rank_to_world[i] for i in range(expected_size)
-        ],
+        world_ranks_by_axis_rank=[rank_to_world[i] for i in range(expected_size)],
     )
 
 

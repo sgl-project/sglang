@@ -63,8 +63,14 @@ class TestComputeUnshardPlan:
     def test_multi_axis_raises(self) -> None:
         dim_specs = parse_dims("h(tp) s(cp)")
         parallel_infos = [
-            {"tp": AxisInfo(axis_rank=0, axis_size=2), "cp": AxisInfo(axis_rank=0, axis_size=2)},
-            {"tp": AxisInfo(axis_rank=1, axis_size=2), "cp": AxisInfo(axis_rank=1, axis_size=2)},
+            {
+                "tp": AxisInfo(axis_rank=0, axis_size=2),
+                "cp": AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                "tp": AxisInfo(axis_rank=1, axis_size=2),
+                "cp": AxisInfo(axis_rank=1, axis_size=2),
+            },
         ]
         with pytest.raises(NotImplementedError, match="Multi-axis unshard"):
             compute_unshard_plan(dim_specs, parallel_infos)
