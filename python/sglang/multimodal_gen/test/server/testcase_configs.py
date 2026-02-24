@@ -247,6 +247,8 @@ class DiffusionSamplingParams:
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
 
+    diffusers_kwargs: dict | None = None
+
 
 @dataclass(frozen=True)
 class DiffusionTestCase:

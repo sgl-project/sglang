@@ -943,6 +943,8 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = dict(sampling_params.extras)
+        if sampling_params.diffusers_kwargs:
+            extra_body["diffusers_kwargs"] = sampling_params.diffusers_kwargs
 
         response = client.images.with_raw_response.generate(
             model=model_path,
