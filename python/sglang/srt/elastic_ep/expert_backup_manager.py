@@ -1,7 +1,6 @@
 import logging
 import multiprocessing as mp
 import re
-import time
 
 import torch
 import zmq
@@ -46,14 +45,14 @@ class ExpertBackupManager:
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
         context = zmq.Context(2)
-        self.send_to_expert_backup_client = context.socket(zmq.PUB)
-        self.send_to_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}"
-        )
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
         self.recv_from_expert_backup_client.bind(
             f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2}"
+        )
+        self.send_to_expert_backup_client = context.socket(zmq.PUB)
+        self.send_to_expert_backup_client.bind(
+            f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}"
         )
         self.backup_weights_from_disk()
         self.start_transfer_server()
