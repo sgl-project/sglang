@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import NamedTuple
 
 from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering, ParallelAxis
 from sglang.srt.debug_utils.comparator.unshard.types import (
@@ -7,6 +8,11 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
     UnshardParams,
     UnshardPlan,
 )
+
+
+class _ShardedAxis(NamedTuple):
+    dim_index: int
+    spec: DimSpec
 
 
 def compute_unshard_plan(
@@ -26,15 +32,17 @@ def compute_unshard_plan(
     )
 
     plans: list[UnshardPlan] = []
-    for axis_name, (dim_idx, spec) in sharded_axes.items():
+    for axis_name, sharded_axis in sharded_axes.items():
         groups = _compute_groups(
             current_coords=current_coords,
             target_axis=axis_name,
         )
 
         plans.append(UnshardPlan(
-            axis=spec.parallel,
-            params=_resolve_unshard_params(spec=spec, dim_index=dim_idx),
+            axis=sharded_axis.spec.parallel,
+            params=_resolve_unshard_params(
+                spec=sharded_axis.spec, dim_index=sharded_axis.dim_index,
+            ),
             groups=groups,
         ))
 
@@ -49,19 +57,20 @@ def compute_unshard_plan(
 
 def _extract_sharded_axes(
     dim_specs: list[DimSpec],
-) -> dict[ParallelAxis, tuple[int, DimSpec]]:
-    result: dict[ParallelAxis, tuple[int, DimSpec]] = {}
-    for dim_idx, spec in enumerate(dim_specs):
-        if spec.parallel is not None:
-            result[spec.parallel] = (dim_idx, spec)
-    return result
+) -> dict[ParallelAxis, _ShardedAxis]:
+    return {
+        spec.parallel: _ShardedAxis(dim_index=dim_idx, spec=spec)
+        for dim_idx, spec in enumerate(dim_specs)
+        if spec.parallel is not None
+    }
 
 
 def _build_and_validate_coords(
     *,
-    sharded_axes: dict[ParallelAxis, tuple[int, DimSpec]],
+    sharded_axes: dict[ParallelAxis, _ShardedAxis],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> dict[int, dict[ParallelAxis, int]]:
+    """Validate parallel_infos and return {index: {axis: axis_rank}} for each input tensor."""
     coords_by_index: dict[int, dict[ParallelAxis, int]] = {}
     axis_sizes: dict[ParallelAxis, int] = {}
 
