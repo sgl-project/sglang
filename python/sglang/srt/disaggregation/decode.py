@@ -360,8 +360,8 @@ class DecodePreallocQueue:
             self._create_receiver_and_enqueue(req, prefill_dp_rank)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
-        if req.data_parallel_rank is not None:
-            return req.data_parallel_rank
+        if req.disagg_prefill_dp_rank is not None:
+            return req.disagg_prefill_dp_rank
 
         if _is_fake_transfer(req, self.scheduler.server_args):
             return 0

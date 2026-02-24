@@ -232,6 +232,9 @@ class Engine(EngineBase):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
@@ -242,14 +245,25 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        if data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if routed_dp_rank is None:
+                routed_dp_rank = data_parallel_rank
+
         if self.server_args.enable_dp_attention:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.dp_size:
+            if routed_dp_rank is None:
+                logger.debug("routed_dp_rank not provided, using default dispatch")
+            elif routed_dp_rank < 0:
+                raise ValueError("routed_dp_rank must be non-negative")
+            elif routed_dp_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
+                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
                 )
 
         obj = GenerateReqInput(
@@ -271,7 +285,8 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
+            routed_dp_rank=routed_dp_rank,
+            disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
@@ -324,6 +339,9 @@ class Engine(EngineBase):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
@@ -334,18 +352,28 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        if data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if routed_dp_rank is None:
+                routed_dp_rank = data_parallel_rank
 
         if self.server_args.enable_dp_attention:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.dp_size:
+            if routed_dp_rank is None:
+                logger.debug("routed_dp_rank not provided, using default dispatch")
+            elif routed_dp_rank < 0:
+                raise ValueError("routed_dp_rank must be non-negative")
+            elif routed_dp_rank >= self.server_args.dp_size:
                 raise ValueError(
-                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                    f"routed_dp_rank must be in range [0, {self.server_args.dp_size-1}]"
                 )
 
-        logger.debug(f"data_parallel_rank: {data_parallel_rank}")
+        logger.debug(f"routed_dp_rank: {routed_dp_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -365,7 +393,8 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
+            routed_dp_rank=routed_dp_rank,
+            disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,

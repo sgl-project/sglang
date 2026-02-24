@@ -236,7 +236,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
@@ -299,6 +303,18 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -672,9 +688,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            data_parallel_rank=(
-                self.data_parallel_rank if self.data_parallel_rank is not None else None
-            ),
+            routed_dp_rank=self.routed_dp_rank,
+            disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -744,8 +759,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -952,8 +969,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
