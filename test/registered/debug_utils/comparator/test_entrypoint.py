@@ -224,8 +224,9 @@ class TestEntrypointGroupingLogical:
         target_dir = tmp_path / "target"
 
         for rank, shard in [(0, full_tensor[:, :4]), (1, full_tensor[:, 4:])]:
-            _create_rank_dump(baseline_dir, rank=rank, name="hidden", tensor=shard)
-        baseline_path = baseline_dir / _FIXED_EXP_NAME
+            baseline_path = _create_rank_dump(
+                baseline_dir, rank=rank, name="hidden", tensor=shard
+            )
 
         target_path = _create_tp_sharded_dumps(
             target_dir,
@@ -253,7 +254,7 @@ class TestEntrypointGroupingLogical:
         target_dir = tmp_path / "target"
 
         for tensor_name, tensor in [("t_a", full_a), ("t_b", full_b)]:
-            _create_tp_sharded_dumps(
+            baseline_path = _create_tp_sharded_dumps(
                 baseline_dir,
                 full_tensor=tensor,
                 name=tensor_name,
@@ -262,7 +263,7 @@ class TestEntrypointGroupingLogical:
                 dims_str="b h(tp)",
             )
             target_tensor = tensor + torch.randn_like(tensor) * 0.0001
-            _create_tp_sharded_dumps(
+            target_path = _create_tp_sharded_dumps(
                 target_dir,
                 full_tensor=target_tensor,
                 name=tensor_name,
@@ -271,8 +272,6 @@ class TestEntrypointGroupingLogical:
                 dims_str="b h(tp)",
             )
 
-        baseline_path = baseline_dir / _FIXED_EXP_NAME
-        target_path = target_dir / _FIXED_EXP_NAME
         args = _make_args(baseline_path, target_path, diff_threshold=0.01)
 
         records = _run_and_parse(args, capsys)
