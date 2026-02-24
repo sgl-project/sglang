@@ -119,6 +119,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -564,8 +565,6 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -1530,8 +1529,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -1762,8 +1759,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         topk_indices,
         llama_4_scaling,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
