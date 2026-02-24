@@ -124,7 +124,7 @@ class TestEntrypointPerRank:
 
         output = capsys.readouterr().out
         assert "Skip:" in output
-        assert "no_baseline" in output
+        assert "baseline_load_failed" in output
 
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
@@ -176,7 +176,7 @@ class TestEntrypointJsonl:
         records = _parse_jsonl(capsys.readouterr().out)
         skips = [r for r in records if isinstance(r, SkipRecord)]
         assert len(skips) == 1
-        assert skips[0].reason == "no_baseline"
+        assert skips[0].reason == "baseline_load_failed"
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -252,7 +252,8 @@ def _create_tp_sharded_dumps(
 class TestEntrypointUnshard:
     """Integration tests for the unshard pipeline path."""
 
-    def test_smart_mode_skips_missing_dims(self, tmp_path, capsys):
+    def test_smart_mode_no_dims_single_rank(self, tmp_path, capsys):
+        """Single-rank dumps without dims: load_and_unshard returns raw tensor."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, output_format="json")
         capsys.readouterr()
@@ -260,13 +261,12 @@ class TestEntrypointUnshard:
         run(args)
 
         records = _parse_jsonl(capsys.readouterr().out)
-        skips = [r for r in records if isinstance(r, SkipRecord)]
-        assert len(skips) == 2
-        assert all(s.reason == "target_load_failed" for s in skips)
+        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
+        assert len(comparisons) == 2
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 2
-        assert summary.skipped == 2
+        assert summary.skipped == 0
 
     def test_tp_unshard_same_size(self, tmp_path, capsys):
         torch.manual_seed(42)

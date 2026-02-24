@@ -25,6 +25,8 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    df_baseline = read_meta(args.baseline_path)
+
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
         (pl.col("step") >= args.start_step) & (pl.col("step") <= args.end_step)
@@ -32,8 +34,6 @@ def run(args: argparse.Namespace) -> None:
     if args.filter:
         df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
     assert all(c in df_target.columns for c in ["rank", "step", "dump_index", "name"])
-
-    df_baseline = read_meta(args.baseline_path)
 
     print_record(
         ConfigRecord(
@@ -55,20 +55,20 @@ def run(args: argparse.Namespace) -> None:
 
     for tensor_key in unique_keys.iter_rows(named=True):
         conditions = {k: tensor_key[k] for k in key_cols}
-        target_rows = filter_rows(df_target, conditions=conditions)
         baseline_rows = filter_rows(df_baseline, conditions=conditions)
+        target_rows = filter_rows(df_target, conditions=conditions)
 
         if match_mode == "smart":
             process_smart(
-                target_rows=target_rows,
                 baseline_rows=baseline_rows,
+                target_rows=target_rows,
                 args=args,
                 counts=counts,
             )
         else:
             process_per_rank(
-                target_rows=target_rows,
                 baseline_rows=baseline_rows,
+                target_rows=target_rows,
                 args=args,
                 counts=counts,
             )

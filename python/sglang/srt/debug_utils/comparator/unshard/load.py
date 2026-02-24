@@ -13,19 +13,24 @@ from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 
 def load_and_unshard(
-    *,
     rows: list[dict],
     base_path: Path,
 ) -> Optional[torch.Tensor]:
     """Load all rank tensors for one side and unshard them.
 
     Reads dims from the first file's embedded metadata.
-    Returns None if dims is missing or any tensor fails to load.
+    When dims is missing: returns the raw tensor if there is exactly one row,
+    otherwise returns None (ambiguous — cannot determine how to unshard).
     """
+    if not rows:
+        return None
+
     loaded = [ValueWithMeta.load(base_path / row["filename"]) for row in rows]
 
     dims_str = loaded[0].meta.get("dims")
     if dims_str is None:
+        if len(loaded) == 1:
+            return _as_tensor(loaded[0].value)
         return None
 
     dim_specs = parse_dims(dims_str)
@@ -43,3 +48,9 @@ def load_and_unshard(
         tensors_by_index[i] = item.value
 
     return execute_unshard_plan(plan, tensors_by_index)
+
+
+def _as_tensor(value: object) -> Optional[torch.Tensor]:
+    if not isinstance(value, torch.Tensor):
+        return None
+    return value

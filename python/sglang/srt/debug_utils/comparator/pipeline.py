@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -11,92 +11,65 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
 from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
-from sglang.srt.debug_utils.comparator.utils import _single
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+_LoadFn = Callable[[list[dict], Path], Optional[torch.Tensor]]
 
 
 def process_smart(
     *,
-    target_rows: list[dict],
     baseline_rows: list[dict],
+    target_rows: list[dict],
     args: argparse.Namespace,
     counts: dict[str, int],
 ) -> None:
-    name = target_rows[0]["name"]
+    _process(
+        baseline_rows=baseline_rows,
+        target_rows=target_rows,
+        args=args,
+        counts=counts,
+        load_fn=load_and_unshard,
+    )
+
+
+def process_per_rank(
+    *,
+    baseline_rows: list[dict],
+    target_rows: list[dict],
+    args: argparse.Namespace,
+    counts: dict[str, int],
+) -> None:
+    _process(
+        baseline_rows=baseline_rows,
+        target_rows=target_rows,
+        args=args,
+        counts=counts,
+        load_fn=_load_single_tensor,
+    )
+
+
+def _process(
+    *,
+    baseline_rows: list[dict],
+    target_rows: list[dict],
+    args: argparse.Namespace,
+    counts: dict[str, int],
+    load_fn: _LoadFn,
+) -> None:
+    name = (baseline_rows or target_rows)[0]["name"]
     fmt = args.output_format
 
-    target_tensor = load_and_unshard(
-        rows=target_rows,
-        base_path=Path(args.target_path),
-    )
-    baseline_tensor = _load_baseline(
-        rows=baseline_rows,
-        base_path=Path(args.baseline_path),
-    )
+    baseline_tensor = load_fn(baseline_rows, Path(args.baseline_path))
+    target_tensor = load_fn(target_rows, Path(args.target_path))
 
-    if target_tensor is None or baseline_tensor is None:
-        reason = "target_load_failed" if target_tensor is None else "baseline_load_failed"
+    if baseline_tensor is None or target_tensor is None:
+        reason = "baseline_load_failed" if baseline_tensor is None else "target_load_failed"
         _skip(name, reason, counts, fmt)
         return
 
     _compare_and_record(
         x_baseline=baseline_tensor,
         x_target=target_tensor,
-        name=name,
-        args=args,
-        counts=counts,
-    )
-
-
-def _load_baseline(
-    *,
-    rows: list[dict],
-    base_path: Path,
-) -> Optional[torch.Tensor]:
-    if not rows:
-        return None
-
-    result = load_and_unshard(rows=rows, base_path=base_path)
-    if result is not None:
-        return result
-
-    if len(rows) == 1:
-        return _load_tensor(base_path / rows[0]["filename"])
-
-    return None
-
-
-def process_per_rank(
-    *,
-    target_rows: list[dict],
-    baseline_rows: list[dict],
-    args: argparse.Namespace,
-    counts: dict[str, int],
-) -> None:
-    row = _single(target_rows)
-    name = row["name"]
-
-    if not baseline_rows:
-        _skip(name, "no_baseline", counts, args.output_format)
-        return
-
-    if len(baseline_rows) > 1:
-        _skip(name, "ambiguous_baseline", counts, args.output_format)
-        return
-
-    path_target = Path(args.target_path) / row["filename"]
-    path_baseline = Path(args.baseline_path) / baseline_rows[0]["filename"]
-
-    x_baseline = _load_tensor(path_baseline)
-    x_target = _load_tensor(path_target)
-
-    if x_baseline is None or x_target is None:
-        _skip(name, "load_failed", counts, args.output_format)
-        return
-
-    _compare_and_record(
-        x_baseline=x_baseline,
-        x_target=x_target,
         name=name,
         args=args,
         counts=counts,
@@ -129,15 +102,14 @@ def _compare_and_record(
     )
 
 
-def _load_tensor(path: Path) -> Optional[torch.Tensor]:
-    loaded = ValueWithMeta.load(path)
-    return _as_tensor(loaded.value)
-
-
-def _as_tensor(value: object) -> Optional[torch.Tensor]:
-    if not isinstance(value, torch.Tensor):
+def _load_single_tensor(rows: list[dict], base_path: Path) -> Optional[torch.Tensor]:
+    if len(rows) != 1:
         return None
-    return value
+
+    loaded = ValueWithMeta.load(base_path / rows[0]["filename"])
+    if not isinstance(loaded.value, torch.Tensor):
+        return None
+    return loaded.value
 
 
 def _skip(

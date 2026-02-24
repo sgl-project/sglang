@@ -1,10 +1,8 @@
 import functools
-from typing import Optional, Sequence, Tuple, TypeVar
+from typing import Optional, Tuple
 
 import torch
 from pydantic import BaseModel, ConfigDict
-
-_T = TypeVar("_T")
 
 
 class _StrictBase(BaseModel):
@@ -39,11 +37,6 @@ def try_unify_shape(x: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
         return functools.reduce(lambda a, _: a.squeeze(0), range(num_dim_to_remove), x)
 
     return x
-
-
-def _single(items: Sequence[_T]) -> _T:
-    assert len(items) == 1, f"Expected exactly 1 element, got {len(items)}"
-    return items[0]
 
 
 # Copied from DeepGEMM
