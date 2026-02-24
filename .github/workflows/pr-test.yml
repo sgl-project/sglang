@@ -52,20 +52,24 @@ on:
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{branch}-{pr_sha}-{stage}
+  # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
+  # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
+  #   (without it, both resolve the branch segment to 'main' and block each other)
   # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
   # - pr_head_sha isolates /rerun-stage from main branch runs
   # - target_stage allows parallel stage dispatches to run independently
-  # This ensures pull_request and workflow_dispatch on same branch cancel each other
-  group: pr-test-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
 
 permissions:
   actions: write
   contents: read
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -198,6 +202,8 @@ jobs:
 
       - name: Set max-parallel based on run type
         id: set-parallel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Scheduled runs and high-priority PRs get full parallelism
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -206,6 +212,27 @@ jobs:
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             echo "max_parallel=14" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 14"
+          elif [[ -n "${{ inputs.target_stage }}" ]]; then
+            # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
+            # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
+            LABELS=""
+            PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
+            if [[ -n "$PR_HEAD_SHA" ]]; then
+              LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
+                --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            if [[ -z "$LABELS" ]]; then
+              LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            echo "PR labels: ${LABELS:-"(none)"}"
+            if echo "$LABELS" | grep -Fxq "high priority"; then
+              echo "max_parallel=14" >> $GITHUB_OUTPUT
+              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
+            else
+              echo "max_parallel=3" >> $GITHUB_OUTPUT
+              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+            fi
           else
             echo "max_parallel=3" >> $GITHUB_OUTPUT
             echo "Using default max_parallel of 3"
@@ -848,6 +875,9 @@ jobs:
           # temporarily put backend-independent cpu tests here
           python3 run_suite.py --hw cpu --suite default $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   stage-a-cpu-only:
     needs: [check-changes, call-gate]
     if: |
@@ -950,6 +980,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-small-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
+
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-large-1-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1000,6 +1035,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-1-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-large-2-gpu:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1052,6 +1092,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-b-test-large-2-gpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -1106,6 +1151,9 @@ jobs:
         run: |
           IS_BLACKWELL=1 python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
@@ -1158,6 +1206,10 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -1212,6 +1264,11 @@ jobs:
             --total-partitions 2 \
             $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1260,6 +1317,11 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1316,6 +1378,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1366,6 +1433,11 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-deepep-4-gpu:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1411,6 +1483,9 @@ jobs:
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
     if: |
@@ -1455,6 +1530,9 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1506,6 +1584,11 @@ jobs:
           fi
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
   stage-c-test-4-gpu-gb200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
     if: |
@@ -1552,6 +1635,9 @@ jobs:
             CONTINUE_ON_ERROR_FLAG="--continue-on-error"
           fi
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
 
   pr-test-finish:
     needs:

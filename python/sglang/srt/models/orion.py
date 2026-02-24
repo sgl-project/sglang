@@ -7,6 +7,7 @@
 # LICENSE: https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/main/LICENSE
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/orion.py
 """Inference-only Orion-14B model compatible with HuggingFace weights."""
+
 from collections.abc import Iterable
 from typing import Any, Optional, Tuple
 

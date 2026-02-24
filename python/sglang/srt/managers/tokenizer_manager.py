@@ -511,8 +511,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            if self.server_args.enable_lora and obj.lora_path:
-                await self._resolve_lora_path(obj)
+            await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -695,9 +694,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            input_ids, token_type_ids = await self._tokenize_texts(
-                input_text, is_cross_encoder_request
-            )
+            # For audio-only requests (e.g., Whisper), text may be empty.
+            # The multimodal processor will provide input_ids later.
+            if not input_text and self.mm_processor and obj.contains_mm_input():
+                # Use empty placeholder - multimodal processor will override
+                input_ids = []
+            else:
+                input_ids, token_type_ids = await self._tokenize_texts(
+                    input_text, is_cross_encoder_request
+                )
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -958,6 +963,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
@@ -1450,20 +1456,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         self.event_loop = loop
 
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
-            )
-        else:
-            # We cannot add signal handler when the tokenizer manager is not in
-            # the main thread due to the CPython limitation.
-            logger.warning(
-                "Signal handler is not added because the tokenizer manager is "
-                "not in the main thread. This disables graceful shutdown of the "
-                "tokenizer manager when SIGTERM is received."
             )
 
         self.asyncio_tasks.add(
@@ -1862,6 +1862,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
+            if (
+                recv_obj.spec_acceptance_histogram
+                and len(recv_obj.spec_acceptance_histogram) > i
+                and recv_obj.spec_acceptance_histogram[i]
+            ):
+                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
+                    i
+                ]
+
     def _calculate_timing_metrics(
         self,
         meta_info: Dict[str, Any],
@@ -2153,6 +2163,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
+        state.finished_time = time.time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -2161,7 +2172,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
-        meta_info = {"id": recv_obj.rid, "finish_reason": finish_reason}
+        meta_info = {
+            "id": recv_obj.rid,
+            "finish_reason": finish_reason,
+            "weight_version": self.server_args.weight_version,
+            "e2e_latency": state.finished_time - state.created_time,
+        }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
@@ -2201,6 +2217,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    async def _validate_and_resolve_lora(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        if not obj.lora_path:
+            return
+
+        if not self.server_args.enable_lora:
+            first_adapter = (
+                obj.lora_path
+                if isinstance(obj.lora_path, str)
+                else next((a for a in obj.lora_path if a), None)
+            )
+
+            raise ValueError(
+                f"LoRA adapter '{first_adapter}' was requested, but LoRA is not enabled. "
+                "Please launch the server with --enable-lora flag and preload adapters "
+                "using --lora-paths or /load_lora_adapter endpoint."
+            )
+
+        await self._resolve_lora_path(obj)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):

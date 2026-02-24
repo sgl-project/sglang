@@ -415,7 +415,7 @@ class TestGLM41VPPAccuracy(unittest.TestCase):
             eval_name="mmmu",
             num_examples=None,
             num_threads=32,
-            response_answer_regex="<\|begin_of_box\|>(.*)<\|end_of_box\|>",
+            response_answer_regex=r"<\|begin_of_box\|>(.*)<\|end_of_box\|>",
         )
 
         metrics = run_eval(args)
