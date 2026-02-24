@@ -32,6 +32,7 @@ def compute_unshard_plan(
 
     _validate(sharded_axes=set(sharded), parallel_infos=parallel_infos)
 
+    # current_coords[tensor_index][axis] = axis_rank
     current_coords: list[dict[ParallelAxis, int]] = [
         {axis: info[axis].axis_rank for axis in sharded}
         for info in parallel_infos
