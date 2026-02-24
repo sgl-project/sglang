@@ -89,7 +89,11 @@ def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
 
     dim_specs = parse_dims(dims_str)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
-    return compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
+    plan = compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
+
+    if plan is None:
+        return []
+    return [plan]
 
 
 def _extract_tensors(
@@ -117,5 +121,9 @@ def _execute_plans(
         return tensors[0]
 
     unshard_plans = [p for p in plans if isinstance(p, UnshardPlan)]
+    assert len(unshard_plans) <= 1, (
+        f"Expected at most 1 unshard plan, got {len(unshard_plans)}"
+    )
+
     tensors_by_world_rank = dict(enumerate(tensors))
-    return execute_unshard_plan(unshard_plans, tensors_by_world_rank)
+    return execute_unshard_plan(unshard_plans[0], tensors_by_world_rank)

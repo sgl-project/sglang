@@ -19,10 +19,11 @@ class TestExecuteUnshardPlan:
 
         dim_specs = parse_dims("b h(tp) d")
         parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plan = compute_unshard_plan(dim_specs, parallel_infos)
+        assert plan is not None
         tensors_by_rank = {i: shards[i] for i in range(4)}
 
-        result = execute_unshard_plan(plans, tensors_by_rank)
+        result = execute_unshard_plan(plan, tensors_by_rank)
         assert torch.allclose(result, full_tensor)
 
     def test_scrambled_world_ranks_correct_result(self) -> None:
@@ -36,7 +37,8 @@ class TestExecuteUnshardPlan:
             {"tp": AxisInfo(axis_rank=1, axis_size=4)},
         ]
         dim_specs = parse_dims("h(tp) d")
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plan = compute_unshard_plan(dim_specs, parallel_infos)
+        assert plan is not None
 
         tensors_by_rank = {
             0: shards[2],
@@ -45,22 +47,8 @@ class TestExecuteUnshardPlan:
             3: shards[1],
         }
 
-        result = execute_unshard_plan(plans, tensors_by_rank)
+        result = execute_unshard_plan(plan, tensors_by_rank)
         assert torch.allclose(result, full_tensor)
-
-    def test_no_sharded_dims_single_tensor(self) -> None:
-        tensor = torch.randn(4, 4)
-        dim_specs = parse_dims("b d")
-        parallel_infos = [{}]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
-        assert len(plans) == 0
-
-        result = execute_unshard_plan(plans, {0: tensor})
-        assert torch.allclose(result, tensor)
-
-    def test_no_plans_multiple_tensors_raises(self) -> None:
-        with pytest.raises(ValueError, match="No unshard plans"):
-            execute_unshard_plan([], {0: torch.randn(2), 1: torch.randn(2)})
 
 
 if __name__ == "__main__":

@@ -14,12 +14,12 @@ class TestComputeUnshardPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
         parallel_infos = [{"tp": AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plan = compute_unshard_plan(dim_specs, parallel_infos)
 
-        assert len(plans) == 1
-        assert plans[0].axis == ParallelAxis.TP
-        assert plans[0].params.dim == 2
-        assert plans[0].world_ranks_by_axis_rank == [0, 1, 2, 3]
+        assert plan is not None
+        assert plan.axis == ParallelAxis.TP
+        assert plan.params.dim == 2
+        assert plan.world_ranks_by_axis_rank == [0, 1, 2, 3]
 
     def test_inconsistent_axis_size_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
@@ -50,8 +50,24 @@ class TestComputeUnshardPlan:
             {"tp": AxisInfo(axis_rank=3, axis_size=4)},
             {"tp": AxisInfo(axis_rank=1, axis_size=4)},
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
-        assert plans[0].world_ranks_by_axis_rank == [1, 3, 0, 2]
+        plan = compute_unshard_plan(dim_specs, parallel_infos)
+        assert plan is not None
+        assert plan.world_ranks_by_axis_rank == [1, 3, 0, 2]
+
+    def test_no_sharded_axes_returns_none(self) -> None:
+        dim_specs = parse_dims("b s d")
+        parallel_infos = [{}]
+        plan = compute_unshard_plan(dim_specs, parallel_infos)
+        assert plan is None
+
+    def test_multi_axis_raises(self) -> None:
+        dim_specs = parse_dims("h(tp) s(cp)")
+        parallel_infos = [
+            {"tp": AxisInfo(axis_rank=0, axis_size=2), "cp": AxisInfo(axis_rank=0, axis_size=2)},
+            {"tp": AxisInfo(axis_rank=1, axis_size=2), "cp": AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        with pytest.raises(NotImplementedError, match="Multi-axis unshard"):
+            compute_unshard_plan(dim_specs, parallel_infos)
 
 
 if __name__ == "__main__":
