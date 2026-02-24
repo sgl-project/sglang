@@ -114,7 +114,7 @@ def _group_and_project(
 
     groups: list[list[int]] = []
     projected: _CoordsList = []
-    for key in sorted(buckets, key=lambda k: sorted(k)):
+    for key in sorted(buckets, key=lambda k: sorted((a.value, v) for a, v in k)):
         entries = sorted(buckets[key])
         groups.append([idx for _, idx in entries])
         projected.append(dict(key))

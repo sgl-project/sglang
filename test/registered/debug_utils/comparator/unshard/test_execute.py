@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
-from sglang.srt.debug_utils.comparator.unshard.executor import execute_unshard_plan
+from sglang.srt.debug_utils.comparator.unshard.executor import (
+    _apply_unshard,
+    execute_unshard_plan,
+)
 from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
 from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -149,6 +152,103 @@ class TestExecuteUnshardPlan:
         dim_specs = parse_dims("b s(cp) h(tp)")
         plans = compute_unshard_plan(dim_specs, parallel_infos)
         assert len(plans) == 2
+
+        current = tensors
+        for plan in plans:
+            current = execute_unshard_plan(plan, current)
+
+        assert len(current) == 1
+        assert torch.allclose(current[0], full_tensor)
+
+
+    def test_unsupported_params_type_raises(self) -> None:
+        """_apply_unshard raises ValueError for unknown params type."""
+
+        class _FakeParams:
+            pass
+
+        with pytest.raises(ValueError, match="Unsupported unshard"):
+            _apply_unshard(_FakeParams(), [torch.randn(2, 2)])
+
+    def test_cp_tp_ep_three_axis_concat(self) -> None:
+        """CP=2 + TP=2 + EP=2: three-step unshard reconstructs original tensor."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16, 32)
+
+        ep_chunks = list(full_tensor.chunk(2, dim=1))
+        shard_map: dict[tuple[int, int, int], torch.Tensor] = {}
+        for ep_rank in range(2):
+            cp_chunks = list(ep_chunks[ep_rank].chunk(2, dim=2))
+            for cp_rank in range(2):
+                tp_chunks = list(cp_chunks[cp_rank].chunk(2, dim=3))
+                for tp_rank in range(2):
+                    shard_map[(ep_rank, cp_rank, tp_rank)] = tp_chunks[tp_rank]
+
+        tensors: list[torch.Tensor] = []
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for ep_rank in range(2):
+            for cp_rank in range(2):
+                for tp_rank in range(2):
+                    tensors.append(shard_map[(ep_rank, cp_rank, tp_rank)])
+                    parallel_infos.append(
+                        {
+                            ParallelAxis.EP: AxisInfo(axis_rank=ep_rank, axis_size=2),
+                            ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                            ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                        }
+                    )
+
+        dim_specs = parse_dims("b e(ep) s(cp) h(tp)")
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 3
+
+        current = tensors
+        for plan in plans:
+            current = execute_unshard_plan(plan, current)
+
+        assert len(current) == 1
+        assert torch.allclose(current[0], full_tensor)
+
+    def test_cp_tp_ep_scrambled_three_axis(self) -> None:
+        """Scrambled ranks for CP=2 + TP=2 + EP=2 still reconstruct correctly."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16, 32)
+
+        ep_chunks = list(full_tensor.chunk(2, dim=1))
+        shard_map: dict[tuple[int, int, int], torch.Tensor] = {}
+        for ep_rank in range(2):
+            cp_chunks = list(ep_chunks[ep_rank].chunk(2, dim=2))
+            for cp_rank in range(2):
+                tp_chunks = list(cp_chunks[cp_rank].chunk(2, dim=3))
+                for tp_rank in range(2):
+                    shard_map[(ep_rank, cp_rank, tp_rank)] = tp_chunks[tp_rank]
+
+        scrambled_assignment = [
+            (1, 0, 1),  # world_rank=0
+            (0, 1, 0),  # world_rank=1
+            (1, 1, 0),  # world_rank=2
+            (0, 0, 0),  # world_rank=3
+            (0, 1, 1),  # world_rank=4
+            (1, 0, 0),  # world_rank=5
+            (0, 0, 1),  # world_rank=6
+            (1, 1, 1),  # world_rank=7
+        ]
+
+        tensors: list[torch.Tensor] = []
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for ep_rank, cp_rank, tp_rank in scrambled_assignment:
+            tensors.append(shard_map[(ep_rank, cp_rank, tp_rank)])
+            parallel_infos.append(
+                {
+                    ParallelAxis.EP: AxisInfo(axis_rank=ep_rank, axis_size=2),
+                    ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                    ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                }
+            )
+
+        dim_specs = parse_dims("b e(ep) s(cp) h(tp)")
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 3
 
         current = tensors
         for plan in plans:

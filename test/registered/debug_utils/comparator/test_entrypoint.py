@@ -773,6 +773,42 @@ class TestEntrypointGroupingLogical:
         records = _run_and_parse(args, capsys)
         _assert_single_comparison_passed(records)
 
+    def test_ep_cp_tp_three_axis_unshard(self, tmp_path, capsys):
+        """EP=2 + CP=2 + TP=2: three-axis shards are unsharded before comparison."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16, 32)
+        full_target = full_baseline + torch.randn(4, 8, 16, 32) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_ep_cp_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                ep_size=2,
+                cp_size=2,
+                tp_size=2,
+                expert_dim=1,
+                seq_dim=2,
+                head_dim=3,
+                dims_str="b e(ep) s(cp) h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
 
 # --------------------------- Assertion helpers -------------------
 
@@ -930,6 +966,48 @@ def _create_cp_tp_sharded_dumps(
                 num_steps=num_steps,
             )
             rank += 1
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_ep_cp_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    ep_size: int,
+    cp_size: int,
+    tp_size: int,
+    expert_dim: int,
+    seq_dim: int,
+    head_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create EP+CP+TP three-axis sharded dump files from a full tensor."""
+    ep_chunks = list(full_tensor.chunk(ep_size, dim=expert_dim))
+    rank = 0
+    for ep_rank in range(ep_size):
+        cp_chunks = list(ep_chunks[ep_rank].chunk(cp_size, dim=seq_dim))
+        for cp_rank in range(cp_size):
+            tp_chunks = list(cp_chunks[cp_rank].chunk(tp_size, dim=head_dim))
+            for tp_rank in range(tp_size):
+                _create_rank_dump(
+                    directory,
+                    rank=rank,
+                    name=name,
+                    tensor=tp_chunks[tp_rank],
+                    dims=dims_str,
+                    parallel_info={
+                        "ep_rank": ep_rank,
+                        "ep_size": ep_size,
+                        "cp_rank": cp_rank,
+                        "cp_size": cp_size,
+                        "tp_rank": tp_rank,
+                        "tp_size": tp_size,
+                    },
+                    num_steps=num_steps,
+                )
+                rank += 1
     return directory / _FIXED_EXP_NAME
 
 
