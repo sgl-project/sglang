@@ -56,28 +56,6 @@ def _apply_unshard(
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
 
 
-def verify_replicated_groups(
-    *,
-    plan: UnshardPlan,
-    tensors: list[torch.Tensor],
-) -> list[ReplicatedMismatchWarning]:
-    if not isinstance(plan.params, PickParams):
-        return []
-
-    warnings: list[ReplicatedMismatchWarning] = []
-    for group_idx, group in enumerate(plan.groups):
-        group_tensors = [tensors[i] for i in group]
-        warnings.extend(
-            _verify_replicated_group(
-                group_tensors,
-                axis=plan.axis,
-                group_index=group_idx,
-            )
-        )
-
-    return warnings
-
-
 def _verify_replicated_group(
     ordered_tensors: list[torch.Tensor],
     *,

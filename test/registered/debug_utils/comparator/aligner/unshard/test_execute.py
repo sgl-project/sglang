@@ -5,8 +5,8 @@ import torch
 
 from sglang.srt.debug_utils.comparator.aligner.unshard.executor import (
     _apply_unshard,
+    _verify_replicated_group,
     execute_unshard_plan,
-    verify_replicated_groups,
 )
 from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
     compute_unshard_plan,
@@ -382,56 +382,44 @@ class TestPickOperation:
         assert torch.allclose(current[0], full_tensor)
 
 
-class TestVerifyReplicatedGroups:
+class TestVerifyReplicatedGroup:
     def test_warns_on_mismatch(self) -> None:
-        """verify_replicated_groups produces warning when replicas differ."""
-        dim_specs = parse_dims("h d")
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
-            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
-        ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
-        assert len(plans) == 1
-        assert isinstance(plans[0].params, PickParams)
-
+        """_verify_replicated_group produces warning when replicas differ."""
         tensor_a = torch.ones(4)
         tensor_b = torch.ones(4) + 0.1
 
-        warnings = verify_replicated_groups(plan=plans[0], tensors=[tensor_a, tensor_b])
+        warnings = _verify_replicated_group(
+            [tensor_a, tensor_b], axis=ParallelAxis.TP, group_index=0,
+        )
         assert len(warnings) == 1
         assert warnings[0].axis == "tp"
         assert warnings[0].group_index == 0
+        assert warnings[0].differing_index == 1
+        assert warnings[0].baseline_index == 0
         assert warnings[0].max_abs_diff == pytest.approx(0.1, abs=1e-5)
 
     def test_no_warn_when_identical(self) -> None:
-        """verify_replicated_groups produces no warning for identical replicas."""
-        dim_specs = parse_dims("h d")
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
-            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
-        ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
-        assert len(plans) == 1
-
+        """_verify_replicated_group produces no warning for identical replicas."""
         tensor = torch.randn(4, 8)
-        warnings = verify_replicated_groups(
-            plan=plans[0], tensors=[tensor, tensor.clone()]
+
+        warnings = _verify_replicated_group(
+            [tensor, tensor.clone()], axis=ParallelAxis.TP, group_index=0,
         )
         assert warnings == []
 
-    def test_no_warn_for_concat_plan(self) -> None:
-        """verify_replicated_groups returns empty for non-PickParams plans."""
-        dim_specs = parse_dims("h(tp)")
-        parallel_infos = [
-            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
-            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
-        ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
-        assert len(plans) == 1
+    def test_multiple_mismatches(self) -> None:
+        """_verify_replicated_group reports each differing replica."""
+        baseline = torch.zeros(4)
+        other_a = torch.ones(4)
+        other_b = torch.ones(4) * 2
 
-        tensors = [torch.randn(4), torch.randn(4)]
-        warnings = verify_replicated_groups(plan=plans[0], tensors=tensors)
-        assert warnings == []
+        warnings = _verify_replicated_group(
+            [baseline, other_a, other_b], axis=ParallelAxis.CP, group_index=1,
+        )
+        assert len(warnings) == 2
+        assert warnings[0].differing_index == 1
+        assert warnings[1].differing_index == 2
+        assert warnings[1].max_abs_diff == pytest.approx(2.0, abs=1e-5)
 
     def test_execute_returns_warnings(self) -> None:
         """execute_unshard_plan returns warnings for replicated mismatch."""
