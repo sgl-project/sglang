@@ -200,7 +200,7 @@ class LTX2PipelineConfig(PipelineConfig):
             steps = int(num_inference_steps)
             if steps <= 0:
                 raise ValueError(f"num_inference_steps must be positive, got {steps}")
-            return torch.linspace(1.0, 0.0, steps + 1)[:-1].tolist()
+            return [1.0 - i / steps for i in range(steps)]
         return sigmas
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:

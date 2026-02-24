@@ -306,6 +306,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)
 
+        # Cast to bf16 to match model weights dtype. coords_dtype controls
+        # intermediate coordinate precision (fp32 for audio) and differs.
         return cos_freqs.to(torch.bfloat16), sin_freqs.to(torch.bfloat16)
 
 

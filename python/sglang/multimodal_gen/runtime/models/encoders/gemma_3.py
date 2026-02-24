@@ -774,7 +774,6 @@ class Gemma3TextModel(nn.Module):
             position_ids = torch.arange(
                 0, hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
-        # position_ids = position_ids + 1
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
 

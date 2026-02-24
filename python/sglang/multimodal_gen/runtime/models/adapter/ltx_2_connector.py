@@ -34,7 +34,7 @@ def apply_split_rotary_emb(
         # The cos/sin batch dim may only be broadcastable, so take batch size from x
         b = x.shape[0]
         _, h, t, _ = cos.shape
-        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        x = x.reshape(b, t, h, -1).transpose(1, 2)
         needs_reshape = True
 
     # Split last dim (2*r) into (d=2, r)
@@ -63,7 +63,7 @@ def apply_split_rotary_emb(
     out = out.reshape(*out.shape[:-2], last)
 
     if needs_reshape:
-        out = out.swapaxes(1, 2).reshape(b, t, -1)
+        out = out.transpose(1, 2).reshape(b, t, -1)
 
     out = out.to(dtype=x_dtype)
     return out
