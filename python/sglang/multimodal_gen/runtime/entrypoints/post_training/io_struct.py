@@ -17,3 +17,4 @@ class GetWeightsChecksumReqInput:
     """Compute SHA-256 checksum of loaded module weights for verification."""
 
     module_names: list[str] | None = None
+

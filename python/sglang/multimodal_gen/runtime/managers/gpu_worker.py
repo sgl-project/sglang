@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.loader.disk_weight_utils import compute_disk_checksum
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -398,7 +399,40 @@ class GPUWorker:
         if success:
             self.server_args.model_path = model_path
             self.pipeline.model_path = model_path
+            self._verify_disk_server_parity(model_path, target_modules)
         return success, message
+
+    def _verify_disk_server_parity(
+        self,
+        model_path: str,
+        module_names: list[str] | None = None,
+    ) -> None:
+        """Log a warning if server-side and disk-side checksums diverge."""
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model,
+        )
+
+        all_modules = get_updatable_modules(self.pipeline)
+        names = module_names if module_names is not None else list(all_modules.keys())
+        local_path = maybe_download_model(model_path)
+
+        for name in names:
+            module = all_modules.get(name)
+            if module is None:
+                continue
+            weights_dir = os.path.join(local_path, name)
+            if not os.path.isdir(weights_dir):
+                continue
+            server_cs = compute_weights_checksum(
+                iter_materialized_weights(module)
+            )
+            disk_cs = compute_disk_checksum(module, weights_dir)
+            if server_cs != disk_cs:
+                logger.warning(
+                    "Disk-server checksum mismatch for module '%s' "
+                    "(server=%s, disk=%s)",
+                    name, server_cs, disk_cs,
+                )
 
     def get_weights_checksum(
         self, module_names: list[str] | None = None
@@ -420,6 +454,7 @@ class GPUWorker:
                 iter_materialized_weights(module)
             )
         return checksums
+
 
 
 OOM_MSG = f"""

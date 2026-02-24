@@ -60,3 +60,4 @@ async def get_weights_checksum(request: Request):
         return ORJSONResponse({"error": str(e)}, status_code=500)
 
     return ORJSONResponse(response.output, status_code=200)
+

@@ -663,5 +663,118 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
         self._assert_server_matches_model(base_url, perturbed_model_dir)
 
 
+class TestDiskServerChecksumParity(_UpdateWeightsApiMixin):
+    """Verify that update_weights_from_disk succeeds for all module types.
+
+    Disk-server checksum parity is verified internally by the server
+    (GPUWorker._verify_disk_server_parity) after every successful update.
+    A mismatch is logged as a warning.  These tests exercise the full
+    update path for each module type to ensure no warnings are raised.
+    """
+
+    @pytest.fixture(
+        scope="class",
+        params=_ACTIVE_MODEL_PAIRS,
+        ids=_PAIR_IDS,
+    )
+    def diffusion_server_parity(self, request):
+        """Class-scoped server fixture shared across parity tests."""
+        default_model, source_model = request.param
+        port = get_dynamic_server_port()
+        wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
+
+        local_source = maybe_download_model(source_model)
+        perturbed_model_dir = tempfile.mkdtemp(prefix="sglang_parity_perturbed_")
+
+        clone_thread = threading.Thread(
+            target=_clone_model_with_modified_module,
+            args=(
+                local_source,
+                perturbed_model_dir,
+                _VAE_MODULE,
+                _perturb_safetensor,
+            ),
+        )
+        clone_thread.start()
+
+        manager = ServerManager(
+            model=default_model,
+            port=port,
+            wait_deadline=wait_deadline,
+            extra_args="--num-gpus 1",
+        )
+        ctx = manager.start()
+        clone_thread.join()
+
+        try:
+            yield ctx, default_model, perturbed_model_dir
+        finally:
+            ctx.cleanup()
+            shutil.rmtree(perturbed_model_dir, ignore_errors=True)
+
+    def _assert_update_succeeds(
+        self,
+        base_url: str,
+        model_path: str,
+        target_modules: list[str] | None = None,
+    ) -> None:
+        """Update weights and assert the operation succeeds."""
+        result, status_code = self._update_weights(
+            base_url, model_path, target_modules=target_modules
+        )
+        assert status_code == 200 and result.get("success"), (
+            f"Update failed: {result}"
+        )
+
+    def test_disk_server_parity_after_full_update(self, diffusion_server_parity):
+        """After updating all modules, disk-server parity is verified internally.
+
+        Covers transformer (direct mapping), VAE (BN stats augmentation), and
+        text encoders (QKV merge) in one pass.
+        """
+        ctx, default_model, perturbed_model_dir = diffusion_server_parity
+        base_url = f"http://localhost:{ctx.port}"
+
+        self._update_weights(base_url, default_model)
+        self._assert_update_succeeds(base_url, perturbed_model_dir)
+
+    def test_disk_server_parity_after_vae_update(self, diffusion_server_parity):
+        """After updating only the VAE, disk-server parity is verified internally.
+
+        The VAE is the primary module affected by memory-only BN parameter
+        augmentation (FLUX.2-klein-4B). This test isolates that path.
+        """
+        ctx, default_model, perturbed_model_dir = diffusion_server_parity
+        base_url = f"http://localhost:{ctx.port}"
+
+        self._update_weights(base_url, default_model)
+        self._assert_update_succeeds(
+            base_url, perturbed_model_dir, target_modules=[_VAE_MODULE]
+        )
+
+    def test_disk_server_parity_text_encoders(self, diffusion_server_parity):
+        """After updating text encoders, disk-server parity is verified internally.
+
+        Text encoders (e.g., CLIP) use QKV merge during loading; this test
+        exercises that path via a targeted update.
+        """
+        ctx, default_model, perturbed_model_dir = diffusion_server_parity
+        base_url = f"http://localhost:{ctx.port}"
+
+        self._update_weights(base_url, default_model)
+
+        all_checksums = self._get_weights_checksum(base_url)
+        text_encoder_names = [
+            name
+            for name, cs in all_checksums.items()
+            if _TEXT_ENCODER_MODULE_PREFIX in name and cs != "not_found"
+        ]
+        assert text_encoder_names, "No text encoder modules found in server checksums"
+
+        self._assert_update_succeeds(
+            base_url, perturbed_model_dir, target_modules=text_encoder_names
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
