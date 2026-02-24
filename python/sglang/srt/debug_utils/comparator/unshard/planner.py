@@ -10,9 +10,13 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 )
 
 
+# _CoordsList[tensor_index][axis] = axis_rank
+_CoordsList = list[dict[ParallelAxis, int]]
+
+
 class _GroupResult(NamedTuple):
     groups: list[list[int]]
-    projected_coords: list[dict[ParallelAxis, int]]
+    projected_coords: _CoordsList
 
 
 def compute_unshard_plan(
@@ -32,8 +36,7 @@ def compute_unshard_plan(
 
     _validate(sharded_axes=set(sharded), parallel_infos=parallel_infos)
 
-    # current_coords[tensor_index][axis] = axis_rank
-    current_coords: list[dict[ParallelAxis, int]] = [
+    current_coords: _CoordsList = [
         {axis: info[axis].axis_rank for axis in sharded}
         for info in parallel_infos
     ]
@@ -92,7 +95,7 @@ def _validate(
 
 def _group_and_project(
     *,
-    current_coords: list[dict[ParallelAxis, int]],
+    current_coords: _CoordsList,
     target_axis: ParallelAxis,
 ) -> _GroupResult:
     """Group tensors by other-axes coords, sort within group by target_axis rank."""
@@ -103,7 +106,7 @@ def _group_and_project(
         buckets[key].append((coords[target_axis], idx))
 
     groups: list[list[int]] = []
-    projected: list[dict[ParallelAxis, int]] = []
+    projected: _CoordsList = []
     for key in sorted(buckets, key=lambda k: sorted(k)):
         entries = sorted(buckets[key])
         groups.append([idx for _, idx in entries])
