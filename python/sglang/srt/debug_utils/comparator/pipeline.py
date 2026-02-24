@@ -16,16 +16,15 @@ from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 def process_tensor_group(
     *,
-    baseline_rows: list[dict],
-    target_rows: list[dict],
+    name: str,
+    baseline_filenames: list[str],
+    target_filenames: list[str],
     args: argparse.Namespace,
     counts: dict[str, int],
     grouping: str,
 ) -> None:
-    name = (baseline_rows or target_rows)[0]["name"]
-
-    baseline_tensor = load_tensor(baseline_rows, Path(args.baseline_path), grouping=grouping)
-    target_tensor = load_tensor(target_rows, Path(args.target_path), grouping=grouping)
+    baseline_tensor = load_tensor(baseline_filenames, Path(args.baseline_path), grouping=grouping)
+    target_tensor = load_tensor(target_filenames, Path(args.target_path), grouping=grouping)
 
     if baseline_tensor is None or target_tensor is None:
         reason = "baseline_load_failed" if baseline_tensor is None else "target_load_failed"
@@ -49,20 +48,20 @@ def process_tensor_group(
 
 
 def load_tensor(
-    rows: list[dict],
+    filenames: list[str],
     base_path: Path,
     *,
     grouping: str,
 ) -> Optional[torch.Tensor]:
-    if not rows:
+    if not filenames:
         return None
 
     if grouping == "raw":
-        if len(rows) != 1:
+        if len(filenames) != 1:
             return None
-        return _as_tensor(ValueWithMeta.load(base_path / rows[0]["filename"]).value)
+        return _as_tensor(ValueWithMeta.load(base_path / filenames[0]).value)
 
-    return load_and_unshard(rows, base_path)
+    return load_and_unshard(filenames, base_path)
 
 
 def _as_tensor(value: object) -> Optional[torch.Tensor]:

@@ -53,8 +53,9 @@ def run(args: argparse.Namespace) -> None:
         target_rows = filter_rows(df_target, conditions=conditions)
 
         process_tensor_group(
-            baseline_rows=baseline_rows,
-            target_rows=target_rows,
+            name=tensor_group_key["name"],
+            baseline_filenames=[r["filename"] for r in baseline_rows],
+            target_filenames=[r["filename"] for r in target_rows],
             args=args,
             counts=counts,
             grouping=grouping,
