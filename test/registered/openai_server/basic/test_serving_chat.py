@@ -133,6 +133,84 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_jinja_uses_openai_tool_schema_first(self):
+        """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "description": "Add two numbers.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"},
+                            },
+                            "required": ["a", "b"],
+                        },
+                    },
+                }
+            ],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        expected_tools = [tool.model_dump() for tool in req.tools]
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], expected_tools)
+
+    def test_jinja_tool_schema_fallback_to_flat_function(self):
+        """Fallback to function-only schema when template rejects OpenAI wrapper."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "add",
+                        "description": "Add two numbers.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"},
+                            },
+                            "required": ["a", "b"],
+                        },
+                    },
+                }
+            ],
+        )
+
+        self.tm.tokenizer.apply_chat_template.side_effect = [
+            RuntimeError("template expects flat tools format"),
+            [1, 2, 3],
+        ]
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        first_tools = self.tm.tokenizer.apply_chat_template.call_args_list[0].kwargs[
+            "tools"
+        ]
+        second_tools = self.tm.tokenizer.apply_chat_template.call_args_list[1].kwargs[
+            "tools"
+        ]
+        self.assertEqual(first_tools, [tool.model_dump() for tool in req.tools])
+        self.assertEqual(
+            second_tools, [tool.function.model_dump() for tool in req.tools]
+        )
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 

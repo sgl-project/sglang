@@ -332,7 +332,7 @@ python3 -m sglang.bench_serving \
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
-  --model mode-name \
+  --model model-name \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \

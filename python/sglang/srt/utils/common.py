@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -70,7 +71,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -245,7 +246,7 @@ is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
 is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version,
-        device_capability_majors=[10, 12],
+        device_capability_majors=[10, 11, 12],
         cuda_version=(12, 8),
     )
 )
@@ -299,6 +300,10 @@ def xpu_has_xmx_support():
     return False
 
 
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
+
+
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
@@ -310,15 +315,14 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_nvidia_cublas_cu12_version_ge_12_9():
+def is_nvidia_cublas_version_ge_12_9():
     """
-    temporary fix for issue #11272
+    temporary fix for issue #11272 (cublas 12.9+)
     """
-    try:
-        installed_version = version("nvidia-cublas-cu12")
-    except PackageNotFoundError:
-        return False
-    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+    for pkg in ("nvidia-cublas", "nvidia-cublas-cu12"):
+        if check_pkg_version_at_least(pkg, "12.9"):
+            return True
+    return False
 
 
 def random_uuid() -> str:
@@ -861,6 +865,9 @@ def load_audio(
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
+    elif audio_file.startswith("file://"):
+        audio_file = unquote(urlparse(audio_file).path)
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -906,6 +913,9 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        image = Image.open(image_file)
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -926,6 +936,10 @@ def get_image_bytes(image_file: Union[str, bytes]):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         return response.content
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        with open(image_file, "rb") as f:
+            return f.read()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -975,8 +989,11 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("file://"):
+                video_file = unquote(urlparse(video_file).path)
+                vr = VideoReader(video_file, ctx=ctx)
             # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
+            elif os.path.isfile(unquote(urlparse(video_file).path)):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -984,6 +1001,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1039,10 +1058,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -1080,7 +1114,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.2")
+        min_version: Minimum version required (e.g., "0.6.3")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1094,10 +1128,6 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -2170,7 +2200,13 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
+        if is_npu():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -3738,13 +3774,28 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+def get_libnuma():
+    libnuma = None
 
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+        try:
+            libnuma = ctypes.CDLL(libnuma_so)
+        except OSError as e:
+            logger.error(f"{e}")
+            libnuma = None
+        if libnuma is not None:
+            break
+    return libnuma
+
+
+def numa_bind_to_node(node: int):
+    libnuma = get_libnuma()
+
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.error("numa not available on this system, skip bind action")
+    else:
+        libnuma.numa_run_on_node(ctypes.c_int(node))
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
@@ -4053,13 +4104,13 @@ def get_numa_node_count() -> int:
     Returns:
         int: The number of NUMA nodes.
     """
-    libnuma = ctypes.CDLL("libnuma.so")
+    libnuma = get_libnuma()
     return libnuma.numa_max_node() + 1
 
 
 def is_numa_available() -> bool:
     try:
-        libnuma = ctypes.CDLL("libnuma.so")
+        libnuma = get_libnuma()
         return libnuma.numa_available() >= 0
     except Exception:
         return False
