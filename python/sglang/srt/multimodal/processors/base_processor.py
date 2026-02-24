@@ -380,7 +380,7 @@ class BaseMultimodalProcessor(ABC):
 
         input_ids, offsets, modality_list = self.build_input_ids(
             prompt,
-            image_grid_thw=img_grid_thw,
+            img_grid_thw=img_grid_thw,
             video_grid_thw=video_grid_thw,
             audio_seq_lens=audio_feature_lens,
         )
