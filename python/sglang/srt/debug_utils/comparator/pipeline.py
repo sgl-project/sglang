@@ -69,15 +69,7 @@ def _compute_plans(
     baseline_metas: list[dict[str, Any]],
     target_metas: list[dict[str, Any]],
 ) -> tuple[list[Plan], list[Plan]]:
-    """Compute plans for both sides from metadata only.
-
-    This function deliberately takes metadata dicts, not tensors or
-    ValueWithMeta objects — plan computation is a pure metadata operation
-    and must never inspect actual tensor data.
-
-    Currently only produces unshard plans; future pipeline components
-    (e.g. reduction, reordering) will also contribute to the plan.
-    """
+    """This function deliberately takes metadata, since plan computation must never inspect actual tensor data."""
     return (
         _compute_single_plan(baseline_metas),
         _compute_single_plan(target_metas),
