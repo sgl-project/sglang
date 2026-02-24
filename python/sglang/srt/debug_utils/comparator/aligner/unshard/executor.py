@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.debug_utils.comparator.unshard.types import (
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
     ConcatParams,
     UnshardParams,
     UnshardPlan,

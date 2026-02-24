@@ -9,12 +9,12 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SkipRecord,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
-from sglang.srt.debug_utils.comparator.unshard.executor import execute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
+from sglang.srt.debug_utils.comparator.aligner.unshard.executor import execute_unshard_plan
+from sglang.srt.debug_utils.comparator.aligner.unshard.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.types import Plan, UnshardPlan
+from sglang.srt.debug_utils.comparator.aligner.unshard.planner import compute_unshard_plan
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import Plan, UnshardPlan
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 

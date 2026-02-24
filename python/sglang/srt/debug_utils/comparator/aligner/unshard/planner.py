@@ -2,7 +2,7 @@ from collections import defaultdict
 from typing import NamedTuple
 
 from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering, ParallelAxis
-from sglang.srt.debug_utils.comparator.unshard.types import (
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
     AxisInfo,
     ConcatParams,
     UnshardParams,
