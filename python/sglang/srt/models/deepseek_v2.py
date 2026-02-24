@@ -1404,7 +1404,7 @@ class DeepseekV2AttentionMLA(
             inner_state = self.forward_absorb_prepare(
                 positions, hidden_states, forward_batch, zero_allocator, llama_4_scaling
             )
-        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
@@ -1443,7 +1443,7 @@ class DeepseekV2AttentionMLA(
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
-        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
