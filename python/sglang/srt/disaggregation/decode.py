@@ -25,14 +25,15 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -69,8 +70,16 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+
+
+def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and server_args.disaggregation_transfer_backend == "fake"
+    )
 
 
 class DecodeReqToTokenPool:
@@ -193,7 +202,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: BaseKVReceiver
+    kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
@@ -264,7 +273,7 @@ class DecodePreallocQueue:
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-    def _init_kv_manager(self) -> BaseKVManager:
+    def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -326,10 +335,8 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        kv_manager_class: Type[BaseKVManager] = get_kv_class(
-            self.transfer_backend, KVClassType.MANAGER
-        )
-        kv_manager: BaseKVManager = kv_manager_class(
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
@@ -356,10 +363,7 @@ class DecodePreallocQueue:
         if req.data_parallel_rank is not None:
             return req.data_parallel_rank
 
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
+        if _is_fake_transfer(req, self.scheduler.server_args):
             return 0
 
         bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
@@ -374,15 +378,12 @@ class DecodePreallocQueue:
         return None
 
     def _create_receiver_and_enqueue(self, req: Req, dp_rank: int) -> None:
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
-        else:
-            kv_receiver_class = get_kv_class(
-                self.transfer_backend, KVClassType.RECEIVER
-            )
+        backend = (
+            TransferBackend.FAKE
+            if _is_fake_transfer(req, self.scheduler.server_args)
+            else self.transfer_backend
+        )
+        kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
@@ -833,11 +834,7 @@ class DecodeTransferQueue:
             else 0
         )
 
-        if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            decode_req.req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            # Warm up or fake transfer mode
+        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)
