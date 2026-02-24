@@ -150,7 +150,7 @@ class KimiMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk if not _is_npu else True,,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk if not _is_npu else True,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=(
