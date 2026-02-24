@@ -10,10 +10,6 @@ def execute_unshard_plan(
     plan: UnshardPlan,
     tensors_by_world_rank: dict[int, torch.Tensor],
 ) -> torch.Tensor:
-    """Execute a single unshard plan on actual tensor data.
-
-    Concatenation order is strictly by axis_rank (not world_rank).
-    """
     ordered_tensors = [
         tensors_by_world_rank[world_rank]
         for world_rank in plan.world_ranks_by_axis_rank
