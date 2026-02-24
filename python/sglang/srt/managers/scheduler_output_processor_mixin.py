@@ -538,12 +538,13 @@ class SchedulerOutputProcessorMixin:
             )
 
     def _try_kv_return(self, req: Req) -> None:
-        """Reverse KV transfer: decode → prefill, waits for completion.
+        """Reverse KV transfer: decode → prefill, with on-demand page allocation.
 
         Uses the existing NixlKVManager.send_kvcache() in the reverse direction.
-        Looks up prefill peer info from kv_manager.prefill_kv_return_info
-        (populated during bootstrap) and allocates destination pages from
-        the pre-allocated pool.
+        Before starting the RDMA transfer, requests destination pages from
+        the prefill worker via a ZMQ round-trip. This eliminates the need for
+        pre-reserved page pools — the prefill allocates from its normal KV
+        pool on-demand and can decline if under memory pressure.
 
         IMPORTANT: This blocks until the RDMA transfer completes so that the
         source KV pages are not freed while the transfer is in flight.
@@ -587,24 +588,51 @@ class SchedulerOutputProcessorMixin:
             else:
                 num_pages = len(kv_indices)
 
-            # Allocate destination pages from the pre-allocated pool
-            pool = prefill_info["dst_page_pool"]
-            ptr = prefill_info["dst_page_ptr"]
-            if ptr + num_pages > len(pool):
+            # --- On-demand allocation: request pages from prefill ---
+            alloc_req_sock = prefill_info.get("alloc_req_sock")
+            alloc_reply_sock = prefill_info.get("alloc_reply_sock")
+            if alloc_req_sock is None or alloc_reply_sock is None:
                 logger.debug(
-                    "KV return: no dst pages left for req %s (need %d, have %d)",
-                    req.rid, num_pages, len(pool) - ptr,
+                    "KV return: no alloc sockets for req %s, skipping", req.rid
                 )
                 return
-            dst_page_indices = np.array(pool[ptr:ptr + num_pages], dtype=np.int32)
-            prefill_info["dst_page_ptr"] = ptr + num_pages
 
+            request_id = f"kvr_{req.rid}"
+            alloc_reply_port = prefill_info.get("alloc_reply_port", 0)
+            t_alloc = time.time()
+            alloc_req_sock.send_multipart([
+                str(num_pages).encode("ascii"),
+                request_id.encode("ascii"),
+                kv_mgr.local_ip.encode("ascii"),
+                str(alloc_reply_port).encode("ascii"),
+            ])
+
+            # Wait for allocation reply with timeout
+            if alloc_reply_sock.poll(timeout=5000):  # 5s timeout
+                reply = alloc_reply_sock.recv_multipart()
+                reply_id = reply[0].decode("ascii")
+                page_data = reply[1]
+                if not page_data:
+                    logger.debug(
+                        "KV return: prefill declined allocation for req %s "
+                        "(memory pressure), skipping",
+                        req.rid,
+                    )
+                    return
+                dst_page_indices = np.frombuffer(page_data, dtype=np.int32).copy()
+            else:
+                logger.warning(
+                    "KV return: allocation request timed out for req %s", req.rid
+                )
+                return
+
+            alloc_ms = (time.time() - t_alloc) * 1000
             logger.debug(
-                "KV return: starting transfer for req %s — %d pages, "
-                "dst_pool ptr=%d/%d, peer=%s",
-                req.rid, num_pages, ptr, len(pool), prefill_info["agent_name"],
+                "KV return: allocated %d pages on prefill for req %s in %.1fms",
+                len(dst_page_indices), req.rid, alloc_ms,
             )
 
+            # --- RDMA transfer ---
             notif = f"kv_return_{req.rid}"
             t0 = time.time()
             xfer_handle = kv_mgr.send_kvcache(
@@ -650,9 +678,9 @@ class SchedulerOutputProcessorMixin:
             kv_mgr.send_kv_return_metadata(prefill_info, full_token_ids, dst_page_indices)
 
             logger.info(
-                "KV return completed for req %s (%d tokens, %d pages, pool %d/%d used, %.1fms)",
-                req.rid, num_generated, num_pages, prefill_info["dst_page_ptr"],
-                len(pool), elapsed * 1000,
+                "KV return completed for req %s (%d tokens, %d pages, "
+                "alloc=%.1fms, xfer=%.1fms)",
+                req.rid, num_generated, num_pages, alloc_ms, elapsed * 1000,
             )
         except Exception as e:
             logger.warning("KV return failed for req %s: %s", req.rid, e)

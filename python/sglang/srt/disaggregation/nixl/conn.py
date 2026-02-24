@@ -374,8 +374,8 @@ class NixlKVManager(CommonKVManager):
 
         Uses a ZMQ PUSH to the decode worker's bootstrap endpoint (ip:port).
         The message is tagged with room="KVReturn" to distinguish it from
-        regular transfer info messages. Includes pre-allocated destination
-        page indices so the decode side knows WHERE to write returned KV.
+        regular transfer info messages. Sends the prefill's alloc_port so
+        decode can request page allocations on-demand before each KV return.
         """
         import zmq
 
@@ -393,14 +393,13 @@ class NixlKVManager(CommonKVManager):
             packed_kv_ptrs = struct.pack(
                 f"{len(self.kv_args.kv_data_ptrs)}Q", *self.kv_args.kv_data_ptrs
             )
-            # Include pre-allocated dst page indices for receiving returned KV
-            dst_pages = getattr(self, "kv_return_dst_pages", np.array([], dtype=np.int32))
-            logger.debug(
-                "KV return: sending %d kv_ptrs, gpu_id=%d, %d dst_pages",
-                len(self.kv_args.kv_data_ptrs), self.kv_args.gpu_id, len(dst_pages),
-            )
-            # Include metadata port + IP so decode can send back token_ids + page indices
             metadata_port = getattr(self, "_kv_return_metadata_port", 0)
+            alloc_port = getattr(self, "_kv_return_alloc_port", 0)
+            logger.debug(
+                "KV return: sending %d kv_ptrs, gpu_id=%d, metadata_port=%d, alloc_port=%d",
+                len(self.kv_args.kv_data_ptrs), self.kv_args.gpu_id,
+                metadata_port, alloc_port,
+            )
             sock.send_multipart([
                 GUARD,
                 b"KVReturn",
@@ -408,14 +407,15 @@ class NixlKVManager(CommonKVManager):
                 self.agent.get_agent_metadata(),
                 packed_kv_ptrs,
                 str(self.kv_args.gpu_id).encode("ascii"),
-                np.asarray(dst_pages, dtype=np.int32).tobytes(),
+                b"",  # empty — no pre-allocated pages (on-demand allocation)
                 str(metadata_port).encode("ascii"),
                 self.local_ip.encode("ascii"),
+                str(alloc_port).encode("ascii"),
             ])
             sock.close()
             logger.info(
                 f"Sent KV return registration to decode agent {decode_kv_args.agent_name} "
-                f"with {len(dst_pages)} pre-allocated dst pages, metadata_port={metadata_port}"
+                f"metadata_port={metadata_port}, alloc_port={alloc_port}"
             )
 
         except Exception as e:
@@ -431,13 +431,8 @@ class NixlKVManager(CommonKVManager):
         prefill_agent_metadata = msg[1]
         prefill_kv_ptrs = list(struct.unpack(f"{len(msg[2]) // 8}Q", msg[2]))
         prefill_gpu_id = int(msg[3].decode("ascii"))
-        # Parse pre-allocated dst page indices from prefill
-        dst_page_pool = (
-            np.frombuffer(msg[4], dtype=np.int32).tolist()
-            if len(msg) > 4 and len(msg[4]) > 0
-            else []
-        )
-        # Parse metadata port (frame 5) and IP (frame 6) for sending back metadata
+        # frame 4 is reserved (was dst_page_pool, now empty for on-demand alloc)
+        # Parse metadata port (frame 5) and IP (frame 6)
         metadata_port = (
             int(msg[5].decode("ascii"))
             if len(msg) > 5 and len(msg[5]) > 0
@@ -448,11 +443,17 @@ class NixlKVManager(CommonKVManager):
             if len(msg) > 6 and len(msg[6]) > 0
             else ""
         )
+        # Parse alloc port (frame 7) for on-demand page allocation
+        alloc_port = (
+            int(msg[7].decode("ascii"))
+            if len(msg) > 7 and len(msg[7]) > 0
+            else 0
+        )
         logger.debug(
             "KV return registration: agent_name=%s, num_kv_ptrs=%d, "
-            "gpu_id=%d, dst_page_pool_size=%d, metadata_port=%d, prefill_ip=%s",
+            "gpu_id=%d, metadata_port=%d, alloc_port=%d, prefill_ip=%s",
             prefill_agent_name, len(prefill_kv_ptrs),
-            prefill_gpu_id, len(dst_page_pool), metadata_port, prefill_ip,
+            prefill_gpu_id, metadata_port, alloc_port, prefill_ip,
         )
 
         if prefill_agent_name not in self.prefill_kv_return_info:
@@ -460,7 +461,7 @@ class NixlKVManager(CommonKVManager):
 
             self.agent.add_remote_agent(prefill_agent_metadata)
 
-            # Eagerly connect a ZMQ PUSH socket for metadata if port is available
+            # Connect ZMQ PUSH socket for metadata (token_ids + page_indices after transfer)
             metadata_sock = None
             if metadata_port > 0 and prefill_ip:
                 ctx = zmq.Context.instance()
@@ -474,18 +475,47 @@ class NixlKVManager(CommonKVManager):
                     f"for prefill agent {prefill_agent_name}"
                 )
 
+            # Connect ZMQ PUSH socket for allocation requests (on-demand)
+            alloc_req_sock = None
+            if alloc_port > 0 and prefill_ip:
+                ctx = zmq.Context.instance()
+                alloc_req_sock = ctx.socket(zmq.PUSH)
+                alloc_req_sock.setsockopt(zmq.LINGER, 1000)
+                alloc_req_sock.setsockopt(zmq.SNDHWM, 1000)
+                alloc_endpoint = f"tcp://{prefill_ip}:{alloc_port}"
+                alloc_req_sock.connect(alloc_endpoint)
+                logger.info(
+                    f"Connected alloc request PUSH socket to {alloc_endpoint} "
+                    f"for prefill agent {prefill_agent_name}"
+                )
+
+            # Bind a ZMQ PULL socket for allocation replies from prefill
+            alloc_reply_sock = None
+            alloc_reply_port = 0
+            if alloc_port > 0:
+                ctx = zmq.Context.instance()
+                alloc_reply_sock = ctx.socket(zmq.PULL)
+                alloc_reply_sock.setsockopt(zmq.RCVHWM, 1000)
+                alloc_reply_port = alloc_reply_sock.bind_to_random_port(
+                    f"tcp://{self.local_ip}"
+                )
+                logger.info(
+                    f"Bound alloc reply PULL socket on {self.local_ip}:{alloc_reply_port}"
+                )
+
             self.prefill_kv_return_info[prefill_agent_name] = {
                 "agent_name": prefill_agent_name,
                 "kv_ptrs": prefill_kv_ptrs,
                 "gpu_id": prefill_gpu_id,
-                "dst_page_pool": dst_page_pool,
-                "dst_page_ptr": 0,  # next available index into dst_page_pool
                 "metadata_port": metadata_port,
-                "metadata_sock": metadata_sock,  # ZMQ PUSH socket (or None)
+                "metadata_sock": metadata_sock,
+                "alloc_req_sock": alloc_req_sock,
+                "alloc_reply_sock": alloc_reply_sock,
+                "alloc_reply_port": alloc_reply_port,
             }
             logger.info(
                 f"Registered prefill agent {prefill_agent_name} for KV return "
-                f"with {len(dst_page_pool)} dst pages, metadata_port={metadata_port}"
+                f"(on-demand alloc), metadata_port={metadata_port}, alloc_port={alloc_port}"
             )
 
     def send_kv_return_metadata(
@@ -522,12 +552,15 @@ class NixlKVManager(CommonKVManager):
             logger.warning("Failed to send KV return metadata: %s", e)
 
     def start_kv_return_receiver(self, tree_cache):
-        """Start receiving KV return metadata on the prefill side.
+        """Start receiving KV return metadata and allocation requests on the prefill side.
 
-        Opens a ZMQ PULL socket for metadata (token_ids, dst_page_indices)
-        sent by decode workers after each KV return transfer completes.
-        Metadata is pushed to a thread-safe queue that the scheduler's main
-        thread drains to insert into RadixCache.
+        Opens two ZMQ PULL sockets:
+        1. Metadata receiver: (token_ids, dst_page_indices) sent after RDMA completes
+        2. Allocation request receiver: decode requests N pages before RDMA
+
+        Metadata is pushed to kv_return_insertion_queue.
+        Allocation requests are pushed to kv_return_alloc_queue for the
+        scheduler main thread to process (allocator is not thread-safe).
 
         Args:
             tree_cache: The prefill worker's RadixCache instance (unused here,
@@ -537,11 +570,13 @@ class NixlKVManager(CommonKVManager):
 
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
-        # Thread-safe queue bridging background ZMQ thread -> scheduler main thread
+        # Thread-safe queues bridging background ZMQ threads -> scheduler main thread
         self.kv_return_insertion_queue = queue.Queue()
+        self.kv_return_alloc_queue = queue.Queue()
 
-        # Bind a ZMQ PULL socket on a random port for metadata
         ctx = zmq.Context.instance()
+
+        # --- Metadata receiver (existing) ---
         meta_sock = ctx.socket(zmq.PULL)
         meta_sock.setsockopt(zmq.RCVHWM, 10000)
         self._kv_return_metadata_port = meta_sock.bind_to_random_port(
@@ -551,6 +586,18 @@ class NixlKVManager(CommonKVManager):
             "KV return metadata receiver bound on %s:%d",
             self.local_ip,
             self._kv_return_metadata_port,
+        )
+
+        # --- Allocation request receiver (new for on-demand) ---
+        alloc_sock = ctx.socket(zmq.PULL)
+        alloc_sock.setsockopt(zmq.RCVHWM, 1000)
+        self._kv_return_alloc_port = alloc_sock.bind_to_random_port(
+            f"tcp://{self.local_ip}"
+        )
+        logger.info(
+            "KV return alloc request receiver bound on %s:%d",
+            self.local_ip,
+            self._kv_return_alloc_port,
         )
 
         def recv_kv_return_metadata():
@@ -573,8 +620,32 @@ class NixlKVManager(CommonKVManager):
                 except Exception as e:
                     logger.debug("KV return metadata recv error: %s", e)
 
+        def recv_kv_return_alloc_requests():
+            """Receive allocation requests from decode and queue for scheduler."""
+            while True:
+                try:
+                    msg = alloc_sock.recv_multipart()
+                    # msg[0] = num_pages (ascii)
+                    # msg[1] = request_id (ascii)
+                    # msg[2] = reply_ip (ascii)
+                    # msg[3] = reply_port (ascii)
+                    num_pages = int(msg[0].decode("ascii"))
+                    request_id = msg[1].decode("ascii")
+                    reply_ip = msg[2].decode("ascii")
+                    reply_port = int(msg[3].decode("ascii"))
+                    self.kv_return_alloc_queue.put(
+                        (num_pages, request_id, reply_ip, reply_port)
+                    )
+                    logger.debug(
+                        "KV return alloc request queued: %d pages, id=%s, reply=%s:%d",
+                        num_pages, request_id, reply_ip, reply_port,
+                    )
+                except Exception as e:
+                    logger.debug("KV return alloc request recv error: %s", e)
+
         threading.Thread(target=recv_kv_return_metadata, daemon=True).start()
-        logger.info("KV return receiver started on prefill worker")
+        threading.Thread(target=recv_kv_return_alloc_requests, daemon=True).start()
+        logger.info("KV return receiver started on prefill worker (metadata + on-demand alloc)")
 
     def _send_kvcache_generic(
         self,

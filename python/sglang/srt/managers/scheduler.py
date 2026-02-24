@@ -971,43 +971,23 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-        # KV return: wire up existing NixlKVManager for reverse transfers
-        self.kv_return_reserved_tokens = 0
+        # KV return: wire up existing NixlKVManager for reverse transfers.
+        # On-demand allocation: no pages are pre-reserved. Decode requests
+        # pages before each KV return transfer, and the scheduler allocates
+        # from the normal KV pool on the main thread.
         if self.server_args.enable_kv_return:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 logger.info("KV return enabled — decode will send generated KV back to prefill")
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-                # Pre-allocate all available pages for receiving returned KV
-                num_reserve_tokens = self.token_to_kv_pool_allocator.available_size()
-                logger.debug(
-                    "KV return: available_tokens=%d, page_size=%d",
-                    num_reserve_tokens,
-                    self.token_to_kv_pool_allocator.page_size,
-                )
-                if num_reserve_tokens > 0:
-                    reserved = self.token_to_kv_pool_allocator.alloc(num_reserve_tokens)
-                    if reserved is not None:
-                        import numpy as np
-                        from sglang.srt.disaggregation.utils import kv_to_page_indices
-                        page_size = self.token_to_kv_pool_allocator.page_size
-                        page_indices = kv_to_page_indices(reserved.cpu().numpy(), page_size)
-                        kv_mgr.kv_return_dst_pages = page_indices
-                        self.kv_return_reserved_tokens = num_reserve_tokens
-                        logger.info(
-                            "Pre-allocated %d pages (%d tokens) for KV return reception",
-                            len(page_indices), num_reserve_tokens,
-                        )
-                    else:
-                        import numpy as np
-                        kv_mgr.kv_return_dst_pages = np.array([], dtype=np.int32)
-                        logger.warning("Failed to pre-allocate pages for KV return")
-                else:
-                    import numpy as np
-                    kv_mgr.kv_return_dst_pages = np.array([], dtype=np.int32)
                 if hasattr(kv_mgr, "start_kv_return_receiver"):
                     kv_mgr.start_kv_return_receiver(self.tree_cache)
-                logger.info("KV return enabled — prefill will accept returned KV into RadixCache")
+                # Cache for ZMQ PUSH sockets to decode reply endpoints
+                self._kv_return_reply_sockets = {}
+                logger.info(
+                    "KV return enabled — prefill will accept returned KV into RadixCache "
+                    "(on-demand allocation, no pre-reserved pages)"
+                )
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -2491,13 +2471,120 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
-        # Drain KV return insertion queue on the prefill side (main thread only)
+        # Process KV return queues on the prefill side (main thread only)
         if self.server_args.enable_kv_return and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._process_kv_return_alloc_requests()
             self._process_kv_return_insertions()
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+
+    def _process_kv_return_alloc_requests(self):
+        """Process on-demand page allocation requests from decode workers.
+
+        Decode sends "allocate N pages" before each KV return RDMA transfer.
+        A background ZMQ thread on the kv_manager queues these requests.
+        We process them HERE on the scheduler's main thread because the
+        token_to_kv_pool_allocator is not thread-safe.
+
+        For each request, we allocate pages from the normal KV pool and
+        send the page indices back to the decode worker via ZMQ PUSH.
+        If allocation fails (memory pressure), we send an empty reply
+        and the decode worker skips the KV return — no data is lost,
+        we just don't cache it.
+        """
+        import queue as queue_mod
+
+        import numpy as np
+        import zmq
+
+        from sglang.srt.disaggregation.utils import kv_to_page_indices
+
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not hasattr(kv_mgr, "kv_return_alloc_queue"):
+            return
+
+        alloc_count = 0
+        while True:
+            try:
+                num_pages, request_id, reply_ip, reply_port = (
+                    kv_mgr.kv_return_alloc_queue.get_nowait()
+                )
+            except queue_mod.Empty:
+                break
+
+            # Convert page count to token count for the allocator
+            page_size = self.token_to_kv_pool_allocator.page_size
+            num_tokens = num_pages * page_size
+
+            # Check available capacity — leave headroom for normal serving
+            avail = self.token_to_kv_pool_allocator.available_size()
+            if num_tokens > avail:
+                logger.debug(
+                    "KV return alloc: insufficient capacity for %d tokens "
+                    "(avail=%d), declining request %s",
+                    num_tokens, avail, request_id,
+                )
+                self._send_kv_return_alloc_reply(
+                    reply_ip, reply_port, request_id, b""
+                )
+                continue
+
+            reserved = self.token_to_kv_pool_allocator.alloc(num_tokens)
+            if reserved is not None:
+                page_indices = kv_to_page_indices(
+                    reserved.cpu().numpy(), page_size
+                )
+                self._send_kv_return_alloc_reply(
+                    reply_ip, reply_port, request_id,
+                    np.asarray(page_indices, dtype=np.int32).tobytes(),
+                )
+                alloc_count += 1
+                logger.debug(
+                    "KV return alloc: granted %d pages (%d tokens) for request %s, "
+                    "remaining avail=%d",
+                    len(page_indices), num_tokens, request_id,
+                    self.token_to_kv_pool_allocator.available_size(),
+                )
+            else:
+                logger.debug(
+                    "KV return alloc: allocator returned None for %d tokens, "
+                    "declining request %s",
+                    num_tokens, request_id,
+                )
+                self._send_kv_return_alloc_reply(
+                    reply_ip, reply_port, request_id, b""
+                )
+
+        if alloc_count > 0:
+            logger.info("Processed %d KV return allocation requests", alloc_count)
+
+    def _send_kv_return_alloc_reply(
+        self, reply_ip: str, reply_port: int, request_id: str, payload: bytes
+    ):
+        """Send allocation reply back to the decode worker."""
+        import zmq
+
+        endpoint = f"tcp://{reply_ip}:{reply_port}"
+        # Reuse cached PUSH sockets per endpoint to avoid reconnection overhead
+        if endpoint not in self._kv_return_reply_sockets:
+            ctx = zmq.Context.instance()
+            sock = ctx.socket(zmq.PUSH)
+            sock.setsockopt(zmq.LINGER, 1000)
+            sock.setsockopt(zmq.SNDHWM, 1000)
+            sock.connect(endpoint)
+            self._kv_return_reply_sockets[endpoint] = sock
+        sock = self._kv_return_reply_sockets[endpoint]
+        try:
+            sock.send_multipart([
+                request_id.encode("ascii"),
+                payload,
+            ])
+        except Exception as e:
+            logger.warning(
+                "Failed to send KV return alloc reply to %s: %s", endpoint, e
+            )
 
     def _process_kv_return_insertions(self):
         """Drain the KV return insertion queue and insert into RadixCache.
@@ -2506,12 +2593,11 @@ class Scheduler(
 
             decode finish → NIXL RDMA write (data) → ZMQ metadata → this method
 
-        The decode worker RDMA-writes generated-token KV directly into
-        pre-allocated page slots on our GPU, then sends a ZMQ message with
-        (token_ids, dst_page_indices).  A background receiver thread pushes
-        those tuples into kv_return_insertion_queue.  We drain them HERE
-        on the scheduler's main thread because tree_cache.insert() is NOT
-        thread-safe.
+        The decode worker RDMA-writes generated-token KV into pages that were
+        allocated on-demand, then sends a ZMQ message with (token_ids,
+        dst_page_indices). A background receiver thread pushes those tuples
+        into kv_return_insertion_queue. We drain them HERE on the scheduler's
+        main thread because tree_cache.insert() is NOT thread-safe.
 
         The token_ids are the FULL sequence (prompt + generated) and the
         dst_page_indices cover only the generated tokens. We first match the
@@ -2553,7 +2639,6 @@ class Scheduler(
             # this is a duplicate insertion (e.g., same prompt with temp=0).
             # Free the orphaned gen pages back to the pool instead of leaking them.
             num_gen_tokens = len(dst_page_indices)
-            expected_prompt_len = len(token_ids) - num_gen_tokens
             if len(prefix_indices) >= len(token_ids):
                 logger.debug(
                     "KV return: tree already has full sequence (%d tokens), "
@@ -2561,9 +2646,6 @@ class Scheduler(
                     len(token_ids), len(gen_pages),
                 )
                 self.token_to_kv_pool_allocator.free(gen_pages)
-                self.kv_return_reserved_tokens = max(
-                    0, self.kv_return_reserved_tokens - len(gen_pages)
-                )
                 insertion_count += 1
                 continue
 
@@ -2583,7 +2665,6 @@ class Scheduler(
             else:
                 aligned_len = len(full_value)
                 if aligned_len > len(token_ids):
-                    # More pages than tokens shouldn't happen; truncate to token count
                     aligned_len = len(token_ids)
                 insert_key = RadixKey(
                     token_ids=token_ids[:aligned_len], extra_key=None
@@ -2594,17 +2675,9 @@ class Scheduler(
                 InsertParams(key=insert_key, value=insert_value)
             )
             insertion_count += 1
-            # Pages inserted into RadixCache become evictable — reduce the
-            # reserved count so memory accounting stays balanced.
-            num_gen_pages = len(gen_pages)
-            self.kv_return_reserved_tokens = max(
-                0, self.kv_return_reserved_tokens - num_gen_pages
-            )
             logger.debug(
-                "KV return insertion: %d tokens (%d prefix + %d gen), %d pages inserted, "
-                "reserved remaining: %d",
-                len(token_ids), len(prefix_indices), num_gen_pages, aligned_len,
-                self.kv_return_reserved_tokens,
+                "KV return insertion: %d tokens (%d prefix + %d gen), %d pages inserted",
+                len(token_ids), len(prefix_indices), len(gen_pages), aligned_len,
             )
 
         if insertion_count > 0:
