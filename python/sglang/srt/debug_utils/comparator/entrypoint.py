@@ -52,13 +52,15 @@ def run(args: argparse.Namespace) -> None:
         baseline_rows = filter_rows(df_baseline, conditions=conditions)
         target_rows = filter_rows(df_target, conditions=conditions)
 
-        process_tensor_group(
+        record = process_tensor_group(
             name=tensor_group_key["name"],
             baseline_filenames=[r["filename"] for r in baseline_rows],
             target_filenames=[r["filename"] for r in target_rows],
             args=args,
             counts=counts,
         )
+        counts[record.category] += 1
+        print_record(record, output_format=args.output_format)
 
     print_record(
         SummaryRecord(total=sum(counts.values()), **counts),

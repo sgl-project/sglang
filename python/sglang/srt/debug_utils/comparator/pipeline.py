@@ -26,8 +26,7 @@ def process_tensor_group(
     baseline_filenames: list[str],
     target_filenames: list[str],
     args: argparse.Namespace,
-    counts: dict[str, int],
-) -> None:
+) -> ComparisonRecord | SkipRecord:
     b_tensors = _load_tensors(baseline_filenames, Path(args.baseline_path))
     t_tensors = _load_tensors(target_filenames, Path(args.target_path))
 
@@ -45,11 +44,7 @@ def process_tensor_group(
 
     if b_tensor is None or t_tensor is None:
         reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
-        counts["skipped"] += 1
-        print_record(
-            SkipRecord(name=name, reason=reason), output_format=args.output_format
-        )
-        return
+        return SkipRecord(name=name, reason=reason)
 
     info = compare_tensors(
         x_baseline=b_tensor,
@@ -58,11 +53,7 @@ def process_tensor_group(
         diff_threshold=args.diff_threshold,
     )
 
-    counts["passed" if info.diff is not None and info.diff.passed else "failed"] += 1
-    print_record(
-        ComparisonRecord(**info.model_dump()),
-        output_format=args.output_format,
-    )
+    return ComparisonRecord(**info.model_dump())
 
 
 def _load_tensors(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:
