@@ -84,9 +84,7 @@ def _compute_single_plan(metas: list[dict[str, Any]]) -> list[Plan]:
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
     plan = compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
 
-    if plan is None:
-        return []
-    return [plan]
+    return [plan] if plan is not None else []
 
 
 def _extract_tensors(
