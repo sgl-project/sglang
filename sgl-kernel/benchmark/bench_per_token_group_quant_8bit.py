@@ -14,7 +14,9 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_8bit,
+)
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.bench_utils import bench_kineto
 

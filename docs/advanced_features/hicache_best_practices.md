@@ -19,6 +19,10 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 --hicache-storage-backend             # Optional storage backend (e.g., hf3fs, mooncake, etc.)
 ```
 
+Notes:
+
+- Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](hicache_storage_runtime_attach_detach.md).
+
 ## Key Configurations with Storage Backends Enabled
 
 ### Memory Layout Optimization

@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -36,6 +38,8 @@ class AttentionType(Enum):
 
     # Decoder attention between previous layer Q/K/V
     DECODER = "decoder"
+    # Decoder bidirectional attention between image tokens
+    DECODER_BIDIRECTIONAL = "decoder_bidirectional"
     # Encoder attention between previous layer Q/K/V
     ENCODER_ONLY = "encoder_only"
 
@@ -132,6 +136,7 @@ class RadixAttention(nn.Module):
 
 
 @register_custom_op(mutates_args=["output"])
+@register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,

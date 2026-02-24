@@ -7,104 +7,13 @@ import tabulate
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
+# NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
+# per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
+# have been migrated to stage-c suites in test/registered/ using the CI registry system.
 suites = {
-    "per-commit-1-gpu": [
-        TestFile("test_deterministic.py", 228),
-        TestFile("test_evs.py", 20),
-        TestFile("test_external_models.py", 30),
-        TestFile("test_gpt_oss_1gpu.py", 402),
-        TestFile("test_hidden_states.py", 55),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
-        TestFile("test_jinja_template_utils.py", 7),
-        TestFile("test_model_hooks.py", 6),
-        TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_request_queue_validation.py", 47),
-        TestFile("test_score_api.py", 260),
-        TestFile("test_server_args.py", 9),
-        TestFile("test_skip_tokenizer_init.py", 77),
-        TestFile("test_srt_endpoint.py", 127),
-        TestFile("test_srt_engine.py", 252),
-        TestFile("test_utils_update_weights.py", 29),
-        TestFile("test_video_utils.py", 5),
-        TestFile("test_modelopt_export.py", 9),
-    ],
-    "per-commit-2-gpu": [
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
-        TestFile("models/test_kimi_linear_models.py", 90),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation_basic.py", 400),
-        TestFile("test_dp_attention.py", 350),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-    ],
-    "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 650),
-        TestFile("test_gpt_oss_4gpu.py", 300),
-        TestFile("test_multi_instance_release_memory_occupation.py", 64),
-        TestFile("test_pp_single_node.py", 500),
-        TestFile("test_epd_disaggregation.py", 150),
-    ],
-    "per-commit-8-gpu-h200": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
-        TestFile("models/test_kimi_k2_models.py", 200),
-        TestFile("test_deepseek_v32_basic.py", 360),
-        TestFile("test_deepseek_v32_mtp.py", 360),
-        TestFile("models/test_mimo_models.py", 200),
-    ],
-    "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
-        TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 180),
-        TestFile("test_disaggregation_dp_attention.py", 155),
-    ],
-    "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
-        TestFile("test_fp8_blockwise_gemm.py", 280),
-        TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
-    ],
-    # "per-commit-8-gpu-b200": [
-    #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
-    # ],
-    "per-commit-4-gpu-gb200": [
-        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
-    ],
-    "per-commit-4-gpu-deepep": [
-        TestFile("ep/test_deepep_small.py", 531),
-        # TODO: Add it back after mooncake supports torch 2.9
-        # TestFile("ep/test_mooncake_ep_small.py", 450),
-    ],
-    "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 563),
-    ],
-    "quantization_test": [
-        TestFile("quant/test_awq.py", 163),
-        TestFile("quant/test_marlin_moe.py", 200),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_quantization.py", 185),
-        TestFile("test_gguf.py", 96),
-    ],
-    "__not_in_ci__": [
-        TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
-        TestFile("models/test_dummy_grok_models.py"),
-        TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_gpt_oss_common.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
-        TestFile("test_profile_v2.py"),
-        TestFile("models/test_ministral3_models.py"),
-        TestFile("test_mistral_large3_basic.py"),
-        TestFile("test_prefill_delayer.py"),
-    ],
+    # quantization_test suite migrated to test/registered/quant/
+    # All CUDA tests migrated to test/registered/
+    "__not_in_ci__": [],
 }
 
 # Add AMD tests
@@ -118,23 +27,7 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_external_models.py", 45),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
-        TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_model_hooks.py", 10),
-        TestFile("test_multi_tokenizer.py", 345),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_request_queue_validation.py", 70),
-        TestFile("test_rope_rocm.py", 3),
-        TestFile("test_server_args.py", 1),
-        TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_srt_engine.py", 261),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_video_utils.py", 8),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
@@ -142,32 +35,13 @@ suite_amd = {
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
+        # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
-    "per-commit-amd-mi35x": [
-        TestFile("test_gpt_oss_1gpu.py", 750),
-    ],
-    "per-commit-2-gpu-amd": [
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-    ],
-    "per-commit-4-gpu-amd": [
-        TestFile("test_pp_single_node.py", 150),
-    ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "nightly-amd": [
-        TestFile("nightly/test_gsm8k_eval_amd.py"),
-    ],
-    # AMD VLM tests using MMMU benchmark (2-GPU runner)
-    "nightly-amd-vlm": [
-        TestFile("nightly/test_vlms_mmmu_eval_amd.py"),
-    ],
-    # AMD 8-GPU tests for base models using gsm8k completion benchmark
-    "nightly-amd-8-gpu": [
-        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
-    ],
+    # per-commit-4-gpu-amd migrated to test/registered/distributed/ using the CI registry system
+    "per-commit-4-gpu-amd": [],
+    # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
+    # have been migrated to test/registered/amd/nightly/ and are now managed
+    # by test/run_suite.py using the registry system.
 }
 
 # Add Intel Xeon tests
@@ -179,6 +53,7 @@ suite_xeon = {
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
+        TestFile("cpu/test_flash_attn.py"),
         TestFile("cpu/test_gemm.py"),
         TestFile("cpu/test_intel_amx_attention_backend_a.py"),
         TestFile("cpu/test_intel_amx_attention_backend_b.py"),
@@ -199,6 +74,7 @@ suite_xeon = {
 suite_xpu = {
     "per-commit-xpu": [
         TestFile("xpu/test_intel_xpu_backend.py"),
+        TestFile("xpu/test_deepseek_ocr.py"),
     ],
 }
 
@@ -207,12 +83,14 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
@@ -227,8 +105,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepep.py", 3600),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 

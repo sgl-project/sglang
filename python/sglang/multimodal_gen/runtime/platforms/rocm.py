@@ -6,6 +6,7 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+
 from functools import lru_cache
 from typing import Any
 
@@ -30,6 +31,10 @@ class RocmPlatform(Platform):
     device_type: str = "cuda"  # torch uses 'cuda' backend string
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
@@ -93,11 +98,6 @@ class RocmPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info(
-            "Trying SGLANG_DIFFUSION_ATTENTION_BACKEND=%s",
-            envs.SGLANG_DIFFUSION_ATTENTION_BACKEND,
-        )
-
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -108,13 +108,10 @@ class RocmPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.AITER:
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
-                    "AITer backend only supports fp16/bf16 inputs but got dtype=%s. "
-                    "Falling back to Torch SDPA backend.",
+                    "AITer backend works best with fp16/bf16 inputs but got dtype=%s. "
+                    "Proceeding with AITer anyway.",
                     dtype,
                 )
-                # TODO: need to compare triton with sdpa as an alternative backend
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
@@ -174,3 +171,8 @@ class RocmPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """ROCm performs better without DIT layerwise offload on Wan."""
+        return False

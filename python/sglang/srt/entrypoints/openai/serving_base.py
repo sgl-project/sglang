@@ -70,19 +70,6 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
-    def _validate_lora_enabled(self, adapter_name: str) -> None:
-        """Check that LoRA is enabled before attempting to use an adapter.
-
-        Raises ValueError with actionable guidance if --enable-lora flag is missing.
-        Adapter existence is validated later by TokenizerManager.lora_registry.
-        """
-        if not self.tokenizer_manager.server_args.enable_lora:
-            raise ValueError(
-                f"LoRA adapter '{adapter_name}' was requested, but LoRA is not enabled. "
-                "Please launch the server with --enable-lora flag and preload adapters "
-                "using --lora-paths or /load_lora_adapter endpoint."
-            )
-
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -282,3 +269,8 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def extract_routing_key(self, raw_request):
+        if raw_request is None:
+            return None
+        return raw_request.headers.get("x-smg-routing-key")

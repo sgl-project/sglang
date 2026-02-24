@@ -12,12 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+
 import dataclasses
 import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -25,6 +26,7 @@ from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -72,6 +74,8 @@ class TimeStats:
     prefill_end_time_host: float = 0.0
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+    # Number of prefill retries for this request
+    prefill_retry_count: int = 0
 
     # Timestamp when prefill phase finishes, obtained from `time.time()`.
     # Note that this differs from the other `_time` fields tracked by the
@@ -138,7 +142,8 @@ class TimeStats:
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB"
+                f"transfer_total={self.transfer_total_mb:.2f}MB, "
+                f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -246,6 +251,22 @@ class SchedulerStats:
     lora_pool_slots_total: int = 0
     lora_pool_utilization: float = 0.0
 
+    # Routing key metrics
+    num_unique_running_routing_keys: int = 0
+    routing_key_running_req_counts: List[int] = field(default_factory=list)
+    routing_key_all_req_counts: List[int] = field(default_factory=list)
+
+
+ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
+
+
+def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
+    """Returns (num_unique_keys, per_key_counts)."""
+    from collections import Counter
+
+    key_counts = Counter(k for k in routing_keys if k is not None)
+    return len(key_counts), list(key_counts.values())
+
 
 @dataclass
 class DPCooperationInfo:
@@ -256,8 +277,10 @@ class DPCooperationInfo:
     @staticmethod
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
+            # Count ranks that are doing any extend-like work.
+            # With overlap scheduling, prefill can appear as MIXED rather than EXTEND.
             num_prefill_ranks=sum(
-                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+                1 for mode in forward_modes if ForwardMode(mode).is_extend()
             ),
         )
 
@@ -271,6 +294,7 @@ class SchedulerMetricsCollector:
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
+        server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram, Summary
@@ -435,6 +459,11 @@ class SchedulerMetricsCollector:
         self.num_transfer_failed_reqs = Counter(
             name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_prefill_retries_total = Counter(
+            name="sglang:num_prefill_retries_total",
+            documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Gauge(
@@ -720,6 +749,25 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        self.num_unique_running_routing_keys = Gauge(
+            name="sglang:num_unique_running_routing_keys",
+            documentation="Number of unique routing keys in running batch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.routing_key_running_req_count = GaugeHistogram(
+            name="sglang:routing_key_running_req_count",
+            documentation="Distribution of routing keys by running request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+        self.routing_key_all_req_count = GaugeHistogram(
+            name="sglang:routing_key_all_req_count",
+            documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
+            labelnames=list(labels.keys()),
+            bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -761,23 +809,57 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
 
-        max_delay_passes = envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get()
+        max_delay = server_args.prefill_delayer_max_delay_passes
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, max_delay_passes - 1],
+            buckets=sorted(
+                set(
+                    x
+                    for x in (
+                        server_args.prefill_delayer_forward_passes_buckets
+                        or [5, 20, 50, 100, 200]
+                    )
+                    if x < max_delay
+                )
+                # Need bucket "<=0" for zero-delay cases, and "max_delay-1" to distinguish "max_delay" timeout passes
+                | {0, max_delay - 1}
+            ),
         )
         self.prefill_delayer_wait_seconds = Histogram(
             name="sglang:prefill_delayer_wait_seconds",
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
-            buckets=[5, 20, 100, 500],
+            buckets=sorted(
+                set(
+                    server_args.prefill_delayer_wait_seconds_buckets
+                    or [1, 2, 5, 10, 20, 50, 100, 200, 500]
+                )
+                # Need bucket "<=0" for zero-delay cases
+                | {0}
+            ),
         )
-        self.prefill_delayer_timeouts_total = Counter(
-            name="sglang:prefill_delayer_timeouts_total",
-            documentation="Total number of prefill delayer timeouts.",
-            labelnames=labels.keys(),
+        self.prefill_delayer_outcomes_total = Counter(
+            name="sglang:prefill_delayer_outcomes_total",
+            documentation="Prefill delayer outcome counts.",
+            labelnames=[
+                *labels.keys(),
+                "input_estimation",
+                "output_allow",
+                "output_reason",
+                "actual_execution",
+            ],
+        )
+
+        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
+        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
+        # If more Info metrics are needed, we can create a common _log_info function.
+        self.cache_config_info = Gauge(
+            name="sglang:cache_config_info",
+            documentation="Cache configuration information.",
+            labelnames=["page_size", "num_pages"],
+            multiprocess_mode="mostrecent",
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
@@ -793,6 +875,10 @@ class SchedulerMetricsCollector:
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_prefill_retries(self, count: int) -> None:
+        if count > 0:
+            self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
@@ -800,13 +886,28 @@ class SchedulerMetricsCollector:
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
-    def observe_prefill_delayer_wait(
-        self, forward_passes: int, wait_seconds: float, is_timeout: bool
+    def observe_prefill_delayer_outcome(
+        self,
+        forward_passes: int,
+        wait_seconds: float,
+        input_estimation: str,
+        output_allow: bool,
+        output_reason: str,
+        actual_execution: bool,
     ) -> None:
-        self._log_histogram(self.prefill_delayer_wait_forward_passes, forward_passes)
-        self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
-        if is_timeout:
-            self.prefill_delayer_timeouts_total.labels(**self.labels).inc(1)
+        if output_allow and actual_execution:
+            self._log_histogram(
+                self.prefill_delayer_wait_forward_passes, forward_passes
+            )
+            self._log_histogram(self.prefill_delayer_wait_seconds, wait_seconds)
+
+        self.prefill_delayer_outcomes_total.labels(
+            **self.labels,
+            input_estimation=input_estimation,
+            output_allow=str(output_allow).lower(),
+            output_reason=output_reason,
+            actual_execution=str(actual_execution).lower(),
+        ).inc(1)
 
     def increment_retracted_reqs(
         self,
@@ -846,6 +947,8 @@ class SchedulerMetricsCollector:
             ("prefill_cache", prefill_cache_tokens),
             ("decode", decode_tokens),
         ]:
+            if delta == 0:
+                continue
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
             if dp_cooperation_info is not None:
                 self.dp_cooperation_realtime_tokens_total.labels(
@@ -941,6 +1044,16 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
 
+        self._log_gauge(
+            self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
+        )
+        self.routing_key_running_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_running_req_counts
+        )
+        self.routing_key_all_req_count.set_by_current_observations(
+            self.labels, stats.routing_key_all_req_counts
+        )
+
         self.last_log_time = time.perf_counter()
 
     def log_grammar_stats(self, grammar_stats) -> None:
@@ -967,6 +1080,9 @@ class SchedulerMetricsCollector:
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
+        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
 
 
 class TokenizerMetricsCollector:
@@ -1050,8 +1166,8 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens.",
-            labelnames=labels.keys(),
+            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            labelnames=list(labels.keys()) + ["cache_source"],
         )
 
         self.num_requests_total = Counter(
@@ -1205,11 +1321,36 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        cached_tokens_details: Optional[Dict[str, Any]] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+
+        # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
-            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+            if cached_tokens_details:
+                # Report by cache source (device/host, and storage if L3 enabled)
+                def report_cache_source(source: str, value: int):
+                    if value > 0:
+                        source_labels = {**labels, "cache_source": source}
+                        self.cached_tokens_total.labels(**source_labels).inc(value)
+
+                report_cache_source("device", cached_tokens_details.get("device", 0))
+                report_cache_source("host", cached_tokens_details.get("host", 0))
+
+                # Storage fields are only present when L3 storage backend is enabled
+                if "storage" in cached_tokens_details:
+                    storage_tokens = cached_tokens_details.get("storage", 0)
+                    if storage_tokens > 0:
+                        backend = (
+                            cached_tokens_details.get("storage_backend") or "unknown"
+                        )
+                        report_cache_source(f"storage_{backend}", storage_tokens)
+            else:
+                # Fallback for backward compatibility
+                labels_total = {**labels, "cache_source": "total"}
+                self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)

@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -19,10 +20,17 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_musa,
+    log_info_on_rank0,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +55,9 @@ class CustomAllreduce:
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
+    if _is_musa:
+        # crossover is at 128MB buffer size for MUSA
+        _MAX_CAR_SIZE = 16 * 8196 * 1024
 
     # max_size: max supported allreduce size
     def __init__(
@@ -129,7 +140,7 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
@@ -210,6 +221,8 @@ class CustomAllreduce:
         """
         lib = CudaRTLibrary()
         pointer = lib.cudaMalloc(size_in_bytes)
+        if _is_musa:
+            lib.cudaMemset(pointer, 0, size_in_bytes)
         handle = lib.cudaIpcGetMemHandle(pointer)
         world_size = dist.get_world_size(group=group)
         rank = dist.get_rank(group=group)
@@ -325,12 +338,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         if _is_hip:
             if self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         return False
@@ -398,13 +411,25 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 if _is_hip:
+                    if self.tms_cudagraph:
+                        return self.all_reduce_unreg(input)
                     return self.all_reduce_reg(input)
                 else:
                     return self.all_reduce(input, registered=not self.tms_cudagraph)
             else:
-                # If warm up, mimic the allocation pattern since custom
-                # allreduce is out-of-place.
-                return torch.zeros_like(input)
+                # Could be warmup OR piecewise cuda graph split op execution.
+                # In piecewise cuda graph, split ops run eagerly outside the graph
+                # but _IS_CAPTURING is still True. We need to do real all-reduce.
+                if is_in_piecewise_cuda_graph():
+                    # Split op execution - do real all-reduce
+                    if _is_hip:
+                        return self.all_reduce_unreg(input)
+                    else:
+                        return self.all_reduce(input, registered=False)
+                else:
+                    # True warmup - mimic the allocation pattern since custom
+                    # allreduce is out-of-place.
+                    return torch.zeros_like(input)
         else:
             if _is_hip:
                 # note: outside of cuda graph context,
@@ -433,7 +458,7 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
-    if _is_cuda:
+    if _is_cuda or _is_musa:
         return CustomAllreduce
 
     assert _is_hip

@@ -7,90 +7,102 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <type_traits>
 
+#ifndef USE_ROCM
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __nv_bfloat16;
+using fp8_e4m3_t = __nv_fp8_e4m3;
+using fp8_e5m2_t = __nv_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __nv_bfloat162;
+using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
+using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+
+using fp32x4_t = float4;
+#endif
+
+/*
+ * LDG Support
+ */
+#ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
+#else
+#define SGLANG_LDG(arg) *(arg)
+#endif
+
 namespace device {
+
+#define SGL_DEVICE __forceinline__ __device__
 
 inline constexpr auto kWarpThreads = 32u;
 inline constexpr auto kFullMask = 0xffffffffu;
 
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
-#ifndef USE_ROCM
-  float old;
-  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
-                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-  return old;
-#else
-  int* addr_as_i = (int*)addr;
-  int old = *addr_as_i, assumed;
-  do {
-    assumed = old;
-    old = atomicCAS(addr_as_i, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
-  } while (assumed != old);
-  return __int_as_float(old);
+template <bool kUsePDL>
+SGL_DEVICE void PDLWaitPrimary() {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
 #endif
 }
 
-__device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 16));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 8));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 4));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 2));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 1));
-  return value;
+template <bool kUsePDL>
+SGL_DEVICE void PDLTriggerSecondary() {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;" :::);
+  }
+#endif
 }
 
-__device__ __forceinline__ float blockReduceMax(float value) {
-  static __shared__ float warpLevelMaxs[kWarpThreads];
-  const int laneId = threadIdx.x % kWarpThreads;
-  const int warpId = threadIdx.x / kWarpThreads;
+/**
+ * \brief Load data with the specified type and offset from a void pointer.
+ * \tparam T The type to load.
+ * \param ptr The base pointer.
+ * \param offset The offset in number of elements of type T.
+ */
+template <typename T>
+SGL_DEVICE T load_as(const void* ptr, int64_t offset = 0) {
+  return static_cast<const T*>(ptr)[offset];
+}
 
-  value = warpReduceMax(value);
-
-  if (laneId == 0) warpLevelMaxs[warpId] = value;
-  __syncthreads();
-
-  value = (threadIdx.x < blockDim.x / kWarpThreads) ? warpLevelMaxs[laneId] : 0;
-  if (warpId == 0) value = warpReduceMax(value);
-
-  return value;
+/**
+ * \brief Store data with the specified type and offset to a void pointer.
+ * \tparam T The type to store.
+ * \param ptr The base pointer.
+ * \param val The value to store.
+ * \param offset The offset in number of elements of type T.
+ * \note we use type_identity_t to force the caller to explicitly specify
+ * the template parameter `T`, which can avoid accidentally using the wrong type.
+ */
+template <typename T>
+SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset = 0) {
+  static_cast<T*>(ptr)[offset] = val;
 }
 
 namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T, std::integral... U>
-__always_inline __device__ auto offset(T* ptr, U... offset) -> void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
+  return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T, std::integral... U>
-__always_inline __device__ auto offset(const T* ptr, U... offset) -> const void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<const char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
+  return static_cast<const T*>(ptr) + (... + offset);
 }
 
 }  // namespace pointer
-
-template <bool kUsePDL>
-__forceinline__ __device__ void PDLWaitPrimary() {
-#ifndef USE_ROCM
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;");
-  }
-#endif
-}
-
-template <bool kUsePDL>
-__forceinline__ __device__ void PDLTriggerSecondary() {
-#ifndef USE_ROCM
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;");
-  }
-#endif
-}
 
 }  // namespace device
 

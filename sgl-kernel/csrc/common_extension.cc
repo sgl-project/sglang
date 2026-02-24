@@ -142,19 +142,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
 
   m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
   m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
 
   m.def(
-      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
 
-  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kCUDA, &sgl_per_tensor_quant_fp8);
 
-  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
   m.def(
@@ -591,37 +591,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
-
-  /*
-   * From fast-hadamard-transform
-   */
-  m.def("fast_hadamard_transform(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform", torch::kCUDA, &fast_hadamard_transform);
-
-  m.def("fast_hadamard_transform_12N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_12N", torch::kCUDA, &fast_hadamard_transform_12N);
-
-  m.def("fast_hadamard_transform_20N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_20N", torch::kCUDA, &fast_hadamard_transform_20N);
-
-  m.def("fast_hadamard_transform_28N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_28N", torch::kCUDA, &fast_hadamard_transform_28N);
-
-  m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
-  m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
-
-  /*
-   * From csrc/sgl_diffusion/elementwise
-   */
-  m.def(
-      "timestep_embedding(Tensor input,"
-      "Tensor output,"
-      "int dim,"
-      "bool flip_sin_to_cos,"
-      "float downscale_freq_shift,"
-      "float scale,"
-      "int max_period) -> Tensor");
-  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -43,7 +43,7 @@ except ImportError:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import gptq_marlin_gemm
+    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 

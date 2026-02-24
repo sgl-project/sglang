@@ -25,6 +25,9 @@ from .simple_eval_common import (
 if TYPE_CHECKING:
     from .simple_eval_common import SamplerBase
 
+# MMLU dataset URL (hosted by OpenAI)
+MMLU_DATASET_URL = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+
 SUBJECT_TO_CATEGORY = {
     "abstract_algebra": "stem",
     "anatomy": "other",
