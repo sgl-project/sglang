@@ -25,6 +25,7 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 class MLPSyncBatchInfo:
     dp_size: int
     tp_size: int
+    cp_size: int
 
     num_tokens: int
     num_tokens_for_logprob: int
@@ -72,7 +73,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 6),
             dtype=torch.int64,
             device=device,
         )
@@ -88,7 +89,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -129,6 +130,7 @@ def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
     attn_tp_size: int,
+    attn_cp_size: int,
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
@@ -185,6 +187,7 @@ def prepare_mlp_sync_batch_raw(
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
+        cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_cuda_graph=can_cuda_graph,
@@ -226,6 +229,7 @@ class SchedulerDPAttnMixin:
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -234,25 +238,21 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
-    def maybe_prepare_mlp_sync_batch_and_log_stats(
+    def maybe_prepare_mlp_sync_batch(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
-        log_stats: bool = True,
     ) -> Optional[ScheduleBatch]:
         """
-        Helper to pair log_prefill_stats with log_prefill_stats_late.
-        Should be called after get_new_batch_prefill() to ensure proper pairing.
+        Helper to prepare MLP sync batch for DP attention.
+        Should be called after get_new_batch_prefill().
 
         Args:
             batch: The batch to process
             need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
-            log_stats: Whether to call log_prefill_stats_late. Set to False for intermediate calls.
         """
         if need_sync if need_sync is not None else self.require_mlp_sync:
             batch = self.prepare_mlp_sync_batch(batch)
-        if log_stats:
-            self.log_prefill_stats_late(batch)
         return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:

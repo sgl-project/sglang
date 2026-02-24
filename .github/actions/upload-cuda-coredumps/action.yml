@@ -1,0 +1,27 @@
+name: Upload CUDA Coredumps
+description: Upload CUDA coredump files as artifacts and clean up the directory.
+
+inputs:
+  artifact-suffix:
+    description: Suffix appended to the artifact name (e.g. matrix partition id)
+    required: false
+    default: ""
+  retention-days:
+    description: Number of days to retain the artifact
+    required: false
+    default: "7"
+
+runs:
+  using: composite
+  steps:
+    - name: Upload CUDA coredumps
+      uses: actions/upload-artifact@v4
+      with:
+        name: cuda-coredumps-${{ github.job }}${{ inputs.artifact-suffix && format('-{0}', inputs.artifact-suffix) }}
+        path: ${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}/
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ignore
+
+    - name: Cleanup CUDA coredumps
+      shell: bash
+      run: rm -rf "${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}"
