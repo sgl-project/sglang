@@ -639,10 +639,6 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
-        # Call post_load_weights for model-specific post-processing
-        # (e.g., DeepEP Waterfill shared expert weight copying)
-        post_load_weights(model, model_config)
-
         return model.eval()
 
     @staticmethod

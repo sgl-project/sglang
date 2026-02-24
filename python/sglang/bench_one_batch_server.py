@@ -565,15 +565,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     skip_token_capacity_threshold = (
         internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
     )
-    # Scale threshold by dp_size: the batch is distributed across DP ranks,
-    # so the per-rank token usage is batch_size/dp_size * (ISL + OSL).
-    dp_size = server_info.get("dp_size", None) or 1
-    skip_token_capacity_threshold *= dp_size
 
     # Get effective max running requests
     max_running_requests_per_dp = internal_state[0].get(
         "effective_max_running_requests_per_dp", -1
     )
+    dp_size = server_info.get("dp_size", None) or 1
     assert (
         max_running_requests_per_dp > 0
     ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"

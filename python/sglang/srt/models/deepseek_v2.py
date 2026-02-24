@@ -1084,7 +1084,7 @@ class DeepseekV2MoE(nn.Module):
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id
+                    layer_id=self.layer_id,
                 ),
             )
 
@@ -1183,7 +1183,7 @@ class DeepseekV2MoE(nn.Module):
                 pre_combine_hook_handle.remove()
 
             def _post_combine_hook(
-                dispatcher: BaseDispatcher, combined_hs: torch.Tensor
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
             ):
                 dispatcher.clear_overlap_args()
                 self.experts.clear_overlap_args()
