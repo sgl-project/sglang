@@ -129,7 +129,9 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
 @unittest.skip(
     "Skip this test until new testing logic in mini-lb has been updated in docker image."
 )
-class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention):
+class TestDisaggregationDPAttentionExternalRouting(
+    TestDisaggregationDPAttentionRoundRobin
+):
     """Test external DP rank assignment via mini-lb --test-external-dp-routing.
 
     NOTE: In PD disaggregation the response comes from the decode server,
@@ -139,8 +141,6 @@ class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention
     The mini-lb internally verifies meta_info["dp_rank"] matches the
     assigned decode dp_rank; a mismatch returns HTTP 500.
     """
-
-    LOAD_BALANCE_METHOD = "round_robin"
 
     @classmethod
     def launch_lb(cls):
@@ -164,35 +164,6 @@ class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention
         ]
         cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1400,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"Evaluation metrics: {metrics}")
-        self.assertGreater(metrics["accuracy"], 0.60)
-
-    def test_bench_serving(self):
-        args = get_benchmark_args(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            dataset_name="random",
-            tokenizer=self.model,
-            num_prompts=1000,
-            random_input_len=4096,
-            random_output_len=1024,
-            request_rate=float("inf"),
-            max_concurrency=256,
-        )
-        result = run_benchmark(args)
-        self.assertLess(result["mean_tpot_ms"], 20)
-        self.assertEqual(result["completed"], 1000)
 
 
 if __name__ == "__main__":
