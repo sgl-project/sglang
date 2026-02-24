@@ -101,7 +101,9 @@ class TestEntrypointPerRank:
 
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, filter="tensor_a", match_mode="per-rank")
+        args = _make_args(
+            baseline_path, target_path, filter="tensor_a", match_mode="per-rank"
+        )
         capsys.readouterr()
 
         run(args)
@@ -126,7 +128,9 @@ class TestEntrypointPerRank:
 
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
-        args = _make_args(baseline_path, target_path, start_step=1, end_step=1, match_mode="per-rank")
+        args = _make_args(
+            baseline_path, target_path, start_step=1, end_step=1, match_mode="per-rank"
+        )
         capsys.readouterr()
 
         run(args)
@@ -138,7 +142,9 @@ class TestEntrypointPerRank:
 class TestEntrypointJsonl:
     def test_jsonl_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
+        args = _make_args(
+            baseline_path, target_path, output_format="json", match_mode="per-rank"
+        )
         capsys.readouterr()
 
         run(args)
@@ -160,7 +166,9 @@ class TestEntrypointJsonl:
             tensor_names=["tensor_a", "tensor_extra"],
             baseline_names=["tensor_a"],
         )
-        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
+        args = _make_args(
+            baseline_path, target_path, output_format="json", match_mode="per-rank"
+        )
         capsys.readouterr()
 
         run(args)
@@ -176,7 +184,9 @@ class TestEntrypointJsonl:
 
     def test_jsonl_all_valid_records(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
-        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
+        args = _make_args(
+            baseline_path, target_path, output_format="json", match_mode="per-rank"
+        )
         capsys.readouterr()
 
         run(args)
