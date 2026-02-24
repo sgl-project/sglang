@@ -11,9 +11,8 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
 
 
 # _CoordsList[tensor_index][axis] =
-#     consider the `tensor_index`-th tensor in the input tensor list,
-#     the value means the output axis rank of it along the `axis`
-#     (e.g. coords[2][TP] = 3)
+#     the axis_rank (shard position) of the tensor_index-th tensor along `axis`
+#     (e.g. coords[2][TP] = 3 means tensor 2 is the TP rank-3 shard)
 _CoordsList = list[dict[ParallelAxis, int]]
 
 
