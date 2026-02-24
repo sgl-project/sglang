@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -19,8 +21,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 try:
@@ -179,8 +179,14 @@ class _NixlEPDispatcherImplBase:
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
         elastic_state = ElasticEPStateManager.instance()
-        self.active_ranks = elastic_state.active_ranks if elastic_state is not None else None
-        self._mask_buffer = torch.zeros_like(self.active_ranks) if self.active_ranks is not None else None
+        self.active_ranks = (
+            elastic_state.active_ranks if elastic_state is not None else None
+        )
+        self._mask_buffer = (
+            torch.zeros_like(self.active_ranks)
+            if self.active_ranks is not None
+            else None
+        )
 
         self.handle = None
         self.quant_config = None

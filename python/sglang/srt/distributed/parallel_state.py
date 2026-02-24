@@ -1592,9 +1592,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
 def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
-def _create_global_tcp_store(
-    rank: int, world_size: int
-) -> None:
+def _create_global_tcp_store(rank: int, world_size: int) -> None:
     """Create a global TCPStore for coordination across ranks.
 
     This function creates a TCPStore that all ranks can use for coordination
@@ -1624,7 +1622,9 @@ def _create_global_tcp_store(
         torch.distributed.broadcast_object_list(ip_list, src=0)
         master_ip = ip_list[0]
 
-    logger.debug("yorayz: master_ip: %s, base_store_port: %d", master_ip, base_store_port)
+    logger.debug(
+        "yorayz: master_ip: %s, base_store_port: %d", master_ip, base_store_port
+    )
     try:
         tcp_store = TCPStore(
             host_name=master_ip,
@@ -1635,13 +1635,18 @@ def _create_global_tcp_store(
         set_global_tcp_store(tcp_store)
         logger.info(
             "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
-            master_ip, base_store_port, rank, world_size
+            master_ip,
+            base_store_port,
+            rank,
+            world_size,
         )
     except Exception as e:
         logger.warning(
             "Failed to create global TCPStore at %s:%d: %s. "
             "Components requiring TCPStore (like NIXL) may not work.",
-            master_ip, base_store_port, e
+            master_ip,
+            base_store_port,
+            e,
         )
 
 

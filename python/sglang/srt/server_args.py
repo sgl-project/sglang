@@ -2225,8 +2225,6 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "nixl":
             self.ep_size = self.tp_size
-            #self.disable_cuda_graph = True
-            #logger.warning("Cuda graph is disabled because moe_a2a_backend=`nixl`")
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -2270,7 +2268,6 @@ class ServerArgs:
                     "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
                 ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
-
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -2291,12 +2288,10 @@ class ServerArgs:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
                     self.eplb_algorithm = "elasticity_aware"
-                assert (
-                    self.eplb_algorithm in [
-                        "elasticity_aware",
-                        "elasticity_aware_hierarchical",
-                    ]
-                ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                assert self.eplb_algorithm in [
+                    "elasticity_aware",
+                    "elasticity_aware_hierarchical",
+                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
