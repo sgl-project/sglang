@@ -27,6 +27,12 @@ UnshardParams = ConcatParams
 class UnshardPlan(_FrozenBase):
     axis: ParallelAxis
     params: UnshardParams
+    # Each inner list is one group of tensor indices to unshard together,
+    # ordered by axis_rank. In a list[UnshardPlan], the first plan's indices
+    # refer to positions in the original tensor list (by world_rank); each
+    # subsequent plan's indices refer to the previous plan's output list.
+    # Every plan's groups must cover all input indices exactly once; the
+    # final plan must produce exactly one output tensor.
     groups: list[list[int]]
 
 
