@@ -159,7 +159,7 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.debug("resized img height: %s, img width: %s", img.height, img.width)
+            logger.debug("resized condition image to: %sx%s", img.height, img.width)
 
             # center-crop
             x1 = (img.width - ow) // 2

@@ -399,7 +399,7 @@ class MOVADenoisingStage(PipelineStage):
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
-        timings = getattr(batch, "timings", None)
+        metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
         with self.progress_bar(total=total_steps) as progress_bar:
@@ -407,7 +407,7 @@ class MOVADenoisingStage(PipelineStage):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
                     logger=logger,
-                    timings=timings,
+                    metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
                 ):
                     pair_t = paired_timesteps[idx_step]
@@ -908,6 +908,6 @@ class MOVADecodingStage(PipelineStage):
             output=video,
             audio=audio,
             audio_sample_rate=getattr(self.audio_vae, "sample_rate", None),
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
         return output_batch
