@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.comparator.pipeline import process_tensor_group
 from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
 
-_NON_KEY_COLS = {"dump_index", "filename", "duplicate_index"}
+_NON_KEY_COLS = {"dump_index", "filename"}
 
 
 def main() -> None:
