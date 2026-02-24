@@ -1,6 +1,8 @@
 name: Release Documentation
 
 on:
+  release:
+    types: [published]
   push:
     branches:
       - main
@@ -24,6 +26,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Fetch full git history for release index
+        if: github.event_name == 'release'
+        run: |
+          git fetch --prune --unshallow || git fetch --prune --depth=0
 
       - name: Install dependencies
         run: |
@@ -53,10 +60,23 @@ jobs:
           make markdown
           python3 wrap_run_llm.py
 
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            python3 release_lookup/generate_index.py --output release_lookup/release_index.json
+
+            # Copy release lookup tool for official docs on published releases.
+            mkdir -p _build/html/release_lookup
+            cp release_lookup/index.html _build/html/release_lookup/
+            cp release_lookup/release_index.json _build/html/release_lookup/
+          fi
+
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1
-          find ../sgl-project.github.io/ -mindepth 1 -not -path "../sgl-project.github.io/.git*" -not -name CNAME -not -name ".jekyll" -not -name ".nojekyll" -delete
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            find ../sgl-project.github.io/ -mindepth 1 -not -path "../sgl-project.github.io/.git*" -not -name CNAME -not -name ".jekyll" -not -name ".nojekyll" -delete
+          else
+            find ../sgl-project.github.io/ -mindepth 1 -not -path "../sgl-project.github.io/.git*" -not -path "../sgl-project.github.io/release_lookup*" -not -name CNAME -not -name ".jekyll" -not -name ".nojekyll" -delete
+          fi
           cp -r * ../sgl-project.github.io
           cp ../../README.md ../sgl-project.github.io/README.md
           cd ../sgl-project.github.io

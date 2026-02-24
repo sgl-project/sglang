@@ -9,3 +9,4 @@ Adding new models and alternative backends.
    support_new_models.md
    transformers_fallback.md
    modelscope.md
+   mindspore_models.md
