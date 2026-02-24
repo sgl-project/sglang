@@ -111,5 +111,7 @@ def _execute_plans(
         if isinstance(plan, UnshardPlan):
             # TODO: incorrect `tensors_by_world_rank` if multi UnshardPlan
             tensors = execute_unshard_plan(plan, tensors_by_world_rank=dict(enumerate(tensors)))
+        else:
+            raise NotImplementedError(f"Unknown {plan=}")
 
     return tensors
