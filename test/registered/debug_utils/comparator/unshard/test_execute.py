@@ -18,7 +18,9 @@ class TestExecuteUnshardPlan:
         shards = list(full_tensor.chunk(4, dim=1))
 
         dim_specs = parse_dims("b h(tp) d")
-        parallel_infos = [{ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)]
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
+        ]
         plans = compute_unshard_plan(dim_specs, parallel_infos)
         assert len(plans) == 1
 
@@ -62,10 +64,12 @@ class TestExecuteUnshardPlan:
         parallel_infos = []
         for cp_rank in range(2):
             for tp_rank in range(4):
-                parallel_infos.append({
-                    ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
-                    ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=4),
-                })
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=4),
+                    }
+                )
 
         plans = compute_unshard_plan(dim_specs, parallel_infos)
         assert len(plans) == 2
@@ -94,10 +98,12 @@ class TestExecuteUnshardPlan:
             tp_chunks = list(cp_chunks[cp_rank].chunk(2, dim=2))
             for tp_rank in range(2):
                 tensors.append(tp_chunks[tp_rank])
-                parallel_infos.append({
-                    ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
-                    ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
-                })
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                    }
+                )
 
         dim_specs = parse_dims("b s(cp) h(tp)")
         plans = compute_unshard_plan(dim_specs, parallel_infos)
@@ -133,10 +139,12 @@ class TestExecuteUnshardPlan:
         parallel_infos = []
         for cp_rank, tp_rank in scrambled_assignment:
             tensors.append(shard_map[(cp_rank, tp_rank)])
-            parallel_infos.append({
-                ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
-                ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
-            })
+            parallel_infos.append(
+                {
+                    ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                    ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                }
+            )
 
         dim_specs = parse_dims("b s(cp) h(tp)")
         plans = compute_unshard_plan(dim_specs, parallel_infos)

@@ -9,10 +9,9 @@ from sglang.srt.debug_utils.comparator.unshard.types import (
     UnshardPlan,
 )
 
-
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`
-#     (e.g. coords[2][TP] = 3 means tensor 2 is the TP rank-3 shard)
+#     (e.g. coords[2] = {TP: 3} means tensor 2 is the 3rd shard in TP axis)
 _CoordsList = list[dict[ParallelAxis, int]]
 
 
@@ -50,11 +49,13 @@ def compute_unshard_plan(
             target_axis=axis,
         )
 
-        plans.append(UnshardPlan(
-            axis=axis,
-            params=_resolve_unshard_params(spec=spec, dim_index=dim_index),
-            groups=result.groups,
-        ))
+        plans.append(
+            UnshardPlan(
+                axis=axis,
+                params=_resolve_unshard_params(spec=spec, dim_index=dim_index),
+                groups=result.groups,
+            )
+        )
 
         current_coords = result.projected_coords
 

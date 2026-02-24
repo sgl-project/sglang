@@ -95,10 +95,12 @@ class TestComputeUnshardPlan:
         parallel_infos = []
         for cp_rank in range(2):
             for tp_rank in range(4):
-                parallel_infos.append({
-                    ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
-                    ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=4),
-                })
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=4),
+                    }
+                )
 
         plans = compute_unshard_plan(dim_specs, parallel_infos)
 
