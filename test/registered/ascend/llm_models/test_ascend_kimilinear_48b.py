@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
