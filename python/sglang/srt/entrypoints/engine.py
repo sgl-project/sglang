@@ -862,17 +862,18 @@ def _sync_scheduler_infos_across_nodes(
     local_scheduler_infos: List[Dict],
 ) -> List[Dict]:
     """
-    Gather scheduler_infos from all nodes using Gloo collective.
+    Gather scheduler_infos from all nodes using StatelessProcessGroup.
     Returns merged list containing scheduler info from all ranks across all nodes.
-    """
-    from datetime import timedelta
 
-    import torch.distributed as dist
+    Uses StatelessProcessGroup (TCPStore-based) instead of dist.init_process_group
+    to avoid polluting/destroying the global process group state, which would break
+    gloo groups used by co-located training actors.
+    """
+    from sglang.srt.distributed.utils import StatelessProcessGroup
 
     METADATA_SYNC_PORT_OFFSET = 10000
     dist_host, dist_port = server_args.dist_init_addr.rsplit(":", 1)
     sync_port = int(dist_port) + METADATA_SYNC_PORT_OFFSET
-    sync_init_method = f"tcp://{dist_host}:{sync_port}"
 
     logger.info(
         f"Syncing scheduler_infos across {server_args.nnodes} nodes "
@@ -880,16 +881,14 @@ def _sync_scheduler_infos_across_nodes(
     )
 
     try:
-        dist.init_process_group(
-            backend="gloo",
-            init_method=sync_init_method,
-            world_size=server_args.nnodes,
+        pg = StatelessProcessGroup.create(
+            host=dist_host,
+            port=sync_port,
             rank=server_args.node_rank,
-            timeout=timedelta(seconds=120),
+            world_size=server_args.nnodes,
         )
 
-        all_node_infos = [None] * server_args.nnodes
-        dist.all_gather_object(all_node_infos, local_scheduler_infos)
+        all_node_infos = pg.all_gather_obj(local_scheduler_infos)
 
         merged_scheduler_infos = []
         for node_infos in all_node_infos:
@@ -907,10 +906,6 @@ def _sync_scheduler_infos_across_nodes(
             f"Only local ranks will be available."
         )
         return local_scheduler_infos
-
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def _launch_scheduler_processes(
