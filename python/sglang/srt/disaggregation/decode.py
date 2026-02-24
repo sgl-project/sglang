@@ -364,14 +364,12 @@ class DecodePreallocQueue:
 
         bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
 
-        if bootstrap_addr not in self.kv_manager.prefill_dp_size_table:
+        prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+        if prefill_info is None:
             return None
 
-        if self.kv_manager.follow_bootstrap_room_table[bootstrap_addr]:
-            return (
-                req.bootstrap_room
-                % self.kv_manager.prefill_dp_size_table[bootstrap_addr]
-            )
+        if prefill_info.follow_bootstrap_room:
+            return req.bootstrap_room % prefill_info.dp_size
 
         return None
 

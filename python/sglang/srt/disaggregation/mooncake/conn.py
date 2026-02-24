@@ -997,7 +997,7 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
+                    addresses = list(self.prefill_info_table.keys())
 
                 for bootstrap_addr in addresses:
                     session = None
@@ -1128,16 +1128,8 @@ class MooncakeKVManager(CommonKVManager):
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
             )
-            keys_to_remove = [
-                self.prefill_attn_tp_size_table,
-                self.prefill_dp_size_table,
-                self.prefill_pp_size_table,
-                self.follow_bootstrap_room_table,
-                self.addr_to_rooms_tracker,
-            ]
-            for k in keys_to_remove:
-                if failed_bootstrap_addr in k:
-                    del k[failed_bootstrap_addr]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
         # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
         affected_rooms = []
