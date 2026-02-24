@@ -80,10 +80,4 @@ def _parse_args() -> argparse.Namespace:
         default="text",
         help="Output format: text (default) or json (JSONL, one JSON object per line)",
     )
-    parser.add_argument(
-        "--dp-rank",
-        type=int,
-        default=0,
-        help="Which DP rank to compare",
-    )
     return parser.parse_args()
