@@ -1,5 +1,11 @@
 name: Release Docker Images Nightly (NPU)
 on:
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/release-docker-npu-nightly.yml'
+      - 'docker/npu.Dockerfile'
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
@@ -74,6 +80,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.01.28
+            SGLANG_KERNEL_NPU_TAG=2026.02.01.post2
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
