@@ -105,6 +105,9 @@ USER root
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
+# Install AMD SMI Python package from ROCm distribution
+RUN cd /opt/rocm/share/amd_smi && python3 -m pip install --no-cache-dir .
+
 WORKDIR /sgl-workspace
 
 # -----------------------
@@ -240,10 +243,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+RUN python3 -m pip install --no-cache-dir maturin \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && /bin/bash -lc 'ulimit -n 8192 && cargo build --release' \
-    && python3 -m pip install --no-cache-dir . \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cache
 
 # -----------------------
@@ -260,7 +263,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       libgtest-dev libgmock-dev \
       libprotobuf-dev protobuf-compiler libgflags-dev libsqlite3-dev \
       python3 python3-dev python3-setuptools python3-pip python3-apt \
-      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev \
+      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev vim \
       cmake ninja-build pkg-config libstdc++6 software-properties-common \
   && rm -rf /var/lib/apt/lists/*; \
   \
@@ -493,10 +496,7 @@ ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
-ENV VLLM_FP8_PADDING=1
-ENV VLLM_FP8_ACT_PADDING=1
-ENV VLLM_FP8_WEIGHT_PADDING=1
-ENV VLLM_FP8_REDUCE_CONV=1
+ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 

@@ -46,7 +46,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -92,6 +92,9 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+)
+from sglang.srt.entrypoints.openai.serving_transcription import (
+    OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -296,6 +299,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
     )
 
@@ -630,7 +636,7 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 
 
 # Do not import `dumper.py` to avoid dependency
-if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
+if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 
     @app.api_route("/dumper/{method}", methods=["POST"])
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
@@ -1415,6 +1421,38 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     """OpenAI-compatible detokenization endpoint."""
     return await raw_request.app.state.openai_serving_detokenize.handle_request(
         request, raw_request
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_v1_audio_transcriptions(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(default="default"),
+    language: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    temperature: float = Form(default=0.0),
+    stream: bool = Form(default=False),
+):
+    """OpenAI-compatible audio transcription endpoint."""
+    if response_format not in ["json", "text"]:
+        return ORJSONResponse(
+            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            status_code=400,
+        )
+
+    audio_data = await file.read()
+
+    return (
+        await raw_request.app.state.openai_serving_transcription.create_transcription(
+            audio_data=audio_data,
+            model=model,
+            language=language,
+            response_format=response_format,
+            temperature=temperature,
+            stream=stream,
+            raw_request=raw_request,
+        )
     )
 
 

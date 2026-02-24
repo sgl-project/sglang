@@ -391,7 +391,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
 
         original_model_path = model_path  # Keep original for custom_pipeline
-        model_path = maybe_download_model(model_path)
+        model_path = maybe_download_model(model_path, force_diffusers_model=True)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
@@ -489,11 +489,6 @@ class DiffusersPipeline(ComposedPipelineBase):
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
         backend = server_args.attention_backend
-
-        if backend is None:
-            config = server_args.pipeline_config
-            if config is not None:
-                backend = getattr(config, "diffusers_attention_backend", None)
 
         if backend is None:
             return

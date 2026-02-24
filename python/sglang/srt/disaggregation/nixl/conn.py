@@ -224,7 +224,7 @@ class NixlKVManager(CommonKVManager):
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
+                    addresses = list(self.prefill_info_table.keys())
 
                 for bootstrap_addr in addresses:
                     session = None
@@ -274,18 +274,12 @@ class NixlKVManager(CommonKVManager):
             ]
             for k in keys_to_remove:
                 del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
-                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_dp_size_table:
-                del self.prefill_dp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_pp_size_table:
-                del self.prefill_pp_size_table[failed_bootstrap_addr]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
             )
-            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
-                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
         # Mark all pending transfers associated with the failed node as failed
         affected_rooms = []
@@ -305,24 +299,6 @@ class NixlKVManager(CommonKVManager):
         for room in possible_affected_rooms:
             logger.error(f"Let room {room} be failed due to prefill down")
             self.update_status(room, KVPoll.Failed)
-
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        pass
 
     def register_buffer_to_engine(self):
         kv_addrs = []
