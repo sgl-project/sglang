@@ -22,7 +22,7 @@ def compute_unshard_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded = {
+    sharded: dict[ParallelAxis, tuple[int, DimSpec]] = {
         spec.parallel: (dim_idx, spec)
         for dim_idx, spec in enumerate(dim_specs)
         if spec.parallel is not None
