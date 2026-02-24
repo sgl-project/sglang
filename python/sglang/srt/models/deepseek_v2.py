@@ -1681,9 +1681,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q_nope_out,
                 )
             else:
-                if (
-                    (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn)
-                    or  (get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz)
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
                 ):
                     # fp8 Triton kernel: always on gfx950,
                     # cudagraph-only on gfx942 (hides launch overhead)
@@ -1863,9 +1862,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     attn_bmm_output,
                 )
             else:
-                if (
-                    (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn)
-                    or  (get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz)
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
                 ):
                     # fp8 Triton kernel: always on gfx950,
                     # cudagraph-only on gfx942 (hides launch overhead)
