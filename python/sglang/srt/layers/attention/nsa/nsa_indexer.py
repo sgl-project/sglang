@@ -28,6 +28,10 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -35,7 +39,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -122,7 +125,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
-        from sgl_kernel import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -162,8 +165,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
-            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attn_context_model_parallel_world_size()
+            self.cp_rank = get_attn_context_model_parallel_rank()
         else:
             self.cp_size = None
             self.cp_rank = None
@@ -226,21 +229,31 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            weight = self.weights_proj.weight
+            out = torch.empty(
+                (x.shape[0], weight.shape[0]),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+            return out
+
         if _is_hip:
             x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        return weights.float()
+
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    def _project_and_scale_head_gates(self, x: torch.Tensor):
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
-        weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights

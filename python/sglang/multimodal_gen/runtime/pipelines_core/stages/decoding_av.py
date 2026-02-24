@@ -69,7 +69,7 @@ class LTX2AVDecodingStage(DecodingStage):
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=None,
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
 
         # 2. Decode Audio
