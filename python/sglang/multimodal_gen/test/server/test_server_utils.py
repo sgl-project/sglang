@@ -18,7 +18,7 @@ from typing import Any, Callable, Sequence
 from urllib.request import urlopen
 
 import pytest
-from openai import Client, OpenAI
+from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -449,81 +449,6 @@ class ServerManager:
             return "\n".join(content.splitlines()[-lines:])
         except Exception:
             return ""
-
-
-class WarmupRunner:
-    """Handles warmup requests for a server."""
-
-    def __init__(
-        self,
-        port: int,
-        model: str,
-        prompt: str,
-        output_size: str,
-        output_format: str = None,
-    ):
-        self.client = OpenAI(
-            api_key="sglang-anything",
-            base_url=f"http://localhost:{port}/v1",
-        )
-        self.model = model
-        self.prompt = prompt
-        self.output_size = output_size
-        self.output_format = output_format
-
-    def run_text_warmups(self, count: int) -> None:
-        """Run text-to-image warmup requests."""
-        if count <= 0:
-            return
-
-        logger.info("[server-test] Running %s text warm-up(s)", count)
-        for _ in range(count):
-            result = self.client.images.generate(
-                model=self.model,
-                prompt=self.prompt,
-                n=1,
-                size=self.output_size,
-                response_format="b64_json",
-            )
-            validate_image(result.data[0].b64_json)
-
-    def run_edit_warmups(
-        self,
-        count: int,
-        edit_prompt: str,
-        image_path: Path,
-    ) -> None:
-        """Run image-edit warmup requests."""
-        if count <= 0:
-            return
-
-        if not isinstance(image_path, list):
-            image_path = [image_path]
-
-        for image in image_path:
-            if not image.exists():
-                logger.warning(
-                    "[server-test] Skipping edit warmup: image missing at %s", image
-                )
-                return
-
-        logger.info("[server-test] Running %s edit warm-up(s)", count)
-        for _ in range(count):
-            images = [open(image, "rb") for image in image_path]
-            try:
-                result = self.client.images.edit(
-                    model=self.model,
-                    image=images,
-                    prompt=edit_prompt,
-                    n=1,
-                    size=self.output_size,
-                    response_format="b64_json",
-                    output_format=self.output_format,
-                )
-            finally:
-                for img in images:
-                    img.close()
-            validate_image(result.data[0].b64_json)
 
 
 class PerformanceValidator:

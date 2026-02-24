@@ -6,18 +6,39 @@
     <title>SGLang Performance Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-primary: #0d1117;
-            --bg-secondary: #161b22;
-            --bg-tertiary: #21262d;
-            --text-primary: #c9d1d9;
-            --text-secondary: #8b949e;
-            --border-color: #30363d;
-            --accent-color: #58a6ff;
-            --accent-green: #3fb950;
-            --accent-orange: #d29922;
-            --accent-red: #f85149;
+            --bg-primary: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-tertiary: #1a2332;
+            --bg-elevated: #1e293b;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --border-color: #1e293b;
+            --border-subtle: rgba(148, 163, 184, 0.08);
+            --accent-cyan: #22d3ee;
+            --accent-cyan-dim: rgba(34, 211, 238, 0.15);
+            --accent-green: #34d399;
+            --accent-green-dim: rgba(52, 211, 153, 0.15);
+            --accent-amber: #fbbf24;
+            --accent-amber-dim: rgba(251, 191, 36, 0.15);
+            --accent-red: #f87171;
+            --accent-red-dim: rgba(248, 113, 113, 0.15);
+            --accent-violet: #a78bfa;
+            --accent-violet-dim: rgba(167, 139, 250, 0.15);
+            --glass-bg: rgba(17, 24, 39, 0.7);
+            --glass-border: rgba(148, 163, 184, 0.1);
+            --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+            --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3);
+            --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.4);
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 14px;
+            --radius-xl: 20px;
         }
 
         * {
@@ -27,290 +48,330 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+            font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
             background-color: var(--bg-primary);
             color: var(--text-primary);
-            line-height: 1.5;
+            line-height: 1.6;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Subtle grid background */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(148, 163, 184, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 163, 184, 0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* Ambient glow */
+        body::after {
+            content: '';
+            position: fixed;
+            top: -40%;
+            left: -20%;
+            width: 80%;
+            height: 80%;
+            background: radial-gradient(ellipse, rgba(34, 211, 238, 0.04) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1480px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 24px 32px;
+            position: relative;
+            z-index: 1;
         }
 
+        /* ---- Header ---- */
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 20px 0;
-            border-bottom: 1px solid var(--border-color);
-            margin-bottom: 24px;
+            padding: 20px 0 24px;
+            margin-bottom: 28px;
+            border-bottom: 1px solid var(--border-subtle);
         }
 
         h1 {
-            font-size: 24px;
+            font-size: 22px;
             font-weight: 600;
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 14px;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
         }
 
-        h1 svg {
-            width: 32px;
-            height: 32px;
+        .logo-mark {
+            width: 36px;
+            height: 36px;
+            border-radius: var(--radius-md);
+            background: linear-gradient(135deg, var(--accent-cyan-dim), rgba(167, 139, 250, 0.12));
+            border: 1px solid rgba(34, 211, 238, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .logo-mark svg {
+            width: 20px;
+            height: 20px;
+            color: var(--accent-cyan);
+        }
+
+        h1 span.title-accent {
+            color: var(--accent-cyan);
         }
 
         .header-actions {
             display: flex;
-            gap: 12px;
+            gap: 10px;
             align-items: center;
         }
 
         .btn {
-            padding: 8px 16px;
-            border-radius: 6px;
+            padding: 8px 18px;
+            border-radius: var(--radius-sm);
             border: 1px solid var(--border-color);
             background: var(--bg-secondary);
-            color: var(--text-primary);
+            color: var(--text-secondary);
             cursor: pointer;
-            font-size: 14px;
-            transition: all 0.2s;
+            font-size: 13px;
+            font-family: 'DM Sans', sans-serif;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .btn:hover {
             background: var(--bg-tertiary);
-            border-color: var(--text-secondary);
+            color: var(--text-primary);
+            border-color: var(--glass-border);
+        }
+
+        .btn svg {
+            width: 14px;
+            height: 14px;
         }
 
         .btn-primary {
-            background: var(--accent-color);
-            border-color: var(--accent-color);
-            color: white;
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.15), rgba(34, 211, 238, 0.08));
+            border-color: rgba(34, 211, 238, 0.25);
+            color: var(--accent-cyan);
         }
 
         .btn-primary:hover {
-            background: #4a9eff;
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.25), rgba(34, 211, 238, 0.12));
+            border-color: rgba(34, 211, 238, 0.4);
         }
 
+        /* ---- Stats Row ---- */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+
+        .stat-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--glass-border);
+            padding: 20px 22px;
+            position: relative;
+            overflow: hidden;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+        }
+
+        .stat-card:nth-child(1)::before { background: linear-gradient(90deg, var(--accent-cyan), transparent); }
+        .stat-card:nth-child(2)::before { background: linear-gradient(90deg, var(--accent-violet), transparent); }
+        .stat-card:nth-child(3)::before { background: linear-gradient(90deg, var(--accent-green), transparent); }
+
+        .stat-card .label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+
+        .stat-card .value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.02em;
+        }
+
+        .stat-card .change {
+            font-size: 12px;
+            margin-top: 6px;
+            font-weight: 500;
+        }
+
+        .stat-card .change.positive { color: var(--accent-green); }
+        .stat-card .change.negative { color: var(--accent-red); }
+
+        /* ---- Filters ---- */
         .filters {
             display: flex;
-            gap: 16px;
+            gap: 14px;
             flex-wrap: wrap;
-            margin-bottom: 24px;
-            padding: 16px;
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
+            margin-bottom: 28px;
+            padding: 18px 22px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--glass-border);
+            align-items: flex-end;
         }
 
         .filter-group {
             display: flex;
             flex-direction: column;
             gap: 6px;
+            flex: 1;
+            min-width: 160px;
         }
 
         .filter-group label {
-            font-size: 12px;
-            color: var(--text-secondary);
-            font-weight: 500;
+            font-size: 10px;
+            color: var(--text-muted);
+            font-weight: 600;
             text-transform: uppercase;
+            letter-spacing: 0.1em;
         }
 
         select {
-            padding: 8px 12px;
-            border-radius: 6px;
+            padding: 9px 32px 9px 14px;
+            border-radius: var(--radius-sm);
             border: 1px solid var(--border-color);
             background: var(--bg-tertiary);
             color: var(--text-primary);
-            font-size: 14px;
-            min-width: 180px;
+            font-size: 13px;
+            font-family: 'DM Sans', sans-serif;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            width: 100%;
+        }
+
+        select:hover {
+            border-color: rgba(148, 163, 184, 0.2);
         }
 
         select:focus {
             outline: none;
-            border-color: var(--accent-color);
+            border-color: rgba(34, 211, 238, 0.4);
+            box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08);
         }
 
+        /* ---- Metric Tabs ---- */
         .tabs {
             display: flex;
-            gap: 4px;
+            gap: 2px;
             margin-bottom: 24px;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 0;
+            padding: 4px;
+            background: var(--bg-secondary);
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-subtle);
+            width: fit-content;
         }
 
         .tab {
-            padding: 12px 20px;
+            padding: 9px 18px;
             cursor: pointer;
-            border-radius: 6px 6px 0 0;
+            border-radius: var(--radius-sm);
             background: transparent;
-            color: var(--text-secondary);
-            border: 1px solid transparent;
-            border-bottom: none;
-            transition: all 0.2s;
+            color: var(--text-muted);
+            border: none;
+            transition: all 0.2s ease;
             font-weight: 500;
+            font-size: 13px;
+            font-family: 'DM Sans', sans-serif;
+            white-space: nowrap;
         }
 
         .tab:hover {
-            color: var(--text-primary);
-            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            background: rgba(148, 163, 184, 0.05);
         }
 
         .tab.active {
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            border-color: var(--border-color);
-            border-bottom: 1px solid var(--bg-secondary);
-            margin-bottom: -1px;
+            background: var(--bg-tertiary);
+            color: var(--accent-cyan);
+            box-shadow: var(--shadow-sm);
         }
 
-        .charts-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(600px, 1fr));
-            gap: 24px;
-        }
-
+        /* ---- Chart Cards ---- */
         .chart-card {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            padding: 20px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--glass-border);
+            padding: 24px;
         }
 
         .chart-card h3 {
-            font-size: 16px;
+            font-size: 15px;
             font-weight: 600;
-            margin-bottom: 16px;
+            margin-bottom: 20px;
             color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            letter-spacing: -0.01em;
+        }
+
+        .chart-card h3::before {
+            content: '';
+            width: 3px;
+            height: 18px;
+            background: var(--accent-cyan);
+            border-radius: 2px;
+            flex-shrink: 0;
         }
 
         .chart-container {
             position: relative;
-            height: 300px;
-        }
-
-        .loading {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 400px;
-            color: var(--text-secondary);
-        }
-
-        .spinner {
-            width: 40px;
-            height: 40px;
-            border: 3px solid var(--border-color);
-            border-top-color: var(--accent-color);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .error {
-            background: rgba(248, 81, 73, 0.1);
-            border: 1px solid var(--accent-red);
-            border-radius: 8px;
-            padding: 20px;
-            text-align: center;
-            color: var(--accent-red);
-        }
-
-        .stats-row {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }
-
-        .stat-card {
-            background: var(--bg-secondary);
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            padding: 16px;
-        }
-
-        .stat-card .label {
-            font-size: 12px;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            margin-bottom: 4px;
-        }
-
-        .stat-card .value {
-            font-size: 24px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .stat-card .change {
-            font-size: 12px;
-            margin-top: 4px;
-        }
-
-        .stat-card .change.positive {
-            color: var(--accent-green);
-        }
-
-        .stat-card .change.negative {
-            color: var(--accent-red);
-        }
-
-        .data-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 24px;
-        }
-
-        .data-table th,
-        .data-table td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .data-table th {
-            background: var(--bg-tertiary);
-            font-weight: 600;
-            color: var(--text-secondary);
-            font-size: 12px;
-            text-transform: uppercase;
-        }
-
-        .data-table tr:hover {
-            background: var(--bg-tertiary);
-        }
-
-        .run-link {
-            color: var(--accent-color);
-            text-decoration: none;
-        }
-
-        .run-link:hover {
-            text-decoration: underline;
-        }
-
-        .no-data {
-            text-align: center;
-            padding: 60px 20px;
-            color: var(--text-secondary);
-        }
-
-        .no-data h3 {
-            margin-bottom: 8px;
-        }
-
-        .model-badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
+            height: 320px;
         }
 
         .metric-section {
@@ -319,70 +380,495 @@
 
         .batch-charts-container {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+            gap: 18px;
         }
 
         .batch-chart-wrapper {
             background: var(--bg-tertiary);
-            border-radius: 6px;
-            padding: 12px;
+            border-radius: var(--radius-md);
+            padding: 16px;
+            border: 1px solid var(--border-subtle);
         }
 
         .batch-chart-title {
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-muted);
+            margin-bottom: 10px;
             text-align: center;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
         }
 
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(600px, 1fr));
+            gap: 24px;
+        }
+
+        /* ---- Data Table ---- */
+        .data-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin-top: 20px;
+        }
+
+        .data-table th {
+            padding: 10px 16px;
+            text-align: left;
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            border-bottom: 1px solid var(--border-color);
+            background: transparent;
+        }
+
+        .data-table td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .data-table tbody tr {
+            transition: background 0.15s ease;
+        }
+
+        .data-table tbody tr:hover {
+            background: rgba(148, 163, 184, 0.04);
+        }
+
+        .data-table td code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--accent-cyan);
+            background: var(--accent-cyan-dim);
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+
+        .run-link {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            color: var(--accent-cyan);
+            text-decoration: none;
+            transition: color 0.15s;
+        }
+
+        .run-link:hover {
+            color: #67e8f9;
+            text-decoration: underline;
+        }
+
+        .model-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 500;
+            background: var(--accent-violet-dim);
+            color: var(--accent-violet);
+            border: 1px solid rgba(167, 139, 250, 0.15);
+        }
+
+        /* ---- Loading ---- */
+        .loading {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 400px;
+            gap: 20px;
+            color: var(--text-muted);
+        }
+
+        .spinner {
+            width: 36px;
+            height: 36px;
+            border: 2px solid var(--border-color);
+            border-top-color: var(--accent-cyan);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-muted);
+        }
+
+        /* ---- Error ---- */
+        .error {
+            background: var(--accent-red-dim);
+            border: 1px solid rgba(248, 113, 113, 0.2);
+            border-radius: var(--radius-lg);
+            padding: 28px;
+            text-align: center;
+            color: var(--accent-red);
+        }
+
+        .error h3 {
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+
+        .error p {
+            font-size: 13px;
+            color: rgba(248, 113, 113, 0.8);
+        }
+
+        .no-data {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        .no-data h3 {
+            margin-bottom: 8px;
+        }
+
+        /* ---- Footer ---- */
         footer {
             margin-top: 48px;
-            padding: 24px 0;
-            border-top: 1px solid var(--border-color);
+            padding: 28px 0;
+            border-top: 1px solid var(--border-subtle);
             text-align: center;
-            color: var(--text-secondary);
-            font-size: 14px;
+            color: var(--text-muted);
+            font-size: 13px;
         }
 
         footer a {
-            color: var(--accent-color);
+            color: var(--text-secondary);
             text-decoration: none;
+            transition: color 0.15s;
         }
 
         footer a:hover {
-            text-decoration: underline;
+            color: var(--accent-cyan);
+        }
+
+        /* ---- Login Overlay ---- */
+        .login-overlay {
+            position: fixed;
+            inset: 0;
+            background-color: var(--bg-primary);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            overflow: hidden;
+        }
+
+        .login-overlay::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(148, 163, 184, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 163, 184, 0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+        }
+
+        .login-overlay::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(ellipse, rgba(34, 211, 238, 0.06) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .login-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-xl);
+            padding: 44px 40px;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: var(--shadow-lg);
+            position: relative;
+            z-index: 1;
+            animation: loginSlideUp 0.5s ease-out;
+        }
+
+        @keyframes loginSlideUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .login-icon {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .login-icon-wrapper {
+            width: 56px;
+            height: 56px;
+            margin: 0 auto;
+            border-radius: var(--radius-lg);
+            background: linear-gradient(135deg, var(--accent-cyan-dim), rgba(167, 139, 250, 0.12));
+            border: 1px solid rgba(34, 211, 238, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-icon-wrapper svg {
+            width: 24px;
+            height: 24px;
+            color: var(--accent-cyan);
+        }
+
+        .login-card h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 6px;
+            text-align: center;
+            letter-spacing: -0.02em;
+        }
+
+        .login-card .login-subtitle {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-align: center;
+            margin-bottom: 28px;
+        }
+
+        .login-card .form-group {
+            margin-bottom: 18px;
+        }
+
+        .login-card .form-group label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 7px;
+            font-weight: 500;
+        }
+
+        .login-card .form-group input {
+            width: 100%;
+            padding: 11px 14px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border-color);
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: 'DM Sans', sans-serif;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+
+        .login-card .form-group input:focus {
+            border-color: rgba(34, 211, 238, 0.4);
+            box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08);
+        }
+
+        .login-card .form-group input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .login-card .login-btn {
+            width: 100%;
+            padding: 11px 16px;
+            border-radius: var(--radius-sm);
+            border: 1px solid rgba(34, 211, 238, 0.3);
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.15), rgba(34, 211, 238, 0.08));
+            color: var(--accent-cyan);
+            font-size: 14px;
+            font-family: 'DM Sans', sans-serif;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-top: 6px;
+        }
+
+        .login-card .login-btn:hover {
+            background: linear-gradient(135deg, rgba(34, 211, 238, 0.25), rgba(34, 211, 238, 0.12));
+            border-color: rgba(34, 211, 238, 0.5);
+        }
+
+        .login-card .login-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .login-error {
+            color: var(--accent-red);
+            font-size: 13px;
+            text-align: center;
+            margin-top: 14px;
+            min-height: 20px;
+        }
+
+        /* ---- Entrance Animations ---- */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(12px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .animate-in {
+            animation: fadeInUp 0.4s ease-out both;
+        }
+
+        .animate-delay-1 { animation-delay: 0.05s; }
+        .animate-delay-2 { animation-delay: 0.1s; }
+        .animate-delay-3 { animation-delay: 0.15s; }
+        .animate-delay-4 { animation-delay: 0.2s; }
+        .animate-delay-5 { animation-delay: 0.25s; }
+        .animate-delay-6 { animation-delay: 0.3s; }
+
+        /* ---- Responsive ---- */
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+            }
+
+            header {
+                flex-direction: column;
+                gap: 16px;
+                align-items: flex-start;
+            }
+
+            .filters {
+                padding: 14px;
+            }
+
+            .filter-group {
+                min-width: 140px;
+            }
+
+            .tabs {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            .batch-charts-container {
+                grid-template-columns: 1fr;
+            }
+
+            .login-card {
+                margin: 16px;
+                padding: 32px 24px;
+            }
+
+            .stat-card .value {
+                font-size: 22px;
+            }
+        }
+
+        /* ---- Scrollbar ---- */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
+    <!-- Login overlay -->
+    <div id="login-overlay" class="login-overlay">
+        <div class="login-card">
+            <div class="login-icon">
+                <div class="login-icon-wrapper">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2" stroke="currentColor" stroke-width="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <circle cx="12" cy="16" r="1.5" fill="currentColor"/>
+                    </svg>
+                </div>
+            </div>
+            <h2>SGLang Performance Dashboard</h2>
+            <p class="login-subtitle">Enter your credentials to access the dashboard</p>
+            <form id="login-form" onsubmit="return handleLogin(event)">
+                <div class="form-group">
+                    <label for="login-username">Username</label>
+                    <input type="text" id="login-username" name="username" autocomplete="username" placeholder="Enter username" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" name="password" autocomplete="current-password" placeholder="Enter password" required>
+                </div>
+                <button type="submit" class="login-btn" id="login-btn">Sign In</button>
+            </form>
+            <div id="login-error" class="login-error"></div>
+        </div>
+    </div>
+
+    <div class="container" id="dashboard-container" style="display: none;">
+        <header class="animate-in">
             <h1>
-                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-                SGLang Performance Dashboard
+                <div class="logo-mark">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 17L12 22L22 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 12L12 17L22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <span><span class="title-accent">SGLang</span> Performance Dashboard</span>
             </h1>
             <div class="header-actions">
-                <button class="btn" onclick="refreshData()">Refresh</button>
+                <button class="btn" onclick="refreshData()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    Refresh
+                </button>
                 <a href="https://github.com/sgl-project/sglang/actions/workflows/nightly-test-nvidia.yml?query=event%3Aschedule" target="_blank" class="btn">
-                    View Workflow
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                    Workflow
                 </a>
             </div>
         </header>
 
         <div id="loading" class="loading">
             <div class="spinner"></div>
+            <div class="loading-text">Loading performance data...</div>
         </div>
 
         <div id="content" style="display: none;">
-            <div class="stats-row" id="stats-row"></div>
+            <div class="stats-row animate-in animate-delay-1" id="stats-row"></div>
 
-            <div class="filters">
+            <div class="filters animate-in animate-delay-2">
                 <div class="filter-group">
                     <label>GPU Configuration</label>
                     <select id="gpu-filter" onchange="handleGpuFilterChange()">
@@ -400,7 +886,7 @@
                     </select>
                 </div>
                 <div class="filter-group">
-                    <label>Input/Output Length</label>
+                    <label>Input / Output Length</label>
                     <select id="io-len-filter" onchange="updateCharts()">
                         <option value="all">All Lengths</option>
                     </select>
@@ -413,9 +899,9 @@
                 </div>
             </div>
 
-            <div class="tabs" id="metric-tabs"></div>
+            <div class="tabs animate-in animate-delay-3" id="metric-tabs"></div>
 
-            <div class="metric-section">
+            <div class="metric-section animate-in animate-delay-4">
                 <div class="chart-card">
                     <h3 id="metric-title">Overall Throughput (tokens/sec)</h3>
                     <div class="batch-charts-container" id="charts-container">
@@ -423,7 +909,7 @@
                 </div>
             </div>
 
-            <div class="chart-card" style="margin-top: 24px;">
+            <div class="chart-card animate-in animate-delay-5" style="margin-top: 24px;">
                 <h3>Recent Benchmark Runs</h3>
                 <table class="data-table" id="runs-table">
                     <thead>
@@ -446,10 +932,10 @@
             <p id="error-message"></p>
         </div>
 
-        <footer>
+        <footer class="animate-in animate-delay-6">
             <p>
-                SGLang Performance Dashboard -
-                <a href="https://github.com/sgl-project/sglang" target="_blank">GitHub</a> |
+                SGLang Performance Dashboard &mdash;
+                <a href="https://github.com/sgl-project/sglang" target="_blank">GitHub</a> &middot;
                 <a href="https://sgl-project.github.io/sglang" target="_blank">Documentation</a>
             </p>
         </footer>

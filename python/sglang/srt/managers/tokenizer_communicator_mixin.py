@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -233,6 +235,9 @@ class TokenizerCommunicatorMixin:
         self.get_loads_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.dumper_control_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -330,6 +335,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadsReqOutput,
                     self.get_loads_communicator.handle_recv,
+                ),
+                (
+                    DumperControlReqOutput,
+                    self.dumper_control_communicator.handle_recv,
                 ),
             ]
         )
@@ -860,6 +869,11 @@ class TokenizerCommunicatorMixin:
             await self.set_internal_state_communicator(obj)
         )
         return [res.updated for res in responses]
+
+    async def dumper_control(
+        self: TokenizerManager, obj: DumperControlReqInput
+    ) -> List[DumperControlReqOutput]:
+        return await self.dumper_control_communicator(obj)
 
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()

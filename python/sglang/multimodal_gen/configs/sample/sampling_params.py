@@ -97,6 +97,8 @@ class SamplingParams:
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
+    output_quality: str | None = "default"
+    output_compression: int | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -126,6 +128,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -151,6 +154,9 @@ class SamplingParams:
     adjust_frames: bool = True
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
+
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -203,12 +209,25 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
+        # Handle output_quality to output_compression conversion
+        if self.output_compression is None and self.output_quality is not None:
+            self.output_compression = self._adjust_output_quality(
+                self.output_quality, self.data_type
+            )
+
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
+        """Convert output_quality string to compression level."""
+        output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+        if output_quality == "default":
+            return 50 if data_type == DataType.VIDEO else 75
+        return output_quality_mapper.get(output_quality)
 
     def _validate(self):
         """
@@ -275,6 +294,11 @@ class SamplingParams:
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
 
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
+
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
                 self.boundary_ratio, (int, float)
@@ -304,6 +328,13 @@ class SamplingParams:
             if self.image_path is None:
                 raise ValueError(
                     f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_image_input():
+            # does not support image input
+            if self.image_path is not None:
+                raise ValueError(
+                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
                 )
 
     def _adjust(
@@ -358,6 +389,12 @@ class SamplingParams:
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.warning(error_msg)
+
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -553,6 +590,18 @@ class SamplingParams:
             help="Name of the output file",
         )
         parser.add_argument(
+            "--output-quality",
+            type=str,
+            default=SamplingParams.output_quality,
+            help="Output quality setting (default, low, medium, high, maximum)",
+        )
+        parser.add_argument(
+            "--output-compression",
+            type=int,
+            default=SamplingParams.output_compression,
+            help="Output compression level (0-100, higher means better quality but larger file size)",
+        )
+        parser.add_argument(
             "--num-outputs-per-prompt",
             type=int,
             default=SamplingParams.num_outputs_per_prompt,
@@ -647,6 +696,13 @@ class SamplingParams:
             help="Guidance rescale factor",
         )
         parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
+        )
+        parser.add_argument(
             "--boundary-ratio",
             type=float,
             default=SamplingParams.boundary_ratio,
@@ -725,6 +781,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -793,9 +861,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass

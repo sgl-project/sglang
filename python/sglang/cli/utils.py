@@ -8,7 +8,8 @@ from functools import lru_cache
 from typing import Optional
 
 import filelock
-from huggingface_hub import hf_hub_download
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ def _maybe_download_model(
         Local directory path that contains the downloaded config file, or the original local directory.
     """
 
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import hf_hub_download
+
     if os.path.exists(model_name_or_path):
         logger.info("Model already exists locally")
         return model_name_or_path
@@ -52,9 +55,11 @@ def _maybe_download_model(
 
     with _get_lock(model_name_or_path):
         # Try `model_index.json` first (diffusers models)
+        source_hub = "MS Hub" if envs.SGLANG_USE_MODELSCOPE.get() else "HF Hub"
         try:
             logger.info(
-                "Downloading model_index.json from HF Hub for %s...",
+                "Downloading model_index.json from %s for %s...",
+                source_hub,
                 model_name_or_path,
             )
             file_path = hf_hub_download(
@@ -70,7 +75,9 @@ def _maybe_download_model(
         # Fallback to `config.json`
         try:
             logger.info(
-                "Downloading config.json from HF Hub for %s...", model_name_or_path
+                "Downloading config.json from %s for %s...",
+                source_hub,
+                model_name_or_path,
             )
             file_path = hf_hub_download(
                 repo_id=model_name_or_path,
@@ -83,9 +90,9 @@ def _maybe_download_model(
             raise ValueError(
                 (
                     "Could not find model locally at %s and failed to download "
-                    "model_index.json/config.json from HF Hub: %s"
+                    "model_index.json/config.json from %s: %s"
                 )
-                % (model_name_or_path, e_config)
+                % (model_name_or_path, source_hub, e_config)
             ) from e_config
 
 
