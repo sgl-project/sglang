@@ -11,6 +11,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
 from sglang.srt.debug_utils.comparator.unshard.load import load_and_unshard
+from sglang.srt.debug_utils.comparator.utils import _single
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 
@@ -83,8 +84,7 @@ def process_per_rank(
     args: argparse.Namespace,
     counts: dict[str, int],
 ) -> None:
-    assert len(target_rows) == 1
-    row = target_rows[0]
+    row = _single(target_rows)
     name = row["name"]
 
     if not baseline_rows:
