@@ -10,6 +10,7 @@ Example:
 
 import argparse
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
+    "FLUX.2-klein-base-4B",
+    "Qwen-Image",
+)
+
 SUITES = {
     "1-gpu": [
         "test_server_a.py",
@@ -29,6 +37,7 @@ SUITES = {
         "../cli/test_generate_t2i_perf.py",
         # unit tests (no server needed)
         "../test_sampling_params_validate.py",
+        "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -225,6 +234,27 @@ def run_pytest(files, filter_expr=None):
     return returncode
 
 
+def _is_in_ci() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
+    if not _is_in_ci():
+        return
+    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
+        return
+    if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
+        print(
+            f"Using preset {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}="
+            f"{os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV]}"
+        )
+        return
+
+    selected_pair = random.choice(_UPDATE_WEIGHTS_MODEL_PAIR_IDS)
+    os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV] = selected_pair
+    print(f"Selected {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}={selected_pair} for this CI run")
+
+
 def main():
     args = parse_args()
 
@@ -239,6 +269,7 @@ def main():
 
     # 2. get files from suite
     suite_files_rel = SUITES[args.suite]
+    _maybe_pin_update_weights_model_pair(suite_files_rel)
 
     suite_files_abs = []
     for f_rel in suite_files_rel:

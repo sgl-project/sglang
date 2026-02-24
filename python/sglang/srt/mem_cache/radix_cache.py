@@ -523,7 +523,7 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        (new_indices, new_last_node) = (
+        new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )

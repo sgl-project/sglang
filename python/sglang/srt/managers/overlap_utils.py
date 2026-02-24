@@ -127,6 +127,13 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            # The indices tensor was allocated on the default stream but is
+            # used here on the forward stream. Meanwhile, the old spec_info
+            # holding this tensor will lose all Python references (replaced at
+            # model_worker_batch.spec_info and batch.spec_info), so the
+            # caching allocator (torch GC) could reclaim the memory before
+            # the GPU finishes reading it.
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]

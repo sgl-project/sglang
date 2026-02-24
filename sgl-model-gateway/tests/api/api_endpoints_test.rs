@@ -880,7 +880,7 @@ mod responses_endpoint_tests {
         let app = ctx.create_app().await;
 
         // Directly store a response in the storage to test the retrieval endpoint
-        use smg::data_connector::{ResponseId, StoredResponse};
+        use data_connector::{ResponseId, StoredResponse};
         let mut stored_response = StoredResponse::new(None);
         stored_response.id = ResponseId::from("resp_test_input_items");
         stored_response.input = json!([
