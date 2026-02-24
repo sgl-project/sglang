@@ -1,24 +1,30 @@
+import logging
 from typing import Callable
 
 from torch import nn
 
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-    is_xpu,
-)
+from sglang.platforms import current_platform
+from sglang.srt.utils import cpu_has_amx_support
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_cpu = is_cpu()
+logger = logging.getLogger(__name__)
+
+# Use unified platform abstraction for all platform detection.
+# Platform detection happens at module import time via current_platform singleton.
+_is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+_is_cpu = current_platform.is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
-_is_npu = is_npu()
-_is_xpu = is_xpu()
-_is_musa = is_musa()
+_is_npu = current_platform.is_npu()
+_is_xpu = current_platform.is_xpu()
+_is_musa = current_platform.is_musa()
+
+# Log warning if no accelerator platform was detected but we're not explicitly on CPU
+if not any([_is_cuda, _is_hip, _is_npu, _is_xpu, _is_musa]) and not _is_cpu:
+    logger.warning(
+        "No accelerator platform detected (CUDA, ROCm, NPU, XPU, MUSA). "
+        "MultiPlatformOp will use forward_native() fallback. "
+        "If you have GPU hardware, check driver installation and device visibility."
+    )
 
 
 class MultiPlatformOp(nn.Module):

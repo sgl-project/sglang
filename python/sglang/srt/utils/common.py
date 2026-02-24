@@ -131,12 +131,44 @@ BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elaps
 
 @lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    """
+    Check if CUDA is available.
+
+    Uses the unified platform abstraction internally for consistent detection.
+
+    Note: This checks platform identity via the unified abstraction, which may
+    differ from the legacy `torch.cuda.is_available() and torch.version.cuda`
+    check in edge cases (e.g., Jetson, CPU-only PyTorch with NVML).
+    """
+    from sglang.platforms import current_platform
+
+    result = current_platform.is_cuda()
+
+    # Warn if platform detection disagrees with torch.cuda
+    if result and not (torch.cuda.is_available() and torch.version.cuda):
+        logger.warning(
+            "Platform detected as CUDA but torch.cuda check failed. "
+            "torch.cuda.is_available()=%s, torch.version.cuda=%s. "
+            "This may indicate a PyTorch installation without CUDA support "
+            "or a Jetson platform.",
+            torch.cuda.is_available(),
+            torch.version.cuda,
+        )
+
+    return result
 
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    """
+    Check if platform is CUDA-alike (CUDA or ROCm).
+
+    Uses the unified platform abstraction internally for consistent detection.
+    Note: MUSA is excluded as it uses mccl, not nccl.
+    """
+    from sglang.platforms import current_platform
+
+    return current_platform.is_cuda_alike()
 
 
 @lru_cache(maxsize=1)

@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.platforms import current_platform
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -721,7 +722,12 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
-        # Handle device-specific backends.
+        # Handle device-specific backends via unified platform abstraction.
+        # This sets platform-specific defaults (e.g., flashinfer for CUDA).
+        current_platform.postprocess_server_args(self)
+
+        # Legacy device-specific handlers for platforms not yet fully migrated.
+        # These will be removed once all platforms implement postprocess_server_args().
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
