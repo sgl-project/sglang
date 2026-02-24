@@ -250,14 +250,6 @@ void sgl_per_token_group_quant_8bit_v2(
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void bmm_fp8(
-    at::Tensor A,
-    at::Tensor B,
-    at::Tensor D,
-    at::Tensor A_scale,
-    at::Tensor B_scale,
-    at::Tensor workspace_buffer,
-    int64_t cublas_handle);
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
