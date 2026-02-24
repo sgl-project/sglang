@@ -30,14 +30,14 @@ def process(
     load_fn: LoadFn,
 ) -> None:
     name = (baseline_rows or target_rows)[0]["name"]
-    fmt = args.output_format
 
     baseline_tensor = load_fn(baseline_rows, Path(args.baseline_path))
     target_tensor = load_fn(target_rows, Path(args.target_path))
 
     if baseline_tensor is None or target_tensor is None:
         reason = "baseline_load_failed" if baseline_tensor is None else "target_load_failed"
-        _skip(name, reason, counts, fmt)
+        counts["skipped"] += 1
+        print_record(SkipRecord(name=name, reason=reason), output_format=args.output_format)
         return
 
     info = compare_tensors(
@@ -65,13 +65,3 @@ def _load_single_tensor(rows: list[dict], base_path: Path) -> Optional[torch.Ten
     if not isinstance(loaded.value, torch.Tensor):
         return None
     return loaded.value
-
-
-def _skip(
-    name: str,
-    reason: str,
-    counts: dict[str, int],
-    output_format: str,
-) -> None:
-    counts["skipped"] += 1
-    print_record(SkipRecord(name=name, reason=reason), output_format=output_format)
