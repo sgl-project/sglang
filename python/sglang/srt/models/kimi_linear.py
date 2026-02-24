@@ -140,38 +140,23 @@ class KimiMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
-        if not _is_npu:
-            self.topk = TopK(
-                top_k=config.num_experts_per_token,
-                renormalize=moe_renormalize,
-                use_grouped_topk=True,
-                num_expert_group=config.num_expert_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                quant_config=quant_config,
-                routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-                # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-                # and requires the output format to be standard. We use quant_config to determine the output format.
-                output_format=(
-                    TopKOutputFormat.STANDARD if quant_config is None else None
-                ),
-            )
-        else:
-            self.topk = TopK(
-                top_k=config.num_experts_per_token,
-                renormalize=False,
-                use_grouped_topk=True,
-                num_expert_group=config.num_expert_group,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                quant_config=quant_config,
-                routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=True,
-                output_format=(
-                    TopKOutputFormat.STANDARD if quant_config is None else None
-                ),
-            )
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_token,
+            renormalize=moe_renormalize if not _is_npu else False,
+            use_grouped_topk=True,
+            num_expert_group=config.num_expert_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
+            routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk if not _is_npu else True,,
+            # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+            # and requires the output format to be standard. We use quant_config to determine the output format.
+            output_format=(
+                TopKOutputFormat.STANDARD if quant_config is None else None
+            ),
+        )
 
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
