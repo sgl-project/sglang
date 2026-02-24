@@ -479,11 +479,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
-        self.expert_backup_client = (
-            ExpertBackupClient(self.server_args, self)
-            if self.server_args.enable_elastic_expert_backup
-            else None
-        )
 
         (
             ElasticEPStateManager.init(self.server_args)
@@ -493,6 +488,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+
+        # Load the expert backup client
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if self.server_args.enable_elastic_expert_backup
+            else None
+        )
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
@@ -878,6 +880,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "mooncake"
             )
+            or self.server_args.enable_elastic_expert_backup
         )
 
         if use_mooncake_te:

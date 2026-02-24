@@ -60,33 +60,28 @@ class ExpertBackupClient:
 
         self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._receive_thread.start()
-    
+
     def _receive_loop(self):
         cnt = 0
         while cnt < self.engine_num:
-            response = self.recv_list[cnt].recv_pyobj() 
+            response = self.recv_list[cnt].recv_pyobj()
             self.dram_map_list[response.rank] = response.weight_pointer_map
             self.session_id_list[response.rank] = response.session_id
             self.buffer_size = max(self.buffer_size, response.buffer_size)
             cnt += 1
-            
+
         self.use_backup = True
         self.start_transfer_client()
 
     def start_transfer_client(self):
         from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+
         self.transfer_engine = get_mooncake_transfer_engine()
-        self.transfer_engine.initialize(
-            get_local_ip_auto(),
-            "P2PHANDSHAKE",
-            "rdma",
-            self.server_args.mooncake_ib_device,
-        )
 
         self.params_dict = dict(self.model_runner.model.named_parameters())
         for name, param in self.params_dict.items():
             param_data = param.data
-            ret_value = self.transfer_engine.register_memory(
+            ret_value = self.transfer_engine.engine.register_memory(
                 param_data.data_ptr(), param_data.numel() * param_data.element_size()
             )
             if ret_value != 0:
@@ -149,7 +144,7 @@ class ExpertBackupClient:
                     )
                     weight_size_list.append(weight_info["byte_size"])
             before_transfer = time.time()
-            ret = self.transfer_engine.batch_transfer_sync_read(
+            ret = self.transfer_engine.engine.batch_transfer_sync_read(
                 self.session_id_list[i],
                 local_ptr_list,
                 server_ptr_list,

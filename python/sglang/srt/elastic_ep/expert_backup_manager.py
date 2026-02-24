@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import re
+import time
 
 import torch
 import zmq
@@ -58,7 +59,9 @@ class ExpertBackupManager:
             buffer_size=self.continuous_buffer.numel()
             * self.continuous_buffer.element_size(),
         )
-        self.send_to_expert_backup_client.send_pyobj(back_req)
+        while True:
+            self.send_to_expert_backup_client.send_pyobj(back_req)
+            time.sleep(10)
 
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
@@ -125,28 +128,35 @@ class ExpertBackupManager:
 
     def start_transfer_server(self):
         from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+
         self.transfer_engine = get_mooncake_transfer_engine()
-        self.transfer_engine.initialize(
-            get_local_ip_auto(),
-            "P2PHANDSHAKE",
-            "rdma",
-            self.server_args.mooncake_ib_device,
-        )
-        self.session_id = f"{get_local_ip_auto()}:{self.transfer_engine.get_rpc_port()}"
+        self.session_id = self.transfer_engine.session_id
         server_ptr = self.continuous_buffer.data_ptr()
         server_len = (
             self.continuous_buffer.numel() * self.continuous_buffer.element_size()
         )
 
-        ret_value = self.transfer_engine.register_memory(server_ptr, server_len)
+        ret_value = self.transfer_engine.engine.register_memory(server_ptr, server_len)
         if ret_value != 0:
             raise RuntimeError("Mooncake memory registration failed.")
+
 
 def run_expert_backup_manager_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
     set_global_server_args_for_scheduler(server_args)
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        init_mooncake_transfer_engine,
+    )
+
+    init_mooncake_transfer_engine(
+        hostname=get_local_ip_auto(),
+        gpu_id=0,
+        ib_device=(
+            server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+        ),
+    )
     manager = ExpertBackupManager(server_args, port_args)
 
 
