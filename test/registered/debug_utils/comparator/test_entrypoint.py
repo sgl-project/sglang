@@ -31,60 +31,6 @@ class TestEntrypointGroupingRaw:
 
         run(args)
 
-        output = capsys.readouterr().out
-        assert "Config:" in output
-        assert "rel_diff" in output
-        assert "Summary:" in output
-        assert "Skip" not in output
-
-    def test_filter(self, tmp_path, capsys):
-        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
-        capsys.readouterr()
-
-        run(args)
-
-        output = capsys.readouterr().out
-        assert "rel_diff" in output
-
-    def test_no_baseline_skip(self, tmp_path, capsys):
-        baseline_path, target_path = _create_dumps(
-            tmp_path,
-            tensor_names=["tensor_a", "tensor_extra"],
-            baseline_names=["tensor_a"],
-        )
-        args = _make_args(baseline_path, target_path, grouping="raw")
-        capsys.readouterr()
-
-        run(args)
-
-        output = capsys.readouterr().out
-        assert "Skip:" in output
-        assert "baseline_load_failed" in output
-
-    def test_step_range(self, tmp_path, capsys):
-        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
-        args = _make_args(
-            baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
-        )
-        capsys.readouterr()
-
-        run(args)
-
-        output = capsys.readouterr().out
-        assert "Summary:" in output
-
-
-class TestEntrypointJsonl:
-    def test_jsonl_basic(self, tmp_path, capsys):
-        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(
-            baseline_path, target_path, output_format="json", grouping="raw"
-        )
-        capsys.readouterr()
-
-        run(args)
-
         records = _parse_jsonl(capsys.readouterr().out)
         assert isinstance(records[0], ConfigRecord)
 
@@ -96,15 +42,24 @@ class TestEntrypointJsonl:
         assert summary.total == 2
         assert summary.skipped == 0
 
-    def test_jsonl_skip(self, tmp_path, capsys):
+    def test_filter(self, tmp_path, capsys):
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
+        capsys.readouterr()
+
+        run(args)
+
+        records = _parse_jsonl(capsys.readouterr().out)
+        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
+        assert len(comparisons) == 1
+
+    def test_no_baseline_skip(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(
             tmp_path,
             tensor_names=["tensor_a", "tensor_extra"],
             baseline_names=["tensor_a"],
         )
-        args = _make_args(
-            baseline_path, target_path, output_format="json", grouping="raw"
-        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
         capsys.readouterr()
 
         run(args)
@@ -118,11 +73,23 @@ class TestEntrypointJsonl:
         assert isinstance(summary, SummaryRecord)
         assert summary.skipped == 1
 
-    def test_jsonl_all_valid_records(self, tmp_path, capsys):
-        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
+    def test_step_range(self, tmp_path, capsys):
+        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
         args = _make_args(
-            baseline_path, target_path, output_format="json", grouping="raw"
+            baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
         )
+        capsys.readouterr()
+
+        run(args)
+
+        records = _parse_jsonl(capsys.readouterr().out)
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 1
+
+    def test_all_valid_records(self, tmp_path, capsys):
+        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
+        args = _make_args(baseline_path, target_path, grouping="raw")
         capsys.readouterr()
 
         run(args)
@@ -130,14 +97,27 @@ class TestEntrypointJsonl:
         records = _parse_jsonl(capsys.readouterr().out)
         assert all(isinstance(r, _OutputRecord) for r in records)
 
+    def test_text_output_smoke(self, tmp_path, capsys):
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        args = _make_args(
+            baseline_path, target_path, output_format="text", grouping="raw"
+        )
+        capsys.readouterr()
+
+        run(args)
+
+        output = capsys.readouterr().out
+        assert "Config:" in output
+        assert "Summary:" in output
+
 
 class TestEntrypointGroupingLogical:
     """Test `--grouping logical` scenarios"""
 
-    def test_smart_mode_no_dims_single_rank(self, tmp_path, capsys):
+    def test_no_dims_single_rank(self, tmp_path, capsys):
         """Single-rank dumps without dims: load_and_unshard returns raw tensor."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, output_format="json")
+        args = _make_args(baseline_path, target_path)
         capsys.readouterr()
 
         run(args)
@@ -176,7 +156,7 @@ class TestEntrypointGroupingLogical:
         )
 
         args = _make_args(
-            baseline_dir, target_dir, output_format="json", diff_threshold=0.01
+            baseline_dir, target_dir, diff_threshold=0.01
         )
         capsys.readouterr()
         run(args)
@@ -219,7 +199,7 @@ class TestEntrypointGroupingLogical:
         )
 
         args = _make_args(
-            baseline_dir, target_dir, output_format="json", diff_threshold=0.01
+            baseline_dir, target_dir, diff_threshold=0.01
         )
         capsys.readouterr()
         run(args)
@@ -256,9 +236,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(
-            baseline_dir, target_dir, output_format="json", diff_threshold=0.01
-        )
+        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
         capsys.readouterr()
         run(args)
 
@@ -301,7 +279,7 @@ class TestEntrypointGroupingLogical:
             dims_str="b h(tp)",
         )
 
-        args = _make_args(baseline_dir, target_dir, output_format="json")
+        args = _make_args(baseline_dir, target_dir)
         capsys.readouterr()
         run(args)
 
@@ -337,9 +315,7 @@ class TestEntrypointGroupingLogical:
                 dims_str="b h(tp)",
             )
 
-        args = _make_args(
-            baseline_dir, target_dir, output_format="json", diff_threshold=0.01
-        )
+        args = _make_args(baseline_dir, target_dir, diff_threshold=0.01)
         capsys.readouterr()
         run(args)
 
@@ -408,7 +384,7 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         end_step=1000000,
         diff_threshold=1e-3,
         filter=None,
-        output_format="text",
+        output_format="json",
         grouping="logical",
     )
     defaults.update(overrides)
