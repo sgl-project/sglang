@@ -75,6 +75,7 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         diff_threshold=1e-3,
         filter=None,
         output_format="text",
+        match_mode="smart",
     )
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -84,10 +85,10 @@ def _parse_jsonl(output: str) -> list[AnyRecord]:
     return [parse_record_json(line) for line in output.strip().splitlines()]
 
 
-class TestEntrypoint:
+class TestEntrypointPerRank:
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path)
+        args = _make_args(baseline_path, target_path, match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -100,7 +101,7 @@ class TestEntrypoint:
 
     def test_filter(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, filter="tensor_a")
+        args = _make_args(baseline_path, target_path, filter="tensor_a", match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -114,7 +115,7 @@ class TestEntrypoint:
             tensor_names=["tensor_a", "tensor_extra"],
             baseline_names=["tensor_a"],
         )
-        args = _make_args(baseline_path, target_path)
+        args = _make_args(baseline_path, target_path, match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -125,7 +126,7 @@ class TestEntrypoint:
 
     def test_step_range(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
-        args = _make_args(baseline_path, target_path, start_step=1, end_step=1)
+        args = _make_args(baseline_path, target_path, start_step=1, end_step=1, match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -137,7 +138,7 @@ class TestEntrypoint:
 class TestEntrypointJsonl:
     def test_jsonl_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
-        args = _make_args(baseline_path, target_path, output_format="json")
+        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -159,7 +160,7 @@ class TestEntrypointJsonl:
             tensor_names=["tensor_a", "tensor_extra"],
             baseline_names=["tensor_a"],
         )
-        args = _make_args(baseline_path, target_path, output_format="json")
+        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -175,7 +176,7 @@ class TestEntrypointJsonl:
 
     def test_jsonl_all_valid_records(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
-        args = _make_args(baseline_path, target_path, output_format="json")
+        args = _make_args(baseline_path, target_path, output_format="json", match_mode="per-rank")
         capsys.readouterr()
 
         run(args)
@@ -241,7 +242,7 @@ def _create_tp_sharded_dumps(
 class TestEntrypointUnshard:
     """Integration tests for the unshard pipeline path."""
 
-    def test_backward_compat_no_dims(self, tmp_path, capsys):
+    def test_smart_mode_skips_missing_dims(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, output_format="json")
         capsys.readouterr()
@@ -249,14 +250,13 @@ class TestEntrypointUnshard:
         run(args)
 
         records = _parse_jsonl(capsys.readouterr().out)
-        comparisons = [r for r in records if isinstance(r, ComparisonRecord)]
-        assert len(comparisons) == 2
-        for comp in comparisons:
-            assert comp.diff is not None
+        skips = [r for r in records if isinstance(r, SkipRecord)]
+        assert len(skips) == 2
+        assert all(s.reason == "missing_dims" for s in skips)
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.total == 2
-        assert summary.skipped == 0
+        assert summary.skipped == 2
 
     def test_tp_unshard_same_size(self, tmp_path, capsys):
         torch.manual_seed(42)

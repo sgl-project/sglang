@@ -1,4 +1,5 @@
 import argparse
+from typing import Literal
 
 import polars as pl
 
@@ -7,8 +8,16 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     print_record,
 )
-from sglang.srt.debug_utils.comparator.pipeline import process_logical_tensor
-from sglang.srt.debug_utils.dump_loader import read_meta
+from sglang.srt.debug_utils.comparator.pipeline import (
+    process_per_rank,
+    process_smart,
+)
+from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
+
+MatchMode = Literal["smart", "per-rank"]
+
+_NON_KEY_COLS_SMART = {"rank", "dump_index", "filename", "duplicate_index"}
+_NON_KEY_COLS_PER_RANK = {"dump_index", "filename", "duplicate_index"}
 
 
 def main() -> None:
@@ -39,23 +48,33 @@ def run(args: argparse.Namespace) -> None:
     )
 
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
+    match_mode: MatchMode = args.match_mode
 
-    logical_tensor_key_cols = [
-        c
-        for c in df_target.columns
-        if c not in {"rank", "dump_index", "filename", "duplicate_index"}
-    ]
-    logical_tensor_keys = df_target.unique(subset=logical_tensor_key_cols)
+    non_key_cols = (
+        _NON_KEY_COLS_SMART if match_mode == "smart" else _NON_KEY_COLS_PER_RANK
+    )
+    key_cols = [c for c in df_target.columns if c not in non_key_cols]
+    unique_keys = df_target.unique(subset=key_cols)
 
-    for tensor_key in logical_tensor_keys.iter_rows(named=True):
-        process_logical_tensor(
-            tensor_key=tensor_key,
-            df_target=df_target,
-            df_baseline=df_baseline,
-            args=args,
-            counts=counts,
-            logical_tensor_key_cols=logical_tensor_key_cols,
-        )
+    for tensor_key in unique_keys.iter_rows(named=True):
+        conditions = {k: tensor_key[k] for k in key_cols}
+        target_rows = filter_rows(df_target, conditions=conditions)
+        baseline_rows = filter_rows(df_baseline, conditions=conditions)
+
+        if match_mode == "smart":
+            process_smart(
+                target_rows=target_rows,
+                baseline_rows=baseline_rows,
+                args=args,
+                counts=counts,
+            )
+        else:
+            process_per_rank(
+                target_rows=target_rows,
+                baseline_rows=baseline_rows,
+                args=args,
+                counts=counts,
+            )
 
     print_record(
         SummaryRecord(total=sum(counts.values()), **counts),
@@ -79,5 +98,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["text", "json"],
         default="text",
         help="Output format: text (default) or json (JSONL, one JSON object per line)",
+    )
+    parser.add_argument(
+        "--match-mode",
+        type=str,
+        choices=["smart", "per-rank"],
+        default="smart",
+        help="Matching mode: smart (cross-rank unshard) or per-rank (rank-by-rank)",
     )
     return parser.parse_args()
