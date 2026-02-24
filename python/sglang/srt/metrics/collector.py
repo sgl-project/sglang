@@ -1096,10 +1096,19 @@ class TokenizerMetricsCollector:
         collect_tokens_histogram: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels or {}
         self.collect_tokens_histogram = collect_tokens_histogram
+
+        # Gauge for the server-wide default thinking budget ceiling.
+        # Value is the integer ceiling when set, or -1 when no ceiling is configured.
+        self.default_thinking_budget = Gauge(
+            name="sglang:default_thinking_budget",
+            documentation="The current server-wide default thinking budget ceiling. -1 means unlimited.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1395,6 +1404,15 @@ class TokenizerMetricsCollector:
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def set_default_thinking_budget_gauge(
+        self, labels: Dict[str, str], value: Optional[int]
+    ):
+        """Update the Prometheus gauge for the server-wide thinking budget ceiling.
+        Uses -1 to represent unlimited (None)."""
+        self.default_thinking_budget.labels(**labels).set(
+            value if value is not None else -1
+        )
 
 
 @dataclass

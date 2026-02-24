@@ -464,6 +464,14 @@ class Engine(EngineBase):
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    def set_default_thinking_budget(self, value):
+        """Set the server-wide default thinking budget ceiling."""
+        self.tokenizer_manager.set_default_thinking_budget(value)
+
+    def get_default_thinking_budget(self):
+        """Get the current server-wide default thinking budget ceiling."""
+        return self.tokenizer_manager.get_default_thinking_budget()
+
     def open_session(
         self,
         capacity_of_str_len: int,

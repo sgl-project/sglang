@@ -620,6 +620,10 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    # Server-wide default ceiling for thinking budget tokens.
+    # When set, per-request thinking_budget values are clamped to min(per_request, ceiling).
+    # If a request has no thinking_budget, the ceiling is applied as the default.
+    default_thinking_budget: Optional[int] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -2884,6 +2888,21 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+        # Validate and handle default_thinking_budget
+        if self.default_thinking_budget is not None:
+            if self.default_thinking_budget < 0:
+                raise ValueError(
+                    "--default-thinking-budget must be a non-negative integer"
+                )
+            # Auto-enable custom logit processor when thinking budget ceiling is set,
+            # since we need the ThinkingBudgetLogitProcessor to enforce the ceiling.
+            if not self.enable_custom_logit_processor:
+                logger.info(
+                    "Auto-enabling --enable-custom-logit-processor because "
+                    "--default-thinking-budget is set"
+                )
+                self.enable_custom_logit_processor = True
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -4714,6 +4733,14 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--default-thinking-budget",
+            type=int,
+            default=None,
+            help="Set an initial server-wide default ceiling for thinking budget tokens. "
+            "Requests with a per-request thinking_budget exceeding this value will be clamped. "
+            "Set to 0 to disable thinking entirely. Default: None (no ceiling).",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

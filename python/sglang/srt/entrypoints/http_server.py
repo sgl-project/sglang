@@ -1266,6 +1266,65 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
     return Response(status_code=200)
 
 
+# Server-wide thinking budget ceiling APIs.
+# The ceiling clamps per-request thinking_budget values via
+# min(per_request, ceiling) in the tokenizer manager.
+@app.api_route("/set_default_thinking_budget", methods=["POST", "PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_default_thinking_budget(request: Request):
+    """Set the server-wide default thinking budget ceiling."""
+    try:
+        body = await request.json()
+    except Exception:
+        return ORJSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "message": "Invalid JSON body",
+            },
+        )
+
+    thinking_budget = body.get("thinking_budget")
+
+    # Validate: must be int >= 0 or null (None)
+    if thinking_budget is not None:
+        if (
+            not isinstance(thinking_budget, int)
+            or isinstance(thinking_budget, bool)
+            or thinking_budget < 0
+        ):
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "message": "thinking_budget must be a non-negative integer or null",
+                },
+            )
+
+    _global_state.tokenizer_manager.set_default_thinking_budget(thinking_budget)
+
+    msg = (
+        f"Default thinking budget set to {thinking_budget}"
+        if thinking_budget is not None
+        else "Default thinking budget ceiling removed (unlimited)"
+    )
+    return ORJSONResponse(
+        content={
+            "success": True,
+            "message": msg,
+            "thinking_budget": thinking_budget,
+        }
+    )
+
+
+@app.get("/get_default_thinking_budget")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_default_thinking_budget(request: Request):
+    """Get the current server-wide default thinking budget ceiling."""
+    value = _global_state.tokenizer_manager.get_default_thinking_budget()
+    return ORJSONResponse(content={"thinking_budget": value})
+
+
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_request(obj: AbortReq, request: Request):

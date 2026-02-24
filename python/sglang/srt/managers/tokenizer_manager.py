@@ -231,6 +231,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if self.enable_metrics:
             start_cpu_monitor_thread("tokenizer")
 
+        # Init server-wide thinking budget ceiling
+        self.init_thinking_budget_ceiling()
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -456,6 +459,90 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+
+    def init_thinking_budget_ceiling(self):
+        """Initialize the server-wide thinking budget ceiling from server_args.
+        Also detect the model family to determine which ThinkingBudgetLogitProcessor
+        to auto-inject when the ceiling is active but the client doesn't send one."""
+        self.default_thinking_budget = self.server_args.default_thinking_budget
+
+        # Detect model family and pre-serialize the appropriate processor for auto-injection.
+        self._thinking_budget_processor_str = self._detect_thinking_budget_processor()
+        if self._thinking_budget_processor_str:
+            logger.info(
+                f"Detected thinking budget processor for model type: "
+                f"{getattr(self.model_config.hf_config, 'model_type', 'unknown')}"
+            )
+
+        # Set initial Prometheus gauge value
+        if self.enable_metrics:
+            self.metrics_collector.set_default_thinking_budget_gauge(
+                self.metrics_collector.labels, self.default_thinking_budget
+            )
+
+    def _detect_thinking_budget_processor(self) -> Optional[str]:
+        """Detect the model family and return a pre-serialized ThinkingBudgetLogitProcessor
+        string for auto-injection. Returns None if the model is not a recognized thinking model.
+        """
+        from sglang.srt.sampling.custom_logit_processor import (
+            DeepSeekR1ThinkingBudgetLogitProcessor,
+            Glm4MoeThinkingBudgetLogitProcessor,
+            Qwen3ThinkingBudgetLogitProcessor,
+        )
+
+        model_type = getattr(self.model_config.hf_config, "model_type", "")
+        # Map model_type to the appropriate processor class
+        model_type_to_processor = {
+            "deepseek_v3": DeepSeekR1ThinkingBudgetLogitProcessor,
+            "deepseek_r1": DeepSeekR1ThinkingBudgetLogitProcessor,
+            "glm4": Glm4MoeThinkingBudgetLogitProcessor,
+            "glm_moe": Glm4MoeThinkingBudgetLogitProcessor,
+            "chatglm": Glm4MoeThinkingBudgetLogitProcessor,
+            "qwen3": Qwen3ThinkingBudgetLogitProcessor,
+            "qwen3_moe": Qwen3ThinkingBudgetLogitProcessor,
+        }
+        processor_cls = model_type_to_processor.get(model_type)
+        if processor_cls is not None:
+            return processor_cls.to_str()
+        return None
+
+    def set_default_thinking_budget(self, value: Optional[int]):
+        """Set the server-wide default thinking budget ceiling.
+        Called by the admin API endpoint.
+
+        Note: For the ThinkingBudgetLogitProcessor to take effect, the server
+        must be started with --default-thinking-budget or
+        --enable-custom-logit-processor, since the scheduler process needs
+        this flag set at startup."""
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    "thinking_budget must be a non-negative integer or None"
+                )
+            if value < 0:
+                raise ValueError(
+                    "thinking_budget must be a non-negative integer or None"
+                )
+        self.default_thinking_budget = value
+        if value is not None and not self.server_args.enable_custom_logit_processor:
+            logger.warning(
+                "default_thinking_budget is set but --enable-custom-logit-processor "
+                "was not enabled at server startup. The ThinkingBudgetLogitProcessor "
+                "will not take effect. Restart the server with "
+                "--default-thinking-budget to enable thinking budget enforcement."
+            )
+        if self.enable_metrics:
+            self.metrics_collector.set_default_thinking_budget_gauge(
+                self.metrics_collector.labels, value
+            )
+        if value is not None:
+            logger.info(f"Default thinking budget ceiling set to {value}")
+        else:
+            logger.info("Default thinking budget ceiling removed (unlimited)")
+
+    def get_default_thinking_budget(self) -> Optional[int]:
+        """Get the current server-wide default thinking budget ceiling."""
+        return self.default_thinking_budget
 
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
@@ -917,6 +1004,37 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+
+        # Apply server-wide thinking budget ceiling.
+        # Clamp per-request thinking_budget to min(per_request, ceiling) and
+        # auto-inject the ThinkingBudgetLogitProcessor if the client didn't send one.
+        if self.default_thinking_budget is not None and isinstance(
+            obj, GenerateReqInput
+        ):
+            ceiling = self.default_thinking_budget
+            if sampling_params.custom_params is None:
+                sampling_params.custom_params = {}
+            per_request = sampling_params.custom_params.get("thinking_budget")
+            if (
+                per_request is not None
+                and isinstance(per_request, int)
+                and not isinstance(per_request, bool)
+            ):
+                # Clamp per-request value to the server ceiling
+                sampling_params.custom_params["thinking_budget"] = min(
+                    per_request, ceiling
+                )
+            else:
+                # No per-request value; apply ceiling as default
+                sampling_params.custom_params["thinking_budget"] = ceiling
+
+            # Auto-inject the processor if the client didn't provide one
+            # and we have a known processor for this model family
+            if (
+                obj.custom_logit_processor is None
+                and self._thinking_budget_processor_str
+            ):
+                obj.custom_logit_processor = self._thinking_budget_processor_str
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

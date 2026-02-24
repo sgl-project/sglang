@@ -136,3 +136,17 @@ class HttpServerEngineAdapter(EngineBase):
 
     def flush_cache(self):
         return self._make_request("flush_cache")
+
+    def set_default_thinking_budget(self, value):
+        """Set the server-wide default thinking budget ceiling via HTTP."""
+        url = f"http://{self.server_args.host}:{self.server_args.port}/set_default_thinking_budget"
+        response = requests.post(url, json={"thinking_budget": value})
+        response.raise_for_status()
+        return response.json()
+
+    def get_default_thinking_budget(self):
+        """Get the current server-wide default thinking budget ceiling via HTTP."""
+        url = f"http://{self.server_args.host}:{self.server_args.port}/get_default_thinking_budget"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json().get("thinking_budget")
