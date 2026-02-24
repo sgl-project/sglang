@@ -119,6 +119,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -158,11 +159,11 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
-if _use_aiter_gfx95:
-
+if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
+if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -564,8 +565,6 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -1530,8 +1529,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -1684,8 +1681,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q_nope_out,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
+                ):
+                    # fp8 Triton kernel: always on gfx950,
+                    # cudagraph-only on gfx942 (hides launch overhead)
                     q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=q_nope,
                         WQ=self.w_kc.transpose(-1, -2),
@@ -1862,7 +1862,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     attn_bmm_output,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
+                ):
+                    # fp8 Triton kernel: always on gfx950,
+                    # cudagraph-only on gfx942 (hides launch overhead)
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
