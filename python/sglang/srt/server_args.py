@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_free_port,
     get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
@@ -52,7 +53,6 @@ from sglang.srt.utils.common import (
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
-    is_port_available,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
@@ -214,6 +214,8 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
+
+MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
 
 # Allow external code to add more choices
@@ -459,6 +461,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    mamba_backend: str = "triton"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -657,8 +660,6 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
-    # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
-    disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -737,6 +738,7 @@ class ServerArgs:
         # Set kernel backends.
         self._handle_sampling_backend()
         self._handle_attention_backend_compatibility()
+        self._handle_mamba_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
@@ -811,18 +813,6 @@ class ServerArgs:
                 else "round_robin"
             )
             return
-
-        # Backward compat: in PD prefill, legacy "round_robin" means `bootstrap_room` routing.
-        if (
-            self.disaggregation_mode == "prefill"
-            and self.load_balance_method == "round_robin"
-        ):
-            logger.warning(
-                "In PD-disaggregation prefill mode, the 'round_robin' load balancing method "
-                "means `bootstrap_room` routing (use 'follow_bootstrap_room' instead). "
-                "Falling back to 'follow_bootstrap_room' for backward compatibility."
-            )
-            self.load_balance_method = "follow_bootstrap_room"
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1066,16 +1056,13 @@ class ServerArgs:
             if model_config.is_multimodal and not self.language_only:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
-            # If symm mem is enabled and prealloc size is not set, set it to 4GB
-            if (
-                self.enable_symm_mem
-                and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set()
-            ):
-                envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
-                logger.warning(
-                    "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
-                    "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
-                )
+        # If symm mem is enabled and prealloc size is not set, set it to 4GB
+        if self.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
+            envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
+            logger.warning(
+                "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
+                "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+            )
 
     def _generate_cuda_graph_batch_sizes(self):
         """
@@ -1135,9 +1122,9 @@ class ServerArgs:
         # suggest them to be explicit about kv_cache_dtype to avoid surprises
         if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
             logger.warning(
-                f"When specifying --nsa-prefill-backend or --nsa-decode-backend, "
-                f"you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
-                f"DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
+                "When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
+                "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
 
         if self.kv_cache_dtype == "auto":
@@ -1207,7 +1194,7 @@ class ServerArgs:
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_NSA_FORCE_MLA.set(True)
                     logger.warning(
-                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on SM100."
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
@@ -1216,7 +1203,7 @@ class ServerArgs:
                 if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
-                            f"Context parallel feature is still under experiment. It has only been verified on Hopper platform."
+                            "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
                         if self.nsa_prefill_cp_mode == "in-seq-split":
                             # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
@@ -1226,7 +1213,7 @@ class ServerArgs:
                             self.ep_size = self.tp_size
                             self.kv_cache_dtype = "bf16"
                             logger.warning(
-                                f"For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
+                                "For in-seq split mode, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, kv_cache_dtype == bf16, batch_size == 1"
                             )
                         else:
                             self.enable_dp_attention = True
@@ -1372,7 +1359,7 @@ class ServerArgs:
                 if is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
-                        "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
+                        "Detected Blackwell and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
                 elif (
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")
@@ -1388,7 +1375,11 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
                     )
-                elif self.ep_size == 1 and is_triton_kernels_available():
+                elif (
+                    self.ep_size == 1
+                    and is_triton_kernels_available()
+                    and self.quantization is None
+                ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
@@ -1635,6 +1626,19 @@ class ServerArgs:
                 sm100_default_attention_backend="triton",
             )
 
+        elif model_arch == "GraniteMoeHybridForCausalLM":
+            hf_config = self.get_model_config().hf_config
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(hf_config, "layer_types", [])
+            )
+            if has_mamba:
+                self._handle_mamba_radix_cache(
+                    model_arch=model_arch,
+                    support_mamba_cache_extra_buffer=False,
+                    sm100_default_attention_backend="triton",
+                )
+
         elif model_arch in ["Lfm2ForCausalLM"]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
@@ -1650,7 +1654,7 @@ class ServerArgs:
         if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
             self.disable_overlap_schedule = True
             logger.warning(
-                f"Overlap scheduler is disabled when using sparse head for embedding model."
+                "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
@@ -1836,6 +1840,13 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
+        # Encoder-decoder models (e.g., Whisper)
+        if model_config.is_encoder_decoder:
+            logger.warning(
+                "Cuda graph is disabled for encoder-decoder models (e.g., Whisper)"
+            )
+            self.disable_cuda_graph = True
+
         # Major NVIDIA platforms backends
         if (
             self.attention_backend == "flashmla"
@@ -1861,7 +1872,7 @@ class ServerArgs:
         ):
             if not is_blackwell_supported():
                 raise ValueError(
-                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
                 )
 
             if self.page_size not in [32, 64]:
@@ -2047,6 +2058,22 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+
+    def _handle_mamba_backend(self):
+        if self.mamba_backend == "flashinfer":
+            if is_flashinfer_available():
+                try:
+                    import flashinfer.mamba  # noqa: F401
+
+                    logger.info("Successfully imported FlashInfer mamba module")
+                except (ImportError, AttributeError):
+                    raise ValueError(
+                        "FlashInfer mamba module not available, please check flashinfer installation."
+                    )
+            else:
+                raise ValueError(
+                    "FlashInfer mamba module not available, please check flashinfer installation."
+                )
 
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
@@ -4209,6 +4236,14 @@ class ServerArgs:
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
         )
+        parser.add_argument(
+            "--mamba-backend",
+            type=str,
+            choices=MAMBA_BACKEND_CHOICES,
+            default=ServerArgs.mamba_backend,
+            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
+            "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
 
         # Hierarchical cache
         parser.add_argument(
@@ -4850,12 +4885,6 @@ class ServerArgs:
             help="Enable async KV cache offloading on decode server (PD mode).",
         )
         parser.add_argument(
-            "--disaggregation-decode-enable-fake-auto",
-            action="store_true",
-            help="Auto enable FAKE mode for decode node testing, "
-            "no need to pass bootstrap_host and bootstrap_room in request.",
-        )
-        parser.add_argument(
             "--num-reserved-decode-tokens",
             type=int,
             default=ServerArgs.num_reserved_decode_tokens,
@@ -5487,7 +5516,7 @@ class ServerArgs:
     def validate_transfer_engine(self):
         if importlib.util.find_spec("mooncake.engine") is None:
             logger.warning(
-                f"Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+                "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
             )
             return False
         elif self.enable_memory_saver:
@@ -5590,14 +5619,7 @@ class PortArgs:
         worker_ports: Optional[List[int]] = None,
     ) -> PortArgs:
         if server_args.nccl_port is None:
-            nccl_port = server_args.port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
+            nccl_port = get_free_port()
         else:
             nccl_port = server_args.nccl_port
 
@@ -5658,7 +5680,7 @@ class PortArgs:
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
-            except ValueError as e:
+            except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
                 )
