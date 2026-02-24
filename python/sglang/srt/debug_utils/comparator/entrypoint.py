@@ -45,10 +45,10 @@ def run(args: argparse.Namespace) -> None:
 
     non_key_cols = _NON_KEY_COLS | ({"rank"} if grouping == "logical" else set())
     key_cols = [c for c in df_target.columns if c not in non_key_cols]
-    unique_keys = df_target.unique(subset=key_cols)
+    tensor_group_keys = df_target.unique(subset=key_cols)
 
-    for tensor_key in unique_keys.iter_rows(named=True):
-        conditions = {k: tensor_key[k] for k in key_cols}
+    for tensor_group_key in tensor_group_keys.iter_rows(named=True):
+        conditions = {k: tensor_group_key[k] for k in key_cols}
         baseline_rows = filter_rows(df_baseline, conditions=conditions)
         target_rows = filter_rows(df_target, conditions=conditions)
 
