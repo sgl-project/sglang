@@ -65,8 +65,8 @@ class ExpertBackupClient:
         cnt = 0
         while cnt < self.engine_num:
             response = self.recv_list[cnt].recv_pyobj() 
-            self.dram_map_list[response._rank] = response._map
-            self.session_id_list[response._rank] = response.session_id
+            self.dram_map_list[response.rank] = response.weight_pointer_map
+            self.session_id_list[response.rank] = response.session_id
             self.buffer_size = max(self.buffer_size, response.buffer_size)
             cnt += 1
             
@@ -74,9 +74,8 @@ class ExpertBackupClient:
         self.start_transfer_client()
 
     def start_transfer_client(self):
-        from mooncake.engine import TransferEngine
-
-        self.transfer_engine = TransferEngine()
+        from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+        self.transfer_engine = get_mooncake_transfer_engine()
         self.transfer_engine.initialize(
             get_local_ip_auto(),
             "P2PHANDSHAKE",

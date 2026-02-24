@@ -1432,8 +1432,8 @@ class UpdateExpertBackupReq(BaseReq):
 
 @dataclass
 class BackupDramReq(BaseReq):
-    _rank: int
-    _map: Dict[str, Any]
+    rank: int
+    weight_pointer_map: Dict[str, Any]
     session_id: str
     buffer_size: int
 

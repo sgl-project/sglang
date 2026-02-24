@@ -52,8 +52,8 @@ class ExpertBackupManager:
         self.backup_weights_from_disk()
         self.start_transfer_server()
         back_req = BackupDramReq(
-            _rank=self.engine_rank,
-            _map=self.weight_pointer_map,
+            rank=self.engine_rank,
+            weight_pointer_map=self.weight_pointer_map,
             session_id=self.session_id,
             buffer_size=self.continuous_buffer.numel()
             * self.continuous_buffer.element_size(),
@@ -124,9 +124,8 @@ class ExpertBackupManager:
                 current_byte_offset = end_byte
 
     def start_transfer_server(self):
-        from mooncake.engine import TransferEngine
-
-        self.transfer_engine = TransferEngine()
+        from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+        self.transfer_engine = get_mooncake_transfer_engine()
         self.transfer_engine.initialize(
             get_local_ip_auto(),
             "P2PHANDSHAKE",
