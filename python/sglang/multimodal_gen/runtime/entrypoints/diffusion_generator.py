@@ -13,7 +13,10 @@ import os
 import time
 from typing import Any, Generator, List, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
     ListLorasReq,
@@ -296,6 +299,7 @@ class DiffGenerator:
 
         for p in prompts:
             sampling_params.prompt = p
+            sampling_params.request_id = generate_request_id()
             req = prepare_request(
                 server_args=self.server_args, sampling_params=sampling_params
             )

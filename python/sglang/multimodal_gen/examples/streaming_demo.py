@@ -6,7 +6,7 @@ so clients receive progress updates *during* generation rather than waiting for 
 final output.
 
 Usage:
-    python streaming_demo.py --model Wan-AI/Wan2.2-T2V-14B-Diffusers \\
+    python streaming_demo.py --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \\
         --prompt "A cat playing in the garden" \\
         --stream-every-n-steps 5
 """
