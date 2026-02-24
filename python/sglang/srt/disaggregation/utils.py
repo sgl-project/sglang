@@ -240,9 +240,13 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
-        # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
+        # Store bootstrap_room for validation on decode side.
+        # Use numpy + copy_ to bypass PyTorch's scalar assignment path which
+        # converts through C long long and overflows for uint64 values > 2^63-1.
+        # See: https://github.com/pytorch/pytorch/issues/159168
+        _br = req.bootstrap_room if req.bootstrap_room is not None else 0
+        self.bootstrap_room[req.metadata_buffer_index, 0:1].copy_(
+            torch.from_numpy(np.array([_br], dtype=np.uint64))
         )
 
 
