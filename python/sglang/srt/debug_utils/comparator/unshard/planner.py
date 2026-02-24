@@ -13,13 +13,6 @@ def compute_unshard_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> Optional[UnshardPlan]:
-    """Compute an unshard plan from dim specs and per-rank parallel info.
-
-    Returns a single UnshardPlan for the one sharded axis, or None if no axis is sharded.
-    Only single-axis unshard is supported; multi-axis raises NotImplementedError.
-    Pure computation — does not load tensor data.
-    Validates axis_size consistency and axis_rank coverage.
-    """
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
