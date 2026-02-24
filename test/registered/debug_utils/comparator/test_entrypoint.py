@@ -21,7 +21,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="default", nightly=True)
 
 
-class TestEntrypointPerRank:
+class TestEntrypointGroupingRaw:
+    """Test `--grouping raw` scenarios"""
+
     def test_run_basic(self, tmp_path, capsys):
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
         args = _make_args(baseline_path, target_path, grouping="raw")
@@ -129,8 +131,8 @@ class TestEntrypointJsonl:
         assert all(isinstance(r, _OutputRecord) for r in records)
 
 
-class TestEntrypointUnshard:
-    """Integration tests for the unshard pipeline path."""
+class TestEntrypointGroupingLogical:
+    """Test `--grouping logical` scenarios"""
 
     def test_smart_mode_no_dims_single_rank(self, tmp_path, capsys):
         """Single-rank dumps without dims: load_and_unshard returns raw tensor."""
