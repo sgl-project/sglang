@@ -734,6 +734,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "narutolhy": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override",
+        "can_rerun_stage": true
+    },
     "netanel-haber": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,

@@ -445,6 +445,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
+                        mamba_size=self.server_args.max_mamba_cache_size,
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(

@@ -1970,6 +1970,19 @@ class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
 
 
+@dataclass
+class DumperControlReqInput(BaseReq):
+    method: str
+    body: Dict[str, Any]
+
+
+@dataclass
+class DumperControlReqOutput(BaseReq):
+    success: bool
+    response: List[Dict[str, Any]]
+    error: str = ""
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect

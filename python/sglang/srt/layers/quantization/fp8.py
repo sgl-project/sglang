@@ -677,6 +677,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -706,8 +707,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        self.with_bias = with_bias
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -781,6 +784,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # BIAS (optional, e.g. GPT-OSS)
+        if self.with_bias:
+            w13_up_dim = (
+                2 * intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else intermediate_size_per_partition
+            )
+            w13_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
+            w2_weight_bias = torch.nn.Parameter(
+                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
         if self.block_quant:
@@ -1507,6 +1531,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
                 use_fp8_w8a8=True,
                 w13_scale=(
                     layer.w13_weight_scale_inv

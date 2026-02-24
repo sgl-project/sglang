@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import numpy.typing as npt
 import requests
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -234,9 +233,6 @@ class MooncakeKVManager(CommonKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
-
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -460,9 +456,9 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1)
-        tokens_per_page = np.arange(page_size, dtype=np.int32).reshape(1, -1)
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
         src_token_slot_offsets = (
@@ -997,7 +993,7 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
+                    addresses = list(self.prefill_info_table.keys())
 
                 for bootstrap_addr in addresses:
                     session = None
@@ -1095,25 +1091,6 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
-
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -1124,18 +1101,12 @@ class MooncakeKVManager(CommonKVManager):
             ]
             for k in keys_to_remove:
                 del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
-                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_dp_size_table:
-                del self.prefill_dp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_pp_size_table:
-                del self.prefill_pp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
             )
-            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
-                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
         # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
         affected_rooms = []
@@ -1248,11 +1219,6 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    _ctx = zmq.Context()
-    _socket_cache = {}
-    _socket_locks = {}
-    _global_lock = threading.Lock()
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
