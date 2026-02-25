@@ -50,7 +50,6 @@ class ProfileBackendClient(BaseBackendClient):
                 else:
                     # stop_profile doesn't need any parameters
                     body = {}
-                print(f"async_request_profile {api_url=} {body=}")
                 async with session.post(url=api_url, json=body) as response:
                     if response.status == 200:
                         output.success = True
