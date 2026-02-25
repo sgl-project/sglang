@@ -331,6 +331,13 @@ class SchedulerRuntimeCheckerMixin:
             self._process_kv_return_alloc_requests()
             self._process_kv_return_insertions()
 
+        # Poll async KV return progress even when idle (decode side)
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            self._poll_kv_return_replies()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
@@ -342,6 +349,9 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            # Count in-flight async KV returns (pages still held for RDMA)
+            if hasattr(self, "_kv_return_pending"):
+                queue_size += len(self._kv_return_pending)
             if queue_size:
                 return
 

@@ -2477,6 +2477,10 @@ class Scheduler(
             self._process_kv_return_alloc_requests()
             self._process_kv_return_insertions()
 
+        # Poll async KV return progress on the decode side
+        if self.server_args.enable_kv_return and self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._poll_kv_return_replies()
+
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
