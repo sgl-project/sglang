@@ -202,6 +202,35 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
+    def _resolve_routed_dp_rank(
+        self,
+        routed_dp_rank: Optional[int],
+        data_parallel_rank: Optional[int],
+    ) -> Optional[int]:
+        if data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if routed_dp_rank is None:
+                routed_dp_rank = data_parallel_rank
+
+        if self.server_args.enable_dp_attention:
+            if routed_dp_rank is None:
+                logger.debug("routed_dp_rank not provided, using default dispatch")
+            elif routed_dp_rank < 0:
+                raise ValueError("routed_dp_rank must be non-negative")
+            elif routed_dp_rank >= self.server_args.dp_size:
+                raise ValueError(
+                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
+                )
+
+        logger.debug(f"routed_dp_rank: {routed_dp_rank}")
+        return routed_dp_rank
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -245,26 +274,9 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        if data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if routed_dp_rank is None:
-                routed_dp_rank = data_parallel_rank
-
-        if self.server_args.enable_dp_attention:
-            if routed_dp_rank is None:
-                logger.debug("routed_dp_rank not provided, using default dispatch")
-            elif routed_dp_rank < 0:
-                raise ValueError("routed_dp_rank must be non-negative")
-            elif routed_dp_rank >= self.server_args.dp_size:
-                raise ValueError(
-                    f"routed_dp_rank must be less than dp_size: {self.server_args.dp_size}"
-                )
+        routed_dp_rank = self._resolve_routed_dp_rank(
+            routed_dp_rank, data_parallel_rank
+        )
 
         obj = GenerateReqInput(
             text=prompt,
@@ -352,28 +364,10 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        if data_parallel_rank is not None:
-            import warnings
+        routed_dp_rank = self._resolve_routed_dp_rank(
+            routed_dp_rank, data_parallel_rank
+        )
 
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if routed_dp_rank is None:
-                routed_dp_rank = data_parallel_rank
-
-        if self.server_args.enable_dp_attention:
-            if routed_dp_rank is None:
-                logger.debug("routed_dp_rank not provided, using default dispatch")
-            elif routed_dp_rank < 0:
-                raise ValueError("routed_dp_rank must be non-negative")
-            elif routed_dp_rank >= self.server_args.dp_size:
-                raise ValueError(
-                    f"routed_dp_rank must be in range [0, {self.server_args.dp_size-1}]"
-                )
-
-        logger.debug(f"routed_dp_rank: {routed_dp_rank}")
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,

@@ -233,6 +233,20 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _migrate_deprecated_dp_rank(values: dict) -> dict:
+    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
+        import warnings
+
+        warnings.warn(
+            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if values.get("routed_dp_rank") is None:
+            values["routed_dp_rank"] = values["data_parallel_rank"]
+    return values
+
+
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -307,17 +321,7 @@ class CompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
-        if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if values.get("routed_dp_rank") is None:
-                values["routed_dp_rank"] = values["data_parallel_rank"]
-        return values
+        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -652,17 +656,7 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
-        if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if values.get("routed_dp_rank") is None:
-                values["routed_dp_rank"] = values["data_parallel_rank"]
-        return values
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
