@@ -100,6 +100,17 @@ class SamplingParams:
     output_quality: str | None = "default"
     output_compression: int | None = None
 
+    # Frame interpolation (RIFE 4.22.lite)
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1  # 1=2x, 2=4x
+    frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
+    frame_interpolation_model_path: str | None = (
+        None  # local dir with flownet.pkl; None = HF auto-download
+    )
+    frame_interpolation_hf_repo_id: str = (
+        "hzwer/ECCV2022-RIFE"  # HF repo to download from
+    )
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
@@ -792,6 +803,38 @@ class SamplingParams:
             action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
+        )
+        parser.add_argument(
+            "--enable-frame-interpolation",
+            action="store_true",
+            default=SamplingParams.enable_frame_interpolation,
+            help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
+        )
+        parser.add_argument(
+            "--frame-interpolation-exp",
+            type=int,
+            default=SamplingParams.frame_interpolation_exp,
+            help="Frame interpolation exponent: 1=2x, 2=4x (default: 1).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-scale",
+            type=float,
+            default=SamplingParams.frame_interpolation_scale,
+            help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-model-path",
+            type=str,
+            default=SamplingParams.frame_interpolation_model_path,
+            help="Local directory containing RIFE flownet.pkl weights. "
+            "If not set, weights are auto-downloaded from HuggingFace Hub.",
+        )
+        parser.add_argument(
+            "--frame-interpolation-hf-repo-id",
+            type=str,
+            default=SamplingParams.frame_interpolation_hf_repo_id,
+            help="HuggingFace repo ID to download RIFE weights from "
+            "(default: hzwer/ECCV2022-RIFE).",
         )
         return parser
 
