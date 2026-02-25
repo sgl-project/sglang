@@ -483,6 +483,76 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     return StandardCombineInput(hidden_states=result)
 
 
+@dataclass
+class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
+    """Quantization payload consumed by FlashInfer TRT-LLM BF16 MoE kernels."""
+
+    gemm1_weights: torch.Tensor
+    gemm2_weights: torch.Tensor
+
+    # Expert-parallel metadata
+    global_num_experts: int
+    local_expert_offset: int
+
+
+def fused_experts_none_to_flashinfer_trtllm_bf16(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmBf16MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    # lazy import
+    try:
+        from flashinfer.fused_moe import trtllm_bf16_moe
+    except ImportError as e:
+        raise ImportError(
+            "Can't import trtllm_bf16_moe from flashinfer. "
+            "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
+        ) from e
+
+    assert (
+        runner_config.activation == "silu"
+    ), "Only silu is supported for flashinfer trtllm moe"
+    assert (
+        dispatch_output.topk_output.topk_config.renormalize
+    ), "Renormalize is required for flashinfer trtllm moe"
+    assert (
+        runner_config.num_fused_shared_experts == 0
+    ), "Fused shared experts are not supported for flashinfer trtllm moe"
+    assert (
+        runner_config.is_gated
+    ), "Only gated MoEs are supported for flashinfer trtllm moe"
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    assert TopKOutputChecker.format_is_bypassed(dispatch_output.topk_output)
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    topk_config = topk_output.topk_config
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+
+        # Call the fused kernel
+        final_hidden_states = trtllm_bf16_moe(
+            routing_logits=topk_output.router_logits,
+            routing_bias=topk_config.correction_bias,
+            hidden_states=hidden_states,
+            gemm1_weights=quant_info.gemm1_weights,
+            gemm2_weights=quant_info.gemm2_weights,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=runner_config.intermediate_size_per_partition,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=runner_config.num_local_experts,
+            routing_method_type=runner_config.routing_method_type,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+        )
+
+    return StandardCombineInput(hidden_states=final_hidden_states)
+
+
 @register_fused_func("none", "flashinfer_trtllm")
 def fused_experts_none_to_flashinfer_trtllm(
     dispatch_output: StandardDispatchOutput,
@@ -496,6 +566,10 @@ def fused_experts_none_to_flashinfer_trtllm(
         )
     if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
         return fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output, quant_info, runner_config
+        )
+    if isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_bf16(
             dispatch_output, quant_info, runner_config
         )
     raise TypeError(
