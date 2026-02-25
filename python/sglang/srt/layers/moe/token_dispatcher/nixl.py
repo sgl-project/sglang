@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -21,7 +22,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 try:
     from nixl_ep import Buffer
@@ -172,8 +172,8 @@ class _NixlEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
         # NixlEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
@@ -298,7 +298,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
     ):
-        use_fp8 = not get_bool_env_var("SGLANG_NIXL_EP_BF16_DISPATCH")
+        use_fp8 = not envs.SGLANG_NIXL_EP_BF16_DISPATCH.get()
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (

@@ -1608,7 +1608,7 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
             "Broadcasting from rank 0 to all ranks."
         )
 
-    base_store_port = int(os.environ.get("SGLANG_TCP_STORE_PORT", "29600"))
+    base_store_port = envs.SGLANG_NIXL_TCP_STORE_PORT.get()
 
     # Rank 0 gets its local IP and broadcasts it to all ranks
     # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
@@ -1622,9 +1622,6 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
         torch.distributed.broadcast_object_list(ip_list, src=0)
         master_ip = ip_list[0]
 
-    logger.debug(
-        "yorayz: master_ip: %s, base_store_port: %d", master_ip, base_store_port
-    )
     try:
         tcp_store = TCPStore(
             host_name=master_ip,
@@ -1697,7 +1694,8 @@ def init_distributed_environment(
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
-        _create_global_tcp_store(rank, world_size)
+        if envs.SGLANG_NIXL_EP_ENABLED.get():
+            _create_global_tcp_store(rank, world_size)
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
