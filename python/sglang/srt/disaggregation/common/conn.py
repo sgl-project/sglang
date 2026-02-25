@@ -599,7 +599,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _is_ready(self) -> bool:
-        return self._registered_count > 0
+        if self.attn_tp_size is None or self.pp_size is None:
+            return False
+        expected = self.dp_size * self.attn_tp_size * self.pp_size
+        return self._registered_count >= expected
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
@@ -672,9 +675,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_port": rank_port,
             }
             self._registered_count += 1
+            expected = self.dp_size * self.attn_tp_size * self.pp_size
             logger.debug(
                 f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
-                f" ({self._registered_count} registered)"
+                f" ({self._registered_count}/{expected} registered)"
             )
 
         return web.Response(text="OK", status=200)
@@ -710,11 +714,25 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 
+        if not self._is_ready():
+            return web.Response(
+                text=f"Prefill server not fully registered yet"
+                f" ({self._registered_count} workers registered).",
+                status=503,
+            )
+
         # Find corresponding prefill info
-        async with self.lock:
-            bootstrap_info = self.prefill_port_table[int(prefill_dp_rank)][
-                int(engine_rank)
-            ][int(target_pp_rank)]
+        try:
+            async with self.lock:
+                bootstrap_info = self.prefill_port_table[int(prefill_dp_rank)][
+                    int(engine_rank)
+                ][int(target_pp_rank)]
+        except KeyError:
+            return web.Response(
+                text=f"Bootstrap info not found for dp_rank={prefill_dp_rank} "
+                f"engine_rank={engine_rank} pp_rank={target_pp_rank}",
+                status=404,
+            )
 
         if bootstrap_info is not None:
             return web.json_response(bootstrap_info, status=200)
