@@ -739,9 +739,6 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        # KV return: reverse transfer state (no separate classes — uses existing NixlKVManager)
-        self.kv_return_pending: Dict[str, list] = {}  # rid -> [xfer_handles]
-
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
@@ -2607,9 +2604,18 @@ class Scheduler(
         insertion_count = 0
         while True:
             try:
-                token_ids, dst_page_indices = kv_mgr.kv_return_insertion_queue.get_nowait()
+                token_ids, dst_page_indices, cancel = kv_mgr.kv_return_insertion_queue.get_nowait()
             except queue_mod.Empty:
                 break
+
+            # If decode cancelled this transfer, free the allocated pages and move on
+            if cancel:
+                gen_pages = torch.tensor(dst_page_indices, dtype=torch.int64, device=self.device)
+                self.token_to_kv_pool_allocator.free(gen_pages)
+                logger.debug(
+                    "KV return: freed %d cancelled pages", len(gen_pages)
+                )
+                continue
 
             # Convert returned page indices to torch.Tensor
             gen_pages = torch.tensor(
@@ -2663,6 +2669,15 @@ class Scheduler(
             self.tree_cache.insert(
                 InsertParams(key=insert_key, value=insert_value)
             )
+
+            # Free any gen pages that were truncated by page alignment
+            n_prefix = len(prefix_indices)
+            n_gen_used = max(0, aligned_len - n_prefix)
+            if n_gen_used < len(gen_pages):
+                leftover = gen_pages[n_gen_used:]
+                self.token_to_kv_pool_allocator.free(leftover)
+                logger.debug("KV return: freed %d truncated gen pages", len(leftover))
+
             insertion_count += 1
             logger.debug(
                 "KV return insertion: %d tokens (%d prefix + %d gen), %d pages inserted",

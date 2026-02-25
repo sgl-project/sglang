@@ -211,6 +211,7 @@ class NixlKVManager(CommonKVManager):
 
             # Store prefill NIXL agent info for KV return (populated during bootstrap)
             self.prefill_kv_return_info: Dict[str, dict] = {}
+            self._alloc_reply_buffer: Dict[str, bytes] = {}
             if server_args.enable_kv_return:
                 self._start_kv_return_listener()
         else:
@@ -525,6 +526,7 @@ class NixlKVManager(CommonKVManager):
         prefill_info: dict,
         token_ids: list,
         dst_page_indices: npt.NDArray[np.int32],
+        cancel: bool = False,
     ):
         """Decode-side: send metadata to prefill so it can insert into RadixCache.
 
@@ -536,6 +538,7 @@ class NixlKVManager(CommonKVManager):
             prefill_info: Entry from self.prefill_kv_return_info.
             token_ids: Full token sequence (prompt + generated).
             dst_page_indices: Page indices where KV was written on the prefill side.
+            cancel: If True, tells prefill to free the pages instead of inserting.
         """
         sock = prefill_info.get("metadata_sock")
         if sock is None:
@@ -545,7 +548,8 @@ class NixlKVManager(CommonKVManager):
         try:
             token_ids_bytes = np.array(token_ids, dtype=np.int32).tobytes()
             page_indices_bytes = np.asarray(dst_page_indices, dtype=np.int32).tobytes()
-            sock.send_multipart([token_ids_bytes, page_indices_bytes])
+            status = b"cancel" if cancel else b"ok"
+            sock.send_multipart([token_ids_bytes, page_indices_bytes, status])
             logger.debug(
                 "KV return metadata sent: %d tokens, %d pages to %s",
                 len(token_ids), len(dst_page_indices), prefill_info["agent_name"],
@@ -604,9 +608,11 @@ class NixlKVManager(CommonKVManager):
                     msg = meta_sock.recv_multipart()
                     # msg[0] = token_ids as int32 numpy bytes
                     # msg[1] = dst_page_indices as int32 numpy bytes
+                    # msg[2] = status (b"ok" or b"cancel"), optional for backwards compat
                     token_ids = np.frombuffer(msg[0], dtype=np.int32).tolist()
                     dst_page_indices = np.frombuffer(msg[1], dtype=np.int32)
-                    self.kv_return_insertion_queue.put((token_ids, dst_page_indices))
+                    cancel = len(msg) > 2 and msg[2] == b"cancel"
+                    self.kv_return_insertion_queue.put((token_ids, dst_page_indices, cancel))
                     self._kv_return_receive_count += 1
                     if self._kv_return_receive_count % 50 == 1:
                         logger.info(

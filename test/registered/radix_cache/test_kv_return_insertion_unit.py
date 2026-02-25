@@ -10,7 +10,7 @@ Covers:
 - Duplicate insertion: tree already has full sequence, orphaned pages freed
 - Empty queue: no-op when nothing to process
 - Page-aligned insertion: pages truncated to page_size boundary
-- Memory accounting: kv_return_reserved_tokens decremented correctly
+- Cancel handling: cancelled transfers free pages without inserting
 - Multiple items: queue with several entries drained in one call
 
 Usage:
@@ -40,7 +40,6 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 def _make_scheduler(
     page_size=1,
     max_total_num_tokens=100,
-    kv_return_reserved=0,
 ):
     """Create a minimal mock scheduler with the attributes needed by
     _process_kv_return_insertions."""
@@ -82,8 +81,6 @@ def _make_scheduler(
     # Device (CPU for testing)
     sched.device = "cpu"
 
-    # Memory accounting
-    sched.kv_return_reserved_tokens = kv_return_reserved
     sched.max_total_num_tokens = max_total_num_tokens
 
     # Server args
@@ -98,17 +95,15 @@ class TestKvReturnInsertion(unittest.TestCase):
 
     def test_empty_queue_noop(self):
         """No items in queue — nothing happens, no crash."""
-        sched, _ = _make_scheduler(kv_return_reserved=5)
+        sched, _ = _make_scheduler()
         sched._process_kv_return_insertions()
 
         sched.tree_cache.insert.assert_not_called()
         sched.token_to_kv_pool_allocator.free.assert_not_called()
-        # Reserved count unchanged
-        self.assertEqual(sched.kv_return_reserved_tokens, 5)
 
     def test_normal_insertion(self):
         """Normal case: prompt prefix matched, gen pages concatenated and inserted."""
-        sched, kv_mgr = _make_scheduler(kv_return_reserved=3)
+        sched, kv_mgr = _make_scheduler()
 
         # Simulate: 8 prompt tokens + 3 generated tokens = 11 total
         token_ids = list(range(11))
@@ -122,7 +117,7 @@ class TestKvReturnInsertion(unittest.TestCase):
             last_host_node=MagicMock(),
         )
 
-        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices))
+        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices, False))
         sched._process_kv_return_insertions()
 
         # tree_cache.insert() called once
@@ -133,14 +128,12 @@ class TestKvReturnInsertion(unittest.TestCase):
         self.assertEqual(len(call_args.value), 11)
         # Key = all 11 token_ids
         self.assertEqual(len(call_args.key), 11)
-        # Reserved decremented by 3 (gen pages)
-        self.assertEqual(sched.kv_return_reserved_tokens, 0)
         # free() NOT called (pages are in tree, not orphaned)
         sched.token_to_kv_pool_allocator.free.assert_not_called()
 
     def test_duplicate_insertion_frees_orphaned_pages(self):
         """Duplicate: tree already has full sequence — gen pages freed, not inserted."""
-        sched, kv_mgr = _make_scheduler(kv_return_reserved=2)
+        sched, kv_mgr = _make_scheduler()
 
         # 8 prompt + 2 gen = 10 tokens total
         token_ids = list(range(10))
@@ -154,7 +147,7 @@ class TestKvReturnInsertion(unittest.TestCase):
             last_host_node=MagicMock(),
         )
 
-        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices))
+        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices, False))
         sched._process_kv_return_insertions()
 
         # tree_cache.insert() NOT called (duplicate)
@@ -163,12 +156,10 @@ class TestKvReturnInsertion(unittest.TestCase):
         sched.token_to_kv_pool_allocator.free.assert_called_once()
         freed = sched.token_to_kv_pool_allocator.free.call_args[0][0]
         self.assertEqual(freed.tolist(), [90, 91])
-        # Reserved decremented to 0
-        self.assertEqual(sched.kv_return_reserved_tokens, 0)
 
     def test_page_aligned_truncation(self):
         """With page_size > 1, key/value truncated to page boundary."""
-        sched, kv_mgr = _make_scheduler(page_size=4, kv_return_reserved=2)
+        sched, kv_mgr = _make_scheduler(page_size=4)
 
         # 6 prompt + 2 gen = 8 tokens, but full_value has 8 entries
         # 8 is already aligned to page_size=4 so no truncation needed
@@ -182,7 +173,7 @@ class TestKvReturnInsertion(unittest.TestCase):
             last_host_node=MagicMock(),
         )
 
-        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices))
+        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices, False))
         sched._process_kv_return_insertions()
 
         call_args = sched.tree_cache.insert.call_args[0][0]
@@ -192,7 +183,7 @@ class TestKvReturnInsertion(unittest.TestCase):
 
     def test_page_aligned_truncation_odd(self):
         """With page_size=4 and 9 total entries, truncation to 8."""
-        sched, kv_mgr = _make_scheduler(page_size=4, kv_return_reserved=3)
+        sched, kv_mgr = _make_scheduler(page_size=4)
 
         # 6 prompt + 3 gen = 9 tokens total
         token_ids = list(range(9))
@@ -205,7 +196,7 @@ class TestKvReturnInsertion(unittest.TestCase):
             last_host_node=MagicMock(),
         )
 
-        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices))
+        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices, False))
         sched._process_kv_return_insertions()
 
         call_args = sched.tree_cache.insert.call_args[0][0]
@@ -215,12 +206,12 @@ class TestKvReturnInsertion(unittest.TestCase):
 
     def test_multiple_items_drained(self):
         """Multiple queue items processed in a single call."""
-        sched, kv_mgr = _make_scheduler(kv_return_reserved=4)
+        sched, kv_mgr = _make_scheduler()
 
         # Item 1: normal insertion (5 prompt + 2 gen)
-        kv_mgr.kv_return_insertion_queue.put((list(range(7)), [50, 51]))
+        kv_mgr.kv_return_insertion_queue.put((list(range(7)), [50, 51], False))
         # Item 2: different prompt (4 prompt + 2 gen)
-        kv_mgr.kv_return_insertion_queue.put((list(range(100, 106)), [60, 61]))
+        kv_mgr.kv_return_insertion_queue.put((list(range(100, 106)), [60, 61], False))
 
         def match_side_effect(params):
             n = len(params.key.token_ids)
@@ -237,28 +228,24 @@ class TestKvReturnInsertion(unittest.TestCase):
 
         # Both inserted
         self.assertEqual(sched.tree_cache.insert.call_count, 2)
-        # 4 gen pages total consumed from reserved
-        self.assertEqual(sched.kv_return_reserved_tokens, 0)
 
-    def test_reserved_does_not_go_negative(self):
-        """kv_return_reserved_tokens floors at 0, never goes negative."""
-        sched, kv_mgr = _make_scheduler(kv_return_reserved=1)
+    def test_cancel_frees_pages(self):
+        """Cancelled transfer frees allocated pages without inserting."""
+        sched, kv_mgr = _make_scheduler()
 
-        # 5 prompt + 3 gen but only 1 reserved — should floor at 0, not -2
+        # Simulate a cancelled transfer with 3 pages
         token_ids = list(range(8))
         gen_page_indices = [50, 51, 52]
 
-        prompt_pages = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64)
-        sched.tree_cache.match_prefix.return_value = MatchResult(
-            device_indices=prompt_pages,
-            last_device_node=MagicMock(),
-            last_host_node=MagicMock(),
-        )
-
-        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices))
+        kv_mgr.kv_return_insertion_queue.put((token_ids, gen_page_indices, True))
         sched._process_kv_return_insertions()
 
-        self.assertEqual(sched.kv_return_reserved_tokens, 0)
+        # insert() NOT called (cancelled)
+        sched.tree_cache.insert.assert_not_called()
+        # Pages freed back to allocator
+        sched.token_to_kv_pool_allocator.free.assert_called_once()
+        freed = sched.token_to_kv_pool_allocator.free.call_args[0][0]
+        self.assertEqual(freed.tolist(), [50, 51, 52])
 
     def test_no_kv_return_queue_attribute(self):
         """If kv_mgr has no kv_return_insertion_queue, method returns early."""

@@ -606,30 +606,39 @@ class SchedulerOutputProcessorMixin:
                 str(alloc_reply_port).encode("ascii"),
             ])
 
-            # Wait for allocation reply with timeout
-            if alloc_reply_sock.poll(timeout=5000):  # 5s timeout
-                reply = alloc_reply_sock.recv_multipart()
-                reply_id = reply[0].decode("ascii")
-                if reply_id != request_id:
-                    logger.warning(
-                        "KV return: alloc reply mismatch: expected %s, got %s",
-                        request_id, reply_id,
-                    )
-                    return
-                page_data = reply[1]
-                if not page_data:
-                    logger.debug(
-                        "KV return: prefill declined allocation for req %s "
-                        "(memory pressure), skipping",
-                        req.rid,
-                    )
-                    return
-                dst_page_indices = np.frombuffer(page_data, dtype=np.int32).copy()
+            # Wait for allocation reply with timeout (buffering out-of-order replies)
+            page_data = None
+            if request_id in kv_mgr._alloc_reply_buffer:
+                page_data = kv_mgr._alloc_reply_buffer.pop(request_id)
             else:
+                deadline = time.time() + 5.0
+                while True:
+                    remaining_ms = int((deadline - time.time()) * 1000)
+                    if remaining_ms <= 0:
+                        break
+                    if not alloc_reply_sock.poll(timeout=remaining_ms):
+                        break
+                    reply = alloc_reply_sock.recv_multipart()
+                    reply_id = reply[0].decode("ascii")
+                    if reply_id == request_id:
+                        page_data = reply[1]
+                        break
+                    # Buffer this reply for a later request
+                    kv_mgr._alloc_reply_buffer[reply_id] = reply[1]
+
+            if page_data is None:
                 logger.warning(
                     "KV return: allocation request timed out for req %s", req.rid
                 )
                 return
+            if not page_data:
+                logger.debug(
+                    "KV return: prefill declined allocation for req %s "
+                    "(memory pressure), skipping",
+                    req.rid,
+                )
+                return
+            dst_page_indices = np.frombuffer(page_data, dtype=np.int32).copy()
 
             alloc_ms = (time.time() - t_alloc) * 1000
             logger.debug(
@@ -667,6 +676,7 @@ class SchedulerOutputProcessorMixin:
                     break
                 if state == "ERR":
                     logger.warning("KV return transfer error for req %s", req.rid)
+                    kv_mgr.send_kv_return_metadata(prefill_info, [], dst_page_indices, cancel=True)
                     return
                 time.sleep(poll_interval)
                 elapsed += poll_interval
@@ -676,6 +686,7 @@ class SchedulerOutputProcessorMixin:
                     "KV return transfer timed out for req %s after %.1fs",
                     req.rid, timeout_s,
                 )
+                kv_mgr.send_kv_return_metadata(prefill_info, [], dst_page_indices, cancel=True)
                 return
 
             # Send metadata (token_ids + dst_page_indices) to prefill for RadixCache insertion
