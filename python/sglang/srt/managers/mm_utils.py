@@ -499,6 +499,7 @@ def _merge_precomputed_and_computed(
     max_iterations = min(len(items_size) - 1, len(prefix_length))
     item_idx = 0
     computed_idx = 0
+    skipped_idx = 0
     # build empty tensor for skipped items
     if computed_embedding:
         empty_t = torch.empty(
@@ -520,8 +521,9 @@ def _merge_precomputed_and_computed(
         num_items = items_size[i + 1] - items_size[i]
         if all(precomputed_mask[item_idx : item_idx + num_items]):
             item_idx += num_items
+            skipped_idx += 1
             continue
-        if request_skipped[i]:
+        if request_skipped[skipped_idx]:
             embedding[item_idx : item_idx + num_items] = [empty_t] * num_items
         else:
             embedding[item_idx] = computed_embedding[computed_idx]
@@ -531,6 +533,7 @@ def _merge_precomputed_and_computed(
                     num_items - 1
                 )
             computed_idx += 1
+        skipped_idx += 1
         item_idx += num_items
     return torch.concat(embedding, dim=0)
 

@@ -267,7 +267,9 @@ class MMReceiverBase(ABC):
         pass
 
     @abstractmethod
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(
+        self, img_data, mm_processor, prompt, need_wait_for_image=True
+    ):
         pass
 
     @abstractmethod
@@ -620,7 +622,9 @@ class MMReceiverHTTP(MMReceiverBase):
             encode_thread.start()
 
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt, need_wait_for_image):
+    async def recv_mm_data(
+        self, img_data, mm_processor, prompt, need_wait_for_image=True
+    ):
         try:
             if len(self.encode_urls) == 0 or not need_wait_for_image:
                 return None
