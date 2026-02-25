@@ -98,11 +98,13 @@ class TestRecordTypes:
     def test_discriminated_union_parsing(self):
         for record in [
             ConfigRecord(
-                baseline_path="/a",
-                target_path="/b",
-                diff_threshold=1e-3,
-                start_step=0,
-                end_step=100,
+                config={
+                    "baseline_path": "/a",
+                    "target_path": "/b",
+                    "diff_threshold": 1e-3,
+                    "start_step": 0,
+                    "end_step": 100,
+                },
             ),
             SkipRecord(name="attn", reason="no_baseline"),
             ComparisonRecord(
@@ -133,7 +135,7 @@ def _make_warning(**overrides) -> ReplicatedMismatchWarning:
 
 class TestAlignWarnings:
     def test_comparison_record_failed_when_diff_passed_but_warnings(self):
-        """ComparisonRecord with diff.passed=True but align_warnings → category=='failed'."""
+        """ComparisonRecord with diff.passed=True but warnings → category=='failed'."""
         record = ComparisonRecord(
             name="hidden",
             baseline=_make_tensor_info(),
@@ -141,21 +143,21 @@ class TestAlignWarnings:
             unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(passed=True),
-            align_warnings=[_make_warning()],
+            warnings=[_make_warning()],
         )
         assert record.category == "failed"
 
     def test_skip_record_failed_when_warnings(self):
-        """SkipRecord with align_warnings → category=='failed' instead of 'skipped'."""
+        """SkipRecord with warnings → category=='failed' instead of 'skipped'."""
         record = SkipRecord(
             name="x",
             reason="no_baseline",
-            align_warnings=[_make_warning()],
+            warnings=[_make_warning()],
         )
         assert record.category == "failed"
 
-    def test_align_warnings_json_round_trip(self):
-        """align_warnings survive model_dump_json → parse_record_json round-trip."""
+    def test_warnings_json_round_trip(self):
+        """warnings survive model_dump_json → parse_record_json round-trip."""
         warning = _make_warning(
             axis="cp",
             group_index=2,
@@ -170,14 +172,14 @@ class TestAlignWarnings:
             unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
-            align_warnings=[warning],
+            warnings=[warning],
         )
 
         restored = parse_record_json(record.model_dump_json())
         assert isinstance(restored, ComparisonRecord)
-        assert len(restored.align_warnings) == 1
+        assert len(restored.warnings) == 1
 
-        restored_warning = restored.align_warnings[0]
+        restored_warning = restored.warnings[0]
         assert restored_warning.axis == "cp"
         assert restored_warning.group_index == 2
         assert restored_warning.differing_index == 3

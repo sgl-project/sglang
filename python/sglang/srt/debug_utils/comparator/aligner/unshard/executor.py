@@ -8,7 +8,7 @@ from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
 )
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis
 from sglang.srt.debug_utils.comparator.output_types import (
-    AlignWarning,
+    AnyWarning,
     ReplicatedMismatchWarning,
 )
 
@@ -16,8 +16,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
 def execute_unshard_plan(
     plan: UnshardPlan,
     tensors: list[torch.Tensor],
-) -> tuple[list[torch.Tensor], list[AlignWarning]]:
-    all_warnings: list[AlignWarning] = []
+) -> tuple[list[torch.Tensor], list[AnyWarning]]:
+    all_warnings: list[AnyWarning] = []
     result: list[torch.Tensor] = []
 
     for group_idx, group in enumerate(plan.groups):
@@ -40,7 +40,7 @@ def _apply_unshard(
     *,
     axis: ParallelAxis,
     group_index: int,
-) -> tuple[torch.Tensor, list[AlignWarning]]:
+) -> tuple[torch.Tensor, list[AnyWarning]]:
     if isinstance(params, PickParams):
         warnings = _verify_replicated_group(
             ordered_tensors,
