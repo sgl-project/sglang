@@ -13,11 +13,7 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -596,6 +592,7 @@ class VisionAttention(nn.Module):
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ):
@@ -686,8 +683,8 @@ class VisionAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            reduce_results=False,
             prefix=add_prefix("proj", prefix),
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
@@ -949,8 +946,6 @@ class VisionAttention(nn.Module):
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)
-            if self.tp_size > 1:
-                output = get_attention_tp_group().all_reduce(output)
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(
@@ -959,8 +954,6 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [s, b, h * head_size]
             output, _ = self.proj(context_layer)
-            if self.tp_size > 1:
-                output = get_attention_tp_group().all_reduce(output)
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)

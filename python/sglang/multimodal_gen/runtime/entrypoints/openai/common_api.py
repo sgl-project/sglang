@@ -6,7 +6,7 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,

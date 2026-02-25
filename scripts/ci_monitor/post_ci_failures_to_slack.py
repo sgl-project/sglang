@@ -160,7 +160,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             color = "good"
         else:
             # Ping relevant people when there are failures
-            mentions = "<@U09RR5TNC94> <@U09ABMCKQPM>"
+            mentions = "<@U09R55D8EAY> <@U09ABMCKQPM>"
             summary_lines = [f"{mentions} 🚨 *CI Critical Failures (Scheduled Runs)*"]
 
             # Iterate in hardware priority order, with PR Test before Nightly

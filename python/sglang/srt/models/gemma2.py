@@ -39,7 +39,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
+
+_is_npu = is_npu()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -142,13 +144,28 @@ class Gemma2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=self.rope_theta,
-            is_neox_style=True,
-        )
+        if (
+            not _is_npu
+            or "Gemma2ForSequenceClassification" not in self.config.architectures
+        ):
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=self.rope_theta,
+                is_neox_style=True,
+            )
+            logit_cap = self.config.attn_logit_softcapping
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=self.rope_theta,
+                is_neox_style=True,
+                dtype=torch.float32,
+            )
+            logit_cap = 0.0
 
         use_sliding_window = layer_id % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
@@ -157,7 +174,7 @@ class Gemma2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            logit_cap=self.config.attn_logit_softcapping,
+            logit_cap=logit_cap,
             sliding_window_size=(
                 get_attention_sliding_window_size(config)
                 if use_sliding_window
@@ -294,7 +311,9 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states *= normalizer
 
         residual = None

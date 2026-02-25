@@ -737,3 +737,25 @@ def trace_event_batch(
 
     for req in reqs:
         trace_event(name, req.rid, ts=ts, attrs=_attrs)
+
+
+class SpanAttributes:
+    # Attribute names copied from here to avoid version conflicts:
+    # https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
+    GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.completion_tokens"
+    GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
+    GEN_AI_USAGE_CACHED_TOKENS = "gen_ai.usage.cached_tokens"
+    GEN_AI_REQUEST_MAX_TOKENS = "gen_ai.request.max_tokens"
+    GEN_AI_REQUEST_TOP_P = "gen_ai.request.top_p"
+    GEN_AI_REQUEST_TOP_K = "gen_ai.request.top_k"
+    GEN_AI_REQUEST_TEMPERATURE = "gen_ai.request.temperature"
+    GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+    GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
+    GEN_AI_REQUEST_ID = "gen_ai.request.id"
+    GEN_AI_REQUEST_N = "gen_ai.request.n"
+    GEN_AI_LATENCY_TIME_IN_QUEUE = "gen_ai.latency.time_in_queue"
+    GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN = "gen_ai.latency.time_to_first_token"
+    GEN_AI_LATENCY_E2E = "gen_ai.latency.e2e"
+    GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL = "gen_ai.latency.time_in_model_prefill"
+    GEN_AI_LATENCY_TIME_IN_MODEL_DECODE = "gen_ai.latency.time_in_model_decode"
+    GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE = "gen_ai.latency.time_in_model_inference"

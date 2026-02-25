@@ -31,13 +31,18 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.configs import (
+    BailingHybridConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
     Lfm2Config,
+    Lfm2MoeConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
@@ -45,6 +50,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
@@ -106,11 +112,13 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
+    DecodeInputBuffers,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -120,7 +128,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -146,6 +153,7 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
     dynamic_import,
+    empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_cpu_ids_by_node,
@@ -185,11 +193,6 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
-
-    init_npu_backend()
-
 MLA_ATTENTION_BACKENDS = [
     "aiter",
     "flashinfer",
@@ -211,6 +214,13 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
 ]
+
+TORCH_DTYPE_TO_KV_CACHE_STR = {
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.float8_e4m3fnuz: "fp8_e4m3",
+    torch.float8_e5m2: "fp8_e5m2",
+    torch.bfloat16: "bf16",
+}
 
 
 def add_mla_attention_backend(backend_name):
@@ -278,6 +288,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         nccl_port: int,
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
+        attn_cp_rank: Optional[int] = None,
+        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -291,9 +303,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
-        self.dp_size = server_args.dp_size
+        self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dp_rank = moe_dp_rank
+        self.moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -365,6 +381,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
+        # Initialize MooncakeTransferEngine
+        self.init_shared_mooncake_transfer_engine()
+
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
@@ -389,6 +408,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
+
+        if self.is_multimodal:
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values
         self.support_pp = (
@@ -489,6 +511,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
+        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
+            model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
@@ -566,8 +590,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                else server_args.max_running_requests // (self.dp_size)
             ),
             self.req_to_token_pool.size,
         )
@@ -739,7 +762,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
+        # Allow external orchestrators (e.g. trainpi) to override the distributed
+        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
+        # env-vars and an externally-created TCPStore, completely avoiding port
+        # conflicts with intra-host collocation.
+        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        if dist_init_method_override:
+            dist_init_method = dist_init_method_override
+        elif self.server_args.dist_init_addr:
             dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
@@ -777,8 +807,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
+                attention_data_parallel_size=self.dp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                attention_context_model_parallel_size=self.attn_cp_size,
+                moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
@@ -814,6 +847,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
         return min_per_gpu_memory
+
+    def init_shared_mooncake_transfer_engine(self):
+        """
+        Need MooncakeTransferEngine when:
+        1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
+        2) HiCache uses mooncake storage backend
+        3) Encoder disaggregation uses mooncake
+        """
+        use_mooncake_te = (
+            (
+                self.server_args.disaggregation_mode != "null"
+                and self.server_args.disaggregation_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.enable_hierarchical_cache
+                and self.server_args.hicache_storage_backend == "mooncake"
+            )
+            or (
+                self.server_args.encoder_only
+                and self.server_args.encoder_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.language_only
+                and self.server_args.encoder_transfer_backend == "mooncake"
+            )
+        )
+
+        if use_mooncake_te:
+            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                init_mooncake_transfer_engine,
+            )
+
+            init_mooncake_transfer_engine(
+                hostname=get_local_ip_auto(),
+                gpu_id=self.gpu_id,
+                ib_device=(
+                    self.server_args.disaggregation_ib_device
+                    or self.server_args.mooncake_ib_device
+                ),
+            )
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -977,6 +1050,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
                 self.pp_rank,
             )
+
+        if dumper.may_enable:
+            dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
@@ -1500,9 +1576,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
-    def hybrid_gdn_config(self):
+    def hybrid_lightning_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig | JetVLMConfig):
+        if isinstance(config, BailingHybridConfig):
+            return config
+        return None
+
+    @property
+    def hybrid_gdn_config(self):
+        config = self.model_config.hf_config.get_text_config()
+        if isinstance(
+            config,
+            Qwen3NextConfig
+            | Qwen3_5Config
+            | Qwen3_5MoeConfig
+            | JetNemotronConfig
+            | JetVLMConfig,
+        ):
             return config
         return None
 
@@ -1515,10 +1605,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pattern = getattr(config, "mtp_hybrid_override_pattern", None)
             if pattern is not None and "M" not in pattern:
                 return None
-        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
+        if isinstance(
+            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+        ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
+
+        if isinstance(config, GraniteMoeHybridConfig):
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(config, "layer_types", [])
+            )
+            if not has_mamba:
+                return None
+            else:
+                return config
+
         return None
 
     @property
@@ -1538,7 +1641,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
+        return (
+            self.mamba2_config
+            or self.hybrid_gdn_config
+            or self.kimi_linear_config
+            or self.hybrid_lightning_config
+        )
 
     def can_run_piecewise_cuda_graph(self):
         if self.is_draft_worker:
@@ -1576,8 +1684,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 if _is_hip:
                     self.kv_cache_dtype = fp8_dtype
+                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        self.kv_cache_dtype
+                    ]
                 else:
                     self.kv_cache_dtype = torch.float8_e4m3fn
+                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                        self.kv_cache_dtype
+                    ]
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
@@ -1619,8 +1733,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        tic = time.perf_counter()
-        logger.info("Init attention backend begin.")
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -1631,9 +1743,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
-        logger.info(
-            f"Init attention backend end. elapsed={time.perf_counter() - tic:.2f} s"
-        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
@@ -1731,6 +1840,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
 
         backend_str = self.server_args.moe_runner_backend
+
+        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
+
         if backend_str not in [
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
@@ -1758,12 +1870,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Running FlashInfer autotune...")
 
-        with torch.inference_mode(), autotune():
-            self._dummy_run(batch_size=self.req_to_token_pool.size)
-
+        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        self.forward_stream.wait_stream(torch.cuda.current_stream())
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            with torch.inference_mode(), autotune():
+                self._dummy_run(
+                    batch_size=self.req_to_token_pool.size, run_ctx=autotune()
+                )
+        torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
-    def _dummy_run(self, batch_size: int):
+    def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
         if self.is_generation:
             capture_forward_mode = ForwardMode.DECODE
@@ -1799,7 +1917,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers: GraphInputBuffers = GraphInputBuffers.create(
+        buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,
@@ -2003,7 +2121,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        run_once()
+        with torch.inference_mode(), run_ctx or empty_context():
+            run_once()
 
     def init_device_graphs(self):
         """Capture device graphs."""
@@ -2066,6 +2185,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
         self.moe_layers = []
+        self.moe_fusions = []
         for layer in language_model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
@@ -2077,22 +2197,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)
             elif hasattr(layer, "linear_attn"):
-                self.attention_layers.append(layer.linear_attn)
+                if hasattr(layer.linear_attn, "attn"):
+                    self.attention_layers.append(layer.linear_attn.attn)
+                else:
+                    self.attention_layers.append(layer.linear_attn)
             # For InternVL model
             elif hasattr(layer, "attention"):
                 if hasattr(layer.attention, "attn"):
                     self.attention_layers.append(layer.attention.attn)
 
             moe_block = None
+            moe_fusion = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
                 moe_block = layer.mlp.experts
+                moe_fusion = layer.mlp
             if hasattr(layer, "block_sparse_moe") and hasattr(
                 layer.block_sparse_moe, "experts"
             ):
                 moe_block = layer.block_sparse_moe.experts
+                moe_fusion = layer.block_sparse_moe
             if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
                 moe_block = layer.moe.experts
+                moe_fusion = layer.moe
             self.moe_layers.append(moe_block)
+            self.moe_fusions.append(moe_fusion)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
@@ -2189,7 +2317,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
+    ]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2198,20 +2328,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if (
+        can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
-        ):
-            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        )
+
+        if can_run_graph:
+            return (
+                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
+                can_run_graph,
+            )
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        return (
+            self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            ),
+            can_run_graph,
         )
 
     def forward_idle(
@@ -2308,6 +2446,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
+        if dumper.may_enable:
+            dumper.step()
+
         return output
 
     def _forward_raw(
@@ -2367,7 +2508,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            ret = self.forward_extend(
+            ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2469,7 +2610,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
         mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(self.model_config.hf_text_config, "rope_scaling", {})
+        rope_scaling = getattr(
+            self.model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(self.model_config.hf_text_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling
