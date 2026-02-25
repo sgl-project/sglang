@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -665,9 +666,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # If the abort is from scheduler.
                 if finish_reason_type == "abort":
+                    code = finish_reason.get(
+                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
-                        finish_reason.get("status_code", 500),
+                        code.name,
+                        code.value,
                     )
                     yield f"data: {error}\n\n"
                     continue
