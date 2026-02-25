@@ -159,7 +159,7 @@ async def generations(
         result,
         b64_list=b64_list,
         cloud_url=cloud_url,
-        # provide a local fallback URL when cloud upload is unavailable(mirror /v1/images/edits).
+        # Provide a local fallback URL when cloud upload is unavailable, mirroring /v1/images/edits.
         fallback_url=f"/v1/images/{request_id}/content",
     )
 
