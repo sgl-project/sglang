@@ -878,6 +878,138 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
 
+class TestEntrypointReplicatedAxis:
+    """Test replicated-axis scenarios through the full entrypoint pipeline."""
+
+    def test_replicated_axis_identical_replicas_passed(self, tmp_path, capsys):
+        """CP2 TP2, TP replicated and identical → passed, no align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_replicated_tp_sharded_cp_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                dims_str="b s(cp) d",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.align_warnings == []
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+
+    def test_replicated_mismatch_fails(self, tmp_path, capsys):
+        """CP2 TP2, TP replicas differ (> atol) → failed with align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_replicated_tp_sharded_cp_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                dims_str="b s(cp) d",
+                tp_noise=0.5,
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].category == "failed"
+        assert len(comparisons[0].align_warnings) > 0
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+
+    def test_summary_counts_failed_from_align_warnings_only(self, tmp_path, capsys):
+        """Diff itself passes but TP replicas differ → summary.failed=1 from align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_replicated_tp_sharded_cp_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="attn_out",
+            cp_size=2,
+            tp_size=2,
+            seq_dim=1,
+            dims_str="b s(cp) d",
+            tp_noise=0.5,
+        )
+        _create_replicated_tp_sharded_cp_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="attn_out",
+            cp_size=2,
+            tp_size=2,
+            seq_dim=1,
+            dims_str="b s(cp) d",
+            tp_noise=0.5,
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.5,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+
+        comp = comparisons[0]
+        assert comp.diff is not None
+        assert comp.diff.passed
+        assert len(comp.align_warnings) > 0
+        assert comp.category == "failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+        assert summary.passed == 0
+
+
 # --------------------------- Assertion helpers -------------------
 
 
@@ -1132,6 +1264,49 @@ def _create_cp_zigzag_tp_sharded_dumps(
                 dims=dims_str,
                 parallel_info=parallel_info,
                 num_steps=num_steps,
+            )
+            rank += 1
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_replicated_tp_sharded_cp_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    tp_size: int,
+    seq_dim: int,
+    dims_str: str,
+    tp_noise: float = 0.0,
+) -> Path:
+    """Create CP-sharded + TP-replicated dump files from a full tensor.
+
+    CP direction: chunks along seq_dim (sharded).
+    TP direction: clones (replicated), with optional noise to simulate mismatch.
+    """
+    cp_chunks: list[torch.Tensor] = list(full_tensor.chunk(cp_size, dim=seq_dim))
+
+    rank: int = 0
+    for cp_rank in range(cp_size):
+        for tp_rank in range(tp_size):
+            shard = cp_chunks[cp_rank].clone()
+            if tp_noise > 0 and tp_rank > 0:
+                shard = shard + torch.randn_like(shard) * tp_noise
+
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=shard,
+                dims=dims_str,
+                parallel_info={
+                    "cp_rank": cp_rank,
+                    "cp_size": cp_size,
+                    "tp_rank": tp_rank,
+                    "tp_size": tp_size,
+                },
             )
             rank += 1
 

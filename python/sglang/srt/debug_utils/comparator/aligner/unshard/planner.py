@@ -4,6 +4,7 @@ from typing import NamedTuple
 from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
     AxisInfo,
     ConcatParams,
+    PickParams,
     UnshardParams,
     UnshardPlan,
 )
@@ -32,31 +33,38 @@ def compute_unshard_plan(
         for dim_idx, spec in enumerate(dim_specs)
         if spec.parallel is not None
     }
-    if not sharded_axis_infos:
+    sharded_axes: set[ParallelAxis] = set(sharded_axis_infos)
+
+    all_axes: set[ParallelAxis] = {axis for info in parallel_infos for axis in info}
+    replicated_axes: set[ParallelAxis] = all_axes - sharded_axes
+
+    if not sharded_axes and not replicated_axes:
         return []
 
-    _validate(sharded_axes=set(sharded_axis_infos), parallel_infos=parallel_infos)
+    _validate(
+        axes_to_validate=sharded_axes | replicated_axes,
+        parallel_infos=parallel_infos,
+    )
 
     current_coords: _CoordsList = [
-        {axis: info[axis].axis_rank for axis in sharded_axis_infos}
+        {axis: info[axis].axis_rank for axis in sharded_axes | replicated_axes}
         for info in parallel_infos
     ]
 
+    axis_and_params: list[tuple[ParallelAxis, UnshardParams]] = [
+        (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
+    ] + [
+        (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
+        for axis, (dim_index, spec) in sharded_axis_infos.items()
+    ]
+
     plans: list[UnshardPlan] = []
-    for axis, (dim_index, spec) in sharded_axis_infos.items():
+    for axis, params in axis_and_params:
         result = _group_and_project(
             current_coords=current_coords,
             target_axis=axis,
         )
-
-        plans.append(
-            UnshardPlan(
-                axis=axis,
-                params=_resolve_unshard_params(spec=spec, dim_index=dim_index),
-                groups=result.groups,
-            )
-        )
-
+        plans.append(UnshardPlan(axis=axis, params=params, groups=result.groups))
         current_coords = result.projected_coords
 
     return plans
@@ -64,18 +72,18 @@ def compute_unshard_plan(
 
 def _validate(
     *,
-    sharded_axes: set[ParallelAxis],
+    axes_to_validate: set[ParallelAxis],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
 ) -> None:
-    """Check that every rank has all sharded axes, sizes are consistent, and ranks are complete."""
+    """Check that every rank has all axes, sizes are consistent, and ranks are complete."""
     axis_sizes: dict[ParallelAxis, int] = {}
 
     for world_rank, parallel_info in enumerate(parallel_infos):
-        for axis in sharded_axes:
+        for axis in axes_to_validate:
             if axis not in parallel_info:
                 raise ValueError(
                     f"world_rank={world_rank} missing parallel_info for "
-                    f"sharded axis {axis.value!r}"
+                    f"axis {axis.value!r}"
                 )
 
             axis_info = parallel_info[axis]

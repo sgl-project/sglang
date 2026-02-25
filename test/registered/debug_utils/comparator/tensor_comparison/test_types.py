@@ -6,6 +6,7 @@ import pytest
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
+    ReplicatedMismatchWarning,
     SkipRecord,
     SummaryRecord,
     parse_record_json,
@@ -116,6 +117,72 @@ class TestRecordTypes:
             restored = parse_record_json(record.model_dump_json())
             assert type(restored) is type(record)
             assert restored == record
+
+
+def _make_warning(**overrides) -> ReplicatedMismatchWarning:
+    defaults: dict = dict(
+        axis="tp",
+        group_index=0,
+        differing_index=1,
+        baseline_index=0,
+        max_abs_diff=0.1,
+    )
+    defaults.update(overrides)
+    return ReplicatedMismatchWarning(**defaults)
+
+
+class TestAlignWarnings:
+    def test_comparison_record_failed_when_diff_passed_but_warnings(self):
+        """ComparisonRecord with diff.passed=True but align_warnings → category=='failed'."""
+        record = ComparisonRecord(
+            name="hidden",
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(),
+            unified_shape=[4, 8],
+            shape_mismatch=False,
+            diff=_make_diff(passed=True),
+            align_warnings=[_make_warning()],
+        )
+        assert record.category == "failed"
+
+    def test_skip_record_failed_when_warnings(self):
+        """SkipRecord with align_warnings → category=='failed' instead of 'skipped'."""
+        record = SkipRecord(
+            name="x",
+            reason="no_baseline",
+            align_warnings=[_make_warning()],
+        )
+        assert record.category == "failed"
+
+    def test_align_warnings_json_round_trip(self):
+        """align_warnings survive model_dump_json → parse_record_json round-trip."""
+        warning = _make_warning(
+            axis="cp",
+            group_index=2,
+            differing_index=3,
+            baseline_index=0,
+            max_abs_diff=0.42,
+        )
+        record = ComparisonRecord(
+            name="mlp",
+            baseline=_make_tensor_info(),
+            target=_make_tensor_info(),
+            unified_shape=[4, 8],
+            shape_mismatch=False,
+            diff=_make_diff(),
+            align_warnings=[warning],
+        )
+
+        restored = parse_record_json(record.model_dump_json())
+        assert isinstance(restored, ComparisonRecord)
+        assert len(restored.align_warnings) == 1
+
+        restored_warning = restored.align_warnings[0]
+        assert restored_warning.axis == "cp"
+        assert restored_warning.group_index == 2
+        assert restored_warning.differing_index == 3
+        assert restored_warning.baseline_index == 0
+        assert restored_warning.max_abs_diff == pytest.approx(0.42)
 
 
 if __name__ == "__main__":
