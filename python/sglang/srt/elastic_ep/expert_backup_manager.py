@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import re
+import signal
 
 import torch
 import zmq
@@ -73,6 +74,9 @@ class ExpertBackupManager:
             * self.continuous_buffer.element_size(),
         )
         self.send_to_expert_backup_client.send_pyobj(back_req)
+
+        # Keep the manager subprocess alive until signals
+        signal.pause()
 
     def backup_weights_from_disk(self):
         load_config = LoadConfig(load_format=self.load_format)
