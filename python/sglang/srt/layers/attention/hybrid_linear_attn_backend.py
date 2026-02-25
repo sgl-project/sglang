@@ -46,7 +46,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-if not is_cpu() and not is_npu():
+if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
     try:
         from sglang.jit_kernel.cutedsl_gdn import (
