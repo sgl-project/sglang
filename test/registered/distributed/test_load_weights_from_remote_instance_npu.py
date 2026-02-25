@@ -24,7 +24,7 @@ import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -38,8 +38,7 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=72, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=72, suite="stage-b-test-large-2-gpu-amd")
+register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 def verify_params_close(params1, params2, error_msg):
