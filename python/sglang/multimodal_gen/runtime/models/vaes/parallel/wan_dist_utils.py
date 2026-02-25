@@ -10,6 +10,86 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+
+
+_FA_MAX_HEAD_DIM = 256
+
+
+class _VaeRingAttnImpl:
+    """
+    Simple attn impl for VAE ring attention, no forward-context dependency.
+    q/k/v expected in [B, S, H, D] layout; returns (output, softmax_lse).
+    Falls back to SDPA (with manual lse) when head_dim > 256.
+    """
+
+    def __init__(self, softmax_scale: float, head_size: int) -> None:
+        self.softmax_scale = softmax_scale
+        self.use_flash = head_size <= _FA_MAX_HEAD_DIM
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata=None,
+        *,
+        return_softmax_lse: bool = False,
+    ):
+        if self.use_flash:
+            return self._flash_forward(query, key, value, return_softmax_lse)
+        return self._sdpa_forward(query, key, value, return_softmax_lse)
+
+    def _flash_forward(self, q, k, v, return_softmax_lse):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+            fa_ver,
+            flash_attn_func,
+            flash_attn_varlen_func_op,
+            flash_attn_varlen_func_op_lse,
+        )
+
+        seqlen = q.shape[1]
+        if fa_ver == 3:
+            out = flash_attn_func(
+                q=q, k=k, v=v,
+                cu_seqlens_q=None, cu_seqlens_k=None,
+                max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=False,
+                return_softmax_lse=return_softmax_lse,
+                ver=fa_ver,
+            )
+            if return_softmax_lse:
+                return out  # already (out, lse)
+            return out, None
+        if fa_ver == 4:
+            if return_softmax_lse:
+                return flash_attn_varlen_func_op_lse(
+                    q=q, k=k, v=v,
+                    cu_seqlens_q=None, cu_seqlens_k=None,
+                    max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                    softmax_scale=self.softmax_scale,
+                    causal=False, return_softmax_lse=True, ver=fa_ver,
+                )
+            out = flash_attn_varlen_func_op(
+                q=q, k=k, v=v,
+                cu_seqlens_q=None, cu_seqlens_k=None,
+                max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                softmax_scale=self.softmax_scale,
+                causal=False, return_softmax_lse=False, ver=fa_ver,
+            )
+            return out, None
+        raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def _sdpa_forward(self, q, k, v, return_softmax_lse):
+        # q/k/v: [B, S, H, D] -> [B, H, S, D] for bmm
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale  # [B, H, S, S]
+        lse = torch.logsumexp(scores, dim=-1) if return_softmax_lse else None
+        out = torch.softmax(scores, dim=-1) @ v  # [B, H, S, D]
+        out = out.transpose(1, 2)  # [B, S, H, D]
+        return out, lse
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
     AvgDown3D,
@@ -481,8 +561,66 @@ class WanDistAttentionBlock(nn.Module):
         self.rank = get_sp_parallel_rank()
         self.world_size = get_sp_world_size()
         self.sp_group = get_sp_group()
+        self.use_ring_attn = False
+        if self.world_size > 1 and getattr(self.sp_group, "device_group", None) is not None:
+            self.use_ring_attn = True
+            self.attn_impl = _VaeRingAttnImpl(softmax_scale=1.0 / (dim**0.5), head_size=dim)
 
     def forward(self, x):
+        if self.use_ring_attn:
+            identity = x
+            batch_size, channels, num_frames, height, width = x.size()
+            x = x.permute(0, 2, 1, 3, 4).reshape(
+                batch_size * num_frames, channels, height, width
+            )
+            x = self.norm(x)
+
+            # compute query, key, value
+            qkv = self.to_qkv(x)
+            qkv = qkv.reshape(batch_size * num_frames, 1, channels * 3, -1)
+            qkv = qkv.permute(0, 1, 3, 2).contiguous()
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            # [B*T, 1, H*W, C] -> [batch, seq, head, head_dim]
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+
+            orig_dtype = q.dtype
+            if orig_dtype not in (torch.float16, torch.bfloat16):
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
+
+            from sglang.multimodal_gen.runtime.layers.usp import ring_attn
+
+            x = ring_attn(
+                q, k, v,
+                attn_impl=self.attn_impl,
+                is_causal=False,
+                dropout_p=0.0,
+                group=self.sp_group.device_group,
+            )
+
+            if x.dtype != orig_dtype:
+                x = x.to(orig_dtype)
+
+            # [B*T, H*W, 1, C] -> [batch_size * num_frames, channels, height, width]
+            x = (
+                x.squeeze(2)
+                .transpose(1, 2)
+                .reshape(batch_size * num_frames, channels, height, width)
+            )
+
+            # output projection
+            x = self.proj(x)
+
+            # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
+            x = x.view(batch_size, num_frames, channels, height, width)
+            x = x.permute(0, 2, 1, 3, 4)
+
+            return x + identity
+
         if self.world_size > 1:
             x = self.sp_group.all_gather(x, dim=-2)
             x = x.contiguous()

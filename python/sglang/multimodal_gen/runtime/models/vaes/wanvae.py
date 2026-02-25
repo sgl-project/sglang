@@ -412,7 +412,7 @@ class WanEncoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                )
+                        )
             x = self.conv_in(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -449,7 +449,7 @@ class WanEncoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                )
+                        )
             x = self.conv_out(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -718,7 +718,7 @@ class WanDecoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                )
+                        )
             x = self.conv_in(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -752,7 +752,7 @@ class WanDecoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                )
+                        )
             x = self.conv_out(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -888,18 +888,21 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            chunks = []
             with forward_context(
                 feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
             ):
-                t = x.shape[2]
-                iter_ = 1 + (t - 1) // 4
                 for i in range(iter_):
                     feat_idx.set(0)
                     if i == 0:
-                        out = self.encoder(x[:, :, :1, :, :])
+                        chunks.append(self.encoder(x[:, :, :1, :, :]))
                     else:
-                        out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
-                        out = torch.cat([out, out_], 2)
+                        chunks.append(
+                            self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                        )
+            out = torch.cat(chunks, dim=2)
             enc = self.quant_conv(out)
             mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
             enc = torch.cat([mu, logvar], dim=1)
@@ -946,23 +949,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
+            chunks = []
             with forward_context(
                 feat_cache_arg=self._feat_map, feat_idx_arg=self._conv_idx
             ):
                 for i in range(iter_):
                     feat_idx.set(0)
-                    if i == 0:
-                        first_chunk.set(True)
-                        out = self.decoder(x[:, :, i : i + 1, :, :])
-                    else:
-                        first_chunk.set(False)
-                        out_ = self.decoder(x[:, :, i : i + 1, :, :])
-                        out = torch.cat([out, out_], 2)
+                    first_chunk.set(i == 0)
+                    chunks.append(self.decoder(x[:, :, i : i + 1, :, :]))
+            out = torch.cat(chunks, dim=2)
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)
 
-            out = out.float()
             out = torch.clamp(out, min=-1.0, max=1.0)
             self.clear_cache()
         else:

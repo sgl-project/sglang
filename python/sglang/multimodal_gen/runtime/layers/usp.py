@@ -165,6 +165,7 @@ def ring_attn(
     attn_impl: "AttentionImpl",
     is_causal: bool = False,
     dropout_p: float = 0.0,
+    group: torch.distributed.ProcessGroup | None = None,
 ):
     """
     Ring Attention implementation.
@@ -181,14 +182,18 @@ def ring_attn(
                    used as the computational kernel.
         is_causal: Whether to apply causal masking.
         dropout_p: Dropout probability.
+        group: Optional ProcessGroup. Defaults to `get_sp_group().ring_group`.
     """
     # torch.distributed.tensor.experimental._attention is not a public API,
     from torch.distributed.tensor.experimental._attention import (
         _templated_ring_attention,
     )
 
-    ring_pg = get_sp_group().ring_group
-    assert ring_pg is not None, "Ring process group is not initialized."
+    if group is None:
+        ring_pg = get_sp_group().ring_group
+        assert ring_pg is not None, "Ring process group is not initialized."
+    else:
+        ring_pg = group
 
     # Ring attention primitives expect tensors in [B, H, S, D] layout.
     # We permute the inputs here.
