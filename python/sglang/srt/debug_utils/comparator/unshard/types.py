@@ -27,7 +27,12 @@ UnshardParams = ConcatParams
 class UnshardPlan(_FrozenBase):
     axis: ParallelAxis
     params: UnshardParams
-    world_ranks_by_axis_rank: list[int]
+    # groups[i] = indices in the input tensor list, which will be operated (e.g. concat) into i-th output tensor.
+    #
+    # Multistep example (CP=2, TP=2, 4 input tensors):
+    #   plan[0] (CP): groups=[[0,2],[1,3]]  — 4 tensors → 2 tensors
+    #   plan[1] (TP): groups=[[0,1]]        — 2 tensors → 1 tensor
+    groups: list[list[int]]
 
 
 # Union of all plan types. Future pipeline components (e.g. reduction,
