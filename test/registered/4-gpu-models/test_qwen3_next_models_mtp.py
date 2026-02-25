@@ -10,7 +10,7 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,
     test_input_output_logprobs_match_prefill_cache_hit_helper,
-    test_input_output_logprobs_match_helper
+    test_input_output_logprobs_match_helper,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -72,9 +72,7 @@ class TestQwen3NextMTP(CustomTestCase):
                 "--chunked-prefill-size",
                 "2048",
                 "--mamba-scheduler-strategy",
-                "extra_buffer",
-                "--mamba-track-interval",
-                "128",
+                "no_buffer",
             ],
         )
 
@@ -214,6 +212,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
                 ), f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
         print("test_prefix_cache_branching passed")
 
+
 class TestQwen3NextMTPV2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -268,7 +267,6 @@ class TestQwen3NextMTPV2(CustomTestCase):
             metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
         )
 
-
     # TODO(hzh): After merging the PR that fixes specv2 to correctly return log probs, re-open the tests below. https://github.com/sgl-project/sglang/pull/18645
     # def test_input_output_logprobs_match(self):
     #     test_input_output_logprobs_match_helper(
@@ -296,6 +294,7 @@ class TestQwen3NextMTPV2(CustomTestCase):
     #         max_samples=32,
     #         max_new_tokens=512,
     #     )
+
 
 if __name__ == "__main__":
     unittest.main()
