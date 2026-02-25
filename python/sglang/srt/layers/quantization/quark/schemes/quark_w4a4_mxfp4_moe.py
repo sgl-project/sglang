@@ -11,7 +11,7 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_torch_compile_disable_decorator
+    get_torch_compile_disable_decorator,
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
@@ -167,7 +167,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-
 
     @get_torch_compile_disable_decorator(_use_aiter_gfx95)
     def apply_weights(
