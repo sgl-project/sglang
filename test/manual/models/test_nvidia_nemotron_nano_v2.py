@@ -28,6 +28,7 @@ class TestNvidiaNemotronNanoV2BF16ExtraBuffer(
     cache_chunk_size = 256
     gsm8k_accuracy_thres = 0.87
     kl_div_thres = 0.008
+    kl_div_thres_prefill = 0.03
     other_args = [
         "--max-mamba-cache-size",
         "256",

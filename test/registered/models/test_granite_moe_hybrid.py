@@ -13,7 +13,7 @@ GRANITE_MOE_HYBRID_MODEL = "ibm-granite/granite-4.0-h-micro"
 
 class TestGraniteMoeHybrid(GSM8KMixin, DefaultServerBase):
     model = GRANITE_MOE_HYBRID_MODEL
-    gsm8k_accuracy_thres = 0.5
+    gsm8k_accuracy_thres = 0.78
     other_args = [
         "--trust-remote-code",
     ]
@@ -24,8 +24,9 @@ class TestGraniteMoeHybridExtraBuffer(
 ):
     model = GRANITE_MOE_HYBRID_MODEL
     cache_chunk_size = 256
-    gsm8k_accuracy_thres = 0.5
+    gsm8k_accuracy_thres = 0.78
     kl_div_thres = 0.008
+    kl_div_thres_prefill = 0.03
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
