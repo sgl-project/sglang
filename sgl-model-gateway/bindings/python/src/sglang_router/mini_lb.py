@@ -229,13 +229,6 @@ class MiniLoadBalancer:
     ):
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
-        if self.test_external_dp_routing:
-            await self._ensure_dp_sizes()
-            prefill_req, decode_req, _ = self._fork_dp_requests(modified_request)
-        else:
-            prefill_req = modified_request
-            decode_req = modified_request
-
         async def stream_results():
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(
@@ -259,12 +252,12 @@ class MiniLoadBalancer:
                 tasks = [
                     session.post(
                         f"{prefill_server}/{endpoint}",
-                        json=prefill_req,
+                        json=modified_request,
                         headers=headers,
                     ),
                     session.post(
                         f"{decode_server}/{endpoint}",
-                        json=decode_req,
+                        json=modified_request,
                         headers=headers,
                     ),
                 ]
