@@ -1592,6 +1592,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
 def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
+
 def _create_global_tcp_store(rank: int, world_size: int) -> None:
     """Create a global TCPStore for coordination across ranks.
 
