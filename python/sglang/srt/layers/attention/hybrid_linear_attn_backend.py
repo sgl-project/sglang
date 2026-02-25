@@ -243,15 +243,8 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2 is used by EAGLEWorkerV2 to fill draft KV cache after verification.
-                draft_token_num = forward_batch.extend_seq_lens_cpu[0]
-                query_start_loc = torch.arange(
-                    0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=draft_token_num,
-                    dtype=torch.int32,
-                    device=forward_batch.input_ids.device,
-                )
+                # Draft model only uses full attention layers, so mamba metadata is unused.
+                query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
                     0,
