@@ -156,12 +156,29 @@ class ZImageAttention(nn.Module):
                 prefix=f"{prefix}.to_qkv",
             )
         else:
-            self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
             self.to_k = ColumnParallelLinear(
-                dim, kv_dim, bias=False, gather_output=False
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
             )
             self.to_v = ColumnParallelLinear(
-                dim, kv_dim, bias=False, gather_output=False
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
             )
 
         if self.qk_norm:
