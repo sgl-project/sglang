@@ -5,7 +5,7 @@ import time
 
 import torch
 
-from sglang.jit_kernel.cuda_wait_value import Event, stream_wait_value
+from sglang.jit_kernel.cuda_wait_value import Event
 
 
 def _run_wait_before_record(event: Event | torch.cuda.Event):
