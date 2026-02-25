@@ -2152,10 +2152,6 @@ class ServerArgs:
                 "compressed-tensors",
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
-            model_arch = self.get_model_config().hf_config.architectures[0]
-            assert (
-                "Qwen" in model_arch or "Deepseek" in model_arch
-            ), "FlashInfer TRTLLM MoE is only supported for Qwen or Deepseek models."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
