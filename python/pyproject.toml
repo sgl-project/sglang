@@ -19,7 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "av",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.2",
+  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.3",
   "gguf",
   "hf_transfer",
   "huggingface_hub",

@@ -8,6 +8,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -108,7 +109,7 @@ class TestAbortWithApiKey(CustomTestCase):
         )
 
 
-class TestAbortAll(CustomTestCase):
+class TestAbortAll(AbortAllMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -123,40 +124,6 @@ class TestAbortAll(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def _run_decode(self):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 16000,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
-    def test_abort_all(self):
-        num_requests = 32
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            # ensure the decode has been started
-            time.sleep(2)
-
-            requests.post(
-                self.base_url + "/abort_request",
-                json={
-                    "abort_all": True,
-                },
-            )
-
-            for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
 
 
 class TestAbortAllWithRetraction(CustomTestCase):
@@ -198,6 +165,8 @@ class TestAbortAllWithRetraction(CustomTestCase):
                     "max_new_tokens": 4000,
                     "ignore_eos": True,
                 },
+                "return_logprob": True,
+                "top_logprobs_num": 3,
             },
         )
         return response.json()
@@ -218,25 +187,44 @@ class TestAbortAllWithRetraction(CustomTestCase):
             )
 
             abort_in_queue_count = 0
-            abort_in_queue_with_none_empty_text = 0
+            abort_in_queue_with_partial_gen = 0
 
             for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
-                if (
-                    future.result()["meta_info"]["finish_reason"]["message"]
-                    == "Abort in waiting queue"
-                ):
+                result = future.result()
+                meta_info = result["meta_info"]
+                finish_reason = meta_info.get("finish_reason", {})
+
+                self.assertEqual(finish_reason.get("type"), "abort")
+
+                if finish_reason.get("message") == "Abort in waiting queue":
                     abort_in_queue_count += 1
-                    if len(future.result()["output_ids"]) > 0:
-                        abort_in_queue_with_none_empty_text += 1
-            assert abort_in_queue_count > 0
-            assert abort_in_queue_with_none_empty_text > 0
+                    output_ids = result.get("output_ids", [])
+
+                    if len(output_ids) > 0:
+                        abort_in_queue_with_partial_gen += 1
+
+                        self.assertEqual(
+                            meta_info.get("completion_tokens"), len(output_ids)
+                        )
+                        self.assertGreater(len(result.get("text", "")), 0)
+                        self.assertIsNotNone(meta_info.get("weight_version"))
+                        self.assertGreater(meta_info.get("e2e_latency"), 0)
+                        for logprob_key in [
+                            "output_token_logprobs",
+                            "output_top_logprobs",
+                        ]:
+                            self.assertEqual(
+                                len(meta_info.get(logprob_key, [])),
+                                len(output_ids),
+                                f"Length of '{logprob_key}' should match output_ids length",
+                            )
+
+            self.assertGreater(abort_in_queue_count, 0)
+            self.assertGreater(abort_in_queue_with_partial_gen, 0)
             print("Finished test_abort_all_with_retraction")
 
 
-class TestAbortWithWaitingTimeout(CustomTestCase):
+class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -254,33 +242,6 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def _run_decode(self):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "Today is ",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 512,
-                    "ignore_eos": True,
-                },
-            },
-        )
-        return response.json()
-
-    def test_waiting_timeout(self):
-        num_requests = 2
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode) for _ in range(num_requests)]
-
-            error_count = 0
-            for future in as_completed(futures):
-                result = future.result()
-                if result.get("object") == "error":
-                    error_count += 1
-                    self.assertEqual(result["code"], 503)
-            self.assertEqual(error_count, 1)
 
 
 class TestAbortWithRunningTimeout(CustomTestCase):

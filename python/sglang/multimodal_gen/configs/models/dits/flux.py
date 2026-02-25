@@ -23,9 +23,36 @@ class FluxArchConfig(DiTArchConfig):
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
+    # nunchaku checkpoint uses different weight names; map to sglang flux layout
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            r"transformer\.(\w*)\.(.*)$": r"\1.\2",
+            # HF diffusers format
+            r"^transformer\.(\w*)\.(.*)$": r"\1.\2",
+            # transformer_blocks nunchaku format (raw export - before internal conversion)
+            r"^transformer_blocks\.(\d+)\.mlp_fc1\.(.*)$": r"transformer_blocks.\1.ff.net.0.proj.\2",
+            r"^transformer_blocks\.(\d+)\.mlp_fc2\.(.*)$": r"transformer_blocks.\1.ff.net.2.\2",
+            r"^transformer_blocks\.(\d+)\.mlp_context_fc1\.(.*)$": r"transformer_blocks.\1.ff_context.net.0.proj.\2",
+            r"^transformer_blocks\.(\d+)\.mlp_context_fc2\.(.*)$": r"transformer_blocks.\1.ff_context.net.2.\2",
+            r"^transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"transformer_blocks.\1.attn.to_qkv.\2",
+            r"^transformer_blocks\.(\d+)\.qkv_proj_context\.(.*)$": r"transformer_blocks.\1.attn.to_added_qkv.\2",
+            r"^transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"transformer_blocks.\1.attn.to_out.0.\2",
+            r"^transformer_blocks\.(\d+)\.out_proj_context\.(.*)$": r"transformer_blocks.\1.attn.to_add_out.\2",
+            r"^transformer_blocks\.(\d+)\.norm_q\.(.*)$": r"transformer_blocks.\1.attn.norm_q.\2",
+            r"^transformer_blocks\.(\d+)\.norm_k\.(.*)$": r"transformer_blocks.\1.attn.norm_k.\2",
+            r"^transformer_blocks\.(\d+)\.norm_added_q\.(.*)$": r"transformer_blocks.\1.attn.norm_added_q.\2",
+            r"^transformer_blocks\.(\d+)\.norm_added_k\.(.*)$": r"transformer_blocks.\1.attn.norm_added_k.\2",
+            # transformer_blocks nunchaku format (already converted with convert_flux_state_dict)
+            r"^transformer_blocks\.(\d+)\.attn\.add_qkv_proj\.(.*)$": r"transformer_blocks.\1.attn.to_added_qkv.\2",
+            # single_transformer_blocks nunchaku format (raw export - before internal conversion)
+            r"^single_transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_qkv.\2",
+            r"^single_transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.0.\2",
+            r"^single_transformer_blocks\.(\d+)\.norm_q\.(.*)$": r"single_transformer_blocks.\1.attn.norm_q.\2",
+            r"^single_transformer_blocks\.(\d+)\.norm_k\.(.*)$": r"single_transformer_blocks.\1.attn.norm_k.\2",
+            # nunchaku quantization parameter name conversions (apply to all blocks)
+            r"^(.*)\.smooth_orig$": r"\1.smooth_factor_orig",
+            r"^(.*)\.smooth$": r"\1.smooth_factor",
+            r"^(.*)\.lora_down$": r"\1.proj_down",
+            r"^(.*)\.lora_up$": r"\1.proj_up",
         }
     )
 

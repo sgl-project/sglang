@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -25,6 +26,9 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+
+# Maximum rows per Triton block for layernorm gated kernel
+MAX_ROWS_PER_BLOCK = 4
 
 
 def rms_norm_ref(
@@ -173,9 +177,17 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    # When piecewise cuda graph is enabled, use a constant value to avoid
+    # torch.compile creating guards on the dynamic batch dimension.
+    try:
+        if get_global_server_args().enable_piecewise_cuda_graph:
+            return MAX_ROWS_PER_BLOCK
+    except ValueError:
+        # Global server args not initialized (e.g., in unit tests)
+        pass
     sm_count = _get_sm_count(device)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
-    rows_per_block = min(rows_per_block, 4)
+    rows_per_block = min(rows_per_block, MAX_ROWS_PER_BLOCK)
     return rows_per_block
 
 
