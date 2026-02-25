@@ -24,22 +24,21 @@ def compare_tensors(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     name: str = "",
+    diff_threshold: float = 1e-3,
 ) -> TensorComparisonInfo:
     baseline_info = TensorInfo(
-        shape=x_baseline.shape,
-        dtype=x_baseline.dtype,
+        shape=list(x_baseline.shape),
+        dtype=str(x_baseline.dtype),
         stats=_compute_tensor_stats(x_baseline.float()),
-        sample=None,
     )
     target_info = TensorInfo(
-        shape=x_target.shape,
-        dtype=x_target.dtype,
+        shape=list(x_target.shape),
+        dtype=str(x_target.dtype),
         stats=_compute_tensor_stats(x_target.float()),
-        sample=None,
     )
 
     x_baseline = try_unify_shape(x_baseline, target_shape=x_target.shape)
-    unified_shape = x_baseline.shape
+    unified_shape = list(x_baseline.shape)
 
     baseline_original_dtype = x_baseline.dtype
     target_original_dtype = x_target.dtype
@@ -54,12 +53,16 @@ def compare_tensors(
     downcast_dtype: Optional[torch.dtype] = None
 
     if not shape_mismatch:
-        diff = _compute_diff(x_baseline=x_baseline_f, x_target=x_target_f)
+        diff = _compute_diff(
+            x_baseline=x_baseline_f,
+            x_target=x_target_f,
+            diff_threshold=diff_threshold,
+        )
 
         needs_sample = diff.max_abs_diff > SAMPLE_DIFF_THRESHOLD
         if needs_sample:
-            baseline_info.sample = get_truncated_value(x_baseline_f)
-            target_info.sample = get_truncated_value(x_target_f)
+            baseline_info.sample = str(get_truncated_value(x_baseline_f))
+            target_info.sample = str(get_truncated_value(x_target_f))
 
         if baseline_original_dtype != target_original_dtype:
             downcast_dtype = compute_smaller_dtype(
@@ -69,6 +72,7 @@ def compare_tensors(
                 diff_downcast = _compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
+                    diff_threshold=diff_threshold,
                 )
 
     return TensorComparisonInfo(
@@ -79,7 +83,7 @@ def compare_tensors(
         shape_mismatch=shape_mismatch,
         diff=diff,
         diff_downcast=diff_downcast,
-        downcast_dtype=downcast_dtype,
+        downcast_dtype=str(downcast_dtype) if downcast_dtype is not None else None,
     )
 
 
@@ -101,15 +105,28 @@ def _quantile_or_none(x: torch.Tensor, *, q: float, include: bool) -> Optional[f
     return torch.quantile(x, q).item() if include else None
 
 
-def _compute_diff(x_baseline: torch.Tensor, x_target: torch.Tensor) -> DiffInfo:
+def _compute_diff(
+    x_baseline: torch.Tensor,
+    x_target: torch.Tensor,
+    diff_threshold: float = 1e-3,
+) -> DiffInfo:
     raw_abs_diff = (x_target - x_baseline).abs()
     max_diff_coord = argmax_coord(raw_abs_diff)
 
+    rel_diff = calc_rel_diff(x_target, x_baseline).item()
+    max_abs_diff = raw_abs_diff.max().item()
+    mean_abs_diff = raw_abs_diff.mean().item()
+
     return DiffInfo(
-        rel_diff=calc_rel_diff(x_target, x_baseline).item(),
-        max_abs_diff=raw_abs_diff.max().item(),
-        mean_abs_diff=raw_abs_diff.mean().item(),
-        max_diff_coord=max_diff_coord,
+        rel_diff=rel_diff,
+        max_abs_diff=max_abs_diff,
+        mean_abs_diff=mean_abs_diff,
+        max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
+        passed=(
+            rel_diff <= diff_threshold
+            and max_abs_diff <= diff_threshold
+            and mean_abs_diff <= diff_threshold
+        ),
     )

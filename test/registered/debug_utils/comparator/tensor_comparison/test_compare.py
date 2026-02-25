@@ -53,6 +53,7 @@ class TestComputeDiff:
         assert diff.rel_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.mean_abs_diff == pytest.approx(0.0, abs=1e-5)
+        assert diff.passed is True
 
     def test_known_offset(self):
         x = torch.ones(10, 10)
@@ -62,10 +63,11 @@ class TestComputeDiff:
         diff = _compute_diff(x_baseline=x, x_target=y)
 
         assert diff.max_abs_diff == pytest.approx(0.5, abs=1e-4)
-        assert diff.max_diff_coord == (3, 7)
+        assert diff.max_diff_coord == [3, 7]
         assert diff.baseline_at_max == pytest.approx(1.0, abs=1e-4)
         assert diff.target_at_max == pytest.approx(1.5, abs=1e-4)
         assert diff.mean_abs_diff == pytest.approx(0.5 / 100, abs=1e-4)
+        assert diff.passed is False
 
     def test_rel_diff_value(self):
         x = torch.tensor([1.0, 0.0])
@@ -73,6 +75,7 @@ class TestComputeDiff:
         diff = _compute_diff(x_baseline=x, x_target=y)
 
         assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
+        assert diff.passed is False
 
 
 class TestCompareTensors:
@@ -83,8 +86,8 @@ class TestCompareTensors:
         info = compare_tensors(x_baseline=x, x_target=y, name="test")
 
         assert info.name == "test"
-        assert info.baseline.shape == torch.Size([5, 5])
-        assert info.target.shape == torch.Size([5, 5])
+        assert info.baseline.shape == [5, 5]
+        assert info.target.shape == [5, 5]
         assert info.shape_mismatch is False
         assert info.diff is not None
         assert info.diff_downcast is None
@@ -107,7 +110,7 @@ class TestCompareTensors:
         assert info.shape_mismatch is False
         assert info.diff is not None
         assert info.diff_downcast is not None
-        assert info.downcast_dtype == torch.bfloat16
+        assert info.downcast_dtype == "torch.bfloat16"
 
     def test_shape_unification(self):
         torch.manual_seed(0)
@@ -117,8 +120,8 @@ class TestCompareTensors:
 
         info = compare_tensors(x_baseline=x, x_target=y, name="unify")
 
-        assert info.baseline.shape == torch.Size([1, 1, 4, 8])
-        assert info.unified_shape == torch.Size([4, 8])
+        assert info.baseline.shape == [1, 1, 4, 8]
+        assert info.unified_shape == [4, 8]
         assert info.shape_mismatch is False
         assert info.diff is not None
         assert info.diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
