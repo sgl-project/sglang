@@ -400,6 +400,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
+            dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
 
