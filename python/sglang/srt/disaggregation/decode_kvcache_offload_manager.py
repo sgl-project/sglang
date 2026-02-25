@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -115,15 +116,15 @@ class DecodeKVCacheOffloadManager:
             prefill_hashes = self._compute_prefix_hash(
                 req.origin_input_ids[:prefill_offloaded_len]
             )
-            last_prefill_hash = prefill_hashes[-1] if prefill_offloaded_len > 0 else ""
-            state = {
-                "prefill_len": prefill_offloaded_len,
-                "inc_len": 0,
-                "last_hash": last_prefill_hash,
-            }
+            last_prefill_hash = prefill_hashes[-1] if prefill_offloaded_len > 0 else None
+            state = OffloadedState(
+                prefill_len=prefill_offloaded_len,
+                inc_len=0,
+                last_hash=last_prefill_hash,
+            )
             self.offloaded_state[req.rid] = state
-        incremental_total = len(all_tokens) - state["prefill_len"]
-        incremental_new = incremental_total - state["inc_len"]
+        incremental_total = len(all_tokens) - state.prefill_len
+        incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
         )
@@ -132,14 +133,14 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Extract incremental tokens and indices for the newly available chunk
-        start = state["prefill_len"] + state["inc_len"]
+        start = state.prefill_len + state.inc_len
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
 
         # Early free prefill-offloaded GPU memory (NSA-aware)
-        if state["prefill_len"] > 0 and state["inc_len"] == 0:
-            self.token_to_kv_pool_allocator.free(token_indices[: state["prefill_len"]])
+        if state.prefill_len > 0 and state.inc_len == 0:
+            self.token_to_kv_pool_allocator.free(token_indices[: state.prefill_len])
 
         # Asynchronously offload incremental KV cache from device to host
         self.request_counter += 1
@@ -160,7 +161,7 @@ class DecodeKVCacheOffloadManager:
             start,
             end,
         )
-        state["inc_len"] += incremental_aligned_len
+        state.inc_len += incremental_aligned_len
         return True
 
     def check_offload_progress(self):
@@ -206,12 +207,12 @@ class DecodeKVCacheOffloadManager:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
 
-                prior_hash = self.offloaded_state.get(req.rid, {}).get("last_hash", "")
+                prior_hash = self.offloaded_state[req.rid].last_hash if req.rid in self.offloaded_state else None
                 last_hash = self._trigger_backup(
                     req, host_indices, incremental_tokens, start_time, prior_hash
                 )
                 if req.rid in self.offloaded_state:
-                    self.offloaded_state[req.rid]["last_hash"] = last_hash
+                    self.offloaded_state[req.rid].last_hash = last_hash
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
@@ -271,8 +272,8 @@ class DecodeKVCacheOffloadManager:
             prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
             inc_len = 0
         else:
-            prefill_len = state.get("prefill_len", 0)
-            inc_len = state.get("inc_len", 0)
+            prefill_len = state.prefill_len
+            inc_len = state.inc_len
         # If no incremental offload ever happened, the prefill-aligned part was never freed.
         # Free the prefill portion on request finish to avoid leaks.
         if prefill_len > 0 and inc_len == 0:
