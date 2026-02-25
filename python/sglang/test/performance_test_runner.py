@@ -79,6 +79,7 @@ def run_performance_test(
             other_args=model.extra_args,
             variant=model.variant or "",
             extra_bench_args=extra_bench_args,
+            env=model.env,
         )
 
         if success and results:

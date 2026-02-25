@@ -61,8 +61,12 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.mamba.ops import (
+    initialize_mamba_selective_state_update_backend,
+)
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
+    get_attention_cp_group,
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
@@ -86,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -151,6 +157,7 @@ from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
+    PrefillStats,
     SchedulerMetricsMixin,
 )
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -266,6 +273,8 @@ class Scheduler(
         tp_rank: int,
         moe_ep_rank: int,
         pp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
@@ -276,6 +285,10 @@ class Scheduler(
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dp_rank = moe_dp_rank
+        self.moe_dp_size = server_args.moe_dp_size
         self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
@@ -321,6 +334,7 @@ class Scheduler(
                 self.tp_rank,
                 self.tp_size,
                 self.dp_size,
+                self.attn_cp_size,
             )
         )
 
@@ -346,6 +360,9 @@ class Scheduler(
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
+
+        # Init mamba backend
+        self.init_mamba_backend()
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
@@ -404,7 +421,7 @@ class Scheduler(
         context = zmq.Context(2)
         self.idle_sleeper = None
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -480,6 +497,9 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
+    def init_mamba_backend(self) -> None:
+        initialize_mamba_selective_state_update_backend(self.server_args)
+
     def init_moe_gemm_config(self):
         # For the MM models, check the text_config for MoE settings
         config_to_check = getattr(
@@ -505,6 +525,8 @@ class Scheduler(
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
             pp_rank=self.pp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
@@ -523,6 +545,8 @@ class Scheduler(
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
             dp_rank=self.dp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
@@ -570,6 +594,8 @@ class Scheduler(
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
@@ -1058,8 +1084,25 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (DumperControlReqInput, self.handle_dumper_control),
             ]
         )
+
+    def _abort_on_running_timeout(self):
+        # NOTE: this should be called before a batch is launched,
+        # as current spec-v1 still filters batch inside verify stage.
+        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if timeout_s <= 0:
+            return
+        if self.running_batch.is_empty():
+            return
+
+        deadline = time.perf_counter() - timeout_s
+        for req in self.running_batch.reqs:
+            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                req.to_finish = FINISH_ABORT(
+                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
+                )
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1184,7 +1227,7 @@ class Scheduler(
                 return []
 
         if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 recv_reqs = []
 
                 while True:
@@ -1208,7 +1251,7 @@ class Scheduler(
             else:
                 recv_reqs = None
         else:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
@@ -1224,7 +1267,7 @@ class Scheduler(
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
@@ -1237,6 +1280,15 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
+
+            if self.attn_cp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
@@ -1480,7 +1532,10 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if recv_req.bootstrap_room is None:
+                if (
+                    recv_req.bootstrap_room is None
+                    and self.transfer_backend != TransferBackend.FAKE
+                ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
@@ -1719,12 +1774,12 @@ class Scheduler(
         )
         return req_to_abort.rid == recv_req.rid
 
-    def _abort_on_queued_timeout(self):
-        if (timeout_ms := envs.SGLANG_QUEUED_TIMEOUT_MS.get()) <= 0:
+    def _abort_on_waiting_timeout(self):
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
         deleted_reqs = set()
-        deadline = time.perf_counter() - (timeout_ms / 1000.0)
+        deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
@@ -1736,7 +1791,7 @@ class Scheduler(
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request queue timeout reached.",
+                            "message": "Request waiting timeout reached.",
                         },
                         rid=req.rid,
                     ),
@@ -1761,6 +1816,7 @@ class Scheduler(
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
+            lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
@@ -1820,7 +1876,8 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        self._abort_on_queued_timeout()
+        self._abort_on_waiting_timeout()
+        self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -1875,9 +1932,7 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-                new_batch, log_stats=False
-            )
+            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -1892,9 +1947,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch_and_log_stats(
-            ret, need_sync=need_mlp_sync
-        )
+        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
@@ -2120,6 +2173,15 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        # Record prefill stats for logging after forward
+        new_batch.prefill_stats = PrefillStats(
+            log_input_tokens=adder.log_input_tokens,
+            log_hit_tokens=adder.log_hit_tokens,
+            new_token_ratio=adder.new_token_ratio,
+            running_bs=len(self.running_batch.reqs),
+            num_new_seqs=len(can_run_list),
+        )
 
         # Mixed-style chunked prefill
         if (
@@ -2745,6 +2807,20 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
+            # Abort requests already retracted to CPU cache
+            if self.disagg_decode_prealloc_queue.retracted_queue:
+                remaining_retracted = []
+                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
+                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                        assert hasattr(decode_req, "kv_cache_cpu")
+                        del decode_req.kv_cache_cpu
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=decode_req.rid), decode_req
+                        )
+                    else:
+                        remaining_retracted.append(decode_req)
+                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
@@ -2890,6 +2966,28 @@ class Scheduler(
         self.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
+    def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        from sglang.srt.debug_utils.dumper import dumper
+
+        try:
+            response: list = []
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                response = dumper._http_manager.handle_request(
+                    method=recv_req.method, body=recv_req.body
+                )
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=True, response=response), recv_req
+            )
+        except Exception as e:
+            print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
+            self.send_to_tokenizer.send_output(
+                DumperControlReqOutput(success=False, response=[], error=str(e)),
+                recv_req,
+            )
+
     # placeholder for override
     def update_cache_from_scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -2975,6 +3073,8 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
@@ -2989,6 +3089,10 @@ def run_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
+    if server_args.attn_cp_size > 1:
+        prefix += f" ATTN_CP{attn_cp_rank}"
+    if server_args.moe_dp_size > 1:
+        prefix += f" MOE_DP{moe_dp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
@@ -3033,6 +3137,8 @@ def run_scheduler_process(
             tp_rank,
             moe_ep_rank,
             pp_rank,
+            attn_cp_rank,
+            moe_dp_rank,
             dp_rank,
         )
         result_dict = {

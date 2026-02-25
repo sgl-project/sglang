@@ -46,7 +46,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -769,6 +770,11 @@ class Req(ReqDllmMixin):
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
 
+        # Acceptance histogram for speculative decoding.
+        # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+        # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+        self.spec_acceptance_histogram: List[int] = []
+
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
@@ -856,6 +862,18 @@ class Req(ReqDllmMixin):
             stage.value, now - self.last_tic
         )
         self.last_tic = now
+
+    def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
+        """Update the speculative decoding acceptance histogram.
+
+        Args:
+            accepted_draft_tokens: Number of draft tokens accepted in this step.
+        """
+        if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
+            self.spec_acceptance_histogram.extend(
+                [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)
+            )
+        self.spec_acceptance_histogram[accepted_draft_tokens] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -946,15 +964,17 @@ class Req(ReqDllmMixin):
     def tail_str(self) -> str:
         # Check stop strings and stop regex patterns together
         if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
+            len(self.sampling_params.stop_strs) == 0
+            and len(self.sampling_params.stop_regex_strs) == 0
         ):
-            max_len_tail_str = max(
-                self.sampling_params.stop_str_max_len + 1,
-                self.sampling_params.stop_regex_max_len + 1,
-            )
+            return ""
 
-        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+
+        tail_len = min(max_len_tail_str, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1304,6 +1324,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     @classmethod
     def init_new(
@@ -2243,6 +2264,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
         )
 
     def maybe_evict_swa(self):

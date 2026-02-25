@@ -27,13 +27,32 @@ DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+CUSTOM_IMAGE=""
+BUILD_FROM_DOCKERFILE=""
+GPU_ARCH_BUILD=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
+    --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
+    --rocm-version)
+      ROCM_VERSION="$2"
+      MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
+      MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      echo "Using ROCm version override: ${ROCM_VERSION}"
+      shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
+      echo "Usage: $0 [OPTIONS]"
+      echo "Options:"
+      echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
+      echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
+      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
+      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -54,7 +73,7 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don’t yet build specifically for
+# Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -134,18 +153,73 @@ find_latest_image() {
   fi
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
-  echo "Using hard-coded fallback…" >&2
-  if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
-  else
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
-  fi
+  echo "Using hard-coded fallback for ${ROCM_VERSION}…" >&2
+  case "${ROCM_VERSION}" in
+    rocm720)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
+      fi
+      ;;
+    rocm700)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
+      fi
+      ;;
+    *)
+      echo "Error: no hard-coded fallback available for ${ROCM_VERSION}" >&2
+      return 1
+      ;;
+  esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-echo "Pulling Docker image: ${IMAGE}"
-docker pull "${IMAGE}"
+# Determine which image to use
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  # Use explicitly provided custom image
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
+  docker pull "${IMAGE}"
+elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
+  # Build image from Dockerfile
+  if [[ -z "${GPU_ARCH_BUILD}" ]]; then
+    echo "Error: --gpu-arch is required when using --build-from-dockerfile" >&2
+    exit 1
+  fi
+
+  DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
+
+  # Use rocm720.Dockerfile for ROCm 7.2 builds, otherwise use rocm.Dockerfile
+  if [[ "${GPU_ARCH_BUILD}" == *"rocm720"* ]]; then
+    DOCKERFILE="${DOCKERFILE_DIR}/rocm720.Dockerfile"
+  else
+    DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
+  fi
+
+  if [[ ! -f "${DOCKERFILE}" ]]; then
+    echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
+    exit 1
+  fi
+
+  IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
+  echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
+
+  # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
+  docker build \
+    --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
+    --build-arg SGL_BRANCH="main" \
+    -t "${IMAGE}" \
+    -f "${DOCKERFILE}" \
+    "${DOCKERFILE_DIR}"
+  echo "Successfully built image: ${IMAGE}"
+else
+  # Find the latest pre-built image
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  echo "Pulling Docker image: ${IMAGE}"
+  docker pull "${IMAGE}"
+fi
 
 CACHE_HOST=/home/runner/sgl-data
 if [[ -d "$CACHE_HOST" ]]; then
@@ -156,6 +230,7 @@ fi
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
+  --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
   --group-add video \
