@@ -18,7 +18,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 from sglang.srt.environ import envs
-PORT_BASE = env.SGLANG_BACKUP_PORT_BASE.get()
+PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
 
 
