@@ -1,15 +1,31 @@
 import argparse
 from pathlib import Path
+from typing import Any
 
 import polars as pl
+import torch
 
+from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
+    execute_aligner_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.entrypoint.planner import (
+    compute_aligner_plan,
+)
 from sglang.srt.debug_utils.comparator.output_types import (
+    AnyWarning,
+    ComparisonRecord,
     ConfigRecord,
+    SkipRecord,
     SummaryRecord,
+    _OutputRecord,
     print_record,
 )
-from sglang.srt.debug_utils.comparator.pipeline import process_tensor_group
-from sglang.srt.debug_utils.dump_loader import filter_rows, read_meta
+from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+    compare_tensor_pair,
+)
+from sglang.srt.debug_utils.comparator.utils import Pair
+from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
+from sglang.srt.debug_utils.dump_loader import ValueWithMeta, filter_rows, read_meta
 
 _NON_KEY_COLS = {"dump_index", "filename"}
 
@@ -20,6 +36,8 @@ def main() -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    warning_sink.set_output_format(args.output_format)
+
     df_baseline = read_meta(args.baseline_path)
 
     df_target = read_meta(args.target_path)
@@ -47,7 +65,7 @@ def run(args: argparse.Namespace) -> None:
         baseline_rows = filter_rows(df_baseline, conditions=conditions)
         target_rows = filter_rows(df_target, conditions=conditions)
 
-        record = process_tensor_group(
+        record = _process_tensor_group(
             name=tensor_group_key["name"],
             baseline_filenames=[r["filename"] for r in baseline_rows],
             target_filenames=[r["filename"] for r in target_rows],
@@ -62,6 +80,68 @@ def run(args: argparse.Namespace) -> None:
         SummaryRecord(total=sum(counts.values()), **counts),
         output_format=args.output_format,
     )
+
+
+def _process_tensor_group(
+    *,
+    name: str,
+    baseline_filenames: list[str],
+    target_filenames: list[str],
+    baseline_path: Path,
+    target_path: Path,
+    diff_threshold: float,
+) -> _OutputRecord:
+    with warning_sink.context() as collected_warnings:
+        return _process_tensor_group_raw(
+            name=name,
+            baseline_filenames=baseline_filenames,
+            target_filenames=target_filenames,
+            baseline_path=baseline_path,
+            target_path=target_path,
+            diff_threshold=diff_threshold,
+            collected_warnings=collected_warnings,
+        )
+
+
+def _process_tensor_group_raw(
+    *,
+    name: str,
+    baseline_filenames: list[str],
+    target_filenames: list[str],
+    baseline_path: Path,
+    target_path: Path,
+    diff_threshold: float,
+    collected_warnings: list[AnyWarning],
+) -> ComparisonRecord | SkipRecord:
+    loaded_pair: Pair[list[ValueWithMeta]] = Pair(
+        x=[ValueWithMeta.load(baseline_path / f) for f in baseline_filenames],
+        y=[ValueWithMeta.load(target_path / f) for f in target_filenames],
+    )
+
+    metas_pair: Pair[list[dict[str, Any]]] = loaded_pair.map(
+        lambda items: [item.meta for item in items]
+    )
+
+    plan = compute_aligner_plan(metas_pair=metas_pair)
+
+    tensors_pair: Pair[list[torch.Tensor]] = loaded_pair.map(
+        lambda items: [item.value for item in items if isinstance(item.value, torch.Tensor)]
+    )
+
+    result = execute_aligner_plan(tensors_pair=tensors_pair, plan=plan)
+
+    if result.tensors is None:
+        reason = f"{'baseline' if result.failed_side_xy == 'x' else 'target'}_load_failed"
+        return SkipRecord(name=name, reason=reason, warnings=collected_warnings)
+
+    info = compare_tensor_pair(
+        x_baseline=result.tensors.x,
+        x_target=result.tensors.y,
+        name=name,
+        diff_threshold=diff_threshold,
+    )
+
+    return ComparisonRecord(**info.model_dump(), warnings=collected_warnings)
 
 
 def _parse_args() -> argparse.Namespace:
