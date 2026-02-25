@@ -153,6 +153,7 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
+    skip_input_image_preprocess: bool = False
 
     model_path: str = ""
     pipeline_config_path: str | None = None
