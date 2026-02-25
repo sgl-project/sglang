@@ -1,13 +1,54 @@
 import json
 import os
 import random
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.common import ASSISTANT_SUFFIX, DatasetRow
+from sglang.benchmark.datasets.common import (
+    ASSISTANT_SUFFIX,
+    BaseDataset,
+    DatasetRow,
+)
 from sglang.benchmark.utils import remove_suffix
+
+
+@dataclass
+class CustomDataset(BaseDataset):
+    dataset_path: str
+    num_requests: int
+    fixed_output_len: Optional[int]
+    context_len: Optional[int]
+    prompt_suffix: str
+    apply_chat_template: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "CustomDataset":
+        assert not getattr(args, "tokenize_prompt", False)
+        return cls(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            fixed_output_len=args.sharegpt_output_len,
+            context_len=args.sharegpt_context_len,
+            prompt_suffix=args.prompt_suffix,
+            apply_chat_template=args.apply_chat_template,
+        )
+
+    def load(
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
+    ) -> List[DatasetRow]:
+        return sample_custom_requests(
+            dataset_path=self.dataset_path,
+            num_requests=self.num_requests,
+            tokenizer=tokenizer,
+            fixed_output_len=self.fixed_output_len,
+            context_len=self.context_len,
+            prompt_suffix=self.prompt_suffix,
+            apply_chat_template=self.apply_chat_template,
+        )
 
 
 def sample_custom_requests(

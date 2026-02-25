@@ -24,7 +24,10 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    _sanitize_for_logging,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
@@ -291,14 +294,20 @@ class Req:
         else:
             target_width = -1
 
-        # Log sampling parameters
-        debug_str = f"""Sampling params:
+        # sanitize prompts for info-level logging
+        sanitized_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
+        sanitized_neg_prompt = _sanitize_for_logging(
+            self.negative_prompt, key_hint="negative_prompt"
+        )
+
+        # log non-sensitive parameters at info level
+        info_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
                          fps: {self.fps}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
+                      prompt: {sanitized_prompt}
+                  neg_prompt: {sanitized_neg_prompt}
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
@@ -310,7 +319,15 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+
+        # log full prompts at debug level only (for debugging purposes)
+        debug_str = f"""Full prompts:
+                      prompt: {self.prompt}
+                  neg_prompt: {self.negative_prompt}
+        """
+
         if not self.suppress_logs:
+            logger.info(info_str)
             logger.debug(debug_str)
 
 
