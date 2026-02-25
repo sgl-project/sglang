@@ -156,7 +156,7 @@ class SamplingParams:
     suppress_logs: bool = False
 
     return_file_paths_only: bool = True
-    enable_sequence_shard: bool = False
+    enable_sequence_shard: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -390,10 +390,20 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
+
+        if "wan" in pipeline_name_lower and (
+            self.enable_sequence_shard is None or self.enable_sequence_shard
+        ):
+            self.enable_sequence_shard = True
+            logger.debug("Automatically enabled enable_sequence_shard")
+        else:
+            self.enable_sequence_shard = False
+
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment"
+                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
@@ -406,8 +416,14 @@ class SamplingParams:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
+            original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
+                original_num_frames
+            )
+            logger.info(
+                "Adjusting number of frames from %s to %s based on model",
+                original_num_frames,
+                self.num_frames,
             )
 
             # Adjust number of frames based on number of GPUs for video task
