@@ -203,7 +203,10 @@ class AiterAttnBackend(AttentionBackend):
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
-            if self.num_head == 16 and self.kv_cache_dtype is not fp8_dtype:
+            # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
+            if (
+                self.num_head == 16 or self.num_head == 128
+            ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
@@ -1560,6 +1563,7 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
+
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )

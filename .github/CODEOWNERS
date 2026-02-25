@@ -37,6 +37,7 @@
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
+/python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue

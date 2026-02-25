@@ -245,7 +245,6 @@ sgl-model-gateway/tests/fixtures/golden/
 
 lmms-eval
 
-**/.claude/
 **/.serena/
 ctags/
 outputs/
