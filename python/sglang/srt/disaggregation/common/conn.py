@@ -736,10 +736,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        if bootstrap_info is not None:
-            return web.json_response(bootstrap_info, status=200)
-        else:
-            return web.Response(text="Bootstrap info not Found", status=404)
+        return web.json_response(bootstrap_info, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()
