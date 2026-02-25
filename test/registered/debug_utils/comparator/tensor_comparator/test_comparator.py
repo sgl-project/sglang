@@ -78,7 +78,7 @@ class TestComputeDiff:
         assert diff.passed is False
 
 
-class TestCompareTensorPair:
+class TestCompareTensors:
     def test_normal(self):
         x = torch.randn(5, 5)
         y = x + torch.randn(5, 5) * 0.001

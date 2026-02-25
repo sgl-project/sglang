@@ -3,13 +3,13 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
     SkipRecord,
     SummaryRecord,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
