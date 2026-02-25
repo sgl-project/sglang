@@ -5,7 +5,11 @@ import pytest
 from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
     compute_unshard_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.types import AxisInfo
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
+    AxisInfo,
+    ConcatParams,
+    PickParams,
+)
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -228,7 +232,7 @@ class TestComputeUnshardPlan:
         assert len(plans[2].groups) == 1
         assert len(plans[2].groups[0]) == 2
 
-    def test_replicated_axis_raises(self) -> None:
+    def test_sharded_axis_missing_from_rank_raises(self) -> None:
         """A world_rank missing a sharded axis raises ValueError."""
         dim_specs = parse_dims("s(cp) h(tp)")
         parallel_infos = [
@@ -238,7 +242,159 @@ class TestComputeUnshardPlan:
             },
             {
                 ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
-                # missing TP — replicated
+                # missing TP — sharded axis absent from rank
+            },
+        ]
+        with pytest.raises(ValueError, match="missing parallel_info"):
+            compute_unshard_plan(dim_specs, parallel_infos)
+
+
+class TestReplicatedAxes:
+    def test_replicated_tp_with_sharded_cp(self) -> None:
+        """CP2 TP2, dims='b s(cp) d' → PickPlan(TP) + ConcatPlan(CP)."""
+        dim_specs = parse_dims("b s(cp) d")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 2
+        assert plans[0].axis == ParallelAxis.TP
+        assert isinstance(plans[0].params, PickParams)
+        assert len(plans[0].groups) == 2
+        for group in plans[0].groups:
+            assert len(group) == 2
+
+        assert plans[1].axis == ParallelAxis.CP
+        assert isinstance(plans[1].params, ConcatParams)
+        assert plans[1].params.dim == 1
+
+    def test_fully_replicated(self) -> None:
+        """CP2 TP2, dims='b h d' → PickPlan(CP) + PickPlan(TP)."""
+        dim_specs = parse_dims("b h d")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 2
+        assert all(isinstance(p.params, PickParams) for p in plans)
+        axes = {p.axis for p in plans}
+        assert axes == {ParallelAxis.CP, ParallelAxis.TP}
+
+    def test_multiple_replicated_one_sharded(self) -> None:
+        """CP2 TP2 EP2, dims='h(tp)' → PickPlan(CP) + PickPlan(EP) + ConcatPlan(TP)."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for ep_rank in range(2):
+                for tp_rank in range(2):
+                    parallel_infos.append(
+                        {
+                            ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                            ParallelAxis.EP: AxisInfo(axis_rank=ep_rank, axis_size=2),
+                            ParallelAxis.TP: AxisInfo(axis_rank=tp_rank, axis_size=2),
+                        }
+                    )
+
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 3
+        pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
+        concat_plans = [p for p in plans if isinstance(p.params, ConcatParams)]
+        assert len(pick_plans) == 2
+        assert len(concat_plans) == 1
+        assert concat_plans[0].axis == ParallelAxis.TP
+
+        replicated_axes = {p.axis for p in pick_plans}
+        assert replicated_axes == {ParallelAxis.CP, ParallelAxis.EP}
+
+    def test_replicated_scrambled_ranks(self) -> None:
+        """Scrambled world_rank order with replicated axis."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=1, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 2
+        assert plans[0].axis == ParallelAxis.CP
+        assert isinstance(plans[0].params, PickParams)
+        assert plans[1].axis == ParallelAxis.TP
+        assert isinstance(plans[1].params, ConcatParams)
+
+    def test_replicated_axis_inconsistent_size_raises(self) -> None:
+        """Replicated axis with inconsistent sizes raises ValueError."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=4),
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
+            },
+        ]
+        with pytest.raises(ValueError, match="Inconsistent axis_size"):
+            compute_unshard_plan(dim_specs, parallel_infos)
+
+    def test_replicated_axis_missing_from_rank_raises(self) -> None:
+        """A rank missing a replicated axis that other ranks have raises ValueError."""
+        dim_specs = parse_dims("h(tp)")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {
+                ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2),
+                ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
+            },
+            {
+                # missing CP — replicated axis absent from this rank
+                ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
         with pytest.raises(ValueError, match="missing parallel_info"):

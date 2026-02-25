@@ -148,7 +148,7 @@ class TestCpZigzagTpE2E:
             if isinstance(plan, ReorderPlan):
                 current = execute_reorder_plan(plan, current)
             else:
-                current = execute_unshard_plan(plan, current)
+                current, _ = execute_unshard_plan(plan, current)
 
         assert len(current) == 1
         assert torch.allclose(current[0], full_tensor)
