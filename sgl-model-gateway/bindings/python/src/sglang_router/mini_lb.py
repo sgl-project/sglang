@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import random
 import urllib
+import warnings
 from http import HTTPStatus
 from itertools import chain
 from typing import Optional
@@ -229,9 +230,7 @@ class MiniLoadBalancer:
     ):
 
         if self.test_external_dp_routing:
-            logging.warning(
-                "--test-external-dp-routing is not supported with streaming"
-            )
+            warnings.warn("--test-external-dp-routing is not supported with streaming")
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
