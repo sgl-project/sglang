@@ -26,10 +26,6 @@ ROCm 7.2.0:
 pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
 ```
 
-## Resolving Triton
-
-Triton 3.5.1 has a known issue in the ROCm 7.2.0 environment.  Replace the installation following the [ROCm docker recipe](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L472).
-
 ## Resolving AITER
 
 [AITER](https://github.com/ROCm/aiter) is a fundamental dependency. Wheel-izing it is ongoing.
@@ -56,3 +52,34 @@ $ python3 -m pip install --no-cache-dir setuptools-rust \
 ### [TileLang](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L216)
 
 ### [FHT (fast-hadamard-transform)](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L300)
+
+## Revolving triton
+
+To avoid known issues in triton 3.5.1 installed by default, we recommend upgrading triton after installation.  In ROCm 7.0.0 environment,
+```
+pip install triton==3.6.0
+```
+or ROCm 7.2.0,
+```
+pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.6.0%2Brocm7.2.0.gitba5c1517-cp310-cp310-linux_x86_64.whl
+```
+
+### `torch._inductor.exc.InductorError: AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'`
+
+After upgrading, you may hit this error during inference when PyTorch Inductor interacts with Triton metadata.
+
+A pragmatic workaround is to guard the metadata access in Inductor's Triton heuristics so it only reads `cluster_dims` when the attribute exists:
+
+```diff
+--- a/opt/venv/lib/python3.10/site-packages/torch/_inductor/runtime/triton_heuristics.py
++++ b/opt/venv/lib/python3.10/site-packages/torch/_inductor/runtime/triton_heuristics.py
+@@ -1759,6 +1759,8 @@
+                 else (
+                     (binary.metadata.num_ctas, *binary.metadata.cluster_dims)
+                     if hasattr(binary, "metadata")
++                    and hasattr(binary.metadata, "num_ctas")
++                    and hasattr(binary.metadata, "cluster_dims")
+                     else ()
+                 )
+             ),
+```

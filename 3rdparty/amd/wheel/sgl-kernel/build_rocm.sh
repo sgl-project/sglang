@@ -27,7 +27,7 @@ docker run --rm \
   bash -c "
   # Install torch, triton, and friends, depending on the ROCm version
   if [[ "${ROCM_VERSION}" == "700" ]]; then
-    ${PYTHON_ROOT_PATH}/pip install https://download.pytorch.org/whl/rocm7.0/torch-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/triton_rocm-3.6.0-cp310-cp310-linux_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchaudio-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl https://download.pytorch.org/whl/rocm7.0/torchvision-0.25.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl
+    ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl
   elif [[ "${ROCM_VERSION}" == "720" ]]; then
     ${PYTHON_ROOT_PATH}/pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl
   fi

@@ -6,6 +6,7 @@ WHEEL_DIR="dist"
 wheel_files=($WHEEL_DIR/*.whl)
 for wheel in "${wheel_files[@]}"; do
     intermediate_wheel="${wheel/linux/manylinux2014}"
+    [[ "$intermediate_wheel" == *"+rocm"* ]] && continue
 
     # Extract the current python version from the wheel name
     if [[ $intermediate_wheel =~ -cp([0-9]+)- ]]; then

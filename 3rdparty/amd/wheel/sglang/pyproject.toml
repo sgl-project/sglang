@@ -68,25 +68,26 @@ runtime_common = [
   "grpcio-reflection>=1.78.0",
 ]
 
-# ROCm 7.0.0 specific packages (https://download.pytorch.org/whl/rocm7.0)
+# ROCm specific packages (https://repo.radeon.com/rocm/manylinux/)
+# Existing practice for daily rocm700 docker images relies on 700-rc
+# versions of software that are not public available. Here we pin some
+# from rocm702 as the closest set as daily rocm700 images.
 rocm700 = [
-  "torch @ https://download.pytorch.org/whl/rocm7.0/torch-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl",
-  "triton-rocm @ https://download.pytorch.org/whl/triton_rocm-3.6.0-cp310-cp310-linux_x86_64.whl",
-  "torchaudio @ https://download.pytorch.org/whl/rocm7.0/torchaudio-2.10.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl",
-  "torchvision @ https://download.pytorch.org/whl/rocm7.0/torchvision-0.25.0%2Brocm7.0-cp310-cp310-manylinux_2_28_x86_64.whl",
+  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl",
+  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl",
+  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
+  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
+  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm700-cp310-abi3-manylinux2014_x86_64.whl#sha256=2d56ee97d8e6dae29d35a2524de4bffb8e07752bcc74e73313462496427832bf",
 ]
 
-# ROCm 7.2.0 specific packages (https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2)
 rocm720 = [
   "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl",
   "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl",
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  # XXX: URL should be ready before merging
-  # "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
+  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm720-cp310-abi3-manylinux2014_x86_64.whl#sha256=91a3f50ef0b9d2a140dbf6e2aabff45a50c45a4782b9215997bce6f71749180f",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
