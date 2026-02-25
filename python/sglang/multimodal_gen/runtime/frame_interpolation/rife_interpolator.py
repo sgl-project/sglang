@@ -68,92 +68,161 @@ def warp(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
+    """Conv2d + LeakyReLU helper (matches RIFE 4.22 conv())."""
+    return nn.Sequential(
+        nn.Conv2d(
+            in_planes,
+            out_planes,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=True,
+        ),
+        nn.LeakyReLU(0.2, True),
+    )
+
+
+class ResConv(nn.Module):
+    """Residual convolution block with learnable beta scaling (RIFE 4.22)."""
+
+    def __init__(self, c: int, dilation: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(c, c, 3, 1, dilation, dilation=dilation, groups=1)
+        self.beta = nn.Parameter(torch.ones((1, c, 1, 1)), requires_grad=True)
+        self.relu = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(self.conv(x) * self.beta + x)
+
+
 class IFBlock(nn.Module):
-    """Single-scale optical flow + alpha blending block (RIFE IFBlock)."""
+    """Single-scale optical flow + mask + feature block (RIFE 4.22)."""
 
     def __init__(self, in_planes: int, c: int = 64):
         super().__init__()
         self.conv0 = nn.Sequential(
-            nn.Conv2d(in_planes, c // 2, 3, 2, 1),
-            nn.PReLU(c // 2),
-            nn.Conv2d(c // 2, c, 3, 2, 1),
-            nn.PReLU(c),
+            _conv(in_planes, c // 2, 3, 2, 1),
+            _conv(c // 2, c, 3, 2, 1),
         )
         self.convblock = nn.Sequential(
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
-            nn.Conv2d(c, c, 3, 1, 1),
-            nn.PReLU(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
+            ResConv(c),
         )
-        self.lastconv = nn.ConvTranspose2d(c, 5, 4, 2, 1)
-
-    def forward(
-        self, x: torch.Tensor, flow: torch.Tensor, scale: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if scale != 1:
-            x = F.interpolate(
-                x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False
-            )
-        if flow is not None:
-            flow = (
-                F.interpolate(
-                    flow, scale_factor=1.0 / scale, mode="bilinear", align_corners=False
-                )
-                / scale
-            )
-            x = torch.cat((x, flow), 1)
-        x = self.conv0(x)
-        x = self.convblock(x) + x
-        tmp = self.lastconv(x)
-        tmp = F.interpolate(
-            tmp, scale_factor=scale * 2, mode="bilinear", align_corners=False
-        )
-        flow = tmp[:, :4] * scale * 2
-        mask = tmp[:, 4:5]
-        return flow, mask
-
-
-class IFNet(nn.Module):
-    """3-scale IFNet_HDv3 optical flow network (RIFE backbone)."""
-
-    def __init__(self):
-        super().__init__()
-        self.block0 = IFBlock(7 + 4, c=192)
-        self.block1 = IFBlock(8 + 4 + 4, c=128)
-        self.block2 = IFBlock(8 + 4 + 4, c=96)
-        self.block_tea = IFBlock(10 + 4 + 4, c=64)
-        self.encode = nn.Sequential(
-            nn.Conv2d(3, 16, 3, 2, 1),
-            nn.PReLU(16),
-            nn.Conv2d(16, 16, 3, 1, 1),
-            nn.PReLU(16),
+        self.lastconv = nn.Sequential(
+            nn.ConvTranspose2d(c, 4 * 13, 4, 2, 1),
+            nn.PixelShuffle(2),
         )
 
     def forward(
         self,
-        img0: torch.Tensor,
-        img1: torch.Tensor,
+        x: torch.Tensor,
+        flow: Optional[torch.Tensor] = None,
+        scale: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = F.interpolate(
+            x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False
+        )
+        if flow is not None:
+            flow = (
+                F.interpolate(
+                    flow,
+                    scale_factor=1.0 / scale,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                * 1.0
+                / scale
+            )
+            x = torch.cat((x, flow), 1)
+        feat = self.conv0(x)
+        feat = self.convblock(feat)
+        tmp = self.lastconv(feat)
+        tmp = F.interpolate(
+            tmp, scale_factor=scale, mode="bilinear", align_corners=False
+        )
+        flow = tmp[:, :4] * scale
+        mask = tmp[:, 4:5]
+        feat = tmp[:, 5:]
+        return flow, mask, feat
+
+
+class Head(nn.Module):
+    """Feature encoder producing 4-channel features at full resolution (RIFE 4.22)."""
+
+    def __init__(self):
+        super().__init__()
+        self.cnn0 = nn.Conv2d(3, 16, 3, 2, 1)
+        self.cnn1 = nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn2 = nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn3 = nn.ConvTranspose2d(16, 4, 4, 2, 1)
+        self.relu = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = self.cnn0(x)
+        x = self.relu(x0)
+        x1 = self.cnn1(x)
+        x = self.relu(x1)
+        x2 = self.cnn2(x)
+        x = self.relu(x2)
+        x3 = self.cnn3(x)
+        return x3
+
+
+class IFNet(nn.Module):
+    """4-scale IFNet optical flow network (RIFE 4.22 backbone)."""
+
+    def __init__(self):
+        super().__init__()
+        self.block0 = IFBlock(7 + 8, c=192)
+        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
+        self.block2 = IFBlock(8 + 4 + 8 + 8, c=64)
+        self.block3 = IFBlock(8 + 4 + 8 + 8, c=32)
+        self.encode = Head()
+
+        # teacher and caltime are not used during inference but are defined
+        # so that their weights can be loaded from flownet.pkl (strict=True).
+        self.teacher = IFBlock(8 + 4 + 8 + 3 + 8, c=64)
+        self.caltime = nn.Sequential(
+            nn.Conv2d(17, 32, 3, 1, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(32, 64, 3, 1, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 1, 3, 1, 1),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
         timestep: float = 0.5,
         scale_list: Optional[list] = None,
-        training: bool = False,
-        fastmode: bool = True,
-        ensemble: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]:
+    ) -> tuple[list, torch.Tensor, list]:
         if scale_list is None:
             scale_list = [8, 4, 2, 1]
-        channel = img0.shape[1]
-        img0 = img0.float()
-        img1 = img1.float()
+
+        channel = x.shape[1] // 2
+        img0 = x[:, :channel]
+        img1 = x[:, channel:]
+
+        if not torch.is_tensor(timestep):
+            timestep = (x[:, :1].clone() * 0 + 1) * timestep
+        else:
+            timestep = timestep.repeat(1, 1, img0.shape[2], img0.shape[3])
+
         f0 = self.encode(img0[:, :3])
         f1 = self.encode(img1[:, :3])
+
         flow_list = []
         merged = []
         mask_list = []
@@ -161,68 +230,47 @@ class IFNet(nn.Module):
         warped_img1 = img1
         flow = None
         mask = None
-        loss_distill = 0
-        stu = [self.block0, self.block1, self.block2]
-        for i in range(3):
-            if flow is not None:
-                flow_d, mask_d = stu[i](
+
+        block = [self.block0, self.block1, self.block2, self.block3]
+        for i in range(4):
+            if flow is None:
+                flow, mask, feat = block[i](
+                    torch.cat((img0[:, :3], img1[:, :3], f0, f1, timestep), 1),
+                    None,
+                    scale=scale_list[i],
+                )
+            else:
+                wf0 = warp(f0, flow[:, :2])
+                wf1 = warp(f1, flow[:, 2:4])
+                fd, m0, feat = block[i](
                     torch.cat(
                         (
-                            img0[:, :3],
-                            img1[:, :3],
                             warped_img0[:, :3],
                             warped_img1[:, :3],
+                            wf0,
+                            wf1,
+                            timestep,
                             mask,
+                            feat,
                         ),
                         1,
                     ),
                     flow,
                     scale=scale_list[i],
                 )
-                flow = flow + flow_d
-                mask = mask + mask_d
-            else:
-                flow, mask = stu[i](
-                    torch.cat((img0[:, :3], img1[:, :3], f0, f1), 1),
-                    None,
-                    scale=scale_list[i],
-                )
-            mask_list.append(torch.sigmoid(mask))
+                mask = m0
+                flow = flow + fd
+
+            mask_list.append(mask)
             flow_list.append(flow)
             warped_img0 = warp(img0, flow[:, :2])
             warped_img1 = warp(img1, flow[:, 2:4])
-            merged.append(
-                (warped_img0 * mask_list[i] + warped_img1 * (1 - mask_list[i]))[:, :3]
-            )
-        if not fastmode:
-            c0 = self.encode(warped_img0[:, :3])
-            c1 = self.encode(warped_img1[:, :3])
-            flow_d, mask_d = self.block_tea(
-                torch.cat(
-                    (
-                        img0[:, :3],
-                        img1[:, :3],
-                        warped_img0[:, :3],
-                        warped_img1[:, :3],
-                        mask,
-                        merged[2],
-                    ),
-                    1,
-                ),
-                flow,
-                scale=scale_list[3],
-            )
-            flow = flow + flow_d
-            mask = mask + mask_d
-            mask = torch.sigmoid(mask)
-            merged.append(
-                (
-                    warp(img0, flow[:, :2]) * mask
-                    + warp(img1, flow[:, 2:4]) * (1 - mask)
-                )[:, :3]
-            )
+            merged.append((warped_img0, warped_img1))
 
-        return flow_list, mask_list[2], merged, loss_distill
+        mask = torch.sigmoid(mask)
+        merged[3] = warped_img0 * mask + warped_img1 * (1 - mask)
+
+        return flow_list, mask_list[3], merged
 
 
 class Model:
@@ -270,16 +318,27 @@ class Model:
         timestep: float = 0.5,
     ) -> torch.Tensor:
         """Interpolate a single intermediate frame between img0 and img1."""
+        n, c, h, w = img0.shape
+
+        # Pad to multiples of 32 so that RIFE's downsample/upsample round-trips
+        # preserve spatial dimensions exactly.
+        ph = ((h - 1) // 32 + 1) * 32
+        pw = ((w - 1) // 32 + 1) * 32
+        pad = (0, pw - w, 0, ph - h)
+        img0 = F.pad(img0, pad)
+        img1 = F.pad(img1, pad)
+
         imgs = torch.cat((img0, img1), 1)
-        scale_list = [4 / scale, 2 / scale, 1 / scale]
+        scale_list = [8 / scale, 4 / scale, 2 / scale, 1 / scale]
         with torch.no_grad():
-            flow_list, mask, merged, _ = self.flownet(
-                imgs[:, :3],
-                imgs[:, 3:6],
+            flow_list, mask, merged = self.flownet(
+                imgs,
                 timestep=timestep,
                 scale_list=scale_list,
             )
-        return merged[2]
+
+        # Crop back to original resolution
+        return merged[3][:, :, :h, :w]
 
 
 # ---------------------------------------------------------------------------
@@ -321,22 +380,8 @@ class FrameInterpolator:
         if model_path in _MODEL_CACHE:
             return _MODEL_CACHE[model_path]
 
-        # Try to load Model class from user's RIFE_HDv3.py (most version-accurate)
-        rife_py = os.path.join(model_path, "RIFE_HDv3.py")
-        if os.path.isfile(rife_py):
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location("RIFE_HDv3", rife_py)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            ModelClass = mod.Model
-            logger.info("Using Model from %s", rife_py)
-        else:
-            ModelClass = Model  # vendored fallback
-            logger.info("RIFE_HDv3.py not found; using vendored Model")
-
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = ModelClass()
+        model = Model()
         model.load_model(model_path, rank=-1)
         model.eval()
         model.flownet = model.flownet.to(device)
