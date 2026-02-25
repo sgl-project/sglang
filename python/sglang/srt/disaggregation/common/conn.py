@@ -599,10 +599,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _is_ready(self) -> bool:
-        if self.attn_tp_size is None or self.pp_size is None:
-            return False
-        expected = self.dp_size * self.attn_tp_size * self.pp_size
-        return self._registered_count >= expected
+        return self._registered_count > 0
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
@@ -677,7 +674,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._registered_count += 1
             logger.debug(
                 f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
-                f" ({self._registered_count}/{self.dp_size * self.attn_tp_size * self.pp_size} registered)"
+                f" ({self._registered_count} registered)"
             )
 
         return web.Response(text="OK", status=200)
