@@ -556,7 +556,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
-        top_k = layer.top_k or topk_ids.shape[1]    # in case layer.top_k is not set
+        top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
             torch.ops.npu.npu_moe_init_routing_v2(
