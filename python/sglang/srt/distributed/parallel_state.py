@@ -1608,7 +1608,7 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
             "Broadcasting from rank 0 to all ranks."
         )
 
-    base_store_port = envs.SGLANG_NIXL_TCP_STORE_PORT.get()
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
     # Rank 0 gets its local IP and broadcasts it to all ranks
     # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)

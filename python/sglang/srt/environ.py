@@ -271,6 +271,7 @@ class Envs:
     # Override the distributed init method used by torch.distributed.init_process_group.
     # Set to "env://" to use an externally-created TCPStore via MASTER_ADDR/MASTER_PORT.
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
+    SGLANG_TCP_STORE_PORT = EnvInt(29600)
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
@@ -371,7 +372,6 @@ class Envs:
     # NIXL-EP
     SGLANG_NIXL_EP_ENABLED = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
-    SGLANG_NIXL_TCP_STORE_PORT = EnvInt(29600)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
 
     # NSA Backend
