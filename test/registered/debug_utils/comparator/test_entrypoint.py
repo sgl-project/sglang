@@ -1093,7 +1093,9 @@ def _create_cp_zigzag_tp_sharded_dumps(
 ) -> Path:
     """Create CP-zigzag (+optional TP) sharded dump files from a full tensor."""
     num_chunks: int = cp_size * 2
-    natural_chunks: list[torch.Tensor] = list(full_tensor.chunk(num_chunks, dim=seq_dim))
+    natural_chunks: list[torch.Tensor] = list(
+        full_tensor.chunk(num_chunks, dim=seq_dim)
+    )
 
     zigzag_order: list[int] = []
     for i in range(cp_size):
