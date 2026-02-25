@@ -20,32 +20,30 @@ import random
 import shutil
 import sys
 import time
-import traceback
-import uuid
 import warnings
 from argparse import ArgumentParser
-from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
-import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark.backends import request_backend, request_profile
+from sglang.benchmark.backends.base_client import RequestFuncInput, RequestFuncOutput
+from sglang.benchmark.backends.common import (
+    _create_bench_client_session as _create_bench_client_session_impl,
+)
+from sglang.benchmark.backends.common import get_auth_headers as _get_auth_headers
+from sglang.benchmark.backends.common import get_request_headers as _get_request_headers
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
-    parse_custom_headers,
-    remove_prefix,
     set_ulimit,
 )
-
-_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -61,68 +59,18 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def _create_bench_client_session():
-    # When the pressure is big, the read buffer could be full before aio thread read
-    # the content. We increase the read_bufsize from 64K to 10M.
-    # Define constants for timeout and buffer size for clarity and maintainability
-    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
-    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
-
-    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
-    return aiohttp.ClientSession(
-        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
-    )
-
-
-@dataclass
-class RequestFuncInput:
-    prompt: Union[str, List[str], List[Dict[str, str]]]
-    api_url: str
-    prompt_len: int
-    output_len: int
-    model: str
-    lora_name: str
-    image_data: Optional[List[str]]
-    extra_request_body: Dict[str, Any]
-    timestamp: Optional[float] = None
-    routing_key: Optional[str] = None
-
-
-@dataclass
-class RequestFuncOutput:
-    generated_text: str = ""
-    success: bool = False
-    latency: float = 0.0
-    ttft: float = 0.0  # Time to first token
-    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
-    text_chunks: List[str] = field(default_factory=list)
-    prompt_len: int = 0
-    error: str = ""
-    output_len: int = 0
-    start_time: float = 0.0
-
-    @staticmethod
-    def init_new(request_func_input: RequestFuncInput):
-        output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
-        return output
+    # Compatibility wrapper for downstream imports from sglang.bench_serving.
+    return _create_bench_client_session_impl()
 
 
 def get_auth_headers() -> Dict[str, str]:
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-    if openai_api_key:
-        return {"Authorization": f"Bearer {openai_api_key}"}
-    else:
-        api_key = os.environ.get("API_KEY")
-        if api_key:
-            return {"Authorization": f"{api_key}"}
-        return {}
+    # Compatibility wrapper for downstream imports from sglang.bench_serving.
+    return _get_auth_headers()
 
 
 def get_request_headers() -> Dict[str, str]:
-    headers = get_auth_headers()
-    if h := getattr(args, "header", None):
-        headers.update(parse_custom_headers(h))
-    return headers
+    # Compatibility wrapper for downstream imports from sglang.bench_serving.
+    return _get_request_headers(args)
 
 
 # trt llm does not support ignore_eos
@@ -131,70 +79,7 @@ async def async_request_trt_llm(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-    assert api_url.endswith("generate_stream")
-
-    async with _create_bench_client_session() as session:
-        payload = {
-            "accumulate_tokens": True,
-            "text_input": request_func_input.prompt,
-            "temperature": 0.000001,
-            "top_p": 1.0,
-            "max_tokens": request_func_input.output_len,
-            "stream": True,
-            "min_length": request_func_input.output_len,
-            "end_id": 1048576,
-            **request_func_input.extra_request_body,
-        }
-        if args.disable_ignore_eos:
-            del payload["min_length"]
-            del payload["end_id"]
-        output = RequestFuncOutput.init_new(request_func_input)
-
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(url=api_url, json=payload) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
-
-                        data = json.loads(chunk)
-                        output.generated_text += data["text_output"]
-                        timestamp = time.perf_counter()
-                        # First token
-                        if ttft == 0.0:
-                            ttft = timestamp - st
-                            output.ttft = ttft
-
-                        # Decoding phase
-                        else:
-                            output.itl.append(timestamp - most_recent_timestamp)
-
-                        most_recent_timestamp = timestamp
-
-                    output.latency = most_recent_timestamp - st
-                    output.success = True
-                    output.output_len = request_func_input.output_len
-
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-        if pbar:
-            pbar.update(1)
-        return output
+    return await request_backend("trt", args, request_func_input, pbar=pbar)
 
 
 # set ignore_eos True by default
@@ -202,527 +87,39 @@ async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
-
-    prompt = request_func_input.prompt
-
-    async with _create_bench_client_session() as session:
-        # Build payload with defaults that can be overridden by extra_request_body
-        payload = {
-            "model": request_func_input.model,
-            "prompt": prompt,
-            "best_of": 1,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-        }
-
-        # Add temperature default only if not specified in extra_request_body
-        if "temperature" not in request_func_input.extra_request_body:
-            payload["temperature"] = 0.0
-
-        # Add ignore_eos default only if not specified in extra_request_body
-        if "ignore_eos" not in request_func_input.extra_request_body:
-            payload["ignore_eos"] = not args.disable_ignore_eos
-
-        # Merge in extra parameters - these will override defaults if present
-        payload.update(request_func_input.extra_request_body)
-
-        # hack to accommodate different LoRA conventions between SGLang and vLLM.
-        if request_func_input.lora_name:
-            payload["model"] = request_func_input.lora_name
-            payload["lora_path"] = request_func_input.lora_name
-
-        if request_func_input.image_data:
-            payload.update({"image_data": request_func_input.image_data})
-
-        headers = get_request_headers()
-        if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
-
-        output = RequestFuncOutput.init_new(request_func_input)
-
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        output.start_time = st
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    if pbar:
-        pbar.update(1)
-    return output
+    return await request_backend("sglang-oai", args, request_func_input, pbar=pbar)
 
 
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    """Makes a request to the OpenAI Chat Completions API.
-
-    Handles both streaming and non-streaming responses, including support
-    for image data in messages. Calculates and returns various performance
-    metrics.
-
-    Args:
-        request_func_input: Input parameters for the request.
-        pbar: Optional tqdm progress bar to update.
-
-    Returns:
-        RequestFuncOutput: Output of the request, including generated text,
-                           latency, TTFT, ITL, and success status.
-    """
-    api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
-
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        rid = str(uuid.uuid4())
-        input_partial = deepcopy(request_func_input)
-        input_partial.prompt = "..."
-        request_start_time = time.time()
-        print(
-            f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
-        )
-
-    if isinstance(request_func_input.prompt, list):
-        messages = request_func_input.prompt
-    elif request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
-            {
-                "type": "image_url",
-                "image_url": {"url": img_url},
-            }
-            for img_url in request_func_input.image_data
-        ]
-        content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
-            {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
-    else:
-        messages = [{"role": "user", "content": request_func_input.prompt}]
-
-    async with _create_bench_client_session() as session:
-        # Build payload with defaults that can be overridden by extra_request_body
-        payload = {
-            "model": request_func_input.model,
-            "messages": messages,
-            "max_completion_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-        }
-
-        # Add temperature default only if not specified in extra_request_body
-        if "temperature" not in request_func_input.extra_request_body:
-            payload["temperature"] = 0.0
-
-        # Add ignore_eos default only if not specified in extra_request_body
-        # Default to False for more realistic behavior (respect EOS tokens)
-        if "ignore_eos" not in request_func_input.extra_request_body:
-            payload["ignore_eos"] = not args.disable_ignore_eos
-
-        # Merge in extra parameters (tools, temperature, top_p, etc.)
-        # These will override defaults if present
-        payload.update(request_func_input.extra_request_body)
-
-        # hack to accommodate different LoRA conventions between SGLang and vLLM.
-        if request_func_input.lora_name:
-            payload["model"] = request_func_input.lora_name
-            payload["lora_path"] = request_func_input.lora_name
-
-        headers = get_request_headers()
-        if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
-
-        output = RequestFuncOutput.init_new(request_func_input)
-
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        output.start_time = st
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    if args.disable_stream:
-                        # Non-streaming response
-                        response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
-                        output.success = True
-                        output.latency = time.perf_counter() - st
-                        output.ttft = (
-                            output.latency
-                        )  # For non-streaming, TTFT = total latency
-                        output.output_len = response_json.get("usage", {}).get(
-                            "completion_tokens", output_len
-                        )
-                    else:
-                        # Streaming response
-                        async for chunk_bytes in response.content:
-                            chunk_bytes = chunk_bytes.strip()
-                            if not chunk_bytes:
-                                continue
-
-                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                            latency = time.perf_counter() - st
-                            if chunk == "[DONE]":
-                                pass
-                            else:
-                                data = json.loads(chunk)
-
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-
-                                if content:
-                                    timestamp = time.perf_counter()
-                                    # First token
-                                    if ttft == 0.0:
-                                        ttft = timestamp - st
-                                        output.ttft = ttft
-
-                                    # Decoding phase
-                                    else:
-                                        output.text_chunks.append(content)
-                                        output.itl.append(
-                                            timestamp - most_recent_timestamp
-                                        )
-
-                                    most_recent_timestamp = timestamp
-                                    generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
-
-                        output.generated_text = generated_text
-                        output.success = True
-                        output.latency = latency
-                        output.output_len = output_len
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        curr_t = time.time()
-        output_partial = deepcopy(output)
-        output_partial.generated_text = "..."
-        print(
-            f'rid={rid} time={curr_t} time_delta={curr_t - request_start_time} message="request end" output="{str(output_partial)}"'
-        )
-
-    if pbar:
-        pbar.update(1)
-    return output
+    return await request_backend("sglang-oai-chat", args, request_func_input, pbar=pbar)
 
 
 async def async_request_truss(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-
-    prompt = request_func_input.prompt
-
-    async with _create_bench_client_session() as session:
-        payload = {
-            "model": request_func_input.model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "best_of": 1,
-            "max_tokens": request_func_input.output_len,
-            "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
-        }
-        headers = get_request_headers()
-
-        output = RequestFuncOutput.init_new(request_func_input)
-
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = request_func_input.output_len
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    if pbar:
-        pbar.update(1)
-    return output
+    return await request_backend("truss", args, request_func_input, pbar=pbar)
 
 
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    api_url = request_func_input.api_url
-    prompt = request_func_input.prompt
-
-    async with _create_bench_client_session() as session:
-        payload = {
-            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
-            "stream": not args.disable_stream,
-            "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": -1,
-            **request_func_input.extra_request_body,
-        }
-
-        # Add image data if available (list of image urls/base64)
-        if request_func_input.image_data:
-            payload["image_data"] = request_func_input.image_data
-
-        headers = get_request_headers()
-        if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
-
-        output = RequestFuncOutput.init_new(request_func_input)
-
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
-        st = time.perf_counter()
-        output.start_time = st
-        most_recent_timestamp = st
-        last_output_len = 0
-        try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
-                if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
-
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
-
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-            print(f"{output.error=}")
-
-    if pbar:
-        pbar.update(1)
-    return output
+    return await request_backend("sglang", args, request_func_input, pbar=pbar)
 
 
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
-    raise NotImplementedError()
+    return await request_backend("gserver", args, request_func_input, pbar=pbar)
 
 
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
-    async with _create_bench_client_session() as session:
-        output = RequestFuncOutput()
-        try:
-            if api_url.endswith("/start_profile"):
-                num_steps = getattr(args, "profile_num_steps", None)
-                profile_by_stage = getattr(args, "profile_by_stage", None)
-                if profile_by_stage and num_steps is None:
-                    num_steps = 5
-
-                output_dir = getattr(args, "profile_output_dir", None)
-                if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-                output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
-                    time.time()
-                )
-                output_dir.mkdir(exist_ok=True, parents=True)
-                output_dir = str(output_dir)
-
-                body = {
-                    "activities": getattr(args, "profile_activities", []),
-                    "num_steps": num_steps,
-                    "profile_by_stage": profile_by_stage,
-                    "profile_stages": getattr(args, "profile_stages", None),
-                    "output_dir": output_dir,
-                    "profile_prefix": getattr(args, "profile_prefix", None),
-                }
-            else:
-                # stop_profile doesn't need any parameters
-                body = {}
-            print(f"async_request_profile {api_url=} {body=}")
-            async with session.post(url=api_url, json=body) as response:
-                if response.status == 200:
-                    output.success = True
-                else:
-                    output.error = (
-                        (response.reason or "") + ": " + (await response.text())
-                    )
-                    output.success = False
-        except Exception:
-            output.success = False
-            exc_info = sys.exc_info()
-            output.error = "".join(traceback.format_exception(*exc_info))
-
-    return output
+    return await request_profile(args, api_url)
 
 
 def _build_profile_urls(
