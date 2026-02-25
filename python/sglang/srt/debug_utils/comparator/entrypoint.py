@@ -125,13 +125,17 @@ def _process_tensor_group_raw(
     plan = compute_aligner_plan(metas_pair=metas_pair)
 
     tensors_pair: Pair[list[torch.Tensor]] = loaded_pair.map(
-        lambda items: [item.value for item in items if isinstance(item.value, torch.Tensor)]
+        lambda items: [
+            item.value for item in items if isinstance(item.value, torch.Tensor)
+        ]
     )
 
     result = execute_aligner_plan(tensors_pair=tensors_pair, plan=plan)
 
     if result.tensors is None:
-        reason = f"{'baseline' if result.failed_side_xy == 'x' else 'target'}_load_failed"
+        reason = (
+            f"{'baseline' if result.failed_side_xy == 'x' else 'target'}_load_failed"
+        )
         return SkipRecord(name=name, reason=reason, warnings=collected_warnings)
 
     info = compare_tensor_pair(
