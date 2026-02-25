@@ -184,11 +184,11 @@ def set_dp_buffer_len(
 
 
 def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer(group = group)
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer(group = group)
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
