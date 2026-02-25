@@ -12,7 +12,6 @@ from sglang.srt.debug_utils.comparator.aligner.reorderer.planner import (
 )
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
     ReordererPlan,
-    ZigzagToNaturalParams,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
     execute_unsharder_plan,
