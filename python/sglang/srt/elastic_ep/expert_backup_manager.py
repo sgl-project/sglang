@@ -33,9 +33,6 @@ def extract_expert_id(param_name):
 
 class ExpertBackupManager:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs):
-        self.server_args = server_args
-        self.port_args = port_args
-        self.model_path = server_args.model_path
         self.load_format = server_args.load_format
         self.model_config = ModelConfig.from_server_args(server_args)
         self.continuous_buffer = None
@@ -64,7 +61,7 @@ class ExpertBackupManager:
         # losing the initial PUB message due to slow joiners.
         num_ready_clients = 0
 
-        while num_ready_clients < self.server_args.tp_size:
+        while num_ready_clients < server_args.tp_size:
             self.recv_from_expert_backup_client.recv_pyobj()
             num_ready_clients += 1
 
