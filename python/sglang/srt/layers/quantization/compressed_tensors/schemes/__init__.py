@@ -4,7 +4,10 @@ from .compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
 )
-from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
+try:
+    from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
+except ImportError:
+    CompressedTensorsMxInt4MoE = None
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from .compressed_tensors_w4a8_int8_moe import NPUCompressedTensorsW4A8Int8DynamicMoE
