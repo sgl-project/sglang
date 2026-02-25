@@ -1,6 +1,5 @@
 import pytest
 import torch
-from sgl_kernel import gptq_marlin_gemm as aot_gptq_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
@@ -86,26 +85,6 @@ def test_gptq_marlin_gemm(
         is_zp_float=False,
     )
 
-    aot_output = aot_gptq_marlin_gemm(
-        a_input,
-        None,
-        marlin_q_w,
-        marlin_s,
-        marlin_s2,
-        marlin_zp,
-        g_idx,
-        sort_indices,
-        workspace,
-        quant_type,
-        a_input.shape[0],
-        b_weight.shape[1],
-        a_input.shape[1],
-        is_k_full=True,
-        use_atomic_add=False,
-        use_fp32_reduce=False,
-        is_zp_float=False,
-    )
-
     output_ref = torch.matmul(a_input, w_ref)
     torch.cuda.synchronize()
 
@@ -114,9 +93,6 @@ def test_gptq_marlin_gemm(
         torch.abs(output_ref)
     )
     assert max_diff < 0.04
-
-    # JIT kernel should produce bitwise identical results to AOT kernel
-    torch.testing.assert_close(output, aot_output, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

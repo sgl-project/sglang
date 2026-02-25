@@ -20,10 +20,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
@@ -46,155 +45,6 @@ def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     if not env_var_value:
         return None
     return [float(x) for x in env_var_value.split(",")]
-
-
-@dataclass
-class TimeStats:
-    """
-    Store the timestamps for each stage of a request.
-
-    Unified: wait_queue -> forward -> completion
-    Prefill: bootstrap_queue -> wait_queue -> forward -> transfer_queue -> completion
-    Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
-    """
-
-    disagg_mode: DisaggregationMode = DisaggregationMode.NULL
-    lb_entry_time: float = 0.0
-    wait_queue_entry_time: float = 0.0
-    forward_entry_time: float = 0.0
-    completion_time: float = 0.0
-    prefill_bootstrap_queue_entry_time: float = 0.0
-    prefill_transfer_queue_entry_time: float = 0.0
-    decode_prealloc_queue_entry_time: float = 0.0
-    decode_transfer_queue_entry_time: float = 0.0
-    # TODO: correct set them
-    bootstrap_duration: float = 0.0
-    alloc_waiting_duration: float = 0.0
-    prefill_start_time_host: float = 0.0
-    prefill_end_time_host: float = 0.0
-    transfer_speed_gb_s: float = 0.0
-    transfer_total_mb: float = 0.0
-    # Number of prefill retries for this request
-    prefill_retry_count: int = 0
-
-    # Timestamp when prefill phase finishes, obtained from `time.time()`.
-    # Note that this differs from the other `_time` fields tracked by the
-    # `TimeStats` class, which are obtained from `time.perf_counter()`.
-    # We use `time.time()` instead of `time.perf_counter()` here in order to
-    # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
-    prefill_finished_ts: float = 0.0
-
-    def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
-
-    def get_prefill_launch_delay(self) -> Optional[float]:
-        if self.prefill_start_time_host > 0.0:
-            return self.prefill_start_time_host - self.forward_entry_time
-        return None
-
-    def get_prefill_launch_latency(self) -> Optional[float]:
-        if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
-            return self.prefill_end_time_host - self.prefill_start_time_host
-        return None
-
-    def get_prefill_finished_ts(self) -> Optional[float]:
-        if self.prefill_finished_ts > 0.0:
-            return self.prefill_finished_ts
-        return None
-
-    def convert_to_duration(self) -> str:
-        if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if SGLANG_TEST_REQUEST_TIME_STATS:
-                assert (
-                    queue_duration >= 0 and forward_duration >= 0
-                ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
-
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
-        elif self.disagg_mode == DisaggregationMode.PREFILL:
-            bootstrap_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
-            )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if SGLANG_TEST_REQUEST_TIME_STATS:
-                if self.wait_queue_entry_time > 0:
-                    assert (
-                        bootstrap_duration >= 0
-                        and queue_duration >= 0
-                        and forward_duration >= 0
-                    ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
-
-            other = max(
-                0.0,
-                bootstrap_duration
-                - (self.alloc_waiting_duration + self.bootstrap_duration),
-            )
-            return (
-                f"bootstrap_queue_duration({self.format_duration(bootstrap_duration)}) "
-                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
-                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
-                f"+ other({self.format_duration(other)}); "
-                f"queue_duration={self.format_duration(queue_duration)}, "
-                f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
-                f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB, "
-                f"#retries={self.prefill_retry_count}"
-            )
-        elif self.disagg_mode == DisaggregationMode.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
-            )
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
-            )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if SGLANG_TEST_REQUEST_TIME_STATS:
-                if self.wait_queue_entry_time > 0:
-                    assert (
-                        prealloc_duration >= 0
-                        and transfer_duration >= 0
-                        and queue_duration >= 0
-                        and forward_duration >= 0
-                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
-
-            other = max(
-                0.0,
-                prealloc_duration
-                - (self.alloc_waiting_duration + self.bootstrap_duration),
-            )
-            return (
-                f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
-                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
-                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
-                f"+ other({self.format_duration(other)}); "
-                f"transfer_duration={self.format_duration(transfer_duration)}; "
-                f"queue_duration={self.format_duration(queue_duration)}, "
-                f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.decode_prealloc_queue_entry_time:.3f}"
-            )
-        else:
-            return "Unknown Time Stats"
-
-    def format_duration(self, duration: float) -> str:
-        return f"{duration * 1e3:.2f}ms"
-
-    def disagg_mode_str(self) -> str:
-        if self.disagg_mode == DisaggregationMode.NULL:
-            return "unified"
-        elif self.disagg_mode == DisaggregationMode.DECODE:
-            return "decode"
-        elif self.disagg_mode == DisaggregationMode.PREFILL:
-            return "prefill"
-        else:
-            return "unknown"
 
 
 @dataclass
