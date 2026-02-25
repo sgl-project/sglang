@@ -2,9 +2,11 @@ import sys
 
 import pytest
 
+from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
+    compute_unshard_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import AxisInfo
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis, parse_dims
-from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.types import AxisInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="default", nightly=True)
@@ -172,13 +174,14 @@ class TestComputeUnshardPlan:
         with pytest.raises(NotImplementedError, match="reduction"):
             compute_unshard_plan(dim_specs, parallel_infos)
 
-    def test_ordering_not_natural_raises(self) -> None:
+    def test_ordering_zigzag_accepted(self) -> None:
         dim_specs = parse_dims("s(cp,zigzag)")
         parallel_infos = [
             {ParallelAxis.CP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
-        with pytest.raises(NotImplementedError, match="ordering"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.CP
 
     def test_ordering_natural_accepted(self) -> None:
         dim_specs = parse_dims("s(cp,natural)")

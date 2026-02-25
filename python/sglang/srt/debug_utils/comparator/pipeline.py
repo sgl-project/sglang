@@ -1,21 +1,32 @@
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 
+from sglang.srt.debug_utils.comparator.aligner.reorder import (
+    ReorderPlan,
+    compute_reorder_plans,
+    execute_reorder_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.executor import (
+    execute_unshard_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.parallel_info import (
+    normalize_parallel_info,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
+    compute_unshard_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import UnshardPlan
 from sglang.srt.debug_utils.comparator.dims import parse_dims
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     SkipRecord,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
-from sglang.srt.debug_utils.comparator.unshard.executor import execute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.parallel_info import (
-    normalize_parallel_info,
-)
-from sglang.srt.debug_utils.comparator.unshard.planner import compute_unshard_plan
-from sglang.srt.debug_utils.comparator.unshard.types import Plan, UnshardPlan
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+
+Plan = Union[UnshardPlan, ReorderPlan]
 
 
 def process_tensor_group(
@@ -83,7 +94,13 @@ def _compute_plans_for_group(metas: list[dict[str, Any]]) -> list[Plan]:
     dim_specs = parse_dims(dims_str)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
 
-    return compute_unshard_plan(dim_specs=dim_specs, parallel_infos=parallel_infos)
+    unshard_plans = compute_unshard_plan(
+        dim_specs=dim_specs, parallel_infos=parallel_infos
+    )
+    reorder_plans = compute_reorder_plans(
+        dim_specs=dim_specs, parallel_infos=parallel_infos
+    )
+    return [*unshard_plans, *reorder_plans]
 
 
 def _extract_tensors(
@@ -106,10 +123,16 @@ def _execute_plans(
 
     current = tensors
     for plan in plans:
-        if isinstance(plan, UnshardPlan):
-            current = execute_unshard_plan(plan, current)
-        else:
-            raise NotImplementedError(f"Unknown {plan=}")
+        current = _execute_plan(current, plan)
 
     assert len(current) == 1
     return current[0]
+
+
+def _execute_plan(tensors, plan):
+    if isinstance(plan, UnshardPlan):
+        return execute_unshard_plan(plan, tensors)
+    elif isinstance(plan, ReorderPlan):
+        return execute_reorder_plan(plan, tensors)
+    else:
+        raise NotImplementedError(f"Unknown {plan=}")

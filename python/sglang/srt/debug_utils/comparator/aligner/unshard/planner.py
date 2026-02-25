@@ -1,13 +1,13 @@
 from collections import defaultdict
 from typing import NamedTuple
 
-from sglang.srt.debug_utils.comparator.dims import DimSpec, Ordering, ParallelAxis
-from sglang.srt.debug_utils.comparator.unshard.types import (
+from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
     AxisInfo,
     ConcatParams,
     UnshardParams,
     UnshardPlan,
 )
+from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
 
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`
@@ -126,9 +126,5 @@ def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnshardParams:
     if spec.reduction is not None:
         raise NotImplementedError(
             f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
-        )
-    if spec.ordering is not None and spec.ordering != Ordering.NATURAL:
-        raise NotImplementedError(
-            f"Unshard for ordering={spec.ordering} not yet implemented (Phase 2)"
         )
     return ConcatParams(dim=dim_index)

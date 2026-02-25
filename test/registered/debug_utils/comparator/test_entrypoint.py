@@ -809,6 +809,74 @@ class TestEntrypointGroupingLogical:
         comp = _assert_single_comparison_passed(records)
         assert comp.name == "hidden"
 
+    def test_cp_zigzag_unshard(self, tmp_path, capsys):
+        """CP=2 zigzag reorder is correctly undone through the full pipeline."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_zigzag_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=1,
+                seq_dim=1,
+                head_dim=2,
+                dims_str="b s(cp,zigzag) h",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+    def test_cp_zigzag_tp_unshard(self, tmp_path, capsys):
+        """CP=2 zigzag + TP=2: multi-axis unshard with reorder through full pipeline."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_zigzag_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                head_dim=2,
+                dims_str="b s(cp,zigzag) h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
 
 # --------------------------- Assertion helpers -------------------
 
@@ -1008,6 +1076,65 @@ def _create_ep_cp_tp_sharded_dumps(
                     num_steps=num_steps,
                 )
                 rank += 1
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_cp_zigzag_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    tp_size: int,
+    seq_dim: int,
+    head_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create CP-zigzag (+optional TP) sharded dump files from a full tensor."""
+    num_chunks: int = cp_size * 2
+    natural_chunks: list[torch.Tensor] = list(
+        full_tensor.chunk(num_chunks, dim=seq_dim)
+    )
+
+    zigzag_order: list[int] = []
+    for i in range(cp_size):
+        zigzag_order.append(i)
+        zigzag_order.append(num_chunks - 1 - i)
+
+    zigzagged: torch.Tensor = torch.cat(
+        [natural_chunks[idx] for idx in zigzag_order], dim=seq_dim
+    )
+
+    cp_chunks: list[torch.Tensor] = list(zigzagged.chunk(cp_size, dim=seq_dim))
+
+    rank: int = 0
+    for cp_rank in range(cp_size):
+        tp_chunks: list[torch.Tensor] = (
+            list(cp_chunks[cp_rank].chunk(tp_size, dim=head_dim))
+            if tp_size > 1
+            else [cp_chunks[cp_rank]]
+        )
+        for tp_rank in range(tp_size):
+            parallel_info: dict[str, int] = {
+                "cp_rank": cp_rank,
+                "cp_size": cp_size,
+            }
+            if tp_size > 1:
+                parallel_info["tp_rank"] = tp_rank
+                parallel_info["tp_size"] = tp_size
+
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=tp_chunks[tp_rank],
+                dims=dims_str,
+                parallel_info=parallel_info,
+                num_steps=num_steps,
+            )
+            rank += 1
+
     return directory / _FIXED_EXP_NAME
 
 
