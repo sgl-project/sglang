@@ -453,6 +453,13 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                # delete feature to save memory
+                if req.multimodal_inputs is not None:
+                    for mm_item in req.multimodal_inputs.mm_items:
+                        pixel_values = mm_item.feature
+                        if isinstance(pixel_values, torch.Tensor):
+                            mm_item.feature = None
+                            del pixel_values
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
