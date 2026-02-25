@@ -119,19 +119,19 @@ def _convert(data):
         return data
 
 
-_vision_grid_attrs = {
+_mm_grid_attrs = {
     Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
     Modality.VIDEO: ["video_grid_thw"],
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
 
 
-def _get_vision_grid_dim(mm_inputs, modality):
-    for attr in _vision_grid_attrs[modality]:
+def _get_mm_grid_dim(mm_inputs, modality):
+    for attr in _mm_grid_attrs[modality]:
         if attr in mm_inputs:
             return mm_inputs[attr]
     raise ValueError(
-        f"Vision grid dim ({_vision_grid_attrs[modality]}) not found in {mm_inputs}"
+        f"Vision grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}"
     )
 
 
@@ -551,7 +551,7 @@ class MMEncoder:
             if k == "pixel_values":
                 continue
             val = _convert(v)
-            if k in _vision_grid_attrs.get(Modality.IMAGE, []):
+            if k in _mm_grid_attrs.get(Modality.IMAGE, []):
                 mm_item.set(k, val[indices])
             else:
                 mm_item.set(k, val)
@@ -883,7 +883,7 @@ class MMEncoder:
                 "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
             }
 
-            return _get_vision_grid_dim(mm_inputs, modality), mm_embedding, aux_data
+            return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
