@@ -343,9 +343,9 @@ class PipelineConfig:
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
-        if batch.enable_sequence_shard:
-            return latents, False
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard and sp_world_size > 1:
+            return latents, False
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
