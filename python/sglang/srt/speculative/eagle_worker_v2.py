@@ -887,7 +887,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,
-                skip_masking=True,  # idle/empty batches filtered by guard above, so no -1 values
             )
 
     def move_accepted_tokens_to_target_kvcache(
