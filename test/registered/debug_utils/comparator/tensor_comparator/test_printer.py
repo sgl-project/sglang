@@ -2,10 +2,10 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.tensor_comparison.printer import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.printer import (
     print_comparison,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
     TensorInfo,

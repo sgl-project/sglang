@@ -3,10 +3,10 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import Discriminator, Field, TypeAdapter, model_validator
 
-from sglang.srt.debug_utils.comparator.tensor_comparison.formatter import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase

@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
     TensorStats,

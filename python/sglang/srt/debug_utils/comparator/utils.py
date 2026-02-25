@@ -40,13 +40,13 @@ def argmax_coord(x: torch.Tensor) -> Tuple[int, ...]:
 
 
 def compute_smaller_dtype(
-    dtype_a: torch.dtype, dtype_b: torch.dtype
+    dtypes: Pair[torch.dtype],
 ) -> Optional[torch.dtype]:
     info_dict = {
         (torch.float32, torch.bfloat16): torch.bfloat16,
         # ... add more ...
     }
-    return info_dict.get((dtype_a, dtype_b)) or info_dict.get((dtype_b, dtype_a))
+    return info_dict.get((dtypes.x, dtypes.y)) or info_dict.get((dtypes.y, dtypes.x))
 
 
 def try_unify_shape(x: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from sglang.srt.debug_utils.comparator.dims import ParallelAxis
 from sglang.srt.debug_utils.comparator.utils import _FrozenBase
@@ -11,6 +11,16 @@ from sglang.srt.debug_utils.comparator.utils import _FrozenBase
 class AxisInfo(_FrozenBase):
     axis_rank: int
     axis_size: int
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> AxisInfo:
+        if self.axis_size <= 0:
+            raise ValueError(f"axis_size must be > 0, got {self.axis_size}")
+        if not (0 <= self.axis_rank < self.axis_size):
+            raise ValueError(
+                f"axis_rank must be in [0, {self.axis_size}), got {self.axis_rank}"
+            )
+        return self
 
 
 class ConcatParams(_FrozenBase):
@@ -22,15 +32,15 @@ class PickParams(_FrozenBase):
     op: Literal["pick"] = "pick"
 
 
-UnshardParams = Annotated[
+UnsharderParams = Annotated[
     Union[ConcatParams, PickParams],
     Field(discriminator="op"),
 ]
 
 
-class UnshardPlan(_FrozenBase):
+class UnsharderPlan(_FrozenBase):
     axis: ParallelAxis
-    params: UnshardParams
+    params: UnsharderParams
     # groups[i] = indices in the input tensor list, which will be operated (e.g. concat) into i-th output tensor.
     #
     # Multistep example (CP=2, TP=2, 4 input tensors):

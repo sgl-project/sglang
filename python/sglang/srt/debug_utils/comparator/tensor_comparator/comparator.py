@@ -2,13 +2,14 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
     TensorInfo,
     TensorStats,
 )
 from sglang.srt.debug_utils.comparator.utils import (
+    Pair,
     argmax_coord,
     calc_rel_diff,
     compute_smaller_dtype,
@@ -20,7 +21,7 @@ QUANTILE_NUMEL_THRESHOLD = 10_000_000
 SAMPLE_DIFF_THRESHOLD = 1e-3
 
 
-def compare_tensors(
+def compare_tensor_pair(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     name: str = "",
@@ -66,7 +67,7 @@ def compare_tensors(
 
         if baseline_original_dtype != target_original_dtype:
             downcast_dtype = compute_smaller_dtype(
-                baseline_original_dtype, target_original_dtype
+                Pair(x=baseline_original_dtype, y=target_original_dtype)
             )
             if downcast_dtype is not None:
                 diff_downcast = _compute_diff(
