@@ -15,7 +15,7 @@ def _jit_stream_wait_value_module() -> Module:
     return load_jit(
         "cuda_wait_value",
         cuda_files=["cuda_wait_value.cuh"],
-        cuda_wrappers=[("stream_wait_value", "cuda_wait_value")],
+        cuda_wrappers=[("stream_wait_value", "stream_wait_value")],
     )
 
 
