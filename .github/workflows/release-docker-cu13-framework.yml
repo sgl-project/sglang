@@ -10,9 +10,9 @@ on:
         description: "Version to build (without v prefix, e.g., 0.5.8)"
         required: true
       flashinfer_version:
-        description: "FlashInfer version (default: 0.6.1)"
+        description: "FlashInfer version (default: 0.6.3)"
         required: false
-        default: "0.6.1"
+        default: "0.6.3"
 
 jobs:
   publish-x86:

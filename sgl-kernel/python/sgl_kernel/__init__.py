@@ -48,7 +48,6 @@ from sgl_kernel.gemm import (
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     gptq_gemm,
-    gptq_marlin_gemm,
     gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
@@ -65,13 +64,6 @@ from sgl_kernel.gemm import (
     silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
-from sgl_kernel.hadamard import (
-    hadamard_transform,
-    hadamard_transform_12n,
-    hadamard_transform_20n,
-    hadamard_transform_28n,
-    hadamard_transform_40n,
-)
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
@@ -84,11 +76,6 @@ from sgl_kernel.mamba import (
     causal_conv1d_update,
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
-)
-from sgl_kernel.marlin import (
-    awq_marlin_moe_repack,
-    awq_marlin_repack,
-    gptq_marlin_repack,
 )
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
