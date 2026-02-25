@@ -168,6 +168,14 @@ def cutlass_scaled_fp4_mm(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     assert a.ndim == 2 and b.ndim == 2
+    try:
+        import sglang.jit_kernel.nvfp4_scaled_mm as _jit_nvfp4
+
+        return _jit_nvfp4.cutlass_scaled_fp4_mm(
+            a, b, block_scale_a, block_scale_b, alpha, out_dtype
+        )
+    except Exception:
+        pass
     m, n = a.shape[0], b.shape[0]
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     torch.ops.sgl_kernel.cutlass_scaled_fp4_mm.default(
