@@ -119,9 +119,15 @@ def _load_decode_kvcache_offload_manager():
     )
 
     decode_mgr_path = os.path.join(
-        python_dir, "sglang", "srt", "disaggregation", "decode_kvcache_offload_manager.py"
+        python_dir,
+        "sglang",
+        "srt",
+        "disaggregation",
+        "decode_kvcache_offload_manager.py",
     )
-    return _load_module_from_path("_decode_kvcache_offload_manager_for_test", decode_mgr_path)
+    return _load_module_from_path(
+        "_decode_kvcache_offload_manager_for_test", decode_mgr_path
+    )
 
 
 @dataclass
@@ -177,7 +183,9 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._decode_mgr_mod = _load_decode_kvcache_offload_manager()
-        cls.DecodeKVCacheOffloadManager = cls._decode_mgr_mod.DecodeKVCacheOffloadManager
+        cls.DecodeKVCacheOffloadManager = (
+            cls._decode_mgr_mod.DecodeKVCacheOffloadManager
+        )
 
     def _make_manager(self, *, page_size: int):
         req_to_token = torch.arange(0, 64, dtype=torch.int64).reshape(1, 64)
@@ -259,9 +267,13 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
         class DisaggregationMode:
             DECODE = "decode"
 
-        _install_stub_module("sglang.srt.disaggregation.utils", DisaggregationMode=DisaggregationMode)
+        _install_stub_module(
+            "sglang.srt.disaggregation.utils", DisaggregationMode=DisaggregationMode
+        )
         _install_stub_module("sglang.srt.environ", envs=_Envs())
-        _install_stub_module("sglang.srt.layers.logits_processor", LogitsProcessorOutput=object)
+        _install_stub_module(
+            "sglang.srt.layers.logits_processor", LogitsProcessorOutput=object
+        )
         _install_stub_module(
             "sglang.srt.layers.moe.routed_experts_capturer",
             get_global_experts_capturer=lambda: types.SimpleNamespace(
@@ -282,8 +294,13 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
             RequestStage=types.SimpleNamespace(),
             ScheduleBatch=object,
         )
-        _install_stub_module("sglang.srt.mem_cache.common", release_kv_cache=lambda *_: None)
-        _install_stub_module("sglang.srt.server_args", get_global_server_args=lambda: types.SimpleNamespace())
+        _install_stub_module(
+            "sglang.srt.mem_cache.common", release_kv_cache=lambda *_: None
+        )
+        _install_stub_module(
+            "sglang.srt.server_args",
+            get_global_server_args=lambda: types.SimpleNamespace(),
+        )
         _install_stub_module(
             "sglang.srt.tracing.trace",
             trace_slice=lambda *_args, **_kwargs: None,
@@ -292,7 +309,11 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
         )
 
         sched_path = os.path.join(
-            python_dir, "sglang", "srt", "managers", "scheduler_output_processor_mixin.py"
+            python_dir,
+            "sglang",
+            "srt",
+            "managers",
+            "scheduler_output_processor_mixin.py",
         )
         cls._sched_mod = _load_module_from_path(
             "_scheduler_output_processor_mixin_for_test", sched_path

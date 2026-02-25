@@ -116,7 +116,9 @@ class DecodeKVCacheOffloadManager:
             prefill_hashes = self._compute_prefix_hash(
                 req.origin_input_ids[:prefill_offloaded_len]
             )
-            last_prefill_hash = prefill_hashes[-1] if prefill_offloaded_len > 0 else None
+            last_prefill_hash = (
+                prefill_hashes[-1] if prefill_offloaded_len > 0 else None
+            )
             state = OffloadedState(
                 prefill_len=prefill_offloaded_len,
                 inc_len=0,
@@ -138,7 +140,7 @@ class DecodeKVCacheOffloadManager:
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
 
-        # Early free prefill-offloaded GPU memory (NSA-aware)
+        # Early free prefill-offloaded GPU memory
         if state.prefill_len > 0 and state.inc_len == 0:
             self.token_to_kv_pool_allocator.free(token_indices[: state.prefill_len])
 
@@ -207,7 +209,11 @@ class DecodeKVCacheOffloadManager:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
 
-                prior_hash = self.offloaded_state[req.rid].last_hash if req.rid in self.offloaded_state else None
+                prior_hash = (
+                    self.offloaded_state[req.rid].last_hash
+                    if req.rid in self.offloaded_state
+                    else None
+                )
                 last_hash = self._trigger_backup(
                     req, host_indices, incremental_tokens, start_time, prior_hash
                 )
