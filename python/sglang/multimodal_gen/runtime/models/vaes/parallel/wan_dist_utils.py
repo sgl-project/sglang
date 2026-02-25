@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 
-
 _FA_MAX_HEAD_DIM = 256
 
 
@@ -50,9 +49,13 @@ class _VaeRingAttnImpl:
         seqlen = q.shape[1]
         if fa_ver == 3:
             out = flash_attn_func(
-                q=q, k=k, v=v,
-                cu_seqlens_q=None, cu_seqlens_k=None,
-                max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
                 softmax_scale=self.softmax_scale,
                 causal=False,
                 return_softmax_lse=return_softmax_lse,
@@ -64,18 +67,30 @@ class _VaeRingAttnImpl:
         if fa_ver == 4:
             if return_softmax_lse:
                 return flash_attn_varlen_func_op_lse(
-                    q=q, k=k, v=v,
-                    cu_seqlens_q=None, cu_seqlens_k=None,
-                    max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=None,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=seqlen,
+                    max_seqlen_k=seqlen,
                     softmax_scale=self.softmax_scale,
-                    causal=False, return_softmax_lse=True, ver=fa_ver,
+                    causal=False,
+                    return_softmax_lse=True,
+                    ver=fa_ver,
                 )
             out = flash_attn_varlen_func_op(
-                q=q, k=k, v=v,
-                cu_seqlens_q=None, cu_seqlens_k=None,
-                max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
                 softmax_scale=self.softmax_scale,
-                causal=False, return_softmax_lse=False, ver=fa_ver,
+                causal=False,
+                return_softmax_lse=False,
+                ver=fa_ver,
             )
             return out, None
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
@@ -85,11 +100,15 @@ class _VaeRingAttnImpl:
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale  # [B, H, S, S]
+        scores = (
+            torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale
+        )  # [B, H, S, S]
         lse = torch.logsumexp(scores, dim=-1) if return_softmax_lse else None
         out = torch.softmax(scores, dim=-1) @ v  # [B, H, S, D]
         out = out.transpose(1, 2)  # [B, S, H, D]
         return out, lse
+
+
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import (
     AvgDown3D,
@@ -562,9 +581,14 @@ class WanDistAttentionBlock(nn.Module):
         self.world_size = get_sp_world_size()
         self.sp_group = get_sp_group()
         self.use_ring_attn = False
-        if self.world_size > 1 and getattr(self.sp_group, "device_group", None) is not None:
+        if (
+            self.world_size > 1
+            and getattr(self.sp_group, "device_group", None) is not None
+        ):
             self.use_ring_attn = True
-            self.attn_impl = _VaeRingAttnImpl(softmax_scale=1.0 / (dim**0.5), head_size=dim)
+            self.attn_impl = _VaeRingAttnImpl(
+                softmax_scale=1.0 / (dim**0.5), head_size=dim
+            )
 
     def forward(self, x):
         if self.use_ring_attn:
@@ -595,7 +619,9 @@ class WanDistAttentionBlock(nn.Module):
             from sglang.multimodal_gen.runtime.layers.usp import ring_attn
 
             x = ring_attn(
-                q, k, v,
+                q,
+                k,
+                v,
                 attn_impl=self.attn_impl,
                 is_causal=False,
                 dropout_p=0.0,

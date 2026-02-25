@@ -412,7 +412,7 @@ class WanEncoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                        )
+                )
             x = self.conv_in(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -449,7 +449,7 @@ class WanEncoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                        )
+                )
             x = self.conv_out(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -718,7 +718,7 @@ class WanDecoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                        )
+                )
             x = self.conv_in(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
@@ -752,7 +752,7 @@ class WanDecoder3d(nn.Module):
                         cache_x,
                     ],
                     dim=2,
-                        )
+                )
             x = self.conv_out(x, _feat_cache[idx])
             _feat_cache[idx] = cache_x
             _feat_idx += 1
