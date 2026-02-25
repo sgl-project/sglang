@@ -135,13 +135,26 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+    def ensure_parallel_info(
+        self, bootstrap_addr: str, max_retries: int = 20, retry_interval: float = 1.0
+    ) -> bool:
         """Fetch and cache prefill parallel info if not yet available.
         Returns True if info is available (cached or freshly fetched).
+        Retries with backoff if the prefill server hasn't registered yet.
         """
         if bootstrap_addr in self.prefill_info_table:
             return True
-        info = self._fetch_prefill_server_info(bootstrap_addr)
+        info = None
+        for attempt in range(max_retries):
+            info = self._fetch_prefill_server_info(bootstrap_addr)
+            if info is not None:
+                break
+            if attempt < max_retries - 1:
+                logger.info(
+                    f"Prefill server info not available from {bootstrap_addr}, "
+                    f"retrying ({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(retry_interval)
         if info is None:
             return False
 
@@ -573,6 +586,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
+        self._registered_count = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -583,6 +597,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def run(self):
         self.thread.start()
+
+    def _is_ready(self) -> bool:
+        if self.attn_tp_size is None or self.pp_size is None:
+            return False
+        expected = self.dp_size * self.attn_tp_size * self.pp_size
+        return self._registered_count >= expected
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
@@ -654,8 +674,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
+            self._registered_count += 1
             logger.debug(
                 f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+                f" ({self._registered_count}/{self.dp_size * self.attn_tp_size * self.pp_size} registered)"
             )
 
         return web.Response(text="OK", status=200)
@@ -672,6 +694,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             and int(prefill_dp_rank) == -1
             and int(target_pp_rank) == -1
         ):
+            if not self._is_ready():
+                return web.Response(
+                    text=f"Prefill server not fully registered yet"
+                    f" ({self._registered_count} workers registered).",
+                    status=503,
+                )
             info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,
                 dp_size=self.dp_size,
