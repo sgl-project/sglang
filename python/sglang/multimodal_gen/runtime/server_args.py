@@ -63,10 +63,15 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
     - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
     - Dataclasses are expanded to dicts and sanitized recursively.
     - Callables/functions are rendered as their qualified name.
+    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
     - Fallback to str(...) for unknown types.
     """
     # Handle simple types quickly
     if obj is None or isinstance(obj, (str, int, float, bool)):
+        # redact sensitive prompt fields
+        if key_hint in ("prompt", "negative_prompt"):
+            if isinstance(obj, str):
+                return f"<redacted, len={len(obj)}>"
         return obj
 
     # Enum -> value for readability
@@ -134,7 +139,7 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
 
     # Sequences/Sets -> list
     if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x) for x in obj]
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
 
     # Functions / Callables -> qualified name
     try:

@@ -48,7 +48,6 @@ from sgl_kernel.gemm import (
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     gptq_gemm,
-    gptq_marlin_gemm,
     gptq_shuffle,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
@@ -77,11 +76,6 @@ from sgl_kernel.mamba import (
     causal_conv1d_update,
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
-)
-from sgl_kernel.marlin import (
-    awq_marlin_moe_repack,
-    awq_marlin_repack,
-    gptq_marlin_repack,
 )
 from sgl_kernel.memory import set_kv_buffer_kernel, weak_ref_tensor
 from sgl_kernel.moe import (
