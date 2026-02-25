@@ -540,7 +540,7 @@ class TestEntrypointGroupingLogical:
         assert summary.skipped == 0
 
     def test_multi_step_tp(self, tmp_path, capsys):
-        """Two steps with TP=2 shards produce two logical groups (one per step)."""
+        """Two steps with TP=2 shards produce two per-step comparisons (no aux → no alignment)."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
 
@@ -571,6 +571,8 @@ class TestEntrypointGroupingLogical:
         records = _run_and_parse(args, capsys)
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 2
+        assert comparisons[0].baseline.shape == [4, 8]
+        assert comparisons[1].baseline.shape == [4, 8]
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -612,7 +614,7 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "attn_out"
 
     def test_filter_logical(self, tmp_path, capsys):
-        """--filter in logical grouping selects only matching tensor groups."""
+        """--filter in logical grouping selects only matching tensor bundles."""
         torch.manual_seed(42)
         full_a = torch.randn(4, 8)
         full_b = torch.randn(4, 8)
@@ -736,7 +738,7 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
     def test_cp_tp_different_sizes(self, tmp_path, capsys):
-        """Baseline CP=2+TP=2 vs target CP=1+TP=4: both sides independently unshard."""
+        """Baseline CP=2+TP=2 vs target CP=1+TP=4: both sides independently unsharder."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 16)
         full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
