@@ -170,7 +170,13 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
     )
 
-    # Keep original weights/scales to support update_weights_from_disk.
+    # Clean up weights that won't be used by TRT-LLM
+    del (
+        layer.w2_weight,
+        layer.w2_weight_scale,
+        layer.w13_weight,
+        layer.w13_weight_scale,
+    )
 
 
 @dataclass
