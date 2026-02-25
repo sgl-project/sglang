@@ -70,10 +70,22 @@ def get_gen_prefix_cache_path(args, tokenizer):
     """Create cache directory under ~/.cache/sglang/benchmark"""
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
-    # Create a unique cache filename based on the generation parameters
+    # Support both GeneratedSharedPrefixDataset (unprefixed fields)
+    # and argparse.Namespace (gsp_-prefixed fields).
+    def _get(name):
+        val = getattr(args, name, None)
+        if val is not None:
+            return val
+        return getattr(args, f"gsp_{name}")
+
+    ng = _get("num_groups")
+    ppg = _get("prompts_per_group")
+    spl = _get("system_prompt_len")
+    ql = _get("question_len")
+    ol = _get("output_len")
     cache_key = (
-        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
+        f"gen_shared_prefix_{args.seed}_{ng}_{ppg}_"
+        f"{spl}_{ql}_{ol}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
