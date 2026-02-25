@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import activations
 
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -776,12 +776,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.language_model.load_weights(language_weights)
 
     @classmethod
-    def get_model_config_for_expert_location(cls, config):
+    def get_model_config_for_expert_location(cls, config: KimiK25Config):
         text_config = config.text_config
         return ModelConfigForExpertLocation(
             num_layers=text_config.num_hidden_layers,
             num_logical_experts=text_config.n_routed_experts,
             num_groups=text_config.n_group,
         )
+
 
 EntryClass = [KimiK25ForConditionalGeneration]
