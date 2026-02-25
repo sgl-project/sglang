@@ -634,7 +634,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"]["finish_reason"]
                 # If the abort is from scheduler.
-                if finish_reason.get("type") == "abort":
+                if finish_reason and finish_reason.get("type") == "abort":
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         finish_reason.get("status_code", 500),
