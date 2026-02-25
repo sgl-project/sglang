@@ -125,14 +125,38 @@ _mm_grid_attrs = {
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
 
+_mm_feature_attrs = {
+    Modality.IMAGE: ["pixel_values"],
+    Modality.VIDEO: ["pixel_values_videos"],
+    Modality.AUDIO: ["input_features"],
+}
+
 
 def _get_mm_grid_dim(mm_inputs, modality):
     for attr in _mm_grid_attrs[modality]:
         if attr in mm_inputs:
             return mm_inputs[attr]
+    raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
+
+
+def _get_mm_feature(mm_inputs, modality):
+    for attr in _mm_feature_attrs[modality]:
+        if attr in mm_inputs:
+            return mm_inputs[attr]
     raise ValueError(
-        f"Vision grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}"
+        f"Feature attrs ({_mm_feature_attrs[modality]}) not found in {mm_inputs}"
     )
+
+
+def _build_mm_aux_data(mm_inputs):
+    """
+    Build auxiliary data for video modality.
+    """
+    aux_data = {
+        "video_timestamps": mm_inputs.get("video_timestamps", None),
+        "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
+    }
+    return aux_data
 
 
 class MMEncoder:
@@ -483,52 +507,67 @@ class MMEncoder:
             async_futures = [asyncio.wrap_future(f) for f in futures]
             return await asyncio.gather(*async_futures)
 
-    def get_num_patches(self, grid: Union[torch.Tensor, List[int]]) -> int:
-        """Calculate number of raw patches (before 2x2 merge). Used for pixel_values slicing."""
-        return int(grid[0] * grid[1] * grid[2])
+    def get_num_patches(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
+        if modality == Modality.AUDIO:
+            return int(grid.item())
+        else:
+            return int(grid[0] * grid[1] * grid[2])
 
-    def get_num_tokens(self, grid: Union[torch.Tensor, List[int]]) -> int:
+    def get_num_tokens(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
         """Calculate number of tokens (after 2x2 merge). Used for mm_embedding slicing."""
-        merge_size = getattr(self.image_processor, "merge_size", 2)
-        return self.get_num_patches(grid) // (merge_size**2)
+        if modality == Modality.AUDIO:
+            input_length = self.get_num_patches(grid, modality)
+            return self._get_feat_extract_output_lengths(input_length)
+        else:
+            merge_size = getattr(self.image_processor, "merge_size", 2)
+            return self.get_num_patches(grid) // (merge_size**2)
 
     def slice_embedding(
-        self, mm_embedding: torch.Tensor, grid_thw: List
+        self, mm_embedding: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[torch.Tensor]:
         """Slice a concatenated embedding tensor into individual image embeddings."""
         slices, offset = [], 0
         for grid in grid_thw:
-            count = self.get_num_tokens(grid)
+            count = self.get_num_tokens(grid, modality)
             slices.append(mm_embedding[offset : offset + count])
             offset += count
         return slices
 
     def _calculate_hashes_from_features(
-        self, pixel_values: torch.Tensor, grid_thw: List
+        self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
     ) -> List[str]:
-        """CPU Task: Compute hashes based on processed feature patches (pixel_values)."""
+        """CPU Task: Compute hashes based on processed feature patches."""
         hashes, offset = [], 0
+        logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
-            num_patches = self.get_num_patches(grid)
-            feature_slice = pixel_values[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(
-                modality=Modality.IMAGE, feature=feature_slice
-            )
+            num_patches = self.get_num_patches(grid, modality)
+            feature_slice = mm_feature[offset : offset + num_patches]
+            tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
             tmp_item.set_pad_value()
             hashes.append(tmp_item.hash)
             offset += num_patches
         return hashes
 
     async def _encode_missing(
-        self, pixel_values: torch.Tensor, images_input: dict, indices: List[int]
+        self,
+        mm_feature: torch.Tensor,
+        mm_inputs: dict,
+        indices: List[int],
+        modality: Modality = Modality.IMAGE,
+        get_feature_fn=None,
     ) -> List[torch.Tensor]:
         """
-        GPU Task: Run ViT inference ONLY on the subset of images missing from the cache.
+        GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = images_input["image_grid_thw"]
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
 
-        # 1. Slice pixel_values to get only the patches for missing images
-        sub_pixel_list = []
+        # 1. Slice mm_feature to get only the patches for missing mm items
+        sub_feature_list = []
         offsets = [0]
         curr = 0
         for g in grid_thw:
@@ -536,64 +575,63 @@ class MMEncoder:
             offsets.append(curr)
 
         for idx in indices:
-            sub_pixel_list.append(pixel_values[offsets[idx] : offsets[idx + 1]])
+            sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
 
-        sub_feature = torch.cat(sub_pixel_list, dim=0)
+        sub_feature = torch.cat(sub_feature_list, dim=0)
 
         mm_item = MultimodalDataItem.from_dict(
             {
-                "modality": Modality.IMAGE,
+                "modality": modality,
                 "feature": _convert(sub_feature),
             }
         )
 
-        for k, v in images_input.items():
-            if k == "pixel_values":
+        for k, v in mm_inputs.items():
+            if k in _mm_feature_attrs.get(modality, []):
                 continue
             val = _convert(v)
-            if k in _mm_grid_attrs.get(Modality.IMAGE, []):
+            if k in _mm_grid_attrs.get(modality, []):
                 mm_item.set(k, val[indices])
             else:
                 mm_item.set(k, val)
 
         with torch.inference_mode():
-            new_embeddings = self.model.get_image_feature([mm_item]).cpu()
+            new_embeddings = get_feature_fn([mm_item]).cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
         sub_grids = [grid_thw[i] for i in indices]
-        return self.slice_embedding(new_embeddings, sub_grids)
+        return self.slice_embedding(new_embeddings, sub_grids, modality)
 
     async def encode_with_global_cache(
         self,
         mm_items,
+        modality: Modality,
         req_id: str,
         num_parts: int,
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
-        images = await self._flatten_and_load_images(mm_items)
-        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
-        images_input = self.image_processor(images=images, **kwargs)
-        pixel_values = images_input["pixel_values"]
-        grid_thw = images_input["image_grid_thw"]
-        num_images = len(grid_thw)
+        mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        mm_feature = _get_mm_feature(mm_inputs, modality)
+        num_items = len(grid_thw)
 
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
         if self.rank == 0:
             if hashes is None:
-                image_hashes = self._calculate_hashes_from_features(
-                    pixel_values, grid_thw
+                mm_hashes = self._calculate_hashes_from_features(
+                    mm_feature, grid_thw, modality
                 )
             else:
-                image_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(image_hashes)
+                mm_hashes = hashes
+            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
         else:
-            image_hashes = None
-            mask_tensor = torch.zeros(num_images, dtype=torch.int32)
+            mm_hashes = None
+            mask_tensor = torch.zeros(num_items, dtype=torch.int32)
 
         if self.server_args.tp_size > 1:
             torch.distributed.broadcast(
@@ -610,7 +648,7 @@ class MMEncoder:
         new_slices = []
         if missing_indices:
             new_slices = await self._encode_missing(
-                pixel_values, images_input, missing_indices
+                mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
             )
 
         # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
@@ -618,8 +656,10 @@ class MMEncoder:
 
         if self.rank == 0:
             if hit_indices:
-                hit_hashes = [image_hashes[i] for i in hit_indices]
-                hit_tokens = [self.get_num_tokens(grid_thw[i]) for i in hit_indices]
+                hit_hashes = [mm_hashes[i] for i in hit_indices]
+                hit_tokens = [
+                    self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
+                ]
                 self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
 
                 try:
@@ -632,7 +672,7 @@ class MMEncoder:
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.error(
                         f"Prefetch failed for req {req_id}: {e}. "
-                        f"Falling back to ViT for {len(hit_indices)} hit images."
+                        f"Falling back to ViT for {len(hit_indices)} hit items."
                     )
                     prefetch_status[0] = 0
 
@@ -644,21 +684,21 @@ class MMEncoder:
                 group=self.mm_global_cache.prefetch_tp_group,
             )
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit images.
+        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
         if prefetch_status.item() == 0 and hit_indices:
             logger.info(
                 f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} images."
+                f"for {len(hit_indices)} mm items."
             )
             fallback_slices = await self._encode_missing(
-                pixel_values, images_input, hit_indices
+                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
             )
         else:
             fallback_slices = None
 
         # Step 6: Rank 0 assembles final embedding and prepares for sending.
         if self.rank == 0:
-            final_slices = [None] * num_images
+            final_slices = [None] * num_items
 
             for i, idx in enumerate(missing_indices):
                 final_slices[idx] = new_slices[i]
@@ -666,7 +706,7 @@ class MMEncoder:
             # Fill in cache-hit embeddings (from prefetch or fallback)
             if prefetch_status.item() == 1 and hit_indices:
                 cached_slices = self.mm_global_cache.get_embeddings(
-                    [image_hashes[i] for i in hit_indices]
+                    [mm_hashes[i] for i in hit_indices]
                 )
                 for i, idx in enumerate(hit_indices):
                     final_slices[idx] = cached_slices[i]
@@ -678,10 +718,10 @@ class MMEncoder:
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [image_hashes[i] for i in missing_indices]
+            all_new_hashes = [mm_hashes[i] for i in missing_indices]
             all_new_slices = list(new_slices)
             if fallback_slices is not None:
-                all_new_hashes += [image_hashes[i] for i in hit_indices]
+                all_new_hashes += [mm_hashes[i] for i in hit_indices]
                 all_new_slices += list(fallback_slices)
 
             if all_new_hashes:
@@ -697,8 +737,15 @@ class MMEncoder:
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
 
+            aux_data = _build_mm_aux_data(mm_inputs)
             self.embedding_to_send[req_id] = EmbeddingData(
-                req_id, num_parts, part_idx, grid_thw, mm_embedding
+                req_id,
+                num_parts,
+                part_idx,
+                grid_thw,
+                modality,
+                mm_embedding,
+                **aux_data,
             )
             return (
                 mm_embedding.nbytes,
@@ -831,23 +878,11 @@ class MMEncoder:
                 f"Currently only support image, video and audio modalities, {modality} modality has no processor available."
             )
 
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": modality,
-                "feature": _convert(feature),
-            }
-        )
-        for k, v in processor_input.items():
-            if k in ["pixel_values", "pixel_values_videos", "input_features"]:
-                continue
-            mm_item.set(k, _convert(v))
-        return processor_input, mm_item, get_feature_method
+        return processor_input, get_feature_method
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
         try:
-            mm_inputs, mm_item, get_feature_fn = await self._process_mm_items(
-                mm_items, modality
-            )
+            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:
@@ -856,6 +891,17 @@ class MMEncoder:
             # support mm_cache
             mm_embedding = None
             mm_hash = None
+
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": modality,
+                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+                }
+            )
+            for k, v in mm_inputs.items():
+                if k in _mm_feature_attrs[modality]:
+                    continue
+                mm_item.set(k, _convert(v))
 
             if self.server_args.enable_prefix_mm_cache:
                 mm_item.set_pad_value()
@@ -878,11 +924,7 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            aux_data = {
-                "video_timestamps": mm_inputs.get("video_timestamps", None),
-                "second_per_grid_ts": mm_inputs.get("second_per_grid_ts", None),
-            }
-
+            aux_data = _build_mm_aux_data(mm_inputs)
             return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
@@ -1178,6 +1220,7 @@ async def run_encoder(
             if encoder.mm_global_cache is not None:
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
@@ -1251,6 +1294,7 @@ async def handle_encode_request(request: dict):
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
+                    modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
