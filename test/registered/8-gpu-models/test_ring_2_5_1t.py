@@ -20,7 +20,6 @@ class TestRing2_5_1T(unittest.TestCase):
 
     def test_ring_2_5_1t(self):
         base_args = [
-            "--tp=8",
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
