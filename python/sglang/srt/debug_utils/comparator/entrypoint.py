@@ -1,7 +1,9 @@
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import polars as pl
+import torch
 
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
@@ -11,8 +13,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     print_record,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparison import compare_tensors
-from sglang.srt.debug_utils.comparator.utils import load_object
-from sglang.srt.debug_utils.dump_loader import find_row, read_meta
+from sglang.srt.debug_utils.dump_loader import ValueWithMeta, find_row, read_meta
 
 
 def main() -> None:
@@ -70,8 +71,8 @@ def run(args: argparse.Namespace) -> None:
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
 
-        x_baseline = load_object(path_baseline)
-        x_target = load_object(path_target)
+        x_baseline = _load_tensor(path_baseline)
+        x_target = _load_tensor(path_target)
 
         if x_baseline is None or x_target is None:
             counts["skipped"] += 1
@@ -102,6 +103,13 @@ def run(args: argparse.Namespace) -> None:
         SummaryRecord(total=sum(counts.values()), **counts),
         output_format=args.output_format,
     )
+
+
+def _load_tensor(path: Path) -> Optional[torch.Tensor]:
+    loaded = ValueWithMeta.load(path)
+    if not isinstance(loaded.value, torch.Tensor):
+        return None
+    return loaded.value
 
 
 def _parse_args() -> argparse.Namespace:

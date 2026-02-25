@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -8,7 +7,6 @@ from sglang.srt.debug_utils.comparator.utils import (
     argmax_coord,
     calc_rel_diff,
     compute_smaller_dtype,
-    load_object,
     try_unify_shape,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,29 +88,6 @@ class TestComputeSmallerDtype:
 
     def test_unknown_pair_returns_none(self):
         assert compute_smaller_dtype(torch.int32, torch.int64) is None
-
-
-class TestLoadObject:
-    def test_load_tensor(self, tmp_path):
-        path = tmp_path / "tensor.pt"
-        torch.save(torch.randn(5, 5), path)
-        assert load_object(path).shape == (5, 5)
-
-    def test_load_dict_with_value_key(self, tmp_path):
-        path = tmp_path / "wrapped.pt"
-        tensor = torch.randn(3, 3)
-        torch.save({"value": tensor}, path)
-        result = load_object(path)
-        assert result is not None
-        assert result.shape == (3, 3)
-
-    def test_non_tensor_returns_none(self, tmp_path):
-        path = tmp_path / "tensor.pt"
-        torch.save({"dict": 1}, path)
-        assert load_object(path) is None
-
-    def test_nonexistent_returns_none(self):
-        assert load_object(Path("/nonexistent.pt")) is None
 
 
 if __name__ == "__main__":
