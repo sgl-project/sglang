@@ -238,7 +238,7 @@ def compute_dp_attention_world_info(
         attn_dp_rank = 0
     else:
         # Rank layout is (dp, cp, tp) where tp is the fastest-changing dim:
-        # tp_rank = ((cp_rank * dp_size) + dp_rank) * attn_tp_size + attn_tp_rank
+        # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
 
     return attn_tp_rank, attn_tp_size, attn_dp_rank
