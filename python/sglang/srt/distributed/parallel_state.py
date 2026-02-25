@@ -1526,6 +1526,20 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
+_DEVICE_TO_DISTRIBUTED_BACKEND = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl",
+    "musa": "mccl",
+}
+
+
+def get_default_distributed_backend(device: str) -> str:
+    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1534,12 +1548,6 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: Optional[int] = None,
 ):
-
-    if backend.lower() == "nccl" and not torch.cuda.is_available():
-        # Use gloo backend for non-CUDA platforms (MPS, CPU)
-        backend = "gloo"
-        logger.info("Using gloo backend since CUDA is not available")
-
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
