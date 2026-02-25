@@ -1,5 +1,7 @@
 import json
 import random
+from argparse import Namespace
+from dataclasses import dataclass
 from typing import List
 
 import numpy as np
@@ -8,10 +10,48 @@ from transformers import PreTrainedTokenizerBase
 from sglang.benchmark.datasets.common import (
     SHAREGPT_FILENAME,
     SHAREGPT_REPO_ID,
+    BaseDataset,
     DatasetRow,
     compute_random_lens,
 )
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
+
+
+@dataclass
+class RandomDataset(BaseDataset):
+    input_len: int
+    output_len: int
+    num_requests: int
+    range_ratio: float
+    dataset_path: str
+    return_text: bool
+    random_sample: bool
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "RandomDataset":
+        return cls(
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            num_requests=args.num_prompts,
+            range_ratio=args.random_range_ratio,
+            dataset_path=args.dataset_path,
+            return_text=not getattr(args, "tokenize_prompt", False),
+            random_sample=(args.dataset_name == "random"),
+        )
+
+    def load(
+        self, tokenizer: PreTrainedTokenizerBase, model_id=None
+    ) -> List[DatasetRow]:
+        return sample_random_requests(
+            input_len=self.input_len,
+            output_len=self.output_len,
+            num_prompts=self.num_requests,
+            range_ratio=self.range_ratio,
+            tokenizer=tokenizer,
+            dataset_path=self.dataset_path,
+            random_sample=self.random_sample,
+            return_text=self.return_text,
+        )
 
 
 def sample_random_requests(

@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
-from sglang.srt.metrics.collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -222,47 +222,74 @@ class MooncakeStoreConfig:
         )
 
 
-class MooncakeStore(HiCacheStorage):
+class MooncakeBaseStore:
+    def __init__(self):
+        self.store = None
+        self.config = None
+
+    def _import_mooncake_store(self):
+        try:
+            from mooncake.store import MooncakeDistributedStore
+
+            return MooncakeDistributedStore
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html "
+                "to run SGLang with MooncakeConnector."
+            ) from e
+
+    def _load_config(self, storage_config: Any = None):
+        extra_config = (
+            getattr(storage_config, "extra_config", None) if storage_config else None
+        )
+
+        if extra_config and (
+            extra_config.get("master_server_address") is not None
+            or extra_config.get("client_server_address") is not None
+        ):
+            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            config = MooncakeStoreConfig.from_file()
+            logger.info("Mooncake Configuration loaded from file successfully.")
+
+        else:
+            config = MooncakeStoreConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded from env successfully.")
+
+        return config
+
+    def register_buffer(self, tensor: torch.Tensor):
+        if self.store is None:
+            raise RuntimeError("Mooncake store is not initialized.")
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error(f"Failed to register buffer, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+            )
+
+
+class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
-        try:
-            from mooncake.store import MooncakeDistributedStore
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html"
-                "to run SGLang with MooncakeConnector."
-            ) from e
-
+        MooncakeBaseStore.__init__(self)
+        MooncakeDistributedStore = self._import_mooncake_store()
         try:
             self.store = MooncakeDistributedStore()
 
+            self.config = self._load_config(storage_config)
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
                 else None
             )
-            # Load configuration with master_server_address prioritized from extra_config if available
-            if extra_config is not None and (
-                extra_config.get("master_server_address") is not None
-                or extra_config.get("client_server_address") is not None
-            ):
-                # Load from extra_config
-                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-                logger.info(
-                    "Mooncake Configuration loaded from extra_config successfully."
-                )
-            elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-                # Load from config file
-                self.config = MooncakeStoreConfig.from_file()
-                logger.info("Mooncake Configuration loaded from file successfully.")
-            else:
-                # Load from environment variables
-                self.config = MooncakeStoreConfig.load_from_env()
-                logger.info("Mooncake Configuration loaded from env successfully.")
-
             tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
 
             per_tp_global_segment_size = (
@@ -442,14 +469,7 @@ class MooncakeStore(HiCacheStorage):
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
-            buffer_ptr = buffer.data_ptr()
-            buffer_size = buffer.numel() * buffer.element_size()
-            ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
-            if ret_code:
-                logger.error(f"Failed to register buffer, error code: {ret_code}")
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
+            super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err

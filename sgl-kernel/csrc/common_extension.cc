@@ -197,26 +197,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/gemm/gptq
    */
   m.def(
-      "gptq_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor! b_scales, Tensor? global_scale_or_none,"
-      "Tensor? b_zeros_or_none, Tensor? g_idx_or_none, Tensor? perm_or_none,"
-      "Tensor! workspace, int b_q_type_id, int size_m, int size_n, int size_k,"
-      "bool is_k_full, bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
-  m.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
-
-  m.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
       "use_shuffle, int bit) -> Tensor");
   m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
   m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
-
-  m.def("gptq_marlin_repack(Tensor! b_q_weight, Tensor! perm, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("gptq_marlin_repack", torch::kCUDA, &gptq_marlin_repack);
-
-  m.def("awq_marlin_repack(Tensor! b_q_weight, int size_k, int size_n, int num_bits) -> Tensor");
-  m.impl("awq_marlin_repack", torch::kCUDA, &awq_marlin_repack);
 
   /*
    * From csrc/moe
