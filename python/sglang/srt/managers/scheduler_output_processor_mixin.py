@@ -552,7 +552,7 @@ class SchedulerOutputProcessorMixin:
         import numpy as np
 
         num_generated = len(req.output_ids)
-        logger.debug(
+        logger.info(
             "KV return: _try_kv_return called for req %s (num_generated=%d)",
             req.rid, num_generated,
         )
@@ -561,7 +561,7 @@ class SchedulerOutputProcessorMixin:
 
         kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
         if not hasattr(kv_mgr, "prefill_kv_return_info") or not kv_mgr.prefill_kv_return_info:
-            logger.debug("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
+            logger.info("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
             return
 
         # Use the first registered prefill peer (multi-prefill lookup is future work)

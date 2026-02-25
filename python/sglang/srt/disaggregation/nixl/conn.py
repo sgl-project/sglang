@@ -280,7 +280,7 @@ class NixlKVManager(CommonKVManager):
                     msg = msg[1:]
                     tag = msg[0].decode("ascii")
                     if tag == "KVReturn":
-                        logger.debug("KV return listener: received KVReturn message (%d parts)", len(msg))
+                        logger.info("KV return listener: received KVReturn message (%d parts)", len(msg))
                         self._register_prefill_for_kv_return(msg[1:])
                     else:
                         # Not a KV return message — this shouldn't happen on decode
@@ -1181,7 +1181,7 @@ class NixlKVManager(CommonKVManager):
                     # Register new peer and save KV base pointers.
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     self._add_remote_peer(decode_kv_args)
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    logger.info(f"Register KVArgs from {agent_name} successfully (enable_kv_return={self.server_args.enable_kv_return})")
 
                     # KV return bootstrap reply: send this prefill's NIXL agent
                     # metadata + pre-allocated page indices back to the decode

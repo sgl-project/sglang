@@ -323,11 +323,12 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
-        # Process KV return insertions even when idle (prefill side)
+        # Process KV return alloc requests and insertions even when idle (prefill side)
         if (
             self.server_args.enable_kv_return
             and self.disaggregation_mode == DisaggregationMode.PREFILL
         ):
+            self._process_kv_return_alloc_requests()
             self._process_kv_return_insertions()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
