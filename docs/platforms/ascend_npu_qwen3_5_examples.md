@@ -39,7 +39,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:{tag}
+quay.io/ascend/sglang:${tag}
 ```
 
 ## Deployment
@@ -157,10 +157,6 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export STREAMS_PER_DEVICE=32
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_NPU_USE_MULTI_STREAM=1
 export HCCL_BUFFSIZE=1000
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=lo
@@ -214,17 +210,16 @@ python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
         --attention-backend ascend \
         --device npu \
-        --tp-size 2 --nnodes 1 --node-rank 0 \
-        --chunked-prefill-size 4096 --max-prefill-tokens 120000 \
+        --tp-size 2 \
+        --chunked-prefill-size -1 --max-prefill-tokens 120000 \
         --disable-radix-cache \
         --trust-remote-code \
         --host 127.0.0.1 \
-        --mem-fraction-static 0.7 \
+        --mem-fraction-static 0.8 \
         --port 8000 \
-        --cuda-graph-bs 16 \
+        --cuda-graph-bs 32 \
         --enable-multimodal \
-        --mm-attention-backend ascend_attn \
-        --dtype bfloat16
+        --mm-attention-backend ascend_attn
 ```
 
 ### Prefill-Decode Disaggregation
