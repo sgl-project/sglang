@@ -2053,10 +2053,10 @@
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
             "stages_ms": {
-                "DiffusersExecutionStage": 5070.86
+                "DiffusersExecutionStage": 6160.17
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 5079.29,
+            "expected_e2e_ms": 6170.56,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0
         },
