@@ -2369,7 +2369,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return False
 
         if isinstance(obj.image_data, list):
-            return len(obj.image_data) > 1
+            return len(obj.image_data) >= envs.SGLANG_ENCODER_DISPATCH_MIN_ITEMS.get()
         return False
 
     def _handle_epd_disaggregation_encode_request(
