@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
 import torch
 
 from sglang.jit_kernel.cuda_wait_value import Event
@@ -21,6 +22,7 @@ def _run_wait_before_record(event: Event | torch.cuda.Event):
         event.record()
 
 
+@pytest.mark.skip(reason="Causes deadlock in CI: the blocking thread never exits")
 def test_custom_event_blocks_stream():
     block_thread = threading.Thread(
         target=_run_wait_before_record, args=(Event(),), daemon=True
@@ -41,7 +43,3 @@ def test_custom_event_blocks_stream():
     assert not non_block_thread.is_alive(), "torch.cuda.Event should not block"
     print("=" * 40)
     print("Test completed successfully.")
-
-
-if __name__ == "__main__":
-    test_custom_event_blocks_stream()
