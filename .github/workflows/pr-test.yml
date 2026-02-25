@@ -1362,14 +1362,22 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
-      # - name: Warmup Weights and JIT Compilation
-      #   timeout-minutes: 20
-      #   run: |
-      #     # An example command for testing the warmup. TODO: make this more general and move them to python scripts.
-      #     python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            inclusionAI/Ring-2.5-1T:8
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1520,6 +1528,19 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
+
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8
 
       - name: Run test
         timeout-minutes: 45
