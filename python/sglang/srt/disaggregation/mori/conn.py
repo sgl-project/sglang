@@ -7,8 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -194,16 +193,8 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.bootstrap_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
-            )
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.waiting_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
-            )
-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
-            self.addr_to_rooms_tracker = defaultdict(set)
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
 

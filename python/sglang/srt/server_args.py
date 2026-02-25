@@ -216,6 +216,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -498,6 +499,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -523,6 +525,9 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    linear_attn_backend: str = "triton"
+    linear_attn_decode_backend: Optional[str] = None
+    linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -692,6 +697,7 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    enable_mm_global_cache: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -885,12 +891,7 @@ class ServerArgs:
 
     def _handle_npu_backends(self):
         if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import (
-                init_npu_backend,
-                set_default_server_args,
-            )
-
-            init_npu_backend()
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
 
@@ -1301,6 +1302,13 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+            elif is_hip():
+                if not self.enable_dp_attention and self.nnodes == 1:
+                    # TODO (Hubert): Put this back later
+                    # self.enable_aiter_allreduce_fusion = True
+                    logger.info(
+                        "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
+                    )
 
                 if (
                     self.quantization == "modelopt_fp4"
@@ -1356,6 +1364,22 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
+            if is_blackwell_supported():
+                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
+                if not self.enable_dp_attention and self.nnodes == 1:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                    )
+            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
+                # TODO (Hubert): Put this back later
+                # self.enable_aiter_allreduce_fusion = True
+                logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            is_mxfp4_quant_format = (
+                quantization_config is not None
+                and quantization_config.get("quant_method") == "mxfp4"
+            )
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1719,6 +1743,13 @@ class ServerArgs:
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
+                    "Please use --mamba-scheduler-strategy no_buffer instead."
+                )
+
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
@@ -2217,15 +2248,17 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
-            self.deepep_mode = "normal"
-            logger.warning("auto set deepep_mode=`normal` for MORI EP")
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-            assert (self.chunked_prefill_size) <= get_int_env_var(
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
-            ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+            # Check chunked prefill for mori
+            # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+            # Skip validation if disaggregation mode is decode.
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                assert (self.chunked_prefill_size) <= get_int_env_var(
+                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+                ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -2719,6 +2752,12 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
         if self.enable_deterministic_inference:
+            if self.enable_aiter_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_aiter_allreduce_fusion = False
+
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
@@ -4120,6 +4159,11 @@ class ServerArgs:
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
+            "--enable-aiter-allreduce-fusion",
+            action="store_true",
+            help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
@@ -4259,6 +4303,31 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--linear-attn-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_backend,
+            help="The default kernel backend for linear attention (GDN/KDA). "
+            "Can be overridden per-mode by --linear-attn-decode-backend "
+            "and --linear-attn-prefill-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-decode-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_decode_backend,
+            help="Override the kernel backend for linear attention decode. "
+            "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="Override the kernel backend for linear attention prefill/extend. "
+            "If not set, uses --linear-attn-backend.",
         )
 
         # Hierarchical cache
@@ -5066,6 +5135,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_prefix_mm_cache,
             help="Enable prefix multimodal cache. Currently only supports mm-only.",
+        )
+
+        parser.add_argument(
+            "--enable-mm-global-cache",
+            action="store_true",
+            default=ServerArgs.enable_mm_global_cache,
+            help="Enable global multimodal embedding cache to skip redundant ViT inference.",
         )
 
         # For registering hooks

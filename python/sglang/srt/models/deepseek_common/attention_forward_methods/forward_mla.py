@@ -32,10 +32,11 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import bmm_fp8
 
-if _use_aiter_gfx95:
+if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
+if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
         fused_rms_fp8_group_quant,
@@ -218,8 +219,11 @@ class DeepseekMLAForwardMixin:
                     q_nope_out,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
+                ):
+                    # fp8 Triton kernel: always on gfx950,
+                    # cudagraph-only on gfx942 (hides launch overhead)
                     q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=q_nope,
                         WQ=self.w_kc.transpose(-1, -2),

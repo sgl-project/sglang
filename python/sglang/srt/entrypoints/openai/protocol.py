@@ -233,6 +233,20 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _migrate_deprecated_dp_rank(values: dict) -> dict:
+    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
+        import warnings
+
+        warnings.warn(
+            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if values.get("routed_dp_rank") is None:
+            values["routed_dp_rank"] = values["data_parallel_rank"]
+    return values
+
+
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -285,7 +299,11 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # For request id
@@ -299,6 +317,11 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -614,7 +637,11 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
@@ -625,6 +652,11 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
