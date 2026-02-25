@@ -1,5 +1,5 @@
 """
-    This file upload the media generated in diffusion-nightly-test to a slack channel of SGLang
+This file upload the media generated in diffusion-nightly-test to a slack channel of SGLang
 """
 
 import logging

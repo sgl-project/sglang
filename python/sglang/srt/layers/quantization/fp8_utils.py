@@ -61,6 +61,7 @@ if _use_aiter:
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
+
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
@@ -144,7 +145,7 @@ class Fp8GemmRunnerBackend(Enum):
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
 
-    def is_flashinfer(self) -> bool:
+    def is_flashinfer_trtllm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_TRTLLM
 
     def is_flashinfer_deepgemm(self) -> bool:
@@ -199,7 +200,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
-    if backend.is_flashinfer():
+    if backend.is_flashinfer_trtllm():
         if not (is_blackwell_supported() and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "

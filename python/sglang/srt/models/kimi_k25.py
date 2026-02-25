@@ -30,10 +30,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
@@ -474,9 +477,10 @@ class MoonViT3dPretrainedModel(nn.Module):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config, *inputs, use_data_parallel: bool = False, **kwargs):
         super().__init__()
         config = deepcopy(config)
+        self.config = config
         self.merge_kernel_size = config.merge_kernel_size
         self.patch_size = config.patch_size
         self.merge_type = config.merge_type
@@ -499,6 +503,7 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "mlp_dim": config.intermediate_size,
                 "activation": PytorchGELUTanh(),
                 "attn_bias": True,
+                "use_data_parallel": use_data_parallel,
             },
             video_attn_type=config.video_attn_type,
         )
@@ -540,11 +545,9 @@ class K2VLMultiModalProjector(nn.Module):
     def __init__(
         self,
         config: KimiK25VisionConfig,
-        use_data_parallel: bool = False,
         prefix: str = "",
     ):
         super().__init__()
-        self.use_data_parallel = use_data_parallel
 
         # Hidden size after patch merging
         merge_h, merge_w = config.merge_kernel_size
@@ -643,6 +646,15 @@ def vision_tower_forward_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
+    # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
+    # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+        }
+    )
+
     def __init__(
         self,
         config: KimiK25Config,
@@ -652,8 +664,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
+        self.vision_tower = MoonViT3dPretrainedModel(
+            config.vision_config, use_data_parallel=self.use_data_parallel
+        )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
@@ -676,6 +692,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
+
+        if self.use_data_parallel:
+            image_embeds = run_dp_sharded_mrope_vision_model(
+                self.vision_tower,
+                pixel_values,
+                grid_thws.tolist(),
+                rope_type="rope_2d",
+            )
+            image_features = self.mm_projector(image_embeds)
+            return image_features
+
         image_features = vision_tower_forward_auto(
             self.vision_tower,
             pixel_values,
@@ -695,6 +722,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -704,13 +732,16 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
+        mapper = getattr(self, "hf_to_sglang_mapper", None)
+        if mapper is not None:
+            weights = mapper.apply(weights)
 
         # Separate vision tower weights and language model weights
         vision_weights = []

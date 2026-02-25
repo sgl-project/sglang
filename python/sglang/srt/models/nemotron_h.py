@@ -61,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -633,7 +634,18 @@ class NemotronHForCausalLM(nn.Module):
     }
 
     remap_prefix = {"backbone": "model"}
-    remap_substr = {"A_log": "A", "embeddings": "embed_tokens"}
+    remap_substr = {
+        "A_log": "A",
+        "embeddings": "embed_tokens",
+        "k_proj.k_scale": "attn.k_scale",
+        "v_proj.v_scale": "attn.v_scale",
+    }
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "backbone.": "model.",
+        }
+    )
 
     def __init__(
         self,
@@ -645,6 +657,7 @@ class NemotronHForCausalLM(nn.Module):
         super().__init__()
         lora_config = None
         self.config = config
+        self.quant_config = quant_config
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
@@ -776,9 +789,10 @@ class NemotronHForCausalLM(nn.Module):
                 continue
 
             if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
+                if name not in params_dict:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
 
             layer_id = get_layer_id(name)
             if (
