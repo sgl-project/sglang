@@ -601,6 +601,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def _is_ready(self) -> bool:
         if self.attn_tp_size is None or self.pp_size is None:
             return False
+        # TODO: verify this expected count is correct for all parallelism
+        # combinations (CP / DP attention / system DP / TP / PP).
         expected = self.dp_size * self.attn_tp_size * self.pp_size
         return self._registered_count >= expected
 
