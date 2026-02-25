@@ -1110,6 +1110,8 @@ class SchedulerOutputProcessorMixin:
             ):
                 req.log_time_stats()
 
+        dp_ranks = [self.dp_rank] * len(rids) if rids else None
+
         # Send to detokenizer
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
@@ -1154,6 +1156,7 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
                     load=load,
+                    dp_ranks=dp_ranks,
                 )
             )
 
