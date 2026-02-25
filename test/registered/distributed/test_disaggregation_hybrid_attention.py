@@ -244,7 +244,6 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.90)
 
 
-@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

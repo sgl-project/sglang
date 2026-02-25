@@ -2364,9 +2364,6 @@ class ServerArgs:
                 model_arch=model_arch,
                 sm100_default_attention_backend="triton",
             )
-            config = self.get_model_config()
-            if hasattr(config.hf_config, "mamba_chunk_size"):
-                self._mamba_chunk_size = config.hf_config.mamba_chunk_size
 
         elif model_arch == "GraniteMoeHybridForCausalLM":
             hf_config = self.get_model_config().hf_config
@@ -2377,7 +2374,6 @@ class ServerArgs:
             if has_mamba:
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
-                    support_mamba_cache_extra_buffer=False,
                     sm100_default_attention_backend="triton",
                 )
 
@@ -2462,7 +2458,11 @@ class ServerArgs:
         support_mamba_cache: bool = True,
         support_mamba_cache_extra_buffer: bool = True,
         sm100_default_attention_backend: str = None,
+        fallback_attention_backend: str = "triton",
     ):
+        model_config = self.get_model_config()
+        if hasattr(model_config.hf_config, "mamba_chunk_size"):
+            self._mamba_chunk_size = model_config.hf_config.mamba_chunk_size
         if (
             is_sm100_supported()
             and self.attention_backend is None
@@ -2488,7 +2488,7 @@ class ServerArgs:
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "mamba extra_buffer is not compatible with --disable-radix-cache. "
                     "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
@@ -2505,11 +2505,11 @@ class ServerArgs:
                 assert (
                     self.mamba_track_interval % self.page_size == 0
                 ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                chunk_size = getattr(self, "_mamba_chunk_size", FLA_CHUNK_SIZE)
                 assert (
-                    max(FLA_CHUNK_SIZE, self.page_size)
-                    % min(FLA_CHUNK_SIZE, self.page_size)
+                    max(chunk_size, self.page_size) % min(chunk_size, self.page_size)
                     == 0
-                ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                ), f"For SSM models with extra buffer, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
@@ -2527,7 +2527,7 @@ class ServerArgs:
                 if self.attention_backend == "trtllm_mha":
                     logger.warning(
                         "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        "Try to use --attention-backend triton if radix cache is necessary."
+                        f"Try to use --attention-backend {fallback_attention_backend} if radix cache is necessary."
                     )
                     self.disable_radix_cache = True
                     self.disable_overlap_schedule = False
