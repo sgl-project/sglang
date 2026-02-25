@@ -8,6 +8,7 @@ import zmq
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import BackupDramReq
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -16,8 +17,8 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
-from sglang.srt.environ import envs
+from sglang.srt.utils import get_local_ip_auto
+
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
 
