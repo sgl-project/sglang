@@ -599,13 +599,13 @@ class SchedulerOutputProcessorMixin:
                 .numpy()
             )
 
-            # Convert to page-level indices
+            # Convert to page-level indices (must match kv_to_page_indices)
             page_size = self.token_to_kv_pool_allocator.page_size
             if page_size > 1:
                 num_pages = len(kv_indices) // page_size
                 if num_pages == 0:
                     return False
-                kv_indices = kv_indices[::page_size][:num_pages]
+                kv_indices = kv_indices[::page_size][:num_pages] // page_size
             else:
                 num_pages = len(kv_indices)
 
