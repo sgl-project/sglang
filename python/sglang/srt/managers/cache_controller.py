@@ -192,7 +192,7 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
@@ -216,7 +216,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -225,9 +224,10 @@ class PrefetchOperation(StorageOperation):
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -343,6 +343,7 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
+        self.prefetch_hit_queue = Queue()
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
@@ -611,6 +612,7 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
         self.stop_event.clear()
@@ -761,7 +763,6 @@ class HiCacheController:
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -770,7 +771,7 @@ class HiCacheController:
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -936,23 +937,16 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    # Record hit count, so the scheduler thread will know the exact memory to allocate
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
-                    self.prefetch_buffer.put(operation)
+                    operation.storage_hit_count = storage_hit_count
+                    self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue
