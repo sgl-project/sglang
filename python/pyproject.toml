@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,7 +19,6 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -28,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.2",
+  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.3",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -76,10 +75,10 @@ dependencies = [
   "uvloop",
   "xgrammar==0.1.27",
 
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
-  "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
+  "smg-grpc-proto>=0.3.3",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
+  "grpcio-health-checking>=1.78.0",
 ]
 
 [[tool.uv.index]]
@@ -102,18 +101,19 @@ torch = [
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "PyYAML==6.0.1",
-  "cloudpickle",
+  "cloudpickle==3.1.2",
   "diffusers==0.36.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
-  "remote-pdb",
+  "remote-pdb==2.1.0",
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.2.0",
-  "addict"
+  "addict==2.4.0",
+  "av==16.1.0",
 ]
 
 tracing = [
