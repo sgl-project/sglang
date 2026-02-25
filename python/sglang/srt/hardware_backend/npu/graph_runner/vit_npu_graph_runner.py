@@ -13,32 +13,21 @@
 # ==============================================================================
 
 """ViT NPU Graph Runner class."""
+
 from __future__ import annotations
 
-import inspect
 from typing import Dict, Hashable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch_npu
 
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-
-
-vit_graph_memory_pool = None
-
-
-def get_vit_graph_memory_pool():
-    return vit_graph_memory_pool
-
-
-def set_vit_graph_memory_pool(val):
-    global vit_graph_memory_pool
-    vit_graph_memory_pool = val
 
 
 class ViTNpuGraphRunner(ViTCudaGraphRunner):
@@ -51,6 +40,8 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
       - vit.deepstack_vision_indexes: Sequence[int]
       - vit.deepstack_merger_list: nn.ModuleList (same length as deepstack_vision_indexes)
     """
+
+    _graph_memory_pool = None
 
     def __init__(
         self,
@@ -76,11 +67,11 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         graph_key: int,
     ):
 
-        graph = torch.cuda.CUDAGraph()
+        graph = torch_npu.npu.NPUGraph()
         vit = self.vit
 
         override_backend = get_global_server_args().mm_attention_backend
-        with torch.cuda.graph(graph, pool=get_vit_graph_memory_pool()):
+        with torch_npu.npu.graph(graph, pool=ViTNpuGraphRunner._graph_memory_pool):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -134,28 +125,6 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
         self.block_graphs[graph_key] = graph
 
-    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int):
-        if self.sin_cos_ws is None:
-            max_shape = self.max_context_len or seq_len
-            max_shape = max(max_shape, seq_len)
-            cos_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
-            )
-            sin_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
-            )
-            self.sin_cos_ws = (cos_ws, sin_ws)
-        else:
-            if self.sin_cos_ws[0].size(0) < seq_len:
-                max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
-                cos_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                sin_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                self.sin_cos_ws = (cos_ws, sin_ws)
-
     def create_graph(
         self,
         x_3d: torch.Tensor,  # [S, 1, H]
@@ -169,10 +138,12 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         if graph_key in self.block_graphs:
             return graph_key
 
-        if get_vit_graph_memory_pool() is None:
-            set_vit_graph_memory_pool(self.device_module.graph_pool_handle())
+        if ViTNpuGraphRunner._graph_memory_pool is None:
+            ViTNpuGraphRunner._graph_memory_pool = (
+                self.device_module.graph_pool_handle()
+            )
         # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_vit_graph_memory_pool())
+        set_graph_pool_id(ViTNpuGraphRunner._graph_memory_pool)
 
         # pre-allocate workspace
         attn_module: VisionAttention = vit.blocks[0].attn
