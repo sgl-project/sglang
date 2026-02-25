@@ -2374,7 +2374,7 @@ class ServerArgs:
             if has_mamba:
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
-                    sm100_default_attention_backend="triton",
+                    sm100_default_attention_backend="flashinfer",
                 )
 
         elif model_arch in ["Lfm2ForCausalLM"]:
