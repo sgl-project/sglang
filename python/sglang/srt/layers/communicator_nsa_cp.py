@@ -34,6 +34,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    get_attention_cp_group,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -154,7 +155,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
-                get_local_dp_buffer(),
+                get_local_dp_buffer(get_attention_cp_group()),
                 hidden_states,
             )
             attn_cp_all_gather_into_tensor(
