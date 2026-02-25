@@ -305,38 +305,39 @@ class FrameInterpolator:
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
-        """Resolve weight path (downloading from HF if needed) and load model."""
+        """Resolve weight path and load model."""
         model_path = self._model_path
 
-        # Auto-download from HuggingFace Hub when no valid local path is given
         if model_path is None or not os.path.isdir(model_path):
-            try:
-                from huggingface_hub import hf_hub_download
-            except ImportError:
-                raise ImportError(
-                    "huggingface_hub is required for automatic RIFE weight download. "
-                    "Install it with: pip install huggingface_hub"
-                )
-            logger.info(
-                "Downloading RIFE weights from HuggingFace Hub: %s", self._hf_repo_id
+            raise ValueError(
+                "RIFE model path not found. "
+                "Download RIFE weights from https://github.com/hzwer/Practical-RIFE#model-list, "
+                "extract the zip, and pass the directory via "
+                "--frame-interpolation-model-path <path/to/train_log>."
             )
-            flownet_path = hf_hub_download(
-                repo_id=self._hf_repo_id,
-                filename="train_log/flownet.pkl",
-            )
-            model_path = os.path.dirname(flownet_path)
-            logger.info("RIFE weights cached at: %s", model_path)
 
         self._resolved_path = model_path
 
-        # Check module-level cache
         if model_path in _MODEL_CACHE:
             return _MODEL_CACHE[model_path]
 
-        # Load and cache
+        # Try to load Model class from user's RIFE_HDv3.py (most version-accurate)
+        rife_py = os.path.join(model_path, "RIFE_HDv3.py")
+        if os.path.isfile(rife_py):
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("RIFE_HDv3", rife_py)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            ModelClass = mod.Model
+            logger.info("Using Model from %s", rife_py)
+        else:
+            ModelClass = Model  # vendored fallback
+            logger.info("RIFE_HDv3.py not found; using vendored Model")
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = Model()
-        model.load_model(model_path, rank=0)
+        model = ModelClass()
+        model.load_model(model_path, rank=-1)
         model.eval()
         model.flownet = model.flownet.to(device)
         _MODEL_CACHE[model_path] = model
