@@ -1,6 +1,5 @@
 from typing import Optional, Union
 
-import flashinfer.sampling
 import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
