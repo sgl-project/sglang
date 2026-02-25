@@ -106,11 +106,11 @@ def maybe_dump_performance(
     )
 
 
-def generate_cmd(args: argparse.Namespace):
+def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = ServerArgs.from_cli_args(args, unknown_args)
 
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
     sampling_params_kwargs["request_id"] = generate_request_id()
@@ -158,8 +158,10 @@ class GenerateSubcommand(CLISubcommand):
         """Get names of arguments for generate_video method"""
         return [field.name for field in dataclasses.fields(SamplingParams)]
 
-    def cmd(self, args: argparse.Namespace) -> None:
-        generate_cmd(args)
+    def cmd(
+        self, args: argparse.Namespace, unknown_args: list[str] | None = None
+    ) -> None:
+        generate_cmd(args, unknown_args)
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""

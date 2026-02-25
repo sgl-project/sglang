@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -29,6 +28,10 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
@@ -315,6 +318,7 @@ class GlmImageAttention(torch.nn.Module):
         eps,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -329,13 +333,23 @@ class GlmImageAttention(torch.nn.Module):
 
         self.num_kv_heads = self.dim_head // self.inner_kv_dim
 
-        self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
-        self.to_v = ReplicatedLinear(query_dim, self.inner_kv_dim, bias=bias)
+        self.to_q = ReplicatedLinear(
+            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_k = ReplicatedLinear(
+            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        )
+        self.to_v = ReplicatedLinear(
+            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        )
 
         # (dropout omitted)
         self.to_out = nn.ModuleList(
-            [ReplicatedLinear(self.inner_dim, self.out_dim, bias=True)]
+            [
+                ReplicatedLinear(
+                    self.inner_dim, self.out_dim, bias=True, quant_config=quant_config
+                )
+            ]
         )
 
         if qk_norm is None:
@@ -466,6 +480,7 @@ class GlmImageTransformerBlock(nn.Module):
         time_embed_dim: int = 512,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -483,6 +498,7 @@ class GlmImageTransformerBlock(nn.Module):
             eps=1e-5,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn1",
+            quant_config=quant_config,
         )
 
         # 2. Feedforward
@@ -687,6 +703,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         self,
         config: GlmImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
 
@@ -747,6 +764,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.time_embed_dim,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=f"transformer_blocks.{i}",
+                    quant_config=quant_config,
                 )
                 for i in range(arch_config.num_layers)
             ]

@@ -12,7 +12,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
     By default, SGLANG_*/SGL_* keys are rejected — use ``Envs`` descriptors
     for those.  Pass ``allow_sglang=True`` only for special env vars that
-    intentionally bypass ``environ.py`` (e.g. ``SGLANG_DUMPER_*``).
+    intentionally bypass ``environ.py``.
     """
     if not allow_sglang:
         for key in env_vars:
@@ -185,8 +185,6 @@ class Envs:
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
-    # CuTe DSL GDN Decode
-    SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
@@ -253,12 +251,13 @@ class Envs:
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
-    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(30)
+    SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

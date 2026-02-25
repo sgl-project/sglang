@@ -15,7 +15,6 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
@@ -735,7 +734,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             or quant_config.get_name() == "compressed_tensors"
         ):
             # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
-            return FlashInferFusedMoE
+            return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE

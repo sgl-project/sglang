@@ -50,10 +50,12 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
+    get_default_distributed_backend,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -738,29 +740,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
-        if self.device == "cuda":
-            if self.server_args.elastic_ep_backend == "mooncake":
-                backend = "mooncake"
-                if self.server_args.mooncake_ib_device:
-                    mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
-                    try:
-                        from mooncake import ep as mooncake_ep
+        backend = get_default_distributed_backend(self.device)
+        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
+            backend = "mooncake"
+            if self.server_args.mooncake_ib_device:
+                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                try:
+                    from mooncake import ep as mooncake_ep
 
-                        mooncake_ep.set_device_filter(mooncake_ib_device)
-                    except:
-                        pass  # A warning will be raised in `init_distributed_environment`
-            else:
-                backend = "nccl"
-        elif self.device == "xpu":
-            backend = "xccl"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
-            backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
-        elif self.device == "musa":
-            backend = "mccl"
+                    mooncake_ep.set_device_filter(mooncake_ib_device)
+                except:
+                    pass  # A warning will be raised in `init_distributed_environment`
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -1054,6 +1044,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
                 self.pp_rank,
             )
+
+        if dumper.may_enable:
+            dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
@@ -2437,6 +2430,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        if dumper.may_enable:
+            dumper.step()
 
         return output
 
