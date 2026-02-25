@@ -2434,13 +2434,20 @@ class ServerArgs:
                 "enable_kv_storage_optimization_mla is adjust tp False when tp_size=1"
             )
             self.enable_kv_storage_optimization_mla = False
-        if (
-            self.enable_kv_storage_optimization_mla
-            and self.disaggregation_mode == "null"
-        ):
-            raise ValueError(
-                "The argument enable_kv_storage_optimization_mla and self.disaggregation_mode(null) are mutuially exclusive"
-            )
+        if self.enable_kv_storage_optimization_mla:
+            if self.disaggregation_mode == "null":
+                raise ValueError(
+                    "The argument enable_kv_storage_optimization_mla and self.disaggregation_mode(null) are mutuially exclusive"
+                )
+            elif self.pp_size > 1:
+                raise ValueError(
+                    "The argument enable_kv_storage_optimization_mla and pp_size>1 are mutuially exclusive"
+                )
+            elif not self.use_mla_backend():
+                raise ValueError(
+                    "The argument enable_kv_storage_optimization_mla only supports page size 128 for MLA model architectures"
+                )
+
 
         if self.load_format == "remote_instance":
             if (
@@ -4959,11 +4966,11 @@ class ServerArgs:
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
-        # For optimization kv storage in pd-disaggregation (only prefill)
+        # For optimization kv storage in pd-disaggregation (The kvCache is split only in the prefill phase.)
         parser.add_argument(
             "--enable-kv-storage-optimization-mla",
             action="store_true",
-            help="Use optimization kv storage in pd-disaggregation (only prefill) with set --disable-radix-cache and --attention-backend ascend and MLA",
+            help="Use optimization kv storage in pd-disaggregation with set --disable-radix-cache and MLA",
         )
 
     @classmethod

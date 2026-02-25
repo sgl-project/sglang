@@ -315,8 +315,31 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_addr
             )
 
+        self.prefill_kv_split_size = 1
+        if get_global_server_args().enable_kv_storage_optimization_mla:
+            self.prefill_kv_split_size = self.prefill_attn_tp_size
+            # tp_rank in prefill needs send_kvCache to all tp_rank in tp_group in decode
+            self.required_dst_info_num = self.kv_mgr.attn_tp_size
+
+            # All tp_rank in tp_group need to be notified
+            self.target_tp_rank = (
+                self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
+            )
+            self.target_tp_ranks = [rank for rank in range(self.prefill_attn_tp_size)]
+
+            # The tp_rank in decode needs to receive the response of each tp_rank in prefill
+            # in the case of short sequences, some tp_rank may be empty and not send to kvcache
+            page_size = self.kv_mgr.kv_args.page_size
+            total_page_num = (
+                self.kv_mgr.kv_args.origin_input_len + page_size - 1
+            ) // page_size
+            base_page = total_page_num // self.prefill_kv_split_size
+            extra = total_page_num % self.prefill_kv_split_size
+            self.required_prefill_response_num = (
+                self.prefill_kv_split_size if base_page >= 1 else extra
+            )
         # Handling for PD with different TP sizes per DP rank
-        if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
+        elif self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
             )
@@ -369,27 +392,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.required_prefill_response_num = (
                     self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
-
-        self.prefill_kv_split_size = 1
-        if get_global_server_args().enable_kv_storage_optimization_mla:
-            self.prefill_kv_split_size = self.prefill_attn_tp_size
-            # tp_rank in prefill needs send_kvcache to all tp_rank in tp_group in decode
-            self.required_dst_info_num = self.kv_mgr.attn_tp_size
-
-            # All tp_rank in tp_group need to be notified
-            self.target_tp_ranks = [rank for rank in range(self.prefill_attn_tp_size)]
-
-            # The tp_rank in decode needs to receive the response of each tp_rank in prefill
-            # in the case of short sequences, some tp_rank may be empty and not send to kvcache
-            page_size = self.kv_mgr.kv_args.page_size
-            total_page_num = (
-                self.kv_mgr.kv_args.origin_input_len + page_size - 1
-            ) // page_size
-            base_page = total_page_num // self.prefill_kv_split_size
-            extra = total_page_num % self.prefill_kv_split_size
-            self.required_prefill_response_num = (
-                self.prefill_kv_split_size if base_page >= 1 else extra
-            )
 
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")

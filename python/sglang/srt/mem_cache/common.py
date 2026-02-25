@@ -128,10 +128,6 @@ def write_cache_indices(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
             )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
             if get_global_server_args().enable_kv_storage_optimization_mla:
                 seq_lens_tp = extend_lens_tp = tp_seq_len
                 req_to_token_pool.write(
@@ -361,7 +357,7 @@ def alloc_paged_token_slots_extend_for_mla_kvcache_split(
     split_kv_rank: int,
 ):
     bs = len(batch.reqs)
-    tp_seq_start = [0] * bs
+    tp_token_index_start_in_seq = [0] * bs
     page_size = tree_cache.token_to_kv_pool_allocator.page_size
 
     # token nums in this split_kv_rank
@@ -385,7 +381,7 @@ def alloc_paged_token_slots_extend_for_mla_kvcache_split(
         token_num_tensor[i] = max(token_num_tensor[i], 0)
         batch.reqs[i].tp_seq_len = token_num_tensor[i]
 
-        tp_seq_start[i] = start_page * page_size
+        tp_token_index_start_in_seq[i] = start_page * page_size
 
     # alloc out_loc use tokens length in split_kv_rank
     extend_num_token = sum(l.item() for l in token_num_tensor)
@@ -400,7 +396,7 @@ def alloc_paged_token_slots_extend_for_mla_kvcache_split(
     )
 
     # padding -1 to origin input length, skip this loc-1 when set_kv_buffer
-    len_sum = sum(l.item() for l in seq_lens)
+    len_sum = seq_lens_cpu.sum().item()
     padded_out_loc = torch.full(
         (len_sum,), -1, dtype=tp_out_loc.dtype, device=batch.device
     )
@@ -409,9 +405,9 @@ def alloc_paged_token_slots_extend_for_mla_kvcache_split(
     out_loc_start = 0
     for i in range(bs):
         flatten_seq_start = flatten_seq_start + (
-            seq_lens[i - 1].item() if i >= 1 else 0
+            seq_lens_cpu[i - 1].item() if i >= 1 else 0
         )
-        padded_out_loc_start = flatten_seq_start + tp_seq_start[i]
+        padded_out_loc_start = flatten_seq_start + tp_token_index_start_in_seq[i]
         padded_out_loc_end = padded_out_loc_start + token_num_tensor[i].item()
 
         out_loc_start = out_loc_start + (token_num_tensor[i - 1] if i >= 1 else 0)
