@@ -227,6 +227,12 @@ class MiniLoadBalancer:
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
     ):
+
+        if self.test_external_dp_routing:
+            logging.warning(
+                "--test-external-dp-routing is not supported with streaming"
+            )
+
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():

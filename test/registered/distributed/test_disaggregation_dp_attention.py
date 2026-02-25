@@ -129,9 +129,7 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
 @unittest.skip(
     "Skip this test until new testing logic in mini-lb has been updated in docker image."
 )
-class TestDisaggregationDPAttentionExternalRouting(
-    TestDisaggregationDPAttentionRoundRobin
-):
+class TestDisaggregationDPAttentionExternalRouting(TestDisaggregationDPAttention):
     """Test external DP rank assignment via mini-lb --test-external-dp-routing.
 
     NOTE: In PD disaggregation the response comes from the decode server,
