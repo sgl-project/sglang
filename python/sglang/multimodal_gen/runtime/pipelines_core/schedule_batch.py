@@ -281,7 +281,7 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
-        if self.is_warmup:
+        if self.is_warmup or self.suppress_logs:
             return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
@@ -312,8 +312,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        if not self.suppress_logs:
-            logger.debug(debug_str)
+        logger.debug(debug_str)
 
 
 @dataclass
