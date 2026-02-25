@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.metrics.collector import DPCooperationInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -23,6 +25,7 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 class MLPSyncBatchInfo:
     dp_size: int
     tp_size: int
+    cp_size: int
 
     num_tokens: int
     num_tokens_for_logprob: int
@@ -53,10 +56,24 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        return torch.tensor(
+            [
+                0,  # num_tokens
+                0,  # num_tokens_for_logprob
+                1,  # can_cuda_graph
+                0,  # is_extend_in_batch
+                1,  # local_can_run_tbo
+                ForwardMode.IDLE.value,  # local_forward_mode
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 6),
             dtype=torch.int64,
             device=device,
         )
@@ -66,6 +83,14 @@ class MLPSyncBatchInfo:
             local_info_tensor,
             group=group,
         )
+        if device == "cpu":
+            tp_active_ranks = get_tp_group().active_ranks_cpu
+        else:
+            tp_active_ranks = get_tp_group().active_ranks
+
+        # Set fallback values for inactive ranks
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
@@ -105,6 +130,7 @@ def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
     attn_tp_size: int,
+    attn_cp_size: int,
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
@@ -146,7 +172,10 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and disable_overlap_schedule:
+    if len(offload_tags) == 0 and (
+        disable_overlap_schedule
+        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    ):
         group = tp_group.device_group
         device = tp_group.device
     else:
@@ -158,6 +187,7 @@ def prepare_mlp_sync_batch_raw(
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
+        cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_cuda_graph=can_cuda_graph,
@@ -199,6 +229,7 @@ class SchedulerDPAttnMixin:
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -207,25 +238,21 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
-    def maybe_prepare_mlp_sync_batch_and_log_stats(
+    def maybe_prepare_mlp_sync_batch(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
-        log_stats: bool = True,
     ) -> Optional[ScheduleBatch]:
         """
-        Helper to pair log_prefill_stats with log_prefill_stats_late.
-        Should be called after get_new_batch_prefill() to ensure proper pairing.
+        Helper to prepare MLP sync batch for DP attention.
+        Should be called after get_new_batch_prefill().
 
         Args:
             batch: The batch to process
             need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
-            log_stats: Whether to call log_prefill_stats_late. Set to False for intermediate calls.
         """
         if need_sync if need_sync is not None else self.require_mlp_sync:
             batch = self.prepare_mlp_sync_batch(batch)
-        if log_stats:
-            self.log_prefill_stats_late(batch)
         return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:

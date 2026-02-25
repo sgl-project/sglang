@@ -1,5 +1,8 @@
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -40,6 +43,8 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     negative_prompt: Optional[str] = None
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
@@ -68,6 +73,7 @@ class VideoResponse(BaseModel):
 class VideoGenerationsRequest(BaseModel):
     prompt: str
     input_reference: Optional[str] = None
+    reference_url: Optional[str] = None
     model: Optional[str] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
@@ -77,13 +83,15 @@ class VideoGenerationsRequest(BaseModel):
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = 1.0
+    guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
@@ -95,3 +103,23 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class VertexGenerateReqInput(BaseReq):
+    instances: List[dict]
+    parameters: Optional[dict] = None

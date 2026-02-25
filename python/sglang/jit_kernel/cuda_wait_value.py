@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
 
-@lru_cache(maxsize=1)
+@cache_once
 def _jit_stream_wait_value_module() -> Module:
     return load_jit(
         "cuda_wait_value",
         cuda_files=["cuda_wait_value.cuh"],
-        cuda_wrappers=[("stream_wait_value", "stream_wait_value")],
+        cuda_wrappers=[("stream_wait_value", "cuda_wait_value")],
     )
 
 

@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
@@ -45,7 +45,11 @@ class TestCompressedTensorsLlama3FP8(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.45)
+        if is_hip():
+            # Lower threshold for AMD because FP8 dtype differs (fp8_fnuz)
+            self.assertGreaterEqual(metrics["accuracy"], 0.40)
+        else:
+            self.assertGreaterEqual(metrics["accuracy"], 0.45)
 
 
 if __name__ == "__main__":

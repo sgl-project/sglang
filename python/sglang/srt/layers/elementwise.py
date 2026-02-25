@@ -230,7 +230,7 @@ def fused_rmsnorm_kernel(
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     input_start = pid * hidden_dim
 
     offsets = tl.arange(0, BLOCK_SIZE)

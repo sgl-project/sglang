@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Keep consistent with other openai_server/basic unit tests.
 register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 try:
     from sglang.srt.entrypoints.openai.serving_rerank import (
