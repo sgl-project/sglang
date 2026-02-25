@@ -374,6 +374,9 @@ class DecodePreallocQueue:
         if prefill_info is None:
             return None
 
+        if prefill_info.dp_size == 1:
+            return 0
+
         if prefill_info.follow_bootstrap_room:
             return req.bootstrap_room % prefill_info.dp_size
 
