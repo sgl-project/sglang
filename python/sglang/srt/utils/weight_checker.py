@@ -22,7 +22,7 @@ class WeightChecker:
             self._snapshot()
         elif action == "reset_tensors":
             self._reset_tensors()
-        elif action == "reset_tensors_without_buffers":
+        elif action == "reset_params":
             self._reset_tensors(skip_buffers=True)
         elif action == "compare":
             self._compare()
