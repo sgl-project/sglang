@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import queue as queue_mod
 import signal
 import sys
 import time
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import psutil
 import setproctitle
 import torch
@@ -54,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    kv_to_page_indices,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -169,9 +172,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
@@ -981,7 +985,7 @@ class Scheduler(
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
                 if hasattr(kv_mgr, "start_kv_return_receiver"):
-                    kv_mgr.start_kv_return_receiver(self.tree_cache)
+                    kv_mgr.start_kv_return_receiver()
                 # Cache for ZMQ PUSH sockets to decode reply endpoints
                 self._kv_return_reply_sockets = {}
                 logger.info(
@@ -2494,15 +2498,8 @@ class Scheduler(
         and the decode worker skips the KV return — no data is lost,
         we just don't cache it.
         """
-        import queue as queue_mod
-
-        import numpy as np
-        import zmq
-
-        from sglang.srt.disaggregation.utils import kv_to_page_indices
-
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-        if not hasattr(kv_mgr, "kv_return_alloc_queue"):
+        if kv_mgr.kv_return_alloc_queue is None:
             return
 
         alloc_count = 0
@@ -2564,8 +2561,6 @@ class Scheduler(
         self, reply_ip: str, reply_port: int, request_id: str, payload: bytes
     ):
         """Send allocation reply back to the decode worker."""
-        import zmq
-
         endpoint = f"tcp://{reply_ip}:{reply_port}"
         # Reuse cached PUSH sockets per endpoint to avoid reconnection overhead
         if endpoint not in self._kv_return_reply_sockets:
@@ -2605,13 +2600,8 @@ class Scheduler(
         concatenate with the returned generated-token pages to form the
         complete value tensor for insert().
         """
-        import queue as queue_mod
-
-        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
-        if not hasattr(kv_mgr, "kv_return_insertion_queue"):
+        if kv_mgr.kv_return_insertion_queue is None:
             return
 
         insertion_count = 0
@@ -2638,7 +2628,6 @@ class Scheduler(
             # If the tree already covers the full sequence (prompt + gen),
             # this is a duplicate insertion (e.g., same prompt with temp=0).
             # Free the orphaned gen pages back to the pool instead of leaking them.
-            num_gen_tokens = len(dst_page_indices)
             if len(prefix_indices) >= len(token_ids):
                 logger.debug(
                     "KV return: tree already has full sequence (%d tokens), "

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -549,10 +550,8 @@ class SchedulerOutputProcessorMixin:
         IMPORTANT: This blocks until the RDMA transfer completes so that the
         source KV pages are not freed while the transfer is in flight.
         """
-        import numpy as np
-
         num_generated = len(req.output_ids)
-        logger.info(
+        logger.debug(
             "KV return: _try_kv_return called for req %s (num_generated=%d)",
             req.rid, num_generated,
         )
@@ -560,8 +559,8 @@ class SchedulerOutputProcessorMixin:
             return
 
         kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
-        if not hasattr(kv_mgr, "prefill_kv_return_info") or not kv_mgr.prefill_kv_return_info:
-            logger.info("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
+        if not kv_mgr.prefill_kv_return_info:
+            logger.debug("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
             return
 
         # Use the first registered prefill peer (multi-prefill lookup is future work)
@@ -611,6 +610,12 @@ class SchedulerOutputProcessorMixin:
             if alloc_reply_sock.poll(timeout=5000):  # 5s timeout
                 reply = alloc_reply_sock.recv_multipart()
                 reply_id = reply[0].decode("ascii")
+                if reply_id != request_id:
+                    logger.warning(
+                        "KV return: alloc reply mismatch: expected %s, got %s",
+                        request_id, reply_id,
+                    )
+                    return
                 page_data = reply[1]
                 if not page_data:
                     logger.debug(

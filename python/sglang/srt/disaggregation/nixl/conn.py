@@ -198,6 +198,8 @@ class NixlKVManager(CommonKVManager):
 
         # KV return notification state (prefill side)
         self._kv_return_receive_count = 0
+        self.kv_return_alloc_queue = None
+        self.kv_return_insertion_queue = None
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
@@ -551,7 +553,7 @@ class NixlKVManager(CommonKVManager):
         except Exception as e:
             logger.warning("Failed to send KV return metadata: %s", e)
 
-    def start_kv_return_receiver(self, tree_cache):
+    def start_kv_return_receiver(self):
         """Start receiving KV return metadata and allocation requests on the prefill side.
 
         Opens two ZMQ PULL sockets:
@@ -561,10 +563,6 @@ class NixlKVManager(CommonKVManager):
         Metadata is pushed to kv_return_insertion_queue.
         Allocation requests are pushed to kv_return_alloc_queue for the
         scheduler main thread to process (allocator is not thread-safe).
-
-        Args:
-            tree_cache: The prefill worker's RadixCache instance (unused here,
-                        kept for API compat; insertions happen on scheduler thread).
         """
         import zmq
 
