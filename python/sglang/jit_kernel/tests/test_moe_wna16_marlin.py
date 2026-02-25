@@ -2,21 +2,12 @@ import itertools
 
 import pytest
 import torch
+from sgl_kernel import moe_wna16_marlin_gemm as aot_moe_wna16_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
-
-try:
-    from sgl_kernel import moe_wna16_marlin_gemm as _aot_fn
-
-    def aot_moe_wna16_marlin_gemm(**kwargs):
-        return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(**kwargs)
-
-    AOT_AVAILABLE = True
-except (ImportError, AttributeError):
-    AOT_AVAILABLE = False
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -152,7 +143,7 @@ def _run_single_gemm_aot(
     is_k_full,
     use_atomic_add,
 ):
-    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    return aot_moe_wna16_marlin_gemm(
         a,
         c,
         qweight,
@@ -230,7 +221,9 @@ TEST_CASES = generate_test_cases()
         for c in TEST_CASES
     ],
 )
-def test_moe_wna16_marlin_gemm(m, n, k, e, topk, dtype, group_size, act_order, quant_type):
+def test_moe_wna16_marlin_gemm(
+    m, n, k, e, topk, dtype, group_size, act_order, quant_type
+):
     torch.manual_seed(0)
 
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -267,8 +260,7 @@ def test_moe_wna16_marlin_gemm(m, n, k, e, topk, dtype, group_size, act_order, q
     )
 
     use_atomic_add = (
-        dtype == torch.half
-        or torch.cuda.get_device_capability("cuda")[0] >= 9
+        dtype == torch.half or torch.cuda.get_device_capability("cuda")[0] >= 9
     )
 
     scalar_type = _get_scalar_type(4, has_zp)
@@ -303,33 +295,32 @@ def test_moe_wna16_marlin_gemm(m, n, k, e, topk, dtype, group_size, act_order, q
     torch.cuda.synchronize()
 
     # --- Check bitwise equality with AOT kernel ---
-    if AOT_AVAILABLE:
-        c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
-        c_aot = _run_single_gemm_aot(
-            a,
-            c_aot,
-            qweight1,
-            scales1,
-            zeros1,
-            g_idx1,
-            sort_indices1,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            scalar_type,
-            block_size_m,
-            topk,
-            m,
-            2 * n,
-            k,
-            False,
-            True,
-            use_atomic_add,
-        )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
+    c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
+    c_aot = _run_single_gemm_aot(
+        a,
+        c_aot,
+        qweight1,
+        scales1,
+        zeros1,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        scalar_type,
+        block_size_m,
+        topk,
+        m,
+        2 * n,
+        k,
+        False,
+        True,
+        use_atomic_add,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -70,26 +70,95 @@ def _make_inputs(size_m):
 
     c = torch.empty((size_m * TOPK, SIZE_N), dtype=DTYPE, device="cuda")
 
-    return a, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, workspace
-
-
-def _run_jit(a, c, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, workspace, size_m):
-    return jit_fn(
-        a, c, _qweight, None, _scales, None, None, None, None,
-        workspace, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights,
-        moe_block_size=BLOCK_SIZE_M, top_k=TOPK, mul_topk_weights=False, is_ep=False,
-        b_q_type=QUANT_TYPE, size_m=size_m, size_n=SIZE_N, size_k=SIZE_K,
-        is_k_full=True, use_atomic_add=True, use_fp32_reduce=True, is_zp_float=False,
+    return (
+        a,
+        c,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        workspace,
     )
 
 
-def _run_aot(a, c, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, workspace, size_m):
+def _run_jit(
+    a,
+    c,
+    topk_weights,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    workspace,
+    size_m,
+):
+    return jit_fn(
+        a,
+        c,
+        _qweight,
+        None,
+        _scales,
+        None,
+        None,
+        None,
+        None,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=BLOCK_SIZE_M,
+        top_k=TOPK,
+        mul_topk_weights=False,
+        is_ep=False,
+        b_q_type=QUANT_TYPE,
+        size_m=size_m,
+        size_n=SIZE_N,
+        size_k=SIZE_K,
+        is_k_full=True,
+        use_atomic_add=True,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+
+def _run_aot(
+    a,
+    c,
+    topk_weights,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_padded,
+    workspace,
+    size_m,
+):
     return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-        a, c, _qweight, None, _scales, None, None, None, None,
-        workspace, sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights,
-        moe_block_size=BLOCK_SIZE_M, top_k=TOPK, mul_topk_weights=False, is_ep=False,
-        b_q_type_id=QUANT_TYPE.id, size_m=size_m, size_n=SIZE_N, size_k=SIZE_K,
-        is_k_full=True, use_atomic_add=True, use_fp32_reduce=True, is_zp_float=False,
+        a,
+        c,
+        _qweight,
+        None,
+        _scales,
+        None,
+        None,
+        None,
+        None,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=BLOCK_SIZE_M,
+        top_k=TOPK,
+        mul_topk_weights=False,
+        is_ep=False,
+        b_q_type_id=QUANT_TYPE.id,
+        size_m=size_m,
+        size_n=SIZE_N,
+        size_k=SIZE_K,
+        is_k_full=True,
+        use_atomic_add=True,
+        use_fp32_reduce=True,
+        is_zp_float=False,
     )
 
 
@@ -98,11 +167,17 @@ def check_correctness():
         print("sgl_kernel AOT not available, skipping correctness check")
         return
     size_m = 16
-    a, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, ntp, workspace = _make_inputs(size_m)
+    a, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, ntp, workspace = (
+        _make_inputs(size_m)
+    )
     c_jit = c.clone()
     c_aot = c.clone()
-    _run_jit(a, c_jit, topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m)
-    _run_aot(a, c_aot, topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m)
+    _run_jit(
+        a, c_jit, topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m
+    )
+    _run_aot(
+        a, c_aot, topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m
+    )
     torch.testing.assert_close(c_jit, c_aot, rtol=1e-3, atol=1e-3)
     print("Correctness check passed (JIT vs AOT)")
 
@@ -136,14 +211,34 @@ else:
     )
 )
 def benchmark(size_m, provider):
-    a, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, ntp, workspace = _make_inputs(size_m)
+    a, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, ntp, workspace = (
+        _make_inputs(size_m)
+    )
 
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "jit":
-        fn = lambda: _run_jit(a, c.clone(), topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m)
+        fn = lambda: _run_jit(
+            a,
+            c.clone(),
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            ntp,
+            workspace,
+            size_m,
+        )
     elif provider == "aot":
-        fn = lambda: _run_aot(a, c.clone(), topk_weights, sorted_token_ids, expert_ids, ntp, workspace, size_m)
+        fn = lambda: _run_aot(
+            a,
+            c.clone(),
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            ntp,
+            workspace,
+            size_m,
+        )
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

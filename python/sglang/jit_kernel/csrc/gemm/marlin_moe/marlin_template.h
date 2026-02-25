@@ -19,11 +19,11 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+#include <sgl_kernel/scalar_type.hpp>
 
 #include "../marlin/dequant.h"
 #include "../marlin/marlin.cuh"
 #include "../marlin/marlin_dtypes.cuh"
-#include <sgl_kernel/scalar_type.hpp>
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
   static_assert(                                                                         \
@@ -36,21 +36,21 @@ using namespace device::marlin;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
 template <
-    typename scalar_t,                     // compute dtype, half or nv_float16
+    typename scalar_t,                   // compute dtype, half or nv_float16
     const host::ScalarTypeId w_type_id,  // weight ScalarType id
-    const int threads,                     // number of threads in a threadblock
-    const int thread_m_blocks,             // number of 16x16 blocks in the m
-                                           // dimension (batchsize) of the
-                                           // threadblock
-    const int thread_n_blocks,             // same for n dimension (output)
-    const int thread_k_blocks,             // same for k dimension (reduction)
-    const bool m_block_size_8,             // whether m_block_size == 8
-                                           // only works when thread_m_blocks == 1
-    const int stages,                      // number of stages for the async global->shared
-                                           // fetch pipeline
-    const int group_blocks,                // number of consecutive 16x16 blocks
-                                           // with a separate quantization scale
-    const bool is_zp_float                 // is zero point of float16 type?
+    const int threads,                   // number of threads in a threadblock
+    const int thread_m_blocks,           // number of 16x16 blocks in the m
+                                         // dimension (batchsize) of the
+                                         // threadblock
+    const int thread_n_blocks,           // same for n dimension (output)
+    const int thread_k_blocks,           // same for k dimension (reduction)
+    const bool m_block_size_8,           // whether m_block_size == 8
+                                         // only works when thread_m_blocks == 1
+    const int stages,                    // number of stages for the async global->shared
+                                         // fetch pipeline
+    const int group_blocks,              // number of consecutive 16x16 blocks
+                                         // with a separate quantization scale
+    const bool is_zp_float               // is zero point of float16 type?
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -276,22 +276,22 @@ __device__ inline void wait_negative_and_add(int* lock) {
 }
 
 template <
-    typename scalar_t,                     // compute dtype, half or nv_float16
+    typename scalar_t,                   // compute dtype, half or nv_float16
     const host::ScalarTypeId w_type_id,  // weight ScalarType id
     const host::ScalarTypeId s_type_id,  // weight scale ScalarType id
-    const int threads,                     // number of threads in a threadblock
-    const int thread_m_blocks,             // number of 16x16 blocks in the m
-                                           // dimension (batchsize) of the
-                                           // threadblock
-    const int thread_n_blocks,             // same for n dimension (output)
-    const int thread_k_blocks,             // same for k dimension (reduction)
-    const bool m_block_size_8,             // whether m_block_size == 8
-                                           // only works when thread_m_blocks == 1
-    const int stages,                      // number of stages for the async global->shared
-                                           // fetch pipeline
-    const int group_blocks,                // number of consecutive 16x16 blocks
-                                           // with a separate quantization scale
-    const bool is_zp_float                 // is zero point of float16 type?
+    const int threads,                   // number of threads in a threadblock
+    const int thread_m_blocks,           // number of 16x16 blocks in the m
+                                         // dimension (batchsize) of the
+                                         // threadblock
+    const int thread_n_blocks,           // same for n dimension (output)
+    const int thread_k_blocks,           // same for k dimension (reduction)
+    const bool m_block_size_8,           // whether m_block_size == 8
+                                         // only works when thread_m_blocks == 1
+    const int stages,                    // number of stages for the async global->shared
+                                         // fetch pipeline
+    const int group_blocks,              // number of consecutive 16x16 blocks
+                                         // with a separate quantization scale
+    const bool is_zp_float               // is zero point of float16 type?
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -356,8 +356,7 @@ __global__ void Marlin(
   constexpr bool is_int_type =
       w_type == host::kU4 || w_type == host::kU8 || w_type == host::kU4B8 || w_type == host::kU8B128;
   // see comments of dequant.h for more details
-  constexpr bool dequant_skip_flop = w_type == host::kFE4M3fn ||
-                                     w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
+  constexpr bool dequant_skip_flop = w_type == host::kFE4M3fn || w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 

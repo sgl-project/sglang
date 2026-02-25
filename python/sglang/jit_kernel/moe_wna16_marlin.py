@@ -107,9 +107,7 @@ def moe_wna16_marlin_gemm(
 
     # Allocate a_tmp for act_order column permutation
     if has_act_order:
-        a_tmp = torch.empty(
-            (size_m * top_k, size_k), dtype=a.dtype, device=device
-        )
+        a_tmp = torch.empty((size_m * top_k, size_k), dtype=a.dtype, device=device)
     else:
         a_tmp = torch.empty(0, dtype=a.dtype, device=device)
 
