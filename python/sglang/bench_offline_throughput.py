@@ -23,7 +23,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset, sample_random_requests
+from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine

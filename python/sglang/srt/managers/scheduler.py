@@ -1532,7 +1532,10 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if recv_req.bootstrap_room is None:
+                if (
+                    recv_req.bootstrap_room is None
+                    and self.transfer_backend != TransferBackend.FAKE
+                ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"

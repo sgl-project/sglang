@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -124,14 +125,35 @@ class ComponentLoader(ABC):
             if isinstance(component, nn.Module):
                 component = component.eval()
             current_gpu_mem = current_platform.get_available_gpu_memory()
+            model_size = get_memory_usage_of_component(component)
             consumed = gpu_mem_before_loading - current_gpu_mem
-            logger.info(
-                f"Loaded %s: %s ({source} version). consumed: %.2f GB, avail mem: %.2f GB",
-                component_name,
-                component.__class__.__name__,
-                consumed,
-                current_gpu_mem,
-            )
+
+            # detect component device
+            try:
+                component_device = str(next(component.parameters()).device)
+                is_on_gpu = "cuda" in component_device
+            except (StopIteration, AttributeError):
+                is_on_gpu = False
+                component_device = "unknown"
+
+            if is_on_gpu:
+                logger.info(
+                    f"Loaded %s: %s ({source} version). model size: %.2f GB, consumed GPU: %.2f GB, avail GPU mem: %.2f GB",
+                    component_name,
+                    component.__class__.__name__,
+                    model_size,
+                    consumed,
+                    current_gpu_mem,
+                )
+            else:
+                logger.info(
+                    f"Loaded %s: %s ({source} version). model size: %.2f GB, device: %s, avail GPU mem: %.2f GB",
+                    component_name,
+                    component.__class__.__name__,
+                    model_size,
+                    component_device,
+                    current_gpu_mem,
+                )
         return component, consumed
 
     def load_native(
