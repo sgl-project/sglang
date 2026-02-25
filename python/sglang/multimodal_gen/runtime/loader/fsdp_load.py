@@ -136,6 +136,14 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
+
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
+            quant_method.process_weights_after_loading(module)
+
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
@@ -252,6 +260,7 @@ def load_model_from_full_model_state_dict(
     sorted_param_names = sorted(custom_param_sd.keys())
 
     sharded_sd = {}
+    skipped_checkpoint_keys: list[str] = []
 
     # shard from loaded state_dict, custom_param_sd -> sharded_sd
     for target_param_name in sorted_param_names:
@@ -265,6 +274,7 @@ def load_model_from_full_model_state_dict(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
             else:
+                skipped_checkpoint_keys.append(target_param_name)
                 continue
 
         # use meta param dtype so quantized params (e.g. FP8) keep their dtype;
@@ -329,6 +339,22 @@ def load_model_from_full_model_state_dict(
         )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
+
+    if skipped_checkpoint_keys:
+        logger.warning(
+            "Checkpoint keys not loaded (no matching model parameter) %s",
+            (
+                skipped_checkpoint_keys[:20]
+                if len(skipped_checkpoint_keys) > 20
+                else skipped_checkpoint_keys
+            ),
+        )
+        if len(skipped_checkpoint_keys) > 20:
+            logger.warning(
+                "... and %d more skipped keys.",
+                len(skipped_checkpoint_keys) - 20,
+            )
+
     # parameters in nn.Module that doesn't exist in safetensor files
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:

@@ -179,5 +179,25 @@ def _list_safetensors_files(model_path: str) -> list[str]:
 
 BYTES_PER_GB = 1024**3
 
+
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
+
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}
