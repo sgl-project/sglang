@@ -546,21 +546,21 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
-def popen_with_error_check(command: list[str], allow_exit: bool = False):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def popen_with_error_check(command: list[str]):
+    process = subprocess.Popen(command, stdout=None, stderr=None)
 
     def _run_and_check():
-        stdout, stderr = process.communicate()
+        process.wait()
 
-        while process.poll() is None:
-            time.sleep(5)
+        if process.returncode == -9:
+            return
 
-        if not allow_exit or process.returncode != 0:
+        if process.returncode != 0:
             raise Exception(
-                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+                f"{shlex.join(command)} exited with code {process.returncode}"
             )
 
-    t = threading.Thread(target=_run_and_check)
+    t = threading.Thread(target=_run_and_check, daemon=True)
     t.start()
     return process
 
@@ -1041,6 +1041,7 @@ def get_benchmark_args(
     gsp_output_len=32,
     gsp_num_turns=1,
     header=None,
+    max_concurrency=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -1082,6 +1083,7 @@ def get_benchmark_args(
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
         header=header,
+        max_concurrency=max_concurrency,
     )
 
 
