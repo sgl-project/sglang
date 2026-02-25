@@ -632,6 +632,15 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
+                finish_reason = content["meta_info"]["finish_reason"]
+                # If the abort is from scheduler.
+                if finish_reason.get("type") == "abort":
+                    error = self.create_streaming_error_response(
+                        finish_reason.get("message", "Generation aborted."),
+                        finish_reason.get("status_code", 500),
+                    )
+                    yield f"data: {error}\n\n"
+
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
@@ -639,7 +648,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
