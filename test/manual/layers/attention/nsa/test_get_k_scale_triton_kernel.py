@@ -89,8 +89,13 @@ def get_k_and_s_triton():
     _, page_indice_batch_offset = buffer_indexer.shape
     max_seq_len = seq_len_tensor.max().item()
 
-    grid = (batch, max_seq_len)
-    BLOCK_SIZE = 128
+    BLOCK_SIZE = 256
+    BLOCK_SIZE_K = 128
+
+    num_token_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_k_threads = (index_head_dim + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
+    grid = (batch, num_token_blocks, num_k_threads)
     seq_num_pow2 = 1
     while seq_num_pow2 < batch:
         seq_num_pow2 *= 2
@@ -108,7 +113,8 @@ def get_k_and_s_triton():
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
-        BLOCK_SIZE_K=BLOCK_SIZE,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 
     torch_k_out, torch_s_out = golden_torch_gen(
@@ -144,7 +150,8 @@ def get_k_and_s_triton():
             index_head_dim=index_head_dim,
             s_offset_in_page=s_offset_in_page,
             page_indice_batch_offset=page_indice_batch_offset,
-            BLOCK_SIZE_K=BLOCK_SIZE,
+            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
         )
 
     torch.cuda.synchronize()
@@ -162,7 +169,8 @@ def get_k_and_s_triton():
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
-        BLOCK_SIZE_K=BLOCK_SIZE,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 
     end_time = time.perf_counter()

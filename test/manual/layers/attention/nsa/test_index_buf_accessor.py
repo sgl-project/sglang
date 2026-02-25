@@ -560,14 +560,23 @@ if __name__ == "__main__":
     print("✓ GetS tests passed\n")
 
     # Test GetKAndS
-    print("Testing GetKAndS...")
+    print("Testing GetKAndS SeqLen=256...")
     test_get_k_and_s = TestGetKAndS()
     test_get_k_and_s.test_get_k_and_s_correctness(
         num_pages=4, seq_len=256, page_size=64, index_head_dim=128
     )
     test_get_k_and_s.test_get_k_and_s_sequential_pages()
     test_get_k_and_s.test_get_k_and_s_partial_page()
-    print("✓ GetKAndS tests passed\n")
+    print("✓ GetKAndS SeqLen=256 tests passed\n")
+
+    print("Testing GetKAndS SeqLen=128K...")
+    test_get_k_and_s = TestGetKAndS()
+    test_get_k_and_s.test_get_k_and_s_correctness(
+        num_pages=2048, seq_len=131072, page_size=64, index_head_dim=128
+    )
+    test_get_k_and_s.test_get_k_and_s_sequential_pages()
+    test_get_k_and_s.test_get_k_and_s_partial_page()
+    print("✓ GetKAndS SeqLen=128K tests passed\n")
 
     # Test edge cases
     print("Testing edge cases...")
