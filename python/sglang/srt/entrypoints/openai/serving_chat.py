@@ -662,20 +662,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    finish_reasons[index] = finish_reason
-
-                # If the abort is from scheduler.
-                if finish_reason_type == "abort":
-                    code = finish_reason.get(
-                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                    )
-                    error = self.create_streaming_error_response(
-                        finish_reason.get("message", "Generation aborted."),
-                        code.name,
-                        code.value,
-                    )
-                    yield f"data: {error}\n\n"
-                    continue
+                    # If the abort is from scheduler.
+                    if finish_reason_type == "abort":
+                        code = finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        error = self.create_streaming_error_response(
+                            finish_reason.get("message", "Generation aborted."),
+                            code.name,
+                            code.value,
+                        )
+                        yield f"data: {error}\n\n"
+                        break
+                    else:
+                        finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):
