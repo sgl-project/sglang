@@ -2243,6 +2243,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
+        self.attention_mha_layers = []  # for deepseek
         self.moe_layers = []
         self.moe_fusions = []
         for layer in language_model.model.layers:
@@ -2252,7 +2253,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     attn_layer = layer.self_attn.attn
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
-                    attn_layer = layer.self_attn.attn_mqa
+                    # self.attention_layers.append(layer.self_attn.attn_mqa)
+                    self.attention_layers.append(layer.self_attn)
+                    # self.attention_mha_layers.append(self.self_attn.attn_mha)
+                    # self.indexer_layers.append(layer.self_attn.indexer)
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn

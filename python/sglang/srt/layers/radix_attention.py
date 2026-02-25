@@ -114,25 +114,25 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
-            else:
-                output = torch.empty_like(q)
-            unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
-            )
-            return output
-        else:
-            return forward_batch.attn_backend.forward(
-                q,
-                k,
-                v,
-                self,
-                forward_batch,
-                save_kv_cache,
-                **kwargs,
-            )
+        # if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        #     if self.qk_head_dim != self.v_head_dim:
+        #         output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+        #     else:
+        #         output = torch.empty_like(q)
+        #     unified_attention_with_output(
+        #         q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+        #     )
+        #     return output
+        # else:
+        return forward_batch.attn_backend.forward(
+            q,
+            k,
+            v,
+            self,
+            forward_batch,
+            save_kv_cache,
+            **kwargs,
+        )
 
 
 @register_custom_op(mutates_args=["output"])

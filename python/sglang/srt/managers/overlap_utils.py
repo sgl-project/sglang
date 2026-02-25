@@ -16,8 +16,7 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,

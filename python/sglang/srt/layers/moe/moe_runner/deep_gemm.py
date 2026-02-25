@@ -185,7 +185,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
+
+        if all_tokens != 0:
+            silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(

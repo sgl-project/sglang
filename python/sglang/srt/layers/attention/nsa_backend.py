@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -2062,7 +2063,11 @@ class NativeSparseAttnBackend(
                     total_kv_tokens = forward_batch.seq_lens_sum
                     total_q_tokens = forward_batch.extend_num_tokens
                     # Heuristic based on benchmarking flashmla_kv vs flashmla_sparse + dequantize_k_cache_paged
-                    if total_kv_tokens < total_q_tokens * 512:
+                    # piece wise cuda-graph do flashmla_sparse
+                    if (
+                        total_kv_tokens < total_q_tokens * 512
+                        or get_forward_context() is not None
+                    ):
                         self.nsa_prefill_impl = "flashmla_sparse"
                         return
                 self.nsa_prefill_impl = "flashmla_kv"

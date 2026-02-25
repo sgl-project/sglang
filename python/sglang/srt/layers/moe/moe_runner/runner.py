@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
+# import torch
+# from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerOutput
+
+
 logger = logging.getLogger(__name__)
 
 

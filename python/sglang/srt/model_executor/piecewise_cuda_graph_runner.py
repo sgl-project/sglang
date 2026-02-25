@@ -383,7 +383,9 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=torch.tensor(
+                    num_tokens, device=self.device, dtype=torch.int32
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -540,7 +542,9 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=torch.tensor(
+                    num_tokens, device=self.device, dtype=torch.int32
+                ),
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
