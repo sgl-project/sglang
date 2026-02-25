@@ -494,9 +494,9 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+        if req.routed_dp_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
 
