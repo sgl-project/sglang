@@ -1,655 +1,463 @@
-/*
- * Copyright (c) 2024 by FlashInfer team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
-#include <flashinfer/pos_enc.cuh>  // upstream
-#include <tvm/ffi/container/tensor.h>
+#include <dlpack/dlpack.h>
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-
-namespace flashinfer {
-
-namespace kv_buffer_saver {
-
-template <typename DType, typename IdType, uint32_t vec_size>
-__device__ __forceinline__ void prepare(
-    vec_t<float, vec_size>& v_vec,
-    IdType& kv_cache_offset,
-    DType* v,
-    IdType* kv_cache_loc,
-    uint32_t idx,
-    uint32_t tx,
-    uint32_t kv_head_idx,
-    size_t v_stride_n,
-    size_t v_stride_h) {
-  kv_cache_offset = kv_cache_loc[idx];
-
-  DType* v_ptr = v + get_elem_offset_impl(idx, kv_head_idx, 0, v_stride_n, v_stride_h);
-  v_vec.cast_load(v_ptr + tx * vec_size);
-}
-
-template <typename DType, typename IdType, uint32_t vec_size>
-__device__ __forceinline__ void save(
-    IdType& kv_cache_offset,
-    vec_t<float, vec_size>& k_vec,
-    vec_t<float, vec_size>& v_vec,
-    DType* k_buffer,
-    DType* v_buffer,
-    uint32_t idx,
-    uint32_t tx,
-    uint32_t kv_head_idx,
-    size_t k_buffer_stride_n,
-    size_t k_buffer_stride_h,
-    size_t v_buffer_stride_n,
-    size_t v_buffer_stride_h) {
-  DType* k_buffer_ptr =
-      k_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, k_buffer_stride_n, k_buffer_stride_h);
-  DType* v_buffer_ptr =
-      v_buffer + get_elem_offset_impl(kv_cache_offset, kv_head_idx, 0, v_buffer_stride_n, v_buffer_stride_h);
-  k_vec.cast_store(k_buffer_ptr + tx * vec_size);
-  v_vec.cast_store(v_buffer_ptr + tx * vec_size);
-}
-
-}  // namespace kv_buffer_saver
-
-template <
-    bool save_kv_cache,
-    bool interleave,
-    uint32_t head_dim,
-    uint32_t vec_size,
-    uint32_t bdx,
-    typename DType,
-    typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel(
-    DType* q,
-    DType* k,
-    DType* v,
-    DType* q_rope,
-    DType* k_rope,
-    DType* k_buffer,
-    DType* v_buffer,
-    float* __restrict__ cos_sin_cache,
-    IdType* __restrict__ pos_ids,
-    uint32_t nnz,
-    uint32_t num_qo_heads,
-    uint32_t num_kv_heads,
-    uint32_t rotary_dim,
-    size_t q_stride_n,
-    size_t q_stride_h,
-    size_t k_stride_n,
-    size_t k_stride_h,
-    size_t v_stride_n,
-    size_t v_stride_h,
-    size_t q_rope_stride_n,
-    size_t q_rope_stride_h,
-    size_t k_rope_stride_n,
-    size_t k_rope_stride_h,
-    size_t k_buffer_stride_n,
-    size_t k_buffer_stride_h,
-    size_t v_buffer_stride_n,
-    size_t v_buffer_stride_h,
-    IdType* __restrict__ kv_cache_loc) {
-  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t by = blockIdx.y;
-  const uint32_t bdy = blockDim.y;
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-
-  vec_t<float, vec_size> cos, sin;
-  if (bx * bdy + ty < nnz) {
-    const uint32_t idx = bx * bdy + ty;
-    const IdType pos = pos_ids[idx];
-
-    const int half_rotary_dim = rotary_dim / 2;
-
-    // 1. if interleave:
-    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
-    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
-    // 2. if not interleave
-    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
-    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if (tx * vec_size < rotary_dim) {
-      int sin_offset = rotary_dim / 2;
-      int vec_idx;
-      if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
-      } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
-      }
-      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
-    }
-
-    if (by < num_qo_heads) {
-      uint32_t qo_head_idx = by;
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr = q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    } else {
-      uint32_t kv_head_idx = by - num_qo_heads;
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-
-      DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-
-      vec_t<float, vec_size> v_vec;
-      IdType kv_cache_offset;
-      if constexpr (save_kv_cache) {
-        kv_buffer_saver::prepare<DType, IdType, vec_size>(
-            v_vec, kv_cache_offset, v, kv_cache_loc, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
-      }
-
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
-
-      if constexpr (save_kv_cache) {
-        kv_buffer_saver::save<DType, IdType, vec_size>(
-            kv_cache_offset,
-            k_vec,
-            v_vec,
-            k_buffer,
-            v_buffer,
-            idx,
-            tx,
-            kv_head_idx,
-            k_buffer_stride_n,
-            k_buffer_stride_h,
-            v_buffer_stride_n,
-            v_buffer_stride_h);
-      }
-    }
-  }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
-}
-
-template <
-    bool save_kv_cache,
-    bool interleave,
-    uint32_t head_dim,
-    uint32_t vec_size,
-    uint32_t bdx,
-    typename DType,
-    typename IdType>
-__global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
-    DType* q,
-    DType* k,
-    DType* v,
-    DType* q_rope,
-    DType* k_rope,
-    DType* k_buffer,
-    DType* v_buffer,
-    float* __restrict__ cos_sin_cache,
-    IdType* __restrict__ pos_ids,
-    uint32_t nnz,
-    uint32_t num_qo_heads,
-    uint32_t num_kv_heads,
-    uint32_t rotary_dim,
-    size_t q_stride_n,
-    size_t q_stride_h,
-    size_t k_stride_n,
-    size_t k_stride_h,
-    size_t v_stride_n,
-    size_t v_stride_h,
-    size_t q_rope_stride_n,
-    size_t q_rope_stride_h,
-    size_t k_rope_stride_n,
-    size_t k_rope_stride_h,
-    size_t k_buffer_stride_n,
-    size_t k_buffer_stride_h,
-    size_t v_buffer_stride_n,
-    size_t v_buffer_stride_h,
-    IdType* __restrict__ kv_cache_loc) {
-  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
-  const uint32_t bdy = blockDim.y;
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-
-  vec_t<float, vec_size> cos, sin;
-  if (bx * bdy + ty < nnz) {
-    const uint32_t idx = bx * bdy + ty;
-    const IdType pos = pos_ids[idx];
-    const int half_rotary_dim = rotary_dim / 2;
-
-    // 1. if interleave:
-    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
-    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
-    // 2. if not interleave
-    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
-    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if (tx * vec_size < rotary_dim) {
-      int sin_offset = rotary_dim / 2;
-      int vec_idx;
-      if constexpr (interleave) {
-        vec_idx = (tx * vec_size) / 2;  // Force integer division
-      } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
-      }
-      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
-    }
-
-    // not to unroll the loop, because num head might be large and might lead to worse performance
-#pragma unroll 1
-    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr = q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    }
-
-#pragma unroll 1
-    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-
-      DType* k_rope_ptr = k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-
-      vec_t<float, vec_size> v_vec;
-      IdType kv_cache_offset;
-      if constexpr (save_kv_cache) {
-        kv_buffer_saver::prepare<DType, IdType, vec_size>(
-            v_vec, kv_cache_offset, v, kv_cache_loc, idx, tx, kv_head_idx, v_stride_n, v_stride_h);
-      }
-
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
-
-      if constexpr (save_kv_cache) {
-        kv_buffer_saver::save<DType, IdType, vec_size>(
-            kv_cache_offset,
-            k_vec,
-            v_vec,
-            k_buffer,
-            v_buffer,
-            idx,
-            tx,
-            kv_head_idx,
-            k_buffer_stride_n,
-            k_buffer_stride_h,
-            v_buffer_stride_n,
-            v_buffer_stride_h);
-      }
-    }
-  }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
-}
-
-#define DISPATCH_SAVE_KV_CACHE(save_kv_cache, SAVE_KV_CACHE, ...) \
-  if (save_kv_cache) {                                            \
-    const bool SAVE_KV_CACHE = true;                              \
-    __VA_ARGS__                                                   \
-  } else {                                                        \
-    const bool SAVE_KV_CACHE = false;                             \
-    __VA_ARGS__                                                   \
-  }
-
-template <typename DType, typename IdType>
-cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
-    DType* q,
-    DType* k,
-    DType* v,
-    DType* q_rope,
-    DType* k_rope,
-    DType* k_buffer,
-    DType* v_buffer,
-    float* cos_sin_cache,
-    IdType* pos_ids,
-    uint32_t nnz,
-    uint32_t num_qo_heads,
-    uint32_t num_kv_heads,
-    uint32_t rotary_dim,
-    uint32_t head_dim,
-    size_t q_stride_n,
-    size_t q_stride_h,
-    size_t k_stride_n,
-    size_t k_stride_h,
-    size_t v_stride_n,
-    size_t v_stride_h,
-    size_t q_rope_stride_n,
-    size_t q_rope_stride_h,
-    size_t k_rope_stride_n,
-    size_t k_rope_stride_h,
-    size_t k_buffer_stride_n,
-    size_t k_buffer_stride_h,
-    size_t v_buffer_stride_n,
-    size_t v_buffer_stride_h,
-    IdType* kv_cache_loc,
-    bool interleave,
-    bool save_kv_cache,
-    bool enable_pdl,
-    cudaStream_t stream = nullptr) {
-  int dev_id = 0;
-  int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-#define LAUNCH_KERNEL_RAW(kernel_name)                                \
-  do {                                                                \
-    cudaLaunchConfig_t config = {};                                   \
-    config.gridDim = nblks;                                           \
-    config.blockDim = nthrs;                                          \
-    config.dynamicSmemBytes = 0;                                      \
-    config.stream = stream;                                           \
-    cudaLaunchAttribute attrs[1] = {};                                \
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl; \
-    config.numAttrs = 1;                                              \
-    config.attrs = attrs;                                             \
-                                                                      \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                          \
-        &config,                                                      \
-        kernel_name,                                                  \
-        q,                                                            \
-        k,                                                            \
-        v,                                                            \
-        q_rope,                                                       \
-        k_rope,                                                       \
-        k_buffer,                                                     \
-        v_buffer,                                                     \
-        cos_sin_cache,                                                \
-        pos_ids,                                                      \
-        nnz,                                                          \
-        num_qo_heads,                                                 \
-        num_kv_heads,                                                 \
-        rotary_dim,                                                   \
-        q_stride_n,                                                   \
-        q_stride_h,                                                   \
-        k_stride_n,                                                   \
-        k_stride_h,                                                   \
-        v_stride_n,                                                   \
-        v_stride_h,                                                   \
-        q_rope_stride_n,                                              \
-        q_rope_stride_h,                                              \
-        k_rope_stride_n,                                              \
-        k_rope_stride_h,                                              \
-        k_buffer_stride_n,                                            \
-        k_buffer_stride_h,                                            \
-        v_buffer_stride_n,                                            \
-        v_buffer_stride_h,                                            \
-        kv_cache_loc));                                               \
-  } while (0)
-
-  DISPATCH_SAVE_KV_CACHE(save_kv_cache, SAVE_KV_CACHE, {
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        // operate on 16 Bytes at a time
-        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
-        // how many threads needed per head_dim
-        constexpr uint32_t bdx = HEAD_DIM / vec_size;
-        // how many threads needed per block
-        uint32_t num_threads = std::max(128U, bdx);
-        // how many tokens can we process in a block
-        uint32_t bdy = num_threads / bdx;
-        // how many blocks needed to process all tokens
-        uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-
-        auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel<
-            SAVE_KV_CACHE,
-            INTERLEAVE,
-            HEAD_DIM,
-            vec_size,
-            bdx,
-            DType,
-            IdType>;
-
-        int num_blocks_per_sm_0 = 0;
-        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
-        uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
-
-        if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
-          dim3 nblks(nblks_x);
-          dim3 nthrs(bdx, bdy);
-          LAUNCH_KERNEL_RAW(kernel_0);
-        } else {
-          dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
-          dim3 nthrs(bdx, bdy);
-          auto kernel_1 = BatchQKApplyRotaryPosIdsCosSinCacheEnhancedHeadParallelismKernel<
-              SAVE_KV_CACHE,
-              INTERLEAVE,
-              HEAD_DIM,
-              vec_size,
-              bdx,
-              DType,
-              IdType>;
-          LAUNCH_KERNEL_RAW(kernel_1);
-        }
-      });
-    });
-  });
-#undef LAUNCH_KERNEL_RAW
-
-  return cudaSuccess;
-}
-
-}  // namespace flashinfer
+#include <numeric>
 
 namespace {
 
-#define DISPATCH_TVM_DTYPE_TO_CTYPE(tvm_dtype_code, tvm_dtype_bits, c_type, ...)                      \
-  [&]() -> bool {                                                                                     \
-    if (tvm_dtype_code == kDLFloat && tvm_dtype_bits == 32) {                                         \
-      using c_type = float;                                                                           \
-      return __VA_ARGS__();                                                                           \
-    }                                                                                                 \
-    if (tvm_dtype_code == kDLFloat && tvm_dtype_bits == 16) {                                         \
-      using c_type = half;                                                                            \
-      return __VA_ARGS__();                                                                           \
-    }                                                                                                 \
-    if (tvm_dtype_code == kDLBfloat && tvm_dtype_bits == 16) {                                        \
-      using c_type = nv_bfloat16;                                                                     \
-      return __VA_ARGS__();                                                                           \
-    }                                                                                                 \
-    RuntimeCheck(false, "Unsupported data type. Only float32, float16, and bfloat16 are supported."); \
-    return false;                                                                                     \
-  }()
+struct FusedRopeParams {
+  void* __restrict__ q_ptr;
+  void* __restrict__ k_ptr;  // NOTE: this k is pre-offset in host code to reduce computation in kernel
+  const void* __restrict__ cos_sin_cache_ptr;
+  const void* __restrict__ positions;
+  int64_t q_stride_bytes;
+  int64_t k_stride_bytes;
+  int64_t head_stride_bytes;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t num_tokens;
+};
 
-inline void check_cuda_contiguous(tvm::ffi::TensorView x) {
-  using namespace host;
+struct FusedRopeStoreParams {
+  FusedRopeParams base_params;
+  void* v_ptr;
+  void* __restrict__ k_cache;
+  void* __restrict__ v_cache;
+  const void* __restrict__ out_loc;
+  int64_t v_stride_bytes;
+  int64_t cache_stride_bytes;
+};
 
-  RuntimeCheck(x.device().device_type == kDLCUDA);
-  RuntimeCheck(x.is_contiguous());
+constexpr uint32_t kBlockSize = 128;
+
+[[maybe_unused]]
+constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
+  uint32_t power = 1;
+  while (power * factor < target)
+    power *= 2;
+  return power;
 }
 
-struct ApplyRopePosIdsCosSinCacheKernel {
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
+__global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
+  using namespace device;
+
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
+  constexpr int64_t kVecSize = next_pow2(kRopeDim, (2 * kWorkThreads * (1 + kIsNeox)));
+  using DType2 = packed_t<DType>;
+  using InputStorage = AlignedVector<DType2, kVecSize>;
+  constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
+  constexpr uint32_t kLaneCount = kRopeDim / kDimPerThread;
+  static_assert(kRopeDim % kDimPerThread == 0 && kLaneCount <= kWorkThreads);
+
+  const auto &[
+    q, k, cos_sin_cache_ptr, positions, // pointers
+    q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
+    num_qo_heads, num_kv_heads, num_tokens // dimensions
+  ] = params;
+
+  const auto num_blks = gridDim.x;
+  constexpr auto kWorkersPerBlock = kBlockSize / kWorkThreads;
+  const auto num_workers = num_blks * kWorkersPerBlock;
+  const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
+  const auto num_works = num_q_and_k_heads * num_tokens;
+  const auto start_worker_id = (blockIdx.x * kBlockSize + threadIdx.x) / kWorkThreads;
+  const auto cos_cache_ptr = cos_sin_cache_ptr;
+  const auto sin_cache_ptr = pointer::offset(cos_sin_cache_ptr, kCosSinStrideBytes / 2);
+
+  uint32_t lane_id = threadIdx.x % kWorkThreads;
+  if constexpr (kLaneCount < kWorkThreads) {
+    if (lane_id >= kLaneCount) return;
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+
+  for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
+    const int64_t token_id = idx / num_q_and_k_heads;
+    const int64_t head_id = idx % num_q_and_k_heads;
+    const auto pos = static_cast<const IdType*>(positions)[token_id];
+    const auto load_q = head_id < num_qo_heads;
+    const auto input_ = load_q ? pointer::offset(q, token_id * q_stride_bytes)  //
+                               : pointer::offset(k, token_id * k_stride_bytes);
+    const auto input = pointer::offset(input_, head_id * head_stride_bytes);
+    const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
+    const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
+    if constexpr (kIsNeox) {
+      using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
+      const auto input_x = input;
+      const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
+      auto input_vec_x = load_as<InputStorage>(input_x, lane_id);
+      auto input_vec_y = load_as<InputStorage>(input_y, lane_id);
+      const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
+      const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+      for (int64_t j = 0; j < kVecSize; ++j) {
+        const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
+        const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
+        const auto [cos_0, cos_1] = cos_pair[j];
+        const auto [sin_0, sin_1] = sin_pair[j];
+        const auto out_x0 = x0 * cos_0 - y0 * sin_0;
+        const auto out_y0 = x0 * sin_0 + y0 * cos_0;
+        const auto out_x1 = x1 * cos_1 - y1 * sin_1;
+        const auto out_y1 = x1 * sin_1 + y1 * cos_1;
+        input_vec_x[j] = cast<DType2, fp32x2_t>({out_x0, out_x1});
+        input_vec_y[j] = cast<DType2, fp32x2_t>({out_y0, out_y1});
+      }
+      store_as<InputStorage>(input_x, input_vec_x, lane_id);
+      store_as<InputStorage>(input_y, input_vec_y, lane_id);
+    } else {
+      using CacheStorage = AlignedVector<float, kVecSize>;
+      auto input_vec = load_as<InputStorage>(input, lane_id);
+      const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
+      const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+      for (int64_t j = 0; j < kVecSize; ++j) {
+        const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+        const auto cos = cos_vec[j];
+        const auto sin = sin_vec[j];
+        const auto out_x = x * cos - y * sin;
+        const auto out_y = x * sin + y * cos;
+        input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
+      }
+      store_as<InputStorage>(input, input_vec, lane_id);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
+__global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
+  using namespace device;
+
+  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
+  constexpr int64_t kVecSize = kRopeDim / (2 * kWorkThreads * (1 + kIsNeox));
+  using DType2 = packed_t<DType>;
+  using InputStorage = AlignedVector<DType2, kVecSize>;
+  constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
+  static_assert(kRopeDim == kDimPerThread * kWorkThreads);
+
+  const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
+  const auto &[
+    q, k, cos_sin_cache_ptr, positions, // pointers
+    q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
+    num_qo_heads, num_kv_heads, num_tokens // dimensions
+  ] = base_params;
+
+  const auto num_blks = gridDim.x;
+  constexpr auto kWorkersPerBlock = kBlockSize / kWorkThreads;
+  const auto num_workers = num_blks * kWorkersPerBlock;
+  const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
+  const auto num_works = num_q_and_k_heads * num_tokens;
+  const auto num_extra_works = num_kv_heads * num_tokens;  // rope works + v store works
+  const auto start_worker_id = (blockIdx.x * kBlockSize + threadIdx.x) / kWorkThreads;
+  const auto lane_id = threadIdx.x % kWorkThreads;
+  const auto cos_cache_ptr = cos_sin_cache_ptr;
+  const auto sin_cache_ptr = pointer::offset(cos_sin_cache_ptr, kCosSinStrideBytes / 2);
+
+  auto idx = start_worker_id;
+
+  PDLWaitPrimary<kUsePDL>();
+  // in this case, head_dim = rope_dim must be true
+  __builtin_assume(head_stride_bytes == kRopeDim * sizeof(DType));
+
+  for (; idx < num_works; idx += num_workers) {
+    const int64_t token_id = idx / num_q_and_k_heads;
+    const int64_t head_id = idx % num_q_and_k_heads;
+    const auto pos = static_cast<const IdType*>(positions)[token_id];
+    const auto loc = static_cast<const IdType*>(out_loc)[token_id];
+    const auto load_q = head_id < num_qo_heads;
+    const auto input_ = load_q ? pointer::offset(q, token_id * q_stride_bytes)  //
+                               : pointer::offset(k, token_id * k_stride_bytes);
+    const auto input = pointer::offset(input_, head_id * head_stride_bytes);
+    const auto cos_ptr = pointer::offset(cos_cache_ptr, pos * kCosSinStrideBytes);
+    const auto sin_ptr = pointer::offset(sin_cache_ptr, pos * kCosSinStrideBytes);
+    if constexpr (kIsNeox) {
+      using CacheStorage = AlignedVector<fp32x2_t, kVecSize>;
+      const auto input_x = input;
+      const auto input_y = pointer::offset(input, (kRopeDim / 2) * sizeof(DType));
+      auto input_vec_x = load_as<InputStorage>(input_x, lane_id);
+      auto input_vec_y = load_as<InputStorage>(input_y, lane_id);
+      const auto cos_pair = load_as<CacheStorage>(cos_ptr, lane_id);
+      const auto sin_pair = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+      for (int64_t j = 0; j < kVecSize; ++j) {
+        const auto [x0, x1] = cast<fp32x2_t>(input_vec_x[j]);
+        const auto [y0, y1] = cast<fp32x2_t>(input_vec_y[j]);
+        const auto [cos_0, cos_1] = cos_pair[j];
+        const auto [sin_0, sin_1] = sin_pair[j];
+        const auto out_x0 = x0 * cos_0 - y0 * sin_0;
+        const auto out_y0 = x0 * sin_0 + y0 * cos_0;
+        const auto out_x1 = x1 * cos_1 - y1 * sin_1;
+        const auto out_y1 = x1 * sin_1 + y1 * cos_1;
+        input_vec_x[j] = cast<DType2, fp32x2_t>({out_x0, out_x1});
+        input_vec_y[j] = cast<DType2, fp32x2_t>({out_y0, out_y1});
+      }
+      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+      const auto output_x = load_q ? input : k_out;
+      store_as<InputStorage>(output_x, input_vec_x, lane_id);
+      const auto output_y = pointer::offset(output_x, (kRopeDim / 2) * sizeof(DType));
+      store_as<InputStorage>(output_y, input_vec_y, lane_id);
+    } else {
+      using CacheStorage = AlignedVector<float, kVecSize>;
+      auto input_vec = load_as<InputStorage>(input, lane_id);
+      const auto cos_vec = load_as<CacheStorage>(cos_ptr, lane_id);
+      const auto sin_vec = load_as<CacheStorage>(sin_ptr, lane_id);
+#pragma unroll
+      for (int64_t j = 0; j < kVecSize; ++j) {
+        const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+        const auto cos = cos_vec[j];
+        const auto sin = sin_vec[j];
+        const auto out_x = x * cos - y * sin;
+        const auto out_y = x * sin + y * cos;
+        input_vec[j] = cast<DType2, fp32x2_t>({out_x, out_y});
+      }
+      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+      const auto output = load_q ? input : k_out;
+      store_as<InputStorage>(output, input_vec, lane_id);
+    }
+  }
+
+  __syncwarp();  // to avoid warp divergence
+  idx -= num_works;
+  for (; idx < num_extra_works; idx += num_workers) {
+    using VStorage = AlignedVector<DType, kRopeDim / kWorkThreads>;
+    const int64_t token_id = idx / num_kv_heads;
+    const int64_t head_id = idx % num_kv_heads;
+    const auto loc = static_cast<const IdType*>(out_loc)[token_id];
+    const auto input = pointer::offset(v_ptr, token_id * v_stride_bytes, head_id * head_stride_bytes);
+    const auto input_vec = load_as<VStorage>(input, lane_id);
+    const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+    store_as<VStorage>(output, input_vec, lane_id);
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType>
+struct FusedRopeKernel {
+  static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
+  static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
+  static constexpr bool kSupportFused = kWorkThreads * kDimPerThread == kRopeDim;
+  static_assert(kRopeDim % kDimPerThread == 0);
+  static_assert(kBlockSize % kWorkThreads == 0);
+
+  template <typename IdType>
+  static constexpr auto _kernel_0 = fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
+  template <typename IdType>
+  static constexpr auto _kernel_1 = fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, IdType, kWorkThreads>;
+
+  static auto get_num_sm(DLDevice device) {
+    static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
+    return kNumSM;
+  }
+
   static void
-  run(tvm::ffi::TensorView q,  // [nnz, H_Q, D]
-      tvm::ffi::TensorView k,  // [nnz, H_K, D]
-      tvm::ffi::TensorView q_rope,
-      tvm::ffi::TensorView k_rope,
-      tvm::ffi::TensorView cos_sin_cache,  // [max_seq_len, R]
-      tvm::ffi::TensorView pos_ids,
-      bool interleave,
-      bool enable_pdl,
-      tvm::ffi::Optional<tvm::ffi::TensorView> v,            // null or [nnz, H_V, D]
-      tvm::ffi::Optional<tvm::ffi::TensorView> k_buffer,     // null or [nnz, H_K, D]
-      tvm::ffi::Optional<tvm::ffi::TensorView> v_buffer,     // null or [nnz, H_V, D]
-      tvm::ffi::Optional<tvm::ffi::TensorView> kv_cache_loc  // null or [n]
-  ) {
+  run(const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions) {
+    using namespace host;
+    auto N = SymbolicSize{"num_tokens"};
+    auto Q = SymbolicSize{"num_qo_heads"};
+    auto K = SymbolicSize{"num_kv_heads"};
+    auto D = SymbolicSize{"rope_dim"};
+    auto Dq = SymbolicSize{"q_stride"};
+    auto Dk = SymbolicSize{"k_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    D.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
+    TensorMatcher({N, Q, D})  // q input
+        .with_strides({Dq, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(q);
+    TensorMatcher({N, K, D})  // k input
+        .with_strides({Dk, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(k);
+    TensorMatcher({-1, D})  // cos_sin_cache
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(cos_sin_cache);
+    TensorMatcher({N})  // positions
+        .with_dtype<int32_t, int64_t>(id_type)
+        .with_device(device)
+        .verify(positions);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
+    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
+    const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
+
+    // NOTE: we offset the k here to reduce computation cost in the kernel
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    const auto params = FusedRopeParams{
+        .q_ptr = q.data_ptr(),
+        .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+        .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+        .positions = positions.data_ptr(),
+        .q_stride_bytes = q_stride_bytes,
+        .k_stride_bytes = k_stride_bytes,
+        .head_stride_bytes = head_stride_bytes,
+        .num_qo_heads = num_qo_heads,
+        .num_kv_heads = num_kv_heads,
+        .num_tokens = num_tokens,
+    };
+
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto kernel = is_int32 ? _kernel_0<int32_t> : _kernel_0<int64_t>;
+    const uint32_t kNumSM = get_num_sm(device.unwrap());
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(_kernel_0<int32_t>, kBlockSize),
+        runtime::get_blocks_per_sm(_kernel_0<int64_t>, kBlockSize),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+    const auto needed_blocks = div_ceil(num_works, (kBlockSize / kWorkThreads));
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void run_fused(
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView v,
+      const tvm::ffi::TensorView k_cache,
+      const tvm::ffi::TensorView v_cache,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc) {
+    if constexpr (kSupportFused) {
+      return _run_fused_impl(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc);
+    } else {
+      host::Panic("Fused rope + store is not supported for rope_dim ", kRopeDim);
+    }
+  }
+
+  static void _run_fused_impl(
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView v,
+      const tvm::ffi::TensorView k_cache,
+      const tvm::ffi::TensorView v_cache,
+      const tvm::ffi::TensorView cos_sin_cache,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc) {
     using namespace host;
 
-    RuntimeCheck(q.strides().back() == 1);
-    RuntimeCheck(k.strides().back() == 1);
+    auto N = SymbolicSize{"num_tokens"};
+    auto Q = SymbolicSize{"num_qo_heads"};
+    auto K = SymbolicSize{"num_kv_heads"};
+    auto D = SymbolicSize{"rope_dim"};
+    auto R = SymbolicSize{"row_size"};
+    auto Dq = SymbolicSize{"q_stride"};
+    auto Dk = SymbolicSize{"k_stride"};
+    auto Dv = SymbolicSize{"v_stride"};
+    auto Dd = SymbolicSize{"head_stride"};
+    auto Dc = SymbolicSize{"cache_stride"};
+    auto device = SymbolicDevice{};
+    auto id_type = SymbolicDType{};
+    D.set_value(kRopeDim);
+    device.set_options<kDLCUDA>();
 
-    const bool save_kv_cache = v.has_value();
-    if (save_kv_cache) {
-      RuntimeCheck(v.has_value());
-      RuntimeCheck(k_buffer.has_value());
-      RuntimeCheck(v_buffer.has_value());
-      RuntimeCheck(kv_cache_loc.has_value());
-      // CHECK_LAST_DIM_CONTIGUOUS
-      RuntimeCheck(v.value().strides().back() == 1);
-      RuntimeCheck(k_buffer.value().strides().back() == 1);
-      RuntimeCheck(v_buffer.value().strides().back() == 1);
-      // CHECK_DIM
-      RuntimeCheck(k_buffer.value().ndim() == 3);
-      RuntimeCheck(v_buffer.value().ndim() == 3);
-      RuntimeCheck(v.value().ndim() == 3);
-      RuntimeCheck(kv_cache_loc.value().ndim() == 1);
+    TensorMatcher({N, Q, D})  // q input
+        .with_strides({Dq, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(q);
+    TensorMatcher({N, K, D})  // k input
+        .with_strides({Dk, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(k);
+    TensorMatcher({N, K, D})  // v input
+        .with_strides({Dv, Dd, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(v);
+    TensorMatcher({-1, D})  // cos_sin_cache
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(cos_sin_cache);
+    TensorMatcher({N})  // positions, out_loc
+        .with_dtype<int32_t, int64_t>(id_type)
+        .with_device(device)
+        .verify(positions)
+        .verify(out_loc);
+    TensorMatcher({-1, R})  // k_cache
+        .with_strides({Dc, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(k_cache)
+        .verify(v_cache);
 
-      check_cuda_contiguous(kv_cache_loc.value());
-    }
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
+    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+    const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
+    const auto k_stride_bytes = static_cast<int64_t>(Dk.unwrap() * sizeof(DType));
+    const auto head_stride = Dd.unwrap();
+    const auto row_dim = R.unwrap();
+    const auto head_stride_bytes = static_cast<int64_t>(Dd.unwrap() * sizeof(DType));
 
-    size_t k_buffer_stride_n = save_kv_cache ? k_buffer.value().stride(0) : 0;
-    size_t k_buffer_stride_h = save_kv_cache ? k_buffer.value().stride(1) : 0;
-    size_t v_buffer_stride_n = save_kv_cache ? v_buffer.value().stride(0) : 0;
-    size_t v_buffer_stride_h = save_kv_cache ? v_buffer.value().stride(1) : 0;
-    size_t v_stride_n = save_kv_cache ? v.value().stride(0) : 0;
-    size_t v_stride_h = save_kv_cache ? v.value().stride(1) : 0;
-    auto kv_cache_loc_ptr = save_kv_cache ? static_cast<int64_t*>(kv_cache_loc.value().data_ptr()) : nullptr;
+    RuntimeCheck(kRopeDim == head_stride, "rope_dim ", kRopeDim, " should = head_stride ", head_stride);
+    RuntimeCheck(num_kv_heads * kRopeDim == row_dim, "invalid kvcache");
 
-    check_cuda_contiguous(cos_sin_cache);
-    check_cuda_contiguous(pos_ids);
+    // NOTE: we offset the k here to reduce computation cost in the kernel
+    const int64_t k_offset = static_cast<int64_t>(num_qo_heads) * head_stride_bytes;
+    const auto params = FusedRopeParams{
+        .q_ptr = q.data_ptr(),
+        .k_ptr = pointer::offset(k.data_ptr(), -k_offset),
+        .cos_sin_cache_ptr = cos_sin_cache.data_ptr(),
+        .positions = positions.data_ptr(),
+        .q_stride_bytes = q_stride_bytes,
+        .k_stride_bytes = k_stride_bytes,
+        .head_stride_bytes = head_stride_bytes,
+        .num_qo_heads = num_qo_heads,
+        .num_kv_heads = num_kv_heads,
+        .num_tokens = num_tokens,
+    };
 
-    auto device = q.device();
-    RuntimeCheck(k.device() == device);
-    RuntimeCheck(cos_sin_cache.device() == device);
-    RuntimeCheck(pos_ids.device() == device);
-    RuntimeCheck(q.ndim() == 3);
-    RuntimeCheck(k.ndim() == 3);
+    const auto v_stride_bytes = static_cast<int64_t>(Dv.unwrap() * sizeof(DType));
+    const auto cache_stride_bytes = static_cast<int64_t>(Dc.unwrap() * sizeof(DType));
+    const auto store_params = FusedRopeStoreParams{
+        .base_params = params,
+        .v_ptr = v.data_ptr(),
+        .k_cache = pointer::offset(k_cache.data_ptr(), -k_offset),
+        .v_cache = v_cache.data_ptr(),
+        .out_loc = out_loc.data_ptr(),
+        .v_stride_bytes = v_stride_bytes,
+        .cache_stride_bytes = cache_stride_bytes,
+    };
 
-    // cos_sin_cache: (max_seq_len, R)
-    // First half of R is cos, second half is sin
-    RuntimeCheck(cos_sin_cache.ndim() == 2);
-    RuntimeCheck(q.size(0) == k.size(0));
-    RuntimeCheck(q.size(2) == k.size(2));
-
-    unsigned int rotary_dim = cos_sin_cache.size(1);
-    unsigned int num_qo_heads = q.size(1);
-    unsigned int num_kv_heads = k.size(1);
-    unsigned int head_dim = q.size(2);
-    unsigned int nnz = q.size(0);
-    size_t q_stride_n = q.stride(0);
-    size_t q_stride_h = q.stride(1);
-    size_t k_stride_n = k.stride(0);
-    size_t k_stride_h = k.stride(1);
-
-    size_t q_rope_stride_n = q_rope.stride(0);
-    size_t q_rope_stride_h = q_rope.stride(1);
-    size_t k_rope_stride_n = k_rope.stride(0);
-    size_t k_rope_stride_h = k_rope.stride(1);
-
-    auto query_dtype = q.dtype();
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
-    DISPATCH_TVM_DTYPE_TO_CTYPE(query_dtype.code, query_dtype.bits, c_type, [&] {
-      // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
-      // to avoid changing original code path; but this branch is feature-complete and should switch to this later
-      if (save_kv_cache) {
-        cudaError_t status = flashinfer::BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
-            static_cast<c_type*>(q.data_ptr()),
-            static_cast<c_type*>(k.data_ptr()),
-            save_kv_cache ? static_cast<c_type*>(v.value().data_ptr()) : nullptr,
-            static_cast<c_type*>(q_rope.data_ptr()),
-            static_cast<c_type*>(k_rope.data_ptr()),
-            save_kv_cache ? static_cast<c_type*>(k_buffer.value().data_ptr()) : nullptr,
-            save_kv_cache ? static_cast<c_type*>(v_buffer.value().data_ptr()) : nullptr,
-            static_cast<float*>(cos_sin_cache.data_ptr()),
-            static_cast<int64_t*>(pos_ids.data_ptr()),
-            nnz,
-            num_qo_heads,
-            num_kv_heads,
-            rotary_dim,
-            head_dim,
-            q_stride_n,
-            q_stride_h,
-            k_stride_n,
-            k_stride_h,
-            v_stride_n,
-            v_stride_h,
-            q_rope_stride_n,
-            q_rope_stride_h,
-            k_rope_stride_n,
-            k_rope_stride_h,
-            k_buffer_stride_n,
-            k_buffer_stride_h,
-            v_buffer_stride_n,
-            v_buffer_stride_h,
-            kv_cache_loc_ptr,
-            interleave,
-            save_kv_cache,
-            enable_pdl,
-            stream);
-        RuntimeCheck(
-            status == cudaSuccess,
-            "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
-                std::string(cudaGetErrorString(status)));
-      } else {
-        RuntimeCheck(!enable_pdl);
-        cudaError_t status = flashinfer::BatchQKApplyRotaryPosIdsCosSinCache(
-            static_cast<c_type*>(q.data_ptr()),
-            static_cast<c_type*>(k.data_ptr()),
-            static_cast<c_type*>(q_rope.data_ptr()),
-            static_cast<c_type*>(k_rope.data_ptr()),
-            static_cast<float*>(cos_sin_cache.data_ptr()),
-            static_cast<int64_t*>(pos_ids.data_ptr()),
-            nnz,
-            num_qo_heads,
-            num_kv_heads,
-            rotary_dim,
-            head_dim,
-            q_stride_n,
-            q_stride_h,
-            k_stride_n,
-            k_stride_h,
-            q_rope_stride_n,
-            q_rope_stride_h,
-            k_rope_stride_n,
-            k_rope_stride_h,
-            interleave,
-            stream);
-        RuntimeCheck(
-            status == cudaSuccess,
-            "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " + std::string(cudaGetErrorString(status)));
-      }
-      return true;
-    });
+    const auto is_int32 = id_type.is_type<int32_t>();
+    const auto kernel = is_int32 ? _kernel_1<int32_t> : _kernel_1<int64_t>;
+    const uint32_t kNumSM = get_num_sm(device.unwrap());
+    static const uint32_t kOccupancyTable[2] = {
+        runtime::get_blocks_per_sm(_kernel_1<int32_t>, kBlockSize),
+        runtime::get_blocks_per_sm(_kernel_1<int64_t>, kBlockSize),
+    };
+    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+    // rope works for q+k heads, plus v store works for kv heads
+    const auto num_total_works = (num_qo_heads + 2 * num_kv_heads) * num_tokens;
+    const auto needed_blocks = div_ceil(num_total_works, (kBlockSize / kWorkThreads));
+    const auto num_blocks = std::min(max_blocks, needed_blocks);
+    LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, store_params);
   }
 };
 

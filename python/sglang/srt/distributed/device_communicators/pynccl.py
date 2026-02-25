@@ -164,6 +164,35 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def outplace_all_reduce(
+        self,
+        in_tensor: torch.Tensor,
+        out_tensor: Optional[torch.Tensor] = None,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+    ) -> Optional[torch.Tensor]:
+        if self.disabled:
+            return None
+        assert in_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {in_tensor.device}"
+        )
+
+        if out_tensor is None:
+            out_tensor = torch.empty_like(in_tensor)
+
+        stream = self._resolve_stream(stream)
+        self.nccl.ncclAllReduce(
+            buffer_type(in_tensor.data_ptr()),  # sendbuff
+            buffer_type(out_tensor.data_ptr()),  # recvbuff - DIFFERENT pointer
+            in_tensor.numel(),
+            ncclDataTypeEnum.from_torch(in_tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+        return out_tensor
+
     def all_gather(
         self,
         output_tensor: torch.Tensor,
