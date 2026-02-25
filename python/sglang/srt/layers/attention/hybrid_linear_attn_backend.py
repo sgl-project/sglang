@@ -243,7 +243,9 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # Draft model only uses full attention layers, so mamba metadata is unused.
+                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
+                # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
+                # the draft model, so mamba metadata can be skipped.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
