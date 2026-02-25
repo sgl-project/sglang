@@ -13,13 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_qu
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_torch_compile_disable_decorator,
-    is_gfx95_supported,
-    is_hip,
-    set_weight_attrs,
-)
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -29,15 +23,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_gfx95_supported = is_gfx95_supported()
-
 __all__ = ["QuarkW8A8FP8MoE"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
@@ -273,7 +263,6 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    @get_torch_compile_disable_decorator(_use_aiter_gfx95)
     def apply_weights(
         self,
         layer: torch.nn.Module,
