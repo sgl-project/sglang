@@ -15,7 +15,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
-
+from expert_backup_manager import PORT_BASE
 logger = logging.getLogger(__name__)
 
 
@@ -55,14 +55,14 @@ class ExpertBackupClient:
         for i in range(self.engine_num):
             self.recv_list[i] = context.socket(zmq.SUB)
             self.recv_list[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{10000 + i * 2 + 1}"
+                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2 + 1}"
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
             # Synchronization channel to notify the manager when this client is ready.
             self.ready_sockets[i] = context.socket(zmq.PUSH)
             self.ready_sockets[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{10000 + i * 2}"
+                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2}"
             )
             self.ready_sockets[i].send_pyobj(UpdateExpertBackupReq())
 

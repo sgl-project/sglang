@@ -19,7 +19,7 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket
 
 logger = logging.getLogger(__name__)
-
+PORT_BASE = 10000
 
 def extract_expert_id(param_name):
     pattern = r"\.experts\.(\d+)\."
@@ -49,11 +49,11 @@ class ExpertBackupManager:
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
         self.recv_from_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2}"
         )
         self.send_to_expert_backup_client = context.socket(zmq.PUB)
         self.send_to_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{10000 + server_args.node_rank * 2 + 1}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2 + 1}"
         )
         self.backup_weights_from_disk()
         self.start_transfer_server()
