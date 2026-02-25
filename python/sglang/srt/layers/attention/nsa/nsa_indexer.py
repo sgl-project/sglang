@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 from einops import rearrange
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -27,6 +28,10 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -34,7 +39,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -121,7 +125,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
-        from sgl_kernel import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -145,6 +149,7 @@ class Indexer(MultiPlatformOp):
         scale_fmt: Optional[str],
         block_size: int = 128,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        is_neox_style: bool = True,
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -160,8 +165,8 @@ class Indexer(MultiPlatformOp):
         self.alt_stream = alt_stream
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
-            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attn_context_model_parallel_world_size()
+            self.cp_rank = get_attn_context_model_parallel_rank()
         else:
             self.cp_size = None
             self.cp_rank = None
@@ -202,7 +207,7 @@ class Indexer(MultiPlatformOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=True,
+            is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
         self.block_size = block_size
@@ -224,21 +229,31 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            weight = self.weights_proj.weight
+            out = torch.empty(
+                (x.shape[0], weight.shape[0]),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+            return out
+
         if _is_hip:
             x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        return weights.float()
+
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
+    def _project_and_scale_head_gates(self, x: torch.Tensor):
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
-        weights, _ = self.weights_proj(x)
-        weights = weights.float()
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -469,7 +484,6 @@ class Indexer(MultiPlatformOp):
 
     def _get_topk_ragged(
         self,
-        enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         layer_id: int,
         q_fp8: torch.Tensor,
@@ -488,11 +502,9 @@ class Indexer(MultiPlatformOp):
             assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
-        assert (
-            forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        )
         weights = weights.squeeze(-1)
+        k_fp8_list = []
+        k_scale_list = []
 
         if _is_hip:
             block_tables = metadata.get_page_table_1()
@@ -507,37 +519,38 @@ class Indexer(MultiPlatformOp):
         batch_size = len(block_tables)
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
-
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
         if batch_size == 0:
             return topk_result
 
-        ks, ke = metadata.get_indexer_kvcache_range()
-
-        seq_len_sum = forward_batch.seq_lens_sum
-        max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
-        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-            layer_id,
-            forward_batch.seq_lens,
-            block_tables,
-            seq_len_sum,
-            max_seq_len,
-        )
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        assert len(indexer_seq_lens_cpu) == batch_size
+        for i in range(batch_size):
+            seq_len = indexer_seq_lens_cpu[i].item()
+            assert isinstance(seq_len, int)
+            # Use fused Triton kernel to get both K and scale in a single call
+            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+                layer_id,
+                seq_len,
+                block_tables[i],
+            )
+            k_fp8_list.append(k_fp8)
+            k_scale_list.append(k_scale)
         if _is_fp8_fnuz:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
         else:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
-
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
-
-        # Check if we need to chunk to avoid OOM
+        ks, ke = metadata.get_indexer_kvcache_range()
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+
+        # Check if we need to chunk to avoid OOM
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
@@ -1113,12 +1126,7 @@ class Indexer(MultiPlatformOp):
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
                 else:
                     topk_result = self._get_topk_ragged(
-                        enable_dual_stream,
-                        forward_batch,
-                        layer_id,
-                        q_fp8,
-                        weights,
-                        metadata,
+                        forward_batch, layer_id, q_fp8, weights, metadata
                     )
         else:
             topk_result = self.forward_indexer(
@@ -1196,13 +1204,17 @@ class Indexer(MultiPlatformOp):
             )  # [bs, n, d]
             q = torch.cat([q_pe, q_nope], dim=-1)
 
-        indexer_weight_stream = get_indexer_weight_stream()
-        indexer_weight_stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(indexer_weight_stream):
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            indexer_weight_stream = get_indexer_weight_stream()
+            indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(indexer_weight_stream):
+                x = x.view(-1, self.hidden_size)
+                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                weights.record_stream(indexer_weight_stream)
+                weights_event = indexer_weight_stream.record_event()
+        else:
             x = x.view(-1, self.hidden_size)
             weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-            weights.record_stream(indexer_weight_stream)
-            weights_event = indexer_weight_stream.record_event()
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -1284,7 +1296,8 @@ class Indexer(MultiPlatformOp):
 
         if self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
-        torch.npu.current_stream().wait_event(weights_event)
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            torch.npu.current_stream().wait_event(weights_event)
 
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (

@@ -1,0 +1,1342 @@
+import sys
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+import torch
+
+import sglang.srt.debug_utils.dumper as _dumper_module
+from sglang.srt.debug_utils.comparator.entrypoint import run
+from sglang.srt.debug_utils.comparator.output_types import (
+    AnyRecord,
+    ComparisonRecord,
+    ConfigRecord,
+    SkipRecord,
+    SummaryRecord,
+    _OutputRecord,
+    parse_record_json,
+)
+from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=30, suite="default", nightly=True)
+
+_FIXED_EXP_NAME = "my_exp_name"
+
+# Each test has a one-line docstring describing the scenario it covers.
+
+
+class TestEntrypointGroupingRaw:
+    """Test `--grouping raw` scenarios"""
+
+    def test_run_basic(self, tmp_path, capsys):
+        """Two matching tensors produce ConfigRecord, 2 ComparisonRecords, and SummaryRecord."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        assert isinstance(records[0], ConfigRecord)
+
+        assert len(_get_comparisons(records)) == 2
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.skipped == 0
+
+    def test_filter(self, tmp_path, capsys):
+        """--filter selects only the matching tensor, producing 1 ComparisonRecord."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        args = _make_args(baseline_path, target_path, filter="tensor_a", grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        assert len(_get_comparisons(records)) == 1
+
+    def test_no_baseline_skip(self, tmp_path, capsys):
+        """Target tensor missing from baseline emits a SkipRecord with reason baseline_load_failed."""
+        baseline_path, target_path = _create_dumps(
+            tmp_path,
+            tensor_names=["tensor_a", "tensor_extra"],
+            baseline_names=["tensor_a"],
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        skips = [r for r in records if isinstance(r, SkipRecord)]
+        assert len(skips) == 1
+        assert skips[0].reason == "baseline_load_failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.skipped == 1
+
+    def test_step_range(self, tmp_path, capsys):
+        """--start_step/--end_step restricts comparison to a single step out of three."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=3)
+        args = _make_args(
+            baseline_path, target_path, start_step=1, end_step=1, grouping="raw"
+        )
+
+        records = _run_and_parse(args, capsys)
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 1
+
+    def test_all_valid_records(self, tmp_path, capsys):
+        """Every emitted JSON record is a valid _OutputRecord subclass."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["t"], num_steps=2)
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        assert all(isinstance(r, _OutputRecord) for r in records)
+
+    def test_comparison_failed(self, tmp_path, capsys):
+        """Completely different tensors produce a failed ComparisonRecord."""
+        torch.manual_seed(42)
+        baseline_path = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="tensor_a", tensor=torch.randn(10, 10)
+        )
+        target_path = _create_rank_dump(
+            tmp_path / "target",
+            rank=0,
+            name="tensor_a",
+            tensor=torch.randn(10, 10) * 100,
+        )
+        args = _make_args(
+            baseline_path, target_path, grouping="raw", diff_threshold=1e-3
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].diff is not None
+        assert not comparisons[0].diff.passed
+        assert comparisons[0].category == "failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+
+    def test_shape_mismatch(self, tmp_path, capsys):
+        """Different shapes produce shape_mismatch=True and category='failed'."""
+        torch.manual_seed(42)
+        baseline_path = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="tensor_a", tensor=torch.randn(4, 8)
+        )
+        target_path = _create_rank_dump(
+            tmp_path / "target", rank=0, name="tensor_a", tensor=torch.randn(4, 10)
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].shape_mismatch is True
+        assert comparisons[0].diff is None
+        assert comparisons[0].category == "failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+
+    def test_unify_shape_leading_dims(self, tmp_path, capsys):
+        """Leading singleton dims on baseline are squeezed to match target shape."""
+        torch.manual_seed(42)
+        base_tensor = torch.randn(4, 8)
+        baseline_tensor = base_tensor.unsqueeze(0)  # (1, 4, 8)
+        target_tensor = base_tensor + torch.randn(4, 8) * 0.0001  # (4, 8)
+
+        baseline_path = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="tensor_a", tensor=baseline_tensor
+        )
+        target_path = _create_rank_dump(
+            tmp_path / "target", rank=0, name="tensor_a", tensor=target_tensor
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+
+        comp = comparisons[0]
+        assert comp.shape_mismatch is False
+        assert comp.baseline.shape == [1, 4, 8]
+        assert comp.target.shape == [4, 8]
+        assert comp.unified_shape == [4, 8]
+        assert comp.diff is not None
+        assert comp.diff.passed
+
+    def test_dtype_mismatch_downcast(self, tmp_path, capsys):
+        """Baseline float32 vs target bfloat16 produces diff_downcast."""
+        torch.manual_seed(42)
+        baseline_tensor = torch.randn(4, 8, dtype=torch.float32)
+        target_tensor = (baseline_tensor + torch.randn(4, 8) * 0.0001).to(
+            torch.bfloat16
+        )
+
+        baseline_path = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="tensor_a", tensor=baseline_tensor
+        )
+        target_path = _create_rank_dump(
+            tmp_path / "target", rank=0, name="tensor_a", tensor=target_tensor
+        )
+        args = _make_args(
+            baseline_path, target_path, grouping="raw", diff_threshold=0.01
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].diff_downcast is not None
+        assert comparisons[0].downcast_dtype is not None
+
+    def test_mixed_summary(self, tmp_path, capsys):
+        """One passed, one failed, one skipped tensor in a single run."""
+        torch.manual_seed(42)
+        similar_tensor = torch.randn(4, 4)
+        different_baseline = torch.randn(4, 4)
+        different_target = torch.randn(4, 4) * 100
+        extra_tensor = torch.randn(4, 4)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(baseline_dir, rank=0, name="similar", tensor=similar_tensor)
+        _create_rank_dump(
+            baseline_dir, rank=0, name="different", tensor=different_baseline
+        )
+
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="similar",
+            tensor=similar_tensor + torch.randn(4, 4) * 0.0001,
+        )
+        _create_rank_dump(target_dir, rank=0, name="different", tensor=different_target)
+        _create_rank_dump(target_dir, rank=0, name="extra", tensor=extra_tensor)
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            grouping="raw",
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+        assert summary.failed == 1
+        assert summary.skipped == 1
+        assert summary.total == 3
+
+    def test_filter_empty_result(self, tmp_path, capsys):
+        """--filter matching nothing produces summary with total=0."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        args = _make_args(
+            baseline_path, target_path, filter="nonexistent_pattern", grouping="raw"
+        )
+
+        records = _run_and_parse(args, capsys)
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 0
+
+    def test_raw_multi_rank(self, tmp_path, capsys):
+        """Two ranks in raw grouping produce two ComparisonRecords (one per rank)."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 4)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for rank in range(2):
+            _create_rank_dump(baseline_dir, rank=rank, name="hidden", tensor=tensor)
+            _create_rank_dump(
+                target_dir,
+                rank=rank,
+                name="hidden",
+                tensor=tensor + torch.randn(4, 4) * 0.0001,
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            grouping="raw",
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
+
+    def test_text_output_smoke(self, tmp_path, capsys):
+        """Text output format renders without errors and contains Config/Summary sections."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        args = _make_args(
+            baseline_path, target_path, output_format="text", grouping="raw"
+        )
+        capsys.readouterr()
+
+        run(args)
+
+        output = capsys.readouterr().out
+        assert "Config:" in output
+        assert "Summary:" in output
+
+    def test_text_output_with_failure(self, tmp_path, capsys):
+        """Text output with a failed comparison renders failure info."""
+        torch.manual_seed(42)
+        baseline_path = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="tensor_a", tensor=torch.randn(10, 10)
+        )
+        target_path = _create_rank_dump(
+            tmp_path / "target",
+            rank=0,
+            name="tensor_a",
+            tensor=torch.randn(10, 10) * 100,
+        )
+        args = _make_args(
+            baseline_path, target_path, output_format="text", grouping="raw"
+        )
+        capsys.readouterr()
+
+        run(args)
+
+        output = capsys.readouterr().out
+        assert "Summary:" in output
+        assert "failed" in output.lower()
+
+    def test_duplicate_dump_pairing(self, tmp_path, capsys):
+        """Same name dumped twice (different values) pairs by duplicate_index: 0th↔0th, 1st↔1st."""
+        torch.manual_seed(42)
+        tensor_v0 = torch.randn(4, 4)
+        tensor_v1 = torch.randn(4, 4)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(_dumper_module, "_get_rank", lambda: 0)
+                dumper = _Dumper(
+                    config=DumperConfig(
+                        enable=True,
+                        dir=str(side_dir),
+                        exp_name=_FIXED_EXP_NAME,
+                        enable_http_server=False,
+                    )
+                )
+                dumper.__dict__["_static_meta"] = {"world_rank": 0, "world_size": 1}
+
+                dumper.dump("tensor_a", tensor_v0)
+                dumper.dump("tensor_a", tensor_v1)
+                dumper.step()
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            grouping="raw",
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+        assert all(c.diff is not None and c.diff.passed for c in comparisons)
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
+
+
+class TestEntrypointGroupingLogical:
+    """Test `--grouping logical` scenarios"""
+
+    def test_no_dims_single_rank(self, tmp_path, capsys):
+        """Single-rank dumps without dims fall back to raw loading."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        args = _make_args(baseline_path, target_path)
+
+        records = _run_and_parse(args, capsys)
+        assert len(_get_comparisons(records)) == 2
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.skipped == 0
+
+    def test_tp_unshard_same_size(self, tmp_path, capsys):
+        """Both sides TP=2: shards are concatenated before comparison."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8)
+        full_target = full_baseline + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+        target_path = _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 1
+        assert summary.passed == 1
+
+    def test_tp_unshard_different_sizes(self, tmp_path, capsys):
+        """Baseline TP=4 vs target TP=2: different shard counts are handled correctly."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8)
+        full_target = full_baseline + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="hidden",
+            tp_size=4,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+        target_path = _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        _assert_single_comparison_passed(records)
+
+    def test_one_side_dims_single_baseline(self, tmp_path, capsys):
+        """Baseline has no dims (single rank), target has TP shards: unshard target only."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+        target_full = full_tensor + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_rank_dump(
+            baseline_dir, rank=0, name="hidden", tensor=full_tensor
+        )
+
+        target_path = _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=target_full,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        _assert_single_comparison_passed(records)
+
+    @pytest.mark.parametrize(
+        "bad_side, expected_reason",
+        [
+            ("baseline", "baseline_load_failed"),
+            ("target", "target_load_failed"),
+        ],
+    )
+    def test_ambiguous_no_dims_skip(self, tmp_path, capsys, bad_side, expected_reason):
+        """Multi-rank without dims on one side produces a SkipRecord with the appropriate reason."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        good_dir = target_dir if bad_side == "baseline" else baseline_dir
+        bad_dir = baseline_dir if bad_side == "baseline" else target_dir
+
+        _create_rank_dump(good_dir, rank=0, name="hidden", tensor=tensor)
+        for rank, shard in [(0, tensor[:, :4]), (1, tensor[:, 4:])]:
+            _create_rank_dump(bad_dir, rank=rank, name="hidden", tensor=shard)
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+        )
+
+        records = _run_and_parse(args, capsys)
+        skips = [r for r in records if isinstance(r, SkipRecord)]
+        assert len(skips) == 1
+        assert skips[0].reason == expected_reason
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.skipped == 1
+
+    def test_summary_counts_unshard(self, tmp_path, capsys):
+        """Two TP-sharded tensors: summary counts total=2, passed=2, skipped=0."""
+        torch.manual_seed(42)
+        full_a = torch.randn(4, 8)
+        full_b = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for tensor_name, tensor in [("t_a", full_a), ("t_b", full_b)]:
+            baseline_path = _create_tp_sharded_dumps(
+                baseline_dir,
+                full_tensor=tensor,
+                name=tensor_name,
+                tp_size=2,
+                shard_dim=1,
+                dims_str="b h(tp)",
+            )
+            target_tensor = tensor + torch.randn_like(tensor) * 0.0001
+            target_path = _create_tp_sharded_dumps(
+                target_dir,
+                full_tensor=target_tensor,
+                name=tensor_name,
+                tp_size=2,
+                shard_dim=1,
+                dims_str="b h(tp)",
+            )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
+        assert summary.failed == 0
+        assert summary.skipped == 0
+
+    def test_multi_step_tp(self, tmp_path, capsys):
+        """Two steps with TP=2 shards produce two logical groups (one per step)."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+            num_steps=2,
+        )
+        target_path = _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor + torch.randn(4, 8) * 0.0001,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+            num_steps=2,
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
+
+    def test_cp_axis_unshard(self, tmp_path, capsys):
+        """CP-sharded tensors are correctly concatenated along the sequence dim."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            shards = list(full_tensor.chunk(2, dim=1))
+            for cp_rank in range(2):
+                _create_rank_dump(
+                    side_dir,
+                    rank=cp_rank,
+                    name="attn_out",
+                    tensor=shards[cp_rank],
+                    dims="b s(cp) h",
+                    parallel_info={"cp_rank": cp_rank, "cp_size": 2},
+                )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+    def test_filter_logical(self, tmp_path, capsys):
+        """--filter in logical grouping selects only matching tensor groups."""
+        torch.manual_seed(42)
+        full_a = torch.randn(4, 8)
+        full_b = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for tensor_name, tensor in [("t_a", full_a), ("t_b", full_b)]:
+            _create_tp_sharded_dumps(
+                baseline_dir,
+                full_tensor=tensor,
+                name=tensor_name,
+                tp_size=2,
+                shard_dim=1,
+                dims_str="b h(tp)",
+            )
+            _create_tp_sharded_dumps(
+                target_dir,
+                full_tensor=tensor + torch.randn_like(tensor) * 0.0001,
+                name=tensor_name,
+                tp_size=2,
+                shard_dim=1,
+                dims_str="b h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            filter="t_a",
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].name == "t_a"
+
+    def test_mixed_dims_logical(self, tmp_path, capsys):
+        """TP-sharded and single-rank tensors in the same logical run both compare successfully."""
+        torch.manual_seed(42)
+        full_tp_tensor = torch.randn(4, 8)
+        single_tensor = torch.randn(4, 4)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tp_tensor,
+            name="tensor_a",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tp_tensor + torch.randn(4, 8) * 0.0001,
+            name="tensor_a",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp)",
+        )
+
+        _create_rank_dump(baseline_dir, rank=0, name="tensor_b", tensor=single_tensor)
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="tensor_b",
+            tensor=single_tensor + torch.randn(4, 4) * 0.0001,
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+        assert all(c.diff is not None and c.diff.passed for c in comparisons)
+        assert {c.name for c in comparisons} == {"tensor_a", "tensor_b"}
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
+
+    def test_cp_tp_unshard(self, tmp_path, capsys):
+        """CP=2 + TP=2: multi-axis shards are unsharded before comparison."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                head_dim=2,
+                dims_str="b s(cp) h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_cp_tp_different_sizes(self, tmp_path, capsys):
+        """Baseline CP=2+TP=2 vs target CP=1+TP=4: both sides independently unshard."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_cp_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="hidden",
+            cp_size=2,
+            tp_size=2,
+            seq_dim=1,
+            head_dim=2,
+            dims_str="b s(cp) h(tp)",
+        )
+
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="hidden",
+            tp_size=4,
+            shard_dim=2,
+            dims_str="b s h(tp)",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        _assert_single_comparison_passed(records)
+
+    def test_ep_cp_tp_three_axis_unshard(self, tmp_path, capsys):
+        """EP=2 + CP=2 + TP=2: three-axis shards are unsharded before comparison."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16, 32)
+        full_target = full_baseline + torch.randn(4, 8, 16, 32) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_ep_cp_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                ep_size=2,
+                cp_size=2,
+                tp_size=2,
+                expert_dim=1,
+                seq_dim=2,
+                head_dim=3,
+                dims_str="b e(ep) s(cp) h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_cp_zigzag_unshard(self, tmp_path, capsys):
+        """CP=2 zigzag reorder is correctly undone through the full pipeline."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_zigzag_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=1,
+                seq_dim=1,
+                head_dim=2,
+                dims_str="b s(cp,zigzag) h",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+    def test_cp_zigzag_tp_unshard(self, tmp_path, capsys):
+        """CP=2 zigzag + TP=2: multi-axis unshard with reorder through full pipeline."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_zigzag_tp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                head_dim=2,
+                dims_str="b s(cp,zigzag) h(tp)",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+
+class TestEntrypointReplicatedAxis:
+    """Test replicated-axis scenarios through the full entrypoint pipeline."""
+
+    def test_replicated_axis_identical_replicas_passed(self, tmp_path, capsys):
+        """CP2 TP2, TP replicated and identical → passed, no align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_replicated_tp_sharded_cp_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                dims_str="b s(cp) d",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.align_warnings == []
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+
+    def test_replicated_mismatch_fails(self, tmp_path, capsys):
+        """CP2 TP2, TP replicas differ (> atol) → failed with align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_replicated_tp_sharded_cp_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="attn_out",
+                cp_size=2,
+                tp_size=2,
+                seq_dim=1,
+                dims_str="b s(cp) d",
+                tp_noise=0.5,
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].category == "failed"
+        assert len(comparisons[0].align_warnings) > 0
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+
+    def test_summary_counts_failed_from_align_warnings_only(self, tmp_path, capsys):
+        """Diff itself passes but TP replicas differ → summary.failed=1 from align_warnings."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_replicated_tp_sharded_cp_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="attn_out",
+            cp_size=2,
+            tp_size=2,
+            seq_dim=1,
+            dims_str="b s(cp) d",
+            tp_noise=0.5,
+        )
+        _create_replicated_tp_sharded_cp_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="attn_out",
+            cp_size=2,
+            tp_size=2,
+            seq_dim=1,
+            dims_str="b s(cp) d",
+            tp_noise=0.5,
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.5,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+
+        comp = comparisons[0]
+        assert comp.diff is not None
+        assert comp.diff.passed
+        assert len(comp.align_warnings) > 0
+        assert comp.category == "failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+        assert summary.passed == 0
+
+
+# --------------------------- Assertion helpers -------------------
+
+
+def _get_comparisons(records: list[AnyRecord]) -> list[ComparisonRecord]:
+    return [r for r in records if isinstance(r, ComparisonRecord)]
+
+
+def _assert_single_comparison_passed(records: list[AnyRecord]) -> ComparisonRecord:
+    comparisons = _get_comparisons(records)
+    assert len(comparisons) == 1
+    assert comparisons[0].diff is not None
+    assert comparisons[0].diff.passed
+    return comparisons[0]
+
+
+# --------------------------- Utils ------------------------------
+
+
+def _make_dumper(directory: Path) -> _Dumper:
+    return _Dumper(
+        config=DumperConfig(enable=True, dir=str(directory), enable_http_server=False)
+    )
+
+
+def _create_dumps(
+    tmp_path: Path,
+    tensor_names: list[str],
+    *,
+    baseline_names: list[str] | None = None,
+    num_steps: int = 1,
+) -> tuple[Path, Path]:
+    """Create baseline and target dump directories with given tensor names.
+
+    If baseline_names is None, uses the same names as tensor_names.
+    Each step dumps all names with the same tensor (different per baseline/target).
+    """
+    if baseline_names is None:
+        baseline_names = tensor_names
+
+    d_baseline = tmp_path / "baseline"
+    d_target = tmp_path / "target"
+    d_baseline.mkdir()
+    d_target.mkdir()
+
+    torch.manual_seed(42)
+    baseline_tensor = torch.randn(10, 10)
+    target_tensor = baseline_tensor + torch.randn(10, 10) * 0.01
+
+    exp_paths: list[Path] = []
+    for d, names, tensor in [
+        (d_baseline, baseline_names, baseline_tensor),
+        (d_target, tensor_names, target_tensor),
+    ]:
+        dumper = _make_dumper(d)
+        for _ in range(num_steps):
+            for name in names:
+                dumper.dump(name, tensor)
+            dumper.step()
+        exp_paths.append(d / dumper._config.exp_name)
+
+    return exp_paths[0], exp_paths[1]
+
+
+def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace:
+    defaults = dict(
+        baseline_path=str(baseline_path),
+        target_path=str(target_path),
+        start_step=0,
+        end_step=1000000,
+        diff_threshold=1e-3,
+        filter=None,
+        output_format="json",
+        grouping="logical",
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+def _run_and_parse(args: Namespace, capsys: pytest.CaptureFixture) -> list[AnyRecord]:
+    capsys.readouterr()
+    run(args)
+    return _parse_jsonl(capsys.readouterr().out)
+
+
+def _parse_jsonl(output: str) -> list[AnyRecord]:
+    return [parse_record_json(line) for line in output.strip().splitlines()]
+
+
+def _create_rank_dump(
+    directory: Path,
+    *,
+    rank: int,
+    name: str,
+    tensor: torch.Tensor,
+    dims: str | None = None,
+    parallel_info: dict | None = None,
+    num_steps: int = 1,
+) -> Path:
+    """Create a dump file via the real dumper, as if running on the given rank."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
+
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
+
+        static_meta: dict = {"world_rank": rank, "world_size": 1}
+        if parallel_info is not None:
+            static_meta["sglang_parallel_info"] = parallel_info
+        dumper.__dict__["_static_meta"] = static_meta
+
+        for _ in range(num_steps):
+            dumper.dump(name, tensor, dims=dims)
+            dumper.step()
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_cp_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    tp_size: int,
+    seq_dim: int,
+    head_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create CP+TP multi-axis sharded dump files from a full tensor."""
+    cp_chunks = list(full_tensor.chunk(cp_size, dim=seq_dim))
+    rank = 0
+    for cp_rank in range(cp_size):
+        tp_chunks = list(cp_chunks[cp_rank].chunk(tp_size, dim=head_dim))
+        for tp_rank in range(tp_size):
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=tp_chunks[tp_rank],
+                dims=dims_str,
+                parallel_info={
+                    "cp_rank": cp_rank,
+                    "cp_size": cp_size,
+                    "tp_rank": tp_rank,
+                    "tp_size": tp_size,
+                },
+                num_steps=num_steps,
+            )
+            rank += 1
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_ep_cp_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    ep_size: int,
+    cp_size: int,
+    tp_size: int,
+    expert_dim: int,
+    seq_dim: int,
+    head_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create EP+CP+TP three-axis sharded dump files from a full tensor."""
+    ep_chunks = list(full_tensor.chunk(ep_size, dim=expert_dim))
+    rank = 0
+    for ep_rank in range(ep_size):
+        cp_chunks = list(ep_chunks[ep_rank].chunk(cp_size, dim=seq_dim))
+        for cp_rank in range(cp_size):
+            tp_chunks = list(cp_chunks[cp_rank].chunk(tp_size, dim=head_dim))
+            for tp_rank in range(tp_size):
+                _create_rank_dump(
+                    directory,
+                    rank=rank,
+                    name=name,
+                    tensor=tp_chunks[tp_rank],
+                    dims=dims_str,
+                    parallel_info={
+                        "ep_rank": ep_rank,
+                        "ep_size": ep_size,
+                        "cp_rank": cp_rank,
+                        "cp_size": cp_size,
+                        "tp_rank": tp_rank,
+                        "tp_size": tp_size,
+                    },
+                    num_steps=num_steps,
+                )
+                rank += 1
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_cp_zigzag_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    tp_size: int,
+    seq_dim: int,
+    head_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create CP-zigzag (+optional TP) sharded dump files from a full tensor."""
+    num_chunks: int = cp_size * 2
+    natural_chunks: list[torch.Tensor] = list(
+        full_tensor.chunk(num_chunks, dim=seq_dim)
+    )
+
+    zigzag_order: list[int] = []
+    for i in range(cp_size):
+        zigzag_order.append(i)
+        zigzag_order.append(num_chunks - 1 - i)
+
+    zigzagged: torch.Tensor = torch.cat(
+        [natural_chunks[idx] for idx in zigzag_order], dim=seq_dim
+    )
+
+    cp_chunks: list[torch.Tensor] = list(zigzagged.chunk(cp_size, dim=seq_dim))
+
+    rank: int = 0
+    for cp_rank in range(cp_size):
+        tp_chunks: list[torch.Tensor] = (
+            list(cp_chunks[cp_rank].chunk(tp_size, dim=head_dim))
+            if tp_size > 1
+            else [cp_chunks[cp_rank]]
+        )
+        for tp_rank in range(tp_size):
+            parallel_info: dict[str, int] = {
+                "cp_rank": cp_rank,
+                "cp_size": cp_size,
+            }
+            if tp_size > 1:
+                parallel_info["tp_rank"] = tp_rank
+                parallel_info["tp_size"] = tp_size
+
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=tp_chunks[tp_rank],
+                dims=dims_str,
+                parallel_info=parallel_info,
+                num_steps=num_steps,
+            )
+            rank += 1
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_replicated_tp_sharded_cp_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    tp_size: int,
+    seq_dim: int,
+    dims_str: str,
+    tp_noise: float = 0.0,
+) -> Path:
+    """Create CP-sharded + TP-replicated dump files from a full tensor.
+
+    CP direction: chunks along seq_dim (sharded).
+    TP direction: clones (replicated), with optional noise to simulate mismatch.
+    """
+    cp_chunks: list[torch.Tensor] = list(full_tensor.chunk(cp_size, dim=seq_dim))
+
+    rank: int = 0
+    for cp_rank in range(cp_size):
+        for tp_rank in range(tp_size):
+            shard = cp_chunks[cp_rank].clone()
+            if tp_noise > 0 and tp_rank > 0:
+                shard = shard + torch.randn_like(shard) * tp_noise
+
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=shard,
+                dims=dims_str,
+                parallel_info={
+                    "cp_rank": cp_rank,
+                    "cp_size": cp_size,
+                    "tp_rank": tp_rank,
+                    "tp_size": tp_size,
+                },
+            )
+            rank += 1
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_tp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    tp_size: int,
+    shard_dim: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create TP-sharded dump files from a full tensor via the real dumper."""
+    shards = list(full_tensor.chunk(tp_size, dim=shard_dim))
+    for tp_rank in range(tp_size):
+        _create_rank_dump(
+            directory,
+            rank=tp_rank,
+            name=name,
+            tensor=shards[tp_rank],
+            dims=dims_str,
+            parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
+            num_steps=num_steps,
+        )
+    return directory / _FIXED_EXP_NAME
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

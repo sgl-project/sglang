@@ -3,18 +3,28 @@ from typing import List, Union
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
-from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
+
+try:
+    from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
+except ImportError:
+    GlmOcrForConditionalGeneration = None
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [
-        Glm4vForConditionalGeneration,
-        Glm4vMoeForConditionalGeneration,
-        GlmOcrForConditionalGeneration,
+        m
+        for m in [
+            Glm4vForConditionalGeneration,
+            Glm4vMoeForConditionalGeneration,
+            GlmOcrForConditionalGeneration,
+        ]
+        if m is not None
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
