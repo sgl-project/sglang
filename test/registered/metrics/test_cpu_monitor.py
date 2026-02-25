@@ -10,7 +10,7 @@ class TestCpuMonitor(unittest.TestCase):
     def test_cpu_monitor(self):
         from prometheus_client import REGISTRY
 
-        from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+        from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
         thread = start_cpu_monitor_thread("test", interval=0.1)
         self.assertTrue(thread.is_alive())

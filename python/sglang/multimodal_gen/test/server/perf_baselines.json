@@ -316,11 +316,10 @@
             "expected_avg_denoise_ms": 38.25,
             "expected_median_denoise_ms": 35.95
         },
-        "flux_2_image_t2i_layerwise_offload": {
+        "layerwise_offload": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "TextEncodingStage": 513.58,
-                "ImageVAEEncodingStage": 0.0,
                 "LatentPreparationStage": 0.46,
                 "TimestepPreparationStage": 2.38,
                 "DenoisingStage": 52187.62,
@@ -536,6 +535,30 @@
             "expected_e2e_ms": 1292.92,
             "expected_avg_denoise_ms": 83.75,
             "expected_median_denoise_ms": 93.58
+        },
+        "zimage_image_t2i_fp8": {
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 428.59,
+                "LatentPreparationStage": 0.14,
+                "TimestepPreparationStage": 47.26,
+                "DenoisingStage": 778.56,
+                "DecodingStage": 10.39
+            },
+            "denoise_step_ms": {
+                "0": 40.9,
+                "1": 61.08,
+                "2": 95.65,
+                "3": 95.83,
+                "4": 95.65,
+                "5": 96.09,
+                "6": 96.23,
+                "7": 96.04,
+                "8": 96.29
+            },
+            "expected_e2e_ms": 1370.28,
+            "expected_avg_denoise_ms": 85.97,
+            "expected_median_denoise_ms": 95.83
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {

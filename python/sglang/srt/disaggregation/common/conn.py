@@ -6,8 +6,9 @@ import logging
 import socket
 import threading
 import time
+from collections import defaultdict
 from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -99,21 +100,62 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {zmq_bind_host}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
+            # If a timeout happens on the prefill side, it means prefill instances
+            # fail to receive the KV indices from the decode instance of this request.
+            # These timeout requests should be aborted to release the tree cache.
+            self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
+            self.heartbeat_failures: Dict[str, int] = {}
+            self.session_pool: Dict = defaultdict(requests.Session)
+            self.session_pool_lock = threading.Lock()
+            self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
+            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Heartbeat interval should be at least 2 seconds
+            self.heartbeat_interval = max(
+                envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
+            )
+            # Heartbeat failure should be at least 1
+            self.max_failures = max(
+                envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
+            )
+            # If a timeout happens on the decode side, it means decode instances
+            # fail to receive the KV Cache transfer done signal after bootstrapping.
+            # These timeout requests should be aborted to release the tree cache.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def check_status(self, bootstrap_room: int) -> KVPoll:
+        return self.request_status[bootstrap_room]
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        if bootstrap_room not in self.request_status:
+            self.request_status[bootstrap_room] = status
+        else:
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+            else:
+                self.request_status[bootstrap_room] = max(
+                    self.request_status[bootstrap_room], status
+                )
+
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        with self.failure_lock:
+            self.failure_records[bootstrap_room] = failure_reason
 
     def ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Fetch and cache prefill parallel info if not yet available.
@@ -261,7 +303,7 @@ class CommonKVManager(BaseKVManager):
 class CommonKVSender(BaseKVSender):
     def __init__(
         self,
-        mgr: BaseKVManager,
+        mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: int,
         dest_tp_ranks: List[int],
@@ -322,7 +364,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def __init__(
         self,
-        mgr: BaseKVManager,
+        mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,

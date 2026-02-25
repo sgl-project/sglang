@@ -30,6 +30,11 @@ import torch
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 
@@ -66,43 +71,6 @@ class BaseBatchReq(ABC):
 
 
 @dataclass
-class RequestTimingMetricsMixin:
-    """
-    Mixin class containing common request-level timing metrics.
-
-    This class consolidates the timing metrics that are shared across all batch output types
-    to avoid code duplication and ensure consistency.
-    """
-
-    # Queue duration: time spent waiting in queue before request is scheduled.
-    queue_time: Optional[List[Optional[float]]]
-
-    # Forward entry time: timestamp when the request enters the forward pass stage.
-    # This corresponds to `forward_entry_time` in TimeStats.
-    # In different modes:
-    #   - Unified/PD-colocate: timestamp when forward computation begins (covers prefill + decode)
-    #   - Prefill instance (P): timestamp when prefill forward pass begins
-    #   - Decode instance (D): timestamp when decode forward pass begins
-    # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
-    forward_entry_time: Optional[List[Optional[float]]]
-
-    # Prefill launch delay: time spent waiting between forward entry and prefill start.
-    # Calculated as: prefill_start_time - forward_entry_time
-    # This represents the delay between when the request enters the forward stage
-    # and when prefill computation actually begins.
-    prefill_launch_delay: Optional[List[Optional[float]]]
-
-    # Prefill launch latency: time spent during prefill kernel launch.
-    # Calculated as: prefill_end_time_host - prefill_start_time_host
-    prefill_launch_latency: Optional[List[Optional[float]]]
-
-    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
-    # This marks when the prefill computation finishes.
-    prefill_finished_ts: Optional[List[Optional[float]]]
-
-
-@dataclass
 class SpeculativeDecodingMetricsMixin:
     """
     Mixin class containing speculative decoding metrics.
@@ -122,23 +90,6 @@ class SpeculativeDecodingMetricsMixin:
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
-
-
-@dataclass
-class APIServingTimingMixin:
-    # Validation step duration
-    validation_time: Optional[float] = None
-
-    # For metrics
-    received_time: Optional[float] = None
-
-    # Perf_counter equivalents for accurate time calculations
-    received_time_perf: Optional[float] = None
-
-
-_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
-    APIServingTimingMixin.__dataclass_fields__.keys()
-)
 
 
 # Parameters for a session
@@ -169,7 +120,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq, APIServingTimingMixin):
+class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -268,6 +219,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
+    received_time: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
@@ -684,10 +636,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
-            **{
-                field: getattr(self, field)
-                for field in _API_SERVING_TIMING_MIXIN_FIELDS
-            },
+            received_time=self.received_time,
         )
 
 
@@ -759,9 +708,6 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
-
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -770,6 +716,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # For observability
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
@@ -788,7 +737,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
+class EmbeddingReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -812,8 +761,6 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # Validation step duration
-    validation_time: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
@@ -826,6 +773,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
 
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict] = None
+    received_time: Optional[float] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -933,10 +881,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
-            **{
-                field: getattr(self, field)
-                for field in _API_SERVING_TIMING_MIXIN_FIELDS
-            },
+            received_time=self.received_time,
         )
 
 
@@ -960,6 +905,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     dimensions: Optional[int] = None
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # For observability
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
@@ -978,9 +925,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(
-    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
-):
+class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -1040,6 +985,9 @@ class BatchTokenIDOutput(
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1074,9 +1022,7 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
 
 
 @dataclass
-class BatchStrOutput(
-    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
-):
+class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -1131,6 +1077,9 @@ class BatchStrOutput(
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
 
 @dataclass
 class BatchMultimodalOutput(BaseBatchReq):
@@ -1158,9 +1107,12 @@ class BatchMultimodalOutput(BaseBatchReq):
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1176,6 +1128,9 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     retraction_counts: List[int]
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
