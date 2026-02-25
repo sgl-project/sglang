@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.nsa_mtp_verification import (
     verify_multi_backend_fused_metadata_copy,
     verify_single_backend_fused_metadata_copy,

@@ -21,7 +21,9 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_align, ceil_div, is_hip
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -571,3 +573,18 @@ def prepare_input_dp_with_cp_dsa(
         total_seq_lens=kv_len_origin,
     )
     return nsa_cp_metadata
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+    # from sgl_kernel import hadamard_transform
+    if _is_hip:
+        from fast_hadamard_transform import hadamard_transform
+    else:
+        from sglang.jit_kernel.hadamard import hadamard_transform
+
+    hidden_size = x.size(-1)
+    assert (
+        hidden_size & (hidden_size - 1)
+    ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    return hadamard_transform(x, scale=hidden_size**-0.5)

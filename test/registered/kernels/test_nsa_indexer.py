@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.nsa.nsa_indexer import (
+from sglang.srt.layers.attention.nsa.nsa_indexer_metadata import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
