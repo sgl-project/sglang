@@ -3,10 +3,12 @@ import base64
 import json
 import os
 import socket
+import subprocess
 import time
 from pathlib import Path
 
 import cv2
+import httpx
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -17,6 +19,45 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Common model IDs for diffusion tests
+#
+# Centralised here so every test file references the same constants instead
+# of scattering hard-coded strings.  When adding a new model that will be
+# reused across tests, define it here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+
+# Qwen image generation models
+DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
+DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
+DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
+DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"
+DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2511"
+DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
+
+# FLUX image generation models
+DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"
+DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-dev"
+DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST = (
+    "black-forest-labs/FLUX.2-klein-base-4B"
+)
+
+# Wan video generation models
+DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+)
+DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+)
+DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 
 
 def is_image_url(image_path: str | Path | None) -> bool:
@@ -57,6 +98,103 @@ def get_dynamic_server_port() -> int:
         base_port = 20000 + first_device_id * 1000
 
     return base_port + 1000
+
+
+def find_free_port(host: str = "127.0.0.1") -> int:
+    """Bind to port 0 and let the OS assign an available port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def wait_for_server_health(
+    base_url: str,
+    path: str = "/health",
+    timeout: float = 180.0,
+    interval: float = 1.0,
+) -> None:
+    """Poll ``GET <base_url><path>`` until it returns HTTP 200."""
+    deadline = time.time() + timeout
+    last_err: Exception | None = None
+    last_status: int | None = None
+    while time.time() < deadline:
+        try:
+            r = httpx.get(f"{base_url}{path}", timeout=5.0)
+            last_status = r.status_code
+            if r.status_code == 200:
+                return
+        except Exception as e:
+            last_err = e
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Server at {base_url}{path} not healthy after {timeout}s. "
+        f"last_status={last_status} last_err={last_err}"
+    )
+
+
+def post_json(
+    base_url: str,
+    path: str,
+    payload: dict,
+    timeout: float = 300.0,
+) -> httpx.Response:
+    """POST JSON to ``<base_url><path>`` and return the response."""
+    return httpx.post(f"{base_url}{path}", json=payload, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# GPU memory helpers (nvidia-smi)
+# ---------------------------------------------------------------------------
+
+
+def query_gpu_mem_used_mib(gpu_index: int = 0) -> int | None:
+    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure."""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={gpu_index}",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).strip()
+        return int(out.splitlines()[0].strip())
+    except Exception as e:
+        logger.warning("nvidia-smi memory query failed: %s: %s", type(e).__name__, e)
+        return None
+
+
+def require_gpu_mem_query(gpu_index: int = 0) -> int:
+    """Like :func:`query_gpu_mem_used_mib` but raises when unavailable."""
+    mem = query_gpu_mem_used_mib(gpu_index)
+    assert mem is not None, (
+        "nvidia-smi memory query is unavailable; "
+        "cannot enforce GPU memory assertions."
+    )
+    return mem
+
+
+def assert_gpu_mem_changed(
+    label: str,
+    before_mib: int,
+    after_mib: int,
+    min_delta_mib: int,
+) -> None:
+    """Assert that GPU memory changed by at least *min_delta_mib* MiB."""
+    delta = abs(after_mib - before_mib)
+    logger.info(
+        "[MEM] %s: before=%d MiB  after=%d MiB  |delta|=%d MiB",
+        label,
+        before_mib,
+        after_mib,
+        delta,
+    )
+    assert delta >= min_delta_mib, (
+        f"GPU memory change too small for '{label}': "
+        f"|after-before|={delta} MiB < {min_delta_mib} MiB "
+        f"(before={before_mib} MiB, after={after_mib} MiB)"
+    )
 
 
 def is_mp4(data: bytes) -> bool:
