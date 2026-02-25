@@ -7,11 +7,29 @@
 
 #include <concepts>
 #include <cstddef>
+#include <type_traits>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include <type_traits>
+#else
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+using cudaError_t = hipError_t;
+using cudaStream_t = hipStream_t;
+using cudaLaunchConfig_t = hipLaunchConfig_t;
+using cudaLaunchAttribute = hipLaunchAttribute;
+inline constexpr auto cudaSuccess = hipSuccess;
+#define cudaStreamPerThread hipStreamPerThread
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetLastError hipGetLastError
+#define cudaLaunchKernel hipLaunchKernel
+#endif
 
 #ifndef USE_ROCM
 using fp32_t = float;
@@ -26,6 +44,18 @@ using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
 
+using fp32x4_t = float4;
+#else
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __hip_bfloat16;
+using fp8_e4m3_t = uint8_t;
+using fp8_e5m2_t = uint8_t;
+using fp32x2_t = float2;
+using fp16x2_t = half2;
+using bf16x2_t = __hip_bfloat162;
+using fp8x2_e4m3_t = uint16_t;
+using fp8x2_e5m2_t = uint16_t;
 using fp32x4_t = float4;
 #endif
 
@@ -146,6 +176,10 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
+#ifdef USE_ROCM
+    (void)enabled;
+    m_config.numAttrs = 0;
+#else
     if (enabled) {
       m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attrs[0].val.programmaticStreamSerializationAllowed = true;
@@ -154,12 +188,24 @@ struct LaunchKernel {
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
+#ifdef USE_ROCM
+    hipLaunchKernelGGL(
+        std::forward<T>(kernel),
+        m_config.gridDim,
+        m_config.blockDim,
+        m_config.dynamicSmemBytes,
+        m_config.stream,
+        std::forward<Args>(args)...);
+    RuntimeDeviceCheck(m_location);
+#else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+#endif
   }
 
  private:
