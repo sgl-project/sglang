@@ -2401,10 +2401,6 @@ class ServerArgs:
                 self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
-                assert self.enable_mamba_extra_buffer(), (
-                    "Spec v2 requires mamba scheduler strategy `extra_buffer`. "
-                    "Please set `--mamba-scheduler-strategy extra_buffer`."
-                )
                 self.disable_overlap_schedule = False
                 logger.warning(
                     "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
