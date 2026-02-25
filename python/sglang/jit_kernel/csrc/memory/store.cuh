@@ -88,30 +88,13 @@ void dispatch_store_kv_cache(
   if (size_bytes % 256 == 0) {
     const size_t items_per_warp = static_cast<size_t>(size_bytes / 256);
     store_kv_cache_256x1<<<num_blocks, num_threads, 0, stream>>>(
-        k_cache_ptr,
-        v_cache_ptr,
-        out_loc_ptr,
-        length,
-        k_ptr,
-        v_ptr,
-        kv_cache_stride,
-        kv_input_stride,
-        items_per_warp);
+        k_cache_ptr, v_cache_ptr, out_loc_ptr, length, k_ptr, v_ptr, kv_cache_stride, kv_input_stride, items_per_warp);
   } else if (size_bytes % 128 == 0) {
     const size_t items_per_warp = static_cast<size_t>(size_bytes / 128);
     store_kv_cache_128x2<<<num_blocks, num_threads, 0, stream>>>(
-        k_cache_ptr,
-        v_cache_ptr,
-        out_loc_ptr,
-        length,
-        k_ptr,
-        v_ptr,
-        kv_cache_stride,
-        kv_input_stride,
-        items_per_warp);
+        k_cache_ptr, v_cache_ptr, out_loc_ptr, length, k_ptr, v_ptr, kv_cache_stride, kv_input_stride, items_per_warp);
   } else {
-    host::Panic(
-        "Last dim size bytes of k/v must be divisible by 128, got: {}", size_bytes);
+    host::Panic("Last dim size bytes of k/v must be divisible by 128, got: {}", size_bytes);
   }
 }
 
@@ -130,9 +113,7 @@ void store_kv_cache(
   RuntimeCheck(k.dim() == 2, "k must be 2D");
   RuntimeCheck(v.dim() == 2, "v must be 2D");
   RuntimeCheck(out_loc.dim() == 1 && out_loc.is_contiguous(), "out_loc must be 1D contiguous");
-  RuntimeCheck(
-      k_cache.size(1) == v_cache.size(1),
-      "k_cache and v_cache must have the same head dim");
+  RuntimeCheck(k_cache.size(1) == v_cache.size(1), "k_cache and v_cache must have the same head dim");
   RuntimeCheck(k.size(1) == v.size(1), "k and v must have the same head dim");
   RuntimeCheck(k.size(1) == k_cache.size(1), "k and k_cache must have the same head dim");
   RuntimeCheck(k.stride(1) == 1 && k_cache.stride(1) == 1, "k and k_cache must be contiguous in head dim");
@@ -154,8 +135,7 @@ void store_kv_cache(
   const int num_blocks = static_cast<int>((length + num_warps - 1) / num_warps);
 
   const auto device = k_cache.device();
-  const auto stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(device.device_type, device.device_id));
+  const auto stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 
   if (host::is_type<int32_t>(out_loc.dtype())) {
     dispatch_store_kv_cache<int32_t>(
