@@ -384,7 +384,7 @@ class DeepEPMoE(FusedMoE):
                         NPUCompressedTensorsW4A16Int4DynamicMoE,
                         CompressedTensorsFusedMoEMethod,
                     ),
-                 ):
+                ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
                     )
