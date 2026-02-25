@@ -2334,7 +2334,7 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method for now (Qwen models)
+        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
         # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
         # end to end, so we just avoid using trtllm_moe for speculative decoding.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
