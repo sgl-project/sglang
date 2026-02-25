@@ -412,7 +412,8 @@ class SamplingParams:
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
-        elif self.adjust_frames:
+        else:
+            # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
@@ -426,44 +427,51 @@ class SamplingParams:
                 self.num_frames,
             )
 
-            # Adjust number of frames based on number of GPUs for video task
-            use_temporal_scaling_frames = (
-                pipeline_config.vae_config.use_temporal_scaling_frames
-            )
-            num_frames = self.num_frames
-            num_gpus = server_args.num_gpus
-            temporal_scale_factor = (
-                pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
-
-            if use_temporal_scaling_frames:
-                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-
-            if orig_latent_num_frames % server_args.num_gpus != 0:
-                # Adjust latent frames to be divisible by number of GPUs
-                if self.num_frames_round_down:
-                    # Ensure we have at least 1 batch per GPU
-                    new_latent_num_frames = (
-                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                    )
-                else:
-                    new_latent_num_frames = (
-                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                    )
+            if self.adjust_frames:
+                # Adjust number of frames based on number of GPUs for video task
+                use_temporal_scaling_frames = (
+                    pipeline_config.vae_config.use_temporal_scaling_frames
+                )
+                num_frames = self.num_frames
+                num_gpus = server_args.num_gpus
+                temporal_scale_factor = (
+                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                )
 
                 if use_temporal_scaling_frames:
-                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                    new_num_frames = (
-                        new_latent_num_frames - 1
-                    ) * temporal_scale_factor + 1
+                    orig_latent_num_frames = (
+                        num_frames - 1
+                    ) // temporal_scale_factor + 1
+                else:
+                    orig_latent_num_frames = num_frames
 
-                logger.info(
-                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                    self.num_frames,
-                    new_num_frames,
-                    server_args.num_gpus,
-                )
-                self.num_frames = new_num_frames
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
+                    if self.num_frames_round_down:
+                        # Ensure we have at least 1 batch per GPU
+                        new_latent_num_frames = (
+                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                        )
+                    else:
+                        new_latent_num_frames = (
+                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                        )
+
+                    if use_temporal_scaling_frames:
+                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                        new_num_frames = (
+                            new_latent_num_frames - 1
+                        ) * temporal_scale_factor + 1
+                    else:
+                        new_num_frames = new_latent_num_frames
+
+                    logger.info(
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                        self.num_frames,
+                        new_num_frames,
+                        server_args.num_gpus,
+                    )
+                    self.num_frames = new_num_frames
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
