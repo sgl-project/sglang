@@ -658,6 +658,49 @@ class SchedulerOutputProcessorMixin:
             logger.warning("KV return: failed to post alloc for req %s: %s", req.rid, e)
             return False
 
+    def _start_kv_return_rdma(
+        self, pending: PendingKvReturn, page_data: bytes, kv_mgr
+    ) -> bool:
+        """Parse alloc reply and start RDMA transfer for a pending KV return.
+
+        Returns True if the RDMA transfer was posted (pending transitions to
+        TRANSFERRING state).  Returns False if the alloc was declined or the
+        RDMA post failed — in both cases the KV pages are released here.
+        """
+        if not page_data:
+            logger.debug(
+                "KV return: prefill declined alloc for req %s", pending.rid
+            )
+            release_kv_cache(pending.req, self.tree_cache)
+            return False
+
+        pending.dst_page_indices = np.frombuffer(
+            page_data, dtype=np.int32
+        ).copy()
+        try:
+            pending.xfer_handle = kv_mgr.send_kvcache(
+                peer_name=pending.prefill_info["agent_name"],
+                prefill_kv_indices=pending.kv_indices,
+                dst_kv_ptrs=pending.prefill_info["kv_ptrs"],
+                dst_kv_indices=pending.dst_page_indices,
+                dst_gpu_id=pending.prefill_info["gpu_id"],
+                notif=f"kv_return_{pending.rid}",
+            )
+            pending.state = _KVR_TRANSFERRING
+            pending.xfer_started_at = time.time()
+            return True
+        except Exception as e:
+            logger.warning(
+                "KV return: RDMA post failed for req %s: %s",
+                pending.rid, e,
+            )
+            kv_mgr.send_kv_return_metadata(
+                pending.prefill_info, [],
+                pending.dst_page_indices, cancel=True,
+            )
+            release_kv_cache(pending.req, self.tree_cache)
+            return False
+
     def _poll_kv_return_replies(self) -> None:
         """Non-blocking poll for KV return alloc replies and RDMA completions.
 
@@ -672,6 +715,23 @@ class SchedulerOutputProcessorMixin:
         if not hasattr(self, "_kv_return_pending") or not self._kv_return_pending:
             return
 
+        try:
+            self._poll_kv_return_replies_impl()
+        except Exception as e:
+            logger.warning(
+                "KV return: unexpected error in poll, releasing %d pending "
+                "entries to avoid page leak: %s",
+                len(self._kv_return_pending), e,
+            )
+            for pending in self._kv_return_pending.values():
+                try:
+                    release_kv_cache(pending.req, self.tree_cache)
+                except Exception:
+                    pass
+            self._kv_return_pending.clear()
+
+    def _poll_kv_return_replies_impl(self) -> None:
+        """Inner implementation of _poll_kv_return_replies."""
         kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
         now = time.time()
         completed_ids = []
@@ -695,96 +755,26 @@ class SchedulerOutputProcessorMixin:
                     reply_id = reply[0].decode("ascii")
                     if reply_id in self._kv_return_pending:
                         pending = self._kv_return_pending[reply_id]
-                        page_data = reply[1]
-                        if not page_data:
-                            # Prefill declined (memory pressure)
-                            logger.debug(
-                                "KV return: prefill declined alloc for req %s",
-                                pending.rid,
-                            )
-                            release_kv_cache(pending.req, self.tree_cache)
-                            completed_ids.append(reply_id)
-                            continue
-
-                        pending.dst_page_indices = np.frombuffer(
-                            page_data, dtype=np.int32
-                        ).copy()
-                        alloc_ms = (now - pending.posted_at) * 1000
-                        logger.debug(
-                            "KV return: alloc reply for req %s (%d pages, %.1fms)",
-                            pending.rid, len(pending.dst_page_indices), alloc_ms,
-                        )
-
-                        # Start RDMA transfer
-                        try:
-                            notif = f"kv_return_{pending.rid}"
-                            pending.xfer_handle = kv_mgr.send_kvcache(
-                                peer_name=pending.prefill_info["agent_name"],
-                                prefill_kv_indices=pending.kv_indices,
-                                dst_kv_ptrs=pending.prefill_info["kv_ptrs"],
-                                dst_kv_indices=pending.dst_page_indices,
-                                dst_gpu_id=pending.prefill_info["gpu_id"],
-                                notif=notif,
-                            )
-                            pending.state = _KVR_TRANSFERRING
-                            pending.xfer_started_at = time.time()
-                        except Exception as e:
-                            logger.warning(
-                                "KV return: RDMA post failed for req %s: %s",
-                                pending.rid, e,
-                            )
-                            kv_mgr.send_kv_return_metadata(
-                                pending.prefill_info, [],
-                                pending.dst_page_indices, cancel=True,
-                            )
-                            release_kv_cache(pending.req, self.tree_cache)
+                        if not self._start_kv_return_rdma(
+                            pending, reply[1], kv_mgr
+                        ):
                             completed_ids.append(reply_id)
                     else:
                         # Buffer for a request we haven't seen yet (shouldn't happen
                         # in practice but safe to buffer)
                         kv_mgr._alloc_reply_buffer[reply_id] = reply[1]
 
-        # Check for alloc timeouts
+        # Check for alloc timeouts and buffered replies
         for req_id, pending in self._kv_return_pending.items():
             if req_id in completed_ids:
                 continue
             if pending.state == _KVR_WAITING_ALLOC:
-                # Also check the buffer in case reply arrived out of band
+                # Check the buffer in case reply arrived out of band
                 if pending.request_id in kv_mgr._alloc_reply_buffer:
                     page_data = kv_mgr._alloc_reply_buffer.pop(pending.request_id)
-                    if not page_data:
-                        logger.debug(
-                            "KV return: prefill declined alloc for req %s (from buffer)",
-                            pending.rid,
-                        )
-                        release_kv_cache(pending.req, self.tree_cache)
-                        completed_ids.append(req_id)
-                        continue
-                    pending.dst_page_indices = np.frombuffer(
-                        page_data, dtype=np.int32
-                    ).copy()
-                    try:
-                        notif = f"kv_return_{pending.rid}"
-                        pending.xfer_handle = kv_mgr.send_kvcache(
-                            peer_name=pending.prefill_info["agent_name"],
-                            prefill_kv_indices=pending.kv_indices,
-                            dst_kv_ptrs=pending.prefill_info["kv_ptrs"],
-                            dst_kv_indices=pending.dst_page_indices,
-                            dst_gpu_id=pending.prefill_info["gpu_id"],
-                            notif=notif,
-                        )
-                        pending.state = _KVR_TRANSFERRING
-                        pending.xfer_started_at = time.time()
-                    except Exception as e:
-                        logger.warning(
-                            "KV return: RDMA post failed for req %s: %s",
-                            pending.rid, e,
-                        )
-                        kv_mgr.send_kv_return_metadata(
-                            pending.prefill_info, [],
-                            pending.dst_page_indices, cancel=True,
-                        )
-                        release_kv_cache(pending.req, self.tree_cache)
+                    if not self._start_kv_return_rdma(
+                        pending, page_data, kv_mgr
+                    ):
                         completed_ids.append(req_id)
                     continue
 
