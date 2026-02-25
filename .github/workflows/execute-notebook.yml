@@ -3,9 +3,12 @@ name: Execute Notebooks
 on:
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "python/sglang/**"
       - "docs/**"
+      - "!python/sglang/**/*.md"
+      - "!docs/**/*.md"
   workflow_dispatch:
 
 
@@ -17,9 +20,16 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
+  call-gate:
+    # Align with PR Test: fail fast if PR doesn't have run-ci label.
+    # This makes /tag-and-rerun-ci work by rerunning this failed workflow.
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
   run-all-notebooks:
+    needs: [call-gate]
     runs-on: 1-gpu-runner
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: github.event_name != 'pull_request' || needs.call-gate.result == 'success'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,9 +55,11 @@ jobs:
 
   notebook-finish:
     needs: [
+      call-gate,
       run-all-notebooks
     ]
     runs-on: ubuntu-latest
+    if: always() && needs.run-all-notebooks.result != 'skipped'
     steps:
       - name: Check all dependent job statuses
         run: |

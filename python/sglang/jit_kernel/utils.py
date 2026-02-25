@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import pathlib
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
 
@@ -60,6 +61,9 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = [
+    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
@@ -74,6 +78,12 @@ CPP_DTYPE_MAP = {
     torch.float16: "fp16_t",
     torch.bfloat16: "bf16_t",
 }
+
+
+# AMD/ROCm note:
+@cache_once
+def is_hip_runtime() -> bool:
+    return bool(torch.version.hip)
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -152,16 +162,30 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    return load_inline(
-        "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
-        cpp_sources=cpp_sources,
-        cuda_sources=cuda_sources,
-        extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
-        extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-        extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-        build_directory=build_directory,
-    )
+    # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
+    env_key = "TVM_FFI_CUDA_ARCH_LIST"
+    env_existed = env_key in os.environ
+    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
+    if is_hip_runtime():
+        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
+        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
+    if not env_existed:
+        os.environ[env_key] = _get_cuda_arch_list()
+    try:
+        return load_inline(
+            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
+            cpp_sources=cpp_sources,
+            cuda_sources=cuda_sources,
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )
+    finally:
+        # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
+        if not env_existed:
+            del os.environ[env_key]
 
 
 @cache_once
@@ -170,3 +194,11 @@ def is_arch_support_pdl() -> bool:
 
     device = torch.cuda.current_device()
     return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+@cache_once
+def _get_cuda_arch_list() -> str:
+    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"{major}.{minor}"

@@ -18,6 +18,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -246,7 +247,15 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
@@ -260,6 +269,8 @@ class RouterArgs:
                 "power_of_two",
                 "manual",
                 "bucket",
+                "consistent_hashing",
+                "prefix_hash",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -267,7 +278,15 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -341,6 +360,11 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}test-external-dp-routing",
+            action="store_true",
+            help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
