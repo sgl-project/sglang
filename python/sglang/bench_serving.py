@@ -36,11 +36,8 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets import (
-    DatasetRow,
-    get_dataset,
-    get_mooncake_request_over_time,
-)
+from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
