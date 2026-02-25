@@ -214,6 +214,9 @@ class TestDeepSeekR1EvalMI35x(unittest.TestCase):
                         )
                         passed = acc >= config.accuracy_threshold
                         status = "✅ PASS" if passed else "❌ FAIL"
+                        print(
+                            f"  accuracy={acc:.3f} threshold={config.accuracy_threshold} {status}"
+                        )
 
                         all_results.append(
                             {

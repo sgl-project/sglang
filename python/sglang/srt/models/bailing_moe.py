@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """SGLang BailingMoE model."""
+
 import logging
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -717,7 +718,7 @@ class BailingMoEModel(nn.Module):
                 self.embed_dim,
                 quant_config=quant_config,
                 prefix=add_prefix("word_embeddings", prefix),
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.word_embeddings = PPMissingLayer()
@@ -742,6 +743,8 @@ class BailingMoEModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        self.layers_to_capture = []
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -764,6 +767,10 @@ class BailingMoEModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states if residual is None else hidden_states + residual
+                    )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -789,7 +796,10 @@ class BailingMoEModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
             return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class BailingMoEForCausalLM(nn.Module):
@@ -825,6 +835,8 @@ class BailingMoEForCausalLM(nn.Module):
                 use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
+
+        self.capture_aux_hidden_states = False
 
     @property
     def start_layer(self):
@@ -863,9 +875,14 @@ class BailingMoEForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
@@ -1013,6 +1030,19 @@ class BailingMoEForCausalLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None if num_groups == 0 else num_groups,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            # Add +1 because in SGLang, for the i-th layer, the auxiliary hidden state
+            # corresponds to the output of layer (i - 1).
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

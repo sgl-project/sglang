@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::{debug, error, info, warn};
@@ -203,8 +204,13 @@ impl BucketPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for BucketPolicy {
-    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
@@ -628,6 +634,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         // Two requests len =34 ->load balancing
         policy
@@ -638,6 +645,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -647,6 +655,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(11)).await;
@@ -681,6 +690,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         let idx_2 = policy
             .select_worker(
@@ -690,6 +700,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         let idx_3 = policy
             .select_worker(
@@ -699,6 +710,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(idx_1, 0, "Should not trigger load balancing");
         assert_ne!(idx_2, idx_3, "Should trigger load balancing");
@@ -723,6 +735,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap(); // worker1: 20
         policy
             .select_worker(
@@ -732,6 +745,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap(); // worker1: 8
 
         // Next request should not use bucket scheduling (no load balancing)
@@ -743,6 +757,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(
             idx, 0,
@@ -768,6 +783,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap(); // worker1: 15
         policy
             .select_worker(
@@ -777,6 +793,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap(); // worker2: 5
         policy
             .select_worker(
@@ -786,6 +803,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap(); // worker3: 10
 
         // Next request should use bucket scheduling (load balancing)
@@ -797,6 +815,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(
             idx, 0,
@@ -870,6 +889,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -879,6 +899,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -888,6 +909,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -897,6 +919,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -906,6 +929,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -915,6 +939,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -951,6 +976,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -960,6 +986,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -969,6 +996,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -978,6 +1006,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -987,6 +1016,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -996,6 +1026,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1087,6 +1118,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1120,6 +1152,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1209,6 +1242,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1218,6 +1252,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1227,6 +1262,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1236,6 +1272,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1245,6 +1282,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1254,6 +1292,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1287,6 +1326,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1296,6 +1336,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1305,6 +1346,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1314,6 +1356,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1323,6 +1366,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         policy
             .select_worker(
@@ -1332,6 +1376,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;

@@ -1,9 +1,13 @@
+import multiprocessing as mp
+import unittest
+
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase
 
 # Reward model tests
-register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=69, suite="stage-b-test-small-1-gpu-5090")
-register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,17 +23,15 @@ register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing as mp
-import unittest
 
-import torch
-
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
     ("Skywork/Skywork-Reward-Llama-3.1-8B-v0.2", 1, 4e-2),
+    # Qwen3-based reward model (uses Qwen3ForSequenceClassification)
+    ("Skywork/Skywork-Reward-V2-Qwen3-0.6B", 1, 1.5e-1),
 ]
 TORCH_DTYPES = [torch.float16]
 

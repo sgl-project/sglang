@@ -41,7 +41,8 @@ class BaseTestGptOss(CustomTestCase):
 
         if model_variant == "20b":
             other_args += ["--cuda-graph-max-bs", "600"]
-        if _is_hip:
+        # Respect SGLANG_USE_AITER if already set, otherwise default to "0" for HIP
+        if _is_hip and "SGLANG_USE_AITER" not in os.environ:
             os.environ["SGLANG_USE_AITER"] = "0"
         self._run_test_raw(
             model=model,

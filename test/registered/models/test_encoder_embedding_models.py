@@ -1,8 +1,16 @@
+import multiprocessing as mp
+import random
+import time
+import unittest
+
+import torch
+from transformers import AutoConfig, AutoTokenizer
+
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
+from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 # Encoder embedding model tests (CUDA only)
-register_cuda_ci(est_time=270, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=144, suite="stage-b-test-small-1-gpu-5090")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,16 +28,8 @@ register_cuda_ci(est_time=144, suite="stage-b-test-small-1-gpu-5090")
 
 # python -m unittest test_encoder_embedding_models.TestEncoderEmbeddingModels.test_prefill_logits
 
-import multiprocessing as mp
-import random
-import time
-import unittest
 
-import torch
-from transformers import AutoConfig, AutoTokenizer
-
-from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
+register_cuda_ci(est_time=270, suite="stage-b-test-small-1-gpu")
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 

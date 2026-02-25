@@ -15,6 +15,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.model_loader.loader import ModelOptModelLoader
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,7 +27,6 @@ CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
 register_cuda_ci(est_time=11, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=8, suite="stage-b-test-small-1-gpu-5090")
 
 
 class TestModelOptModelLoader(CustomTestCase):
@@ -63,7 +63,7 @@ class TestModelOptModelLoader(CustomTestCase):
 
         self.model_path = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         self.load_config = LoadConfig()
-        self.device_config = DeviceConfig(device="cuda")
+        self.device_config = DeviceConfig(device=get_device())
 
         # Create a basic model config with unified quantization flag
         self.model_config = ModelConfig(

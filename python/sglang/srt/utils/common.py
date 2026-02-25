@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -70,7 +71,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -101,6 +102,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+torch_release = pkg_version.parse(torch.__version__).release
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -185,6 +187,15 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+@lru_cache(maxsize=1)
+def is_musa() -> bool:
+    try:
+        import torchada  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -235,7 +246,7 @@ is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
 is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version,
-        device_capability_majors=[10, 12],
+        device_capability_majors=[10, 11, 12],
         cuda_version=(12, 8),
     )
 )
@@ -289,6 +300,10 @@ def xpu_has_xmx_support():
     return False
 
 
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
+
+
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
@@ -300,15 +315,14 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_nvidia_cublas_cu12_version_ge_12_9():
+def is_nvidia_cublas_version_ge_12_9():
     """
-    temporary fix for issue #11272
+    temporary fix for issue #11272 (cublas 12.9+)
     """
-    try:
-        installed_version = version("nvidia-cublas-cu12")
-    except PackageNotFoundError:
-        return False
-    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+    for pkg in ("nvidia-cublas", "nvidia-cublas-cu12"):
+        if check_pkg_version_at_least(pkg, "12.9"):
+            return True
+    return False
 
 
 def random_uuid() -> str:
@@ -510,8 +524,8 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
-        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+        props = torch.cuda.get_device_properties(gpu_id)
+        if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
@@ -565,6 +579,25 @@ def get_available_gpu_memory(
         if empty_cache:
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "musa":
+        num_gpus = torch.musa.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.musa.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
+                "which may cause useless memory allocation for torch MUSA context.",
+            )
+        if empty_cache:
+            torch.musa.empty_cache()
+        props = torch.musa.get_device_properties(gpu_id)
+        if props.is_integrated:
+            # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -832,6 +865,9 @@ def load_audio(
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
+    elif audio_file.startswith("file://"):
+        audio_file = unquote(urlparse(audio_file).path)
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -877,6 +913,9 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        image = Image.open(image_file)
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -897,6 +936,10 @@ def get_image_bytes(image_file: Union[str, bytes]):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         return response.content
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        with open(image_file, "rb") as f:
+            return f.read()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -946,8 +989,11 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("file://"):
+                video_file = unquote(urlparse(video_file).path)
+                vr = VideoReader(video_file, ctx=ctx)
             # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
+            elif os.path.isfile(unquote(urlparse(video_file).path)):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -955,6 +1001,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -1010,10 +1058,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -1045,12 +1108,26 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
+def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
+    """
+    Check if a package is installed and meets the minimum version requirement.
+
+    Args:
+        pkg: Package name (distribution name, e.g., "flashinfer-python")
+        min_version: Minimum version required (e.g., "0.6.3")
+
+    Returns:
+        True if package is installed and version >= min_version, False otherwise
+    """
+    try:
+        installed_version = version(pkg)
+        return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
+    except PackageNotFoundError:
+        return False
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1200,7 +1277,9 @@ def broadcast_pyobj(
     of dist_group argument).
     """
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        "cuda"
+        if torch.cuda.is_available() and not force_cpu_device
+        else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -1761,6 +1840,47 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mtgpu_memory_capacity():
+    try:
+        # Run mthreads-gmi and capture the output
+        result = subprocess.run(
+            [
+                "mthreads-gmi --query | grep 'FB Memory Usage' -A 2 | grep 'Total' | awk -F':' '{print $2}' | awk '{print $1}' | sed 's/MiB//'"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"mthreads-gmi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback to torch.musa.mem_get_info() when failed to get memory capacity from mthreads-gmi.
+            if hasattr(torch, "musa") and torch.musa.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from mthreads-gmi, falling back to torch.musa.mem_get_info()."
+                )
+                return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
+        )
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1774,6 +1894,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_cpu_memory_capacity()
     elif device == "xpu":
         gpu_mem = get_xpu_memory_capacity()
+    elif device == "musa":
+        gpu_mem = get_mtgpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1836,7 +1958,7 @@ def init_custom_process_group(
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # We need to determine the appropriate parameter name based on PyTorch version
     pg_options_param_name = (
-        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+        "backend_options" if torch_release >= (2, 6) else "pg_options"
     )
     pg, _ = _new_process_group_helper(
         world_size,
@@ -1872,7 +1994,7 @@ def print_info_once(msg: str) -> None:
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1929,12 +2051,17 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
+    if is_musa():
+        if device_id == None:
+            return "musa"
+        return "musa:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
         except RuntimeError:
@@ -1959,7 +2086,7 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
     return 0
@@ -1967,7 +2094,7 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -2073,7 +2200,13 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
+        if is_npu():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -2314,7 +2447,64 @@ def kill_itself_when_parent_died():
         logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
-def set_uvicorn_logging_configs():
+class UvicornAccessLogFilter(logging.Filter):
+    """Filter uvicorn access logs by request path.
+
+    Notes:
+    - Uvicorn access records usually provide `request_line` like: "GET /metrics HTTP/1.1".
+    - We defensively fall back to parsing `record.getMessage()` if needed.
+    """
+
+    def __init__(self, excluded_path_prefixes=None):
+        super().__init__()
+        excluded_path_prefixes = excluded_path_prefixes or []
+        # Normalize once: drop empty prefixes, stringify, keep as tuple (fast iteration, immutable).
+        self.excluded_path_prefixes = tuple(str(p) for p in excluded_path_prefixes if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        path = None
+
+        request_line = getattr(record, "request_line", None)
+        if request_line:
+            parts = str(request_line).split()
+            if len(parts) >= 2:
+                path = parts[1]
+
+        if not path:
+            # Fallback for non-standard formatters/records
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = None
+            if msg:
+                q1 = msg.find('"')
+                q2 = msg.find('"', q1 + 1) if q1 != -1 else -1
+                if q1 != -1 and q2 != -1:
+                    rl = msg[q1 + 1 : q2]
+                    parts = rl.split()
+                    if len(parts) >= 2:
+                        path = parts[1]
+
+        if not path:
+            return True
+
+        # Strip query string for matching
+        path = str(path)
+        # Some proxies/clients may emit absolute-form request-target in logs:
+        # e.g. "GET https://example.com/metrics HTTP/1.1" -> extract "/metrics".
+        if "://" in path:
+            try:
+                path = urlparse(path).path or path
+            except Exception:
+                # If parsing fails, fall back to the raw value.
+                pass
+        path = path.split("?", 1)[0]
+        return not any(
+            path.startswith(prefix) for prefix in self.excluded_path_prefixes
+        )
+
+
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -2325,6 +2515,68 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+    _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
+
+
+def _configure_uvicorn_access_log_filter(
+    uvicorn_logging_config: dict, server_args=None
+):
+    """Configure uvicorn access log path filter into uvicorn LOGGING_CONFIG.
+
+    This optionally filters uvicorn access logs (e.g., suppress noisy /metrics polling).
+
+    Args:
+        uvicorn_logging_config: The dict-like LOGGING_CONFIG from uvicorn.
+        server_args: Parsed server args object that may contain:
+            - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
+    """
+    # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
+    if server_args is None:
+        return
+
+    filter_name = "sglang_uvicorn_access_path_filter"
+
+    excluded_prefixes = getattr(
+        server_args, "uvicorn_access_log_exclude_prefixes", None
+    )
+    if not excluded_prefixes:
+        return
+
+    # Normalize: accept list/tuple; treat a single string as one prefix (not an iterable of chars).
+    if isinstance(excluded_prefixes, str):
+        excluded_prefixes = [excluded_prefixes]
+
+    # De-duplicate while keeping order; drop empty prefixes.
+    excluded_prefixes = [p for p in excluded_prefixes if p]
+    excluded_prefixes = list(dict.fromkeys(excluded_prefixes))
+    if not excluded_prefixes:
+        return
+
+    uvicorn_logging_config.setdefault("filters", {})
+    uvicorn_logging_config["filters"][filter_name] = {
+        "()": "sglang.srt.utils.common.UvicornAccessLogFilter",
+        "excluded_path_prefixes": excluded_prefixes,
+    }
+
+    # Attach filter to access handler and/or uvicorn.access logger (best-effort across uvicorn versions).
+    handlers = uvicorn_logging_config.get("handlers", {})
+    if "access" in handlers:
+        filters_list = handlers["access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            handlers["access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
+
+    loggers_cfg = uvicorn_logging_config.get("loggers", {})
+    if "uvicorn.access" in loggers_cfg:
+        filters_list = loggers_cfg["uvicorn.access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            loggers_cfg["uvicorn.access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
 
 
 def get_open_port() -> int:
@@ -2589,6 +2841,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def get_quantization_config(hf_config) -> str | None:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -2743,6 +3003,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -2751,7 +3012,10 @@ def is_fa3_default_architecture(hf_config):
         "Glm4MoeForCausalLM",
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
+        "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+        "StepVLForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
 
@@ -3464,19 +3728,27 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id() -> int:
+def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
+
+    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
+    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
+    the device ID unchanged.
+
+    Args:
+        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
+
+    Returns:
+        The physical device ID
     """
+    device_idx = int(pytorch_device_id)
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    assert (
-        cuda_visible_devices is not None
-    ), "CUDA_VISIBLE_DEVICES should be set in a scheduler"
-    device_list = cuda_visible_devices.split(",")
-    assert (
-        len(device_list) == 1
-    ), "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
-    return int(device_list[0])
+    if cuda_visible_devices:
+        device_list = cuda_visible_devices.split(",")
+        return int(device_list[device_idx])
+    else:
+        return device_idx
 
 
 def get_device_sm_nvidia_smi():
@@ -3502,13 +3774,28 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
+def get_libnuma():
+    libnuma = None
 
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_localalloc()
+    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
+        try:
+            libnuma = ctypes.CDLL(libnuma_so)
+        except OSError as e:
+            logger.error(f"{e}")
+            libnuma = None
+        if libnuma is not None:
+            break
+    return libnuma
+
+
+def numa_bind_to_node(node: int):
+    libnuma = get_libnuma()
+
+    if libnuma is None or libnuma.numa_available() < 0:
+        logger.error("numa not available on this system, skip bind action")
+    else:
+        libnuma.numa_run_on_node(ctypes.c_int(node))
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 def json_list_type(value):
@@ -3808,3 +4095,116 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def get_numa_node_count() -> int:
+    """
+    Get the number of NUMA nodes available on the system.
+    Must be called after is_numa_available() is True.
+    Returns:
+        int: The number of NUMA nodes.
+    """
+    libnuma = get_libnuma()
+    return libnuma.numa_max_node() + 1
+
+
+def is_numa_available() -> bool:
+    try:
+        libnuma = get_libnuma()
+        return libnuma.numa_available() >= 0
+    except Exception:
+        return False
+
+
+def get_system_nvgpu_count() -> int:
+    """
+    Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
+
+    Returns:
+        int: The total number of physical GPUs.
+    """
+    result = subprocess.run(
+        ["nvidia-smi", "--list-gpus"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    gpu_lines = [
+        line
+        for line in result.stdout.strip().split("\n")
+        if line.strip().startswith("GPU")
+    ]
+    return len(gpu_lines)
+
+
+@lru_cache(maxsize=1)
+def get_current_device_numa_node_cuda() -> int:
+    """
+    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
+
+    First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
+    If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
+    evenly across NUMA nodes based on GPU ID intervals.
+
+    For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
+
+    Returns:
+        int: The NUMA node ID (e.g., 0, 1).
+
+    Raises:
+        RuntimeError: If device information cannot be retrieved.
+    """
+    import torch
+
+    logical_device_id = torch.cuda.current_device()
+    physical_device_id = get_physical_device_id(logical_device_id)
+
+    # Query NUMA topology from nvidia-smi
+    result = subprocess.run(
+        ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output_line = result.stdout.strip()
+    prefix = "NUMA IDs of closest CPU:"
+
+    if output_line.startswith(prefix):
+        numa_id_str = output_line[len(prefix) :].strip()
+        if numa_id_str.isdigit():
+            return int(numa_id_str)
+
+    # Fall back: distribute GPUs evenly across NUMA nodes
+    numa_count = get_numa_node_count()
+    gpu_count = get_system_nvgpu_count()
+
+    if gpu_count >= numa_count:
+        gpus_per_numa = gpu_count // numa_count  # >= 1
+        numa_node = physical_device_id // gpus_per_numa  # 0 ~ numa_count - 1
+    else:
+        logger.warning(
+            f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
+        )
+        numa_node = 0
+
+    return numa_node
+
+
+def nvgpu_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.cuda is None:
+        return False
+    return True
+
+
+def bind_to_closest_numa_node_cuda():
+    """
+    Bind the current process to the NUMA node closest to the active CUDA device.
+
+    Uses `numa` library calls via ctypes to set the CPU affinity of the process.
+    """
+    if is_numa_available() and nvgpu_available():
+        node_id = get_current_device_numa_node_cuda()
+        numa_bind_to_node(node_id)

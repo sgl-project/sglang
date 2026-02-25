@@ -4,9 +4,9 @@ mod discover_dp;
 mod discover_metadata;
 mod find_worker_to_update;
 mod find_workers_to_remove;
-mod register_tokenizer;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
+mod submit_tokenizer_job;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;
@@ -27,12 +27,13 @@ pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
-pub use register_tokenizer::RegisterTokenizerStep;
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
+pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
+use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
 use crate::{
@@ -45,7 +46,6 @@ use crate::{
         Worker, WorkerRegistry,
     },
     protocols::worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
-    workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
 
 /// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
@@ -159,15 +159,11 @@ pub fn create_local_worker_workflow(
         )
         .add_step(
             StepDefinition::new(
-                "register_tokenizer",
-                "Register Tokenizer",
-                Arc::new(RegisterTokenizerStep),
+                "submit_tokenizer_job",
+                "Submit Tokenizer Job",
+                Arc::new(SubmitTokenizerJobStep),
             )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(10))
+            .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&["register_workers"]),
         )

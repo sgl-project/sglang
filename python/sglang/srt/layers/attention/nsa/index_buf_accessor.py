@@ -4,7 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -349,21 +353,24 @@ def _set_k_and_s_triton(
         raise ValueError(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
-    if is_hip():
+    if _is_hip:
         assert buf_numel_per_page == 1 * (128 + 4)
     else:
         assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
-    if is_hip():
+    if _is_hip:
         assert page_size == 1
     else:
         assert page_size == 64
 
     assert buf.dtype == torch.uint8
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
-    assert index_k.dtype == torch.float8_e4m3fn
+    if _is_fp8_fnuz:
+        assert index_k.dtype == torch.float8_e4m3fnuz
+    else:
+        assert index_k.dtype == torch.float8_e4m3fn
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
@@ -371,7 +378,10 @@ def _set_k_and_s_triton(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    if _is_fp8_fnuz:
+        buf_fp8 = buf.view(torch.float8_e4m3fnuz)
+    else:
+        buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
