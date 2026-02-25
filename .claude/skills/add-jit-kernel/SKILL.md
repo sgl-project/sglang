@@ -78,7 +78,7 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 auto N = SymbolicSize{"num_elements"};
 auto device = SymbolicDevice{};
 device.set_options<kDLCUDA>();
-TensorMatcher({N})
+TensorMatcher({N})  //
     .with_dtype<fp16_t>()
     .with_device(device)
     .verify(dst)
@@ -255,7 +255,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({N})
+  TensorMatcher({N})  //
       .with_dtype<T>()
       .with_device(device_)
       .verify(dst)
