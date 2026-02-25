@@ -46,7 +46,16 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -92,6 +101,9 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+)
+from sglang.srt.entrypoints.openai.serving_transcription import (
+    OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -140,13 +152,17 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
+from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.trace import (
+    process_tracing_init,
+    set_global_trace_level,
+    trace_set_thread_info,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -296,6 +312,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
     )
 
@@ -865,6 +884,16 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/set_trace_level", methods=["GET", "POST"])
+def set_trace_level(level: int = Query(..., ge=0)):
+    set_global_trace_level(level)
+
+    return Response(
+        content="success",
+        status_code=200,
+    )
+
+
 @app.api_route("/freeze_gc", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def freeze_gc_async():
@@ -1415,6 +1444,38 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     """OpenAI-compatible detokenization endpoint."""
     return await raw_request.app.state.openai_serving_detokenize.handle_request(
         request, raw_request
+    )
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_v1_audio_transcriptions(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(default="default"),
+    language: Optional[str] = Form(default=None),
+    response_format: str = Form(default="json"),
+    temperature: float = Form(default=0.0),
+    stream: bool = Form(default=False),
+):
+    """OpenAI-compatible audio transcription endpoint."""
+    if response_format not in ["json", "text"]:
+        return ORJSONResponse(
+            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            status_code=400,
+        )
+
+    audio_data = await file.read()
+
+    return (
+        await raw_request.app.state.openai_serving_transcription.create_transcription(
+            audio_data=audio_data,
+            model=model,
+            language=language,
+            response_format=response_format,
+            temperature=temperature,
+            stream=stream,
+            raw_request=raw_request,
+        )
     )
 
 

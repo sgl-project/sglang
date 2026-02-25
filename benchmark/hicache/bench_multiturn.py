@@ -11,7 +11,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.benchmark.datasets import sample_random_requests
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import async_request_sglang_generate, gen_payload
 
