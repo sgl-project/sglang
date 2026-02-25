@@ -21,18 +21,18 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -60,7 +60,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
+from sglang.srt.observability.req_time_stats import (
+    set_schedule_time_batch,
+    set_time_batch,
+)
 from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -69,8 +72,16 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+
+
+def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
+    return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+        req.bootstrap_host is None
+        and server_args.disaggregation_transfer_backend == "fake"
+    )
 
 
 class DecodeReqToTokenPool:
@@ -193,7 +204,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: BaseKVReceiver
+    kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
@@ -264,7 +275,7 @@ class DecodePreallocQueue:
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-    def _init_kv_manager(self) -> BaseKVManager:
+    def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -326,10 +337,8 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        kv_manager_class: Type[BaseKVManager] = get_kv_class(
-            self.transfer_backend, KVClassType.MANAGER
-        )
-        kv_manager: BaseKVManager = kv_manager_class(
+        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
@@ -346,20 +355,17 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            dp_rank = self._resolve_dp_rank(req)
-            if dp_rank is None:
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is None:
                 self.pending_reqs.append(req)
                 return
-            self._create_receiver_and_enqueue(req, dp_rank)
+            self._create_receiver_and_enqueue(req, prefill_dp_rank)
 
-    def _resolve_dp_rank(self, req: Req) -> Optional[int]:
-        if req.data_parallel_rank is not None:
-            return req.data_parallel_rank
+    def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+        if req.disagg_prefill_dp_rank is not None:
+            return req.disagg_prefill_dp_rank
 
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
+        if _is_fake_transfer(req, self.scheduler.server_args):
             return 0
 
         bootstrap_addr = f"{req.bootstrap_host}:{req.bootstrap_port}"
@@ -368,31 +374,29 @@ class DecodePreallocQueue:
         if prefill_info is None:
             return None
 
+        if prefill_info.dp_size == 1:
+            return 0
+
         if prefill_info.follow_bootstrap_room:
             return req.bootstrap_room % prefill_info.dp_size
 
         return None
 
-    def _create_receiver_and_enqueue(self, req: Req, dp_rank: int) -> None:
-        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
-        else:
-            kv_receiver_class = get_kv_class(
-                self.transfer_backend, KVClassType.RECEIVER
-            )
+    def _create_receiver_and_enqueue(self, req: Req, prefill_dp_rank: int) -> None:
+        backend = (
+            TransferBackend.FAKE
+            if _is_fake_transfer(req, self.scheduler.server_args)
+            else self.transfer_backend
+        )
+        kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
-            prefill_dp_rank=dp_rank,
+            prefill_dp_rank=prefill_dp_rank,
         )
 
-        req.add_latency(RequestStage.DECODE_PREPARE)
-        trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
         self.queue.append(
             DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
         )
@@ -492,16 +496,16 @@ class DecodePreallocQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _resolve_pending_reqs(self) -> None:
-        """Batch-resolve dp_ranks for pending requests and create receivers."""
+        """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
             return
 
         bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
 
         # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the dp_rank,
+        # we need get the prefill info before resolving the prefill_dp_ranks
         # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving the dp_rank
+        # so we need to ensure the parallel info before resolving it.
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
             return
 
@@ -509,9 +513,9 @@ class DecodePreallocQueue:
         need_query = []
         for req in self.pending_reqs:
             # NOTE: we need resolve it again because we may ensure the parallel info here
-            dp_rank = self._resolve_dp_rank(req)
-            if dp_rank is not None:
-                resolved.append((req, dp_rank))
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                resolved.append((req, prefill_dp_rank))
             else:
                 need_query.append(req)
 
@@ -533,8 +537,8 @@ class DecodePreallocQueue:
         else:
             self.pending_reqs = []
 
-        for req, dp_rank in resolved:
-            self._create_receiver_and_enqueue(req, dp_rank)
+        for req, prefill_dp_rank in resolved:
+            self._create_receiver_and_enqueue(req, prefill_dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -668,13 +672,7 @@ class DecodePreallocQueue:
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
-            decode_req.req.time_stats.decode_transfer_queue_entry_time = (
-                time.perf_counter()
-            )
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
-            trace_slice_end(
-                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
-            )
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -833,11 +831,7 @@ class DecodeTransferQueue:
             else 0
         )
 
-        if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
-            decode_req.req.bootstrap_host is None
-            and self.scheduler.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            # Warm up or fake transfer mode
+        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
             pass
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)
@@ -887,12 +881,7 @@ class DecodeTransferQueue:
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
-        trace_slice_end(
-            RequestStage.DECODE_TRANSFERRED,
-            decode_req.req.rid,
-            auto_next_anon=True,
-        )
-        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+        decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
@@ -956,7 +945,6 @@ class DecodeTransferQueue:
         for i in indices_to_remove:
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
-            self.queue[i].req.add_latency(RequestStage.DECODE_TRANSFERRED)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -1079,7 +1067,7 @@ class SchedulerDisaggregationDecodeMixin:
         ret = self.maybe_prepare_mlp_sync_batch(ret)
 
         if ret:
-            trace_event_batch("schedule", ret.reqs)
+            set_schedule_time_batch(ret)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1107,7 +1095,6 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                req.add_latency(RequestStage.DECODE_WAITING)
                 req.init_next_round_input(self.tree_cache)
             else:
                 waiting_queue.append(req)
@@ -1116,8 +1103,7 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
-        for req in can_run_list:
-            req.time_stats.forward_entry_time = time.perf_counter()
+        set_time_batch(can_run_list, "set_forward_entry_time")
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

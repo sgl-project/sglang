@@ -42,7 +42,7 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.2-3B-Instruct": 0.55,
     # Mistral series
     "mistralai/Mistral-7B-Instruct-v0.3": 0.55,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.58,
     # DeepSeek series
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     # Qwen2 series

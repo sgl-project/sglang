@@ -1,50 +1,58 @@
-import tempfile
-import unittest
-from pathlib import Path
+import sys
 
 import polars as pl
+import pytest
 import torch
 
+from sglang.srt.debug_utils.dump_loader import (
+    ValueWithMeta,
+    _add_duplicate_index,
+    _cast_to_polars_dtype,
+    find_row,
+    read_meta,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="default", nightly=True)
 
 
-class TestDumpLoader(CustomTestCase):
-    def test_read_meta(self):
-        from sglang.srt.debug_utils.dump_loader import read_meta
+class TestReadMeta:
+    def test_basic(self, tmp_path):
+        for fn in [
+            "step=1___rank=0___dump_index=1___name=a.pt",
+            "step=2___rank=0___dump_index=2___name=b.pt",
+        ]:
+            torch.save(torch.randn(5), tmp_path / fn)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for fn in [
-                "step=1___rank=0___dump_index=1___name=a.pt",
-                "step=2___rank=0___dump_index=2___name=b.pt",
-            ]:
-                torch.save(torch.randn(5), Path(tmpdir) / fn)
+        df = read_meta(str(tmp_path))
+        assert len(df) == 2
+        assert all(c in df.columns for c in ["step", "rank", "name"])
 
-            df = read_meta(tmpdir)
-            self.assertEqual(len(df), 2)
-            self.assertTrue(all(c in df.columns for c in ["step", "rank", "name"]))
 
-    def test_find_row(self):
-        from sglang.srt.debug_utils.dump_loader import find_row
-
+class TestFindRow:
+    def test_single_match(self):
         df = pl.DataFrame({"id": [1, 2], "name": ["a", "b"], "file": ["f1", "f2"]})
-        self.assertEqual(find_row(df, {"id": 2})["file"], "f2")
-        self.assertIsNone(find_row(df, {"id": 999}))
+        assert find_row(df, {"id": 2})["file"] == "f2"
 
-        df_dup = pl.DataFrame({"id": [1, 1], "file": ["f1", "f2"]})
-        self.assertIsNone(find_row(df_dup, {"id": 1}))
+    def test_no_match(self):
+        df = pl.DataFrame({"id": [1, 2], "name": ["a", "b"], "file": ["f1", "f2"]})
+        assert find_row(df, {"id": 999}) is None
 
-    def test_cast_to_polars_dtype(self):
-        from sglang.srt.debug_utils.dump_loader import _cast_to_polars_dtype
+    def test_ambiguous(self):
+        df = pl.DataFrame({"id": [1, 1], "file": ["f1", "f2"]})
+        assert find_row(df, {"id": 1}) is None
 
-        self.assertEqual(_cast_to_polars_dtype("42", pl.Int64), 42)
-        self.assertEqual(_cast_to_polars_dtype("3.14", pl.Float64), 3.14)
 
-    def test_add_duplicate_index(self):
-        from sglang.srt.debug_utils.dump_loader import _add_duplicate_index
+class TestCastToPolars:
+    def test_int(self):
+        assert _cast_to_polars_dtype("42", pl.Int64) == 42
 
+    def test_float(self):
+        assert _cast_to_polars_dtype("3.14", pl.Float64) == pytest.approx(3.14)
+
+
+class TestAddDuplicateIndex:
+    def test_basic(self):
         df = pl.DataFrame(
             {
                 "name": ["a", "a", "b"],
@@ -53,13 +61,40 @@ class TestDumpLoader(CustomTestCase):
             }
         )
         result = _add_duplicate_index(df)
-        self.assertEqual(
-            result.filter(pl.col("name") == "a")
-            .sort("dump_index")["duplicate_index"]
-            .to_list(),
-            [0, 1],
-        )
+        assert result.filter(pl.col("name") == "a").sort("dump_index")[
+            "duplicate_index"
+        ].to_list() == [0, 1]
+
+
+class TestValueWithMeta:
+    def test_load_dict_format(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=hidden.pt"
+        tensor = torch.randn(4, 8)
+        torch.save({"value": tensor, "meta": {"custom": "field"}}, path)
+
+        loaded = ValueWithMeta.load(path)
+        assert torch.allclose(loaded.value, tensor)
+        assert loaded.meta["custom"] == "field"
+        assert loaded.meta["name"] == "hidden"
+        assert loaded.meta["rank"] == 0
+
+    def test_load_bare_tensor(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=bare.pt"
+        tensor = torch.randn(3, 3)
+        torch.save(tensor, path)
+
+        loaded = ValueWithMeta.load(path)
+        assert torch.allclose(loaded.value, tensor)
+        assert loaded.meta["name"] == "bare"
+
+    def test_load_corrupted_file(self, tmp_path) -> None:
+        path = tmp_path / "step=0___rank=0___dump_index=1___name=bad.pt"
+        path.write_text("not a valid pt file")
+
+        loaded = ValueWithMeta.load(path)
+        assert loaded.value is None
+        assert loaded.meta["name"] == "bad"
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
