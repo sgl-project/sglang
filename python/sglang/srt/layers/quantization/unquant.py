@@ -548,7 +548,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
-        # topk_weights: [B*S, K]; topk_ids: [B*S, K]
+        # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
         original_dtype = x.dtype
