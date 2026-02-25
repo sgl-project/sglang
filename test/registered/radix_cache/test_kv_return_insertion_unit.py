@@ -43,19 +43,10 @@ def _make_scheduler(
 ):
     """Create a minimal mock scheduler with the attributes needed by
     _process_kv_return_insertions."""
-    from sglang.srt.managers.scheduler_runtime_checker_mixin import (
-        SchedulerRuntimeCheckerMixin,
-    )
-
     sched = MagicMock()
 
-    # Bind the real method under test
-    sched._process_kv_return_insertions = (
-        SchedulerRuntimeCheckerMixin.__dict__  # bypass descriptor protocol
-    )
-    # Actually, _process_kv_return_insertions is on Scheduler, not the mixin.
-    # We need to import it from scheduler. Since importing scheduler pulls in
-    # heavy deps, we bind the method manually from its source module.
+    # Bind the real method under test.  Importing Scheduler pulls in heavy deps,
+    # so we bind the method manually from its source module.
     import types
 
     from sglang.srt.managers.scheduler import Scheduler
