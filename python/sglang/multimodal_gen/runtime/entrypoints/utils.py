@@ -353,62 +353,18 @@ def save_outputs(
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
 
-        # When frame interpolation is requested for video, extract frames first
-        # (without saving), interpolate, then save with updated fps.
-        do_interpolate = enable_frame_interpolation and data_type == DataType.VIDEO
-
-        if do_interpolate:
-            # 1. Extract frames only — do not write to disk yet
-            frames = post_process_sample(
-                sample,
-                data_type,
-                fps,
-                save_output=False,
-                save_file_path=None,
-                audio_sample_rate=audio_sample_rate,
-                output_compression=output_compression,
-            )
-
-            # 2. Interpolate (skip if fewer than 2 frames)
-            if len(frames) > 1:
-                from sglang.multimodal_gen.runtime.frame_interpolation import (
-                    interpolate_video_frames,
-                )
-
-                frames, multiplier = interpolate_video_frames(
-                    frames,
-                    exp=frame_interpolation_exp,
-                    scale=frame_interpolation_scale,
-                )
-                effective_fps = fps * multiplier
-            else:
-                effective_fps = fps
-
-            # 3. Re-pack interpolated frames and save via post_process_sample
-            interpolated_sample = np.stack(frames)
-            # Re-attach per-sample audio (was packed into `sample` by
-            # attach_audio_to_video_sample above)
-            if isinstance(sample, (tuple, list)) and len(sample) == 2:
-                interpolated_sample = (interpolated_sample, sample[1])
-            frames = post_process_sample(
-                interpolated_sample,
-                data_type,
-                effective_fps,
-                save_output=save_output,
-                save_file_path=save_file_path,
-                audio_sample_rate=audio_sample_rate,
-                output_compression=output_compression,
-            )
-        else:
-            frames = post_process_sample(
-                sample,
-                data_type,
-                fps,
-                save_output,
-                save_file_path,
-                audio_sample_rate=audio_sample_rate,
-                output_compression=output_compression,
-            )
+        frames = post_process_sample(
+            sample,
+            data_type,
+            fps,
+            save_output,
+            save_file_path,
+            audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
+            enable_frame_interpolation=enable_frame_interpolation,
+            frame_interpolation_exp=frame_interpolation_exp,
+            frame_interpolation_scale=frame_interpolation_scale,
+        )
 
         if samples_out is not None:
             samples_out.append(sample)
@@ -436,14 +392,18 @@ def post_process_sample(
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
 ):
     """
-    Process sample output and save video if necessary
+    Process sample output, optionally interpolate video frames, and save.
     """
     audio = None
     if isinstance(sample, (tuple, list)) and len(sample) == 2:
         sample, audio = sample
 
+    # 1. Convert tensor / array to list of uint8 HWC frames
     frames = None
     if isinstance(sample, torch.Tensor):
         if sample.dim() == 3:
@@ -476,7 +436,20 @@ def post_process_sample(
                 arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
             frames = list(arr)
 
-    # 2. Save outputs if requested
+    # 2. Frame interpolation (video only)
+    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        from sglang.multimodal_gen.runtime.frame_interpolation import (
+            interpolate_video_frames,
+        )
+
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=frame_interpolation_exp,
+            scale=frame_interpolation_scale,
+        )
+        fps = fps * multiplier
+
+    # 3. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
