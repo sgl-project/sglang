@@ -1,136 +1,31 @@
-"""
-Unit tests for decode-side KV cache offload finalize-release logic.
-
-Usage:
-    python -m pytest test/unit/test_decode_kvcache_offload_by_page_size.py -v
-"""
-
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
 import types
 import unittest
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
+import Any
+import List
+import Optional
 import torch
+import Union
 
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
+from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-
-def _ensure_pkg(name: str) -> types.ModuleType:
-    if name in sys.modules:
-        m = sys.modules[name]
-        if not hasattr(m, "__path__"):
-            m.__path__ = []
-        return m
-    m = types.ModuleType(name)
-    m.__path__ = []
-    sys.modules[name] = m
-    return m
-
-
-def _install_stub_module(fullname: str, **attrs) -> None:
-    parts = fullname.split(".")
-    for i in range(1, len(parts)):
-        _ensure_pkg(".".join(parts[:i]))
-    m = types.ModuleType(fullname)
-    for k, v in attrs.items():
-        setattr(m, k, v)
-    sys.modules[fullname] = m
-
-
-def _load_module_from_path(module_name: str, file_path: str):
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    assert spec is not None and spec.loader is not None
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-def _bootstrap_sglang_namespace(python_dir: str) -> None:
-    sglang_dir = os.path.join(python_dir, "sglang")
-    sg = types.ModuleType("sglang")
-    sg.__path__ = [sglang_dir]
-    sys.modules["sglang"] = sg
-    _ensure_pkg("sglang.srt")
-    if python_dir not in sys.path:
-        sys.path.insert(0, python_dir)
-
-
-def _load_decode_kvcache_offload_manager():
-    repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    python_dir = os.path.join(repo_dir, "python")
-    _bootstrap_sglang_namespace(python_dir)
-
-    class HiCacheController:  # pragma: no cover
-        pass
-
-    class BaseTokenToKVPoolAllocator:  # pragma: no cover
-        pass
-
-    class BasePrefixCache:  # pragma: no cover
-        pass
-
-    class MHATokenToKVPool:  # pragma: no cover
-        pass
-
-    class MLATokenToKVPool:  # pragma: no cover
-        pass
-
-    class ReqToTokenPool:  # pragma: no cover
-        pass
-
-    class MHATokenToKVPoolHost:  # pragma: no cover
-        pass
-
-    class MLATokenToKVPoolHost:  # pragma: no cover
-        pass
-
-    class ServerArgs:  # pragma: no cover
-        pass
-
-    _install_stub_module(
-        "sglang.srt.managers.cache_controller",
-        HiCacheController=HiCacheController,
-    )
-    _install_stub_module(
-        "sglang.srt.mem_cache.allocator",
-        BaseTokenToKVPoolAllocator=BaseTokenToKVPoolAllocator,
-    )
-    _install_stub_module(
-        "sglang.srt.mem_cache.base_prefix_cache",
-        BasePrefixCache=BasePrefixCache,
-    )
-    _install_stub_module(
-        "sglang.srt.mem_cache.memory_pool",
-        MHATokenToKVPool=MHATokenToKVPool,
-        MLATokenToKVPool=MLATokenToKVPool,
-        ReqToTokenPool=ReqToTokenPool,
-    )
-    _install_stub_module(
-        "sglang.srt.mem_cache.memory_pool_host",
-        MHATokenToKVPoolHost=MHATokenToKVPoolHost,
-        MLATokenToKVPoolHost=MLATokenToKVPoolHost,
-    )
-    _install_stub_module(
-        "sglang.srt.server_args",
-        ServerArgs=ServerArgs,
-    )
-
-    decode_mgr_path = os.path.join(
-        python_dir,
-        "sglang",
-        "srt",
-        "disaggregation",
-        "decode_kvcache_offload_manager.py",
-    )
-    return _load_module_from_path(
-        "_decode_kvcache_offload_manager_for_test", decode_mgr_path
-    )
 
 
 @dataclass
@@ -139,7 +34,7 @@ class _TimeStats:
     completion_time: float = 0.0
 
 
-class _DummyReq:
+class _DummyReq(Req):
     def __init__(self, *, rid: str, req_pool_idx: int, origin_input_ids: list[int]):
         self.rid = rid
         self.req_pool_idx = req_pool_idx
@@ -149,6 +44,7 @@ class _DummyReq:
         self.time_stats = _TimeStats()
         self._committed_kv_cache = 0
         self._overalloc = (0, 0)
+        self.is_retracted = False
 
     def finished(self) -> bool:
         return True
@@ -160,43 +56,78 @@ class _DummyReq:
         return self._overalloc
 
 
-class _DummyReqToTokenPool:
+class _DummyReqToTokenPool(ReqToTokenPool):
     def __init__(self, req_to_token: torch.Tensor):
         self.req_to_token = req_to_token
         self.freed_reqs: list[str] = []
+        self.idx_to_rid = {}
 
-    def free(self, req: _DummyReq):
-        self.freed_reqs.append(req.rid)
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, int):
+            rid = self.idx_to_rid.get(free_index, str(free_index))
+            self.freed_reqs.append(rid)
+        else:
+            for idx in free_index:
+                rid = self.idx_to_rid.get(idx, str(idx))
+                self.freed_reqs.append(rid)
 
 
-class _DummyAllocator:
+class _DummyAllocator(BaseTokenToKVPoolAllocator):
     def __init__(self):
         self.freed: list[torch.Tensor] = []
+        self.is_not_in_free_group = True
 
     def free(self, indices: torch.Tensor):
         self.freed.append(indices.detach().cpu().clone())
 
+    def clear(self):
+        pass
 
-class _DummyTreeCache:
+    def alloc(self, need_size: int):
+        return None
+
+
+class _DummyTreeCache(BasePrefixCache):
     def __init__(self):
         self.protected_size_ = 0
 
+    def reset(self):
+        pass
+
+    def match_prefix(self, key: Any, **kwargs):
+        return None
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        pass
+
+    def cache_unfinished_req(self, req: Req, **kwargs):
+        pass
+
+    def evict(self, num_tokens: int):
+        pass
+
+    def inc_lock_ref(self, node: Any):
+        pass
+
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+        pass
+
 
 class TestFinalizeReleaseOnFinish(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls._decode_mgr_mod = _load_decode_kvcache_offload_manager()
-        cls.DecodeKVCacheOffloadManager = (
-            cls._decode_mgr_mod.DecodeKVCacheOffloadManager
-        )
-
     def _make_manager(self, *, page_size: int):
         req_to_token = torch.arange(0, 64, dtype=torch.int64).reshape(1, 64)
         req_to_token_pool = _DummyReqToTokenPool(req_to_token=req_to_token)
+        req_to_token_pool.idx_to_rid[0] = "r1"
+        req_to_token_pool.idx_to_rid[0] = "r2"
+        req_to_token_pool.idx_to_rid[0] = "r3"
+        req_to_token_pool.idx_to_rid[0] = "r4"
+        # Since all tests use req_pool_idx=0, we can just map 0 to the current req rid in each test if needed,
+        # or just use a generic way. For now, let's just make sure it doesn't crash.
+        # Better: let each test set the mapping.
         allocator = _DummyAllocator()
         tree_cache = _DummyTreeCache()
 
-        mgr = self.DecodeKVCacheOffloadManager.__new__(self.DecodeKVCacheOffloadManager)
+        mgr = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
         mgr.req_to_token_pool = req_to_token_pool
         mgr.token_to_kv_pool_allocator = allocator
         mgr.page_size = page_size
@@ -210,6 +141,7 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
 
         req = _DummyReq(rid="r1", req_pool_idx=0, origin_input_ids=list(range(10)))
         req._committed_kv_cache = 10
+        pool.idx_to_rid[0] = "r1"
 
         mgr.finalize_release_on_finish(req)
 
@@ -221,10 +153,11 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
 
     def test_finalize_does_not_double_free_prefill_when_inc_offloaded(self):
         mgr, pool, allocator, _ = self._make_manager(page_size=4)
-        mgr.offloaded_state["r2"] = {"prefill_len": 8, "inc_len": 4}
+        mgr.offloaded_state["r2"] = OffloadedState(prefill_len=8, inc_len=4)
 
         req = _DummyReq(rid="r2", req_pool_idx=0, origin_input_ids=list(range(10)))
         req._committed_kv_cache = 14
+        pool.idx_to_rid[0] = "r2"
 
         mgr.finalize_release_on_finish(req)
 
@@ -235,10 +168,11 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
 
     def test_finalize_frees_prefill_when_state_exists_but_inc_never_offloaded(self):
         mgr, pool, allocator, _ = self._make_manager(page_size=4)
-        mgr.offloaded_state["r3"] = {"prefill_len": 8, "inc_len": 0}
+        mgr.offloaded_state["r3"] = OffloadedState(prefill_len=8, inc_len=0)
 
         req = _DummyReq(rid="r3", req_pool_idx=0, origin_input_ids=list(range(10)))
         req._committed_kv_cache = 10
+        pool.idx_to_rid[0] = "r3"
 
         mgr.finalize_release_on_finish(req)
 
@@ -248,81 +182,27 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
         self.assertEqual(pool.freed_reqs, ["r3"])
         self.assertNotIn("r3", mgr.offloaded_state)
 
+    def test_finalize_frees_overallocated_kv(self):
+        mgr, pool, allocator, _ = self._make_manager(page_size=4)
+
+        req = _DummyReq(rid="r4", req_pool_idx=0, origin_input_ids=list(range(10)))
+        req._committed_kv_cache = 10
+        req._overalloc = (10, 14)
+        pool.idx_to_rid[0] = "r4"
+
+        mgr.finalize_release_on_finish(req)
+
+        # 1. prefill-aligned: [0, 8]
+        # 2. remaining: [8, 10]
+        # 3. overalloc: [12, 14] (10 is aligned up to 12)
+        self.assertEqual(len(allocator.freed), 3)
+        self.assertTrue(torch.equal(allocator.freed[0], torch.arange(0, 8)))
+        self.assertTrue(torch.equal(allocator.freed[1], torch.arange(8, 10)))
+        self.assertTrue(torch.equal(allocator.freed[2], torch.arange(12, 14)))
+        self.assertEqual(pool.freed_reqs, ["r4"])
+
 
 class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        python_dir = os.path.join(repo_dir, "python")
-        _bootstrap_sglang_namespace(python_dir)
-
-        class _EnvVar:
-            def __init__(self, v):
-                self._v = v
-
-            def get(self):
-                return self._v
-
-        class _Envs:
-            SGLANG_FORWARD_TIMEOUT_MS = _EnvVar(0)
-            SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = _EnvVar(0)
-
-        class DisaggregationMode:
-            DECODE = "decode"
-
-        _install_stub_module(
-            "sglang.srt.disaggregation.utils", DisaggregationMode=DisaggregationMode
-        )
-        _install_stub_module("sglang.srt.environ", envs=_Envs())
-        _install_stub_module(
-            "sglang.srt.layers.logits_processor", LogitsProcessorOutput=object
-        )
-        _install_stub_module(
-            "sglang.srt.layers.moe.routed_experts_capturer",
-            get_global_experts_capturer=lambda: types.SimpleNamespace(
-                get_routed_experts=lambda **_: []
-            ),
-        )
-        _install_stub_module(
-            "sglang.srt.managers.io_struct",
-            AbortReq=object,
-            BatchEmbeddingOutput=object,
-            BatchTokenIDOutput=object,
-        )
-        _install_stub_module(
-            "sglang.srt.managers.schedule_batch",
-            FINISH_ABORT=lambda *_args, **_kwargs: None,
-            BaseFinishReason=object,
-            Req=object,
-            RequestStage=types.SimpleNamespace(),
-            ScheduleBatch=object,
-        )
-        _install_stub_module(
-            "sglang.srt.mem_cache.common", release_kv_cache=lambda *_: None
-        )
-        _install_stub_module(
-            "sglang.srt.server_args",
-            get_global_server_args=lambda: types.SimpleNamespace(),
-        )
-        _install_stub_module(
-            "sglang.srt.tracing.trace",
-            trace_slice=lambda *_args, **_kwargs: None,
-            trace_slice_batch=lambda *_args, **_kwargs: None,
-            trace_slice_end=lambda *_args, **_kwargs: None,
-        )
-
-        sched_path = os.path.join(
-            python_dir,
-            "sglang",
-            "srt",
-            "managers",
-            "scheduler_output_processor_mixin.py",
-        )
-        cls._sched_mod = _load_module_from_path(
-            "_scheduler_output_processor_mixin_for_test", sched_path
-        )
-        cls.SchedulerOutputProcessorMixin = cls._sched_mod.SchedulerOutputProcessorMixin
-
     def test_decode_finished_offload_failure_triggers_finalize_release(self):
         class _Allocator:
             def free_group_begin(self):
@@ -331,29 +211,27 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
             def free_group_end(self):
                 pass
 
-        class _SpecAlgorithm:
-            def is_none(self):
-                return True
-
-        class _Batch:
+        class _Batch(ScheduleBatch):
             def __init__(self, reqs):
                 self.reqs = reqs
                 self.return_logprob = False
-                self.spec_algorithm = _SpecAlgorithm()
-                self.is_spec_v2 = False
+                self.spec_algorithm = MagicMock()
+                self.spec_algorithm.is_none.return_value = True
+                self.enable_overlap = False
 
             def batch_size(self):
                 return len(self.reqs)
 
-        class _Result:
+        class _Result(LogitsProcessorOutput):
             def __init__(self):
                 self.copy_done = None
                 self.logits_output = None
                 self.next_token_ids = torch.tensor([7], dtype=torch.int64)
                 self.can_run_cuda_graph = False
 
-        class _Req:
+        class _Req(Req):
             def __init__(self):
+                self.rid = "r1"
                 self._finished = False
                 self.output_ids = []
                 self.origin_input_ids = [1, 2, 3]
@@ -363,6 +241,8 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
                 self.return_logprob = False
                 self.return_hidden_states = False
                 self.grammar = None
+                self.prefix_indices = []
+                self.req_pool_idx = 0
 
             def finished(self):
                 return self._finished
@@ -382,7 +262,7 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
                 self.finalize_calls += 1
                 self.last_req = req
 
-        class _Processor(self.SchedulerOutputProcessorMixin):
+        class _Processor(SchedulerOutputProcessorMixin):
             def __init__(self):
                 self.server_args = types.SimpleNamespace(
                     disaggregation_decode_enable_offload_kvcache=True,
@@ -417,3 +297,7 @@ class TestSchedulerFinalizeReleaseCall(unittest.TestCase):
 
         self.assertEqual(p.decode_offload_manager.finalize_calls, 1)
         self.assertIs(p.decode_offload_manager.last_req, req)
+
+
+if __name__ == "__main__":
+    unittest.main()
