@@ -200,7 +200,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-def _get_rope_shape_impl(org, interpolation_mode, shape):
+@torch.compile(dynamic=True, disable=_is_npu)
+def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
             org.permute((2, 0, 1)).unsqueeze(0),
@@ -211,23 +212,6 @@ def _get_rope_shape_impl(org, interpolation_mode, shape):
         .permute((1, 2, 0))
         .flatten(end_dim=1)
     )
-
-
-compile_impl = torch.compile(
-    _get_rope_shape_impl,
-    dynamic=True,
-)
-
-
-disable_impl = torch._dynamo.disable(
-    _get_rope_shape_impl,
-)
-
-
-def get_rope_shape(org, interpolation_mode, shape):
-    if _is_npu:
-        return disable_impl(org, interpolation_mode, shape)
-    return compile_impl(org, interpolation_mode, shape)
 
 
 def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
