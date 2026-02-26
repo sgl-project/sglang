@@ -306,10 +306,7 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         initial_status = KVPoll.Bootstrapping
-        if (
-            self.kv_mgr.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.kv_mgr.skip_register_prefill
-        ):
+        if self.kv_mgr.skip_register_prefill:
             # Non-authoritative CP ranks are dummy participants.
             initial_status = KVPoll.WaitingForInput
         self.kv_mgr.update_status(self.bootstrap_room, initial_status)
