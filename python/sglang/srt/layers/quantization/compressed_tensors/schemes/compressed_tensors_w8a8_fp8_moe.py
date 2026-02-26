@@ -126,21 +126,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w2_inter_dim_padded = intermediate_size_per_partition
         if _use_aiter:
             ALIGN_K = 128
-            align_k = lambda n: (n + ALIGN_K - 1) // ALIGN_K * ALIGN_K
+            align_k = lambda n: ((n + ALIGN_K - 1) // ALIGN_K) * ALIGN_K
             if w2_inter_dim_padded % ALIGN_K:
                 w2_inter_dim_padded = align_k(w2_inter_dim_padded)
                 # up proj + gate fusion : 2x
                 w13_inter_dim_padded = w2_inter_dim_padded * 2
-                if hasattr(torch, "float4_e2m1fn_x2"):
-                    # pack fp4: 2x
-                    w13_inter_dim_padded *= 2
                 padded_for_mfma = True
         logger.error(f'debug moe: w13      : ({num_experts}, {w13_inter_dim_padded}, {hidden_size}) <{padded_for_mfma}>')
         logger.error(f'debug moe: w2       : ({num_experts}, {hidden_size}, {w2_inter_dim_padded}) <{padded_for_mfma}>')
 
-        logger.error(f'debug moe: block_n={block_n}, block_k={block_k}')
-        logger.error(f'debug moe: w13 scale: {2 * ((intermediate_size_per_partition + block_n - 1) // block_n)}, {(hidden_size + block_k - 1) // block_k}')
-        logger.error(f'debug moe: w2 scale:  {(hidden_size + block_n - 1) // block_n}, {(intermediate_size_per_partition + block_k - 1) // block_k}')
+        #logger.error(f'debug moe: block_n={block_n}, block_k={block_k}')
+        #logger.error(f'debug moe: w13 scale: {2 * ((intermediate_size_per_partition + block_n - 1) // block_n)}, {(hidden_size + block_k - 1) // block_k}')
+        #logger.error(f'debug moe: w2 scale:  {(hidden_size + block_n - 1) // block_n}, {(intermediate_size_per_partition + block_k - 1) // block_k}')
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -194,7 +191,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    (
+                        w13_inter_dim_padded
+                        if padded_for_mfma
+                        else 2 * intermediate_size_per_partition
+                    ),
+                    #2 * intermediate_size_per_partition,
                     1,
                     dtype=torch.float32,
                 ),
