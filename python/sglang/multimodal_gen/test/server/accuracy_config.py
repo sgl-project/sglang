@@ -81,6 +81,11 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "SGLang ZImage transformer diverges from Diffusers baseline (CosSim ~0.61) despite matched weights and freqs"
         )
     },
+    "fsdp-inference": {
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "SGLang text encoder weights do not fully load from HF checkpoint"
+        )
+    },
     "wan2_2_ti2v_5b": {
         ComponentType.TRANSFORMER: ComponentSkip(
             "SGLang transformer loader rejects new parameters in HF checkpoint"
