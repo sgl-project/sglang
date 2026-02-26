@@ -428,10 +428,10 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
-        key, value = maybe_bigram_convert(self.is_eagle, key, value)
-
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+
+        key, value = maybe_bigram_convert(self.is_eagle, key, value)
 
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
