@@ -144,7 +144,7 @@ class WaitingImageRequest:
         self.error_code = None
         self.start_time = time.time()
 
-    def send_encode_request(self):
+    async def _send_embedding_port(self):
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:
@@ -154,48 +154,41 @@ class WaitingImageRequest:
                 logger.error(f"Failed to send request to {url}: {e}")
                 raise
 
-        async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=1800)
-            ) as session:
-                tasks = []
-                logger.info(f"{self.num_items_assigned = } ")
-                for idx, assigned_num in enumerate(self.num_items_assigned):
-                    if assigned_num == 0:
-                        continue
-                    encoder_url = self.encoder_urls[idx]
-                    target_url = f"{encoder_url}/scheduler_receive_url"
-                    payload = {
-                        "req_id": req_id,
-                        "receive_count": receive_count,
-                        "receive_url": f"{host_name}:{embedding_port}",
-                    }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=1800)
+        ) as session:
+            tasks = []
+            logger.info(f"{self.num_items_assigned = } ")
+            for idx, assigned_num in enumerate(self.num_items_assigned):
+                if assigned_num == 0:
+                    continue
+                encoder_url = self.encoder_urls[idx]
+                target_url = f"{encoder_url}/scheduler_receive_url"
+                payload = {
+                    "req_id": self.recv_req.rid,
+                    "receive_count": self.receive_count,
+                    "receive_url": f"{self.host_name}:{self.embedding_port}",
+                }
+                logger.info(f"Preparing to send  to {target_url}")
+                task = _send_single_request(session, target_url, payload)
+                tasks.append(task)
 
-                    logger.info(f"Preparing to send  to {target_url}")
+            if not tasks:
+                logger.info("No tasks to send.")
+                return
+            logger.info(f"Concurrently sending {len(tasks)} requests...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Request {i} failed: {result}")
+                else:
+                    logger.debug(f"Request {i} succeeded.")
 
-                    task = _send_single_request(session, target_url, payload)
-                    tasks.append(task)
+    def send_encode_request(self):
+        def _run():
+            asyncio.run(self._send_embedding_port())
 
-                if not tasks:
-                    logger.info("No tasks to send.")
-                    return
-                logger.info(f"Concurrently sending {len(tasks)} requests...")
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Request {i} failed: {result}")
-                    else:
-                        logger.debug(f"Request {i} succeeded.")
-
-        asyncio.run(
-            send_embedding_port(
-                self.recv_req.rid,
-                self.receive_count,
-                self.host_name,
-                self.embedding_port,
-            )
-        )
+        threading.Thread(target=_run).start()
 
     def _try_recv_mm_data(self):
         if self.status != WaitingImageRequestStatus.PENDING:
