@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class NgramVerifyInput(SpecInput):
         retrive_next_token: torch.Tensor,
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
+        grammar: BaseGrammarObject = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -67,6 +69,7 @@ class NgramVerifyInput(SpecInput):
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+        self.grammar = grammar
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -185,9 +188,9 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1

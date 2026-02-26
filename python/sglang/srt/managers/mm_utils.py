@@ -1121,6 +1121,7 @@ def general_mm_embed_routine(
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
             forward_batch.mm_inputs = None
+            forward_batch.mm_input_embeds = input_embeds
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
@@ -1513,6 +1514,27 @@ class ShmPointerMMData:
             self.shm.close()
 
     def __getstate__(self):
+        if not hasattr(self, "shm") or self.shm is None:
+            tensor = getattr(self, "cpu_tensor", None)
+            if tensor is None:
+                tensor = getattr(self, "tensor", None)
+            if tensor is None:
+                raise RuntimeError(
+                    "ShmPointerMMData cannot recreate shared memory without tensor"
+                )
+
+            cpu_tensor = tensor.cpu().contiguous()
+            self.shape = cpu_tensor.shape
+            self.dtype = cpu_tensor.dtype
+
+            nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+            self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
+            try:
+                shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
+                shm_view[:] = cpu_tensor.view(torch.uint8).numpy().flatten()
+            finally:
+                self.shm.close()
+
         return {
             "shm_name": self.shm.name,
             "shape": self.shape,
@@ -1521,12 +1543,15 @@ class ShmPointerMMData:
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
+        self.shape = state["shape"]
+        self.dtype = state["dtype"]
+        self.shm = None
 
         shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         try:
             self.tensor = (
-                torch.frombuffer(shm_handle.buf, dtype=state["dtype"])
-                .reshape(state["shape"])
+                torch.frombuffer(shm_handle.buf, dtype=self.dtype)
+                .reshape(self.shape)
                 .clone()
             )
         finally:

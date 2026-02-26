@@ -56,8 +56,26 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
+enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
+
+constexpr bool operator==(CPUQuantMethod a, int64_t b) {
+  return static_cast<int64_t>(a) == b;
+}
+
+constexpr bool operator==(int64_t a, CPUQuantMethod b) {
+  return a == static_cast<int64_t>(b);
+}
+
+inline int64_t get_4bit_block_k_size(int64_t group_size) {
+  return group_size > 128 ? 128 : group_size;
+}
+
 // pack weight to vnni format
 at::Tensor convert_weight_packed(at::Tensor& weight);
+
+// pack weight to vnni format for int4
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
 
 // moe implementations for int8 w8a8
 template <typename scalar_t>
@@ -133,6 +151,37 @@ void shared_expert_int8_kernel_impl(
     int64_t K);
 
 template <typename scalar_t>
+void fused_experts_int4_w4a8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    uint8_t* __restrict__ A_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    int32_t* __restrict__ Azp_tmp,
+    float* __restrict__ C_tmp,
+    int8_t* __restrict__ dqB_tmp,
+    const scalar_t* __restrict__ input,
+    const uint8_t* __restrict__ packed_w1,
+    const uint8_t* __restrict__ packed_w2,
+    const int8_t* __restrict__ w1z,
+    const int8_t* __restrict__ w2z,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int group_size,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
+
+template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
@@ -200,3 +249,23 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    scalar_t* C,
+    float* C_temp,
+    const uint8_t* A,
+    const float* scales_a,
+    const int32_t* qzeros_a,
+    const uint8_t* B,
+    const float* scales_b,
+    const int8_t* qzeros_b,
+    const int32_t* compensation,
+    int8_t* dqB_tmp,
+    int64_t M,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc_f,
+    int64_t ldc_s,
+    bool store_out,
+    bool use_brgemm);

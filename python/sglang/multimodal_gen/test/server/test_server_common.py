@@ -8,7 +8,6 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, Callable
 
 import openai
@@ -19,14 +18,12 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
     ServerContext,
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -37,7 +34,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    is_image_url,
     wait_for_req_perf_record,
 )
 
@@ -76,6 +72,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.dit_layerwise_offload:
         extra_args += f" --dit-layerwise-offload true"
 
+    if server_args.dit_offload_prefetch_size:
+        extra_args += (
+            f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+        )
+
     if server_args.text_encoder_cpu_offload:
         extra_args += f" --text-encoder-cpu-offload"
 
@@ -86,8 +87,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.enable_warmup:
-        extra_args += f" --enable-warmup"
+    # default warmup
+    extra_args += f" --warmup"
+
+    for arg in server_args.extras:
+        extra_args += f" {arg}"
 
     # Build custom environment variables
     env_vars = {}
@@ -110,41 +114,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         output_size = os.environ.get(
             "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
         )
-        warmup = WarmupRunner(
-            port=ctx.port,
-            model=server_args.model_path,
-            prompt=sampling_params.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sampling_params.output_format,
-        )
-        if server_args.warmup > 0:
-            if sampling_params.image_path and case.sampling_params.prompt:
-                # Handle URL or local path
-                image_path_list = sampling_params.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-
-                new_image_path_list = []
-                for image_path in image_path_list:
-                    if is_image_url(image_path):
-                        new_image_path_list.append(
-                            download_image_from_url(str(image_path))
-                        )
-                    else:
-                        path_obj = Path(image_path)
-                        if not path_obj.exists():
-                            pytest.skip(f"{case.id}: file missing: {image_path}")
-                        new_image_path_list.append(path_obj)
-
-                image_path_list = new_image_path_list
-
-                warmup.run_edit_warmups(
-                    count=server_args.warmup,
-                    edit_prompt=sampling_params.prompt,
-                    image_path=image_path_list,
-                )
-            else:
-                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
@@ -165,6 +134,7 @@ class DiffusionServerBase:
 
     _perf_results: list[dict[str, Any]] = []
     _improved_baselines: list[dict[str, Any]] = []
+    _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
@@ -173,9 +143,21 @@ class DiffusionServerBase:
 
     @classmethod
     def teardown_class(cls):
-        for result in cls._perf_results:
-            result["class_name"] = cls.__name__
-            _GLOBAL_PERF_RESULTS.append(result)
+        print(
+            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
+        )
+        if cls._pytest_config:
+            # Add results to pytest stash (shared across all import contexts)
+            for result in cls._perf_results:
+                result["class_name"] = cls.__name__
+            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
+            print(
+                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
+            )
+        else:
+            print(
+                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
+            )
 
         if cls._improved_baselines:
             import json
@@ -190,6 +172,11 @@ Consider updating perf_baselines.json with the snippets below:
                     f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
                 )
             print(output)
+
+    @pytest.fixture(autouse=True)
+    def _capture_pytest_config(self, request):
+        """Capture pytest config for use in teardown_class."""
+        self.__class__._pytest_config = request.config
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
@@ -256,20 +243,24 @@ Consider updating perf_baselines.json with the snippets below:
 
         summary = validator.collect_metrics(perf_record)
 
-        if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            if missing_scenario:
-                pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
-            return
+        if case.run_perf_check:
+            if is_baseline_generation_mode or missing_scenario:
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                if missing_scenario:
+                    pytest.fail(
+                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                    )
+                return
 
-        self._check_for_improvement(case, summary, scenario)
+            self._check_for_improvement(case, summary, scenario)
 
-        try:
-            validator.validate(perf_record, case.sampling_params.num_frames)
-        except AssertionError as e:
-            logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            raise
+            # only run performance validation if run_perf_check is True
+            try:
+                validator.validate(perf_record, case.sampling_params.num_frames)
+            except AssertionError as e:
+                logger.error(f"Performance validation failed for {case.id}:\n{e}")
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                raise
 
         result = {
             "test_name": case.id,
@@ -292,6 +283,9 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
+        print(
+            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
+        )
 
     def _check_for_improvement(
         self,
@@ -717,6 +711,37 @@ Consider updating perf_baselines.json with the snippets below:
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
 
+    def _test_t2v_rejects_input_reference(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        if case.server_args.modality != "video":
+            return
+
+        base_url = f"http://localhost:{ctx.port}"
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+        data = resp.json().get("data", [])
+        if not data:
+            pytest.fail("/v1/models returned empty model list")
+
+        task_type = data[0].get("task_type")
+        if task_type != "T2V":
+            return
+
+        prompt = case.sampling_params.prompt or "test"
+        payload = {"prompt": prompt, "input_reference": "dummy"}
+        if case.sampling_params.output_size:
+            payload["size"] = case.sampling_params.output_size
+
+        resp = requests.post(f"{base_url}/v1/videos", json=payload)
+        assert (
+            resp.status_code == 400
+        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        detail = resp.json().get("detail", "")
+        assert (
+            "input_reference is not supported" in detail
+        ), f"Unexpected error detail for T2V input_reference: {detail}"
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -750,6 +775,7 @@ Consider updating perf_baselines.json with the snippets below:
 
         # Test /v1/models endpoint for router compatibility
         self._test_v1_models_endpoint(diffusion_server, case)
+        self._test_t2v_rejects_input_reference(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.server_args.lora_path or case.server_args.dynamic_lora_path:

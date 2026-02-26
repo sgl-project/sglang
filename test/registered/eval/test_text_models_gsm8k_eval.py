@@ -11,7 +11,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     check_evaluation_test_results,
@@ -19,6 +18,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+# Nightly eval tests run large models (up to 70B+ params) that may need
+# downloading on cache miss. Use a longer timeout than the default 600s.
+NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
@@ -72,19 +75,19 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_setup in self.models:
             with self.subTest(model=model_setup.model_path):
                 other_args = list(model_setup.extra_args)
-                error_message = None
+                process = None
 
                 if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
                     other_args.extend(["--mem-fraction-static", "0.9"])
 
-                process = popen_launch_server(
-                    model=model_setup.model_path,
-                    other_args=other_args,
-                    base_url=self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                )
-
                 try:
+                    process = popen_launch_server(
+                        model=model_setup.model_path,
+                        other_args=other_args,
+                        base_url=self.base_url,
+                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
+                    )
+
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_setup.model_path,
@@ -103,20 +106,18 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     )
                     is_first = False
 
-                    # 0.0 for empty latency, None for no error
                     all_results.append(
-                        (model_setup.model_path, metrics["score"], 0.0, error_message)
+                        (model_setup.model_path, metrics["score"], 0.0, None)
                     )
                 except Exception as e:
-                    # Capture error message for the summary table
                     error_message = str(e)
-                    # Still append result with error info (use None for N/A metrics to match else clause)
                     all_results.append(
                         (model_setup.model_path, None, None, error_message)
                     )
                     print(f"Error evaluating {model_setup.model_path}: {error_message}")
                 finally:
-                    kill_process_tree(process.pid)
+                    if process is not None:
+                        kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

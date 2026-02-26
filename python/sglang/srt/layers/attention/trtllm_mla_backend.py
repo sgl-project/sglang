@@ -4,6 +4,7 @@ from __future__ import annotations
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -18,14 +19,16 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.utils import (
+    concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
     get_num_page_per_block_flashmla,
+    mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
     import flashinfer
@@ -35,10 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
+logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
@@ -777,84 +777,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
-    def quantize_and_rope_for_fp8(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize and apply RoPE for FP8 attention path.
-
-        This function handles the FP8 quantization and RoPE application for MLA attention.
-        It takes separate query/key nope and rope components, applies RoPE to the rope parts,
-        quantizes all components to FP8, and merges the query components into a single tensor.
-
-        Args:
-            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            forward_batch: Forward batch containing position information
-            cos_sin_cache: Precomputed cosine/sine cache for RoPE
-                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
-            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
-
-        Returns:
-            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
-                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
-        """
-        attn_dtype = torch.float8_e4m3fn
-        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
-
-        # Allocate output tensors with FP8 dtype
-        # Query output will contain merged nope + rope components
-        q_out = q_rope.new_empty(
-            q_len,
-            num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=attn_dtype,
-        )
-
-        # Key outputs maintain original shapes but with FP8 dtype
-        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
-        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
-
-        # Apply RoPE and quantize all components in a single fused kernel call
-        # This kernel handles:
-        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-        # 2. Quantization of all components to FP8 format
-        # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=forward_batch.positions,
-            is_neox=is_neox,
-            quantize_dtype=attn_dtype,
-            # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
-            k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
-            k_nope_out=k_nope_out,
-            # Quantization scales (set to 1.0 for no additional scaling)
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
-        )
-
-        return q_out, k_nope_out, k_rope_out
-
     def _fp8_rope_quantize_and_save(
         self,
         q_nope: torch.Tensor,
@@ -880,7 +802,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k_rope_squeezed = k_rope.squeeze(1)
 
         if save_kv_cache:
-            # Fused kernel: RoPE + FP8 quantize + KV cache write in one call
             return self.fused_rope_quantize_and_append_kv_cache(
                 q_nope,
                 q_rope,
@@ -892,15 +813,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 is_neox,
             )
 
-        # No cache write needed — RoPE + FP8 quantize only
-        merged_q, _k_nope_out, _k_rope_out = self.quantize_and_rope_for_fp8(
+        merged_q, _k_nope_out, _k_rope_out = mla_quantize_and_rope_for_fp8(
             q_nope,
             q_rope,
             k_squeezed,
             k_rope_squeezed,
-            forward_batch,
+            forward_batch.positions,
             cos_sin_cache,
             is_neox,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
         )
         return merged_q
 
@@ -940,15 +862,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """
         nnz = forward_batch.out_cache_loc.shape[0]
 
-        # Allocate output tensor with FP8 dtype
         q_out = q_rope.new_empty(
             nnz,
-            q_rope.shape[1],  # num heads
+            q_rope.shape[1],
             self.kv_lora_rank + self.qk_rope_head_dim,
             dtype=torch.float8_e4m3fn,
         )
 
-        # Get the paged KV cache buffer for this layer (no allocation, just view)
         kv_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         num_pages = kv_buffer.shape[0] // self.page_size
         kv_buffer_paged = kv_buffer.squeeze(1).view(
@@ -1107,7 +1027,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 save_kv_cache,
             )
             merge_query = False
-            save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
+            save_kv_cache = False
 
         # Save KV cache for non-FP8 path (FP8 path already handled above)
         if save_kv_cache:
@@ -1122,7 +1042,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1158,15 +1078,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
         # Scale components:
         # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
-        # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
+        # - k_scale: Key scaling factor from model checkpoint. Only applied when KV cache
+        #   stores FP8-quantized values, to compensate for the quantization scaling.
+        #   For BF16/FP16 KV cache, k_scale must be 1.0 since values are unscaled.
         # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
-        # This unified approach works for both FP16 and FP8 quantized attention paths.
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
+        if self.data_type == torch.float8_e4m3fn:
+            k_scale = (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
+        else:
+            if getattr(layer, "k_scale_float", None) is not None:
+                logger.warning_once(
+                    "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                    "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                    layer.k_scale_float,
+                    self.data_type,
+                )
+            k_scale = 1.0
 
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -1235,7 +1166,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 save_kv_cache,
             )
             merge_query = False
-            save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
+            save_kv_cache = False
 
         # Save KV cache for non-FP8-target-verify path (FP8 path already handled above)
         if save_kv_cache:
@@ -1250,7 +1181,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            q = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            q = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
 
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -1283,11 +1214,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q_scale = 1.0
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
+            if self.data_type == torch.float8_e4m3fn:
+                k_scale = (
+                    layer.k_scale_float
+                    if getattr(layer, "k_scale_float", None) is not None
+                    else 1.0
+                )
+            else:
+                if getattr(layer, "k_scale_float", None) is not None:
+                    logger.warning_once(
+                        "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                        "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                        layer.k_scale_float,
+                        self.data_type,
+                    )
+                k_scale = 1.0
             q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
@@ -1425,7 +1366,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out=out,
             )
         else:
-            out = torch.empty(
+            out = torch.zeros(
                 q.shape[0],
                 q.shape[1],
                 v.shape[2],
@@ -1459,10 +1400,3 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
-
-
-def _concat_mla_absorb_q_general(q_nope, q_rope):
-    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
-        return concat_mla_absorb_q(q_nope, q_rope)
-    else:
-        return torch.cat([q_nope, q_rope], dim=-1)

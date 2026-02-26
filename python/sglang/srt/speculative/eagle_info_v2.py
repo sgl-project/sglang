@@ -169,8 +169,8 @@ class EagleDraftInputV2Mixin:
             )
 
         # Get a forward batch
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_req = topk
+        self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -232,6 +232,17 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                batch.mamba_track_indices = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -267,7 +278,7 @@ class EagleVerifyInputV2Mixin:
         (which contains spec decoding information).
         """
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
             accept_length = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import UsageInfo
+from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
 
 
 @final
@@ -10,9 +10,9 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
+        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
 
     @staticmethod
     def calculate_response_usage(
@@ -73,7 +73,7 @@ class UsageProcessor:
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
-        cached_tokens: Optional[Dict[str, int]] = None,
+        cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(

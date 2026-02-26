@@ -44,7 +44,11 @@ def parse_result_file(filepath: str) -> list[dict]:
 
 
 def transform_benchmark_result(result: dict, gpu_config: str, partition: int) -> dict:
-    """Transform a benchmark result to the metrics schema."""
+    """Transform a benchmark result to the metrics schema.
+
+    Note: input_len and output_len are preserved here for the flat benchmarks list,
+    but are also used as grouping keys in benchmarks_by_io_len.
+    """
     # Handle None values safely for numeric conversions
     latency = result.get("latency")
     last_ttft = result.get("last_ttft")
@@ -62,10 +66,20 @@ def transform_benchmark_result(result: dict, gpu_config: str, partition: int) ->
     }
 
 
+def get_io_len_key(input_len: int, output_len: int) -> str:
+    """Generate a key for input/output length combination."""
+    return f"{input_len}_{output_len}"
+
+
 def group_results_by_model(
     results: list[dict], gpu_config: str, partition: int
 ) -> list[dict]:
-    """Group benchmark results by model, variant, and server_args."""
+    """Group benchmark results by model, variant, and server_args.
+
+    Results are organized with two benchmark structures:
+    - benchmarks: flat list of all benchmarks (for backward compatibility)
+    - benchmarks_by_io_len: nested structure grouped by input/output length combinations
+    """
     groups = {}
 
     for result in results:
@@ -85,11 +99,35 @@ def group_results_by_model(
                 "variant": variant,
                 "server_args": server_args,
                 "benchmarks": [],
+                "benchmarks_by_io_len": {},
             }
 
-        groups[key]["benchmarks"].append(
-            transform_benchmark_result(result, gpu_config, partition)
-        )
+        transformed = transform_benchmark_result(result, gpu_config, partition)
+
+        # Add to flat benchmarks list (backward compatibility)
+        groups[key]["benchmarks"].append(transformed)
+
+        # Add to nested benchmarks_by_io_len structure
+        input_len = result.get("input_len")
+        output_len = result.get("output_len")
+        if input_len is not None and output_len is not None:
+            io_key = get_io_len_key(input_len, output_len)
+            if io_key not in groups[key]["benchmarks_by_io_len"]:
+                groups[key]["benchmarks_by_io_len"][io_key] = {
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "benchmarks": [],
+                }
+            # For the nested structure, exclude input_len and output_len from individual benchmarks
+            # since they're already in the parent
+            nested_benchmark = {
+                k: v
+                for k, v in transformed.items()
+                if k not in ("input_len", "output_len")
+            }
+            groups[key]["benchmarks_by_io_len"][io_key]["benchmarks"].append(
+                nested_benchmark
+            )
 
     return list(groups.values())
 
