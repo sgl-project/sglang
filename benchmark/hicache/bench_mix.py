@@ -13,7 +13,7 @@ from functools import wraps
 import aiohttp
 
 from sglang.bench_serving import RequestFuncOutput
-from sglang.benchmark.datasets import sample_random_requests
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 # Set up logger
