@@ -3,13 +3,10 @@ from __future__ import annotations
 import types
 import unittest
 from dataclasses import dataclass
+from typing import Any, List, Optional, Union
 from unittest.mock import MagicMock
 
-import Any
-import List
-import Optional
 import torch
-import Union
 
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
