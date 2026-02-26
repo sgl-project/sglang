@@ -384,6 +384,16 @@ class BenchSessionLatency(CustomTestCase):
                 f"regular vs streaming (session 0): {mismatches}/{len(reg_out)} turns differ",
             )
 
+            reg_tail = _avg(_collect_latencies(reg_list, last_n=TAIL_TURNS))
+            stm_tail = _avg(_collect_latencies(results, last_n=TAIL_TURNS))
+            speedup = reg_tail / stm_tail if stm_tail > 0 else float("inf")
+            self.assertGreaterEqual(
+                speedup,
+                2.0,
+                f"streaming should be >=2x faster on last {TAIL_TURNS} turns "
+                f"(regular={reg_tail:.1f}ms, streaming={stm_tail:.1f}ms, speedup={speedup:.2f}x)",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
