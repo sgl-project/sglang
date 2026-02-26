@@ -64,20 +64,24 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-if _is_npu:
 
-    def _get_npu_hccl_pg_options():
-        """Helper to create ProcessGroupHCCL options for NPU."""
-        import torch_npu
+def get_torch_distributed_pg_options(group_name=None):
+    if not _is_npu:
+        return None
 
-        options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        hccl_buffer_size = int(
-            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
-            or os.environ.get("HCCL_BUFFSIZE")
-            or 200
-        )
-        options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
-        return options
+    # Only create HCCL options for default group or MoE-related groups
+    if group_name is not None and "moe" not in group_name:
+        return None
+
+    import torch_npu
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    hccl_buffer_size = int(
+        os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+        or os.environ.get("HCCL_BUFFSIZE")
+        or 200
+    )
+    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    return options
 
 
 @dataclass
@@ -283,10 +287,7 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
-                if _is_npu and "moe" in group_name:
-                    pg_options = _get_npu_hccl_pg_options()
-                else:
-                    pg_options = None
+                pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend, pg_options=pg_options
                 )
@@ -1524,10 +1525,7 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
-        if _is_npu:
-            pg_options = _get_npu_hccl_pg_options()
-        else:
-            pg_options = None
+        pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(
