@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -152,7 +153,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output = (
             F.linear(x, layer.weight, bias)
-            if torch.cuda.is_available() or bias is None
+            if current_platform.is_amp_supported() or bias is None
             else F.linear(x, layer.weight, bias.to(x.dtype))
         )  # NOTE: this line assumes that we are using amp when using cuda and is needed to account for the fact that amp isn't supported in mps
         return output
@@ -164,7 +165,6 @@ class LinearBase(torch.nn.Module):
     Args:
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
-        bias: If true, add bias.
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.

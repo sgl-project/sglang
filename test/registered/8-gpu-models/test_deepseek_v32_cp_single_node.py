@@ -18,6 +18,7 @@ BASE_ARGS = [
 DP_ARGS = [
     "--tp=8",
     "--dp=2",
+    "--attn-cp-size=4",
     "--enable-dp-attention",
 ]
 
@@ -43,6 +44,7 @@ CP_IN_SEQ_SPLIT_ARGS = [
 CP_ROUND_ROBIN_ARGS = [
     "--enable-nsa-prefill-context-parallel",
     "--nsa-prefill-cp-mode=round-robin-split",
+    "--attn-cp-size=8",
 ]
 
 
@@ -63,6 +65,7 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
                 DEEPSEEK_V32_EXP_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS + CP_IN_SEQ_SPLIT_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="CP-in-seq-split",
             ),
             # Variant: round-robin-split CP mode (TP only, no DP)
@@ -70,6 +73,7 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
                 DEEPSEEK_V32_EXP_MODEL_PATH,
                 tp_size=8,
                 extra_args=BASE_ARGS + MTP_ARGS + CP_ROUND_ROBIN_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="CP-round-robin-split",
             ),
         ]

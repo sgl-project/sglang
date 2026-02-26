@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 

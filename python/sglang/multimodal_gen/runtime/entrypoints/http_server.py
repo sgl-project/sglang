@@ -5,6 +5,7 @@ import base64
 import os
 import uuid
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 import torch
 from fastapi import APIRouter, FastAPI, Request
@@ -15,12 +16,20 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_ap
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    post_process_sample,
     prepare_request,
+    save_outputs,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+logger = init_logger(__name__)
 
 DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
@@ -43,7 +52,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # On shutdown
-    print("FastAPI app is shutting down...")
+    logger.info("FastAPI app is shutting down...")
     broker_task.cancel()
     async_scheduler_client.close()
 
@@ -110,37 +119,29 @@ def encode_video_to_base64(file_path: str):
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-async def forward_to_scheduler(req_obj, sp):
+async def forward_to_scheduler(
+    req_obj: "Req",
+    sp: SamplingParams,
+):
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None:
+        if response.output is None and response.output_file_paths is None:
             raise RuntimeError("Model generation returned no output.")
 
-        output_file_path = sp.output_file_path()
-        sample = response.output[0]
-        try:
-            audio = response.audio
-        except AttributeError:
-            audio = None
-        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-            audio = audio[0]
-        if audio is not None and not (
-            isinstance(sample, (tuple, list)) and len(sample) == 2
-        ):
-            sample = (sample, audio)
-        post_process_sample(
-            sample=sample,
-            data_type=sp.data_type,
-            fps=sp.fps or 24,
-            save_output=True,
-            save_file_path=output_file_path,
-            audio_sample_rate=(
-                response.audio_sample_rate
-                if hasattr(response, "audio_sample_rate")
-                else None
-            ),
-        )
+        if response.output_file_paths:
+            output_file_path = response.output_file_paths[0]
+        else:
+            output_file_path = sp.output_file_path()
+            save_outputs(
+                [response.output[0]],
+                sp.data_type,
+                sp.fps,
+                True,
+                lambda _idx: output_file_path,
+                audio=response.audio,
+                audio_sample_rate=response.audio_sample_rate,
+            )
 
         if hasattr(response, "model_dump"):
             data = response.model_dump()
@@ -148,7 +149,7 @@ async def forward_to_scheduler(req_obj, sp):
             data = response if isinstance(response, dict) else vars(response)
 
         if output_file_path:
-            print(f"Processing output file: {output_file_path}")
+            logger.info("Processing output file: %s", output_file_path)
             b64_video = encode_video_to_base64(output_file_path)
 
             if b64_video:
@@ -159,7 +160,7 @@ async def forward_to_scheduler(req_obj, sp):
         return make_serializable(data)
 
     except Exception as e:
-        print(f"Error during generation: {e}")
+        logger.error("Error during generation: %s", e, exc_info=True)
         return {"error": str(e)}
 
 
@@ -179,32 +180,17 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
 
-        prompt = inst.get("prompt") or inst.get("text")
-        image_input = inst.get("image") or inst.get("image_url")
-        seed_val = params.get("seed", DEFAULT_SEED)
-
-        # Create a dictionary of provided parameters
-        # This filters out None values so the dataclass defaults kick in
-        user_params = {
-            "num_frames": params.get("num_frames"),
-            "fps": params.get("fps"),
-            "width": params.get("width"),
-            "height": params.get("height"),
-            "guidance_scale": params.get("guidance_scale"),
-            "save_output": params.get("save_output"),
-        }
-
-        # Remove None values to allow SamplingParams defaults to take over
-        valid_params = {k: v for k, v in user_params.items() if v is not None}
-
-        sp = SamplingParams.from_user_sampling_params_args(
-            model_path=server_args.model_path,
-            request_id=rid,
-            prompt=prompt,
-            image_path=image_input,
-            seed=seed_val,
-            server_args=server_args,
-            **valid_params,  # Unpack the filtered dictionary
+        sp = build_sampling_params(
+            rid,
+            prompt=inst.get("prompt") or inst.get("text"),
+            image_path=inst.get("image") or inst.get("image_url"),
+            seed=params.get("seed", DEFAULT_SEED),
+            num_frames=params.get("num_frames"),
+            fps=params.get("fps"),
+            width=params.get("width"),
+            height=params.get("height"),
+            guidance_scale=params.get("guidance_scale"),
+            save_output=params.get("save_output"),
         )
 
         backend_req = prepare_request(server_args, sampling_params=sp)
@@ -229,6 +215,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(weights_api.router)
 
     app.state.server_args = server_args
     return app
