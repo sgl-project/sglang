@@ -99,7 +99,7 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
+    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
@@ -443,6 +443,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_overlap_schedule: bool = True,
     ):
         super().__init__(
             size=size,
@@ -450,9 +451,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
+            raise ValueError(
+                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
+                "Please set `--mamba-scheduler-strategy extra_buffer`."
+            )
+
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(

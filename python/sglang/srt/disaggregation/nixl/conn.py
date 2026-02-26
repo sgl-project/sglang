@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
-import requests
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -193,21 +192,6 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
-            self.heartbeat_failures = {}
-            self.session_pool = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(set)
-            self.connection_lock = threading.Lock()
-
-            # Heartbeat interval should be at least 2 seconds
-            self.heartbeat_interval = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
-            )
-            # Heartbeat failure should be at least 1
-            self.max_failures = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
-            )
-            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
