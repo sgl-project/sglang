@@ -16,6 +16,9 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
 
 def _ensure_pkg(name: str) -> types.ModuleType:
     if name in sys.modules:
