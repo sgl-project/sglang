@@ -1,4 +1,4 @@
-# GLM-5
+# GLM-5 examples
 
 ## Introduction
 
