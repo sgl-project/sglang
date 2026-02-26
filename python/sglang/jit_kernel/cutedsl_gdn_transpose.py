@@ -945,16 +945,17 @@ def cutedsl_fused_recurrent_gated_delta_rule_update(
     beta_ = from_dlpack(beta.detach(), assumed_align=16)
     g_ = from_dlpack(g.detach(), assumed_align=16)
     ind_ = from_dlpack(initial_state_indices.detach(), assumed_align=16)
-    if cu_seqlens != None:
+    if cu_seqlens is not None:
         cu_seqlens_ = from_dlpack(cu_seqlens.detach(), assumed_align=16)
     else:
         cu_seqlens_ = None
 
+    # if cache_steps is not provided, use T as cache_steps and B will be set to 1.
     if cache_steps is None:
         cache_steps = T
 
     CACHE_INTERMEDIATE_STATES = False
-    if intermediate_states_buffer != None:
+    if intermediate_states_buffer is not None:
         intermediate_states_buffer_ = from_dlpack(
             intermediate_states_buffer.detach(), assumed_align=16
         )
