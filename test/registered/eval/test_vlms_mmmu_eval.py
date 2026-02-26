@@ -51,7 +51,7 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.30, 16.7),
+    ): ModelEvalMetrics(0.30, 30.0),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
