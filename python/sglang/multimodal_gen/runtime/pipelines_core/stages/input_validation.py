@@ -140,6 +140,8 @@ class InputValidationStage(PipelineStage):
                 batch.height = height
 
         elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+            if server_args.pipeline_config.skip_input_image_preprocess:
+                return
             # duplicate with vae_image_processor
             # further processing for ti2v task
             if isinstance(
