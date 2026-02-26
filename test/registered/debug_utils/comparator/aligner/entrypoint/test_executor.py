@@ -119,6 +119,7 @@ class TestExecuteAlignerPlan:
                 x=[self._make_step_plan(step=0, indices=[0, 1])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_plan=None,
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(
@@ -139,6 +140,7 @@ class TestExecuteAlignerPlan:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0, 1])],
             ),
+            token_aligner_plan=None,
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(
@@ -153,12 +155,13 @@ class TestExecuteAlignerPlan:
         assert result.tensors is None
         assert result.failed_side_xy == "y"
 
-    def test_single_step(self) -> None:
+    def test_no_token_aligner_single_step(self) -> None:
         plan = AlignerPlan(
             per_step_plans=Pair(
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_plan=None,
         )
 
         t_x: torch.Tensor = torch.tensor([1.0, 2.0])
@@ -180,6 +183,7 @@ class TestExecuteAlignerPlan:
                 x=[self._make_step_plan(step=0, indices=[0])],
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
+            token_aligner_plan=None,
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(

@@ -136,10 +136,32 @@ class TestComputeAlignerPlan:
 
         plan: AlignerPlan = compute_aligner_plan(
             metas_pair=Pair(x=metas_x, y=metas_y),
+            token_aligner_plan=None,
         )
 
         assert len(plan.per_step_plans.x) == 1
         assert len(plan.per_step_plans.y) == 1
+        assert plan.token_aligner_plan is None
+
+    def test_preserves_token_aligner_plan(self) -> None:
+        from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+            TokenAlignerPlan,
+            TokenLocator,
+        )
+
+        ta_plan = TokenAlignerPlan(
+            locators=Pair(
+                x=TokenLocator(token_index_in_step=[0]),
+                y=TokenLocator(token_index_in_step=[0]),
+            ),
+        )
+
+        plan: AlignerPlan = compute_aligner_plan(
+            metas_pair=Pair(x=[_make_meta()], y=[_make_meta()]),
+            token_aligner_plan=ta_plan,
+        )
+
+        assert plan.token_aligner_plan is ta_plan
 
 
 if __name__ == "__main__":

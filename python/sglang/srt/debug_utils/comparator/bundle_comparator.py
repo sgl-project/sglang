@@ -71,7 +71,9 @@ def _compare_bundle_pair_raw(
     metas_pair: Pair[list[dict[str, Any]]] = valid_pair.map(
         lambda items: [it.meta for it in items]
     )
-    plan: AlignerPlan = compute_aligner_plan(metas_pair=metas_pair)
+    plan: AlignerPlan = compute_aligner_plan(
+        metas_pair=metas_pair, token_aligner_plan=None
+    )
 
     # 3. Execute (tensor + plan only, no meta)
     tensors_pair: Pair[list[torch.Tensor]] = valid_pair.map(

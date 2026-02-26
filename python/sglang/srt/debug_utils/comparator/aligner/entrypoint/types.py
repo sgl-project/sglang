@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Optional, Union
 
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+    TokenAlignerPlan,
+)
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
 from sglang.srt.debug_utils.comparator.utils import Pair
 
@@ -20,3 +23,4 @@ class AlignerPerStepPlan:
 @dataclass(frozen=True)
 class AlignerPlan:
     per_step_plans: Pair[list[AlignerPerStepPlan]]
+    token_aligner_plan: Optional[TokenAlignerPlan]

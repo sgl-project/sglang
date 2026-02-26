@@ -94,11 +94,11 @@ class TestExecuteUnsharderPlan:
             for tp_rank in range(4):
                 tensors.append(source[tp_rank])
 
-        with warning_sink.context() as _warnings:
+        with warning_sink.context():
             intermediate = execute_unsharder_plan(plans[0], tensors)
         assert len(intermediate) == 4
 
-        with warning_sink.context() as _warnings:
+        with warning_sink.context():
             final = execute_unsharder_plan(plans[1], intermediate)
         assert len(final) == 1
 
@@ -126,8 +126,8 @@ class TestExecuteUnsharderPlan:
         assert len(plans) == 2
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
@@ -168,8 +168,8 @@ class TestExecuteUnsharderPlan:
         assert len(plans) == 2
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
@@ -222,8 +222,8 @@ class TestExecuteUnsharderPlan:
         assert len(plans) == 3
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
@@ -271,8 +271,8 @@ class TestExecuteUnsharderPlan:
         assert len(plans) == 3
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
@@ -357,8 +357,8 @@ class TestPickOperation:
         assert len(plans) == 2
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
@@ -387,8 +387,8 @@ class TestPickOperation:
         assert all(isinstance(p.params, PickParams) for p in plans)
 
         current = tensors
-        for plan in plans:
-            with warning_sink.context() as _warnings:
+        with warning_sink.context():
+            for plan in plans:
                 current = execute_unsharder_plan(plan, current)
 
         assert len(current) == 1
