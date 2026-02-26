@@ -63,6 +63,10 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = False
 
+    from sglang.jit_kernel.per_token_group_quant_8bit import (
+        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+    )
+
 if _is_hip:
     _has_vllm = False
     if _use_aiter:
@@ -501,19 +505,31 @@ def sglang_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            sgl_per_token_group_quant_8bit(
-                x,
-                x_q,
-                x_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                fuse_silu_and_mul,
-                masked_m,
-                enable_v2=enable_v2,
-            )
+            if enable_v2:
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=True,
+                )
+            else:
+                sgl_per_token_group_quant_8bit_jit(
+                    input=x,
+                    output_q=x_q,
+                    output_s=x_s,
+                    group_size=group_size,
+                    eps=eps,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    scale_ue8m0=scale_ue8m0,
+                )
         else:
             assert not enable_v2
             sgl_per_token_group_quant_fp8(

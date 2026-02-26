@@ -417,26 +417,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       {at::Tag::needs_fixed_stride_order});
   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
-  m.def(
-      "min_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_min_p_arr, float "
-      "min_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("min_p_sampling_from_probs", torch::kCUDA, &min_p_sampling_from_probs);
-
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
-
-  m.def(
-      "top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? "
-      "maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("top_p_sampling_from_probs", torch::kCUDA, &top_p_sampling_from_probs);
-
-  m.def(
-      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? maybe_top_k_arr, "
-      "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
-  m.impl("top_k_top_p_sampling_from_probs", torch::kCUDA, &top_k_top_p_sampling_from_probs);
 
   m.def("top_k_mask_logits(Tensor logits, Tensor mask_logits, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_mask_logits", torch::kCUDA, &top_k_mask_logits);
