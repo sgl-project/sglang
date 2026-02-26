@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -368,9 +369,7 @@ class FrameInterpolator:
         if model_path in _MODEL_CACHE:
             return _MODEL_CACHE[model_path]
 
-        device = torch.device(
-            torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-        )
+        device = current_platform.get_local_torch_device()
         model = Model()
         model.load_model(model_path, strip_module_prefix=True)
         model.eval()
