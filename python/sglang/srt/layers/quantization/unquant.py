@@ -322,11 +322,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        if self.use_flashinfer_trtllm_moe:
+            backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        elif self.use_triton_kernels:
+            backend = MoeRunnerBackend.TRITON_KERNELS
+        else:
+            backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -385,6 +386,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
             return StandardCombineInput(hidden_states=output)
+        elif self.use_flashinfer_trtllm_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmBf16MoeQuantInfo,
+            )
+
+            quant_info = FlashInferTrtllmBf16MoeQuantInfo(
+                gemm1_weights=layer.w13_weight,
+                gemm2_weights=layer.w2_weight,
+                global_num_experts=layer.num_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         else:
             # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
             # because aiter CK kernels don't support all GEMM dimensions
@@ -530,11 +543,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        import torch_npu
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
+        # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
         original_dtype = x.dtype
@@ -542,36 +556,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
-        top_k = layer.top_k
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
+        top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
 
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch_npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        hidden_states, expanded_row_idx, expert_tokens, _ = (
+            torch.ops.npu.npu_moe_init_routing_v2(
+                x,
+                topk_ids,
+                active_num=num_tokens * top_k,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, num_experts],
+                quant_mode=-1,
             )
         )
-
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
-
         expert_tokens = expert_tokens.to(torch.int64)
         w13_bias = [layer.w13_weight_bias] if self.with_bias else None
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
         # gmm1: gate_up_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
             bias=w13_bias,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
@@ -583,25 +592,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch_npu.npu_swiglu(hidden_states)
+            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
 
             hidden_states = GeluAndMul()(hidden_states)
 
         # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
             bias=w2_bias,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
         )[0]
 
-        final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
             skip1=None,
             skip2=None,
@@ -609,6 +618,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=topk_ids,
+            drop_pad_mode=2,
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)

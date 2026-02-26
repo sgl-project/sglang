@@ -17,7 +17,8 @@ from __future__ import annotations
 import bisect
 import logging
 import time
-from typing import TYPE_CHECKING, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -39,6 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -57,6 +59,28 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
+    # Sliced from shared parent buffers
+    input_ids: torch.Tensor
+    out_cache_loc: torch.Tensor
+    swa_out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+    # Shared from parent
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    req_pool_indices: torch.Tensor
+    accept_length: torch.Tensor
+    # Per-step buffers
+    extend_seq_lens: torch.Tensor
+    extend_start_loc: torch.Tensor
+    mrope_positions: torch.Tensor
+    hidden_states: torch.Tensor
+    next_token_logits_buffer: torch.Tensor
+    global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
 class MultiLayerEagleDraftExtendCudaGraphRunner:
@@ -109,7 +133,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         next_cuda_graph_runner,
     ):
         self.next_cuda_graph_runner = next_cuda_graph_runner
-        self.seq_lens_cpu = cuda_graph_buffers["seq_lens_cpu"]
+        seq_lens_cpu = cuda_graph_buffers["seq_lens_cpu"]
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
@@ -119,62 +143,60 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         with torch.device(self.model_runner.device):
             # sliced buffers
             # slice according to max_num_token
-            self.input_ids = cuda_graph_buffers["input_ids"][
+            input_ids = cuda_graph_buffers["input_ids"][
                 offset : offset + self.max_num_token
             ]
-            self.out_cache_loc = cuda_graph_buffers["out_cache_loc"][
+            out_cache_loc = cuda_graph_buffers["out_cache_loc"][
                 offset : offset + self.max_num_token
             ]
-            self.swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][
+            swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][
                 offset : offset + self.max_num_token
             ]
-            self.positions = cuda_graph_buffers["positions"][
+            positions = cuda_graph_buffers["positions"][
                 offset : offset + self.max_num_token
             ]
 
             # shared states
-            self.seq_lens = cuda_graph_buffers["seq_lens"]
-            self.req_pool_indices = cuda_graph_buffers["req_pool_indices"]
-            self.accept_length = cuda_graph_buffers["accept_length"]
+            seq_lens = cuda_graph_buffers["seq_lens"]
+            req_pool_indices = cuda_graph_buffers["req_pool_indices"]
+            accept_length = cuda_graph_buffers["accept_length"]
 
-            self.extend_seq_lens = torch.full(
+            extend_seq_lens = torch.full(
                 (self.max_bs,),
                 self.num_tokens_per_bs,
                 dtype=torch.int32,
             )
-            self.extend_start_loc = torch.arange(
+            extend_start_loc = torch.arange(
                 0,
                 self.max_bs * self.num_tokens_per_bs,
                 step=self.num_tokens_per_bs,
                 dtype=torch.int32,
             )
 
-            self.mrope_positions = torch.zeros(
-                (3, self.max_num_token), dtype=torch.int64
-            )
+            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            self.hidden_states = torch.zeros(
+            hidden_states = torch.zeros(
                 (self.max_num_token, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    self.global_num_tokens_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
             else:
-                self.global_num_tokens_gpu = None
-                self.global_num_tokens_for_logprob_gpu = None
+                global_num_tokens_gpu = None
+                global_num_tokens_for_logprob_gpu = None
 
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
@@ -187,7 +209,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
-            self.next_token_logits_buffer = torch.zeros(
+            next_token_logits_buffer = torch.zeros(
                 (
                     (
                         self.max_bs * self.num_tokens_per_bs
@@ -198,6 +220,24 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
+
+        self.buffers = MultiLayerEagleDraftExtendInputBuffers(
+            input_ids=input_ids,
+            out_cache_loc=out_cache_loc,
+            swa_out_cache_loc=swa_out_cache_loc,
+            positions=positions,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            accept_length=accept_length,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            mrope_positions=mrope_positions,
+            hidden_states=hidden_states,
+            next_token_logits_buffer=next_token_logits_buffer,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        )
 
         # Capture
         try:
@@ -250,54 +290,55 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         CudaGraphRunner.capture(self)
 
     def get_forward_batch(self, bs: int) -> ForwardBatch:
+        buffers = self.buffers
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
-        req_pool_indices = self.req_pool_indices[:bs]
-        seq_lens = self.seq_lens[:bs]
-        seq_lens_cpu = self.seq_lens_cpu[:bs]
-        extend_seq_lens = self.extend_seq_lens[:bs]
+        input_ids = buffers.input_ids[:num_tokens]
+        req_pool_indices = buffers.req_pool_indices[:bs]
+        seq_lens = buffers.seq_lens[:bs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+        extend_seq_lens = buffers.extend_seq_lens[:bs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
-        extend_start_loc = self.extend_start_loc[:bs]
-        accept_length = self.accept_length[:bs]
-        out_cache_loc = self.out_cache_loc[:num_tokens]
-        positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :num_tokens]
-        hidden_states = self.hidden_states[:num_tokens]
-        next_token_logits_buffer = self.next_token_logits_buffer[
+        extend_start_loc = buffers.extend_start_loc[:bs]
+        accept_length = buffers.accept_length[:bs]
+        out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        positions = buffers.positions[:num_tokens]
+        mrope_positions = buffers.mrope_positions[:, :num_tokens]
+        hidden_states = buffers.hidden_states[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
 
         if self.require_mlp_tp_gather:
-            self.global_num_tokens_gpu.copy_(
+            buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            self.global_num_tokens_for_logprob_gpu.copy_(
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.dp_size,
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
             global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
-            self.global_num_tokens_gpu.copy_(
+            buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens],
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
-            self.global_num_tokens_for_logprob_gpu.copy_(
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     [bs],
                     dtype=torch.int32,
-                    device=self.input_ids.device,
+                    device=buffers.input_ids.device,
                 )
             )
             global_dp_buffer_len = num_tokens
@@ -326,8 +367,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
-            global_num_tokens_gpu=self.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -346,6 +387,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         return forward_batch
 
     def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
+        buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
 
@@ -390,7 +432,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             select_index = (
                 torch.arange(bs, device=self.model_runner.device)
                 * (self.speculative_num_draft_tokens + self.step)
-                + self.accept_length[:bs]
+                + buffers.accept_length[:bs]
                 - 1
                 + self.step
             )
@@ -399,24 +441,25 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             if self.next_cuda_graph_runner is not None:
+                next_buffers = self.next_cuda_graph_runner.buffers
                 padding_lens = (
-                    self.speculative_num_draft_tokens - self.accept_length[:bs]
+                    self.speculative_num_draft_tokens - buffers.accept_length[:bs]
                 )
                 assign_new_state_triton(
                     ret.topk_index,
-                    self.input_ids,
-                    self.positions,
-                    self.hidden_states,
-                    self.out_cache_loc,
-                    self.extend_seq_lens,
-                    self.extend_start_loc,
-                    self.next_cuda_graph_runner.input_ids,
-                    self.next_cuda_graph_runner.positions,
-                    self.next_cuda_graph_runner.hidden_states,
-                    self.next_cuda_graph_runner.out_cache_loc,
-                    self.next_cuda_graph_runner.extend_seq_lens,
-                    self.next_cuda_graph_runner.extend_start_loc,
-                    self.next_cuda_graph_runner.seq_lens,
+                    buffers.input_ids,
+                    buffers.positions,
+                    buffers.hidden_states,
+                    buffers.out_cache_loc,
+                    buffers.extend_seq_lens,
+                    buffers.extend_start_loc,
+                    next_buffers.input_ids,
+                    next_buffers.positions,
+                    next_buffers.hidden_states,
+                    next_buffers.out_cache_loc,
+                    next_buffers.extend_seq_lens,
+                    next_buffers.extend_start_loc,
+                    next_buffers.seq_lens,
                     padding_lens,
                     forward_batch.batch_size,
                     self.step,
@@ -424,9 +467,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     forward_batch.req_to_token_pool.req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
-                self.next_cuda_graph_runner.swa_out_cache_loc.copy_(
+                next_buffers.swa_out_cache_loc.copy_(
                     self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        self.next_cuda_graph_runner.out_cache_loc
+                        next_buffers.out_cache_loc
                     )
                 )
 
@@ -446,27 +489,30 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
     def init_replay_state(
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int
     ):
+        buffers = self.buffers
         # Common inputs
-        self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
+        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.extend_seq_lens is not None:
-            self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
-            self.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
-        self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        self.positions[:num_tokens].copy_(forward_batch.positions)
+            buffers.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+            buffers.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
+        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        buffers.positions[:num_tokens].copy_(forward_batch.positions)
         if (
             forward_batch.spec_info.hidden_states.shape[1]
-            == self.hidden_states.shape[1]
+            == buffers.hidden_states.shape[1]
         ):
-            self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
+            buffers.hidden_states[:num_tokens].copy_(
+                forward_batch.spec_info.hidden_states
+            )
         if forward_batch.spec_info.accept_length is not None:
-            self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            buffers.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
+        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
@@ -474,6 +520,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
+        buffers = self.buffers
 
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
@@ -492,28 +539,28 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             self.init_replay_state(forward_batch, bs, raw_bs, num_tokens)
 
         if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
-        forward_batch.spec_info.hidden_states = self.hidden_states[:num_tokens]
-        forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        forward_batch.spec_info.hidden_states = buffers.hidden_states[:num_tokens]
+        forward_batch.spec_info.accept_length = buffers.accept_length[:bs]
         forward_batch.spec_info.num_tokens_per_req = self.num_tokens_per_bs
         forward_batch.spec_info.num_tokens_for_logprob_per_req = 1
-        forward_batch.spec_info.positions = self.positions[:num_tokens]
-        forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
+        forward_batch.spec_info.positions = buffers.positions[:num_tokens]
+        forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].init_forward_metadata_replay_cuda_graph(
             bs=bs,
-            req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
             seq_lens_sum=forward_batch.seq_lens_sum
             + (bs - raw_bs) * self.seq_len_fill_value,
             encoder_lens=None,
             forward_mode=self.forward_mode,
             spec_info=forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=buffers.seq_lens_cpu,
         )
 
         # Replay
@@ -526,7 +573,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
             unpadding_bs = num_tokens
         elif bs != raw_bs:
-            forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]
+            forward_batch.spec_info.accept_length = buffers.accept_length[:raw_bs]
             unpadding_bs = raw_bs
         else:
             unpadding_bs = None
@@ -565,8 +612,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.runners = [None] * self.speculative_num_steps
             return
 
-        self.runners = []
-        buffer_len_list = []
+        self.runners: List[Optional[MultiLayerEagleDraftExtendCudaGraphRunner]] = []
+        buffer_len_list: List[int] = []
 
         # 1. Capture loop
         for step in range(self.speculative_num_steps):

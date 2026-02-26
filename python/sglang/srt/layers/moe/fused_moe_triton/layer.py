@@ -40,7 +40,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
-    StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
@@ -96,9 +95,13 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
-    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake():
+    elif a2a_backend.is_deepep() or a2a_backend.is_mooncake() or a2a_backend.is_mori():
         return MaybeTboDeepEPDispatcher(
-            group=get_tp_group().device_group,
+            group=(
+                get_tp_group().device_group
+                if not a2a_backend.is_mori()
+                else get_tp_group()
+            ),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
             num_experts=moe_runner_config.num_experts,
@@ -121,19 +124,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
         )
-    elif a2a_backend.is_mori():
-        from sglang.srt.layers.moe.token_dispatcher import MoriEPDispatcher
 
-        return MoriEPDispatcher(
-            group=get_tp_group(),
-            router_topk=moe_runner_config.top_k,
-            permute_fusion=True,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
-            hidden_size=moe_runner_config.hidden_size,
-            params_dtype=moe_runner_config.params_dtype,
-            deepep_mode=get_deepep_mode(),
-        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -1127,103 +1118,6 @@ class FusedMoE(torch.nn.Module):
             # TODO: remove this branch after MoE refactor
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
-
-
-class FlashInferFusedMoE(FusedMoE):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        if is_in_piecewise_cuda_graph():
-            if not TopKOutputChecker.format_is_standard(topk_output):
-                # Make sure there is torch lib op registration for the whole moe layer
-                return self.forward_impl(hidden_states, topk_output)
-            else:
-                return moe_forward_piecewise_cuda_graph_impl(
-                    hidden_states,
-                    topk_output.topk_weights,
-                    topk_output.topk_ids,
-                    topk_output.router_logits,
-                    self.layer_id,
-                )
-        else:
-            return self.forward_impl(hidden_states, topk_output)
-
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only silu is supported for flashinfer trtllm moe"
-        assert self.quant_method is not None
-        assert (
-            topk_output.topk_config.renormalize
-        ), "Renormalize is required for flashinfer trtllm moe"
-        assert (
-            self.num_fused_shared_experts == 0
-        ), "Fused shared experts are not supported for flashinfer trtllm moe"
-        assert (
-            self.moe_runner_config.is_gated
-        ), "Only gated MoEs are supported for flashinfer trtllm moe"
-
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-        router_logits = topk_output.router_logits
-        topk_config = topk_output.topk_config
-        correction_bias = topk_config.correction_bias
-        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
-
-        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            # lazy import
-            try:
-                from flashinfer.fused_moe import trtllm_bf16_moe
-            except ImportError as e:
-                raise ImportError(
-                    "Can't import trtllm_bf16_moe from flashinfer. "
-                    "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
-                ) from e
-
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                # TODO: Now trtllm_bf16_moe doesn't support inplace output,
-                # we can move this out when it support that.
-                final_hidden_states = trtllm_bf16_moe(
-                    routing_logits=router_logits,
-                    routing_bias=correction_bias,
-                    hidden_states=hidden_states,
-                    gemm1_weights=self.w13_weight,
-                    gemm2_weights=self.w2_weight,
-                    num_experts=self.num_experts,
-                    top_k=topk_config.top_k,
-                    n_group=topk_config.num_expert_group,
-                    topk_group=topk_config.topk_group,
-                    intermediate_size=self.intermediate_size_per_partition,
-                    local_expert_offset=self.moe_ep_rank * self.num_local_experts,
-                    local_num_experts=self.num_local_experts,
-                    routing_method_type=self.routing_method_type,
-                    routed_scaling_factor=routed_scaling_factor,
-                    tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
-                )
-
-        else:
-
-            final_hidden_states = self.quant_method.apply(
-                layer=self,
-                dispatch_output=StandardDispatchOutput(
-                    hidden_states=hidden_states,
-                    hidden_states_scale=None,
-                    topk_output=topk_output,
-                ),
-            ).hidden_states
-
-        # NOTE for symmetric memory tagging:
-        # We do not create the context in this function.
-        # Instead, we create the context and tagging inside each FusedMoEMethodBase
-        # This can allow fine-grained tagging.
-
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
-        return final_hidden_states
 
 
 class FlashInferFP4MoE(FusedMoE):

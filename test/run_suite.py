@@ -25,6 +25,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
+        "stage-c-test-aiter-fusion-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
@@ -191,7 +192,7 @@ def run_a_suite(args):
     files = [
         f
         for f in glob.glob("registered/**/*.py", recursive=True)
-        if not f.endswith("/conftest.py")
+        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
     ]
     # Strict: all registered files must have proper registration
     sanity_check = True
