@@ -591,7 +591,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # capture records shapes/references.
         if self.data_type == torch.float8_e4m3fn:
             metadata.kv_indices = self._cuda_graph_fused_kv_indices[:num_tokens]
-            metadata.kv_indptr = self._cuda_graph_fused_kv_indptr[:num_tokens + 1]
+            metadata.kv_indptr = self._cuda_graph_fused_kv_indptr[: num_tokens + 1]
             metadata.batch_indices = self._cuda_graph_fused_batch_indices[:num_tokens]
             metadata.positions = self._cuda_graph_fused_positions[:num_tokens]
 
@@ -761,7 +761,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.batch_size = bs
 
             # Initialize fused kernel metadata (computed once per forward pass, used by all layers)
-            if self.data_type == torch.float8_e4m3fn and forward_batch.out_cache_loc is not None:
+            if (
+                self.data_type == torch.float8_e4m3fn
+                and forward_batch.out_cache_loc is not None
+            ):
                 self._init_forward_metadata_for_rope_fusion(
                     self.forward_decode_metadata,
                     forward_batch.out_cache_loc,
@@ -1093,8 +1096,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
 
             q = self._fp8_rope_quantize_and_save(
-                q, q_rope, k, k_rope, layer, forward_batch,
-                cos_sin_cache, is_neox, save_kv_cache,
+                q,
+                q_rope,
+                k,
+                k_rope,
+                layer,
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+                save_kv_cache,
             )
             merge_query = False
             save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
@@ -1172,7 +1182,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
-            enable_pdl=False
+            enable_pdl=False,
         )
 
         # Reshape output directly without slicing
@@ -1214,8 +1224,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
 
             q = self._fp8_rope_quantize_and_save(
-                q, q_rope, k, k_rope, layer, forward_batch,
-                cos_sin_cache, is_neox, save_kv_cache,
+                q,
+                q_rope,
+                k,
+                k_rope,
+                layer,
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+                save_kv_cache,
             )
             merge_query = False
             save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
@@ -1341,7 +1358,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
-                enable_pdl=False
+                enable_pdl=False,
             )
 
             if needs_unpad:

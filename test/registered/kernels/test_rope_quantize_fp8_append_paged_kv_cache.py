@@ -64,24 +64,24 @@ class TestFusedVsSeparatedPath:
     1. Fused: rope_quantize_fp8_append_paged_kv_cache (RoPE + quantize + KV append in one call)
     2. Separated: mla_rope_quantize_fp8 + manual KV cache write (set_mla_kv_buffer equivalent)
     """
-    
+
     # DeepSeek V3/R1 MLA dimensions (fixed by model architecture)
     KV_LORA_RANK = 512
     QK_ROPE_HEAD_DIM = 64
-    
+
     @pytest.fixture
     def device(self):
         return torch.device("cuda")
-    
+
     @pytest.fixture
     def dtype(self):
         return torch.bfloat16
-    
+
     @pytest.fixture
     def cos_sin_cache(self, device):
         max_seq_len = 8192
         return create_cos_sin_cache(max_seq_len, self.QK_ROPE_HEAD_DIM, device)
-    
+
     @staticmethod
     def _generate_cache_locs(batch_size: int, page_size: int, device: torch.device):
         """Generate deterministic scattered cache locations across pages.
@@ -94,7 +94,10 @@ class TestFusedVsSeparatedPath:
         return pages * page_size + offsets
 
     def _create_paged_kv_cache(
-        self, num_pages: int, page_size: int, device: torch.device,
+        self,
+        num_pages: int,
+        page_size: int,
+        device: torch.device,
     ) -> tuple:
         """Create a paged KV cache buffer for testing.
 
@@ -105,15 +108,13 @@ class TestFusedVsSeparatedPath:
         """
         attn_dtype = torch.float8_e4m3fn
         ckv_cache = torch.zeros(
-            num_pages, page_size, self.KV_LORA_RANK,
-            device=device, dtype=attn_dtype
+            num_pages, page_size, self.KV_LORA_RANK, device=device, dtype=attn_dtype
         )
         kpe_cache = torch.zeros(
-            num_pages, page_size, self.QK_ROPE_HEAD_DIM,
-            device=device, dtype=attn_dtype
+            num_pages, page_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=attn_dtype
         )
         return ckv_cache, kpe_cache
-    
+
     def _run_fused_path(
         self,
         q_nope: torch.Tensor,
@@ -169,12 +170,12 @@ class TestFusedVsSeparatedPath:
             quant_scale_kv=1.0,
             page_size=page_size,
             kv_layout="NHD",
-            q_rope_out=q_out[..., self.KV_LORA_RANK:],
-            q_nope_out=q_out[..., :self.KV_LORA_RANK],
+            q_rope_out=q_out[..., self.KV_LORA_RANK :],
+            q_nope_out=q_out[..., : self.KV_LORA_RANK],
         )
 
         return q_out
-    
+
     def _run_separated_path(
         self,
         q_nope: torch.Tensor,
@@ -217,9 +218,9 @@ class TestFusedVsSeparatedPath:
             pos_ids=pos_ids,
             is_neox=False,
             quantize_dtype=attn_dtype,
-            q_rope_out=q_out[..., self.KV_LORA_RANK:],
+            q_rope_out=q_out[..., self.KV_LORA_RANK :],
             k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., :self.KV_LORA_RANK],
+            q_nope_out=q_out[..., : self.KV_LORA_RANK],
             k_nope_out=k_nope_out,
             quant_scale_q=1.0,
             quant_scale_kv=1.0,
@@ -313,32 +314,38 @@ class TestFusedVsSeparatedPath:
             assert ckv_d == 0.0, f"{err}ckv differs at loc {i}! diff={ckv_d}"
             assert kpe_d == 0.0, f"{err}kpe differs at loc {i}! diff={kpe_d}"
 
-        written = torch.zeros(num_pages, page_size, dtype=torch.bool, device=q_nope.device)
+        written = torch.zeros(
+            num_pages, page_size, dtype=torch.bool, device=q_nope.device
+        )
         for i in range(batch_size):
             written[kv_indices[i], positions[i]] = True
         unwritten = ~written
-        assert torch.equal(ckv_fused[unwritten], ckv_fused_snap[unwritten]), (
-            f"Spurious writes detected in {label}ckv_cache!"
-        )
-        assert torch.equal(kpe_fused[unwritten], kpe_fused_snap[unwritten]), (
-            f"Spurious writes detected in {label}kpe_cache!"
-        )
+        assert torch.equal(
+            ckv_fused[unwritten], ckv_fused_snap[unwritten]
+        ), f"Spurious writes detected in {label}ckv_cache!"
+        assert torch.equal(
+            kpe_fused[unwritten], kpe_fused_snap[unwritten]
+        ), f"Spurious writes detected in {label}kpe_cache!"
 
         return q_out_fused, ckv_fused, kpe_fused, unwritten
-    
-    @pytest.mark.parametrize("batch_size,num_heads,page_size", [
-        (1, 128, 64),    # single-token decode, TP=1
-        (1, 16, 64),     # single-token decode, TP=8
-        (3, 128, 64),    # odd small batch, TP=1
-        (8, 16, 64),     # medium batch, TP=8
-        (4, 32, 32),     # small batch, TP=4, page_size=32
-        (32, 64, 64),    # medium batch, TP=2
-        (64, 128, 32),   # larger batch, TP=1, page_size=32
-        (128, 128, 64),  # max cuda_graph_max_bs, TP=1
-        (128, 16, 32),   # max batch, TP=8, page_size=32
-    ])
-    def test_fused_correctness(self, device, dtype, cos_sin_cache,
-                               batch_size, num_heads, page_size):
+
+    @pytest.mark.parametrize(
+        "batch_size,num_heads,page_size",
+        [
+            (1, 128, 64),  # single-token decode, TP=1
+            (1, 16, 64),  # single-token decode, TP=8
+            (3, 128, 64),  # odd small batch, TP=1
+            (8, 16, 64),  # medium batch, TP=8
+            (4, 32, 32),  # small batch, TP=4, page_size=32
+            (32, 64, 64),  # medium batch, TP=2
+            (64, 128, 32),  # larger batch, TP=1, page_size=32
+            (128, 128, 64),  # max cuda_graph_max_bs, TP=1
+            (128, 16, 32),  # max batch, TP=8, page_size=32
+        ],
+    )
+    def test_fused_correctness(
+        self, device, dtype, cos_sin_cache, batch_size, num_heads, page_size
+    ):
         """Fused kernel must be bit-identical to separated path, write only
         targeted slots, and work with non-contiguous combined buffers.
 
@@ -354,22 +361,30 @@ class TestFusedVsSeparatedPath:
         pos_ids = torch.arange(batch_size, device=device, dtype=torch.int32)
 
         torch.manual_seed(batch_size * 1000 + num_heads * 10 + page_size)
-        q_nope = torch.randn(batch_size, num_heads, self.KV_LORA_RANK, device=device, dtype=dtype)
-        q_rope = torch.randn(batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        q_nope = torch.randn(
+            batch_size, num_heads, self.KV_LORA_RANK, device=device, dtype=dtype
+        )
+        q_rope = torch.randn(
+            batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
         k_nope = torch.randn(batch_size, self.KV_LORA_RANK, device=device, dtype=dtype)
-        k_rope = torch.randn(batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        k_rope = torch.randn(
+            batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
 
-        q_out_fused, ckv_fused, kpe_fused, unwritten = self._assert_fused_separated_parity(
-            q_nope=q_nope,
-            q_rope=q_rope,
-            k_nope=k_nope,
-            k_rope=k_rope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=pos_ids,
-            out_cache_loc=out_cache_loc,
-            page_size=page_size,
-            num_pages=num_pages,
-            sentinel_val=sentinel_val,
+        q_out_fused, ckv_fused, kpe_fused, unwritten = (
+            self._assert_fused_separated_parity(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                cos_sin_cache=cos_sin_cache,
+                pos_ids=pos_ids,
+                out_cache_loc=out_cache_loc,
+                page_size=page_size,
+                num_pages=num_pages,
+                sentinel_val=sentinel_val,
+            )
         )
 
         kv_indices = out_cache_loc // page_size
@@ -379,31 +394,48 @@ class TestFusedVsSeparatedPath:
         kv_cache_dim = self.KV_LORA_RANK + self.QK_ROPE_HEAD_DIM
         combined = torch.full(
             (num_pages, page_size, kv_cache_dim),
-            sentinel_val.item(), device=device, dtype=attn_dtype,
+            sentinel_val.item(),
+            device=device,
+            dtype=attn_dtype,
         )
         combined_snap = combined.clone()
-        ckv_comb = combined[:, :, :self.KV_LORA_RANK]
-        kpe_comb = combined[:, :, self.KV_LORA_RANK:]
+        ckv_comb = combined[:, :, : self.KV_LORA_RANK]
+        kpe_comb = combined[:, :, self.KV_LORA_RANK :]
         assert not ckv_comb.is_contiguous(), "ckv_cache should NOT be contiguous"
         assert not kpe_comb.is_contiguous(), "kpe_cache should NOT be contiguous"
 
         q_out_comb = self._run_fused_path(
-            q_nope, q_rope, k_nope, k_rope,
-            cos_sin_cache, pos_ids, out_cache_loc,
-            ckv_comb, kpe_comb, page_size,
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            cos_sin_cache,
+            pos_ids,
+            out_cache_loc,
+            ckv_comb,
+            kpe_comb,
+            page_size,
         )
-        comb_q_diff = torch.max(torch.abs(q_out_comb.float() - q_out_fused.float())).item()
+        comb_q_diff = torch.max(
+            torch.abs(q_out_comb.float() - q_out_fused.float())
+        ).item()
         assert comb_q_diff == 0.0, f"Combined buffer q_out mismatch! diff={comb_q_diff}"
         for i in range(batch_size):
             p, s = kv_indices[i].item(), positions[i].item()
-            cd = torch.max(torch.abs(ckv_comb[p, s].float() - ckv_fused[p, s].float())).item()
-            kd = torch.max(torch.abs(kpe_comb[p, s].float() - kpe_fused[p, s].float())).item()
+            cd = torch.max(
+                torch.abs(ckv_comb[p, s].float() - ckv_fused[p, s].float())
+            ).item()
+            kd = torch.max(
+                torch.abs(kpe_comb[p, s].float() - kpe_fused[p, s].float())
+            ).item()
             assert cd == 0.0, f"Combined ckv differs at loc {i}! diff={cd}"
             assert kd == 0.0, f"Combined kpe differs at loc {i}! diff={kd}"
-        assert torch.equal(ckv_comb[unwritten], combined_snap[:, :, :self.KV_LORA_RANK][unwritten]), \
-            "Spurious writes detected in combined ckv view!"
-        assert torch.equal(kpe_comb[unwritten], combined_snap[:, :, self.KV_LORA_RANK:][unwritten]), \
-            "Spurious writes detected in combined kpe view!"
+        assert torch.equal(
+            ckv_comb[unwritten], combined_snap[:, :, : self.KV_LORA_RANK][unwritten]
+        ), "Spurious writes detected in combined ckv view!"
+        assert torch.equal(
+            kpe_comb[unwritten], combined_snap[:, :, self.KV_LORA_RANK :][unwritten]
+        ), "Spurious writes detected in combined kpe view!"
 
     def test_kv_indptr_contract_mismatch(self, device, dtype, cos_sin_cache):
         """kv_indptr semantics must match MLA one-token-per-batch contract.
@@ -424,10 +456,16 @@ class TestFusedVsSeparatedPath:
         attn_dtype = torch.float8_e4m3fn
 
         torch.manual_seed(7777)
-        q_nope = torch.randn(batch_size, num_heads, self.KV_LORA_RANK, device=device, dtype=dtype)
-        q_rope = torch.randn(batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        q_nope = torch.randn(
+            batch_size, num_heads, self.KV_LORA_RANK, device=device, dtype=dtype
+        )
+        q_rope = torch.randn(
+            batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
         k_nope = torch.randn(batch_size, self.KV_LORA_RANK, device=device, dtype=dtype)
-        k_rope = torch.randn(batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        k_rope = torch.randn(
+            batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
         pos_ids = torch.arange(batch_size, device=device, dtype=torch.int32)
 
         pages = torch.arange(1, batch_size + 1, device=device, dtype=torch.int32)
@@ -442,70 +480,116 @@ class TestFusedVsSeparatedPath:
 
         ckv_good, kpe_good = self._create_paged_kv_cache(num_pages, page_size, device)
         q_out_good = torch.empty(
-            batch_size, num_heads,
+            batch_size,
+            num_heads,
             self.KV_LORA_RANK + self.QK_ROPE_HEAD_DIM,
-            device=device, dtype=attn_dtype,
+            device=device,
+            dtype=attn_dtype,
         )
         flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-            q_rope=q_rope, k_rope=k_rope, q_nope=q_nope, k_nope=k_nope,
-            v=None, cos_sin_cache=cos_sin_cache, pos_ids=pos_ids,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            v=None,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids,
             paged_kv_cache=(ckv_good, kpe_good),
-            kv_indices=kv_indices, kv_indptr=good_kv_indptr,
-            batch_indices=batch_indices, positions=positions_meta,
-            is_neox=False, quantize_dtype=attn_dtype,
-            quant_scale_q=1.0, quant_scale_kv=1.0,
-            page_size=page_size, kv_layout="NHD",
-            q_rope_out=q_out_good[..., self.KV_LORA_RANK:],
-            q_nope_out=q_out_good[..., :self.KV_LORA_RANK],
+            kv_indices=kv_indices,
+            kv_indptr=good_kv_indptr,
+            batch_indices=batch_indices,
+            positions=positions_meta,
+            is_neox=False,
+            quantize_dtype=attn_dtype,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+            page_size=page_size,
+            kv_layout="NHD",
+            q_rope_out=q_out_good[..., self.KV_LORA_RANK :],
+            q_nope_out=q_out_good[..., : self.KV_LORA_RANK],
         )
 
         ckv_bad, kpe_bad = self._create_paged_kv_cache(num_pages, page_size, device)
         q_out_bad = torch.empty_like(q_out_good)
         flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-            q_rope=q_rope, k_rope=k_rope, q_nope=q_nope, k_nope=k_nope,
-            v=None, cos_sin_cache=cos_sin_cache, pos_ids=pos_ids,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            v=None,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids,
             paged_kv_cache=(ckv_bad, kpe_bad),
-            kv_indices=kv_indices, kv_indptr=bad_kv_indptr,
-            batch_indices=batch_indices, positions=positions_meta,
-            is_neox=False, quantize_dtype=attn_dtype,
-            quant_scale_q=1.0, quant_scale_kv=1.0,
-            page_size=page_size, kv_layout="NHD",
-            q_rope_out=q_out_bad[..., self.KV_LORA_RANK:],
-            q_nope_out=q_out_bad[..., :self.KV_LORA_RANK],
+            kv_indices=kv_indices,
+            kv_indptr=bad_kv_indptr,
+            batch_indices=batch_indices,
+            positions=positions_meta,
+            is_neox=False,
+            quantize_dtype=attn_dtype,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+            page_size=page_size,
+            kv_layout="NHD",
+            q_rope_out=q_out_bad[..., self.KV_LORA_RANK :],
+            q_nope_out=q_out_bad[..., : self.KV_LORA_RANK],
         )
         torch.cuda.synchronize()
 
         q_diff = torch.max(torch.abs(q_out_good.float() - q_out_bad.float())).item()
-        assert q_diff == 0.0, f"q_out unexpectedly changed by kv_indptr mismatch! max_diff={q_diff}"
+        assert (
+            q_diff == 0.0
+        ), f"q_out unexpectedly changed by kv_indptr mismatch! max_diff={q_diff}"
 
         ckv_mismatch = torch.max(torch.abs(ckv_good.float() - ckv_bad.float())).item()
         kpe_mismatch = torch.max(torch.abs(kpe_good.float() - kpe_bad.float())).item()
-        assert ckv_mismatch > 0.0 or kpe_mismatch > 0.0, (
-            "Expected KV cache corruption with bad kv_indptr semantics, but saw no difference."
-        )
+        assert (
+            ckv_mismatch > 0.0 or kpe_mismatch > 0.0
+        ), "Expected KV cache corruption with bad kv_indptr semantics, but saw no difference."
 
         ckv_fixed, kpe_fixed = self._create_paged_kv_cache(num_pages, page_size, device)
         q_out_fixed = torch.empty_like(q_out_good)
         flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-            q_rope=q_rope, k_rope=k_rope, q_nope=q_nope, k_nope=k_nope,
-            v=None, cos_sin_cache=cos_sin_cache, pos_ids=pos_ids,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            v=None,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids,
             paged_kv_cache=(ckv_fixed, kpe_fixed),
-            kv_indices=kv_indices, kv_indptr=good_kv_indptr,
-            batch_indices=batch_indices, positions=positions_meta,
-            is_neox=False, quantize_dtype=attn_dtype,
-            quant_scale_q=1.0, quant_scale_kv=1.0,
-            page_size=page_size, kv_layout="NHD",
-            q_rope_out=q_out_fixed[..., self.KV_LORA_RANK:],
-            q_nope_out=q_out_fixed[..., :self.KV_LORA_RANK],
+            kv_indices=kv_indices,
+            kv_indptr=good_kv_indptr,
+            batch_indices=batch_indices,
+            positions=positions_meta,
+            is_neox=False,
+            quantize_dtype=attn_dtype,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+            page_size=page_size,
+            kv_layout="NHD",
+            q_rope_out=q_out_fixed[..., self.KV_LORA_RANK :],
+            q_nope_out=q_out_fixed[..., : self.KV_LORA_RANK],
         )
         torch.cuda.synchronize()
 
-        q_fixed_diff = torch.max(torch.abs(q_out_good.float() - q_out_fixed.float())).item()
-        ckv_fixed_diff = torch.max(torch.abs(ckv_good.float() - ckv_fixed.float())).item()
-        kpe_fixed_diff = torch.max(torch.abs(kpe_good.float() - kpe_fixed.float())).item()
-        assert q_fixed_diff == 0.0, f"q_out mismatch after kv_indptr fix! max_diff={q_fixed_diff}"
-        assert ckv_fixed_diff == 0.0, f"ckv mismatch after kv_indptr fix! max_diff={ckv_fixed_diff}"
-        assert kpe_fixed_diff == 0.0, f"kpe mismatch after kv_indptr fix! max_diff={kpe_fixed_diff}"
+        q_fixed_diff = torch.max(
+            torch.abs(q_out_good.float() - q_out_fixed.float())
+        ).item()
+        ckv_fixed_diff = torch.max(
+            torch.abs(ckv_good.float() - ckv_fixed.float())
+        ).item()
+        kpe_fixed_diff = torch.max(
+            torch.abs(kpe_good.float() - kpe_fixed.float())
+        ).item()
+        assert (
+            q_fixed_diff == 0.0
+        ), f"q_out mismatch after kv_indptr fix! max_diff={q_fixed_diff}"
+        assert (
+            ckv_fixed_diff == 0.0
+        ), f"ckv mismatch after kv_indptr fix! max_diff={ckv_fixed_diff}"
+        assert (
+            kpe_fixed_diff == 0.0
+        ), f"kpe mismatch after kv_indptr fix! max_diff={kpe_fixed_diff}"
 
     def test_high_rope_positions_deepseek(self, device, dtype, cos_sin_cache):
         """DeepSeek-focused spot check for high RoPE positions near cache limit."""
@@ -531,7 +615,9 @@ class TestFusedVsSeparatedPath:
             batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
         )
         k_nope = torch.randn(batch_size, self.KV_LORA_RANK, device=device, dtype=dtype)
-        k_rope = torch.randn(batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        k_rope = torch.randn(
+            batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
 
         self._assert_fused_separated_parity(
             q_nope=q_nope,
@@ -560,9 +646,9 @@ class TestFusedVsSeparatedPath:
         out_cache_loc = out_cache_loc_base[perm]
         pos_ids_base = torch.arange(batch_size, device=device, dtype=torch.int32)
         pos_ids = pos_ids_base[perm]
-        assert not torch.equal(out_cache_loc, out_cache_loc_base), (
-            "Expected a non-monotonic out_cache_loc permutation."
-        )
+        assert not torch.equal(
+            out_cache_loc, out_cache_loc_base
+        ), "Expected a non-monotonic out_cache_loc permutation."
 
         torch.manual_seed(131073)
         q_nope = torch.randn(
@@ -572,7 +658,9 @@ class TestFusedVsSeparatedPath:
             batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
         )
         k_nope = torch.randn(batch_size, self.KV_LORA_RANK, device=device, dtype=dtype)
-        k_rope = torch.randn(batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        k_rope = torch.randn(
+            batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
         q_nope = q_nope[perm]
         q_rope = q_rope[perm]
         k_nope = k_nope[perm]
@@ -615,7 +703,9 @@ class TestFusedVsSeparatedPath:
             batch_size, num_heads, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
         )
         k_nope = torch.randn(batch_size, self.KV_LORA_RANK, device=device, dtype=dtype)
-        k_rope = torch.randn(batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype)
+        k_rope = torch.randn(
+            batch_size, self.QK_ROPE_HEAD_DIM, device=device, dtype=dtype
+        )
 
         self._assert_fused_separated_parity(
             q_nope=q_nope,
