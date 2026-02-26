@@ -438,7 +438,7 @@ def post_process_sample(
 
     # 2. Frame interpolation (video only)
     if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
-        from sglang.multimodal_gen.runtime.frame_interpolation import (
+        from sglang.multimodal_gen.runtime.postprocess import (
             interpolate_video_frames,
         )
 

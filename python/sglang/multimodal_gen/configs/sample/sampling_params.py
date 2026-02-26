@@ -801,7 +801,6 @@ class SamplingParams:
         parser.add_argument(
             "--enable-frame-interpolation",
             action="store_true",
-            default=SamplingParams.enable_frame_interpolation,
             help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
         )
         parser.add_argument(
