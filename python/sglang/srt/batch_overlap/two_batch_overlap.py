@@ -30,6 +30,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    MoriEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -1026,6 +1027,10 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_mori():
+            self._inners = [
+                MoriEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

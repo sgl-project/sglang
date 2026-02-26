@@ -25,6 +25,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
+    get_default_distributed_backend,
     get_mooncake_transfer_engine,
     get_tp_group,
     init_distributed_environment,
@@ -176,6 +177,7 @@ class MMEncoder:
         self.use_image_processor_gpu = use_image_processor_gpu
 
         init_distributed_environment(
+            backend=get_default_distributed_backend(self.device),
             world_size=server_args.tp_size,
             rank=rank,
             distributed_init_method=dist_init_method,

@@ -309,7 +309,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # TVM Python bits need Cython + z3 before configure.
   # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@v0.1.9-rc1" "z3-solver==4.15.4.0"; \
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \

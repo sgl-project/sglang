@@ -216,6 +216,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -524,6 +525,9 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    linear_attn_backend: str = "triton"
+    linear_attn_decode_backend: Optional[str] = None
+    linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -887,12 +891,7 @@ class ServerArgs:
 
     def _handle_npu_backends(self):
         if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import (
-                init_npu_backend,
-                set_default_server_args,
-            )
-
-            init_npu_backend()
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
 
@@ -2249,15 +2248,17 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
-            self.deepep_mode = "normal"
-            logger.warning("auto set deepep_mode=`normal` for MORI EP")
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-            assert (self.chunked_prefill_size) <= get_int_env_var(
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
-            ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+            # Check chunked prefill for mori
+            # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+            # Skip validation if disaggregation mode is decode.
+            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
+                assert (self.chunked_prefill_size) <= get_int_env_var(
+                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+                ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -4302,6 +4303,31 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--linear-attn-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_backend,
+            help="The default kernel backend for linear attention (GDN/KDA). "
+            "Can be overridden per-mode by --linear-attn-decode-backend "
+            "and --linear-attn-prefill-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-decode-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_decode_backend,
+            help="Override the kernel backend for linear attention decode. "
+            "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="Override the kernel backend for linear attention prefill/extend. "
+            "If not set, uses --linear-attn-backend.",
         )
 
         # Hierarchical cache
