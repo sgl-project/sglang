@@ -658,7 +658,7 @@ class ModelConfig:
                     {"quantization": quant_cfg}
                 )
                 if parsed_cfg:
-                    quant_cfg.update(parsed_cfg or dict())
+                    quant_cfg.update(parsed_cfg)
 
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
