@@ -11,7 +11,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
     TensorStats,
@@ -133,7 +133,7 @@ def _make_warning(**overrides) -> ReplicatedMismatchWarning:
     return ReplicatedMismatchWarning(**defaults)
 
 
-class TestAlignWarnings:
+class TestWarnings:
     def test_comparison_record_failed_when_diff_passed_but_warnings(self):
         """ComparisonRecord with diff.passed=True but warnings → category=='failed'."""
         record = ComparisonRecord(

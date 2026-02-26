@@ -3,31 +3,36 @@ from typing import Any, Optional, Union
 
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.reorder import (
-    ReorderPlan,
-    compute_reorder_plans,
-    execute_reorder_plan,
+from sglang.srt.debug_utils.comparator.aligner.reorderer.executor import (
+    execute_reorderer_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.executor import (
-    execute_unshard_plan,
+from sglang.srt.debug_utils.comparator.aligner.reorderer.planner import (
+    compute_reorderer_plans,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.parallel_info import (
+from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
+from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
+    execute_unsharder_plan,
+)
+from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
-    compute_unshard_plan,
+from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
+    compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.types import UnshardPlan
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
 from sglang.srt.debug_utils.comparator.dims import parse_dims
 from sglang.srt.debug_utils.comparator.output_types import (
     AnyWarning,
     ComparisonRecord,
     SkipRecord,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.compare import compare_tensors
+from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
+    compare_tensor_pair,
+)
+from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
-Plan = Union[UnshardPlan, ReorderPlan]
+Plan = Union[UnsharderPlan, ReordererPlan]
 
 
 def process_tensor_group(
@@ -38,6 +43,28 @@ def process_tensor_group(
     baseline_path: Path,
     target_path: Path,
     diff_threshold: float,
+) -> ComparisonRecord | SkipRecord:
+    with warning_sink.context() as collected_warnings:
+        return _process_tensor_group_raw(
+            name=name,
+            baseline_filenames=baseline_filenames,
+            target_filenames=target_filenames,
+            baseline_path=baseline_path,
+            target_path=target_path,
+            diff_threshold=diff_threshold,
+            collected_warnings=collected_warnings,
+        )
+
+
+def _process_tensor_group_raw(
+    *,
+    name: str,
+    baseline_filenames: list[str],
+    target_filenames: list[str],
+    baseline_path: Path,
+    target_path: Path,
+    diff_threshold: float,
+    collected_warnings: list[AnyWarning],
 ) -> ComparisonRecord | SkipRecord:
     b_tensors = _load_tensors(baseline_filenames, baseline_path)
     t_tensors = _load_tensors(target_filenames, target_path)
@@ -51,22 +78,21 @@ def process_tensor_group(
     t_extracted = _extract_tensors(t_tensors)
     del b_tensors, t_tensors
 
-    b_tensor, b_warns = _execute_plans(b_extracted, b_plans)
-    t_tensor, t_warns = _execute_plans(t_extracted, t_plans)
-    all_warnings: list[AnyWarning] = b_warns + t_warns
+    b_tensor = _execute_plans(b_extracted, b_plans)
+    t_tensor = _execute_plans(t_extracted, t_plans)
 
     if b_tensor is None or t_tensor is None:
         reason = "baseline_load_failed" if b_tensor is None else "target_load_failed"
-        return SkipRecord(name=name, reason=reason, warnings=all_warnings)
+        return SkipRecord(name=name, reason=reason, warnings=collected_warnings)
 
-    info = compare_tensors(
+    info = compare_tensor_pair(
         x_baseline=b_tensor,
         x_target=t_tensor,
         name=name,
         diff_threshold=diff_threshold,
     )
 
-    return ComparisonRecord(**info.model_dump(), warnings=all_warnings)
+    return ComparisonRecord(**info.model_dump(), warnings=collected_warnings)
 
 
 def _load_tensors(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:
@@ -96,13 +122,13 @@ def _compute_plans_for_group(metas: list[dict[str, Any]]) -> list[Plan]:
     dim_specs = parse_dims(dims_str)
     parallel_infos = [normalize_parallel_info(meta) for meta in metas]
 
-    unshard_plans = compute_unshard_plan(
+    unsharder_plans = compute_unsharder_plan(
         dim_specs=dim_specs, parallel_infos=parallel_infos
     )
-    reorder_plans = compute_reorder_plans(
+    reorderer_plans = compute_reorderer_plans(
         dim_specs=dim_specs, parallel_infos=parallel_infos
     )
-    return [*unshard_plans, *reorder_plans]
+    return [*unsharder_plans, *reorderer_plans]
 
 
 def _extract_tensors(
@@ -114,32 +140,30 @@ def _extract_tensors(
 def _execute_plans(
     tensors: list[torch.Tensor],
     plans: list[Plan],
-) -> tuple[Optional[torch.Tensor], list[AnyWarning]]:
+) -> Optional[torch.Tensor]:
     if not tensors:
-        return None, []
+        return None
 
     if not plans:
         if len(tensors) != 1:
-            return None, []
-        return tensors[0], []
+            return None
+        return tensors[0]
 
-    warnings: list[AnyWarning] = []
     current = tensors
     for plan in plans:
-        current, new_warnings = _execute_plan(current, plan)
-        warnings.extend(new_warnings)
+        current = _execute_plan(current, plan)
 
     assert len(current) == 1
-    return current[0], warnings
+    return current[0]
 
 
 def _execute_plan(
     tensors: list[torch.Tensor],
     plan: Plan,
-) -> tuple[list[torch.Tensor], list[AnyWarning]]:
-    if isinstance(plan, UnshardPlan):
-        return execute_unshard_plan(plan, tensors)
-    elif isinstance(plan, ReorderPlan):
-        return execute_reorder_plan(plan, tensors), []
+) -> list[torch.Tensor]:
+    if isinstance(plan, UnsharderPlan):
+        return execute_unsharder_plan(plan, tensors)
+    elif isinstance(plan, ReordererPlan):
+        return execute_reorderer_plan(plan, tensors)
     else:
         raise NotImplementedError(f"Unknown {plan=}")

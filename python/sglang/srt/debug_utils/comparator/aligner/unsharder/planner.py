@@ -1,12 +1,12 @@
 from collections import defaultdict
 from typing import NamedTuple
 
-from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
     PickParams,
-    UnshardParams,
-    UnshardPlan,
+    UnsharderParams,
+    UnsharderPlan,
 )
 from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
 
@@ -21,10 +21,10 @@ class _GroupResult(NamedTuple):
     projected_coords: _CoordsList
 
 
-def compute_unshard_plan(
+def compute_unsharder_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
-) -> list[UnshardPlan]:
+) -> list[UnsharderPlan]:
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
@@ -51,20 +51,20 @@ def compute_unshard_plan(
         for info in parallel_infos
     ]
 
-    axis_and_params: list[tuple[ParallelAxis, UnshardParams]] = [
+    axis_and_params: list[tuple[ParallelAxis, UnsharderParams]] = [
         (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
         (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
         for axis, (dim_index, spec) in sharded_axis_infos.items()
     ]
 
-    plans: list[UnshardPlan] = []
+    plans: list[UnsharderPlan] = []
     for axis, params in axis_and_params:
         result = _group_and_project(
             current_coords=current_coords,
             target_axis=axis,
         )
-        plans.append(UnshardPlan(axis=axis, params=params, groups=result.groups))
+        plans.append(UnsharderPlan(axis=axis, params=params, groups=result.groups))
         current_coords = result.projected_coords
 
     return plans
@@ -130,7 +130,7 @@ def _group_and_project(
     return _GroupResult(groups=groups, projected_coords=projected)
 
 
-def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnshardParams:
+def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnsharderParams:
     if spec.reduction is not None:
         raise NotImplementedError(
             f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"

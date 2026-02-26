@@ -3,13 +3,14 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
     SkipRecord,
     SummaryRecord,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
     TensorStats,
@@ -30,6 +31,32 @@ class TestCheckEqualLengths:
     def test_mismatch_raises(self):
         with pytest.raises(ValueError, match="Length mismatch"):
             _check_equal_lengths(a=[1, 2], b=[3])
+
+
+class TestAxisInfo:
+    def test_valid(self):
+        info = AxisInfo(axis_rank=0, axis_size=4)
+        assert info.axis_rank == 0
+
+    def test_axis_size_zero(self):
+        with pytest.raises(ValidationError, match="axis_size must be > 0"):
+            AxisInfo(axis_rank=0, axis_size=0)
+
+    def test_axis_size_negative(self):
+        with pytest.raises(ValidationError, match="axis_size must be > 0"):
+            AxisInfo(axis_rank=0, axis_size=-1)
+
+    def test_axis_rank_negative(self):
+        with pytest.raises(ValidationError, match="axis_rank must be in"):
+            AxisInfo(axis_rank=-1, axis_size=4)
+
+    def test_axis_rank_too_large(self):
+        with pytest.raises(ValidationError, match="axis_rank must be in"):
+            AxisInfo(axis_rank=4, axis_size=4)
+
+    def test_axis_rank_equals_size_minus_one(self):
+        info = AxisInfo(axis_rank=3, axis_size=4)
+        assert info.axis_rank == 3
 
 
 class TestSummaryRecord:

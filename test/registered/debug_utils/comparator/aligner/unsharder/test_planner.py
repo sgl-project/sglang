@@ -2,10 +2,10 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.unshard.planner import (
-    compute_unshard_plan,
+from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
+    compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unshard.types import (
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
     PickParams,
@@ -16,13 +16,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="default", nightly=True)
 
 
-class TestComputeUnshardPlan:
+class TestComputeUnsharderPlan:
     def test_tp4_plan(self) -> None:
         dim_specs = parse_dims("b s h(tp) d")
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 1
         assert plans[0].axis == ParallelAxis.TP
@@ -36,18 +36,18 @@ class TestComputeUnshardPlan:
             {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
         ]
         with pytest.raises(ValueError, match="Inconsistent axis_size"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_missing_axis_in_parallel_info_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
         parallel_infos = [{ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2)}]
         with pytest.raises(ValueError, match="missing parallel_info"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_empty_parallel_infos_raises(self) -> None:
         dim_specs = parse_dims("h(tp)")
         with pytest.raises(ValueError, match="must not be empty"):
-            compute_unshard_plan(dim_specs, [])
+            compute_unsharder_plan(dim_specs, [])
 
     def test_scrambled_world_ranks(self) -> None:
         """world_rank order != axis_rank order."""
@@ -58,14 +58,14 @@ class TestComputeUnshardPlan:
             {ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4)},
             {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4)},
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
         assert len(plans) == 1
         assert plans[0].groups == [[1, 3, 0, 2]]
 
     def test_no_sharded_axes_returns_empty(self) -> None:
         dim_specs = parse_dims("b s d")
         parallel_infos = [{}]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
         assert plans == []
 
     def test_multi_axis_plan(self) -> None:
@@ -89,7 +89,7 @@ class TestComputeUnshardPlan:
                 ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
         assert plans[0].axis == ParallelAxis.CP
@@ -108,7 +108,7 @@ class TestComputeUnshardPlan:
                     }
                 )
 
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
 
@@ -144,7 +144,7 @@ class TestComputeUnshardPlan:
                 ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2),
             },
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
 
@@ -168,7 +168,7 @@ class TestComputeUnshardPlan:
             {ParallelAxis.TP: AxisInfo(axis_rank=3, axis_size=4)},
         ]
         with pytest.raises(ValueError, match="axis_rank coverage.*incomplete"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_reduction_not_implemented_raises(self) -> None:
         dim_specs = parse_dims("h(tp,partial)")
@@ -176,14 +176,14 @@ class TestComputeUnshardPlan:
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
         with pytest.raises(NotImplementedError, match="reduction"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_ordering_zigzag_accepted(self) -> None:
         dim_specs = parse_dims("s(cp,zigzag)")
         parallel_infos = [
             {ParallelAxis.CP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
         assert len(plans) == 1
         assert plans[0].axis == ParallelAxis.CP
 
@@ -192,7 +192,7 @@ class TestComputeUnshardPlan:
         parallel_infos = [
             {ParallelAxis.CP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
         assert len(plans) == 1
         assert plans[0].axis == ParallelAxis.CP
 
@@ -211,7 +211,7 @@ class TestComputeUnshardPlan:
                         }
                     )
 
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 3
         assert plans[0].axis == ParallelAxis.EP
@@ -246,7 +246,7 @@ class TestComputeUnshardPlan:
             },
         ]
         with pytest.raises(ValueError, match="missing parallel_info"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
 
 class TestReplicatedAxes:
@@ -271,7 +271,7 @@ class TestReplicatedAxes:
                 ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
         assert plans[0].axis == ParallelAxis.TP
@@ -305,7 +305,7 @@ class TestReplicatedAxes:
                 ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
         assert all(isinstance(p.params, PickParams) for p in plans)
@@ -327,7 +327,7 @@ class TestReplicatedAxes:
                         }
                     )
 
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 3
         pick_plans = [p for p in plans if isinstance(p.params, PickParams)]
@@ -360,7 +360,7 @@ class TestReplicatedAxes:
                 ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2),
             },
         ]
-        plans = compute_unshard_plan(dim_specs, parallel_infos)
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
 
         assert len(plans) == 2
         assert plans[0].axis == ParallelAxis.CP
@@ -382,7 +382,7 @@ class TestReplicatedAxes:
             },
         ]
         with pytest.raises(ValueError, match="Inconsistent axis_size"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_replicated_axis_missing_from_rank_raises(self) -> None:
         """A rank missing a replicated axis that other ranks have raises ValueError."""
@@ -398,7 +398,7 @@ class TestReplicatedAxes:
             },
         ]
         with pytest.raises(ValueError, match="missing parallel_info"):
-            compute_unshard_plan(dim_specs, parallel_infos)
+            compute_unsharder_plan(dim_specs, parallel_infos)
 
 
 if __name__ == "__main__":
