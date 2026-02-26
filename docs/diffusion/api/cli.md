@@ -41,6 +41,24 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
+**Frame Interpolation** (video only)
+
+- `--enable-frame-interpolation`: Enable post-generation frame interpolation using [RIFE 4.22.lite](https://huggingface.co/elfgum/RIFE-4.22.lite). Model weights are downloaded automatically on first use.
+- `--frame-interpolation-exp {EXP}`: Interpolation exponent — `1` = 2× frames, `2` = 4×, etc. (default: `1`)
+- `--frame-interpolation-scale {SCALE}`: RIFE inference scale; use `0.5` for high-resolution inputs to save memory (default: `1.0`)
+
+Example — generate a 5-frame video and interpolate to 9 frames (2×):
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --prompt "A dog running through a park" \
+  --num-frames 5 \
+  --enable-frame-interpolation \
+  --frame-interpolation-exp 1 \
+  --save-output
+```
+
 **Output Options**
 
 - `--output-path {PATH}`: Directory to save the generated video
