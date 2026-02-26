@@ -6,6 +6,7 @@
 This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
+
 from functools import lru_cache
 from typing import Any
 

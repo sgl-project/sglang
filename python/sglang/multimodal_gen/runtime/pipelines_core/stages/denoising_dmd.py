@@ -102,7 +102,7 @@ class DmdDenoisingStage(DenoisingStage):
                 with StageProfiler(
                     f"denoising_step_{i}",
                     logger=logger,
-                    timings=batch.timings,
+                    metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
                 ):
                     t_int = int(t.item())

@@ -45,7 +45,6 @@ You can build your custom `ComposedPipeline` by combining the following availabl
 | `TextEncodingStage`              | Encodes text prompts into embeddings using one or more text encoders.                                   |
 | `ImageEncodingStage`             | Encodes input images into embeddings, often used in image-to-image tasks.                               |
 | `ImageVAEEncodingStage`          | Specifically encodes an input image into the latent space using a Variational Autoencoder (VAE).        |
-| `ConditioningStage`              | Prepares the conditioning tensors (e.g., from text or image embeddings) for the denoising loop.         |
 | `TimestepPreparationStage`       | Prepares the scheduler's timesteps for the diffusion process.                                           |
 | `LatentPreparationStage`         | Creates the initial noisy latent tensor that will be denoised.                                          |
 | `DenoisingStage`                 | Executes the main denoising loop, iteratively applying the model (e.g., UNet) to refine the latents.    |
@@ -88,15 +87,13 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
         _required_config_modules = ["processor", "scheduler", "text_encoder", "tokenizer", "transformer", "vae"]
 
         def create_pipeline_stages(self, server_args: ServerArgs):
-            """Set up pipeline stages sequentially."""
-            self.add_stage(stage_name="input_validation_stage", stage=InputValidationStage())
-            self.add_stage(stage_name="prompt_encoding_stage_primary", stage=ImageEncodingStage(...))
-            self.add_stage(stage_name="image_encoding_stage_primary", stage=ImageVAEEncodingStage(...))
-            self.add_stage(stage_name="timestep_preparation_stage", stage=TimestepPreparationStage(...))
-            self.add_stage(stage_name="latent_preparation_stage", stage=LatentPreparationStage(...))
-            self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
-            self.add_stage(stage_name="denoising_stage", stage=DenoisingStage(...))
-            self.add_stage(stage_name="decoding_stage", stage=DecodingStage(...))
+            self.add_stage(InputValidationStage())
+            self.add_stage(ImageEncodingStage(...))
+            self.add_stage(ImageVAEEncodingStage(...))
+            self.add_stage(TimestepPreparationStage(...))
+            self.add_stage(LatentPreparationStage(...))
+            self.add_stage(DenoisingStage(...))
+            self.add_stage(DecodingStage(...))
     ```
     The pipeline is constructed by adding stages in order. `Qwen-Image-Edit` uses `ImageEncodingStage` (for prompt and image processing) and `ImageVAEEncodingStage` (for latent extraction) before standard denoising and decoding.
 

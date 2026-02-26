@@ -25,6 +25,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
+        "stage-c-test-aiter-fusion-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
@@ -72,6 +73,8 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.AMD: [
         "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
@@ -186,7 +189,11 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     # All tests (per-commit and nightly) are now in registered/
-    files = glob.glob("registered/**/*.py", recursive=True)
+    files = [
+        f
+        for f in glob.glob("registered/**/*.py", recursive=True)
+        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+    ]
     # Strict: all registered files must have proper registration
     sanity_check = True
 

@@ -1,19 +1,17 @@
-import json
-import os
-
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
 )
-from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
 class ImageEncoderLoader(TextEncoderLoader):
-
     component_names = ["image_encoder"]
     expected_library = "transformers"
 
@@ -41,10 +39,9 @@ class ImageEncoderLoader(TextEncoderLoader):
         #     revision=server_args.revision,
         #     model_override_args=None,
         # )
-        with open(os.path.join(component_model_path, "config.json")) as f:
-            model_config = json.load(f)
-        _clean_hf_config_inplace(model_config)
-        logger.debug("HF model config: %s", model_config)
+        model_config = get_diffusers_component_config(
+            component_path=component_model_path
+        )
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)

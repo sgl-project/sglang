@@ -15,6 +15,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+    is_nunchaku_available,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
@@ -23,6 +30,11 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+try:
+    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
+except Exception:
+    NunchakuFeedForward = None
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
@@ -111,6 +123,8 @@ class ZImageAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -129,13 +143,43 @@ class ZImageAttention(nn.Module):
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
 
-        self.to_q = ColumnParallelLinear(dim, dim, bias=False, gather_output=False)
-        self.to_k = ColumnParallelLinear(
-            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
-        )
-        self.to_v = ColumnParallelLinear(
-            dim, self.head_dim * num_kv_heads, bias=False, gather_output=False
-        )
+        kv_dim = self.head_dim * num_kv_heads
+        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim, kv_dim, kv_dim],
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
+            )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -145,7 +189,16 @@ class ZImageAttention(nn.Module):
             self.norm_k = None
 
         self.to_out = nn.ModuleList(
-            [RowParallelLinear(dim, dim, bias=False, input_is_parallel=True)]
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=False,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            ]
         )
 
         self.attn = USPAttention(
@@ -162,9 +215,23 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
+        if self.use_fused_qkv:
+            qkv, _ = self.to_qkv(hidden_states)
+            q, k, v = qkv.split(
+                [
+                    self.local_num_heads * self.head_dim,
+                    self.local_num_kv_heads * self.head_dim,
+                    self.local_num_kv_heads * self.head_dim,
+                ],
+                dim=-1,
+            )
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+        else:
+            q, _ = self.to_q(hidden_states)
+            k, _ = self.to_k(hidden_states)
+            v, _ = self.to_v(hidden_states)
         q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
@@ -214,6 +281,8 @@ class ZImageTransformerBlock(nn.Module):
         norm_eps: float,
         qk_norm: bool,
         modulation=True,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -227,9 +296,37 @@ class ZImageTransformerBlock(nn.Module):
             num_kv_heads=n_kv_heads,
             qk_norm=qk_norm,
             eps=1e-5,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attention",
         )
 
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
+        hidden_dim = int(dim / 3 * 8)
+        nunchaku_enabled = (
+            isinstance(quant_config, NunchakuConfig) and is_nunchaku_available()
+        )
+        if nunchaku_enabled:
+            import diffusers
+
+            ff = diffusers.models.attention.FeedForward(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="swiglu",
+                inner_dim=hidden_dim,
+                bias=False,
+            )
+            nunchaku_kwargs = {
+                "precision": quant_config.precision,
+                "rank": quant_config.rank,
+                "act_unsigned": quant_config.act_unsigned,
+            }
+            self.feed_forward = NunchakuFeedForward(ff, **nunchaku_kwargs)
+            # NunchakuFeedForward overrides net[2].act_unsigned=True for int4 (GELU-specific
+            # optimization for non-negative activations). Z-Image uses SwiGLU whose output
+            # can be negative, so we must restore the original act_unsigned value.
+            if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
+                self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
+        else:
+            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -389,10 +486,32 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ZImageDitConfig().arch_config.reverse_param_names_mapping
     )
 
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attention.to_qkv",
+                "attention.to_out",
+                "img_mlp",
+                "txt_mlp",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
+
     def __init__(
         self,
         config: ZImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
@@ -443,6 +562,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.norm_eps,
                     arch_config.qk_norm,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=f"noise_refiner.{layer_id}",
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -457,6 +578,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.norm_eps,
                     arch_config.qk_norm,
                     modulation=False,
+                    quant_config=quant_config,
+                    prefix=f"context_refiner.{layer_id}",
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -482,6 +605,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     arch_config.n_kv_heads,
                     arch_config.norm_eps,
                     arch_config.qk_norm,
+                    quant_config=quant_config,
+                    prefix=f"layers.{layer_id}",
                 )
                 for layer_id in range(arch_config.num_layers)
             ]
