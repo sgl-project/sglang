@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -28,13 +29,14 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -122,7 +124,7 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -159,6 +161,7 @@ class DeepseekModelNextN(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
@@ -205,8 +208,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = None
             self.cp_size = None

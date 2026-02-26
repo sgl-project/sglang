@@ -19,7 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAt
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -28,6 +30,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -102,7 +107,13 @@ class SelfAttention(nn.Module):
     Input x should already be the local shard [B, S_local, D] when SP is enabled.
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -116,10 +127,18 @@ class SelfAttention(nn.Module):
         self.num_heads_per_rank = self.num_heads // self.tp_size
 
         # TP strategy: shard Q/K/V over heads (column-parallel), then row-parallel output.
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
+        self.q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.o = RowParallelLinear(
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
@@ -186,7 +205,13 @@ class CrossAttention(nn.Module):
     Uses LocalAttention instead of USPAttention for efficiency.
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -199,10 +224,18 @@ class CrossAttention(nn.Module):
             )
         self.num_heads_per_rank = self.num_heads // self.tp_size
 
-        self.q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.o = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
+        self.q = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.k = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.v = ColumnParallelLinear(
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+        )
+        self.o = RowParallelLinear(
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+        )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
@@ -247,14 +280,12 @@ class CrossAttention(nn.Module):
         return x
 
 
-class GateModule(nn.Module):
-    def __init__(
-        self,
-    ):
+class MulAdd(nn.Module):
+    def __init__(self):
         super().__init__()
 
     def forward(self, x, gate, residual):
-        return x + gate * residual
+        return residual + gate * x
 
 
 class DiTBlock(nn.Module):
@@ -264,20 +295,33 @@ class DiTBlock(nn.Module):
         num_heads: int,
         ffn_dim: int,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(dim, num_heads, eps)
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
+        self.self_attn = SelfAttention(dim, num_heads, eps, quant_config=quant_config)
+        self.cross_attn = CrossAttention(dim, num_heads, eps, quant_config=quant_config)
+        self.norm1 = LayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
+        self.self_attn_norm = nn.LayerNorm(dim, eps=eps)
+        # Fused: residual + 1 * cross_attn_out → layernorm + scale/shift
+        # Replaces the old norm2 (LayerNormScaleShift) + residual add for cross-attention
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
+        self.ffn = MLP(
+            dim,
+            ffn_dim,
+            output_dim=dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
+        )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        self.gate = GateModule()
+        self.mlp_residual = MulAdd()
 
     def forward(self, x, context, t_mod, freqs):
         has_seq = len(t_mod.shape) == 4
@@ -295,11 +339,23 @@ class DiTBlock(nn.Module):
                 scale_mlp.squeeze(2),
                 gate_mlp.squeeze(2),
             )
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        orig_dtype = x.dtype
+        # 1. Self-attention, fuse:
+        # - layernorm(x) * (1 + scale_msa) + shift_msa
+        input_x = self.norm1(x, shift_msa, scale_msa)
+        # 2. torch.compile may fuse mlp_residual and self_attn_norm
+        x = self.mlp_residual(self.self_attn(input_x, freqs), gate_msa, x)
+        norm_x = self.self_attn_norm(x)
+        # 3. Cross-attention, fuse:
+        # - x = x + 1 * cross_output
+        # - input_x = layernorm(x) * (1 + scale_mlp) + shift_mlp
+        cross_output = self.cross_attn(norm_x, context)
+        input_x, x = self.cross_attn_residual_norm(
+            x, cross_output, 1, shift_mlp, scale_mlp
+        )
+        # 4. Feed-forward
+        x = self.mlp_residual(self.ffn(input_x), gate_mlp, x)
+        x = x.to(orig_dtype)
         return x
 
 
@@ -310,7 +366,9 @@ class Head(nn.Module):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm = LayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
         # Output dim is small for MOVA; replicate to avoid TP shape coupling.
         self.head = ReplicatedLinear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
@@ -321,12 +379,12 @@ class Head(nn.Module):
                 self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(2)
             ).chunk(2, dim=2)
-            x, _ = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+            x, _ = self.head(self.norm(x, shift.squeeze(2), scale.squeeze(2)))
         else:
             shift, scale = (
                 self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
             ).chunk(2, dim=1)
-            x, _ = self.head(self.norm(x) * (1 + scale) + shift)
+            x, _ = self.head(self.norm(x, shift, scale))
         return x
 
 
@@ -368,7 +426,12 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping
 
-    def __init__(self, config: MOVAVideoConfig, hf_config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: MOVAVideoConfig,
+        hf_config: dict[str, Any],
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
         # Extract parameters from config
@@ -384,8 +447,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
-        add_control_adapter = config.add_control_adapter
-        in_dim_control_adapter = config.in_dim_control_adapter
         seperated_timestep = config.seperated_timestep
         require_vae_embedding = config.require_vae_embedding
         require_clip_embedding = config.require_clip_embedding
@@ -403,13 +464,24 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
         self.text_embedding = MLP(
-            text_dim, dim, output_dim=dim, act_type="gelu_pytorch_tanh"
+            text_dim,
+            dim,
+            output_dim=dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
         )
-        self.time_embedding = MLP(freq_dim, dim, output_dim=dim, act_type="silu")
+        self.time_embedding = MLP(
+            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
+        )
         # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(nn.SiLU(), ReplicatedLinear(dim, dim * 6))
+        self.time_projection = nn.Sequential(
+            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
+        )
         self.blocks = nn.ModuleList(
-            [DiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
+            [
+                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
+                for _ in range(num_layers)
+            ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
@@ -439,17 +511,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.accumulated_rel_l1_distance_even = 0
         self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
-        if add_control_adapter:
-            from .wan_video_camera_controller import SimpleAdapter
-
-            self.control_adapter = SimpleAdapter(
-                in_dim_control_adapter,
-                dim,
-                kernel_size=patch_size[1:],
-                stride=patch_size[1:],
-            )
-        else:
-            self.control_adapter = None
 
     def _init_freqs(self):
         if self.freqs is not None:
@@ -463,20 +524,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         # NOTE(dhyu): avoid slow_conv
         x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.patch_embedding(x)
-        if (
-            self.control_adapter is not None
-            and control_camera_latents_input is not None
-        ):
-            y_camera = self.control_adapter(control_camera_latents_input)
-            if isinstance(x, list):
-                x = [u + v for u, v in zip(x, y_camera)]
-                x = x[0].unsqueeze(0)
-            else:
-                # Some adapters may return a list even when x is a Tensor.
-                if isinstance(y_camera, list):
-                    x = x + y_camera[0]
-                else:
-                    x = x + y_camera
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         return x, grid_size  # x, grid_size: (f, h, w)
@@ -498,12 +545,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
-        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor],
-        y: torch.Tensor,
-        guidance=None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **kwargs,
     ) -> torch.Tensor:
         # MOVA code historically uses x/context/y/clip_feature naming.
         x = hidden_states
@@ -532,35 +573,8 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             .to(x.device)
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-
-            return custom_forward
-
         for block in self.blocks:
-            if self.training and use_gradient_checkpointing:
-                if use_gradient_checkpointing_offload:
-                    with torch.autograd.graph.save_on_cpu():
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x,
-                            context,
-                            t_mod,
-                            freqs,
-                            use_reentrant=False,
-                        )
-                else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x,
-                        context,
-                        t_mod,
-                        freqs,
-                        use_reentrant=False,
-                    )
-            else:
-                x = block(x, context, t_mod, freqs)
+            x = block(x, context, t_mod, freqs)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

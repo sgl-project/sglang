@@ -1,6 +1,7 @@
 import itertools
 import os
 
+import flashinfer.sampling
 import sgl_kernel
 import torch
 import triton
@@ -69,7 +70,7 @@ def calculate_diff(batch_size, vocab_size, p):
     torch_samples = torch_top_k_top_p_joint_sampling_from_probs(
         normalized_prob, top_k_tensor, top_p_tensor
     )
-    sglang_samples = sgl_kernel.top_k_top_p_sampling_from_probs(
+    sglang_samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         normalized_prob, top_k_tensor, top_p_tensor, filter_apply_order="joint"
     )
 
@@ -120,7 +121,7 @@ def benchmark_sampling(batch_size, vocab_size, p, provider):
             normalized_prob.clone(), top_k_tensor, top_p_tensor
         )
     elif provider == "sglang":
-        fn = lambda: sgl_kernel.top_k_top_p_sampling_from_probs(
+        fn = lambda: flashinfer.sampling.top_k_top_p_sampling_from_probs(
             normalized_prob.clone(),
             top_k_tensor,
             top_p_tensor,

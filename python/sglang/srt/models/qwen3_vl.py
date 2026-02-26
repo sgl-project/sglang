@@ -13,12 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+
 import logging
 import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -28,7 +30,12 @@ from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    BATCH_BUCKETS,
+    FLASHINFER_MAX_SEQLEN_BUCKETS,
+    FLASHINFER_WORKSPACE_SIZE_BYTES,
+    VisionAttention,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -64,13 +71,10 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
-
-
-# === Vision Encoder === #
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -159,6 +163,7 @@ class Qwen3_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -177,6 +182,7 @@ class Qwen3_VisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
+            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -195,6 +201,8 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[torch.Tensor] = None,
+        sequence_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -204,6 +212,8 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_ws=output_ws,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -323,6 +333,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             is_neox_style=True,
         )
 
+        workspace_buffer = None
+        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+            if torch.cuda.is_available() and (not is_npu()):
+                ws_device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                ws_device = self.device
+            workspace_buffer = torch.empty(
+                FLASHINFER_WORKSPACE_SIZE_BYTES,
+                dtype=torch.uint8,
+                device=ws_device,
+            )
+
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -334,6 +356,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    workspace_buffer=workspace_buffer,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -396,31 +419,301 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        patch_pos_embeds_permute = []
-        m_size = self.spatial_merge_size
+    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
+        """
+        Compute continuous interpolation indices for a single dimension.
 
-        embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
-        embeds = (
-            self.pos_embed(embeds)
-            .permute(1, 0)
-            .reshape(1, -1, self.num_grid_per_side, self.num_grid_per_side)
-        )
+        Returns continuous indices.
+        """
+        if self.align_corners:
+            indices = np.linspace(
+                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
+            )
+        else:
+            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
+                self.num_grid_per_side / dim_size
+            ) - 0.5
+            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
+        return indices
+
+    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
+        """
+        Compute bilinear interpolation indices and weights.
+
+        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
+        """
+        h_f = np.floor(h_idxs).astype(np.int64)
+        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
+        dh = h_idxs - h_f
+
+        w_f = np.floor(w_idxs).astype(np.int64)
+        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
+        dw = w_idxs - w_f
+
+        side = self.num_grid_per_side
+
+        indices = [
+            (h_f[:, None] * side + w_f).flatten(),
+            (h_f[:, None] * side + w_c).flatten(),
+            (h_c[:, None] * side + w_f).flatten(),
+            (h_c[:, None] * side + w_c).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[:, None] * (1 - dw)).flatten(),
+            ((1 - dh)[:, None] * dw).flatten(),
+            (dh[:, None] * (1 - dw)).flatten(),
+            (dh[:, None] * dw).flatten(),
+        ]
+        return indices, weights
+
+    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        """
+        Tile and reorganize position embeddings to align with the token sequence.
+        """
+        result_parts = []
+        merge_size = self.spatial_merge_size
+
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            pos_embed = pos_embed.repeat(t, 1)
+
+            h_merge = h // merge_size
+            w_merge = w // merge_size
+
+            pos_embed = (
+                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+
+            result_parts.append(pos_embed)
+
+        return torch.cat(result_parts, dim=0)
+
+    def _torch_interp_indices(
+        self, dim_size: int, device: torch.device
+    ) -> torch.Tensor:
+        side = self.num_grid_per_side
+        if self.align_corners:
+            # align_corners=True
+            return torch.linspace(
+                0, side - 1, dim_size, dtype=torch.float32, device=device
+            )
+        else:
+            # align_corners=False  (match _get_interpolation_indices)
+            idx = (torch.arange(dim_size, dtype=torch.float32, device=device) + 0.5) * (
+                side / dim_size
+            ) - 0.5
+            return idx.clamp_(0, side - 1)
+
+    def fast_pos_embed_interpolate_from_list(self, grid_thw):
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
+
+        outputs = []
         for t, h, w in grid_thw:
-            pos_embed = torch.nn.functional.interpolate(
-                embeds, size=(h, w), mode="bilinear", align_corners=self.align_corners
+            h_idxs = torch.linspace(
+                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
             )
-            pos_embed = pos_embed.reshape(
-                -1,
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+            w_idxs = torch.linspace(
+                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
             )
-            pos_embed = pos_embed.permute(1, 3, 2, 4, 0)
-            pos_embed = pos_embed.flatten(0, 3).repeat(t, 1)
-            patch_pos_embeds_permute.append(pos_embed)
-        return torch.cat(patch_pos_embeds_permute)
+
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=self.dtype)
+
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
+
+            combined = combined.reshape(
+                h // m_size, m_size, w // m_size, m_size, hidden_dim
+            )
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
+
+    def add_padding_to_fi_seqlens(
+        self, seq: np.ndarray, batch_size: int, padding_value: int
+    ) -> np.ndarray:
+        batch_size_padded = next(
+            (b for b in BATCH_BUCKETS if b >= batch_size),
+            # For large batches (> max bucket), round up to a multiple of
+            # the base bucket size to avoid negative pad length.
+            round_up(batch_size, BATCH_BUCKETS[0]),
+        )
+        if batch_size_padded == batch_size:
+            return seq
+        return np.concatenate(
+            [
+                seq,
+                np.full(
+                    (batch_size_padded - batch_size,), padding_value, dtype=seq.dtype
+                ),
+            ]
+        )
+
+    def bucket_flashinfer_max_seqlen(self, real_max_seqlen: int) -> int:
+        if real_max_seqlen <= 0:
+            return FLASHINFER_MAX_SEQLEN_BUCKETS[0]
+        return next(
+            (s for s in FLASHINFER_MAX_SEQLEN_BUCKETS if s >= real_max_seqlen),
+            # For large sequences (> max bucket), round up to a multiple of
+            # the largest bucket to avoid under-estimation.
+            round_up(real_max_seqlen, FLASHINFER_MAX_SEQLEN_BUCKETS[-1]),
+        )
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        """Interpolate position embeddings for (batch, 3) size input dimensions.
+
+        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
+        along temporal dimension. The result is reorganized according to spatial_merge_size.
+
+        Args:
+            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
+                     in patches for each sample.
+
+        Returns:
+            Interpolated position embeddings tensor.
+        """
+        grid_thw_cpu = grid_thw.cpu().numpy()
+
+        # transfer data to CPU before loop
+        temporal_dims = grid_thw_cpu[:, 0].tolist()
+        height_dims = grid_thw_cpu[:, 1].tolist()
+        width_dims = grid_thw_cpu[:, 2].tolist()
+
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
+        total_patches = sum(patches_size)
+        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
+        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+
+        current_idx = 0
+
+        # calculate indices and weights on CPU
+        for t, h, w in zip(temporal_dims, height_dims, width_dims):
+            h_idxs = self._get_interpolation_indices(h)
+            w_idxs = self._get_interpolation_indices(w)
+
+            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
+
+            end_idx = current_idx + h * w
+            for i in range(4):
+                all_indices_np[i, current_idx:end_idx] = indices[i]
+                all_weights_np[i, current_idx:end_idx] = weights[i]
+            current_idx = end_idx
+
+        idx_tensor = torch.from_numpy(all_indices_np).to(device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
+
+        # calculate interpolation
+        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = pos_embeds.view(4, total_patches, -1)
+        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
+        patch_pos_embeds = patch_pos_embeds.split(patches_size)
+        return self._get_position_embedding(
+            patch_pos_embeds, temporal_dims, height_dims, width_dims
+        )
+
+    def compute_flashinfer_batch_offsets_packed(
+        self,
+        token_cu_seqlens: np.ndarray,
+        *,
+        elem_per_token: int,
+    ) -> np.ndarray:
+        """
+        Build packed *element* indptrs for FlashInfer cuDNN prefill.
+
+        Input:
+        token_cu_seqlens: (B+1,) token indptr
+        elem_per_token: per-token element width on THIS TP rank
+                        (usually hidden_size / attn_tp_size)
+
+        Output:
+        packed_offsets: (3 * (B_padded + 1),) int32
+            [qk_indptr, v_indptr, o_indptr] concatenated,
+            each indptr is (B_padded + 1,) in element units.
+        """
+        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        B = int(token_cu_seqlens.size - 1)
+        B_padded = self.bucket_flashinfer_batch_size(B)
+
+        # token indptr -> pad to (B_padded+1,) by appending total_tokens for extra empty sequences
+        token_indptr = token_cu_seqlens.astype(np.int64, copy=False)  # (B+1,)
+        if B_padded != B:
+            pad = np.full((B_padded - B,), token_indptr[-1], dtype=token_indptr.dtype)
+            token_indptr = np.concatenate([token_indptr, pad], axis=0)  # (B_padded+1,)
+
+        # convert token indptr -> element indptr
+        elem_indptr = (token_indptr * int(elem_per_token)).astype(
+            np.int32
+        )  # (B_padded+1,)
+
+        # q/k/v/o in this ViT path share the same indptr
+        return np.concatenate([elem_indptr, elem_indptr, elem_indptr], axis=0)
+
+    def bucket_flashinfer_batch_size(self, batch_size: int) -> int:
+        """Bucketize batch size for cuDNN graph caching."""
+        return next(
+            (b for b in BATCH_BUCKETS if b >= batch_size),
+            round_up(batch_size, BATCH_BUCKETS[0]),
+        )
+
+    def compute_flashinfer_sequence_lengths_padded(
+        self,
+        token_cu_seqlens: np.ndarray,
+    ) -> np.ndarray:
+        """
+        token_cu_seqlens: (B+1,) token indptr
+        return: (B_padded,) token lengths (padded with 0)
+        """
+        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        B = int(token_cu_seqlens.size - 1)
+
+        seq_lens = (token_cu_seqlens[1:] - token_cu_seqlens[:-1]).astype(
+            np.int32
+        )  # (B,)
+
+        B_padded = self.bucket_flashinfer_batch_size(B)
+        if B_padded != B:
+            pad = np.zeros((B_padded - B,), dtype=np.int32)
+            seq_lens = np.concatenate([seq_lens, pad], axis=0)  # (B_padded,)
+        return seq_lens
 
     def forward(
         self,
@@ -435,23 +728,75 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
-            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+            grid_thw = np.array(grid_thw, dtype=np.int32)
         else:
             grid_thw_list = grid_thw.tolist()
+            grid_thw = grid_thw.cpu().numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
-        # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if not is_npu():
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        # ---- build token indptr (B+1,) ----
+        token_cu_seqlens = np.repeat(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(axis=0, dtype=np.int32)
+        token_cu_seqlens = np.concatenate(
+            [np.zeros(1, dtype=np.int32), token_cu_seqlens]
+        )
+
+        flashinfer_max_seqlen = 0
+        cu_seqlens = None
+        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+            # real token lens (B,)
+            real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
+                int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
+            )
+
+            # (B_padded,) token lengths
+            seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
+                token_cu_seqlens
+            )
+
+            # element-per-token width on THIS ATTENTION TP rank
+            # q/k/v in VisionAttention are sharded by attention TP
+            attn_tp_size = 1 if self.use_data_parallel else self.tp_size
+            elem_per_token = (
+                self.hidden_size // attn_tp_size
+            )  # == heads_per_rank * head_dim
+
+            # (3*(B_padded+1),) packed element indptrs
+            offsets_packed = self.compute_flashinfer_batch_offsets_packed(
+                token_cu_seqlens,
+                elem_per_token=elem_per_token,
+            )
+
+            sequence_lengths = (
+                torch.from_numpy(seq_lens_padded)
+                .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                .view(-1, 1, 1, 1)
+            )  # match cuDNN test style
+
+            cu_seqlens = torch.from_numpy(offsets_packed).to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+
+            max_seqlen = int(flashinfer_max_seqlen)
+            sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
         else:
-            cu_seqlens = cu_seqlens.to("cpu")
+            sequence_lengths = None
+            cu_seqlens = torch.from_numpy(token_cu_seqlens)
+            if not is_npu():
+                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+            else:
+                cu_seqlens = cu_seqlens.to("cpu")
+            max_seqlen = None
+
         x = x.unsqueeze(1)
+
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -462,6 +807,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
             )
 
             if layer_num in self.deepstack_visual_indexes:
@@ -685,9 +1032,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=None,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
 
@@ -703,7 +1050,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("model", prefix),
+                prefix=add_prefix("model.language_model", prefix),
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
@@ -886,6 +1233,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1009,7 +1357,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                    name = name.replace(r"model.visual.", r"visual.")
 
                 try:
                     # Skip loading extra bias for GPTQ models.

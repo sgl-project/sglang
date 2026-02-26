@@ -261,25 +261,6 @@ void bmm_fp8(
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
-torch::Tensor gptq_marlin_gemm(
-    torch::Tensor& a,
-    std::optional<torch::Tensor> c_or_none,
-    torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& global_scale_or_none,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
-    std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    torch::Tensor& workspace,
-    sglang::ScalarTypeId const& b_q_type_id,
-    int64_t size_m,
-    int64_t size_n,
-    int64_t size_k,
-    bool is_k_full,
-    bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float);
-
 torch::Tensor gptq_gemm(
     torch::Tensor a,
     torch::Tensor b_q_weight,
@@ -290,11 +271,6 @@ torch::Tensor gptq_gemm(
     int64_t bit);
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
-
-torch::Tensor
-gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
-
-torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
 
 /*
  * From csrc/moe
@@ -707,40 +683,11 @@ void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, 
 /*
  * From FlashInfer
  */
-void min_p_sampling_from_probs(
-    at::Tensor probs,
-    at::Tensor output,
-    std::optional<at::Tensor> maybe_indices,
-    std::optional<at::Tensor> maybe_min_p_arr,
-    double min_p_val,
-    bool deterministic,
-    std::optional<at::Generator> gen);
-
 void top_k_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
-
-void top_k_top_p_sampling_from_probs(
-    at::Tensor probs,
-    at::Tensor output,
-    std::optional<at::Tensor> maybe_indices,
-    std::optional<at::Tensor> maybe_top_k_arr,
-    double top_k_val,
-    std::optional<at::Tensor> maybe_top_p_arr,
-    double top_p_val,
-    bool deterministic,
-    std::optional<at::Generator> gen);
-
-void top_p_sampling_from_probs(
-    at::Tensor probs,
-    at::Tensor output,
-    std::optional<at::Tensor> maybe_indices,
-    std::optional<at::Tensor> maybe_top_p_arr,
-    double top_p_val,
-    bool deterministic,
-    std::optional<at::Generator> gen);
 
 void top_k_mask_logits(
     at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
@@ -935,15 +882,6 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     const torch::Tensor& blockscale_offsets,
     torch::Tensor& quant_output,
     torch::Tensor& scale_factor);
-
-/*
- * From fast-hadamard-transform
- */
-torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
-torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
 
 /*
  * From flashmla

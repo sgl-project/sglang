@@ -86,6 +86,8 @@ class EagleDraftWorker(BaseDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -97,6 +99,8 @@ class EagleDraftWorker(BaseDraftWorker):
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -134,6 +138,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -483,9 +489,9 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -508,8 +514,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -582,6 +588,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -608,7 +616,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         self._draft_worker = EagleDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors
@@ -691,7 +707,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify

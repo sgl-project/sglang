@@ -9,10 +9,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, suite="stage-b-test-large-1-gpu")
@@ -37,7 +39,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -89,7 +91,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -230,6 +232,10 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(last_node.key.token_ids[0], 60)
         self.assertEqual(last_node.key.token_ids[1], 70)
 
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+        tree.sanity_check()
+
     def test_swa_radix_cache_eagle(self):
         # args
         req_size = 10
@@ -243,7 +249,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
