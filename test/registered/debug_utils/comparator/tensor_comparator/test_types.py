@@ -6,9 +6,11 @@ import pytest
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
+    GeneralWarning,
     ReplicatedMismatchWarning,
     SkipRecord,
     SummaryRecord,
+    WarningRecord,
     parse_record_json,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
@@ -104,7 +106,7 @@ class TestRecordTypes:
                     "diff_threshold": 1e-3,
                     "start_step": 0,
                     "end_step": 100,
-                },
+                }
             ),
             SkipRecord(name="attn", reason="no_baseline"),
             ComparisonRecord(
@@ -115,6 +117,9 @@ class TestRecordTypes:
                 shape_mismatch=False,
             ),
             SummaryRecord(total=10, passed=8, failed=1, skipped=1),
+            WarningRecord(
+                warnings=[GeneralWarning(category="test", message="test warning")],
+            ),
         ]:
             restored = parse_record_json(record.model_dump_json())
             assert type(restored) is type(record)
@@ -185,6 +190,36 @@ class TestWarnings:
         assert restored_warning.differing_index == 3
         assert restored_warning.baseline_index == 0
         assert restored_warning.max_abs_diff == pytest.approx(0.42)
+
+    def test_any_warning_discriminated_union_round_trip(self):
+        """All AnyWarning variants survive JSON round-trip via a WarningRecord."""
+        all_warnings = [
+            ReplicatedMismatchWarning(
+                axis="tp",
+                group_index=0,
+                differing_index=1,
+                baseline_index=0,
+                max_abs_diff=0.1,
+            ),
+            GeneralWarning(
+                category="aux_tensors_missing",
+                message="Aux tensors missing, skipping token alignment",
+            ),
+            GeneralWarning(
+                category="rids_mismatch",
+                message="rids mismatch across ranks: rank 0 has [1,2,3], "
+                "rank 1 has [4,5,6]",
+            ),
+        ]
+
+        record = WarningRecord(warnings=all_warnings)
+        restored = parse_record_json(record.model_dump_json())
+        assert isinstance(restored, WarningRecord)
+        assert len(restored.warnings) == len(all_warnings)
+
+        for original, parsed in zip(all_warnings, restored.warnings):
+            assert type(parsed) is type(original)
+            assert parsed == original
 
 
 if __name__ == "__main__":
