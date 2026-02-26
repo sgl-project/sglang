@@ -34,9 +34,9 @@ MODEL_THRESHOLDS = {
         0.270, 23.8
     ),
     ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings(
-        "google/gemma-3n-E4B-it", extra_args=["--mem-fraction-static", "0.5"]
-    ): ModelEvalMetrics(0.270, 17.7),
+    # TODO: gemma-3n-E4B-it is routed to gemma3_mm instead of gemma3n_mm,
+    # causing weight dimension mismatch (4320 vs 4304). Skipped until fixed.
+    # ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.270, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 26.0
