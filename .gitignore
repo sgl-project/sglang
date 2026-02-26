@@ -272,11 +272,6 @@ python/sglang/srt/grpc/*_pb2.pyi
 sgl-kernel/csrc_musa/
 sgl-kernel/include_musa/
 sgl-kernel/csrc/**/*_musa/
-sgl-kernel/third_party/*/csrc_musa/
-sgl-kernel/third_party/*/include_musa/
-
-# Third-party libraries source code
-sgl-kernel/third_party/
 
 # MUSA core dump files
-core_*
+*.mudmp

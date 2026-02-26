@@ -144,6 +144,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                         "Using CompressedTensorsMxInt4MoEMethod with flashinfer_trtllm backend"
                     )
                     return CompressedTensorsMxInt4MoEMethod(quant_config)
+                elif _is_hip:
+                    logger.info_once(
+                        "Using CompressedTensorsWNA16TritonMoEMethod (ROCm)"
+                    )
+                    return CompressedTensorsWNA16TritonMoEMethod(quant_config)
                 else:
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoEMethod(quant_config)
@@ -456,123 +461,114 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
-        output = cutlass_moe_fp4(
-            a=x,
-            a1_gscale=layer.w13_input_scale_quant,
-            w1_fp4=layer.w13_weight,
-            w1_blockscale=layer.w13_weight_scale,
-            w1_alphas=layer.g1_alphas,
-            a2_gscale=layer.w2_input_scale_quant,
-            w2_fp4=layer.w2_weight,
-            w2_blockscale=layer.w2_weight_scale,
-            w2_alphas=layer.g2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            params=layer.cutlass_moe_params,
-            apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
-        ).to(x.dtype)
+        if self.use_flashinfer_trtllm:
+            from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
+
+            router_logits = topk_output.router_logits
+            topk_config = topk_output.topk_config
+
+            # Quantize input hidden states using fp4_quantize
+            hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+                x,
+                layer.w13_input_scale_quant,
+                self.group_size,  # sf_vec_size
+                False,  # use_ue8m0
+                False,  # is_sf_swizzled_layout
+            )
+            hs_fp4 = hs_fp4_bytes.reshape(x.shape[0], x.shape[1] // 2)
+            hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
+
+            correction_bias = (
+                None
+                if topk_config.correction_bias is None
+                else topk_config.correction_bias.to(x.dtype)
+            )
+
+            assert layer.routing_method_type is not None
+
+            # DeepSeekV3 style routing requires float32 router logits
+            if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
+                router_logits = router_logits.to(torch.float32)
+
+            routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+            routed_scaling_factor = (
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            )
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                num_tokens = hs_fp4.shape[0]
+                hidden_size = (
+                    hs_fp4.shape[-1] * 2
+                    if hs_fp4.dtype == torch.uint8
+                    else hs_fp4.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+                )
+
+            output = trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=correction_bias,
+                hidden_states=hs_fp4,
+                hidden_states_scale=hs_scale,
+                gemm1_weights=layer.gemm1_weights_fp4_shuffled,
+                gemm1_weights_scale=layer.gemm1_scales_fp4_shuffled.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=layer.gemm2_weights_fp4_shuffled,
+                gemm2_weights_scale=layer.gemm2_scales_fp4_shuffled.view(
+                    torch.float8_e4m3fn
+                ),
+                gemm2_bias=None,
+                output1_scale_scalar=layer.g1_scale_c,
+                output1_scale_gate_scalar=layer.g1_alphas,
+                output2_scale_scalar=layer.g2_alphas,
+                num_experts=layer.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=layer.intermediate_size_per_partition,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=layer.num_local_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=layer.routing_method_type,
+                do_finalize=True,
+                tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+                output=symm_output,
+            )[0]
+        else:
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+            output = cutlass_moe_fp4(
+                a=x,
+                a1_gscale=layer.w13_input_scale_quant,
+                w1_fp4=layer.w13_weight,
+                w1_blockscale=layer.w13_weight_scale,
+                w1_alphas=layer.g1_alphas,
+                a2_gscale=layer.w2_input_scale_quant,
+                w2_fp4=layer.w2_weight,
+                w2_blockscale=layer.w2_weight_scale,
+                w2_alphas=layer.g2_alphas,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                params=layer.cutlass_moe_params,
+                apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
+            ).to(x.dtype)
 
         return StandardCombineInput(hidden_states=output)
-
-    def apply_with_router_logits(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        assert self.use_flashinfer_trtllm
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
-
-        from sglang.srt.layers.moe.utils import RoutingMethodType
-
-        router_logits = topk_output.router_logits
-        topk_config = topk_output.topk_config
-
-        # Quantize input hidden states using fp4_quantize
-        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-            x,
-            layer.w13_input_scale_quant,
-            self.group_size,  # sf_vec_size
-            False,  # use_ue8m0
-            False,  # is_sf_swizzled_layout
-        )
-        hs_fp4 = hs_fp4_bytes.reshape(x.shape[0], x.shape[1] // 2)
-        hs_scale = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(-1)
-
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(x.dtype)
-        )
-
-        assert layer.routing_method_type is not None
-
-        # DeepSeekV3 style routing requires float32 router logits
-        if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-
-        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
-        routed_scaling_factor = (
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0
-        )
-
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            num_tokens = hs_fp4.shape[0]
-            hidden_size = (
-                hs_fp4.shape[-1] * 2
-                if hs_fp4.dtype == torch.uint8
-                else hs_fp4.shape[-1]
-            )
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
-            )
-
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=correction_bias,
-            hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale,
-            gemm1_weights=layer.gemm1_weights_fp4_shuffled,
-            gemm1_weights_scale=layer.gemm1_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=layer.gemm2_weights_fp4_shuffled,
-            gemm2_weights_scale=layer.gemm2_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
-            gemm2_bias=None,
-            output1_scale_scalar=layer.g1_scale_c,
-            output1_scale_gate_scalar=layer.g1_alphas,
-            output2_scale_scalar=layer.g2_alphas,
-            num_experts=layer.num_experts,
-            top_k=topk_config.top_k,
-            n_group=topk_config.num_expert_group,
-            topk_group=topk_config.topk_group,
-            intermediate_size=layer.intermediate_size_per_partition,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=layer.num_local_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=layer.routing_method_type,
-            do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            output=symm_output,
-        )[0]
 
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
@@ -1377,6 +1373,70 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class CompressedTensorsWNA16TritonMoEMethod(CompressedTensorsWNA16MoEMethod):
+    """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
+
+    Inherits weight creation from CompressedTensorsWNA16MoEMethod but converts
+    weights to the uint8-packed format expected by the Triton fused MoE kernel
+    instead of the Marlin-specific format.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_triton_converted", False):
+            return
+
+        num_experts = layer.w13_weight_packed.shape[0]
+
+        # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w13 = layer.w13_weight_packed.data
+        w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+        # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w2 = layer.w2_weight_packed.data
+        w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+        # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w13_scale = layer.w13_weight_scale.data
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+
+        # Convert w2 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w2_scale = layer.w2_weight_scale.data
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+
+        layer.is_triton_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a16=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            block_shape=[0, self.group_size],
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class NPUCompressedTensorsW4A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):

@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -29,6 +30,10 @@ class RocmPlatform(Platform):
     device_type: str = "cuda"  # torch uses 'cuda' backend string
     dispatch_key: str = "CUDA"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:

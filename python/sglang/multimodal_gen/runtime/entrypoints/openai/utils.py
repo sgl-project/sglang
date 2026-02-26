@@ -7,11 +7,10 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
-import torch
 from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -211,51 +210,43 @@ async def process_generation_batch(
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
-        if result.output is None:
+        if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
-        audio_sample_rate = result.audio_sample_rate
-        if batch.data_type == DataType.VIDEO:
-            for idx, output in enumerate(result.output):
-                save_file_path = str(
-                    os.path.join(batch.output_path, batch.output_file_name)
-                )
-                sample = result.output[idx]
-                audio = result.audio
-                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-                    audio = audio[idx] if audio.shape[0] > idx else None
-                if audio is not None and not (
-                    isinstance(sample, (tuple, list)) and len(sample) == 2
-                ):
-                    sample = (sample, audio)
-                post_process_sample(
-                    sample,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    save_file_path,
-                    audio_sample_rate=audio_sample_rate,
-                )
-                save_file_path_list.append(save_file_path)
+        # If output_file_paths is provided, use it instead of output.
+        if result.output_file_paths:
+            save_file_path_list = result.output_file_paths
         else:
-            for idx, output in enumerate(result.output):
-                save_file_path = str(
-                    os.path.join(
-                        batch.output_path, f"sample_{idx}_" + batch.output_file_name
-                    )
-                )
-                post_process_sample(
-                    output,
+            audio_sample_rate = result.audio_sample_rate
+            if batch.data_type == DataType.VIDEO:
+                save_file_path_list = save_outputs(
+                    result.output,
                     batch.data_type,
                     batch.fps,
                     batch.save_output,
-                    save_file_path,
+                    lambda _idx: str(
+                        os.path.join(batch.output_path, batch.output_file_name)
+                    ),
+                    audio=result.audio,
                     audio_sample_rate=audio_sample_rate,
                 )
-                save_file_path_list.append(save_file_path)
+            else:
+                save_file_path_list = save_outputs(
+                    result.output,
+                    batch.data_type,
+                    batch.fps,
+                    batch.save_output,
+                    lambda idx: str(
+                        os.path.join(
+                            batch.output_path,
+                            f"sample_{idx}_" + batch.output_file_name,
+                        )
+                    ),
+                    audio_sample_rate=audio_sample_rate,
+                )
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)

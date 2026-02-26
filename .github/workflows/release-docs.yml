@@ -14,6 +14,9 @@ concurrency:
   group: release-docs-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
@@ -47,6 +50,7 @@ jobs:
         run: |
           cd docs
           make html
+          make markdown
           python3 wrap_run_llm.py
 
           cd _build/html

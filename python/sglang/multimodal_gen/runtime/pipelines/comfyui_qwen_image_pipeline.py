@@ -12,10 +12,12 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConf
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
-    set_default_dtype,
     shard_model,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    set_default_torch_dtype,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -222,7 +224,7 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
                 mp_policy=mp_policy,
             )
 
-            with set_default_dtype(default_dtype), torch.device("meta"):
+            with set_default_torch_dtype(default_dtype), torch.device("meta"):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             use_fsdp = server_args.use_fsdp_inference

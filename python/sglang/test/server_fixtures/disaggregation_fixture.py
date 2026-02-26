@@ -103,6 +103,82 @@ class PDDisaggregationServerBase(CustomTestCase):
         time.sleep(5)
 
 
+def _get_available_ib_devices():
+    """Auto-detect available high-speed RDMA devices from sysfs.
+
+    Filters for devices that are:
+    1. Not Ethernet NICs (excludes devices with 'eth' in the name like mlx5_eth0)
+    2. Active (port state)
+    3. High-speed (rate >= 100 Gbps to exclude regular Ethernet NICs)
+    """
+    ib_sysfs_path = "/sys/class/infiniband"
+    if not os.path.isdir(ib_sysfs_path):
+        logger.warning("IB sysfs path %s does not exist", ib_sysfs_path)
+        return None
+
+    all_devices = sorted(os.listdir(ib_sysfs_path))
+    logger.warning("All IB devices in sysfs: %s", all_devices)
+
+    devices = []
+    for dev in all_devices:
+        # Check port 1 state and rate (most devices have single port)
+        port_path = os.path.join(ib_sysfs_path, dev, "ports", "1")
+        if not os.path.isdir(port_path):
+            logger.warning("Device %s: SKIPPED (no port 1)", dev)
+            continue
+
+        # Read state and rate for logging
+        state = "unknown"
+        rate = -1
+        state_file = os.path.join(port_path, "state")
+        rate_file = os.path.join(port_path, "rate")
+
+        try:
+            with open(state_file) as f:
+                state = f.read().strip()
+        except (OSError, IOError):
+            pass
+
+        try:
+            with open(rate_file) as f:
+                rate_str = f.read().strip()
+                rate = int(rate_str.split()[0])
+        except (OSError, IOError, ValueError, IndexError):
+            pass
+
+        # Log device properties for debugging
+        logger.warning(
+            "Device %s: state=%s, rate=%d Gbps, has_eth_in_name=%s",
+            dev,
+            state,
+            rate,
+            "eth" in dev.lower(),
+        )
+
+        # Skip devices with "eth" in the name - these are typically Ethernet NICs
+        # that don't work properly with RDMA (e.g., mlx5_eth0)
+        if "eth" in dev.lower():
+            logger.warning("Device %s: SKIPPED (contains 'eth' in name)", dev)
+            continue
+
+        # Check if port is active
+        # State format is like "4: ACTIVE" or just "ACTIVE"
+        if "ACTIVE" not in state.upper():
+            logger.warning("Device %s: SKIPPED (state=%s)", dev, state)
+            continue
+
+        # Check rate (filter out low-speed NICs like 10/25 Gbps Ethernet)
+        if rate >= 0 and rate < 100:  # Skip devices slower than 100 Gbps
+            logger.warning("Device %s: SKIPPED (rate=%d Gbps)", dev, rate)
+            continue
+
+        devices.append(dev)
+        logger.warning("Device %s: INCLUDED", dev)
+
+    logger.warning("Filtered IB devices: %s (count=%d)", devices, len(devices))
+    return devices if devices else None
+
+
 def get_rdma_devices_args():
     def _parse_list_env(var_name: str):
         val = os.getenv(var_name)
@@ -114,10 +190,13 @@ def get_rdma_devices_args():
     def _pick_default_pair(rdma_all_devices):
         return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
 
-    rdma_all_devices = _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES") or [
-        f"mlx5_roce{i}" for i in range(8)
-    ]
-    logger.info("Resolved rdma_all_devices=%s", rdma_all_devices)
+    # Priority: env var > auto-detect > hardcoded fallback
+    rdma_all_devices = (
+        _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
+        or _get_available_ib_devices()
+        or [f"mlx5_roce{i}" for i in range(8)]
+    )
+    logger.warning("Resolved rdma_all_devices=%s", rdma_all_devices)
 
     n_rdma = len(rdma_all_devices)
 
@@ -148,9 +227,37 @@ def get_rdma_devices_args():
             )
 
     # 3. Generate RDMA device names
+    # Detect total GPUs on the node (not just visible ones)
+    try:
+        import torch
+
+        total_gpus = torch.cuda.device_count()
+    except Exception:
+        total_gpus = 8  # Fallback to common 8-GPU setup
+
+    # Handle edge cases
+    if total_gpus == 0:
+        total_gpus = 8
+    if n_rdma > total_gpus:
+        logger.warning(
+            "More RDMA devices (%d) than GPUs (%d), using first and middle device",
+            n_rdma,
+            total_gpus,
+        )
+        return ",".join(_pick_default_pair(rdma_all_devices))
+
+    # Calculate how many GPUs share each RDMA device
+    gpus_per_rdma = max(1, total_gpus // n_rdma)
+    logger.warning(
+        "GPU-to-RDMA mapping: total_gpus=%d, n_rdma=%d, gpus_per_rdma=%d",
+        total_gpus,
+        n_rdma,
+        gpus_per_rdma,
+    )
+
     rdma_devices = []
     for gpu_idx in gpu_indices:
-        nic_index = gpu_idx // (8 // n_rdma)
+        nic_index = min(gpu_idx // gpus_per_rdma, n_rdma - 1)
         rdma_devices.append(rdma_all_devices[nic_index])
 
     if not rdma_devices:

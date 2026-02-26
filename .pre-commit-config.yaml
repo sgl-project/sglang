@@ -67,6 +67,14 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: check-chinese-characters
+        name: check chinese characters in multimodal_gen
+        entry: >-
+          python3 -c 'import sys, re; p=re.compile(r"[\u4e00-\u9fff]"); ec=0; [ ([(print(f"{f}:{i+1}: {l.strip()}") or (ec:=1)) for i,l in enumerate(open(f, "r", encoding="utf-8", errors="ignore")) if p.search(l)]) for f in sys.argv[1:] ]; sys.exit(ec)'
+        language: system
+        files: ^python/sglang/multimodal_gen/.*
+        exclude: ^(python/sglang/multimodal_gen/configs/sample|python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/workflows|python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages)(/|$)
+        types_or: [python, markdown, json, text]
       - id: sort-ci-permissions
         name: sort CI_PERMISSIONS.json
         entry: python3 .github/update_ci_permission.py --sort-only

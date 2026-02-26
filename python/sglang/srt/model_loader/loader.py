@@ -275,6 +275,9 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
+    if load_config.draft_model_idx is not None:
+        kwargs["draft_model_idx"] = load_config.draft_model_idx
+
     return model_class(**kwargs)
 
 

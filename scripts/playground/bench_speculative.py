@@ -83,6 +83,8 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
         disable_ignore_eos=False,
         disable_stream=False,
         return_logprob=False,
+        return_routed_experts=False,
+        plot_throughput=False,
         backend=backend,
         dataset_name="custom",
         num_prompts=None,

@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -69,7 +70,13 @@ class BailingMoEModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("eh_proj", prefix),
+        )
 
         self.decoder = BailingMoEBlock(
             config,
@@ -96,7 +103,7 @@ class BailingMoEModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            hidden_states = self.eh_proj(
+            hidden_states, _ = self.eh_proj(
                 torch.cat(
                     (
                         self.enorm(hidden_states),

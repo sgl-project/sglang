@@ -5,7 +5,7 @@ pub mod core;
 pub use data_connector;
 pub mod grpc_client;
 pub use smg_mcp as mcp;
-pub mod mesh;
+pub use smg_mesh as mesh;
 pub mod middleware;
 pub mod observability;
 pub mod policies;

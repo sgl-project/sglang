@@ -408,10 +408,28 @@ def release_port(lock_socket):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return its process handle.
+    Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
+    notebook/CI commands work without requiring shell=True.
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    env = os.environ.copy()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if "=" in part and not part.startswith("-") and not part.startswith("/"):
+            key, _, value = part.partition("=")
+            if key and value is not None and key.replace("_", "").isalnum():
+                env[key] = value
+                i += 1
+                continue
+        break
+    parts = parts[i:]
+    if not parts:
+        raise ValueError(
+            "Command contains only environment variable assignments, no executable"
+        )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):

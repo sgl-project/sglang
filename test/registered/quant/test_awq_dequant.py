@@ -16,12 +16,13 @@ from sglang.srt.layers.quantization.awq_triton import (
     awq_dequantize_triton,
     awq_gemm_triton,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=2, suite="stage-a-test-1-amd")
 
-device = "cuda"
+device = get_device()
 
 
 def reverse_awq_order(t: torch.Tensor) -> torch.Tensor:

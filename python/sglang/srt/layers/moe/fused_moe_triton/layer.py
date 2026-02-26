@@ -121,6 +121,19 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
         )
+    elif a2a_backend.is_mori():
+        from sglang.srt.layers.moe.token_dispatcher import MoriEPDispatcher
+
+        return MoriEPDispatcher(
+            group=get_tp_group(),
+            router_topk=moe_runner_config.top_k,
+            permute_fusion=True,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            deepep_mode=get_deepep_mode(),
+        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -679,6 +692,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
                 ]
             )
             else loaded_weight
@@ -892,7 +906,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
+                ]
             )
             else loaded_weight
         )

@@ -102,7 +102,7 @@ class ImagePatcher:
         steps: list[tuple[int, int]],
         img_rate_thr: float = 0.6,
     ) -> tuple[list[tuple[int, int, int, int]], tuple[int, int]]:
-        assert 1 >= img_rate_thr >= 0, "The `in_rate_thr` should lie in 0~1"
+        assert 1 >= img_rate_thr >= 0, "The `img_rate_thr` should lie in 0~1"
         windows = []
         # Sliding windows.
         for size, step in zip(sizes, steps):

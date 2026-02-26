@@ -62,10 +62,15 @@ class TestPenalty(CustomTestCase):
         print(json.dumps(response.json()))
         print("=" * 100)
 
-    def run_generate_with_prompt(self, prompt, sampling_params, max_tokens=100):
+    def run_generate_with_prompt(
+        self, prompt, sampling_params, max_tokens=100, seed=None
+    ):
         """Helper method to generate text with a specific prompt and parameters."""
+        sampling_params = sampling_params.copy()
         sampling_params.setdefault("temperature", 0.05)
         sampling_params.setdefault("top_p", 1.0)
+        if seed is not None:
+            sampling_params["seed"] = seed
 
         response = requests.post(
             self.base_url + "/v1/chat/completions",
@@ -96,15 +101,20 @@ class TestPenalty(CustomTestCase):
     ):
         """Generic test for penalty effects."""
         # Run multiple iterations to get more reliable results
+        # Use fixed seeds for deterministic behavior
+        base_seed = 42
         baseline_counts = []
         penalty_counts = []
 
         for i in range(5):
+            # Use same seed for both baseline and penalty in each iteration
+            # to ensure fair comparison with identical starting conditions
+            seed = base_seed + i
             baseline_output = self.run_generate_with_prompt(
-                prompt, baseline_params, max_tokens
+                prompt, baseline_params, max_tokens, seed=seed
             )
             penalty_output = self.run_generate_with_prompt(
-                prompt, penalty_params, max_tokens
+                prompt, penalty_params, max_tokens, seed=seed
             )
 
             baseline_count = self.count_word_repetitions(baseline_output, target_word)

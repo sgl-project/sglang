@@ -47,7 +47,6 @@ jobs:
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
         env:
           USE_CCACHE: 0
-          CMAKE_EXTRA_ARGS: ${{ matrix.arch == 'aarch64' && '-DENABLE_BELOW_SM90=ON' || '' }}
 
       - name: Upload to PyPI
         working-directory: sgl-kernel

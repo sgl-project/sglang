@@ -644,7 +644,7 @@ class SchedulerPPMixin:
                         req.req_pool_idx, : len(req.fill_ids)
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    self.req_to_token_pool.free(req.req_pool_idx)
+                    self.req_to_token_pool.free(req)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1232,8 +1232,9 @@ class ChunkSizePredictor:
 
     def fit(self, seq_lens: List[int], latencies: List[float]):
         """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
-        L = np.array(seq_lens, dtype=np.float64)
-        T = np.array(latencies, dtype=np.float64)
+        # Skip the first data point to reduce fitting bias, as the first run is slower without warmup
+        L = np.array(seq_lens[1:], dtype=np.float64)
+        T = np.array(latencies[1:], dtype=np.float64)
 
         if len(L) < 8:
             raise ValueError(
