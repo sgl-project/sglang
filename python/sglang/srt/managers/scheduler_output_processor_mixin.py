@@ -260,7 +260,9 @@ class SchedulerOutputProcessorMixin:
                     if batch.return_logprob:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
+                        # When start_len == extend_len - 1, the last token is included in the output logprobs,
+                        # so we don't need to return the input logprobs.
+                        if extend_logprob_start_len < extend_input_len - 1:
                             # Update input logprobs.
                             num_input_logprobs = self._calculate_num_input_logprobs(
                                 req, extend_input_len, extend_logprob_start_len
@@ -815,10 +817,11 @@ class SchedulerOutputProcessorMixin:
             req.output_token_logprobs_val.append(output.next_token_logprobs[i])
             req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        # Only add input logprobs if there are input tokens to process
+        # Only add input logprobs if there are input tokens to process. When start_len == extend_len - 1 (num_input_logprobs == 1),
+        # the last token is included in the output logprobs, so we don't need to return the input logprobs.
         # Note: For prefill-only requests with default logprob_start_len, this will be 0,
         # meaning we only compute output logprobs (which is the intended behavior)
-        if num_input_logprobs > 0:
+        if num_input_logprobs > 1:
             self.add_input_logprob_return_values(
                 i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
             )

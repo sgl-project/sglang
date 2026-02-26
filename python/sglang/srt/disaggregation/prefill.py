@@ -527,7 +527,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
+                    # When start_len == extend_len - 1, the last token is included in the output logprobs,
+                    # so we don't need to return the input logprobs.
+                    if extend_logprob_start_len < extend_input_len - 1:
                         # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
                         self.add_input_logprob_return_values(

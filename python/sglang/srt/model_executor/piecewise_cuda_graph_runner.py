@@ -415,7 +415,7 @@ class PiecewiseCudaGraphRunner:
                 forward_batch.extend_logprob_start_lens_cpu,
                 forward_batch.extend_seq_lens_cpu,
             ):
-                if start_len is not None and start_len < seq_len:
+                if start_len is not None and start_len < seq_len - 1:
                     return False
         if num_tokens <= self.max_num_tokens:
             return True
