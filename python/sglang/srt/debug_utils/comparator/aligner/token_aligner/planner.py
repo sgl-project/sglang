@@ -21,7 +21,7 @@ def compute_token_aligner_plan(
         seqs=Pair(x=seqs_info_pair.x.sequences, y=seqs_info_pair.y.sequences)
     )
 
-    _empty = TokenLocator(token_index_in_step=[])
+    _empty = TokenLocator(steps=[], token_index_in_step=[])
     locator_x: TokenLocator = _empty
     locator_y: TokenLocator = _empty
 
@@ -40,9 +40,11 @@ def compute_token_aligner_plan(
         assert x_ids == y_ids, f"{seq_id_x=} {seq_id_y=} {x_ids=} {y_ids=}"
 
         locator_x = locator_x + TokenLocator(
+            steps=rec.x.locator.steps[:common_len],
             token_index_in_step=rec.x.locator.token_index_in_step[:common_len],
         )
         locator_y = locator_y + TokenLocator(
+            steps=rec.y.locator.steps[:common_len],
             token_index_in_step=rec.y.locator.token_index_in_step[:common_len],
         )
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -15,6 +15,9 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.planner import (
     compute_aligner_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPlan
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+    TokenAlignerPlan,
+)
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     SkipRecord,
@@ -35,6 +38,7 @@ def compare_bundle_pair(
     filenames_pair: Pair[list[str]],
     baseline_path: Path,
     target_path: Path,
+    token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
 ) -> Union[ComparisonRecord, SkipRecord]:
     with warning_sink.context() as collected_warnings:
@@ -43,6 +47,7 @@ def compare_bundle_pair(
             filenames_pair=filenames_pair,
             baseline_path=baseline_path,
             target_path=target_path,
+            token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
         )
 
@@ -55,6 +60,7 @@ def _compare_bundle_pair_raw(
     filenames_pair: Pair[list[str]],
     baseline_path: Path,
     target_path: Path,
+    token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
 ) -> Union[ComparisonRecord, SkipRecord]:
     # 1. Load (tensor + meta, ungrouped)
@@ -72,7 +78,7 @@ def _compare_bundle_pair_raw(
         lambda items: [it.meta for it in items]
     )
     plan: AlignerPlan = compute_aligner_plan(
-        metas_pair=metas_pair, token_aligner_plan=None
+        metas_pair=metas_pair, token_aligner_plan=token_aligner_plan
     )
 
     # 3. Execute (tensor + plan only, no meta)

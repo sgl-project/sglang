@@ -43,7 +43,6 @@ def load_and_normalize_aux(
 
     available_names: set[str] = set(df["name"].unique().to_list()) & plugin.all_names
     steps: list[int] = sorted(df["step"].unique().to_list())
-    assert len(steps) == 1, f"Multi-step not yet supported, got {len(steps)} steps"
     tensor_names: set[str] = available_names & plugin.tensor_names
     non_tensor_names: set[str] = available_names & plugin.non_tensor_names
 

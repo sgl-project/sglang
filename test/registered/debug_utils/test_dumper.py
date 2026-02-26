@@ -2127,7 +2127,9 @@ class TestRegisterForwardHook:
 class TestPluginCoreFields:
     def test_sglang_core_fields(self):
         plugin = _SGLangPlugin()
-        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
 
     def test_megatron_core_fields(self):
         plugin = _MegatronPlugin()

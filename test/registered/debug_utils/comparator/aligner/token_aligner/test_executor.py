@@ -28,12 +28,13 @@ register_cpu_ci(est_time=15, suite="default", nightly=True)
 
 
 class TestExecuteAlignment:
-    """Tests for token alignment execution (single-step)."""
+    """Tests for token alignment execution."""
 
     def test_thd_vs_thd_identity(self):
         """Two identical thd sides produce element-wise equal aligned tensors."""
         torch.manual_seed(42)
-        hidden = torch.randn(5, 8)  # 5 tokens, hidden_dim=8
+        hidden_step0 = torch.randn(5, 8)  # 5 tokens, hidden_dim=8
+        hidden_step1 = torch.randn(2, 8)  # 2 tokens
 
         aux = TokenAlignerStepAux(
             input_ids=[10, 20, 30, 40, 50],
@@ -41,9 +42,15 @@ class TestExecuteAlignment:
             seq_lens=[3, 2],
             seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
         )
+        aux_step1 = TokenAlignerStepAux(
+            input_ids=[31, 51],
+            positions=[3, 2],
+            seq_lens=[1, 1],
+            seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+        )
 
         side_aux = TokenAlignerGlobalAux(
-            step_auxs={0: aux},
+            step_auxs={0: aux, 1: aux_step1},
             framework="sglang",
             layout="thd",
         )
@@ -51,12 +58,13 @@ class TestExecuteAlignment:
         index = build_seqs_info(side_aux)
         plan = compute_token_aligner_plan(seqs_info_pair=Pair(x=index, y=index))
 
+        tensors = {0: hidden_step0, 1: hidden_step1}
         aligned: Pair[torch.Tensor] = execute_token_aligner(
-            plan=plan, tensor_pair=Pair(x=hidden, y=hidden)
+            plan=plan, tensor_of_step_pair=Pair(x=tensors, y=tensors)
         )
 
         assert torch.equal(aligned.x, aligned.y)
-        assert aligned.x.shape[0] == len(plan.locators.x.token_index_in_step)
+        assert aligned.x.shape[0] == len(plan.locators.x.steps)
 
     def test_zero_matched_tokens(self):
         """Empty TokenAlignerPlan (no matched tokens) returns shape[0]==0 without crash."""
@@ -64,14 +72,14 @@ class TestExecuteAlignment:
 
         plan = TokenAlignerPlan(
             locators=Pair(
-                x=TokenLocator(token_index_in_step=[]),
-                y=TokenLocator(token_index_in_step=[]),
+                x=TokenLocator(steps=[], token_index_in_step=[]),
+                y=TokenLocator(steps=[], token_index_in_step=[]),
             ),
         )
 
-        tensor = torch.randn(5, 8)
+        tensors = {0: torch.randn(5, 8)}
         aligned: Pair[torch.Tensor] = execute_token_aligner(
-            plan=plan, tensor_pair=Pair(x=tensor, y=tensor)
+            plan=plan, tensor_of_step_pair=Pair(x=tensors, y=tensors)
         )
 
         assert aligned.x.shape[0] == 0

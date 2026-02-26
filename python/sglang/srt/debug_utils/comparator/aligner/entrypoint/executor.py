@@ -51,13 +51,9 @@ def execute_aligner_plan(
 
     # Cross-side: token alignment (or direct extraction for single-step)
     if plan.token_aligner_plan is not None:
-        assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
         combined: Pair[torch.Tensor] = execute_token_aligner(
             plan=plan.token_aligner_plan,
-            tensor_pair=Pair(
-                x=list(step_tensors_x.values())[0],
-                y=list(step_tensors_y.values())[0],
-            ),
+            tensor_of_step_pair=Pair(x=step_tensors_x, y=step_tensors_y),
         )
     else:
         assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
