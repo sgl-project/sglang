@@ -371,13 +371,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
-            print("@" * 100)
-            print(
-                f"layer is {layer}, dir is {dir(layer)}, layer.activation = {getattr(layer, 'activation', None)}"
-            )
-            print(
-                f"conf.act = {moe_runner_config.activation}, conf = {moe_runner_config}"
-            )
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,

@@ -650,12 +650,15 @@ class ModelConfig:
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
             # Identify modelopt quantization
-            if "quant_method" not in quant_cfg:
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
                 parsed_cfg = self._parse_modelopt_quant_config(
                     {"quantization": quant_cfg}
                 )
                 if parsed_cfg:
-                    quant_cfg.update(parsed_cfg)
+                    quant_cfg.update(parsed_cfg or dict())
 
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
