@@ -134,10 +134,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
-        t = config.dtype if hasattr(config, "dtype") else torch.bfloat16
-
-        logger.info(f"config is {config},pdtype = {t} ")
-        logger.info(f"has start projections: {has_start_projections}")
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
