@@ -341,7 +341,7 @@ class MMReceiverHTTP(MMReceiverBase):
                     skip_mm_pool=True,
                 )
 
-    def create_req(self, recv_req):
+    def create_req(self, recv_req: TokenizedGenerateReqInput):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -362,7 +362,8 @@ class MMReceiverHTTP(MMReceiverBase):
             bootstrap_port=recv_req.bootstrap_port,
             bootstrap_room=recv_req.bootstrap_room,
             disagg_mode=self.scheduler.disaggregation_mode,
-            data_parallel_rank=recv_req.data_parallel_rank,
+            routed_dp_rank=recv_req.routed_dp_rank,
+            disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
             vocab_size=self.scheduler.model_config.vocab_size,
             priority=recv_req.priority,
             metrics_collector=(

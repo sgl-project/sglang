@@ -9,6 +9,7 @@ from torch import nn
 from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -30,19 +31,21 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+_is_npu = is_npu()
 
 
 def apply_rope(
@@ -197,7 +200,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
@@ -722,6 +725,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -731,6 +735,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states
@@ -771,6 +776,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Load language model weights
         if language_weights:
             self.language_model.load_weights(language_weights)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiK25Config):
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.n_routed_experts,
+            num_groups=text_config.n_group,
+        )
 
 
 EntryClass = [KimiK25ForConditionalGeneration]
