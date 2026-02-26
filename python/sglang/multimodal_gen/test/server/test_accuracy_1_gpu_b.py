@@ -86,10 +86,11 @@ class TestAccuracy1GPU_B:
         ):
             vocab_size = ref.config.text_config.vocab_size
 
-        # Use a safe range for tokens to avoid index errors or unstable special tokens
+        torch.manual_seed(42)
+        # Generate on CPU to keep deterministic input IDs across runs.
         input_ids = torch.randint(
-            100, min(vocab_size, 30000), (1, 32), device=device, dtype=torch.long
-        )
+            100, min(vocab_size, 30000), (1, 32), device="cpu", dtype=torch.long
+        ).to(device)
         attention_mask = torch.ones_like(input_ids)
 
         with torch.no_grad():

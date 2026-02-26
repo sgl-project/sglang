@@ -60,7 +60,6 @@ MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98")
 class ComponentSpec:
     component: ComponentType
     model_index_keys: Tuple[str, ...]
-    fallback_subfolders: Tuple[str, ...]
     reference_library: str
 
 
@@ -75,19 +74,11 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
             "video_vae",
             "audio_vae",
         ),
-        fallback_subfolders=(
-            "vae",
-            "vae_model",
-            "autoencoder",
-            "autoencoder_kl",
-            "VAE",
-        ),
         reference_library="diffusers",
     ),
     ComponentType.TRANSFORMER: ComponentSpec(
         component=ComponentType.TRANSFORMER,
         model_index_keys=("transformer", "unet", "dit", "video_dit", "audio_dit"),
-        fallback_subfolders=("transformer", "unet", "dit"),
         reference_library="diffusers",
     ),
     ComponentType.TEXT_ENCODER: ComponentSpec(
@@ -97,13 +88,6 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
             "text_encoder_2",
             "text_encoder_3",
             "image_encoder",
-        ),
-        fallback_subfolders=(
-            "text_encoder",
-            "text_encoder_2",
-            "text_encoder_3",
-            "image_encoder",
-            "umt5-xxl",
         ),
         reference_library="transformers",
     ),
@@ -131,7 +115,7 @@ def _has_component_files(path: str) -> bool:
 def _is_text_encoder_config(path: str) -> bool:
     cfg_path = os.path.join(path, "config.json")
     if not os.path.exists(cfg_path):
-        return True
+        return False
     cfg = _read_json(cfg_path)
     # 5120 is the known i2v text-encoder hidden size used by WAN video models.
     if cfg.get("model_type") == "i2v" or cfg.get("dim") == 5120:
@@ -145,6 +129,8 @@ def _resolve_component_subfolder(
     entry = model_index.get(key)
     if isinstance(entry, dict):
         return entry.get("path") or entry.get("subfolder")
+    if isinstance(entry, str):
+        return entry
     if entry is not None:
         return key
     return None
@@ -153,9 +139,14 @@ def _resolve_component_subfolder(
 def resolve_component_path(
     local_root: str, component: ComponentType
 ) -> Tuple[str, str]:
-    """Resolve component subfolder from model_index.json or known fallbacks."""
+    """Resolve component subfolder strictly from model_index.json."""
     spec = COMPONENT_SPECS[component]
-    model_index = _read_json(os.path.join(local_root, "model_index.json"))
+    model_index_path = os.path.join(local_root, "model_index.json")
+    model_index = _read_json(model_index_path)
+    if not model_index:
+        raise FileNotFoundError(
+            f"Missing or empty model_index.json at {model_index_path}"
+        )
 
     for key in spec.model_index_keys:
         subfolder = _resolve_component_subfolder(model_index, key)
@@ -170,30 +161,14 @@ def resolve_component_path(
             continue
         return candidate, subfolder
 
-    for subfolder in spec.fallback_subfolders:
-        candidate = os.path.join(local_root, subfolder)
-        if not _has_component_files(candidate):
-            continue
-        if component == ComponentType.TEXT_ENCODER and not _is_text_encoder_config(
-            candidate
-        ):
-            continue
-        return candidate, subfolder
-
     raise FileNotFoundError(
-        f"Could not locate {component.value} component under {local_root}"
+        f"Could not resolve {component.value} from model_index.json under {local_root}"
     )
 
 
 def _resolve_local_path(hub_id: str) -> str:
     if os.path.isdir(hub_id):
         return hub_id
-    base_dir = os.getenv("SGLANG_DIFFUSION_MODEL_DIR")
-    if base_dir and os.path.isdir(base_dir):
-        short_name = hub_id.split("/")[-1]
-        candidate = os.path.join(base_dir, short_name)
-        if os.path.isdir(candidate):
-            return candidate
     return maybe_download_model(hub_id)
 
 
