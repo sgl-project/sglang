@@ -44,14 +44,18 @@ class TestMatchBundles:
         assert results[0].y[0].name == "t_a"
 
     def test_multiple_names_separate_bundles(self) -> None:
-        target_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a"),
-            _make_row(name="t_b"),
-        ])
-        baseline_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a"),
-            _make_row(name="t_b"),
-        ])
+        target_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a"),
+                _make_row(name="t_b"),
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a"),
+                _make_row(name="t_b"),
+            ]
+        )
 
         results: list[Pair[TensorBundleInfo]] = match_bundles(
             dfs=Pair(x=baseline_df, y=target_df),
@@ -64,14 +68,18 @@ class TestMatchBundles:
         assert "t_b" in result_names
 
     def test_skip_rank_groups_across_ranks(self) -> None:
-        target_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a", rank=0),
-            _make_row(name="t_a", rank=1),
-        ])
-        baseline_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a", rank=0),
-            _make_row(name="t_a", rank=1),
-        ])
+        target_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a", rank=0),
+                _make_row(name="t_a", rank=1),
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a", rank=0),
+                _make_row(name="t_a", rank=1),
+            ]
+        )
 
         results: list[Pair[TensorBundleInfo]] = match_bundles(
             dfs=Pair(x=baseline_df, y=target_df),
@@ -82,13 +90,17 @@ class TestMatchBundles:
         assert len(results[0].y) == 2
 
     def test_baseline_missing_tensor(self) -> None:
-        target_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a"),
-            _make_row(name="t_extra"),
-        ])
-        baseline_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a"),
-        ])
+        target_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a"),
+                _make_row(name="t_extra"),
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a"),
+            ]
+        )
 
         results: list[Pair[TensorBundleInfo]] = match_bundles(
             dfs=Pair(x=baseline_df, y=target_df),
@@ -113,14 +125,18 @@ class TestMatchBundles:
         assert results == []
 
     def test_skip_step_groups_across_steps(self) -> None:
-        target_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a", step=0),
-            _make_row(name="t_a", step=1),
-        ])
-        baseline_df: pl.DataFrame = _make_df([
-            _make_row(name="t_a", step=0),
-            _make_row(name="t_a", step=1),
-        ])
+        target_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a", step=0),
+                _make_row(name="t_a", step=1),
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a", step=0),
+                _make_row(name="t_a", step=1),
+            ]
+        )
 
         results: list[Pair[TensorBundleInfo]] = match_bundles(
             dfs=Pair(x=baseline_df, y=target_df),

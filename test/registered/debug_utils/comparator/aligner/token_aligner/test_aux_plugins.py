@@ -1,5 +1,6 @@
 import sys
 
+import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_plugins import (
