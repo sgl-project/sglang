@@ -711,11 +711,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             if attn_tp_rank not in self.prefill_port_table[dp_group]:
                 self.prefill_port_table[dp_group][attn_tp_rank] = {}
 
-        self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
-            "rank_ip": rank_ip,
-            "rank_port": rank_port,
-        }
-        self._registered_count += 1
+            self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
+                "rank_ip": rank_ip,
+                "rank_port": rank_port,
+            }
+            self._registered_count += 1
+
         expected = self.dp_size * self.attn_tp_size * self.pp_size
         logger.debug(
             f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
