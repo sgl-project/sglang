@@ -1165,11 +1165,15 @@ class _SGLangPlugin(_FrameworkPlugin):
         if isinstance(value, self.ForwardBatch):
             if skip_forward_batch:
                 return {}
-            return {
+            result = {
                 "input_ids": value.input_ids,
                 "seq_lens": value.seq_lens,
                 "positions": value.positions,
+                "req_pool_indices": value.req_pool_indices,
             }
+            if value.rids is not None:
+                result["rids"] = value.rids
+            return result
         if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
 
@@ -1181,7 +1185,9 @@ class _SGLangPlugin(_FrameworkPlugin):
         return None
 
     def core_fields(self) -> frozenset[str]:
-        return frozenset({"input_ids", "positions", "seq_lens"})
+        return frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
 
 
 class _MegatronPlugin(_FrameworkPlugin):
