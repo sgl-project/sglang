@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -14,9 +15,39 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
+from sglang.srt.speculative.dflash_utils import (
+    compute_dflash_accept_len_and_bonus,
+    compute_dflash_sampling_accept_len_and_bonus,
+    is_dflash_sampling_verify_available,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+
+def _compute_paged_keep_slots(
+    *,
+    prefix_lens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Compute how many draft slots per request must remain allocated.
+
+    The allocator frees at page granularity for paged mode, so we can only release
+    full pages from the tail after verify.
+    """
+
+    if page_size <= 1:
+        raise ValueError(f"Expected page_size > 1, got {page_size}.")
+
+    seq_dtype = prefix_lens.dtype
+    extended_lens = prefix_lens + int(draft_token_num)
+    new_lens = prefix_lens + commit_lens.to(seq_dtype)
+    aligned_new_lens = ((new_lens + page_size - 1) // page_size) * page_size
+    keep_lens = torch.minimum(aligned_new_lens, extended_lens)
+    keep_slots = (keep_lens - prefix_lens).to(torch.int64)
+    keep_slots.clamp_(min=0, max=int(draft_token_num))
+    return keep_slots
 
 
 @dataclass
@@ -124,6 +155,9 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
+    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
+    # DFLASH verify is linear (non-tree), so this is always 1.
+    topk: int = 1
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it (e.g. triton).
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
@@ -281,7 +315,7 @@ class DFlashVerifyInput(SpecInput):
         logits_output: LogitsProcessorOutput,
         page_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Greedy DFlash verification.
+        """DFlash verification for greedy and non-greedy sampling.
 
         Returns:
             new_verified_id: int64 tensor [bs] (the new current token per request)
@@ -296,37 +330,71 @@ class DFlashVerifyInput(SpecInput):
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
+        sampling_info = batch.sampling_info
+        if sampling_info is not None:
+            if len(sampling_info) != bs:
+                raise RuntimeError(
+                    "DFLASH verify sampling_info size mismatch: "
+                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+                )
+
+            # Keep speculative verify semantics consistent with normal sampling path.
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.draft_token_num,
+                )
+
+            if (
+                sampling_info.penalizer_orchestrator.is_required
+                or sampling_info.logit_bias is not None
+            ):
+                linear_penalty = torch.zeros(
+                    (bs, logits_output.next_token_logits.shape[1]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                sampling_info.apply_logits_bias(linear_penalty)
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                )
+
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, self.draft_token_num
-        )
-        accept_len, bonus = compute_dflash_accept_len_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+            )
+        else:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, self.draft_token_num
+            )
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
 
-        # Build output tokens on GPU: accepted drafts + bonus token.
-        out_lens = accept_len.to(torch.int32) + 1
-        accept_len_i64 = accept_len.to(torch.int64)
+        # Single D2H transfer: candidates[1:] + accept_len + bonus
+        packed = torch.cat(
+            [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+        ).cpu()
 
-        out_tokens = torch.empty(
-            (bs, self.draft_token_num), dtype=torch.int64, device=device
-        )
-        if int(self.draft_token_num) > 1:
-            out_tokens[:, : self.draft_token_num - 1].copy_(candidates[:, 1:])
-        out_tokens[:, self.draft_token_num - 1].fill_(0)
-        out_tokens.scatter_(1, accept_len_i64[:, None], bonus[:, None])
-
-        out_tokens_cpu = out_tokens.cpu()
-        out_lens_cpu = out_lens.cpu()
-
-        commit_lens_cpu: List[int] = []
-        new_verified_cpu: List[int] = []
+        max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
+        commit_lens_cpu: List[int] = []
+        new_verified_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
-            proposed_len = int(out_lens_cpu[i])
-            proposed = out_tokens_cpu[i, :proposed_len].tolist()
+            acc_len = int(packed[i, max_acc].item())
+            proposed = packed[i, :acc_len].tolist() + [
+                int(packed[i, max_acc + 1].item())
+            ]
 
             appended = 0
             if (
@@ -388,18 +456,26 @@ class DFlashVerifyInput(SpecInput):
                     if req.grammar is not None:
                         req.grammar.accept_token(int(tok))
 
-            # DFlash always treats the last appended token as the new "current token"
-            # (uncommitted); therefore we commit exactly `appended` verify-input tokens.
-            if appended <= 0:
-                raise RuntimeError("DFLASH verify unexpectedly appended 0 tokens.")
-            commit_lens_cpu.append(appended)
-            new_verified_cpu.append(req.output_ids[-1])
-            accept_length_per_req_cpu.append(max(0, appended - 1))
+            if req.output_ids:
+                new_verified_token = int(req.output_ids[-1])
+            elif req.origin_input_ids:
+                # If no token was appended in this verify step, keep the current token unchanged.
+                new_verified_token = int(req.origin_input_ids[-1])
+            else:
+                raise RuntimeError(
+                    "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
+                )
 
+            commit_lens_cpu.append(appended)
+            new_verified_list.append(new_verified_token)
+            accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        new_verified_id = torch.tensor(
+            new_verified_list, dtype=torch.int64, device=device
+        )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:
@@ -411,10 +487,19 @@ class DFlashVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
             batch.out_cache_loc = out_cache_loc[keep_mask]
         else:
-            # Page-size > 1 is not supported in the initial DFlash implementation.
-            raise NotImplementedError(
-                "DFLASH verify with page_size > 1 is not supported yet."
+            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
+            row_offsets = torch.arange(self.draft_token_num, device=device)[None, :]
+            keep_slots = _compute_paged_keep_slots(
+                prefix_lens=batch.seq_lens,
+                commit_lens=commit_lens,
+                draft_token_num=self.draft_token_num,
+                page_size=page_size,
             )
+            free_mask = row_offsets >= keep_slots[:, None]
+            batch.token_to_kv_pool_allocator.free(out_cache_loc[free_mask])
+
+            keep_mask = row_offsets < commit_lens[:, None]
+            batch.out_cache_loc = out_cache_loc[keep_mask]
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
@@ -456,9 +541,6 @@ class DFlashVerifyInput(SpecInput):
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
 
-        new_verified_id = torch.tensor(
-            new_verified_cpu, dtype=torch.int64, device=device
-        )
         return (
             new_verified_id,
             commit_lens,

@@ -1,10 +1,103 @@
 from __future__ import annotations
 
-from typing import Any, List, Tuple
+import logging
+from numbers import Integral
+from typing import Any, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
+
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+logger = logging.getLogger(__name__)
+
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+
+
+if is_cuda():
+    try:
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+            tree_speculative_sampling_target_only,
+        )
+
+        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+    except Exception:
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+        tree_speculative_sampling_target_only = None
+else:
+    top_k_renorm_prob = None
+    top_p_renorm_prob = None
+    tree_speculative_sampling_target_only = None
+
+
+def is_dflash_sampling_verify_available() -> bool:
+    return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _get_or_create_chain_verify_buffers(
+    *,
+    bs: int,
+    draft_token_num: int,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    key = (device.index, int(draft_token_num))
+    cached = _DFLASH_CHAIN_VERIFY_BUFFERS.get(key)
+    cap_bs = 0 if cached is None else int(cached["cap_bs"])
+    if cap_bs < bs:
+        new_cap = max(int(bs), cap_bs * 2 if cap_bs > 0 else int(bs))
+        retrieve_index = torch.arange(
+            new_cap * draft_token_num, dtype=torch.int64, device=device
+        ).view(new_cap, draft_token_num)
+        row_next = torch.arange(
+            1, draft_token_num + 1, dtype=torch.int64, device=device
+        )
+        row_next[-1] = -1
+        retrieve_next_token = row_next.unsqueeze(0).expand(new_cap, -1).clone()
+        retrieve_next_sibling = torch.full(
+            (new_cap, draft_token_num), -1, dtype=torch.int64, device=device
+        )
+        predicts = torch.empty(
+            (new_cap * draft_token_num,), dtype=torch.int32, device=device
+        )
+        accept_index = torch.empty(
+            (new_cap, draft_token_num), dtype=torch.int32, device=device
+        )
+        accept_token_num = torch.empty((new_cap,), dtype=torch.int32, device=device)
+        cached = {
+            "cap_bs": int(new_cap),
+            "retrieve_index": retrieve_index,
+            "retrieve_next_token": retrieve_next_token,
+            "retrieve_next_sibling": retrieve_next_sibling,
+            "predicts": predicts,
+            "accept_index": accept_index,
+            "accept_token_num": accept_token_num,
+        }
+        _DFLASH_CHAIN_VERIFY_BUFFERS[key] = cached
+
+    assert cached is not None
+    retrieve_index = cached["retrieve_index"][:bs]
+    retrieve_next_token = cached["retrieve_next_token"][:bs]
+    retrieve_next_sibling = cached["retrieve_next_sibling"][:bs]
+    predicts = cached["predicts"][: bs * draft_token_num]
+    accept_index = cached["accept_index"][:bs]
+    accept_token_num = cached["accept_token_num"][:bs]
+    return (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    )
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
@@ -51,7 +144,10 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 
 
 def get_dflash_config(config: Any) -> dict:
-    cfg = getattr(config, "dflash_config", None)
+    if isinstance(config, dict):
+        cfg = config.get("dflash_config", None)
+    else:
+        cfg = getattr(config, "dflash_config", None)
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
@@ -61,6 +157,67 @@ def get_dflash_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def resolve_dflash_block_size(
+    *,
+    draft_hf_config: Any,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve DFLASH block size from draft config.
+
+    Precedence:
+      1) `dflash_config.block_size`
+      2) top-level `block_size`
+      3) `default`
+    """
+    dflash_cfg = get_dflash_config(draft_hf_config)
+    dflash_block_size = dflash_cfg.get("block_size", None)
+    if isinstance(draft_hf_config, dict):
+        top_level_block_size = draft_hf_config.get("block_size", None)
+    else:
+        top_level_block_size = getattr(draft_hf_config, "block_size", None)
+
+    parsed_dflash_block_size = None
+    if dflash_block_size is not None:
+        try:
+            parsed_dflash_block_size = int(dflash_block_size)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid DFLASH dflash_config.block_size={dflash_block_size!r}."
+            ) from e
+
+    parsed_top_level_block_size = None
+    if top_level_block_size is not None:
+        try:
+            parsed_top_level_block_size = int(top_level_block_size)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid DFLASH block_size={top_level_block_size!r}."
+            ) from e
+
+    if (
+        parsed_dflash_block_size is not None
+        and parsed_top_level_block_size is not None
+        and parsed_dflash_block_size != parsed_top_level_block_size
+    ):
+        logger.warning(
+            "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
+            top_level_block_size,
+            dflash_block_size,
+        )
+
+    block_size = (
+        parsed_dflash_block_size
+        if parsed_dflash_block_size is not None
+        else parsed_top_level_block_size
+    )
+    if block_size is None:
+        return default
+
+    if block_size <= 0:
+        raise ValueError(f"DFLASH block_size must be positive, got {block_size}.")
+    return block_size
 
 
 def resolve_dflash_target_layer_ids(
@@ -124,6 +281,49 @@ def resolve_dflash_mask_token(*, draft_hf_config: Any) -> str:
     return mask_token
 
 
+def resolve_dflash_mask_token_id(*, draft_hf_config: Any) -> Optional[int]:
+    cfg = get_dflash_config(draft_hf_config)
+    mask_token_id = cfg.get("mask_token_id", None)
+    if mask_token_id is None:
+        return None
+    if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
+        raise ValueError(
+            "DFLASH dflash_config.mask_token_id must be an integer, "
+            f"got {mask_token_id!r} (type={type(mask_token_id).__name__})."
+        )
+    mask_token_id = int(mask_token_id)
+    if mask_token_id < 0:
+        raise ValueError(
+            "DFLASH dflash_config.mask_token_id must be non-negative, "
+            f"got {mask_token_id}."
+        )
+    return mask_token_id
+
+
+def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
+    quant_method = getattr(qkv_proj, "quant_method", None)
+    if not isinstance(quant_method, UnquantizedLinearMethod):
+        return (
+            False,
+            "quantized qkv_proj is not supported for this path "
+            f"(quant_method={type(quant_method).__name__})",
+        )
+    if not hasattr(qkv_proj, "weight"):
+        return False, "qkv weight tensor is missing"
+    return True, ""
+
+
+def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
+    eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
+    if not eligible:
+        return False, reason
+    if getattr(qkv_proj, "bias", None) is not None:
+        return False, "qkv bias is not supported for fused KV path"
+    return True, ""
+
+
 def compute_dflash_accept_len_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -163,3 +363,177 @@ def compute_dflash_accept_len_and_bonus(
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
+
+
+def compute_dflash_sampling_accept_len_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    threshold_single: Optional[float] = None,
+    threshold_acc: Optional[float] = None,
+    uniform_samples: Optional[torch.Tensor] = None,
+    uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
+    use_sparse_topk: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
+
+    This is a chain-specialized variant of speculative target-only verification:
+      - DFlash proposals are linear (topk == 1), so each verify level has at most one candidate.
+      - When a candidate is rejected at a level, the final token is sampled from
+        `relu(q - p)` where `p` has only the rejected candidate mass.
+    """
+    if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
+        raise RuntimeError(
+            "DFLASH non-greedy verification is unavailable on this build/device."
+        )
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+
+    bs, draft_token_num = candidates.shape
+    if bs <= 0:
+        raise ValueError(f"batch size must be positive, got {bs}.")
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "next_token_logits row count mismatch. "
+            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+    if candidates.device != next_token_logits.device:
+        raise ValueError(
+            "candidates and next_token_logits must be on the same device, "
+            f"got {candidates.device} and {next_token_logits.device}."
+        )
+
+    if threshold_single is None:
+        threshold_single = get_global_server_args().speculative_accept_threshold_single
+    if threshold_acc is None:
+        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+    threshold_single = float(threshold_single)
+    threshold_acc = max(float(threshold_acc), 1e-9)
+
+    device = next_token_logits.device
+
+    if uniform_samples is None:
+        uniform_samples = torch.rand(
+            (bs, draft_token_num), dtype=torch.float32, device=device
+        )
+    else:
+        if uniform_samples.shape != (bs, draft_token_num):
+            raise ValueError(
+                "uniform_samples shape mismatch. "
+                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
+            )
+        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
+
+    if uniform_samples_for_final_sampling is None:
+        uniform_samples_for_final_sampling = torch.rand(
+            (bs,), dtype=torch.float32, device=device
+        )
+    else:
+        if uniform_samples_for_final_sampling.shape != (bs,):
+            raise ValueError(
+                "uniform_samples_for_final_sampling shape mismatch. "
+                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+            )
+        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
+            device=device,
+            dtype=torch.float32,
+        )
+
+    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    # Build target distribution once over all verify rows.
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    scaled_logits = next_token_logits / expanded_temperature
+    sparse_topk_applied = False
+
+    if use_sparse_topk and need_top_k:
+        repeated_top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, draft_token_num, dim=0
+        ).to(dtype=torch.int64)
+        vocab_size = int(scaled_logits.shape[-1])
+        repeated_top_ks.clamp_(min=1, max=vocab_size)
+        max_top_k = int(repeated_top_ks.max().item())
+
+        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        if 0 < max_top_k < vocab_size:
+            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+            if not torch.all(repeated_top_ks == max_top_k):
+                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
+                    None, :
+                ]
+                valid = ranks < repeated_top_ks.unsqueeze(1)
+                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+
+            topk_probs = F.softmax(topk_logits, dim=-1)
+            if need_top_p:
+                repeated_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, draft_token_num, dim=0
+                )
+                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+
+            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+            target_probs.scatter_(1, topk_indices, topk_probs)
+            sparse_topk_applied = True
+
+    if not sparse_topk_applied:
+        target_probs = F.softmax(scaled_logits, dim=-1)
+        if need_top_k:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            )
+        if need_top_p:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
+    draft_probs = torch.zeros_like(target_probs)
+
+    (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
+
+    accept_len = accept_token_num
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
+    bonus = predicts[accept_pos].to(torch.int64)
+    return accept_len, bonus

@@ -1,4 +1,5 @@
 import logging
+import math
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -8,6 +9,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -15,15 +17,42 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.dflash_utils import resolve_dflash_mask_token
+from sglang.srt.speculative.dflash_utils import (
+    can_dflash_use_fused_qkv_proj,
+    is_dflash_sampling_verify_available,
+    resolve_dflash_mask_token,
+    resolve_dflash_mask_token_id,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+_FusedKVMaterializeHelper = None
+
+
+def _get_fused_kv_materialize_helper():
+    global _FusedKVMaterializeHelper
+    if _FusedKVMaterializeHelper is None:
+        from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
+            FusedKVMaterializeHelper,
+        )
+
+        _FusedKVMaterializeHelper = FusedKVMaterializeHelper
+    return _FusedKVMaterializeHelper
 
 
 class DFlashWorker:
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
+
+    _VERIFY_SKIP_CUSTOM_MASK_BACKENDS = {
+        "FlashInferAttnBackend",
+        "FlashInferMLAAttnBackend",
+        "FlashAttentionBackend",
+        "TRTLLMHAAttnBackend",
+        "TRTLLMMLABackend",
+    }
 
     def __init__(
         self,
@@ -32,6 +61,8 @@ class DFlashWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -40,6 +71,8 @@ class DFlashWorker:
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -47,7 +80,7 @@ class DFlashWorker:
         self.page_size = server_args.page_size
         self.device = target_worker.device
 
-        self._warned_forced_greedy = False
+        self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
@@ -92,6 +125,8 @@ class DFlashWorker:
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
             pp_rank=0,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
@@ -118,7 +153,13 @@ class DFlashWorker:
         self._mask_token = resolve_dflash_mask_token(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        self._mask_token_id = self._resolve_mask_token_id(mask_token=self._mask_token)
+        self._mask_token_id_override = resolve_dflash_mask_token_id(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
+        self._mask_token_id = self._resolve_mask_token_id(
+            mask_token=self._mask_token,
+            mask_token_id=self._mask_token_id_override,
+        )
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
@@ -127,9 +168,10 @@ class DFlashWorker:
                 self.block_size,
             )
             logger.info(
-                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s",
+                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
                 self._mask_token_id,
+                self._mask_token_id_override,
             )
 
         self._block_pos_offsets = torch.arange(
@@ -158,6 +200,80 @@ class DFlashWorker:
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+
+        self._use_fused_kv_materialize = is_cuda()
+        self._fused_kv_helper: Optional[object] = None
+        if self._use_fused_kv_materialize:
+            self._init_fused_kv_helper()
+
+    def _init_fused_kv_helper(self) -> None:
+        """Initialize the fused KV materialization helper with pre-stacked weights."""
+        try:
+            layers = self.draft_model.layers
+            fused_disable_reason: Optional[str] = None
+
+            if len(layers) == 0:
+                fused_disable_reason = "no layers found"
+
+            for layer_idx, layer in enumerate(layers):
+                attn = layer.self_attn
+                eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
+                if not eligible:
+                    fused_disable_reason = f"{reason}: layer={layer_idx}"
+                    break
+
+                # Keep semantics aligned with set_kv_buffer scaling behavior.
+                k_scale = getattr(attn.attn, "k_scale", None)
+                v_scale = getattr(attn.attn, "v_scale", None)
+                if k_scale is not None and not math.isclose(float(k_scale), 1.0):
+                    fused_disable_reason = (
+                        "non-unit k_scale is not supported for fused KV path: "
+                        f"layer={layer_idx}, k_scale={k_scale}"
+                    )
+                    break
+                if v_scale is not None and not math.isclose(float(v_scale), 1.0):
+                    fused_disable_reason = (
+                        "non-unit v_scale is not supported for fused KV path: "
+                        f"layer={layer_idx}, v_scale={v_scale}"
+                    )
+                    break
+
+            if fused_disable_reason is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: %s",
+                        fused_disable_reason,
+                    )
+                self._use_fused_kv_materialize = False
+                self._fused_kv_helper = None
+                return
+
+            FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
+            first_attn = layers[0].self_attn
+            rotary_emb = first_attn.rotary_emb
+
+            self._fused_kv_helper = FusedKVMaterializeHelper(
+                layers=layers,
+                rotary_emb=rotary_emb,
+                num_kv_heads=first_attn.num_kv_heads,
+                head_dim=first_attn.head_dim,
+                device=self.device,
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH fused KV materialization enabled. "
+                    "n_layers=%d, num_kv_heads=%d, head_dim=%d",
+                    len(layers),
+                    first_attn.num_kv_heads,
+                    first_attn.head_dim,
+                )
+        except Exception as e:
+            logger.warning(
+                "DFLASH fused KV initialization failed, falling back to sequential path: %s",
+                e,
+            )
+            self._use_fused_kv_materialize = False
+            self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
@@ -201,60 +317,87 @@ class DFlashWorker:
         if hasattr(req, "dflash_draft_seq_len"):
             req.dflash_draft_seq_len = 0
 
-    def _resolve_mask_token_id(self, *, mask_token: str) -> int:
+    def _resolve_mask_token_id(
+        self, *, mask_token: str, mask_token_id: Optional[int] = None
+    ) -> int:
         if not isinstance(mask_token, str) or not mask_token:
             raise ValueError(
                 f"DFLASH mask_token must be a non-empty string, got {mask_token!r}."
             )
 
+        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
+        if mask_token_id is not None:
+            resolved_id = int(mask_token_id)
+            if resolved_id >= vocab_size:
+                raise ValueError(
+                    "DFLASH mask_token_id is outside the target vocab size. "
+                    f"mask_token_id={resolved_id}, vocab_size={vocab_size}. "
+                    f"This likely means mask_token={mask_token!r} requires vocab expansion beyond the model's embedding size. "
+                    "SGLang does not support resizing target embeddings for DFLASH yet."
+                )
+
+            tokenizer = getattr(self.target_worker, "tokenizer", None)
+            if tokenizer is not None:
+                token_id_from_vocab = tokenizer.get_vocab().get(mask_token, None)
+                if (
+                    token_id_from_vocab is not None
+                    and int(token_id_from_vocab) != resolved_id
+                ):
+                    raise ValueError(
+                        "DFLASH config mismatch: dflash_config.mask_token_id conflicts with tokenizer vocab id "
+                        f"for dflash_config.mask_token. mask_token={mask_token!r}, "
+                        f"mask_token_id={resolved_id}, tokenizer_vocab_id={int(token_id_from_vocab)}."
+                    )
+            return resolved_id
+
         tokenizer = getattr(self.target_worker, "tokenizer", None)
         if tokenizer is None:
             raise RuntimeError(
-                "DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported)."
+                "DFLASH requires tokenizer initialization when dflash_config.mask_token_id is not set "
+                "(skip_tokenizer_init is not supported in this mode)."
             )
 
-        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-        mask_token_id = None
+        resolved_id = None
         if getattr(tokenizer, "mask_token", None) == mask_token:
-            mask_token_id = getattr(tokenizer, "mask_token_id", None)
+            resolved_id = getattr(tokenizer, "mask_token_id", None)
 
-        if mask_token_id is None:
+        if resolved_id is None:
             # Prefer checking the explicit vocab mapping first.
             vocab = tokenizer.get_vocab()
-            mask_token_id = vocab.get(mask_token, None)
+            resolved_id = vocab.get(mask_token, None)
 
-        if mask_token_id is None:
+        if resolved_id is None:
             # Mirror the reference DFlash HF demo by adding the mask token to the tokenizer.
             # This is safe only when the resulting id stays within the target model vocab size.
             added = tokenizer.add_special_tokens({"mask_token": mask_token})
-            mask_token_id = getattr(tokenizer, "mask_token_id", None)
-            if mask_token_id is None:
-                mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
+            resolved_id = getattr(tokenizer, "mask_token_id", None)
+            if resolved_id is None:
+                resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
             if added and self.tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
                     mask_token,
-                    mask_token_id,
+                    resolved_id,
                     len(tokenizer),
                     vocab_size,
                 )
 
-        if mask_token_id is None or int(mask_token_id) < 0:
+        if resolved_id is None or int(resolved_id) < 0:
             raise ValueError(
                 "DFLASH requires resolving a mask token id, but it could not be resolved. "
                 f"mask_token={mask_token!r}."
             )
 
-        if mask_token_id >= vocab_size:
+        if resolved_id >= vocab_size:
             raise ValueError(
                 "DFLASH mask_token_id is outside the target vocab size. "
-                f"mask_token_id={mask_token_id}, vocab_size={vocab_size}. "
+                f"mask_token_id={resolved_id}, vocab_size={vocab_size}. "
                 f"This likely means mask_token={mask_token!r} requires vocab expansion beyond the model's embedding size. "
                 "SGLang does not support resizing target embeddings for DFLASH yet."
             )
 
-        return int(mask_token_id)
+        return int(resolved_id)
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
@@ -267,12 +410,16 @@ class DFlashWorker:
                 "DFLASH does not support grammar-constrained decoding yet."
             )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if not self._warned_forced_greedy and self.tp_rank == 0:
+            if (
+                not is_dflash_sampling_verify_available()
+                and not self._warned_sampling_fallback
+                and self.tp_rank == 0
+            ):
                 logger.warning(
-                    "DFLASH currently supports greedy verification only; "
-                    "ignoring non-greedy sampling params (e.g. temperature/top_p/top_k) and using argmax."
+                    "DFLASH non-greedy verification is unavailable on this build/device; "
+                    "falling back to greedy argmax verification."
                 )
-                self._warned_forced_greedy = True
+                self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
         device = self.model_runner.device
@@ -328,7 +475,23 @@ class DFlashWorker:
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
-            block_cache_loc = allocator.alloc(bs * self.block_size)
+            if self.page_size == 1:
+                block_cache_loc = allocator.alloc(bs * self.block_size)
+            else:
+                block_end_cpu = seq_lens_cpu + int(self.block_size)
+                last_loc = get_last_loc(
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    block_start,
+                )
+                block_cache_loc = allocator.alloc_extend(
+                    block_start,
+                    seq_lens_cpu,
+                    block_end,
+                    block_end_cpu,
+                    last_loc,
+                    bs * self.block_size,
+                )
             if block_cache_loc is None:
                 raise RuntimeError(
                     f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."
@@ -391,15 +554,7 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
-        backend_name = type(self.model_runner.attn_backend).__name__
-        skip_custom_mask = backend_name in {
-            "FlashInferAttnBackend",
-            "FlashInferMLAAttnBackend",
-            "FlashAttentionBackend",
-            "TRTLLMHAAttnBackend",
-            "TRTLLMMLABackend",
-        }
-        build_custom_mask = not skip_custom_mask
+        _, build_custom_mask = self._resolve_verify_mask_policy()
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -678,25 +833,141 @@ class DFlashWorker:
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
 
-            for layer in self.draft_model.layers:
-                attn = layer.self_attn
-                k, v = attn.kv_proj_only(ctx_hidden)
-                k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(ctx_positions, k)
-                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    ctx_cache_loc,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused KV append failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                    self._append_target_hidden_sequential(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
+            else:
+                self._append_target_hidden_sequential(
+                    ctx_hidden, ctx_positions, ctx_cache_loc
                 )
 
         draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_sequential(
+        self,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        for layer in self.draft_model.layers:
+            attn = layer.self_attn
+            k, v = attn.kv_proj_only(ctx_hidden)
+            k = attn.apply_k_norm(k)
+            k = attn.apply_k_rope(ctx_positions, k)
+            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                attn.attn,
+                ctx_cache_loc,
+                k,
+                v,
+                attn.attn.k_scale,
+                attn.attn.v_scale,
+            )
+
+    def _append_target_hidden_fused(
+        self,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        """Fused KV materialization using batched projection + Triton kernel."""
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(
+            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+        ) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(
+                attn,
+                ctx_cache_loc,
+                cache_k,
+                cache_v,
+                attn.k_scale,
+                attn.v_scale,
+            )
+
+        self._fused_kv_helper.materialize(
+            ctx_hidden=ctx_hidden,
+            positions=ctx_positions,
+            write_layer_kv=_write_layer_kv,
+        )
+
+    def _resolve_verify_mask_backend_name(self) -> str:
+        backend = self.model_runner.attn_backend
+        for _ in range(4):
+            full_backend = getattr(backend, "full_attn_backend", None)
+            if full_backend is None:
+                break
+            backend = full_backend
+        return type(backend).__name__
+
+    def _resolve_verify_mask_policy(self) -> tuple[str, bool]:
+        backend_name = self._resolve_verify_mask_backend_name()
+        return backend_name, (
+            backend_name not in self._VERIFY_SKIP_CUSTOM_MASK_BACKENDS
+        )
+
+    def _update_target_mamba_state_after_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Commit Mamba intermediate states for accepted verify steps.
+
+        During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
+        cache per-step intermediate states. After acceptance, we need to commit the
+        state corresponding to each request's last accepted step.
+        """
+        attn_backend = self.target_worker.model_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+
+        accepted_steps = commit_lens.to(torch.int64) - 1
+        mamba_steps_to_track = None
+
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                to_track_ith.to(torch.int64),
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
 
     def forward_batch_generation(
         self,
@@ -782,6 +1053,13 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if need_mamba_verify_commit else None
+        )
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
@@ -801,6 +1079,13 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        if need_mamba_verify_commit:
+            assert seq_lens_pre_verify is not None
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.

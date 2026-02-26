@@ -221,7 +221,11 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu or not hasattr(self.rotary_emb, "get_cos_sin_with_position"):
+        if (
+            not _is_npu
+            or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
+            or forward_batch.forward_mode.is_extend()
+        ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -785,6 +789,18 @@ class LlamaForCausalLM(nn.Module):
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
 
 class Phi3ForCausalLM(LlamaForCausalLM):
     pass
@@ -794,4 +810,13 @@ class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
 
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM]
+class IQuestCoderForCausalLM(LlamaForCausalLM):
+    pass
+
+
+EntryClass = [
+    LlamaForCausalLM,
+    Phi3ForCausalLM,
+    InternLM3ForCausalLM,
+    IQuestCoderForCausalLM,
+]

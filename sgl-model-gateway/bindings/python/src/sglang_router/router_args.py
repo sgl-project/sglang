@@ -18,6 +18,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
@@ -36,6 +37,7 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
+    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -85,6 +87,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    disable_health_check: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -117,6 +120,9 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: Optional[str] = None
     postgres_pool_max: int = 16
+    redis_url: Optional[str] = None
+    redis_pool_max: int = 16
+    redis_retention_days: int = 30
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -200,6 +206,9 @@ class RouterArgs:
         postgres_group = parser.add_argument_group(
             "PostgreSQL Database", "PostgreSQL database backend configuration"
         )
+        redis_group = parser.add_argument_group(
+            "Redis Database", "Redis database backend configuration"
+        )
         tls_group = parser.add_argument_group(
             "TLS/mTLS Security", "TLS certificates for server and worker communication"
         )
@@ -238,7 +247,15 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(
@@ -252,6 +269,8 @@ class RouterArgs:
                 "power_of_two",
                 "manual",
                 "bucket",
+                "consistent_hashing",
+                "prefix_hash",
             ],
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
@@ -259,7 +278,15 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+            ],
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -305,6 +332,13 @@ class RouterArgs:
             help="Maximum idle time in seconds before eviction (for manual policy)",
         )
         routing_group.add_argument(
+            f"--{prefix}assignment-mode",
+            type=str,
+            default=RouterArgs.assignment_mode,
+            choices=["random", "min_load", "min_group"],
+            help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
+        )
+        routing_group.add_argument(
             f"--{prefix}max-payload-size",
             type=int,
             default=RouterArgs.max_payload_size,
@@ -326,6 +360,11 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}test-external-dp-routing",
+            action="store_true",
+            help="(MiniLB only) Randomly assign routed_dp_rank / disagg_prefill_dp_rank per request and verify the response dp_rank matches.",
         )
         pd_group.add_argument(
             f"--{prefix}pd-disaggregation",
@@ -585,6 +624,12 @@ class RouterArgs:
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
         )
+        health_group.add_argument(
+            f"--{prefix}disable-health-check",
+            action="store_true",
+            default=RouterArgs.disable_health_check,
+            help="Disable all worker health checks at startup",
+        )
         # Tokenizer configuration
         tokenizer_group.add_argument(
             f"--{prefix}model-path",
@@ -663,7 +708,7 @@ class RouterArgs:
             f"--{prefix}history-backend",
             type=str,
             default=RouterArgs.history_backend,
-            choices=["memory", "none", "oracle", "postgres"],
+            choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
 
@@ -731,6 +776,28 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
+
+        # Redis configuration
+        redis_group.add_argument(
+            f"--{prefix}redis-url",
+            type=str,
+            default=os.getenv("REDIS_URL"),
+            help="Redis connection URL (env: REDIS_URL)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-pool-max",
+            type=int,
+            default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
+            help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-retention-days",
+            type=int,
+            default=int(
+                os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)
+            ),
+            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
         # TLS/mTLS configuration

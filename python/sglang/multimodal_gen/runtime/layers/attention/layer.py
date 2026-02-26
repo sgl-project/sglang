@@ -78,7 +78,6 @@ class UlyssesAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
-    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
@@ -157,7 +156,6 @@ class UlyssesAttention(nn.Module):
 class UlyssesAttention_VSA(UlyssesAttention):
     """Distributed attention layer with VSA support."""
 
-    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,

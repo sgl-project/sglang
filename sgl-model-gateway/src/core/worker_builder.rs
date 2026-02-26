@@ -6,7 +6,7 @@ use super::{
     model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerType,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -193,6 +193,7 @@ impl BasicWorkerBuilder {
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -396,6 +397,7 @@ mod tests {
             check_interval_secs: 60,
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -488,6 +490,7 @@ mod tests {
             check_interval_secs: 45,
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: false,
         };
 
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 3, 16)

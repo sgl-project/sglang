@@ -14,10 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     USPAttention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
-    MinimalA2AAttnOp,
-    SparseLinearAttention,
-)
+from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import MinimalA2AAttnOp
 
 __all__ = [
     "USPAttention",
@@ -25,7 +22,6 @@ __all__ = [
     "UlyssesAttention",
     "UlyssesAttention_VSA",
     "MinimalA2AAttnOp",
-    "SparseLinearAttention",
     "AttentionBackend",
     "AttentionMetadata",
     "AttentionMetadataBuilder",

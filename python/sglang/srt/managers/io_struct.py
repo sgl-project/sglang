@@ -30,6 +30,11 @@ import torch
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 
@@ -66,43 +71,6 @@ class BaseBatchReq(ABC):
 
 
 @dataclass
-class RequestTimingMetricsMixin:
-    """
-    Mixin class containing common request-level timing metrics.
-
-    This class consolidates the timing metrics that are shared across all batch output types
-    to avoid code duplication and ensure consistency.
-    """
-
-    # Queue duration: time spent waiting in queue before request is scheduled.
-    queue_time: Optional[List[Optional[float]]]
-
-    # Forward entry time: timestamp when the request enters the forward pass stage.
-    # This corresponds to `forward_entry_time` in TimeStats.
-    # In different modes:
-    #   - Unified/PD-colocate: timestamp when forward computation begins (covers prefill + decode)
-    #   - Prefill instance (P): timestamp when prefill forward pass begins
-    #   - Decode instance (D): timestamp when decode forward pass begins
-    # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
-    forward_entry_time: Optional[List[Optional[float]]]
-
-    # Prefill launch delay: time spent waiting between forward entry and prefill start.
-    # Calculated as: prefill_start_time - forward_entry_time
-    # This represents the delay between when the request enters the forward stage
-    # and when prefill computation actually begins.
-    prefill_launch_delay: Optional[List[Optional[float]]]
-
-    # Prefill launch latency: time spent during prefill kernel launch.
-    # Calculated as: prefill_end_time_host - prefill_start_time_host
-    prefill_launch_latency: Optional[List[Optional[float]]]
-
-    # Prefill finished time: timestamp when prefill phase completes (wall clock time).
-    # This marks when the prefill computation finishes.
-    prefill_finished_ts: Optional[List[Optional[float]]]
-
-
-@dataclass
 class SpeculativeDecodingMetricsMixin:
     """
     Mixin class containing speculative decoding metrics.
@@ -117,22 +85,11 @@ class SpeculativeDecodingMetricsMixin:
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
 
-
-@dataclass
-class APIServingTimingMixin:
-    # Validation step duration
-    validation_time: Optional[float] = None
-
-    # For metrics
-    received_time: Optional[float] = None
-
-    # Perf_counter equivalents for accurate time calculations
-    received_time_perf: Optional[float] = None
-
-
-_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
-    APIServingTimingMixin.__dataclass_fields__.keys()
-)
+    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
+    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # Empty list [] when speculative decoding is disabled.
+    spec_acceptance_histogram: List[List[int]]
 
 
 # Parameters for a session
@@ -163,7 +120,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq, APIServingTimingMixin):
+class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -202,6 +159,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -228,7 +187,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
@@ -260,6 +223,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
+    received_time: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
@@ -291,6 +255,18 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        if self.data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.routed_dp_rank is None:
+                self.routed_dp_rank = self.data_parallel_rank
+            self.data_parallel_rank = None
+
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -664,9 +640,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            data_parallel_rank=(
-                self.data_parallel_rank if self.data_parallel_rank is not None else None
-            ),
+            routed_dp_rank=self.routed_dp_rank,
+            disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
@@ -676,10 +651,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_entropy=self.return_entropy,
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
-            **{
-                field: getattr(self, field)
-                for field in _API_SERVING_TIMING_MIXIN_FIELDS
-            },
+            received_time=self.received_time,
         )
 
 
@@ -709,6 +681,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -734,8 +708,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
 
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -749,9 +725,6 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
-    # tracing context
-    trace_context: Optional[Dict] = None
-
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -760,6 +733,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # For observability
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
@@ -778,7 +754,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
+class EmbeddingReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -802,8 +778,6 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # Validation step duration
-    validation_time: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
@@ -816,9 +790,15 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
 
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict] = None
+    received_time: Optional[float] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
+    # The path to the LoRA adaptors
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -871,6 +851,21 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
+            self._normalize_lora_paths(self.batch_size)
+
+    def _normalize_lora_paths(self, num):
+        """Normalize LoRA paths for batch processing."""
+        if self.lora_path is not None:
+            if isinstance(self.lora_path, str):
+                self.lora_path = [self.lora_path] * num
+            elif isinstance(self.lora_path, list):
+                if len(self.lora_path) != num:
+                    raise ValueError(
+                        f"lora_path list length ({len(self.lora_path)}) must match batch size ({num})"
+                    )
+            else:
+                raise ValueError("lora_path should be a list or a string.")
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -884,6 +879,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
                 text=[self.text[i]] if self.text is not None else None,
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
+                lora_path=self.lora_path[i] if self.lora_path is not None else None,
+                lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
             )
@@ -896,13 +893,12 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
             external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
-            **{
-                field: getattr(self, field)
-                for field in _API_SERVING_TIMING_MIXIN_FIELDS
-            },
+            received_time=self.received_time,
         )
 
 
@@ -918,12 +914,16 @@ class TokenizedEmbeddingReqInput(BaseReq):
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
-    # For data parallel rank routing
-    data_parallel_rank: Optional[int] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
+    # For observability
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
@@ -942,9 +942,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(
-    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
-):
+class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -981,8 +979,9 @@ class BatchTokenIDOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[torch.Tensor]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1000,6 +999,13 @@ class BatchTokenIDOutput(
     load: GetLoadReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # DP rank of the scheduler that processed each request
+    dp_ranks: Optional[List[int]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
@@ -1035,9 +1041,7 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
 
 
 @dataclass
-class BatchStrOutput(
-    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
-):
+class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -1068,8 +1072,9 @@ class BatchStrOutput(
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each output token
-    output_routed_experts: List[List[int]]
+    # The routed experts for each token, including both input and output tokens
+    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    routed_experts: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1088,6 +1093,13 @@ class BatchStrOutput(
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # DP rank of the scheduler that processed each request
+    dp_ranks: Optional[List[int]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
@@ -1113,10 +1125,15 @@ class BatchMultimodalOutput(BaseBatchReq):
     placeholder_tokens_val: List[Optional[List[int]]]
 
     return_bytes: List[bool]
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1130,6 +1147,11 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # For observability
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
@@ -1150,6 +1172,60 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class AttachHiCacheStorageReqInput(BaseReq):
+    """Dynamically attach (enable) HiCache storage backend at runtime.
+
+    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
+    - backend-specific configs (e.g., mooncake master address)
+    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    """
+
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    def __post_init__(self):
+        if self.hicache_storage_prefetch_policy is None:
+            pass
+        else:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if self.hicache_storage_prefetch_policy not in allowed:
+                raise ValueError(
+                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}."
+                )
+
+        if self.hicache_write_policy is None:
+            return
+        allowed = ["write_back", "write_through", "write_through_selective"]
+        if self.hicache_write_policy not in allowed:
+            raise ValueError(
+                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
+                f"Expected one of {allowed}."
+            )
+
+
+@dataclass
+class AttachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class DetachHiCacheStorageReqInput(BaseReq):
+    """Dynamically detach (disable) HiCache storage backend at runtime."""
+
+    pass
+
+
+@dataclass
+class DetachHiCacheStorageReqOutput(BaseReq):
+    success: bool
+    message: str = ""
 
 
 @dataclass
@@ -1203,12 +1279,14 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
-    # Whether to recapture cuda graph after weight udpdate
+    # Whether to recapture cuda graph after weight update
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Tensor metadata
+    manifest: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1435,6 +1513,11 @@ class AbortReq(BaseReq):
 
 
 @dataclass
+class ActiveRanksOutput(BaseReq):
+    status: List[bool]
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
@@ -1644,13 +1727,33 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
+class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+@dataclass
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+    LoadLoRAAdapterFromTensorsReqOutput
+) = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):
@@ -1678,6 +1781,147 @@ class GetLoadReqOutput(BaseReq):
 
 
 @dataclass
+class MemoryMetrics:
+    """Memory breakdown metrics."""
+
+    weight_gb: float = field(
+        metadata={"metric": ("gauge", "Model weight memory in GB")}
+    )
+    kv_cache_gb: float = field(metadata={"metric": ("gauge", "KV cache memory in GB")})
+    graph_gb: float = field(metadata={"metric": ("gauge", "CUDA graph memory in GB")})
+    token_capacity: int = field(
+        metadata={"metric": ("gauge", "Max tokens in KV cache")}
+    )
+
+
+@dataclass
+class SpeculativeMetrics:
+    """Speculative decoding metrics."""
+
+    accept_length: float = field(
+        metadata={"metric": ("gauge", "Avg accepted tokens per step")}
+    )
+    accept_rate: float = field(
+        metadata={"metric": ("gauge", "Speculative acceptance rate")}
+    )
+
+
+@dataclass
+class LoRAMetrics:
+    """LoRA adapter pool metrics."""
+
+    slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
+    slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
+    utilization: float = field(
+        metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
+    )
+
+
+@dataclass
+class DisaggregationMetrics:
+    """PD disaggregation metrics."""
+
+    mode: str  # "prefill", "decode", or "null" - not a metric
+    prefill_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    )
+    prefill_inflight_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
+    )
+    decode_prealloc_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
+    )
+    decode_transfer_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
+    )
+    decode_retracted_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
+    )
+    kv_transfer_speed_gb_s: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer speed in GB/s")}
+    )
+    kv_transfer_latency_ms: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
+    )
+
+
+@dataclass
+class QueueMetrics:
+    """Detailed queue breakdown."""
+
+    waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
+    grammar: int = field(
+        metadata={"metric": ("gauge", "Grammar compilation queue size")}
+    )
+    paused: int = field(
+        metadata={"metric": ("gauge", "Requests paused by weight sync")}
+    )
+    retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
+
+
+@dataclass
+class GetLoadsReqInput(BaseReq):
+    """Request for /v1/loads endpoint."""
+
+    VALID_SECTIONS = frozenset(
+        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+    )
+
+    include: List[str] = field(default_factory=lambda: ["all"])
+    dp_rank: Optional[int] = None
+
+    def __post_init__(self):
+        """Validate include sections."""
+        if self.include:
+            invalid = set(self.include) - self.VALID_SECTIONS
+            if invalid:
+                raise ValueError(
+                    f"Invalid include sections: {invalid}. "
+                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
+                )
+
+
+@dataclass
+class GetLoadsReqOutput(BaseReq):
+    """Per-DP-rank load metrics for /v1/loads endpoint."""
+
+    dp_rank: int
+    timestamp: float
+
+    num_running_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of running requests")}
+    )
+    num_waiting_reqs: int = field(
+        metadata={"metric": ("gauge", "Number of waiting requests")}
+    )
+    num_used_tokens: int = field(
+        metadata={"metric": ("gauge", "Number of tokens in use")}
+    )
+    max_total_num_tokens: int = field(
+        metadata={"metric": ("gauge", "Maximum token capacity")}
+    )
+    token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
+    gen_throughput: float = field(
+        metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
+    )
+    cache_hit_rate: float = field(
+        metadata={"metric": ("gauge", "Prefix cache hit rate")}
+    )
+    utilization: float = field(
+        metadata={"metric": ("gauge", "Overall utilization ratio")}
+    )
+    max_running_requests: int = field(
+        metadata={"metric": ("gauge", "Maximum running requests capacity")}
+    )
+
+    memory: Optional[MemoryMetrics] = None
+    speculative: Optional[SpeculativeMetrics] = None
+    lora: Optional[LoRAMetrics] = None
+    disaggregation: Optional[DisaggregationMetrics] = None
+    queues: Optional[QueueMetrics] = None
+
+
+@dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
 
@@ -1700,6 +1944,19 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class DumperControlReqInput(BaseReq):
+    method: str
+    body: Dict[str, Any]
+
+
+@dataclass
+class DumperControlReqOutput(BaseReq):
+    success: bool
+    response: List[Dict[str, Any]]
+    error: str = ""
 
 
 def _check_all_req_types():

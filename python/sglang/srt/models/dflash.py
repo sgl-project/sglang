@@ -20,14 +20,14 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
-    get_dflash_config,
+    can_dflash_slice_qkv_weight,
+    resolve_dflash_block_size,
     resolve_dflash_target_layer_ids,
 )
 
@@ -120,16 +120,8 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-        )
+        q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -143,9 +135,8 @@ class DFlashAttention(nn.Module):
         we only need K/V for the cached tokens; Q is never consumed.
         """
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
-        if isinstance(
-            getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod
-        ):
+        can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
+        if can_slice_qkv_weight:
             kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
             weight = self.qkv_proj.weight[kv_slice]
             bias = (
@@ -268,8 +259,6 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        dflash_cfg_dict = get_dflash_config(config)
-
         self.layers = nn.ModuleList(
             [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
         )
@@ -292,29 +281,7 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        dflash_block_size = dflash_cfg_dict.get("block_size", None)
-
-        block_size = (
-            dflash_block_size
-            if dflash_block_size is not None
-            else getattr(config, "block_size", None)
-        )
-        if block_size is None:
-            block_size = 16
-        elif (
-            getattr(config, "block_size", None) is not None
-            and dflash_block_size is not None
-        ):
-            if int(dflash_block_size) != int(getattr(config, "block_size")):
-                logger.warning(
-                    "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
-                    getattr(config, "block_size"),
-                    dflash_block_size,
-                )
-        try:
-            self.block_size = int(block_size)
-        except Exception as e:
-            raise ValueError(f"Invalid DFLASH block_size={block_size!r}.") from e
+        self.block_size = resolve_dflash_block_size(draft_hf_config=config, default=16)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""

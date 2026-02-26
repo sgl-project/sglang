@@ -8,7 +8,6 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, Callable
 
 import openai
@@ -19,14 +18,12 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
     ServerContext,
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -37,7 +34,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    is_image_url,
     wait_for_req_perf_record,
 )
 
@@ -76,6 +72,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.dit_layerwise_offload:
         extra_args += f" --dit-layerwise-offload true"
 
+    if server_args.dit_offload_prefetch_size:
+        extra_args += (
+            f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+        )
+
+    if server_args.text_encoder_cpu_offload:
+        extra_args += f" --text-encoder-cpu-offload"
+
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
@@ -83,8 +87,11 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.enable_warmup:
-        extra_args += f" --enable-warmup"
+    # default warmup
+    extra_args += f" --warmup"
+
+    for arg in server_args.extras:
+        extra_args += f" {arg}"
 
     # Build custom environment variables
     env_vars = {}
@@ -107,41 +114,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         output_size = os.environ.get(
             "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
         )
-        warmup = WarmupRunner(
-            port=ctx.port,
-            model=server_args.model_path,
-            prompt=sampling_params.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sampling_params.output_format,
-        )
-        if server_args.warmup > 0:
-            if sampling_params.image_path and case.sampling_params.prompt:
-                # Handle URL or local path
-                image_path_list = sampling_params.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-
-                new_image_path_list = []
-                for image_path in image_path_list:
-                    if is_image_url(image_path):
-                        new_image_path_list.append(
-                            download_image_from_url(str(image_path))
-                        )
-                    else:
-                        path_obj = Path(image_path)
-                        if not path_obj.exists():
-                            pytest.skip(f"{case.id}: file missing: {image_path}")
-                        new_image_path_list.append(path_obj)
-
-                image_path_list = new_image_path_list
-
-                warmup.run_edit_warmups(
-                    count=server_args.warmup,
-                    edit_prompt=sampling_params.prompt,
-                    image_path=image_path_list,
-                )
-            else:
-                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
@@ -162,6 +134,7 @@ class DiffusionServerBase:
 
     _perf_results: list[dict[str, Any]] = []
     _improved_baselines: list[dict[str, Any]] = []
+    _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
@@ -170,9 +143,21 @@ class DiffusionServerBase:
 
     @classmethod
     def teardown_class(cls):
-        for result in cls._perf_results:
-            result["class_name"] = cls.__name__
-            _GLOBAL_PERF_RESULTS.append(result)
+        print(
+            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
+        )
+        if cls._pytest_config:
+            # Add results to pytest stash (shared across all import contexts)
+            for result in cls._perf_results:
+                result["class_name"] = cls.__name__
+            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
+            print(
+                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
+            )
+        else:
+            print(
+                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
+            )
 
         if cls._improved_baselines:
             import json
@@ -187,6 +172,11 @@ Consider updating perf_baselines.json with the snippets below:
                     f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
                 )
             print(output)
+
+    @pytest.fixture(autouse=True)
+    def _capture_pytest_config(self, request):
+        """Capture pytest config for use in teardown_class."""
+        self.__class__._pytest_config = request.config
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
@@ -253,20 +243,24 @@ Consider updating perf_baselines.json with the snippets below:
 
         summary = validator.collect_metrics(perf_record)
 
-        if is_baseline_generation_mode or missing_scenario:
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            if missing_scenario:
-                pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
-            return
+        if case.run_perf_check:
+            if is_baseline_generation_mode or missing_scenario:
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                if missing_scenario:
+                    pytest.fail(
+                        f"Testcase '{case.id}' not found in perf_baselines.json"
+                    )
+                return
 
-        self._check_for_improvement(case, summary, scenario)
+            self._check_for_improvement(case, summary, scenario)
 
-        try:
-            validator.validate(perf_record, case.sampling_params.num_frames)
-        except AssertionError as e:
-            logger.error(f"Performance validation failed for {case.id}:\n{e}")
-            self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            raise
+            # only run performance validation if run_perf_check is True
+            try:
+                validator.validate(perf_record, case.sampling_params.num_frames)
+            except AssertionError as e:
+                logger.error(f"Performance validation failed for {case.id}:\n{e}")
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                raise
 
         result = {
             "test_name": case.id,
@@ -289,6 +283,9 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
+        print(
+            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
+        )
 
     def _check_for_improvement(
         self,
@@ -528,6 +525,104 @@ Consider updating perf_baselines.json with the snippets below:
             "[LoRA Switch E2E] All dynamic switch E2E tests passed for %s", case.id
         )
 
+    def _test_dynamic_lora_loading(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """
+        Test dynamic LoRA loading after server startup.
+
+        This test reproduces the LayerwiseOffload + set_lora issue:
+        - Server starts WITHOUT lora_path (LayerwiseOffloadManager initializes first)
+        - Then set_lora is called via API to load LoRA dynamically
+        - This tests the interaction between layerwise offload and dynamic LoRA loading
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        dynamic_lora_path = case.server_args.dynamic_lora_path
+
+        # Call set_lora to load LoRA dynamically after server startup
+        logger.info(
+            "[Dynamic LoRA] Loading LoRA dynamically via set_lora API for %s", case.id
+        )
+        logger.info("[Dynamic LoRA] LoRA path: %s", dynamic_lora_path)
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={"lora_nickname": "default", "lora_path": dynamic_lora_path},
+        )
+        assert resp.status_code == 200, f"Dynamic set_lora failed: {resp.text}"
+        logger.info("[Dynamic LoRA] set_lora succeeded for %s", case.id)
+
+    def _test_multi_lora_e2e(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+        generate_fn: Callable[[str, openai.Client], str],
+        first_lora_path: str,
+        second_lora_path: str,
+    ) -> None:
+        """
+        Test multiple LoRA adapters with different set_lora input scenarios.
+        Tests: basic multi-LoRA, different strengths, cached adapters, switch back to single.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+        client = OpenAI(base_url=base_url, api_key="dummy")
+
+        # Test 1: Basic multi-LoRA with list format
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [1.0, 1.0],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with multiple adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 2: Different strengths
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": "all",
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with different strengths failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 3: Different targets
+        requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        resp = requests.post(
+            f"{base_url}/set_lora",
+            json={
+                "lora_nickname": ["default", "lora2"],
+                "lora_path": [first_lora_path, second_lora_path],
+                "target": ["transformer", "transformer_2"],
+                "strength": [0.8, 0.5],
+            },
+        )
+        assert (
+            resp.status_code == 200
+        ), f"set_lora with cached adapters failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        # Test 4: Switch back to single LoRA
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert (
+            resp.status_code == 200
+        ), f"set_lora back to single adapter failed: {resp.text}"
+        assert generate_fn(case.id, client) is not None
+
+        logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
+
     def _test_v1_models_endpoint(
         self, ctx: ServerContext, case: DiffusionTestCase
     ) -> None:
@@ -616,6 +711,37 @@ Consider updating perf_baselines.json with the snippets below:
 
         logger.info("[Models API] All /v1/models tests passed for %s", case.id)
 
+    def _test_t2v_rejects_input_reference(
+        self, ctx: ServerContext, case: DiffusionTestCase
+    ) -> None:
+        if case.server_args.modality != "video":
+            return
+
+        base_url = f"http://localhost:{ctx.port}"
+        resp = requests.get(f"{base_url}/v1/models")
+        assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
+        data = resp.json().get("data", [])
+        if not data:
+            pytest.fail("/v1/models returned empty model list")
+
+        task_type = data[0].get("task_type")
+        if task_type != "T2V":
+            return
+
+        prompt = case.sampling_params.prompt or "test"
+        payload = {"prompt": prompt, "input_reference": "dummy"}
+        if case.sampling_params.output_size:
+            payload["size"] = case.sampling_params.output_size
+
+        resp = requests.post(f"{base_url}/v1/videos", json=payload)
+        assert (
+            resp.status_code == 400
+        ), f"Expected 400 for T2V input_reference, got {resp.status_code}: {resp.text}"
+        detail = resp.json().get("detail", "")
+        assert (
+            "input_reference is not supported" in detail
+        ), f"Unexpected error detail for T2V input_reference: {detail}"
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -629,6 +755,11 @@ Consider updating perf_baselines.json with the snippets below:
         - test_diffusion_perf[qwen_image_edit]
         - etc.
         """
+        # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
+        # Server starts WITHOUT lora_path, then set_lora is called after startup
+        if case.server_args.dynamic_lora_path:
+            self._test_dynamic_lora_loading(diffusion_server, case)
+
         generate_fn = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
@@ -644,7 +775,26 @@ Consider updating perf_baselines.json with the snippets below:
 
         # Test /v1/models endpoint for router compatibility
         self._test_v1_models_endpoint(diffusion_server, case)
+        self._test_t2v_rejects_input_reference(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
-        if case.server_args.lora_path:
+        if case.server_args.lora_path or case.server_args.dynamic_lora_path:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+
+            # Test dynamic LoRA switching (requires a second LoRA adapter)
+            if case.server_args.second_lora_path:
+                self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                )
+
+                # Test multi-LoRA functionality
+                self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                )
