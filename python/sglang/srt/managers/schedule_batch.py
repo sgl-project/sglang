@@ -536,7 +536,6 @@ class Req(ReqDllmMixin):
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session = session
-        self.session_id = session.session_id if session else None
         # skip cache insertion after prefill
         self.skip_cache_unfinished = False
         # skip cache insertion after decode

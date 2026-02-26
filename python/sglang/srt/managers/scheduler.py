@@ -1463,7 +1463,7 @@ class Scheduler(
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
             # For session requests, keep mm_inputs for the next request
-            if req.session_id:
+            if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
             for item in mm_inputs.mm_items:
@@ -2957,7 +2957,6 @@ class Scheduler(
                 # Request is still running. Detach it from the session so it gets
                 # cleaned up later on finish, like normal requests.
                 req.session = None
-                req.session_id = None
         del self.sessions[session_id]
 
     def reap_timed_out_sessions(self):
