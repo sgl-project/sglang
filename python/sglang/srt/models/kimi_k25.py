@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_npu = is_npu()
 
+
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
