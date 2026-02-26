@@ -18,6 +18,7 @@ class _SeqInfoAccumulator:
 
     input_ids: list[int] = field(default_factory=list)
     positions: list[int] = field(default_factory=list)
+    steps: list[int] = field(default_factory=list)
     token_index_in_step: list[int] = field(default_factory=list)
 
     def extend(
@@ -25,10 +26,12 @@ class _SeqInfoAccumulator:
         *,
         input_ids: list[int],
         positions: list[int],
+        steps: list[int],
         token_index_in_step: list[int],
     ) -> None:
         self.input_ids.extend(input_ids)
         self.positions.extend(positions)
+        self.steps.extend(steps)
         self.token_index_in_step.extend(token_index_in_step)
 
     def build(self) -> TokenAlignerSeqInfo:
@@ -36,6 +39,7 @@ class _SeqInfoAccumulator:
             input_ids=self.input_ids,
             positions=self.positions,
             locator=TokenLocator(
+                steps=self.steps,
                 token_index_in_step=self.token_index_in_step,
             ),
         )
@@ -68,6 +72,7 @@ def _build_token_aligner_seq_infos(
             accum[seq_id].extend(
                 input_ids=aux.input_ids[offset : offset + seq_len],
                 positions=aux.positions[offset : offset + seq_len],
+                steps=[step] * seq_len,
                 token_index_in_step=list(range(offset, offset + seq_len)),
             )
 

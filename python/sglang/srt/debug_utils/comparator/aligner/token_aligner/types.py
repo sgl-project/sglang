@@ -54,15 +54,17 @@ class TokenAlignerGlobalAux:
 
 
 class TokenLocator(_FrozenBase):
-    """Locates tokens within a single-step tensor.
+    """Locates tokens within a multi-step tensor store.
 
-    token i is at tensor[token_index_in_step[i]].
+    token i is at tensor_of_step[steps[i]][token_index_in_step[i]].
     """
 
+    steps: list[int]
     token_index_in_step: list[int]
 
     def __add__(self, other: TokenLocator) -> TokenLocator:
         return TokenLocator(
+            steps=self.steps + other.steps,
             token_index_in_step=self.token_index_in_step + other.token_index_in_step,
         )
 
@@ -81,6 +83,7 @@ class TokenAlignerSeqInfo(_FrozenBase):
         _check_equal_lengths(
             input_ids=self.input_ids,
             positions=self.positions,
+            locator_steps=self.locator.steps,
             locator_token_index_in_step=self.locator.token_index_in_step,
         )
 
@@ -114,7 +117,9 @@ class TokenAlignerPlan(_FrozenBase):
     @model_validator(mode="after")
     def _validate_fields(self) -> TokenAlignerPlan:
         _check_equal_lengths(
+            locators_x_steps=self.locators.x.steps,
             locators_x_token_index_in_step=self.locators.x.token_index_in_step,
+            locators_y_steps=self.locators.y.steps,
             locators_y_token_index_in_step=self.locators.y.token_index_in_step,
         )
         return self
