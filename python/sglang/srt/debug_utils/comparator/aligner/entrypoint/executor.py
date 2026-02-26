@@ -14,6 +14,9 @@ from sglang.srt.debug_utils.comparator.aligner.reorderer.executor import (
     execute_reorderer_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.executor import (
+    execute_token_aligner,
+)
 from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
     execute_unsharder_plan,
 )
@@ -32,8 +35,9 @@ def execute_aligner_plan(
     tensors_pair: Pair[list[torch.Tensor]],
     plan: AlignerPlan,
 ) -> AlignerResult:
-    """Execute unified unshard/reorder per side, then combine."""
+    """Execute unified unshard/reorder + token-align."""
 
+    # Per-side: unshard + reorder -> dict[step, tensor]
     step_tensors_x: dict[int, torch.Tensor] = _execute_step_plans(
         tensors=tensors_pair.x, step_plans=plan.per_step_plans.x
     )
@@ -45,11 +49,22 @@ def execute_aligner_plan(
         failed_side_xy: str = "x" if not step_tensors_x else "y"
         return AlignerResult(tensors=None, failed_side_xy=failed_side_xy)
 
-    assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
-    combined = Pair(
-        x=list(step_tensors_x.values())[0],
-        y=list(step_tensors_y.values())[0],
-    )
+    # Cross-side: token alignment (or direct extraction for single-step)
+    if plan.token_aligner_plan is not None:
+        assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
+        combined: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan.token_aligner_plan,
+            tensor_pair=Pair(
+                x=list(step_tensors_x.values())[0],
+                y=list(step_tensors_y.values())[0],
+            ),
+        )
+    else:
+        assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
+        combined = Pair(
+            x=list(step_tensors_x.values())[0],
+            y=list(step_tensors_y.values())[0],
+        )
 
     return AlignerResult(tensors=combined, failed_side_xy=None)
 
