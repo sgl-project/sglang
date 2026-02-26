@@ -20,15 +20,15 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A beautiful sunset over the mountains"
 ```
 
-## Diffusers Backend Configuration
+## Diffusers Backend
 
 Cache-DiT supports loading acceleration configs from a custom YAML file. For
-diffusers pipelines, pass the YAML/JSON path via `--cache-dit-config`. This
+diffusers pipelines (`diffusers` backend), pass the YAML/JSON path via `--cache-dit-config`. This
 flow requires cache-dit >= 1.2.0 (`cache_dit.load_configs`).
 
 ### Single GPU inference
 
-Define a `config.yaml` file that contains:
+Define a `cache.yaml` file that contains:
 
 ```yaml
 cache_config:
@@ -46,15 +46,72 @@ cache_config:
 Then apply the config with:
 
 ```bash
-sglang generate --backend diffusers \
+sglang generate \
+  --backend diffusers \
   --model-path Qwen/Qwen-Image \
-  --cache-dit-config config.yaml \
+  --cache-dit-config cache.yaml \
   --prompt "A beautiful sunset over the mountains"
 ```
 
 ### Distributed inference
 
-Define a `parallel_config.yaml` file that contains:
+- 1D Parallelism
+
+Define a parallelism only config yaml `parallel.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  parallel_kwargs:
+    attention_backend: native
+    extra_parallel_modules: ["text_encoder", "vae"]
+```
+
+Then, apply the distributed inference acceleration config from yaml. `ulysses_size: auto` means that cache-dit will auto detect the `world_size` as the ulysses_size. Otherwise, you should manually set it as specific int number, e.g, 4.
+
+Then apply the distributed config with: (Note: please add `--num-gpus N` to specify the number of gpus for distributed inference)
+
+```bash
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
+  --model-path Qwen/Qwen-Image \
+  --cache-dit-config parallel.yaml \
+  --prompt "A futuristic cityscape at sunset"
+```
+
+- 2D Parallelism
+
+You can also define a 2D parallelism config yaml `parallel_2d.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: auto
+  tp_size: 2
+  parallel_kwargs:
+    attention_backend: native
+    extra_parallel_modules: ["text_encoder", "vae"]
+```
+Then, apply the 2D parallelism config from yaml. Here `tp_size: 2` means using tensor parallelism with size 2. The `ulysses_size: auto` means that cache-dit will auto detect the `world_size // tp_size` as the ulysses_size.
+
+- 3D Parallelism
+
+You can also define a 3D parallelism config yaml `parallel_3d.yaml` file that contains:
+
+```yaml
+parallelism_config:
+  ulysses_size: 2
+  ring_size: 2
+  tp_size: 2
+  parallel_kwargs:
+    attention_backend: native
+    extra_parallel_modules: ["text_encoder", "vae"]
+```
+Then, apply the 3D parallelism config from yaml. Here `ulysses_size: 2`, `ring_size: 2`, `tp_size: 2` means using ulysses parallelism with size 2, ring parallelism with size 2 and tensor parallelism with size 2.
+
+### Hybrid Cache and Parallelism
+
+Define a hybrid cache and parallel acceleration config yaml `hybrid.yaml` file that contains:
 
 ```yaml
 cache_config:
@@ -74,16 +131,15 @@ parallelism_config:
     extra_parallel_modules: ["text_encoder", "vae"]
 ```
 
-`ulysses_size: auto` means cache-dit will auto-detect the world_size. Otherwise,
-set it to a specific integer (e.g., `4`).
-
-Then apply the distributed config with:
+Then, apply the hybrid cache and parallel acceleration config from yaml.
 
 ```bash
-sglang generate --backend diffusers \
+sglang generate \
+  --backend diffusers \
+  --num-gpus 4 \
   --model-path Qwen/Qwen-Image \
-  --cache-dit-config parallel_config.yaml \
-  --prompt "A futuristic cityscape at sunset"
+  --cache-dit-config hybrid.yaml \
+  --prompt "A beautiful sunset over the mountains"
 ```
 
 ## Advanced Configuration
@@ -206,14 +262,6 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 ## Troubleshooting
 
-### Distributed environment warning
-
-```
-WARNING: cache-dit is disabled in distributed environment (world_size=N)
-```
-
-This is expected behavior. Cache-DiT currently only supports single-GPU inference.
-
 ### SCM disabled for low step count
 
 For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
@@ -221,5 +269,5 @@ acceleration still works.
 
 ## References
 
-- [Cache-Dit](https://github.com/vipshop/cache-dit)
+- [Cache-DiT](https://github.com/vipshop/cache-dit)
 - [SGLang Diffusion](../index.md)

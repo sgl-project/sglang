@@ -1,12 +1,12 @@
 from abc import abstractmethod
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
-from pydantic import Discriminator, Field, TypeAdapter
+from pydantic import Discriminator, Field, TypeAdapter, model_validator
 
-from sglang.srt.debug_utils.comparator.tensor_comparison.formatter import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
@@ -28,38 +28,45 @@ class ReplicatedMismatchWarning(_StrictBase):
         )
 
 
-AlignWarning = (
-    ReplicatedMismatchWarning  # future: Annotated[Union[...], Discriminator("kind")]
-)
+class GeneralWarning(_StrictBase):
+    kind: Literal["general"] = "general"
+    category: str
+    message: str
+
+    def to_text(self) -> str:
+        return self.message
+
+
+AnyWarning = Annotated[
+    Union[ReplicatedMismatchWarning, GeneralWarning],
+    Discriminator("kind"),
+]
 
 
 class _OutputRecord(_StrictBase):
-    align_warnings: list[AlignWarning] = Field(default_factory=list)
+    warnings: list[AnyWarning] = Field(default_factory=list)
 
     @abstractmethod
     def _format_body(self) -> str: ...
 
     def to_text(self) -> str:
         body = self._format_body()
-        if self.align_warnings:
-            body += "\n" + "\n".join(f"  ⚠ {w.to_text()}" for w in self.align_warnings)
+        if self.warnings:
+            body += "\n" + "\n".join(f"  ⚠ {w.to_text()}" for w in self.warnings)
         return body
 
 
 class ConfigRecord(_OutputRecord):
     type: Literal["config"] = "config"
-    baseline_path: str
-    target_path: str
-    diff_threshold: float
-    start_step: int
-    end_step: int
+    config: dict[str, Any]
+
+    @classmethod
+    def from_args(cls, args) -> "ConfigRecord":
+        """Create ConfigRecord from argparse.Namespace."""
+        return cls(config=vars(args))
 
     def _format_body(self) -> str:
-        return (
-            f"Config: baseline={self.baseline_path} target={self.target_path}\n"
-            f"diff_threshold={self.diff_threshold} "
-            f"steps=[{self.start_step}, {self.end_step}]"
-        )
+        return f"Config: {self.config}"
 
 
 class SkipRecord(_OutputRecord):
@@ -69,7 +76,7 @@ class SkipRecord(_OutputRecord):
 
     @property
     def category(self) -> str:
-        if self.align_warnings:
+        if self.warnings:
             return "failed"
         return "skipped"
 
@@ -82,7 +89,7 @@ class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
 
     @property
     def category(self) -> str:
-        if self.align_warnings:
+        if self.warnings:
             return "failed"
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
@@ -97,6 +104,15 @@ class SummaryRecord(_OutputRecord):
     failed: int
     skipped: int
 
+    @model_validator(mode="after")
+    def _validate_totals(self) -> "SummaryRecord":
+        expected: int = self.passed + self.failed + self.skipped
+        if self.total != expected:
+            raise ValueError(
+                f"total={self.total} != passed({self.passed}) + failed({self.failed}) + skipped({self.skipped}) = {expected}"
+            )
+        return self
+
     def _format_body(self) -> str:
         return (
             f"Summary: {self.passed} passed, {self.failed} failed, "
@@ -104,8 +120,15 @@ class SummaryRecord(_OutputRecord):
         )
 
 
+class WarningRecord(_OutputRecord):
+    type: Literal["warning"] = "warning"
+
+    def _format_body(self) -> str:
+        return ""
+
+
 AnyRecord = Annotated[
-    Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord],
+    Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord, WarningRecord],
     Discriminator("type"),
 ]
 
