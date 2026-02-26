@@ -9,8 +9,8 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.metrics.collector import DPCooperationInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
