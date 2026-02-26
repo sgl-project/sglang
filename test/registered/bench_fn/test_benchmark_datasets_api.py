@@ -294,15 +294,16 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertIn("tools", rows[1].extra_request_body)
 
     def test_generated_shared_prefix_sampler(self):
+        args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
-            num_groups=2,
-            prompts_per_group=2,
-            system_prompt_len=8,
-            question_len=4,
-            output_len=4,
-            range_ratio=0.0,
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
+            range_ratio=args.gsp_range_ratio,
             tokenizer=self.tokenizer,
-            seed=1,
+            seed=args.seed,
         )
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
