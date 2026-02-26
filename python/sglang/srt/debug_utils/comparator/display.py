@@ -88,9 +88,7 @@ def _collect_input_ids_and_positions(
     *,
     tokenizer: Any = None,
 ) -> Optional[list[dict[str, Any]]]:
-    filtered: pl.DataFrame = df.filter(
-        pl.col("name").is_in(["input_ids", "positions"])
-    )
+    filtered: pl.DataFrame = df.filter(pl.col("name").is_in(["input_ids", "positions"]))
     if filtered.is_empty():
         return None
 
@@ -106,7 +104,9 @@ def _collect_input_ids_and_positions(
         ids = data.get("input_ids")
         pos = data.get("positions")
 
-        ids_list: Optional[list[int]] = ids.flatten().tolist() if ids is not None else None
+        ids_list: Optional[list[int]] = (
+            ids.flatten().tolist() if ids is not None else None
+        )
 
         row_data: dict[str, Any] = {
             "step": step,

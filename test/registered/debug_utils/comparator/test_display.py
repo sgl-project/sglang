@@ -90,9 +90,7 @@ class TestCollectRankInfo:
             ]
         )
 
-        rows: Optional[list[dict[str, Any]]] = _collect_rank_info(
-            df, dump_dir=tmp_path
-        )
+        rows: Optional[list[dict[str, Any]]] = _collect_rank_info(df, dump_dir=tmp_path)
 
         assert rows is not None
         assert len(rows) == 1
