@@ -1038,7 +1038,7 @@ def _launch_subprocesses(
         run_scheduler_process_func=run_scheduler_process_func,
     )
 
-    if server_args.enable_elastic_expert_backup:
+    if server_args.enable_elastic_expert_backup and server_args.elastic_ep_backend == "mooncake":
         run_expert_backup_manager(server_args, port_args)
 
     if server_args.node_rank >= 1:

@@ -94,7 +94,11 @@ class ExpertBackupClient:
                 param_data.data_ptr(), param_data.numel() * param_data.element_size()
             )
             if ret_value != 0:
-                raise RuntimeError("GPU buffer memory registration failed.")
+                self.use_backup = False
+                logger.warning(
+                    "Register fails. Stop using expert weight backup!"
+                )
+                break
 
     def update_weights(self):
         global_expert_location_metadata = get_global_expert_location_metadata()
