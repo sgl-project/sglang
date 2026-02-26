@@ -51,7 +51,7 @@ class PrefillServerInfo:
     dp_size: int
     pp_size: int
     page_size: Optional[int]
-    kv_cache_dtype: Optional[str] = None
+    kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
 
     def __post_init__(self):
