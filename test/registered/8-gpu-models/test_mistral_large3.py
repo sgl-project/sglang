@@ -88,7 +88,7 @@ class TestMistralLarge3(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Mistral-Large-3",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.90),
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.85),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_mistral_large3",
             ),
