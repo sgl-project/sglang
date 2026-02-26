@@ -268,7 +268,7 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
             reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
 
             # b_v - sum(b_h*b_k)
-            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
                 tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
                     (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
                     (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
@@ -345,7 +345,7 @@ def fused_recurrent_sigmoid_update_128x32_col(
     h_dtype = mH.element_type
     k_dtype = mK.element_type
     x_threads = 32
-    y_threads = 8
+    y_threads = 4
     if const_expr(DIM == 256):
         x_threads = 32
         y_threads = 16
@@ -713,7 +713,7 @@ def fused_recurrent_update_kernel_128x32_col(
 
             reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
 
-            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
                 tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
                     (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
                     (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
@@ -802,10 +802,15 @@ def fused_recurrent_update_128x32_col(
 ):
     assert all(t.element_type == mQ.element_type for t in [mQ, mK, mV])
 
+    B = mQ.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    T = mK.shape[1]
+    HK = mK.shape[2]
+    HV = mV.shape[2]
+
     h_dtype = mH.element_type
     k_dtype = mK.element_type
     x_threads = 32
-    y_threads = 8
+    y_threads = 4 if (T // CACHE_STEPS) >= 16 else 8
     if const_expr(DIM == 256):
         x_threads = 32
         y_threads = 16
@@ -851,10 +856,6 @@ def fused_recurrent_update_128x32_col(
             mInter, (1, 1, 1, tiler_mn_h[0], tiler_mn_h[1])
         )
 
-    B = mQ.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
-    T = mK.shape[1]
-    HK = mK.shape[2]
-    HV = mV.shape[2]
     blocks_per_head = mK.shape[-1] // BV
 
     assert T // CACHE_STEPS == B, "batch * CACHE_STEPS must be equal to T"
