@@ -400,11 +400,24 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        else:
+            hidden_states = self.mlp(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
@@ -633,11 +646,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
         )
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        else:
+            hidden_states = self.mlp(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
         return hidden_states, residual
 
