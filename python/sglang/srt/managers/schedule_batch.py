@@ -500,7 +500,7 @@ class Req(ReqDllmMixin):
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
-        session: Optional["Session"] = None,
+        session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
