@@ -78,7 +78,7 @@ def _compare_bundle_pair_raw(
         lambda items: [it.meta for it in items]
     )
     plan: AlignerPlan = compute_aligner_plan(
-        metas_pair=metas_pair, token_aligner_plan=None
+        metas_pair=metas_pair, token_aligner_plan=token_aligner_plan
     )
 
     # 3. Execute (tensor + plan only, no meta)
