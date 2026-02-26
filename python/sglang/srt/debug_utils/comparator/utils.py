@@ -1,8 +1,21 @@
+from __future__ import annotations
+
 import functools
-from typing import Optional, Tuple
+from typing import Callable, Generic, Optional, Tuple, TypeVar
 
 import torch
 from pydantic import BaseModel, ConfigDict
+
+_T = TypeVar("_T")
+_U = TypeVar("_U")
+
+
+def _check_equal_lengths(**named_lists: list) -> None:
+    lengths: dict[str, int] = {name: len(lst) for name, lst in named_lists.items()}
+    unique: set[int] = set(lengths.values())
+    if len(unique) > 1:
+        details: str = ", ".join(f"{name}={length}" for name, length in lengths.items())
+        raise ValueError(f"Length mismatch: {details}")
 
 
 class _StrictBase(BaseModel):
@@ -13,19 +26,27 @@ class _FrozenBase(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+class Pair(_FrozenBase, Generic[_T]):
+    x: _T
+    y: _T
+
+    def map(self, fn: Callable[[_T], _U]) -> Pair[_U]:
+        return Pair(x=fn(self.x), y=fn(self.y))
+
+
 def argmax_coord(x: torch.Tensor) -> Tuple[int, ...]:
     flat_idx = x.argmax()
     return tuple(idx.item() for idx in torch.unravel_index(flat_idx, x.shape))
 
 
 def compute_smaller_dtype(
-    dtype_a: torch.dtype, dtype_b: torch.dtype
+    dtypes: Pair[torch.dtype],
 ) -> Optional[torch.dtype]:
     info_dict = {
         (torch.float32, torch.bfloat16): torch.bfloat16,
         # ... add more ...
     }
-    return info_dict.get((dtype_a, dtype_b)) or info_dict.get((dtype_b, dtype_a))
+    return info_dict.get((dtypes.x, dtypes.y)) or info_dict.get((dtypes.y, dtypes.x))
 
 
 def try_unify_shape(x: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
