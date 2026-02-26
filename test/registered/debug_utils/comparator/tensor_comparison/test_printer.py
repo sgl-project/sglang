@@ -1,7 +1,6 @@
 import sys
 
 import pytest
-import torch
 
 from sglang.srt.debug_utils.comparator.tensor_comparison.printer import (
     print_comparison,
@@ -36,25 +35,27 @@ def _make_diff(
     rel_diff: float = 0.0001,
     max_abs_diff: float = 0.0005,
     mean_abs_diff: float = 0.0002,
+    passed: bool = True,
 ) -> DiffInfo:
     return DiffInfo(
         rel_diff=rel_diff,
         max_abs_diff=max_abs_diff,
         mean_abs_diff=mean_abs_diff,
-        max_diff_coord=(2, 3),
+        max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
+        passed=passed,
     )
 
 
 def _make_tensor_info(
-    shape: torch.Size = torch.Size([4, 8]),
-    dtype: torch.dtype = torch.float32,
+    shape: list[int] | None = None,
+    dtype: str = "torch.float32",
     stats: TensorStats | None = None,
     sample: str | None = None,
 ) -> TensorInfo:
     return TensorInfo(
-        shape=shape,
+        shape=shape if shape is not None else [4, 8],
         dtype=dtype,
         stats=stats if stats is not None else _make_stats(),
         sample=sample,
@@ -75,7 +76,7 @@ class TestPrintComparison:
             target=_make_tensor_info(
                 stats=_make_stats(mean=0.1001, std=1.0001, min=-2.0001, max=2.0001),
             ),
-            unified_shape=torch.Size([4, 8]),
+            unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
         )
@@ -83,9 +84,9 @@ class TestPrintComparison:
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "Raw [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
-            "After unify [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "After unify [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
             "[mean] 0.1000 vs 0.1001 (diff: 0.0001)\n"
             "[std] 1.0000 vs 1.0001 (diff: 0.0001)\n"
@@ -96,25 +97,25 @@ class TestPrintComparison:
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
             "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
         )
 
     def test_shape_mismatch(self, capsys):
         info = TensorComparisonInfo(
             name="mismatch",
-            baseline=_make_tensor_info(shape=torch.Size([3, 4])),
-            target=_make_tensor_info(shape=torch.Size([5, 6])),
-            unified_shape=torch.Size([3, 4]),
+            baseline=_make_tensor_info(shape=[3, 4]),
+            target=_make_tensor_info(shape=[5, 6]),
+            unified_shape=[3, 4],
             shape_mismatch=True,
         )
 
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([3, 4]) vs torch.Size([5, 6])\t"
+            "Raw [shape] [3, 4] vs [5, 6]\t"
             "[dtype] torch.float32 vs torch.float32\n"
-            "After unify [shape] torch.Size([3, 4]) vs torch.Size([5, 6])\t"
+            "After unify [shape] [3, 4] vs [5, 6]\t"
             "[dtype] torch.float32 vs torch.float32\n"
             "[mean] 0.0000 vs 0.0000 (diff: 0.0000)\n"
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
@@ -131,22 +132,24 @@ class TestPrintComparison:
         info = TensorComparisonInfo(
             name="downcast",
             baseline=_make_tensor_info(),
-            target=_make_tensor_info(dtype=torch.bfloat16),
-            unified_shape=torch.Size([4, 8]),
+            target=_make_tensor_info(dtype="torch.bfloat16"),
+            unified_shape=[4, 8],
             shape_mismatch=False,
-            diff=_make_diff(rel_diff=0.002, max_abs_diff=0.005, mean_abs_diff=0.001),
-            diff_downcast=_make_diff(
-                rel_diff=0.0001, max_abs_diff=0.0005, mean_abs_diff=0.0002
+            diff=_make_diff(
+                rel_diff=0.002, max_abs_diff=0.005, mean_abs_diff=0.001, passed=False
             ),
-            downcast_dtype=torch.bfloat16,
+            diff_downcast=_make_diff(
+                rel_diff=0.0001, max_abs_diff=0.0005, mean_abs_diff=0.0002, passed=True
+            ),
+            downcast_dtype="torch.bfloat16",
         )
 
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "Raw [shape] [4, 8] vs [4, 8]\t"
             "[🟠dtype] torch.float32 vs torch.bfloat16\n"
-            "After unify [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "After unify [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.bfloat16\n"
             "[mean] 0.0000 vs 0.0000 (diff: 0.0000)\n"
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
@@ -157,20 +160,20 @@ class TestPrintComparison:
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
             "❌ rel_diff=0.002\t❌ max_abs_diff=0.005\t✅ mean_abs_diff=0.001\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
             "When downcast to torch.bfloat16: "
             "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
         )
 
     def test_with_shape_unification(self, capsys):
         info = TensorComparisonInfo(
             name="unify",
-            baseline=_make_tensor_info(shape=torch.Size([1, 1, 4, 8])),
+            baseline=_make_tensor_info(shape=[1, 1, 4, 8]),
             target=_make_tensor_info(),
-            unified_shape=torch.Size([4, 8]),
+            unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
         )
@@ -178,11 +181,11 @@ class TestPrintComparison:
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([1, 1, 4, 8]) vs torch.Size([4, 8])\t"
+            "Raw [shape] [1, 1, 4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
-            "Unify shape: torch.Size([1, 1, 4, 8]) -> torch.Size([4, 8]) "
-            "(to match torch.Size([4, 8]))\n"
-            "After unify [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "Unify shape: [1, 1, 4, 8] -> [4, 8] "
+            "(to match [4, 8])\n"
+            "After unify [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
             "[mean] 0.0000 vs 0.0000 (diff: 0.0000)\n"
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
@@ -193,7 +196,7 @@ class TestPrintComparison:
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
             "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
         )
 
@@ -202,7 +205,7 @@ class TestPrintComparison:
             name="samples",
             baseline=_make_tensor_info(sample="tensor([0.1, 0.2, ...])"),
             target=_make_tensor_info(sample="tensor([0.1, 0.3, ...])"),
-            unified_shape=torch.Size([4, 8]),
+            unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
         )
@@ -210,9 +213,9 @@ class TestPrintComparison:
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "Raw [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
-            "After unify [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "After unify [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
             "[mean] 0.0000 vs 0.0000 (diff: 0.0000)\n"
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
@@ -223,7 +226,7 @@ class TestPrintComparison:
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
             "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
             "x_baseline(sample)=tensor([0.1, 0.2, ...])\n"
             "x_target(sample)=tensor([0.1, 0.3, ...])\n"
@@ -236,7 +239,7 @@ class TestPrintComparison:
             name="no_quantiles",
             baseline=_make_tensor_info(stats=stats_no_quantiles),
             target=_make_tensor_info(stats=stats_no_quantiles),
-            unified_shape=torch.Size([4, 8]),
+            unified_shape=[4, 8],
             shape_mismatch=False,
             diff=_make_diff(),
         )
@@ -244,16 +247,16 @@ class TestPrintComparison:
         print_comparison(info=info, diff_threshold=1e-3)
 
         assert capsys.readouterr().out == (
-            "Raw [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "Raw [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
-            "After unify [shape] torch.Size([4, 8]) vs torch.Size([4, 8])\t"
+            "After unify [shape] [4, 8] vs [4, 8]\t"
             "[dtype] torch.float32 vs torch.float32\n"
             "[mean] 0.0000 vs 0.0000 (diff: 0.0000)\n"
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
             "[min] -2.0000 vs -2.0000 (diff: 0.0000)\n"
             "[max] 2.0000 vs 2.0000 (diff: 0.0000)\n"
             "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
-            "max_abs_diff happens at coord=(2, 3) with "
+            "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
         )
 
