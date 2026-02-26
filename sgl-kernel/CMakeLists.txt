@@ -297,9 +297,6 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/gemm/marlin/gptq_marlin.cu"
-    "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
