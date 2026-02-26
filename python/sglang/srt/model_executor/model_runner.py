@@ -494,7 +494,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ExpertBackupClient(self.server_args, self)
             if (
                 self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend == "mooncake"
+                and self.server_args.elastic_ep_backend is not None
             )
             else None
         )
@@ -885,7 +885,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             or (
                 self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend == "mooncake"
+                and self.server_args.elastic_ep_backend is not None
             )
         )
 
