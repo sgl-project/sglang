@@ -1233,6 +1233,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

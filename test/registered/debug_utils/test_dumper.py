@@ -2002,7 +2002,7 @@ class TestDumperE2E:
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 
-            for field in ("input_ids", "positions"):
+            for field in ("input_ids", "positions", "rids"):
                 assert any(f"name={field}" in f for f in filenames), (
                     f"Missing {field} dump from non-intrusive hooks, "
                     f"got: {sorted(filenames)[:10]}"
@@ -2022,6 +2022,19 @@ class TestDumperE2E:
             assert "name" in loaded["meta"]
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
+
+            rids_files = [f for f in dump_files if "name=rids" in f.name]
+            rids_loaded = torch.load(
+                rids_files[0], map_location="cpu", weights_only=False
+            )
+            rids_value = rids_loaded["value"]
+            assert isinstance(
+                rids_value, list
+            ), f"rids should be a list, got {type(rids_value)}"
+            assert len(rids_value) > 0, "rids should be non-empty"
+            assert all(
+                isinstance(r, str) for r in rids_value
+            ), f"each rid should be a str, got {[type(r) for r in rids_value]}"
         finally:
             kill_process_tree(proc.pid)
 
@@ -2114,7 +2127,9 @@ class TestRegisterForwardHook:
 class TestPluginCoreFields:
     def test_sglang_core_fields(self):
         plugin = _SGLangPlugin()
-        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
 
     def test_megatron_core_fields(self):
         plugin = _MegatronPlugin()
@@ -2254,6 +2269,75 @@ class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
         assert torch.equal(captured["cu_seqlens_kv"]["value"], cu_kv)
         assert "qkv_format" in captured
         assert captured["qkv_format"]["value"] == "thd"
+
+
+class TestDumperDims:
+    def test_dims_in_meta_not_filename(self, tmp_path) -> None:
+        dumper = _make_test_dumper(tmp_path)
+        tensor = torch.randn(4, 8)
+        dumper.dump("hidden", tensor, dims="b h(tp)")
+        dumper.step()
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        pt_files = list(exp_dir.glob("*.pt"))
+        assert len(pt_files) == 1
+
+        assert "dims" not in pt_files[0].stem
+
+        data = torch.load(pt_files[0], weights_only=False)
+        assert "dims" in data["meta"]
+        assert data["meta"]["dims"] == "b h(tp)"
+
+    def test_dims_grad_override(self, tmp_path) -> None:
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(tmp_path),
+                enable_http_server=False,
+                enable_grad=True,
+            )
+        )
+
+        tensor = torch.randn(4, 8, requires_grad=True)
+        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp,partial)")
+        dumper.step()
+
+        tensor.backward(torch.ones_like(tensor))
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        pt_files = sorted(exp_dir.glob("*.pt"))
+        assert len(pt_files) == 2
+
+        value_file = [f for f in pt_files if "grad__" not in f.stem][0]
+        grad_file = [f for f in pt_files if "grad__" in f.stem][0]
+
+        value_data = torch.load(value_file, weights_only=False)
+        assert value_data["meta"]["dims"] == "b h(tp)"
+        assert value_data["meta"]["dims_grad"] == "b h(tp,partial)"
+
+        grad_data = torch.load(grad_file, weights_only=False)
+        assert grad_data["meta"]["dims"] == "b h(tp,partial)"
+
+    def test_dims_grad_inherits(self, tmp_path) -> None:
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(tmp_path),
+                enable_http_server=False,
+                enable_grad=True,
+            )
+        )
+
+        tensor = torch.randn(4, 8, requires_grad=True)
+        dumper.dump("hidden", tensor, dims="b h(tp)")
+        dumper.step()
+
+        tensor.backward(torch.ones_like(tensor))
+
+        exp_dir = tmp_path / dumper._config.exp_name
+        grad_file = [f for f in exp_dir.glob("*.pt") if "grad__" in f.stem][0]
+        grad_data = torch.load(grad_file, weights_only=False)
+        assert grad_data["meta"]["dims"] == "b h(tp)"
 
 
 if __name__ == "__main__":
