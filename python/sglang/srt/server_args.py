@@ -2445,9 +2445,8 @@ class ServerArgs:
                 )
             elif not self.use_mla_backend():
                 raise ValueError(
-                    "The argument enable_kv_storage_optimization_mla only supports page size 128 for MLA model architectures"
+                    "The argument enable_kv_storage_optimization_mla only supports MLA model architectures"
                 )
-
 
         if self.load_format == "remote_instance":
             if (

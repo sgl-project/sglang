@@ -308,7 +308,9 @@ class PrefillBootstrapQueue:
                 )
                 num_pages = end_page - start_page + 1
             else:
-                num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+                num_pages = kv_to_page_num(
+                    num_kv_indices, self.token_to_kv_pool.page_size
+                )
 
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
