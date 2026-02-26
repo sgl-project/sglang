@@ -1,7 +1,8 @@
 import importlib
+import types
 from dataclasses import dataclass
 from importlib.util import find_spec
-from typing import Optional, List, Any
+from typing import Any, List, Optional
 
 import regex as re
 import torch
@@ -9,15 +10,12 @@ import torch.nn.functional as F
 from packaging import version
 
 from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-)
-from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
-    QuantizeMethodBase
+    QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import set_weight_attrs
-
 
 
 def _bond_method_to_cls(func, obj):
@@ -26,7 +24,8 @@ def _bond_method_to_cls(func, obj):
         return func
     else:
         return types.MethodType(func, obj)
-    
+
+
 def _get_weight_attrs(param):
     # record attributes attached to the weight, so we can
     # recover later
@@ -45,6 +44,7 @@ def _get_weight_attrs(param):
                 recorded_weight_attr[key] = attr
     return recorded_weight_attr
 
+
 def _restore_weight_attrs(param, recorded_weight_attr):
     for attr_name, attr in recorded_weight_attr.items():
         if not hasattr(param, attr_name):
@@ -61,6 +61,7 @@ def torchao_version_at_least(torchao_version: str) -> bool:
         except (ImportError, version.InvalidVersion):
             return False
     return False
+
 
 def should_skip(prefix: str, skip_modules: list[str]) -> bool:
     """
@@ -87,21 +88,17 @@ if torchao_version_at_least("0.15.0"):
 else:
     convert_to_packed_tensor_based_on_current_hardware = lambda t: t
 
+
 @dataclass
 class TorchAOConfig(QuantizationConfig):
-    """Configuration for TorchAO-based quantization operations.
-    
-    
-    
-    """
-
+    """Configuration for TorchAO-based quantization operations."""
 
     def __init__(
-            self,
-            torchao_config,
-            skip_modules: list[str] | None = None,
-            is_checkpoint_torchao_serialized: bool = False,
-    )-> None:
+        self,
+        torchao_config,
+        skip_modules: list[str] | None = None,
+        is_checkpoint_torchao_serialized: bool = False,
+    ) -> None:
         """
         # TorchAO quantization relies on tensor subclasses. In order,
         # to enable proper caching this needs standalone compile
@@ -124,7 +121,7 @@ class TorchAOConfig(QuantizationConfig):
 
     def get_name(self) -> str:
         return "torchao"
-    
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -133,17 +130,20 @@ class TorchAOConfig(QuantizationConfig):
         return [torch.float32, torch.float16, torch.bfloat16]
 
     def get_quant_method(
-            self, layer: torch.nn.Module, prefix: str,
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
         from sglang.srt.layers.linear import LinearBase
+
         if not isinstance(layer, LinearBase):
             return None
-        
+
         from torchao.quantization import ModuleFqnToConfig
-        
+
         if should_skip(prefix, self.skip_modules):
             return UnquantizedLinearMethod()
-        
+
         module_fqn = prefix
         if isinstance(self.torchao_config, ModuleFqnToConfig):
             module_fqn_to_config = self.torchao_config.module_fqn_to_config
@@ -151,7 +151,7 @@ class TorchAOConfig(QuantizationConfig):
             if module_fqn in module_fqn_to_config:
                 assert not module_fqn.startswith("re:"), (
                     "module fqn should not start with",
-                    "`re:`, which is used for specifying reges"
+                    "`re:`, which is used for specifying reges",
                 )
                 c = module_fqn_to_config[module_fqn]
             else:
@@ -174,12 +174,12 @@ class TorchAOConfig(QuantizationConfig):
                 return TorchAOLinearMethod(current_torchao_config)
             else:
                 return UnquantizedLinearMethod()
-            
+
         return TorchAOLinearMethod(self)
-        
+
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "TorchAOConfig":
-        """ Create the quant config from an hf model config"""
+        """Create the quant config from an hf model config"""
         try:
             from torchao.core.config import config_from_dict
         except ImportError as err:
@@ -187,7 +187,6 @@ class TorchAOConfig(QuantizationConfig):
                 "Please install torchao>=0.10.0 via"
                 " `pip install torchao>=0.10.0 to use torchao quantization."
             ) from err
-        
 
         quant_method = cls.get_from_keys_or(config, ["quant_method"], None)
         is_checkpoint_torchao_serialized = (
@@ -196,9 +195,9 @@ class TorchAOConfig(QuantizationConfig):
 
         hf_config = cls.get_from_keys_or(config, ["quant_type"], None)
         assert hf_config is not None, "quant_type must be specified"
-        assert len(hf_config) == 1 and "default" in hf_config, (
-            "Expected only one key 'default' in quant_dtype dictionary"
-        )
+        assert (
+            len(hf_config) == 1 and "default" in hf_config
+        ), "Expected only one key 'default' in quant_dtype dictionary"
 
         quant_type = hf_config["default"]
         ao_config = config_from_dict(quant_type)
@@ -210,7 +209,7 @@ class TorchAOConfig(QuantizationConfig):
         _data = quant_type.get("_data", {})
         if not isinstance(_data, dict):
             _data = {}
-        
+
         module_fqn = _data.get("module_fqn_to_config", {})
         if not isinstance(module_fqn, dict):
             module_fqn = {}
@@ -224,12 +223,13 @@ class TorchAOConfig(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
-    
+
     def get_scaled_act_names(self) -> list[str]:
         return []
-    
+
+
 def torchao_quantize_param_data(
-        param: torch.Tensor, torchao_config: Any
+    param: torch.Tensor, torchao_config: Any
 ) -> torch.nn.Parameter:
     """Quantize a Tensor with torchao quantization specified by torchao_config
 
@@ -253,11 +253,12 @@ def torchao_quantize_param_data(
         dummy_linear = torch.nn.Sequential(
             torch.nn.Linear(param.shape[1], param.shape[0], bias=False)
         )
-    
+
     dummy_linear[0].weight = param
     quantize_(dummy_linear, torchao_config)
     return dummy_linear[0].weight
-        
+
+
 class TorchAOLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: TorchAOConfig):
         self.quant_config = quant_config
@@ -272,7 +273,7 @@ class TorchAOLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        
+
         weight = torch.nn.Parameter(
             torch.empty(
                 sum(output_partition_sizes),
@@ -293,18 +294,15 @@ class TorchAOLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         return F.linear(x, layer.weight, bias)
-    
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.quant_config.is_checkpoint_torchao_serialized:
             if not hasattr(layer, "weight"):
-                return 
-            
+                return
+
             # record attributes attached to the weight, so we can
             # recover later
             recorded_weight_attr = _get_weight_attrs(layer.weight)
@@ -315,11 +313,13 @@ class TorchAOLinearMethod(LinearMethodBase):
             )
 
             _restore_weight_attrs(layer.weight, recorded_weight_attr)
-            return 
-        
+            return
+
         # online quantize the weight if the checkpoint is not already
         # quantized by torchao
-        weight = torchao_quantize_param_data(layer.weight, self.quant_config.torchao_config)
+        weight = torchao_quantize_param_data(
+            layer.weight, self.quant_config.torchao_config
+        )
         weight = torch.nn.Parameter(
             convert_to_packed_tensor_based_on_current_hardware(weight),
             weight.required_grad,
