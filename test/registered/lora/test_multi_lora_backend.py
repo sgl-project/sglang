@@ -21,7 +21,8 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 if is_hip():
-    os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+    os.environ.setdefault("SGLANG_USE_AITER", "0")
+
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
