@@ -385,12 +385,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
+            self.local_rank = (
+                storage_config.tp_rank if storage_config is not None else 0
+            )
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
-                self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
             else:
@@ -474,20 +476,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Retry logic to handle Transfer Engine startup race condition
         max_retries = 10
-        retry_delay = 2.0  # seconds
+        retry_delay = 1.0  # seconds
 
         for attempt in range(max_retries):
             ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
             logger.warning(
-                f"Warmup put failed (attempt {attempt + 1}/{max_retries}), "
+                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
                 f"ret={ret}, retrying in {retry_delay}s..."
             )
             time.sleep(retry_delay)
         else:
             raise RuntimeError(
-                f"Warmup put failed after {max_retries} attempts, "
+                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
                 "Transfer Engine might not be ready"
             )
 
