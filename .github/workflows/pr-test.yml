@@ -132,6 +132,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
+              - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
               - "python/pyproject.toml"
               - ".github/workflows/pr-test.yml"
@@ -1362,14 +1363,22 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
-      # - name: Warmup Weights and JIT Compilation
-      #   timeout-minutes: 20
-      #   run: |
-      #     # An example command for testing the warmup. TODO: make this more general and move them to python scripts.
-      #     python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --trust-remote-code
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            inclusionAI/Ring-2.5-1T:8
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test
           CONTINUE_ON_ERROR_FLAG=""
@@ -1521,6 +1530,19 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
+      - name: Warmup DeepGEMM JIT Compilation
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_deep_gemm.py \
+            deepseek-ai/DeepSeek-V3-0324:8 \
+            deepseek-ai/DeepSeek-V3.2-Exp:8
+
+      - name: Warmup Server CUDA Graphs
+        timeout-minutes: 25
+        run: |
+          python3 scripts/ci/cuda/warmup_server.py \
+            deepseek-ai/DeepSeek-V3-0324:8
+
       - name: Run test
         timeout-minutes: 45
         run: |
@@ -1589,55 +1611,57 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.part }}
 
-  stage-c-test-4-gpu-gb200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-gb200
-    timeout-minutes: 240
-    env:
-      RUNNER_LABELS: 4-gpu-gb200
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9-aarch64
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test
-          CONTINUE_ON_ERROR_FLAG=""
-          if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
-            CONTINUE_ON_ERROR_FLAG="--continue-on-error"
-          fi
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+  # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
+  # Re-enable when a 4-gpu-gb200 runner is provisioned.
+  # stage-c-test-4-gpu-gb200:
+  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   runs-on: 4-gpu-gb200
+  #   timeout-minutes: 240
+  #   env:
+  #     RUNNER_LABELS: 4-gpu-gb200
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+  #
+  #     - name: Download artifacts
+  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda12.9-aarch64
+  #
+  #     - name: Install dependencies
+  #       timeout-minutes: 20
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
+  #
+  #     - name: Run test
+  #       timeout-minutes: 45
+  #       run: |
+  #         cd test
+  #         CONTINUE_ON_ERROR_FLAG=""
+  #         if [[ "${{ needs.check-changes.outputs.continue_on_error }}" == "true" ]]; then
+  #           CONTINUE_ON_ERROR_FLAG="--continue-on-error"
+  #         fi
+  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
+  #
+  #     - uses: ./.github/actions/upload-cuda-coredumps
+  #       if: always()
 
   pr-test-finish:
     needs:
@@ -1671,7 +1695,7 @@ jobs:
         stage-c-test-deepep-4-gpu,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
-        stage-c-test-4-gpu-gb200,
+        # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()
     runs-on: ubuntu-latest
