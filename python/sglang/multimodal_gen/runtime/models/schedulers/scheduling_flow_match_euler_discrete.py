@@ -196,16 +196,6 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
     ) -> torch.FloatTensor:
         """
         Forward process in flow-matching
-
-        Args:
-            sample (`torch.FloatTensor`):
-                The input sample.
-            timestep (`int`, *optional*):
-                The current timestep in the diffusion chain.
-
-        Returns:
-            `torch.FloatTensor`:
-                A scaled input sample.
         """
         # Make sure sigmas and timesteps have the same device and dtype as original_samples
         sigmas = self.sigmas.to(device=sample.device, dtype=sample.dtype)

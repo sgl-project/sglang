@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=260, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=260, suite="stage-b-test-large-1-gpu")
 
 TEST_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 

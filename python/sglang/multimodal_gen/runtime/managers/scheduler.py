@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+import os
 import pickle
 from collections import deque
 from copy import deepcopy
@@ -8,12 +10,21 @@ from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    UpdateWeightFromDiskReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
-    _parse_size,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -28,6 +39,8 @@ from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
 class Scheduler:
@@ -81,6 +94,9 @@ class Scheduler:
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ShutdownReq: self._handle_shutdown,
+            UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
         # FIFO, new reqs are appended
@@ -88,6 +104,9 @@ class Scheduler:
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
+        # warmup progress tracking
+        self._warmup_total = 0
+        self._warmup_processed = 0
 
         self.prepare_server_warmup_reqs()
 
@@ -114,10 +133,39 @@ class Scheduler:
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
 
+    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        self._running = False
+        return OutputBatch()
+
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_disk(
+            model_path=req.model_path,
+            flush_cache=req.flush_cache,
+            target_modules=req.target_modules,
+        )
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
+
+    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
+        """Handle get_weights_checksum request."""
+        req = reqs[0]
+        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        return OutputBatch(output=checksums)
+
     def _handle_generation(self, reqs: List[Req]):
-        has_warmup = any(req.is_warmup for req in reqs)
-        if has_warmup:
-            logger.info("Processing warmup req...")
+        warmup_reqs = [req for req in reqs if req.is_warmup]
+        if warmup_reqs:
+            self._warmup_processed += len(warmup_reqs)
+            if self._warmup_total > 0:
+                logger.info(
+                    f"Processing warmup req... ({self._warmup_processed}/{self._warmup_total})"
+                )
+            else:
+                logger.info("Processing warmup req...")
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -149,15 +197,43 @@ class Scheduler:
             and self.server_args.warmup_resolutions is not None
         ):
             # insert warmup reqs constructed with each warmup-resolution
+            self._warmup_total = len(self.server_args.warmup_resolutions)
+            self._warmup_processed = 0
+
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
-                req = Req(
-                    data_type=self.server_args.pipeline_config.task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                    is_warmup=True,
-                )
+                task_type = self.server_args.pipeline_config.task_type
+
+                if task_type in (
+                    ModelTaskType.I2I,
+                    ModelTaskType.TI2I,
+                    ModelTaskType.I2V,
+                    ModelTaskType.TI2V,
+                ):
+                    uploads_dir = os.path.join("outputs", "uploads")
+                    os.makedirs(uploads_dir, exist_ok=True)
+                    input_path = asyncio.run(
+                        save_image_to_path(
+                            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                            os.path.join(uploads_dir, "warmup_image.jpg"),
+                        )
+                    )
+                    req = Req(
+                        data_type=task_type.data_type(),
+                        width=width,
+                        height=height,
+                        prompt="",
+                        negative_prompt="",
+                        image_path=[input_path],
+                    )
+                else:
+                    req = Req(
+                        data_type=task_type.data_type(),
+                        width=width,
+                        height=height,
+                        prompt="",
+                    )
+                req.set_as_warmup()
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -174,15 +250,14 @@ class Scheduler:
             return recv_reqs
 
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmup
+        # only the very first req through server's lifetime will be warmed up
         identity, req = recv_reqs[0]
         if isinstance(req, Req):
             warmup_req = deepcopy(req)
-            warmup_req.is_warmup = True
-            warmup_req.extra["cache_dit_num_inference_steps"] = req.num_inference_steps
-            warmup_req.num_inference_steps = 1
+            warmup_req.set_as_warmup()
             recv_reqs.insert(0, (identity, warmup_req))
-            logger.info("Server warming up....")
+            self._warmup_total = 1
+            self._warmup_processed = 0
             self.warmed_up = True
         return recv_reqs
 
@@ -193,9 +268,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
@@ -313,12 +392,23 @@ class Scheduler:
                 )
                 if is_warmup:
                     if output_batch.error is None:
-                        logger.info(
-                            f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                            output_batch.timings.total_duration_s,
-                        )
+                        if self._warmup_total > 0:
+                            logger.info(
+                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
+                                output_batch.metrics.total_duration_s,
+                            )
+                        else:
+                            logger.info(
+                                f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
+                                output_batch.metrics.total_duration_s,
+                            )
                     else:
-                        logger.info(f"Warmup req processing failed")
+                        if self._warmup_total > 0:
+                            logger.info(
+                                f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
+                            )
+                        else:
+                            logger.info(f"Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
@@ -327,10 +417,9 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
-        self.context.term()
+        self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""

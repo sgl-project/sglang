@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
@@ -119,7 +124,7 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.clear()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
         """Match cached prefix; if there's a tail miss, prefetch from LMCache.
 
         Reuses the base matching logic to obtain (value, last_node). If there
@@ -128,14 +133,15 @@ class LMCRadixCache(RadixCache):
         into those slots, then materialize a new child node for the retrieved
         chunk.
         """
+        key = params.key
         if self.disable or not key:
-            return super().match_prefix(key, **kwargs)
+            return super().match_prefix(params)
 
         if self.page_size != 1:
             aligned_len = len(key) // self.page_size * self.page_size
             key = key[:aligned_len]
 
-        base_res = super().match_prefix(key, **kwargs)
+        base_res = super().match_prefix(params)
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
@@ -150,7 +156,7 @@ class LMCRadixCache(RadixCache):
         prefix_pad = value.numel() % chunk_size
 
         if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(uncached_len)
+            self.evict(EvictParams(num_tokens=uncached_len))
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
@@ -229,7 +235,9 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        match_result = self.match_prefix(RadixKey(token_ids, req.extra_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+        )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None
 
@@ -245,10 +253,10 @@ class LMCRadixCache(RadixCache):
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
 
-    def evict(self, num_tokens: int) -> None:  # type: ignore[override]
+    def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
         if self.disable:
-            return
+            return EvictResult()
 
         self.store_stream.synchronize()
         with self._node_lock:
@@ -256,7 +264,7 @@ class LMCRadixCache(RadixCache):
                 self.dec_lock_ref(node)
             self._in_flight_nodes.clear()
 
-        super().evict(num_tokens)
+        return super().evict(params)
 
     def pretty_print(self):  # type: ignore[override]
         super().pretty_print()
