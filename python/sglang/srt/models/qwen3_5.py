@@ -22,9 +22,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-# Model Executor
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -72,7 +69,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
-from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
@@ -254,22 +250,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        output = torch.empty_like(hidden_states)
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
         """
         Forward pass with three parts:
         1. Input projection
@@ -287,7 +267,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = b.contiguous()
         a = a.contiguous()
 
-        core_attn_out = self.attn.forward(
+        core_attn_out = self.attn(
             forward_batch=forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
