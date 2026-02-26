@@ -131,17 +131,7 @@ def _handle_output_by_index(output, i):
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
             ),
-            queue_time=_extract_field_by_index(output, "queue_time", i),
-            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
-            prefill_launch_delay=_extract_field_by_index(
-                output, "prefill_launch_delay", i
-            ),
-            prefill_launch_latency=_extract_field_by_index(
-                output, "prefill_launch_latency", i
-            ),
-            prefill_finished_ts=_extract_field_by_index(
-                output, "prefill_finished_ts", i
-            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
@@ -228,17 +218,7 @@ def _handle_output_by_index(output, i):
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
             ),
-            queue_time=_extract_field_by_index(output, "queue_time", i),
-            forward_entry_time=_extract_field_by_index(output, "forward_entry_time", i),
-            prefill_launch_delay=_extract_field_by_index(
-                output, "prefill_launch_delay", i
-            ),
-            prefill_launch_latency=_extract_field_by_index(
-                output, "prefill_launch_latency", i
-            ),
-            prefill_finished_ts=_extract_field_by_index(
-                output, "prefill_finished_ts", i
-            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
@@ -293,6 +273,7 @@ def _handle_output_by_index(output, i):
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
+            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),

@@ -10,7 +10,6 @@ import torch
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
-
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -61,6 +60,9 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+DEFAULT_HIP_CFLAGS = [
+    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
@@ -73,8 +75,17 @@ class CPPArgList(list[str]):
 CPP_DTYPE_MAP = {
     torch.float: "fp32_t",
     torch.float16: "fp16_t",
+    torch.float8_e4m3fn: "fp8_e4m3_t",
     torch.bfloat16: "bf16_t",
+    torch.int8: "int8_t",
+    torch.int64: "int64_t",
 }
+
+
+# AMD/ROCm note:
+@cache_once
+def is_hip_runtime() -> bool:
+    return bool(torch.version.hip)
 
 
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
@@ -156,6 +167,10 @@ def load_jit(
     # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     env_existed = env_key in os.environ
+    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
+    if is_hip_runtime():
+        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
+        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:
@@ -164,7 +179,7 @@ def load_jit(
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
+            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,

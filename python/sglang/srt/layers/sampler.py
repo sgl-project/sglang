@@ -19,13 +19,14 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
-    from sgl_kernel import (
+    from flashinfer.sampling import (
         min_p_sampling_from_probs,
-        top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+    )
+    from sgl_kernel import (
+        top_k_renorm_prob,
         top_p_renorm_prob,
     )
-
 if is_npu():
     import torch_npu
 
