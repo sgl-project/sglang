@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Default HuggingFace repo for RIFE 4.22.lite weights
+_DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
+
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
 
@@ -360,16 +363,25 @@ class FrameInterpolator:
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
-        """Resolve weight path and load model."""
-        model_path = self._model_path
+        """Resolve weight path (local dir or HF repo ID) and load model.
 
-        if model_path is None or not os.path.isdir(model_path):
-            raise ValueError(
-                "RIFE model path not found. "
-                "Download RIFE weights from https://github.com/hzwer/Practical-RIFE#model-list, "
-                "extract the zip, and pass the directory via "
-                "--frame-interpolation-model-path <path/to/train_log>."
-            )
+        Resolution order:
+        1. If ``model_path`` is provided, use it (local path or HF repo ID).
+        2. Otherwise fall back to the default HF repo
+           (``elfgum/RIFE-4.22.lite``).
+
+        Both local directories and HuggingFace Hub repo IDs are accepted.
+        When a HF repo ID is given the weights are downloaded (and cached)
+        automatically via ``maybe_download_model()``.
+        """
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model,
+        )
+
+        model_path = self._model_path or _DEFAULT_RIFE_HF_REPO
+
+        # Resolve: local path pass-through, HF repo ID → download & cache
+        model_path = maybe_download_model(model_path)
 
         self._resolved_path = model_path
 
@@ -478,7 +490,8 @@ def interpolate_video_frames(
         frames:     List of uint8 HWC numpy frames.
         exp:        Interpolation exponent (1=2×, 2=4×).
         scale:      RIFE inference scale (default 1.0; use 0.5 for high-res).
-        model_path: Local directory containing flownet.pkl.
+        model_path: Local directory or HuggingFace repo ID containing
+                    flownet.pkl (default: ``elfgum/RIFE-4.22.lite``).
 
     Returns:
         (interpolated_frames, multiplier)
