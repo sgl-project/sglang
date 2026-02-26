@@ -1,8 +1,21 @@
+from __future__ import annotations
+
 import functools
-from typing import Optional, Tuple
+from typing import Callable, Generic, Optional, Tuple, TypeVar
 
 import torch
 from pydantic import BaseModel, ConfigDict
+
+_T = TypeVar("_T")
+_U = TypeVar("_U")
+
+
+def _check_equal_lengths(**named_lists: list) -> None:
+    lengths: dict[str, int] = {name: len(lst) for name, lst in named_lists.items()}
+    unique: set[int] = set(lengths.values())
+    if len(unique) > 1:
+        details: str = ", ".join(f"{name}={length}" for name, length in lengths.items())
+        raise ValueError(f"Length mismatch: {details}")
 
 
 class _StrictBase(BaseModel):
@@ -11,6 +24,14 @@ class _StrictBase(BaseModel):
 
 class _FrozenBase(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class Pair(_FrozenBase, Generic[_T]):
+    x: _T
+    y: _T
+
+    def map(self, fn: Callable[[_T], _U]) -> Pair[_U]:
+        return Pair(x=fn(self.x), y=fn(self.y))
 
 
 def argmax_coord(x: torch.Tensor) -> Tuple[int, ...]:

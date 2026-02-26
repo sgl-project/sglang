@@ -540,7 +540,7 @@ class TestEntrypointGroupingLogical:
         assert summary.skipped == 0
 
     def test_multi_step_tp(self, tmp_path, capsys):
-        """Two steps with TP=2 shards produce two logical groups (one per step)."""
+        """Two steps with TP=2 shards produce two per-step comparisons (no aux → no alignment)."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
 
@@ -571,6 +571,8 @@ class TestEntrypointGroupingLogical:
         records = _run_and_parse(args, capsys)
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 2
+        assert comparisons[0].baseline.shape == [4, 8]
+        assert comparisons[1].baseline.shape == [4, 8]
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
@@ -612,7 +614,7 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "attn_out"
 
     def test_filter_logical(self, tmp_path, capsys):
-        """--filter in logical grouping selects only matching tensor groups."""
+        """--filter in logical grouping selects only matching tensor bundles."""
         torch.manual_seed(42)
         full_a = torch.randn(4, 8)
         full_b = torch.randn(4, 8)
@@ -736,7 +738,7 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
     def test_cp_tp_different_sizes(self, tmp_path, capsys):
-        """Baseline CP=2+TP=2 vs target CP=1+TP=4: both sides independently unshard."""
+        """Baseline CP=2+TP=2 vs target CP=1+TP=4: both sides independently unsharder."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 16)
         full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
@@ -882,7 +884,7 @@ class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
     def test_replicated_axis_identical_replicas_passed(self, tmp_path, capsys):
-        """CP2 TP2, TP replicated and identical → passed, no align_warnings."""
+        """CP2 TP2, TP replicated and identical → passed, no warnings."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -912,14 +914,14 @@ class TestEntrypointReplicatedAxis:
 
         records = _run_and_parse(args, capsys)
         comp = _assert_single_comparison_passed(records)
-        assert comp.align_warnings == []
+        assert comp.warnings == []
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.passed == 1
 
     def test_replicated_mismatch_fails(self, tmp_path, capsys):
-        """CP2 TP2, TP replicas differ (> atol) → failed with align_warnings."""
+        """CP2 TP2, TP replicas differ (> atol) → failed with warnings."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -952,14 +954,14 @@ class TestEntrypointReplicatedAxis:
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 1
         assert comparisons[0].category == "failed"
-        assert len(comparisons[0].align_warnings) > 0
+        assert len(comparisons[0].warnings) > 0
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.failed == 1
 
-    def test_summary_counts_failed_from_align_warnings_only(self, tmp_path, capsys):
-        """Diff itself passes but TP replicas differ → summary.failed=1 from align_warnings."""
+    def test_summary_counts_failed_from_warnings_only(self, tmp_path, capsys):
+        """Diff itself passes but TP replicas differ → summary.failed=1 from warnings."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -1001,7 +1003,7 @@ class TestEntrypointReplicatedAxis:
         comp = comparisons[0]
         assert comp.diff is not None
         assert comp.diff.passed
-        assert len(comp.align_warnings) > 0
+        assert len(comp.warnings) > 0
         assert comp.category == "failed"
 
         summary = records[-1]
