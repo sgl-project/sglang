@@ -13,7 +13,6 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.executor import (
 )
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
-    AlignerPerStepSubPlan,
     AlignerPlan,
 )
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
@@ -34,9 +33,7 @@ class TestExecuteSubPlans:
 
     def test_no_plans_single_tensor_passthrough(self) -> None:
         tensor: torch.Tensor = torch.tensor([1.0, 2.0, 3.0])
-        result: Optional[torch.Tensor] = execute_sub_plans(
-            tensors=[tensor], plans=[]
-        )
+        result: Optional[torch.Tensor] = execute_sub_plans(tensors=[tensor], plans=[])
         assert result is not None
         assert torch.equal(result, tensor)
 
@@ -45,9 +42,7 @@ class TestExecuteSubPlans:
             torch.tensor([1.0]),
             torch.tensor([2.0]),
         ]
-        result: Optional[torch.Tensor] = execute_sub_plans(
-            tensors=tensors, plans=[]
-        )
+        result: Optional[torch.Tensor] = execute_sub_plans(tensors=tensors, plans=[])
         assert result is None
 
     def test_with_unsharder_plan(self) -> None:
@@ -115,12 +110,8 @@ class TestExecuteStepPlans:
 
 
 class TestExecuteAlignerPlan:
-    def _make_step_plan(
-        self, *, step: int, indices: list[int]
-    ) -> AlignerPerStepPlan:
-        return AlignerPerStepPlan(
-            step=step, input_object_indices=indices, sub_plans=[]
-        )
+    def _make_step_plan(self, *, step: int, indices: list[int]) -> AlignerPerStepPlan:
+        return AlignerPerStepPlan(step=step, input_object_indices=indices, sub_plans=[])
 
     def test_x_side_empty_returns_failed_x(self) -> None:
         plan = AlignerPlan(
