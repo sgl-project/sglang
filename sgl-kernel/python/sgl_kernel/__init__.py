@@ -38,7 +38,6 @@ from sgl_kernel.expert_specialization import (
     es_sm100_mxfp8_blockscaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_quant,
 )
-from sgl_kernel.fused_moe import moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
