@@ -77,6 +77,11 @@ ADD_TOOL_STRICT = {
     "function": {**ADD_TOOL["function"], "strict": True},
 }
 
+WEATHER_TOOL_STRICT = {
+    "type": "function",
+    "function": {**WEATHER_TOOL["function"], "strict": True},
+}
+
 
 def _call(client, model, content, tools=None, tool_choice="required", **kwargs):
     """Single-turn tool call request. Defaults to ADD_TOOL_STRICT + required."""
@@ -262,12 +267,17 @@ def _test_reasoning_usage(client, model):
 
 def _test_parallel(client, model):
     """Single request should return multiple tool calls."""
-    response = _call(
-        client,
-        model,
-        "What is 3+5 and what is the weather in Tokyo?",
-        tools=[ADD_TOOL, WEATHER_TOOL],
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": "Please call both functions: use add to compute 3+5, and use get_weather to check the weather in Tokyo.",
+            }
+        ],
+        tools=[ADD_TOOL_STRICT, WEATHER_TOOL_STRICT],
         tool_choice="auto",
+        temperature=0,
     )
     tc = response.choices[0].message.tool_calls
     assert tc and len(tc) >= 2, f"expected >= 2 tool calls, got {len(tc) if tc else 0}"
