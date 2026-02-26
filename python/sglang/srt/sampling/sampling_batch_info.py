@@ -267,6 +267,30 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
 
+        # Filter grammars list to prevent memory leak.
+        # When requests are filtered out, their grammar references should also be removed.
+        # Note: grammars list length must match the batch size before filtering.
+        if self.grammars is not None and len(self.grammars) > max(
+            keep_indices, default=-1
+        ):
+            max_index = max(keep_indices, default=-1)
+            if len(self.grammars) > max_index:
+                self.grammars = [self.grammars[i] for i in keep_indices]
+                if not any(self.grammars):
+                    self.grammars = None
+            else:
+                # If grammars list is shorter than expected, clear it to avoid index errors
+                logger.warning(
+                    f"Inconsistent state: len(grammars)={len(self.grammars)} <= max(keep_indices)={max_index}. Clearing grammars."
+                )
+
+                self.grammars = None
+
+        # Clear vocab_mask when grammars are cleared to release GPU memory
+        if self.grammars is None and self.vocab_mask is not None:
+            self.vocab_mask = None
+            self.apply_mask_func = None
+
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
@@ -381,7 +405,10 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        # Clear grammars reference in the copy to prevent memory leak.
+        # The grammars are only needed for filling vocab_mask, which has already been done
+        # in update_regex_vocab_mask() before this copy is created.
+        return dataclasses.replace(self, penalizer_orchestrator=None, grammars=None)
 
 
 def merge_bias_tensor(
