@@ -11,8 +11,10 @@ from sglang.srt.debug_utils.comparator.output_types import (
     AnyRecord,
     ComparisonRecord,
     ConfigRecord,
+    GeneralWarning,
     SkipRecord,
     SummaryRecord,
+    WarningRecord,
     _OutputRecord,
     parse_record_json,
 )
@@ -1010,6 +1012,221 @@ class TestEntrypointReplicatedAxis:
         assert isinstance(summary, SummaryRecord)
         assert summary.failed == 1
         assert summary.passed == 0
+
+
+class TestEntrypointAlignment:
+    """Test `--grouping logical` with token alignment (aux tensors present)."""
+
+    def test_sglang_multi_step_alignment(self, tmp_path, capsys):
+        """SGLang multi-step dumps with aux tensors auto-trigger alignment."""
+        torch.manual_seed(42)
+        hidden_dim = 8
+
+        hidden_step0 = torch.randn(5, hidden_dim)
+        hidden_step1 = torch.randn(2, hidden_dim)
+
+        exp_paths: list[Path] = []
+        for side_dir in ["baseline", "target"]:
+            d = tmp_path / side_dir
+            d.mkdir()
+
+            dumper = _Dumper(
+                config=DumperConfig(
+                    enable=True,
+                    dir=str(d),
+                    exp_name=_FIXED_EXP_NAME,
+                    enable_http_server=False,
+                )
+            )
+
+            # Step 0: prefill with 2 sequences (3+2 tokens)
+            dumper.dump("input_ids", torch.tensor([10, 20, 30, 40, 50]))
+            dumper.dump("positions", torch.tensor([0, 1, 2, 0, 1]))
+            dumper.dump("seq_lens", torch.tensor([3, 2]))
+            dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+            dumper.dump("rids", ["A", "B"])
+            dumper.dump("hidden_states", hidden_step0)
+            dumper.step()
+
+            # Step 1: decode (1 token per sequence)
+            dumper.dump("input_ids", torch.tensor([31, 51]))
+            dumper.dump("positions", torch.tensor([3, 2]))
+            dumper.dump("seq_lens", torch.tensor([1, 1]))
+            dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+            dumper.dump("rids", ["A", "B"])
+            dumper.dump("hidden_states", hidden_step1)
+            dumper.step()
+
+            exp_paths.append(d / _FIXED_EXP_NAME)
+
+        args = _make_args(exp_paths[0], exp_paths[1], grouping="logical")
+        records = _run_and_parse(args, capsys)
+
+        comparisons = _get_comparisons(records)
+        # AUX_NAMES are filtered out after plan computation → only hidden_states remains
+        assert len(comparisons) == 1
+        assert comparisons[0].name == "hidden_states"
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+        assert summary.failed == 0
+        assert summary.skipped == 0
+
+    def test_sglang_vs_megatron_cross_framework(self, tmp_path, capsys):
+        """SGLang 4-step thd baseline vs Megatron 1-step thd target align correctly."""
+        torch.manual_seed(42)
+        hidden_dim: int = 8
+
+        all_hiddens: torch.Tensor = torch.randn(11, hidden_dim)
+        seq_a_hiddens: torch.Tensor = all_hiddens[:6]
+        seq_b_hiddens: torch.Tensor = all_hiddens[6:]
+
+        # --- SGLang baseline: 1 prefill + 3 decode ---
+        sglang_dir: Path = tmp_path / "baseline"
+        sglang_dir.mkdir()
+        sglang_dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(sglang_dir),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
+
+        # Step 0: prefill — seq A (3 tokens) + seq B (2 tokens)
+        sglang_dumper.dump("input_ids", torch.tensor([10, 20, 30, 40, 50]))
+        sglang_dumper.dump("positions", torch.tensor([0, 1, 2, 0, 1]))
+        sglang_dumper.dump("seq_lens", torch.tensor([3, 2]))
+        sglang_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+        sglang_dumper.dump("rids", ["A", "B"])
+        sglang_dumper.dump(
+            "hidden_states",
+            torch.stack(
+                [
+                    seq_a_hiddens[0],
+                    seq_a_hiddens[1],
+                    seq_a_hiddens[2],
+                    seq_b_hiddens[0],
+                    seq_b_hiddens[1],
+                ]
+            ),
+        )
+        sglang_dumper.step()
+
+        # Steps 1-3: decode — 1 token per sequence
+        decode_data: list[dict[str, object]] = [
+            {
+                "input_ids": torch.tensor([31, 51]),
+                "positions": torch.tensor([3, 2]),
+                "hidden": torch.stack([seq_a_hiddens[3], seq_b_hiddens[2]]),
+            },
+            {
+                "input_ids": torch.tensor([32, 52]),
+                "positions": torch.tensor([4, 3]),
+                "hidden": torch.stack([seq_a_hiddens[4], seq_b_hiddens[3]]),
+            },
+            {
+                "input_ids": torch.tensor([33, 53]),
+                "positions": torch.tensor([5, 4]),
+                "hidden": torch.stack([seq_a_hiddens[5], seq_b_hiddens[4]]),
+            },
+        ]
+        for step_data in decode_data:
+            sglang_dumper.dump("input_ids", step_data["input_ids"])
+            sglang_dumper.dump("positions", step_data["positions"])
+            sglang_dumper.dump("seq_lens", torch.tensor([1, 1]))
+            sglang_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+            sglang_dumper.dump("rids", ["A", "B"])
+            sglang_dumper.dump("hidden_states", step_data["hidden"])
+            sglang_dumper.step()
+
+        # --- Megatron target: 1 step, thd [T, H] ---
+        megatron_dir: Path = tmp_path / "target"
+        megatron_dir.mkdir()
+        megatron_dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(megatron_dir),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
+
+        # THD flat: seq A (6 tokens) + seq B (5 tokens) = 11 tokens total
+        megatron_input_ids: torch.Tensor = torch.tensor(
+            [10, 20, 30, 31, 32, 33, 40, 50, 51, 52, 53]
+        )
+        megatron_cu_seqlens: torch.Tensor = torch.tensor([0, 6, 11])
+
+        megatron_hidden: torch.Tensor = torch.cat([seq_a_hiddens, seq_b_hiddens], dim=0)
+
+        megatron_dumper.dump("input_ids", megatron_input_ids)
+        megatron_dumper.dump("cu_seqlens_q", megatron_cu_seqlens)
+        megatron_dumper.dump("hidden_states", megatron_hidden)
+        megatron_dumper.step()
+
+        # --- Run comparison ---
+        args = _make_args(
+            sglang_dir / _FIXED_EXP_NAME,
+            megatron_dir / _FIXED_EXP_NAME,
+            grouping="logical",
+        )
+
+        records = _run_and_parse(args, capsys)
+
+        warning_records = [r for r in records if isinstance(r, WarningRecord)]
+        layout_warnings = [
+            w
+            for wr in warning_records
+            for w in wr.warnings
+            if isinstance(w, GeneralWarning)
+            and w.category == "layout_detection_fallback"
+        ]
+        assert len(layout_warnings) == 1
+
+        comparisons = _get_comparisons(records)
+        # AUX_NAMES filtered out → only hidden_states remains
+        assert len(comparisons) == 1
+        assert comparisons[0].name == "hidden_states"
+        assert comparisons[0].diff is not None
+        assert comparisons[0].diff.passed
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+        assert summary.failed == 0
+        assert summary.skipped == 0
+
+    def test_alignment_fallback_when_no_aux(self, tmp_path, capsys):
+        """Without aux tensors, logical grouping skips alignment and compares per-step."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"], num_steps=2)
+        args = _make_args(
+            baseline_path, target_path, grouping="logical", diff_threshold=0.1
+        )
+
+        capsys.readouterr()
+        run(args)
+        captured = capsys.readouterr()
+        records = _parse_jsonl(captured.out)
+        warning_records = [r for r in records if isinstance(r, WarningRecord)]
+        aux_missing_warnings = [
+            w
+            for wr in warning_records
+            for w in wr.warnings
+            if isinstance(w, GeneralWarning) and w.category == "aux_tensors_missing"
+        ]
+        assert len(aux_missing_warnings) == 1
+
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 2
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 2
+        assert summary.passed == 2
 
 
 # --------------------------- Assertion helpers -------------------

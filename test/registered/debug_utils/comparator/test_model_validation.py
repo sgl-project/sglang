@@ -92,7 +92,7 @@ class TestTokenAlignerSeqInfo:
         info = TokenAlignerSeqInfo(
             input_ids=[10, 20, 30],
             positions=[0, 1, 2],
-            locator=TokenLocator(token_index_in_step=[0, 1, 0]),
+            locator=TokenLocator(steps=[0, 0, 1], token_index_in_step=[0, 1, 0]),
         )
         assert len(info.input_ids) == 3
 
@@ -101,7 +101,7 @@ class TestTokenAlignerSeqInfo:
             TokenAlignerSeqInfo(
                 input_ids=[10, 20, 30],
                 positions=[0, 1, 2],
-                locator=TokenLocator(token_index_in_step=[0, 1]),
+                locator=TokenLocator(steps=[0, 0], token_index_in_step=[0, 1, 0]),
             )
 
     def test_positions_not_sequential(self):
@@ -109,7 +109,7 @@ class TestTokenAlignerSeqInfo:
             TokenAlignerSeqInfo(
                 input_ids=[10, 20, 30],
                 positions=[0, 2, 1],
-                locator=TokenLocator(token_index_in_step=[0, 1, 0]),
+                locator=TokenLocator(steps=[0, 0, 1], token_index_in_step=[0, 1, 0]),
             )
 
 
@@ -117,18 +117,18 @@ class TestTokenAlignerPlan:
     def test_valid(self):
         plan = TokenAlignerPlan(
             locators=Pair(
-                x=TokenLocator(token_index_in_step=[0, 1, 0]),
-                y=TokenLocator(token_index_in_step=[0, 0, 1]),
+                x=TokenLocator(steps=[0, 0, 1], token_index_in_step=[0, 1, 0]),
+                y=TokenLocator(steps=[0, 1, 1], token_index_in_step=[0, 0, 1]),
             ),
         )
-        assert len(plan.locators.x.token_index_in_step) == 3
+        assert len(plan.locators.x.steps) == 3
 
     def test_length_mismatch(self):
         with pytest.raises(ValidationError, match="Length mismatch"):
             TokenAlignerPlan(
                 locators=Pair(
-                    x=TokenLocator(token_index_in_step=[0, 1]),
-                    y=TokenLocator(token_index_in_step=[0, 0, 1]),
+                    x=TokenLocator(steps=[0, 0], token_index_in_step=[0, 1]),
+                    y=TokenLocator(steps=[0, 1, 1], token_index_in_step=[0, 0, 1]),
                 ),
             )
 

@@ -151,8 +151,8 @@ class TestComputeAlignerPlan:
 
         ta_plan = TokenAlignerPlan(
             locators=Pair(
-                x=TokenLocator(token_index_in_step=[0]),
-                y=TokenLocator(token_index_in_step=[0]),
+                x=TokenLocator(steps=[0], token_index_in_step=[0]),
+                y=TokenLocator(steps=[0], token_index_in_step=[0]),
             ),
         )
 
