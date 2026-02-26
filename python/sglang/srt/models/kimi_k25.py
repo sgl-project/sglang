@@ -38,13 +38,14 @@ from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
+_is_npu = is_npu()
 
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
@@ -198,8 +199,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
-def get_rope_shape(org, interpolation_mode, shape):
+def _get_rope_shape_impl(org, interpolation_mode, shape):
     return (
         F.interpolate(
             org.permute((2, 0, 1)).unsqueeze(0),
@@ -210,6 +210,23 @@ def get_rope_shape(org, interpolation_mode, shape):
         .permute((1, 2, 0))
         .flatten(end_dim=1)
     )
+
+
+compile_impl = torch.compile(
+    _get_rope_shape_impl,
+    dynamic=True,
+)
+
+
+disable_impl = torch._dynamo.disable(
+    _get_rope_shape_impl,
+)
+
+
+def get_rope_shape(org, interpolation_mode, shape):
+    if _is_npu:
+        return disable_impl(org, interpolation_mode, shape)
+    return compile_impl(org, interpolation_mode, shape)
 
 
 def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
