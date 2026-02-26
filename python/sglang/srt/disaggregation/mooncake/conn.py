@@ -9,12 +9,10 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import requests
-import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -27,13 +25,14 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
 )
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
+from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +112,9 @@ class KVArgsRegisterInfo:
     dst_tp_rank: int
     dst_attn_tp_size: int
     dst_kv_item_len: int
+    # for mamba state different tp slice transfer
+    dst_state_item_lens: list[int]
+    dst_state_dim_per_tensor: list[int]
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -127,6 +129,16 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
+            dst_state_item_lens=(
+                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
+                if len(msg) > 10 and len(msg[10]) > 0
+                else []
+            ),
+            dst_state_dim_per_tensor=(
+                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
+                if len(msg) > 11 and len(msg[11]) > 0
+                else []
+            ),
         )
 
 
@@ -170,11 +182,12 @@ class MooncakeKVManager(CommonKVManager):
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
-            transfer_thread_pool_size = get_int_env_var(
-                "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
-                min(max(4, int(0.5 * cpu_count) // 8), 12),
+            transfer_thread_pool_size = (
+                envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
             )
-            transfer_queue_size = get_int_env_var("SGLANG_DISAGGREGATION_QUEUE_SIZE", 4)
+            if transfer_thread_pool_size is None:
+                transfer_thread_pool_size = min(max(4, int(0.5 * cpu_count) // 8), 12)
+            transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
@@ -192,47 +205,14 @@ class MooncakeKVManager(CommonKVManager):
                 threading.Thread(
                     target=self.transfer_worker, args=(queue, executor), daemon=True
                 ).start()
-            # If a timeout happens on the prefill side, it means prefill instances
-            # fail to receive the KV indices from the decode instance of this request.
-            # These timeout requests should be aborted to release the tree cache.
-            self.bootstrap_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
-            )
-
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.heartbeat_failures = {}
-            self.session_pool = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(set)
-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
-            # Heartbeat interval should be at least 2 seconds
-            self.heartbeat_interval = max(
-                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
-            )
-            # Heartbeat failure should be at least 1
-            self.max_failures = max(
-                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
-            )
             self.start_decode_thread()
-            # If a timeout happens on the decode side, it means decode instances
-            # fail to receive the KV Cache transfer done signal after bootstrapping.
-            # These timeout requests should be aborted to release the tree cache.
-            self.waiting_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
-            )
-
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
 
     def init_engine(self):
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
+        self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
@@ -304,8 +284,10 @@ class MooncakeKVManager(CommonKVManager):
             # Use correct item lengths for K and V separately
             if layers_current_pp_stage > len(dst_k_ptrs):
                 logger.error(
-                    f"layers_current_pp_stage is out of range: {layers_current_pp_stage=}, {len(dst_k_ptrs)}"
+                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
                 )
+                return -1
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
@@ -362,12 +344,11 @@ class MooncakeKVManager(CommonKVManager):
                     for f in futures:
                         f.cancel()
                     return status
+            return 0
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
             return process_layers(layers_params)
-
-        return 0
 
     def send_kvcache(
         self,
@@ -390,9 +371,9 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
@@ -410,23 +391,32 @@ class MooncakeKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
-        num_layers = len(self.kv_args.kv_data_ptrs)
         page_size = self.kv_args.page_size
 
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * self.attn_tp_size // dst_attn_tp_size
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
+
+        # GQA replication: how many prefill ranks share the same KV head
+        src_replication = max(1, self.attn_tp_size // total_kv_heads)
 
         # Determine slicing parameters based on TP configuration
         if self.attn_tp_size > dst_attn_tp_size:
             # Send KVCache from multiple prefill instances to 1 decode instance
             src_head_start_offset = 0
             num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
             src_head_start_offset = (
@@ -453,87 +443,44 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        layers_params = [
-            (
-                src_k_ptrs[layer_id],
-                dst_k_ptrs[layer_id],
-                src_kv_item_len,
-                dst_kv_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
-            )
-            for layer_id in range(layers_current_pp_stage)
-        ] + [
-            (
-                src_v_ptrs[layer_id],
-                dst_v_ptrs[layer_id],
-                src_kv_item_len,
-                dst_kv_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
-            )
-            for layer_id in range(layers_current_pp_stage)
-        ]
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        bytes_per_token_on_prefill = src_kv_item_len // page_size
+        bytes_per_token_on_decode = dst_kv_item_len // page_size
+        src_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+        )
+        dst_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+        )
 
-        def process_layer_tp_aware(layer_params):
-            (
-                src_ptr,
-                dst_ptr,
-                src_item_len,
-                dst_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
-            ) = layer_params
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
+        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
+            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
+            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
+            src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
+            dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
 
-            # Calculate strides for a single token slot
-            bytes_per_token_on_prefill = src_item_len // page_size
-            bytes_per_token_on_decode = dst_item_len // page_size
-
-            for i in range(len(prefill_kv_indices)):
-                prefill_page_idx = int(prefill_kv_indices[i])
-                decode_page_idx = int(dst_kv_indices[i])
-
-                # Get the starting addresses for the current src and dst pages
-                src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
-                dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
-
-                # Iterate through each valid token slot within the current page
-                for token_slot_in_page in range(page_size):
-                    # Calculate the start address of the current token slot
-                    src_token_slot_start_addr = (
-                        src_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_prefill
-                    )
-                    dst_token_slot_start_addr = (
-                        dst_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_decode
-                    )
-
-                    # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
-
-                    src_addr_list.append(src_slice_addr)
-                    dst_addr_list.append(dst_slice_addr)
-                    length_list.append(heads_bytes_per_token_to_send)
-
+            src_addr_list = src_slice_addrs.reshape(-1).tolist()
+            if not src_addr_list:
+                # Nothing to transfer for this layer.
+                return 0
+            dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
+            total_slices = len(src_addr_list)
+            length_list = [heads_bytes_per_token_to_send] * total_slices
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = [
-            executor.submit(
-                process_layer_tp_aware,
-                layer_params,
+        futures = []
+        for i in range(layers_current_pp_stage):
+            futures.append(
+                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
-            for layer_params in layers_params
-        ]
+        for i in range(layers_current_pp_stage):
+            futures.append(
+                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
+            )
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
@@ -551,7 +498,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-        if self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK":
+        if (
+            self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
+        ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
@@ -641,17 +590,49 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
         executor: concurrent.futures.ThreadPoolExecutor,
+        target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
 
         if state_type == "mamba":
-            return self._send_mamba_state(
-                req,
-                prefill_state_indices,
-                dst_state_data_ptrs,
-            )
+            # Check if we need slice transfer for different TP sizes
+            if (
+                target_rank_registration_info is not None
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
+                return self._send_mamba_state_slice(
+                    req,
+                    prefill_state_indices,
+                    dst_state_data_ptrs,
+                    target_rank_registration_info.dst_state_item_lens,
+                    target_rank_registration_info.dst_state_dim_per_tensor,
+                    target_rank_registration_info.dst_tp_rank,
+                    target_rank_registration_info.dst_attn_tp_size,
+                )
+            else:
+                return self._send_mamba_state(
+                    req,
+                    prefill_state_indices,
+                    dst_state_data_ptrs,
+                )
         elif state_type in ["swa", "nsa"]:
+            # SWA and NSA hybrid models do not support different TP sizes yet
+            if (
+                target_rank_registration_info is not None
+                and not self.is_mla_backend
+                and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
+            ):
+                raise RuntimeError(
+                    f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
+                )
+            if len(prefill_state_indices) < len(req.dst_state_indices):
+                logger.warning(
+                    f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(req.dst_state_indices)}"
+                )
+                prefill_state_indices = prefill_state_indices[
+                    : len(req.dst_state_indices)
+                ]
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
@@ -685,6 +666,90 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = prefill_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(req.dst_state_indices[0])
             transfer_blocks.append((src_addr, dst_addr, length))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_mamba_state_slice(
+        self,
+        req: TransferInfo,
+        prefill_mamba_index: list[int],
+        dst_state_data_ptrs: list[int],
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+    ):
+        """Transfer Mamba states with TP slice support.
+
+        Mamba state layout:
+        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
+
+        The 3rd dimension is sliced by TP. When prefill and decode have different
+        attn_tp_size, we need to slice the state accordingly.
+        """
+        logger.warning_once(
+            "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
+            f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
+            "Performance may be affected."
+        )
+        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+
+        transfer_blocks = []
+        prefill_state_data_ptrs = self.kv_args.state_data_ptrs
+        prefill_state_item_lens = self.kv_args.state_item_lens
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
+
+        # If no dimension info available, fall back to regular transfer
+        if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
+            return self._send_mamba_state(req, prefill_mamba_index, dst_state_data_ptrs)
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+
+        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+            src_item_len = prefill_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[i]
+            src_dim = src_state_dim_per_tensor[i]
+            dst_dim = dst_state_dim_per_tensor[i]
+
+            # Calculate bytes per dimension slice
+            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
+            src_bytes_per_dim = src_item_len // src_dim
+            dst_bytes_per_dim = dst_item_len // dst_dim
+
+            # Determine slicing parameters based on TP configuration
+            if self.attn_tp_size > dst_attn_tp_size:
+                # Multiple prefill ranks send to 1 decode rank
+                # Each prefill sends all its dims to the appropriate offset in decode
+                src_dim_start = 0
+                num_dims_to_send = src_dim
+                dst_dim_start = local_tp_rank_in_group * src_dim
+            else:
+                # 1 prefill rank sends to multiple decode ranks
+                # Prefill sends a slice of its dims to each decode rank
+                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+                num_dims_to_send = dst_dim
+                dst_dim_start = 0
+
+            # Calculate byte offsets
+            src_dim_offset = src_dim_start * src_bytes_per_dim
+            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
+            bytes_to_send = num_dims_to_send * src_bytes_per_dim
+
+            # Calculate addresses for this state tensor
+            src_addr = (
+                prefill_state_data_ptrs[i]
+                + src_item_len * int(prefill_mamba_index[0])
+                + src_dim_offset
+            )
+            dst_addr = (
+                dst_state_ptr
+                + dst_item_len * int(req.dst_state_indices[0])
+                + dst_dim_offset
+            )
+
+            transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -798,19 +863,12 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
-                                if not self.is_mla_backend and (
-                                    self.attn_tp_size
-                                    != target_rank_registration_info.dst_attn_tp_size
-                                ):
-                                    raise RuntimeError(
-                                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA hybrid models yet."
-                                    )
-
                                 self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
                                     executor,
+                                    target_rank_registration_info,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -895,7 +953,7 @@ class MooncakeKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
-                (bootstrap_room, status, prefill_rank) = msg
+                bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
@@ -914,7 +972,7 @@ class MooncakeKVManager(CommonKVManager):
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
-                        f"Failed to get kvcache from prefill instance, it might be dead",
+                        "Failed to get kvcache from prefill instance, it might be dead",
                     )
                     self.update_status(bootstrap_room, status)
 
@@ -922,7 +980,7 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
+                    addresses = list(self.prefill_info_table.keys())
 
                 for bootstrap_addr in addresses:
                     session = None
@@ -1020,25 +1078,6 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
-
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -1049,18 +1088,12 @@ class MooncakeKVManager(CommonKVManager):
             ]
             for k in keys_to_remove:
                 del self.connection_pool[k]
-            if failed_bootstrap_addr in self.prefill_attn_tp_size_table:
-                del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_dp_size_table:
-                del self.prefill_dp_size_table[failed_bootstrap_addr]
-            if failed_bootstrap_addr in self.prefill_pp_size_table:
-                del self.prefill_pp_size_table[failed_bootstrap_addr]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
             )
-            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
-                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
         # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
         affected_rooms = []
@@ -1173,11 +1206,6 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    _ctx = zmq.Context()
-    _socket_cache = {}
-    _socket_locks = {}
-    _global_lock = threading.Lock()
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -1204,6 +1232,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
+            # Pack state_item_lens and state_dim_per_tensor for mamba state slice transfer
+            packed_state_item_lens = b"".join(
+                struct.pack("I", item_len)
+                for item_len in self.kv_mgr.kv_args.state_item_lens
+            )
+            state_dim_per_tensor = getattr(
+                self.kv_mgr.kv_args, "state_dim_per_tensor", []
+            )
+            packed_state_dim_per_tensor = b"".join(
+                struct.pack("I", dim) for dim in state_dim_per_tensor
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1225,6 +1264,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
+                        packed_state_item_lens,
+                        packed_state_dim_per_tensor,
                     ]
                 )
 

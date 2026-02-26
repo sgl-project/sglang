@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -28,13 +29,14 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -46,11 +48,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2DecoderLayer,
-    DeepseekV3ForCausalLM,
-    enable_nextn_moe_bf16_cast_to_fp8,
-)
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -89,7 +88,7 @@ class DeepseekModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -125,7 +124,7 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -162,6 +161,7 @@ class DeepseekModelNextN(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
@@ -208,8 +208,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = None
             self.cp_size = None

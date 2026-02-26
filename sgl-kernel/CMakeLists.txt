@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
+    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f20a52329482ddca4a627b2f028f88c2959ee299
+    GIT_TAG        cc75c5c5979a607ad20a6828635646f9841acf01
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -105,15 +105,6 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-mscclpp)
-
-# fast-hadamard-transform
-FetchContent_Declare(
-    repo-fast-hadamard-transform
-    GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
-    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
-    GIT_SHALLOW OFF
-)
-FetchContent_Populate(repo-fast-hadamard-transform)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -282,7 +273,6 @@ set(SOURCES
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
-    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
@@ -307,9 +297,6 @@ set(SOURCES
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/gemm/marlin/gptq_marlin.cu"
-    "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
@@ -342,10 +329,6 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
-
-    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
-    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
@@ -457,6 +440,8 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-DCUTLASS_TEST_LEVEL=0"
         "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90"  # For PDL
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"  # Necessary for the WGMMA shapes that we use
         "--expt-relaxed-constexpr"
         "--expt-extended-lambda"
         "--use_fast_math"
@@ -475,21 +460,21 @@ if (SGL_KERNEL_ENABLE_FA3)
     endif()
 
     file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
-    # FP16 source files
+    # FP16 source files - use individual hdim files instead of hdimall to avoid ptxas crash
     file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_fp16*_sm90.cu")
     file(GLOB FA3_FP16_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
     file(GLOB FA3_FP8_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_e4m3*_sm90.cu")
     file(GLOB FA3_FP8_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})

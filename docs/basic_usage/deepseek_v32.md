@@ -16,7 +16,13 @@ Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](h
 docker pull lmsysorg/sglang:latest
 
 # MI350/MI355
-docker pull lmsysorg/sglang:dsv32-rocm
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
+
+# MI300
+# v0.5.8-rocm700-mi30x does not include PR #17504. Prefer the newest MI30x ROCm
+# image tag from Docker Hub when available, or build from source (below).
+docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
+
 
 # NPUs
 docker pull lmsysorg/sglang:dsv32-a2
@@ -45,6 +51,9 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 # Launch with Pure TP
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
+
+# Launch with TP on MI30x/MI35x
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
 
 ### Configuration Tips
@@ -57,9 +66,13 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
+  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires QKV bf16 or QKV fp8.
 - On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
   - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
   - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
+- On Blackwell platform, with slightly accuracy drop, the performance can boost up to 3x-5x
+  - B200: by choosing `trtllm` for both `--nsa-prefill-backend` and `--nsa-decode-backend`, the prefill attention use MHA via TRT-LLM ragged for both short and long sequence (**accuracy impact**). Combine the `trtllm` with `fp8_e4m3` kv cache, the kv cache dim is `576` (kv_lora_rank + qk_rope_head_dim) (**accuracy impact**), compare to the combination of `flashmla_auto` and `fp8_e4m` kv cache dim is `656` (kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage).
+
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
@@ -116,6 +129,14 @@ python3 -m sglang.launch_server \
   --reasoning-parser deepseek-v3
 ```
 
+## NVFP4 Checkpoint
+
+To launch deepseek v3.2 [NVFP4 checkpoint](https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4) on Blackwell devices, the user needs to specify the quantization method as `modelopt_fp4`, and moe runner backend as one of `flashinfer_trtllm`(recommended), `flashinfer_cutlass` and `flashinfer_cutedsl`. Any other usage (parallelism, reasoning parser, ...) is the same as FP8 checkpoint.
+
+An example launching command can be:
+```bash
+python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm --tool-call-parser deepseekv32  --reasoning-parser deepseek-v3
+```
 
 ## PD Disaggregation
 
@@ -186,18 +207,29 @@ Latency: 29.545 s
 Output throughput: 4418.617 token/s
 ```
 
+
 ### Accuracy Test with `gpqa-diamond`
 
 Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
 ```bash
-python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 120000 --repeat 8 --thinking-mode deepseek-v3
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --thinking-mode deepseek-v3
 ```
 
-The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
+The mean accuracy over 8 runs shows 0.797, which matches the number 0.799 in official tech report.
 ```bash
 Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
+
+For Deepseek V3.2, Deepseek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
+
+```bash
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
+
+Repeat: 8, mean: 0.840
+Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
+```
+which matches the official score, 0.824, as reported in the [Deepseek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
 
 ### Accuracy Test with `aime 2025`
 
@@ -278,11 +310,9 @@ DeepSeek-V3.2-Speciale:
 
 For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
 
-### In sequence splitting (default setting)
+### In sequence splitting
 
-The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
-
-The communication group for context parallel reuses the one for attention tp, thus `cp_size` equals `atten_tp_size = tp_size / dp_size`.
+The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
 
 Note that in sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
@@ -295,10 +325,10 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example:
 ```bash
 # In-seq splitting mode launched with EP + DP
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
 ```
 
-### Round robin splitting
+### Round robin splitting (default setting)
 
 This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
 
@@ -309,5 +339,122 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example usage:
 ```bash
 # Launch with FusedMoe + CP8
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel  --attn-cp-size 8 --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
+### Pipeline Parallel + Context Parallel (PP + CP)
+
+This mode combines Pipeline Parallelism (PP) and Context Parallelism (CP) to scale across multiple nodes, which can achieve better throughput and Time To First Token (TTFT). Note that this method has only been tested on H20 96G.
+
+#### Standard Usage
+
+To launch with PP=2 and CP (via `round-robin-split` mode) on 2 nodes. This configuration uses the fused MoE kernel by default, which generally provides better performance.
+
+For related development details, please refer to:
+- Fused MoE + CP support: [PR #13959](https://github.com/sgl-project/sglang/pull/13959)
+- PP + CP support: [Issue #15358](https://github.com/sgl-project/sglang/issues/15358) and [PR #16380](https://github.com/sgl-project/sglang/pull/16380)
+
+Node 0:
+```bash
+export SGLANG_PP_LAYER_PARTITION=30,31
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr <HEAD_NODE_IP>:62001 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-max-bs 8 \
+  --page-size 64 \
+  --watchdog-timeout 3600 \
+  --host 0.0.0.0 --port 8000 \
+  --tool-call-parser deepseekv32
+```
+
+Node 1:
+```bash
+export SGLANG_PP_LAYER_PARTITION=30,31
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --nnodes 2 --node-rank 1 \
+  --dist-init-addr <HEAD_NODE_IP>:62001 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-max-bs 8 \
+  --page-size 64 \
+  --watchdog-timeout 3600 \
+  --host 0.0.0.0 --port 8000 \
+  --tool-call-parser deepseekv32
+```
+
+#### PD Disaggregation with PP + CP
+
+If using PD (Prefill-Decode) Disaggregation, the Prefill nodes can be configured with PP + CP as follows.
+
+Prefill Node 0:
+```bash
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --served-model-name deepseek-v32 \
+  --nnodes 2 --node-rank 0 \
+  --dist-init-addr <PREFILL_HEAD_IP>:20102 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split  \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --max-running-requests 512 \
+  --chunked-prefill-size 4096 \
+  --context-length 131072 \
+  --mem-fraction-static 0.9 \
+  --page-size 64 \
+  --enable-metrics \
+  --collect-tokens-histogram \
+  --tokenizer-worker-num 8 \
+  --host 0.0.0.0 --port 30000
+```
+
+Prefill Node 1:
+```bash
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+  --served-model-name deepseek-v32-prefill \
+  --nnodes 2 --node-rank 1 \
+  --dist-init-addr <PREFILL_HEAD_IP>:20102 \
+  --tp 8 --pp-size 2 \
+  --dp-size 1 --moe-dense-tp-size 1 \
+  --enable-nsa-prefill-context-parallel \
+  --attn-cp-size 8 \
+  --nsa-prefill-cp-mode round-robin-split  \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --max-running-requests 512 \
+  --chunked-prefill-size 4096 \
+  --context-length 131072 \
+  --mem-fraction-static 0.9 \
+  --page-size 64 \
+  --enable-metrics \
+  --collect-tokens-histogram \
+  --tokenizer-worker-num 8 \
+  --host 0.0.0.0 --port 30000
+```
+
+For the Decode nodes, it is recommended to use the **EP mode**.

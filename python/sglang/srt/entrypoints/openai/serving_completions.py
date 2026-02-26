@@ -14,11 +14,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -95,14 +98,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
-        if lora_path:
-            first_adapter = (
-                lora_path
-                if isinstance(lora_path, str)
-                else next((a for a in lora_path if a), None)
-            )
-            if first_adapter:
-                self._validate_lora_enabled(first_adapter)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -116,11 +111,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            data_parallel_rank=request.data_parallel_rank,
+            routed_dp_rank=request.routed_dp_rank,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
         )
@@ -202,6 +200,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        routed_experts = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -214,6 +213,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -236,19 +236,34 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    logprobs = to_openai_style_logprobs(
-                        input_token_logprobs=input_token_logprobs,
-                        input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"]["output_top_logprobs"][
-                            n_prev_token:
-                        ],
-                    )
-                    n_prev_tokens[index] = len(
+                    total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
+                    output_logprobs_slice = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+                    finish_reason_for_logprobs = content["meta_info"]["finish_reason"]
+
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
+                    if (
+                        len(output_logprobs_slice) == 0
+                        and finish_reason_for_logprobs is not None
+                        and input_token_logprobs is None
+                    ):
+                        logprobs = None
+                    else:
+                        logprobs = to_openai_style_logprobs(
+                            input_token_logprobs=input_token_logprobs,
+                            input_top_logprobs=input_top_logprobs,
+                            output_token_logprobs=output_logprobs_slice,
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
@@ -309,6 +324,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             model=request.model,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
+            if request.return_routed_experts and routed_experts:
+                # Get first non-None routed_experts value
+                first_routed_experts = next(
+                    (v for v in routed_experts.values() if v is not None), None
+                )
+                if first_routed_experts is not None:
+                    routed_experts_chunk = CompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=created,
+                        object="text_completion",
+                        choices=[],  # sglext is at response level
+                        model=request.model,
+                        sglext=SglExt(routed_experts=first_routed_experts),
+                    )
+                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
@@ -377,6 +408,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
             echo_prompts = self._prepare_echo_prompts(request)
             echo = True
 
+        # Build sglext at response level (from first ret_item, as these are per-request)
+        first_ret = ret[0]
+        routed_experts = process_routed_experts_from_ret(first_ret, request)
+        cached_tokens_details = process_cached_tokens_details_from_ret(
+            first_ret, request
+        )
+        response_sglext = None
+        if routed_experts or cached_tokens_details:
+            response_sglext = SglExt(
+                routed_experts=routed_experts,
+                cached_tokens_details=cached_tokens_details,
+            )
+
         for idx, ret_item in enumerate(ret):
             text = ret_item["text"]
 
@@ -398,10 +442,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"][
-                        "output_token_logprobs"
-                    ],
-                    output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
+                    output_token_logprobs=ret_item["meta_info"].get(
+                        "output_token_logprobs", []
+                    ),
+                    output_top_logprobs=ret_item["meta_info"].get(
+                        "output_top_logprobs", []
+                    ),
                 )
 
             # Handle hidden states
@@ -436,6 +482,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            sglext=response_sglext,
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

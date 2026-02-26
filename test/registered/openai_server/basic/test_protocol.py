@@ -31,7 +31,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestModelCard(unittest.TestCase):
