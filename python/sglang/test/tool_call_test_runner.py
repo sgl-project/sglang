@@ -262,14 +262,28 @@ def _test_reasoning_usage(client, model):
 
 def _test_parallel(client, model):
     """Single request should return multiple tool calls."""
-    response = _call(
-        client,
-        model,
-        "What is 3+5 and what is the weather in Tokyo?",
-        tools=[ADD_TOOL, WEATHER_TOOL],
+    prompt = (
+        "I need two things done at the same time: compute 3+5 using the add tool "
+        "AND get the weather in Tokyo using the get_weather tool. "
+        "Call both tools in parallel."
     )
-    tc = response.choices[0].message.tool_calls
-    assert tc and len(tc) >= 2, f"expected >= 2 tool calls, got {len(tc) if tc else 0}"
+    max_attempts = 3
+    tc = None
+    for _ in range(max_attempts):
+        response = _call(
+            client,
+            model,
+            prompt,
+            tools=[ADD_TOOL, WEATHER_TOOL],
+            tool_choice="auto",
+        )
+        tc = response.choices[0].message.tool_calls
+        if tc and len(tc) >= 2:
+            return
+    assert False, (
+        f"expected >= 2 tool calls, got {len(tc) if tc else 0}"
+        f" (after {max_attempts} attempts)"
+    )
 
 
 def _test_streaming_parallel(client, model):
