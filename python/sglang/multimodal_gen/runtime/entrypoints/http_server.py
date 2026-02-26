@@ -145,7 +145,6 @@ async def forward_to_scheduler(
                 frame_interpolation_exp=sp.frame_interpolation_exp,
                 frame_interpolation_scale=sp.frame_interpolation_scale,
                 frame_interpolation_model_path=sp.frame_interpolation_model_path,
-                frame_interpolation_hf_repo_id=sp.frame_interpolation_hf_repo_id,
             )
 
         if hasattr(response, "model_dump"):

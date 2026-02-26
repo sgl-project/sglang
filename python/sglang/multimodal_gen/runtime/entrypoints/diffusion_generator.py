@@ -247,7 +247,6 @@ class DiffGenerator:
                         frame_interpolation_exp=req.frame_interpolation_exp,
                         frame_interpolation_scale=req.frame_interpolation_scale,
                         frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        frame_interpolation_hf_repo_id=req.frame_interpolation_hf_repo_id,
                     )
 
                     for idx in range(len(samples_out)):

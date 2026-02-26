@@ -104,12 +104,7 @@ class SamplingParams:
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1  # 1=2x, 2=4x
     frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
-    frame_interpolation_model_path: str | None = (
-        None  # local dir with flownet.pkl; None = HF auto-download
-    )
-    frame_interpolation_hf_repo_id: str = (
-        "hzwer/ECCV2022-RIFE"  # HF repo to download from
-    )
+    frame_interpolation_model_path: str | None = None  # local dir with flownet.pkl
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -826,15 +821,7 @@ class SamplingParams:
             "--frame-interpolation-model-path",
             type=str,
             default=SamplingParams.frame_interpolation_model_path,
-            help="Local directory containing RIFE flownet.pkl weights. "
-            "If not set, weights are auto-downloaded from HuggingFace Hub.",
-        )
-        parser.add_argument(
-            "--frame-interpolation-hf-repo-id",
-            type=str,
-            default=SamplingParams.frame_interpolation_hf_repo_id,
-            help="HuggingFace repo ID to download RIFE weights from "
-            "(default: hzwer/ECCV2022-RIFE).",
+            help="Local directory containing RIFE flownet.pkl weights.",
         )
         return parser
 

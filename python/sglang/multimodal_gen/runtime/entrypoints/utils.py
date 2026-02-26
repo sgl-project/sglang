@@ -345,7 +345,6 @@ def save_outputs(
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
     frame_interpolation_model_path: Optional[str] = None,
-    frame_interpolation_hf_repo_id: str = "hzwer/ECCV2022-RIFE",
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -382,7 +381,6 @@ def save_outputs(
                     exp=frame_interpolation_exp,
                     scale=frame_interpolation_scale,
                     model_path=frame_interpolation_model_path,
-                    hf_repo_id=frame_interpolation_hf_repo_id,
                 )
                 effective_fps = fps * multiplier
             else:

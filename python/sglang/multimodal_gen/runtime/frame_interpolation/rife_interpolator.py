@@ -22,8 +22,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_DEFAULT_HF_REPO_ID = "hzwer/ECCV2022-RIFE"
-
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
 
@@ -357,10 +355,8 @@ class FrameInterpolator:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        hf_repo_id: str = _DEFAULT_HF_REPO_ID,
     ):
         self._model_path = model_path
-        self._hf_repo_id = hf_repo_id
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
@@ -474,7 +470,6 @@ def interpolate_video_frames(
     exp: int = 1,
     scale: float = 1.0,
     model_path: Optional[str] = None,
-    hf_repo_id: str = _DEFAULT_HF_REPO_ID,
 ) -> tuple[list[np.ndarray], int]:
     """
     Convenience wrapper around FrameInterpolator.
@@ -483,11 +478,10 @@ def interpolate_video_frames(
         frames:     List of uint8 HWC numpy frames.
         exp:        Interpolation exponent (1=2×, 2=4×).
         scale:      RIFE inference scale (default 1.0; use 0.5 for high-res).
-        model_path: Local directory containing flownet.pkl. None → HF auto-download.
-        hf_repo_id: HuggingFace repo to download from (default: hzwer/ECCV2022-RIFE).
+        model_path: Local directory containing flownet.pkl.
 
     Returns:
         (interpolated_frames, multiplier)
     """
-    interpolator = FrameInterpolator(model_path=model_path, hf_repo_id=hf_repo_id)
+    interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate(frames, exp=exp, scale=scale)
