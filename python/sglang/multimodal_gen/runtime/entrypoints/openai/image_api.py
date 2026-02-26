@@ -159,6 +159,7 @@ async def generations(
         result,
         b64_list=b64_list,
         cloud_url=cloud_url,
+        fallback_url=f"/v1/images/{request_id}/content",
     )
 
     return ImageResponse(**response_kwargs)
