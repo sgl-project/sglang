@@ -172,14 +172,9 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import block_scale_interleave as flashinfer_block_scale_interleave
     from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise
-else:
-    flashinfer_block_scale_interleave = None
-    flashinfer_mm_mxfp8 = None
-    flashinfer_mxfp8_quantize = None
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
@@ -651,23 +646,6 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
-def mxfp8_scale_linear_to_swizzled(scale_u8: torch.Tensor) -> torch.Tensor:
-    """Convert MXFP8 2D linear scale layout [rows, cols] to swizzled 1D layout."""
-    if scale_u8.dtype != torch.uint8:
-        raise TypeError(f"Expected uint8 scale tensor, got {scale_u8.dtype}.")
-    if scale_u8.ndim != 2:
-        raise ValueError(
-            f"Expected 2D scale tensor, got shape {tuple(scale_u8.shape)}."
-        )
-
-    scale_u8 = scale_u8.contiguous()
-    if flashinfer_block_scale_interleave is None:
-        raise RuntimeError(
-            "mxfp8_scale_linear_to_swizzled requires FlashInfer block_scale_interleave."
-        )
-    return flashinfer_block_scale_interleave(scale_u8).contiguous()
-
-
 def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     # Pack (M, K//32) UE8M0 scales into the layout expected by tl.dot_scaled.
     assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
@@ -805,7 +783,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8."""
-    if flashinfer_mm_mxfp8 is None:
+    if not (is_blackwell_supported() and is_flashinfer_available()):
         raise RuntimeError(
             "MXFP8 FlashInfer GEMM requested, but flashinfer.mm_mxfp8 is unavailable."
         )
@@ -830,17 +808,14 @@ def flashinfer_mxfp8_blockscaled_linear(
     )
 
     if input_scale is None:
-        if flashinfer_mxfp8_quantize is not None:
-            q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-                input_2d, is_sf_swizzled_layout=True, alignment=32
-            )
-            q_input = q_input[:, :k].contiguous()
-            x_scale_u8 = x_scale_u8.contiguous()
-        else:
-            q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
+        q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
+            input_2d, is_sf_swizzled_layout=True, alignment=32
+        )
+        q_input = q_input[:, :k].contiguous()
+        x_scale_u8 = x_scale_u8.contiguous()
     else:
         q_input = input_2d
-        x_scale_u8 = input_scale
+        x_scale_u8 = input_scale.contiguous()
         if q_input.dtype != torch.float8_e4m3fn:
             raise TypeError(
                 "When input_scale is provided, input must be MXFP8 tensor "

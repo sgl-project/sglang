@@ -54,7 +54,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     flashinfer_mxfp8_quantize,
     input_to_float8,
     mxfp8_group_quantize,
-    mxfp8_scale_linear_to_swizzled,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
 )
@@ -108,11 +107,9 @@ if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import shuffle_weight
 
 if is_flashinfer_available():
+    from flashinfer import block_scale_interleave as flashinfer_block_scale_interleave
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType as FlashInferActivationType
-else:
-    flashinfer_cutlass_fused_moe = None
-    FlashInferActivationType = Any
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -478,7 +475,23 @@ class Fp8LinearMethod(LinearMethodBase):
     def _maybe_prepare_flashinfer_mxfp8_weight_scale(self, layer: Module) -> None:
         if not self.use_flashinfer_mxfp8_linear:
             return
-        new_swizzled = mxfp8_scale_linear_to_swizzled(layer.weight_scale_inv.data)
+
+        if not is_sm100_supported() or not is_flashinfer_available():
+            raise RuntimeError(
+                "FlashInfer MXFP8 weight-scale swizzle requires SM100 and FlashInfer."
+            )
+
+        scale_u8 = layer.weight_scale_inv.data
+        if scale_u8.dtype != torch.uint8:
+            raise TypeError(f"Expected uint8 scale tensor, got {scale_u8.dtype}.")
+        if scale_u8.ndim != 2:
+            raise ValueError(
+                f"Expected 2D scale tensor, got shape {tuple(scale_u8.shape)}."
+            )
+        new_swizzled = flashinfer_block_scale_interleave(
+            scale_u8.contiguous()
+        ).contiguous()
+
         cached_swizzled = getattr(layer, "weight_scale_inv_swizzled", None)
         # Keep storage address stable when possible so CUDA graph captures remain valid.
         if (
@@ -659,6 +672,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            assert self.w8a8_mxfp8_linear is not None
             weight_scale = self._get_mxfp8_weight_scale(layer)
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
@@ -738,26 +752,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         moe_runner_backend = get_moe_runner_backend()
-        self._moe_runner_backend = moe_runner_backend
-        self._use_cutlass_backend = moe_runner_backend.is_cutlass()
-        self._use_flashinfer_cutlass_backend = (
-            moe_runner_backend.is_flashinfer_cutlass()
-        )
-        if self._use_cutlass_backend:
+        if moe_runner_backend.is_cutlass():
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
-        if self._use_flashinfer_cutlass_backend:
+        if moe_runner_backend.is_flashinfer_cutlass():
             assert self.use_mxfp8, (
                 "flashinfer_cutlass FP8 MoE currently requires MXFP8 "
                 "(quantization=mxfp8)."
             )
             assert is_sm100_supported(), "flashinfer_cutlass MXFP8 MoE requires SM100."
             assert (
-                flashinfer_cutlass_fused_moe is not None
-            ), "flashinfer_cutlass backend requires flashinfer.fused_moe.cutlass_fused_moe."
+                is_flashinfer_available()
+            ), "flashinfer_cutlass backend requires FlashInfer."
             assert (
                 flashinfer_mxfp8_quantize is not None
             ), "flashinfer_cutlass MXFP8 MoE requires flashinfer.mxfp8_quantize."
@@ -767,10 +776,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # FlashInfer CUTLASS kernel assumes [Up, Gate] order for gated W13.
         moe_runner_config = getattr(self, "moe_runner_config", None)
         is_gated = moe_runner_config is None or moe_runner_config.is_gated
+        moe_runner_backend = get_moe_runner_backend()
         return (
             self.use_mxfp8
-            and self._use_flashinfer_cutlass_backend
-            and flashinfer_cutlass_fused_moe is not None
+            and moe_runner_backend.is_flashinfer_cutlass()
+            and is_flashinfer_available()
             and is_gated
         )
 
@@ -900,7 +910,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self._use_cutlass_backend:
+            if get_moe_runner_backend().is_cutlass():
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1149,7 +1159,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return qweight, scale
 
         if quantize:
-            if self._use_cutlass_backend or self._use_flashinfer_cutlass_backend:
+            moe_runner_backend = get_moe_runner_backend()
+            if (
+                moe_runner_backend.is_cutlass()
+                or moe_runner_backend.is_flashinfer_cutlass()
+            ):
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w13_weight.data
                 )
@@ -1434,7 +1448,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config: MoeRunnerConfig,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if flashinfer_cutlass_fused_moe is None or flashinfer_mxfp8_quantize is None:
+        if not is_flashinfer_available() or flashinfer_mxfp8_quantize is None:
             raise RuntimeError(
                 "FlashInfer MXFP8 MoE requires flashinfer.fused_moe.cutlass_fused_moe "
                 "and flashinfer.mxfp8_quantize."
@@ -1523,6 +1537,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -1560,26 +1575,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self.use_mxfp8 and self._use_flashinfer_cutlass_backend:
-            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
-
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            preallocated_output = (
-                dispatch_output.moe_output
-                if DispatchOutputChecker.format_is_flashinfer(dispatch_output)
-                else None
-            )
-            output = self._apply_flashinfer_cutlass_mxfp8(
-                layer=layer,
-                x=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                moe_runner_config=moe_runner_config,
-                output=preallocated_output,
-            )
-            return StandardCombineInput(hidden_states=output)
-
-        if self._use_cutlass_backend:
+        if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
@@ -1616,6 +1612,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 enable_es=(use_mxfp8, use_mxfp8),
             )
             return StandardCombineInput(hidden_states=output)
+
+        if self.use_mxfp8 and get_moe_runner_backend().is_flashinfer_cutlass():
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            preallocated_output = (
+                dispatch_output.moe_output
+                if DispatchOutputChecker.format_is_flashinfer(dispatch_output)
+                else None
+            )
+            output = self._apply_flashinfer_cutlass_mxfp8(
+                layer=layer,
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                moe_runner_config=moe_runner_config,
+                output=preallocated_output,
+            )
+            return StandardCombineInput(hidden_states=output)
+
 
         if self.runner.runner_backend.is_deep_gemm():
 
