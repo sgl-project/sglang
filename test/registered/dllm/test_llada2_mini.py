@@ -56,7 +56,7 @@ class TestLLaDA2Mini(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_gsm8k(self, mocking_lower_arch: bool = False):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -72,10 +72,12 @@ class TestLLaDA2Mini(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.88)
         if is_in_amd_ci():
             self.assertGreater(metrics["output_throughput"], 80)
+        elif mocking_lower_arch:
+            self.assertGreater(metrics["output_throughput"], 100)
         else:
             self.assertGreater(metrics["output_throughput"], 250)
 
-    def test_bs_1_speed(self):
+    def test_bs_1_speed(self, mocking_lower_arch: bool = False):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
         acc_length, speed = send_one_prompt(args)
 
@@ -88,8 +90,20 @@ class TestLLaDA2Mini(CustomTestCase):
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
+            elif mocking_lower_arch:
+                self.assertGreater(speed, 100)
             else:
                 self.assertGreater(speed, 250)
+
+    def test_for_lower_arch(self):
+        """Simulate sm_86 to verify fallback path works (fused_topk_deepseek unsupported)."""
+        if not is_in_amd_ci():
+            with unittest.mock.patch(
+                "sglang.srt.layers.moe.topk.get_device_capability",
+                return_value=(8, 6),
+            ):
+                self.test_gsm8k(mocking_lower_arch=True)
+                self.test_bs_1_speed(mocking_lower_arch=True)
 
 
 if __name__ == "__main__":
