@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
+import traceback
 from dataclasses import dataclass
+from functools import wraps
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
 import triton
+
+logger = logging.getLogger(__name__)
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -22,8 +27,34 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
-from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+from sgl_kernel.flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func_fa3_raw
+from sgl_kernel.flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache_fa3_raw
+
+
+def _fa3_sm100_guard(name: str):
+    """Raise with full call stack if FA3 (Hopper-only) would run on sm100."""
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+        raise RuntimeError(
+            f"[FA3_TRACE] {name} (Hopper-only FA3) would be invoked on sm100 (Blackwell). "
+            "Use fa4 or flashinfer. Full call stack:\n"
+            + "".join(traceback.format_stack())
+        )
+
+
+def _wrap_fa3_with_sm100_guard(fn, name: str):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        _fa3_sm100_guard(name)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+flash_attn_varlen_func_fa3 = _wrap_fa3_with_sm100_guard(
+    _flash_attn_varlen_func_fa3_raw, "flash_attn_varlen_func"
+)
+flash_attn_with_kvcache_fa3 = _wrap_fa3_with_sm100_guard(
+    _flash_attn_with_kvcache_fa3_raw, "flash_attn_with_kvcache"
+)
 
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
@@ -1135,6 +1166,14 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
