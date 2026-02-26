@@ -204,6 +204,11 @@ def process_content_for_template_format(
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
+                elif chunk_type == "input_text":
+                    # Normalize Responses API "input_text" to Chat API "text"
+                    processed_content_parts.append(
+                        {"type": "text", "text": chunk.get("text", "")}
+                    )
                 elif chunk_type == "text":
                     # For v32 encoding, collect text parts separately
                     if use_dpsk_v32_encoding:
@@ -211,6 +216,9 @@ def process_content_for_template_format(
                     else:
                         # Keep text content as-is for openai format
                         processed_content_parts.append(chunk)
+                else:
+                    # Keep other content as-is
+                    processed_content_parts.append(chunk)
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
