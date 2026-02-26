@@ -63,10 +63,15 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
     - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
     - Dataclasses are expanded to dicts and sanitized recursively.
     - Callables/functions are rendered as their qualified name.
+    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
     - Fallback to str(...) for unknown types.
     """
     # Handle simple types quickly
     if obj is None or isinstance(obj, (str, int, float, bool)):
+        # redact sensitive prompt fields
+        if key_hint in ("prompt", "negative_prompt"):
+            if isinstance(obj, str):
+                return f"<redacted, len={len(obj)}>"
         return obj
 
     # Enum -> value for readability
@@ -134,7 +139,7 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
 
     # Sequences/Sets -> list
     if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x) for x in obj]
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
 
     # Functions / Callables -> qualified name
     try:
@@ -150,59 +155,6 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return str(obj)
     except Exception:
         return "<unserializable>"
-
-
-class ExecutionMode(str, Enum):
-    """
-    Enumeration for different pipeline modes.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    INFERENCE = "inference"
-
-    @classmethod
-    def from_string(cls, value: str) -> "ExecutionMode":
-        """Convert string to ExecutionMode enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [mode.value for mode in cls]
-
-
-class WorkloadType(str, Enum):
-    """
-    Enumeration for different workload types.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    I2V = "i2v"  # Image to Video
-    T2V = "t2v"  # Text to Video
-    T2I = "t2i"  # Text to Image
-    I2I = "i2i"  # Image to Image
-
-    @classmethod
-    def from_string(cls, value: str) -> "WorkloadType":
-        """Convert string to WorkloadType enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [workload.value for workload in cls]
 
 
 class Backend(str, Enum):
@@ -289,6 +241,9 @@ class ServerArgs:
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+
+    # path to pre-quantized transformer weights (single .safetensors or directory).
+    transformer_weights_path: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -400,15 +355,19 @@ class ServerArgs:
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
         ncfg.validate()
-        if not ncfg.enable_svdquant or not ncfg.quantized_model_path:
-            # if nunchaku is not applied
+
+        # propagate the path to server_args
+        if ncfg.transformer_weights_path:
+            self.transformer_weights_path = ncfg.transformer_weights_path
+
+        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
             self.nunchaku_config = None
         else:
             self.nunchaku_config = NunchakuConfig(
                 precision=self.nunchaku_config.quantization_precision,
                 rank=self.nunchaku_config.quantization_rank,
                 act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                quantized_model_path=self.nunchaku_config.quantized_model_path,
+                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
             )
 
     def _adjust_offload(self):
@@ -640,13 +599,6 @@ class ServerArgs:
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
-        )
-        parser.add_argument(
-            "--diffusers-attention-backend",
-            type=str,
-            dest="attention_backend",
-            default=None,
-            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--cache-dit-config",
@@ -1063,12 +1015,6 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        # Convert mode string to enum if necessary
-        if "mode" in kwargs and isinstance(kwargs["mode"], str):
-            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
