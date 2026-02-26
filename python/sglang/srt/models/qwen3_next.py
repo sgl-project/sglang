@@ -5,8 +5,6 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -53,7 +51,6 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -316,7 +313,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        self.linear_attn = RadixLinearAttention(
+        self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
             num_k_heads=self.num_k_heads // self.attn_tp_size,
@@ -366,8 +363,8 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # [b, sq, ng, (hn + hn + np/ng * hn + np/ng + np/ng)]
         # --> [b, sq, ng, hn], [b, sq, ng, hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng * hn], [b, sq, ng, np/ng], [b, sq, ng, np/ng]
-        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
-        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=2)
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=2)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=2)
 
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
@@ -385,9 +382,9 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         seq_len, _ = hidden_states.shape
         if (
-            seq_len < DUAL_STREAM_TOKEN_THRESHOLD
-            and self.alt_stream is not None
+            self.alt_stream is not None
             and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -405,34 +402,11 @@ class Qwen3GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.empty_like(hidden_states)
-            gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        seq_len, _ = hidden_states.shape
-        is_cuda_graph = forward_batch.forward_mode.is_cuda_graph()
-
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
 
-        if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
-            and is_cuda_graph
-            and not _is_cpu
-        ):
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -460,7 +434,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-        core_attn_out = self.linear_attn(
+        core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1172,25 +1146,3 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def gdn_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    ret = attention_layer._forward(hidden_states, forward_batch)
-
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return

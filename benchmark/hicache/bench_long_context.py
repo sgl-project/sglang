@@ -12,7 +12,7 @@ from bench_multiturn import (
 )
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):

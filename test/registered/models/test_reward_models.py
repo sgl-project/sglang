@@ -30,6 +30,8 @@ register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
     ("Skywork/Skywork-Reward-Llama-3.1-8B-v0.2", 1, 4e-2),
+    # Qwen3-based reward model (uses Qwen3ForSequenceClassification)
+    ("Skywork/Skywork-Reward-V2-Qwen3-0.6B", 1, 1.5e-1),
 ]
 TORCH_DTYPES = [torch.float16]
 

@@ -322,10 +322,10 @@ class LRUList:
 
             if self.is_swa_list:
                 evictable_size = tree_cache.swa_evictable_size()
-                lru_list_evictable_size = tree_cache.swa_lru_list_evictable_size()
+                lru_list_evictable_size = self.sanity_check_evictable_size()
             else:
                 evictable_size = tree_cache.full_evictable_size()
-                lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
+                lru_list_evictable_size = self.sanity_check_evictable_size()
 
             assert (
                 evictable_size == lru_list_evictable_size
@@ -556,7 +556,7 @@ class SWARadixCache(BasePrefixCache):
         match_result = self.match_prefix(
             MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
         )
-        (new_indices, new_last_node) = (
+        new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
@@ -781,14 +781,6 @@ class SWARadixCache(BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.swa_evictable_size_
 
-    # Note: this is expensive, only use for debug
-    def full_lru_list_evictable_size(self) -> int:
-        return self.full_lru_list.sanity_check_evictable_size()
-
-    # Note: this is expensive, only use for debug
-    def swa_lru_list_evictable_size(self) -> int:
-        return self.swa_lru_list.sanity_check_evictable_size()
-
     def protected_size(self) -> Tuple[int, int]:
         # Note: use full_protected_size() and swa_protected_size() instead.
         raise NotImplementedError
@@ -811,6 +803,18 @@ class SWARadixCache(BasePrefixCache):
 
         _dfs_helper(self.root_node)
         return torch.cat(values)
+
+    def available_and_evictable_str(self) -> str:
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        full_evictable_size = self.full_evictable_size()
+        swa_evictable_size = self.swa_evictable_size()
+        return (
+            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+            f"Full LRU list evictable size: {self.full_lru_list.sanity_check_evictable_size()}\n"
+            f"SWA LRU list evictable size: {self.swa_lru_list.sanity_check_evictable_size()}\n"
+        )
 
     ##### Internal Helper Functions #####
 

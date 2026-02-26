@@ -4,9 +4,11 @@ import torch
 from utils import precision
 
 from sglang.srt.layers.rotary_embedding import (
-    DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
+)
+from sglang.srt.layers.rotary_embedding.rope_variant import (
+    DeepseekScalingRotaryEmbedding,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -33,12 +35,12 @@ class TestROPE(CustomTestCase):
 
         test_config = [
             # (dtype, is_neox_stype, mrope_interleaved, positions, mrope_section)
-            (torch.bfloat16, True, True, positions_mrope, mrope_section),
-            (torch.bfloat16, True, False, positions_mrope, mrope_section),
             (torch.bfloat16, False, True, positions_mrope, mrope_section),
             (torch.bfloat16, False, False, positions_mrope, mrope_section),
-            (torch.bfloat16, True, False, positions_text, None),
             (torch.bfloat16, False, False, positions_text, None),
+            (torch.bfloat16, True, True, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_text, None),
         ]
         for (
             dtype,
@@ -66,7 +68,7 @@ class TestROPE(CustomTestCase):
                 k_clone = k.clone()
 
                 # ref kernel
-                q_ref, k_ref = rope._forward_cpu(
+                q_ref, k_ref = rope.forward_native(
                     query=q,
                     key=k,
                     positions=positions,

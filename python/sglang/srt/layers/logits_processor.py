@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,8 @@ class LogitsProcessorOutput:
     # The logprobs of input tokens.        shape: [#token]
     input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: List = None
-    input_top_logprobs_idx: List = None
+    input_top_logprobs_val: Optional[List] = None
+    input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -376,7 +376,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
+            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
                 input_logprob_indices,
