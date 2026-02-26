@@ -245,6 +245,7 @@ sgl-model-gateway/tests/fixtures/golden/
 
 lmms-eval
 
+AGENTS.md
 **/.claude/
 **/.serena/
 ctags/
