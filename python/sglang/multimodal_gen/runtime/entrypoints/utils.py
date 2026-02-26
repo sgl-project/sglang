@@ -298,6 +298,9 @@ def prepare_request(
 
     req.adjust_size(server_args)
 
+    if not isinstance(req.prompt, str):
+        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
+
     if (req.width is not None and req.width <= 0) or (
         req.height is not None and req.height <= 0
     ):

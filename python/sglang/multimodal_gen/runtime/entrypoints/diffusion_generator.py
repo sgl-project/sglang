@@ -163,7 +163,6 @@ class DiffGenerator:
         """
         # 1. prepare requests
         prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
-        sampling_params_kwargs["prompt"] = prompts[0]
         sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
