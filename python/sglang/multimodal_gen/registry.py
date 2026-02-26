@@ -423,13 +423,13 @@ def get_model_info(
             return None
 
     # 4. Combine and return the complete model info
-    logger.info("Using native sglang backend for model '%s'", model_path)
+    logger.debug("Using native sglang backend for model '%s'", model_path)
     model_info = ModelInfo(
         pipeline_cls=pipeline_cls,
         sampling_param_cls=config_info.sampling_param_cls,
         pipeline_config_cls=config_info.pipeline_config_cls,
     )
-    logger.info(f"Found model info: {model_info}")
+    logger.debug(f"Found model info: {model_info}")
 
     return model_info
 

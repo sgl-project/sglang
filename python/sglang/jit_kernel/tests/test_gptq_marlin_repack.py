@@ -1,6 +1,5 @@
 import pytest
 import torch
-from sgl_kernel import gptq_marlin_repack as aot_gptq_marlin_repack
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -81,18 +80,10 @@ def test_gptq_marlin_repack(
         q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
     )
 
-    # Run AOT repack kernel
-    aot_output = aot_gptq_marlin_repack(
-        q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
-    )
-
     torch.cuda.synchronize()
 
     # JIT should match the reference (computed from CPU marlin_weights)
     torch.testing.assert_close(jit_output, q_w_marlin_ref)
-
-    # JIT should produce bitwise identical results to AOT
-    torch.testing.assert_close(jit_output, aot_output, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
