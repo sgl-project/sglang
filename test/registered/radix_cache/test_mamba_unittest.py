@@ -141,96 +141,9 @@ class TestMamba(unittest.TestCase):
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
     def test_mamba_radix_cache_1(self):
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
         )
-        # kv cache
-        size = 128
-        dtype = torch.bfloat16
-        head_num = 2
-        head_dim = 256
-        num_layers = 48
-        global_interval = 4
-        max_num_reqs = 10
-        mamba_cache_size = 20
-        max_context_len = 128
-        device = get_device()
-        full_attention_layer_ids = [
-            i for i in range(global_interval - 1, num_layers, global_interval)
-        ]
-
-        # mamba
-        mamba_layers = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids
-        ]
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
-            shape = Mamba2StateShape.create(
-                tp_world_size=1,
-                intermediate_size=4096,
-                n_groups=16,
-                num_heads=32,
-                head_dim=128,
-                state_size=128,
-                conv_kernel=4,
-            )
-            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
-
-        req_to_token_pool = HybridReqToTokenPool(
-            size=max_num_reqs,
-            mamba_size=mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=False,
-            cache_params=mamba2_cache_params,
-            enable_mamba_extra_buffer=False,
-            speculative_num_draft_tokens=3,
-        )
-        # setup kv pool
-        pool = HybridLinearKVPool(
-            size=size,
-            dtype=dtype,
-            page_size=1,
-            head_num=head_num,
-            head_dim=head_dim,
-            full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
-            device=device,
-            enable_memory_saver=False,
-            mamba_pool=req_to_token_pool.mamba_pool,
-        )
-
-        # setup token to kv pool allocator
-        allocator = TokenToKVPoolAllocator(
-            size=size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
-        )
-        params = CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-            disable=False,
-        )
-        # setup radix cache
-        tree = MambaRadixCache(params=params)
-
-        def make_dummy_req():
-            sampling_params = SamplingParams(
-                temperature=0,
-                max_new_tokens=1,
-            )
-            req = Req(
-                rid=0,
-                origin_input_text="",
-                origin_input_ids=[],
-                sampling_params=sampling_params,
-            )
-            req_to_token_pool.alloc([req])
-            return req
-
         mamba_pool = req_to_token_pool.mamba_pool
         # test
         print(
