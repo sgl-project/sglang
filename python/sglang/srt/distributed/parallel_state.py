@@ -76,11 +76,10 @@ def get_torch_distributed_pg_options(group_name=None):
         return None
 
     import torch_npu
+
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE")
-        or os.environ.get("HCCL_BUFFSIZE")
-        or 200
+        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
     )
     options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     return options
