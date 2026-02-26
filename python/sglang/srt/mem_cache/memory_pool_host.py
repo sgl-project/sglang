@@ -1268,7 +1268,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         self,
         host_indices: torch.Tensor,
         staging: torch.Tensor,
-        page_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if host_indices.numel() == 0:
             return
@@ -1281,13 +1280,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         if host_page_indices.device.type != "cpu":
             host_page_indices = host_page_indices.cpu()
-        if page_mask is not None:
-            if not torch.is_tensor(page_mask):
-                page_mask = torch.tensor(page_mask, dtype=torch.bool)
-            if page_mask.device.type != "cpu":
-                page_mask = page_mask.cpu()
-            host_page_indices = host_page_indices[page_mask]
-            staging = staging[page_mask]
         if host_page_indices.numel() == 0:
             return
         if staging.device.type != "cpu":

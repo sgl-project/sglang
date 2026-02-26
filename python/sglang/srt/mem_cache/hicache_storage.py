@@ -71,6 +71,7 @@ class HiCacheStorage(ABC):
     """
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
+    _NSA_INDEXER_SUFFIX = "__nsa_idx"
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -185,8 +186,6 @@ class HiCacheStorage(ABC):
 
 
 class HiCacheFile(HiCacheStorage):
-    _NSA_INDEXER_SUFFIX = "__nsa_idx"
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
