@@ -37,7 +37,6 @@ _MODEL_CACHE: dict[str, "Model"] = {}
 
 def warp(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
     """Warp tenInput by tenFlow using grid_sample."""
-    k = (str(tenFlow.device), str(tenFlow.size()))
     # Build base grid for the current size
     tenHorizontal = (
         torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=tenFlow.device)
@@ -188,21 +187,6 @@ class IFNet(nn.Module):
         self.block3 = IFBlock(8 + 4 + 8 + 8, c=32)
         self.encode = Head()
 
-        # teacher and caltime are not used during inference but are defined
-        # so that their weights can be loaded from flownet.pkl (strict=True).
-        self.teacher = IFBlock(8 + 4 + 8 + 3 + 8, c=64)
-        self.caltime = nn.Sequential(
-            nn.Conv2d(17, 32, 3, 1, 1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(32, 64, 3, 1, 1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(64, 1, 3, 1, 1),
-        )
-
     def forward(
         self,
         x: torch.Tensor,
@@ -288,8 +272,14 @@ class Model:
     def device(self) -> torch.device:
         return next(self.flownet.parameters()).device
 
-    def load_model(self, path: str, rank: int = 0) -> None:
-        """Load weights from {path}/flownet.pkl."""
+    def load_model(self, path: str, strip_module_prefix: bool = True) -> None:
+        """Load weights from {path}/flownet.pkl.
+
+        Args:
+            path: Directory containing ``flownet.pkl``.
+            strip_module_prefix: If True, strip the ``module.`` prefix that
+                ``DataParallel`` / ``DistributedDataParallel`` adds to keys.
+        """
         flownet_path = os.path.join(path, "flownet.pkl")
         if not os.path.isfile(flownet_path):
             raise FileNotFoundError(
@@ -298,7 +288,7 @@ class Model:
             )
 
         def convert(param):
-            if rank == -1:
+            if strip_module_prefix:
                 return {
                     k.replace("module.", ""): v
                     for k, v in param.items()
@@ -308,7 +298,7 @@ class Model:
                 return {k: v for k, v in param.items() if "module." not in k}
 
         state = torch.load(flownet_path, map_location="cpu", weights_only=False)
-        self.flownet.load_state_dict(convert(state))
+        self.flownet.load_state_dict(convert(state), strict=False)
         logger.info("Loaded RIFE weights from %s", flownet_path)
 
     def inference(
@@ -355,30 +345,20 @@ class FrameInterpolator:
     per model_path to avoid reloading across requests.
     """
 
-    def __init__(
-        self,
-        model_path: Optional[str] = None,
-    ):
-        self._model_path = model_path
+    def __init__(self):
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
-        """Resolve weight path (local dir or HF repo ID) and load model.
+        """Load RIFE model weights from the default HF repo.
 
-        Resolution order:
-        1. If ``model_path`` is provided, use it (local path or HF repo ID).
-        2. Otherwise fall back to the default HF repo
-           (``elfgum/RIFE-4.22.lite``).
-
-        Both local directories and HuggingFace Hub repo IDs are accepted.
-        When a HF repo ID is given the weights are downloaded (and cached)
-        automatically via ``maybe_download_model()``.
+        Weights are downloaded (and cached) automatically from
+        ``elfgum/RIFE-4.22.lite`` via ``maybe_download_model()``.
         """
         from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
             maybe_download_model,
         )
 
-        model_path = self._model_path or _DEFAULT_RIFE_HF_REPO
+        model_path = _DEFAULT_RIFE_HF_REPO
 
         # Resolve: local path pass-through, HF repo ID → download & cache
         model_path = maybe_download_model(model_path)
@@ -388,9 +368,11 @@ class FrameInterpolator:
         if model_path in _MODEL_CACHE:
             return _MODEL_CACHE[model_path]
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(
+            torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        )
         model = Model()
-        model.load_model(model_path, rank=-1)
+        model.load_model(model_path, strip_module_prefix=True)
         model.eval()
         model.flownet = model.flownet.to(device)
         _MODEL_CACHE[model_path] = model
@@ -481,7 +463,6 @@ def interpolate_video_frames(
     frames: list[np.ndarray],
     exp: int = 1,
     scale: float = 1.0,
-    model_path: Optional[str] = None,
 ) -> tuple[list[np.ndarray], int]:
     """
     Convenience wrapper around FrameInterpolator.
@@ -490,11 +471,9 @@ def interpolate_video_frames(
         frames:     List of uint8 HWC numpy frames.
         exp:        Interpolation exponent (1=2×, 2=4×).
         scale:      RIFE inference scale (default 1.0; use 0.5 for high-res).
-        model_path: Local directory or HuggingFace repo ID containing
-                    flownet.pkl (default: ``elfgum/RIFE-4.22.lite``).
 
     Returns:
         (interpolated_frames, multiplier)
     """
-    interpolator = FrameInterpolator(model_path=model_path)
+    interpolator = FrameInterpolator()
     return interpolator.interpolate(frames, exp=exp, scale=scale)

@@ -344,7 +344,6 @@ def save_outputs(
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
-    frame_interpolation_model_path: Optional[str] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -380,43 +379,26 @@ def save_outputs(
                     frames,
                     exp=frame_interpolation_exp,
                     scale=frame_interpolation_scale,
-                    model_path=frame_interpolation_model_path,
                 )
                 effective_fps = fps * multiplier
             else:
                 effective_fps = fps
 
-            # 3. Save interpolated frames to disk with updated fps
-            if save_output and save_file_path:
-                os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                quality = (
-                    output_compression / 10 if output_compression is not None else 5
-                )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=effective_fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
-                # Extract per-sample audio for muxing
-                sample_audio = audio
-                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-                    sample_audio = audio[idx] if audio.shape[0] > idx else None
-                elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-                    sample_audio = audio[idx] if audio.shape[0] > idx else None
-                _maybe_mux_audio_into_mp4(
-                    save_file_path=save_file_path,
-                    audio=sample_audio,
-                    frames=frames,
-                    fps=effective_fps,
-                    audio_sample_rate=audio_sample_rate,
-                )
-                logger.info(
-                    f"Output saved to {CYAN}{save_file_path}{RESET} "
-                    f"({effective_fps} fps after {2**frame_interpolation_exp}x interpolation)"
-                )
+            # 3. Re-pack interpolated frames and save via post_process_sample
+            interpolated_sample = np.stack(frames)
+            # Re-attach per-sample audio (was packed into `sample` by
+            # attach_audio_to_video_sample above)
+            if isinstance(sample, (tuple, list)) and len(sample) == 2:
+                interpolated_sample = (interpolated_sample, sample[1])
+            frames = post_process_sample(
+                interpolated_sample,
+                data_type,
+                effective_fps,
+                save_output=save_output,
+                save_file_path=save_file_path,
+                audio_sample_rate=audio_sample_rate,
+                output_compression=output_compression,
+            )
         else:
             frames = post_process_sample(
                 sample,
