@@ -42,6 +42,16 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 quay.io/ascend/sglang:${tag}
 ```
 
+## Download weight
+
+|    Model Name     |                                    Address                                     |
+|:-----------------:|:------------------------------------------------------------------------------:|
+| Qwen3.5-397B-A17B | [Qwen/Qwen3.5-397B-A17B](https://www.modelscope.cn/Qwen/Qwen3.5-397B-A17B.git) |
+| Qwen3.5-122B-A10B | [Qwen/Qwen3.5-122B-A10B](https://www.modelscope.cn/Qwen/Qwen3.5-122B-A10B.git) |
+|  Qwen3.5-35B-A3B  |   [Qwen/Qwen3.5-35B-A3B](https://www.modelscope.cn/Qwen/Qwen3.5-35B-A3B.git)   |
+|    Qwen3.5-27B    |       [Qwen/Qwen3.5-27B](https://www.modelscope.cn/Qwen/Qwen3.5-27B.git)       |
+
+
 ## Deployment
 
 ### Single-node Deployment
