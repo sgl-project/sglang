@@ -430,11 +430,10 @@ def _get_precomputed_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-    allow_mixed: bool = False,
-) -> Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]]]:
+) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_embeddings, return their concatenation.
-    If some but not all have precomputed_embeddings and allow_mixed is False, raise NotImplementedError.
+    If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
     precomputed_embeddings = []
@@ -471,182 +470,17 @@ def _get_precomputed_embedding(
             ]
         )
 
-    if any(feature is not None for feature in precomputed_embeddings) and allow_mixed:
-        return precomputed_embeddings
-    elif any(feature is not None for feature in precomputed_embeddings):
+    if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
+                "MM inputs where only some items are precomputed. "
+                "Use _embed_mm_inputs_with_split so batches are uniform."
             )
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
         return result
     return None
-
-
-def _merge_precomputed_and_computed(
-    embedding: List[Optional[torch.Tensor]],
-    computed_embedding: List[torch.Tensor],
-    items_size: List[int],
-    precomputed_mask: List[bool],
-    prefix_length: List[int],
-    request_skipped: List[bool],
-) -> torch.Tensor:
-    """
-    Fill embedding slots for non-precomputed items.
-    """
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-    item_idx = 0
-    computed_idx = 0
-    skipped_idx = 0
-    # build empty tensor for skipped items
-    if computed_embedding:
-        empty_t = torch.empty(
-            0,
-            computed_embedding[0].shape[-1],
-            device=computed_embedding[0].device,
-            dtype=computed_embedding[0].dtype,
-        )
-    else:
-        empty_t = torch.empty(
-            0,
-            embedding[0].shape[-1],
-            device=embedding[0].device,
-            dtype=embedding[0].dtype,
-        )
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
-            continue
-        num_items = items_size[i + 1] - items_size[i]
-        if all(precomputed_mask[item_idx : item_idx + num_items]):
-            item_idx += num_items
-            skipped_idx += 1
-            continue
-        if request_skipped[skipped_idx]:
-            embedding[item_idx : item_idx + num_items] = [empty_t] * num_items
-        else:
-            embedding[item_idx] = computed_embedding[computed_idx]
-            # computed_embedding is per-request, so we need to fill the remaining slots with empty tensors
-            if num_items > 1:
-                embedding[item_idx + 1 : item_idx + num_items] = [empty_t] * (
-                    num_items - 1
-                )
-            computed_idx += 1
-        skipped_idx += 1
-        item_idx += num_items
-    return torch.concat(embedding, dim=0)
-
-
-def _get_precomputed_embedding_with_mixed(
-    items: List[MultimodalDataItem],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-    items_size: List[int],
-    data_embedding_func: "DataEmbeddingFunc",
-    input_ids: torch.Tensor,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """
-    Mixed mode: some items have precomputed_embeddings, others are computed.
-    Returns (concat embedding, input_ids).
-    """
-    embedding = _get_precomputed_embedding(
-        items, prefix_length, extend_length, items_offset_list, allow_mixed=True
-    )
-    precomputed_mask = [item.precomputed_embeddings is not None for item in items]
-    filtered_data = _filter_non_precomputed_items(
-        items,
-        items_size,
-        prefix_length,
-        extend_length,
-        items_offset_list,
-        precomputed_mask,
-    )
-    computed_embedding, input_ids = _get_chunked_prefill_embedding(
-        data_embedding_func,
-        filtered_data["items"],
-        filtered_data["items_size"],
-        filtered_data["prefix_length"],
-        filtered_data["extend_length"],
-        filtered_data["items_offset_list"],
-        input_ids,
-        allow_mixed=True,
-    )
-
-    if embedding is not None and computed_embedding is not None:
-        return (
-            _merge_precomputed_and_computed(
-                embedding,
-                computed_embedding,
-                items_size,
-                precomputed_mask,
-                prefix_length,
-                filtered_data["request_skipped"],
-            ),
-            input_ids,
-        )
-    return None, input_ids
-
-
-def _filter_non_precomputed_items(
-    items: List[MultimodalDataItem],
-    items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-    precomputed_mask: List[bool],
-) -> Dict[str, Any]:
-    """Filter out precomputed items and return data structures for non-precomputed items."""
-    non_precomputed_items = []
-    non_precomputed_items_size = [0]
-    non_precomputed_items_offset_list = []
-    non_precomputed_prefix_length = []
-    non_precomputed_extend_length = []
-    request_skipped = (
-        []
-    )  # True if _get_chunked_prefill_embedding would continue (all prefixed)
-    current_count = 0
-
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
-            continue
-
-        items_per_req = items[items_size[i] : items_size[i + 1]]
-        items_offset = items_offset_list[i]
-        # Same condition as _get_chunked_prefill_embedding continue
-        skipped = all([offset_end < prefix_length[i] for _, offset_end in items_offset])
-        request_skipped.append(skipped)
-
-        # NOTE: within a request all items are either all precomputed or all not
-        precomputed_mask_per_req = precomputed_mask[items_size[i] : items_size[i + 1]]
-        all_precomputed = all(precomputed_mask_per_req)
-        all_computed = not any(precomputed_mask_per_req)
-        if not all_precomputed and not all_computed:
-            raise NotImplementedError(
-                "Not implemented: Items in a request are neither all precomputed nor all computed!"
-            )
-        if all_precomputed:
-            continue
-
-        for item in items_per_req:
-            non_precomputed_items.append(item)
-        non_precomputed_offsets = list(items_offset)
-        current_count += len(items_per_req)
-        non_precomputed_items_size.append(current_count)
-        non_precomputed_items_offset_list.append(non_precomputed_offsets)
-        non_precomputed_prefix_length.append(prefix_length[i])
-        non_precomputed_extend_length.append(extend_length[i])
-
-    return {
-        "items": non_precomputed_items,
-        "items_size": non_precomputed_items_size,
-        "prefix_length": non_precomputed_prefix_length,
-        "extend_length": non_precomputed_extend_length,
-        "items_offset_list": non_precomputed_items_offset_list,
-        "request_skipped": request_skipped,
-    }
 
 
 DataEmbeddingFunc = Callable[
@@ -1059,36 +893,18 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
-    # 1. Get embedding - support mixed precomputed and non-precomputed embeddings
-    precomputed_mask = [
-        item.precomputed_embeddings is not None for item in embedding_items
-    ]
-
-    if all(precomputed_mask) or not any(precomputed_mask):
-        # all items have precomputed embeddings or no items have precomputed embeddings
-        # keep the original behavior
-        embedding = _get_precomputed_embedding(
-            embedding_items, prefix_length, extend_length, items_offset_list
-        )
-        if embedding is None:
-            embedding, input_ids = _get_chunked_prefill_embedding(
-                data_embedding_func,
-                embedding_items,
-                items_size,
-                prefix_length,
-                extend_length,
-                items_offset_list,
-                input_ids,
-            )
-    else:
-        # some items have precomputed embeddings and some items need to be computed
-        embedding, input_ids = _get_precomputed_embedding_with_mixed(
+    # 1. Get embedding (batch is always uniform: all precomputed or all non-precomputed via _embed_mm_inputs_with_split)
+    embedding = _get_precomputed_embedding(
+        embedding_items, prefix_length, extend_length, items_offset_list
+    )
+    if embedding is None:
+        embedding, input_ids = _get_chunked_prefill_embedding(
+            data_embedding_func,
             embedding_items,
+            items_size,
             prefix_length,
             extend_length,
             items_offset_list,
-            items_size,
-            data_embedding_func,
             input_ids,
         )
 
@@ -1240,6 +1056,115 @@ def embed_mm_inputs(
     return input_embeds, other_info
 
 
+def _embed_mm_inputs_with_split(
+    mm_inputs_list: List[MultimodalInputs],
+    extend_prefix_lens: List[int],
+    extend_seq_lens: List[int],
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_embedding: nn.Embedding,
+    multimodal_model: nn.Module = None,
+    data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: dict[Modality, List[int]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+):
+    """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
+    precomputed_req_indices = []
+    non_precomputed_req_indices = []
+    for idx, mm_input in enumerate(mm_inputs_list):
+        items = [item for item in mm_input.mm_items if item is not None]
+        if items and all(
+            getattr(item, "precomputed_embeddings", None) is not None for item in items
+        ):
+            precomputed_req_indices.append(idx)
+        else:
+            non_precomputed_req_indices.append(idx)
+
+    embed_kwargs = dict(
+        multimodal_model=multimodal_model,
+        input_embedding=input_embedding,
+        data_embedding_func_mapping=data_embedding_func_mapping,
+        placeholder_tokens=placeholder_tokens,
+        use_deepstack=use_deepstack,
+    )
+
+    if not precomputed_req_indices or not non_precomputed_req_indices:
+        return embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            **embed_kwargs,
+        )
+
+    all_seq_lens = forward_batch.extend_seq_lens_cpu
+    mm_batch_indices = [
+        i for i, mm in enumerate(forward_batch.mm_inputs) if mm is not None
+    ]
+    token_starts = []
+    cumulative = 0
+    for sl in all_seq_lens:
+        token_starts.append(cumulative)
+        cumulative += sl
+
+    vocab_size = input_embedding.num_embeddings
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1)).clone()
+    other_info = {}
+    # Pre-allocate full-batch deepstack embeds when needed; merge by position instead of update
+    input_deepstack_embeds = None
+    if use_deepstack and multimodal_model is not None:
+        num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
+        deepstack_shape = input_embeds.shape[:-1] + (
+            input_embeds.shape[-1] * num_deepstack_embeddings,
+        )
+        input_deepstack_embeds = torch.zeros(
+            deepstack_shape,
+            device=input_embeds.device,
+            dtype=input_embeds.dtype,
+        )
+        other_info["input_deepstack_embeds"] = input_deepstack_embeds
+
+    for group_req_indices in [precomputed_req_indices, non_precomputed_req_indices]:
+        sub_mm_inputs = [mm_inputs_list[i] for i in group_req_indices]
+        sub_prefix_lens = [extend_prefix_lens[i] for i in group_req_indices]
+        sub_seq_lens = [extend_seq_lens[i] for i in group_req_indices]
+        group_batch_indices = [mm_batch_indices[i] for i in group_req_indices]
+        sub_slices = [
+            input_ids[token_starts[bi] : token_starts[bi] + all_seq_lens[bi]]
+            for bi in group_batch_indices
+        ]
+        sub_input_ids = torch.cat(sub_slices)
+
+        sub_embeds, sub_info = embed_mm_inputs(
+            mm_inputs_list=sub_mm_inputs,
+            extend_prefix_lens=sub_prefix_lens,
+            extend_seq_lens=sub_seq_lens,
+            input_ids=sub_input_ids,
+            **embed_kwargs,
+        )
+
+        offset = 0
+        for bi in group_batch_indices:
+            req_len = all_seq_lens[bi]
+            start = token_starts[bi]
+            input_embeds[start : start + req_len] = sub_embeds[
+                offset : offset + req_len
+            ]
+            if (
+                input_deepstack_embeds is not None
+                and "input_deepstack_embeds" in sub_info
+            ):
+                input_deepstack_embeds[start : start + req_len] = sub_info[
+                    "input_deepstack_embeds"
+                ][offset : offset + req_len].to(
+                    input_deepstack_embeds.device,
+                    input_deepstack_embeds.dtype,
+                )
+            offset += req_len
+
+    return input_embeds, other_info
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1286,13 +1211,15 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            input_embeds, other_info = embed_mm_inputs(
+            # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+            input_embeds, other_info = _embed_mm_inputs_with_split(
                 mm_inputs_list=mm_inputs_list,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens=extend_seq_lens,
                 input_ids=input_ids,
-                multimodal_model=multimodal_model,
+                forward_batch=forward_batch,
                 input_embedding=embed_tokens,
+                multimodal_model=multimodal_model,
                 data_embedding_func_mapping=data_embedding_funcs,
                 placeholder_tokens=placeholder_tokens,
                 use_deepstack=use_deepstack,
