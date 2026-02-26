@@ -347,11 +347,17 @@ class USPAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        skip_sp: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
 
             q, k, v: [B, S_local, H, D]
+
+        Args:
+            skip_sp: If True, skip all sequence parallelism (both Ulysses
+                and Ring) and compute local attention directly. Use this for
+                cross-attention where KV is replicated across all ranks.
 
         Note: Replicated tensors are not supported in this implementation.
         """
@@ -360,8 +366,7 @@ class USPAttention(nn.Module):
         ), "USPAttention does not support replicated_qkv."
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-        if get_sequence_parallel_world_size() == 1:
-            # No sequence parallelism, just run local attention.
+        if get_sequence_parallel_world_size() == 1 or skip_sp: #skip_sp or
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
 

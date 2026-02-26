@@ -220,8 +220,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # compute attention
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, skip_sp=True)
 
         # output
         x = x.flatten(2)
@@ -267,6 +266,13 @@ class WanI2VCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
+        if not WanTransformerBlock._attn_shape_logged:
+            logger.info(
+                f"[I2V CrossAttn] raw input: x(video)={list(x.shape)}, "
+                f"context(full)={list(context.shape)}, "
+                f"context_img=context[:, :257]={list(context[:, :257].shape)}, "
+                f"context_txt=context[:, 257:]={list(context[:, 257:].shape)}"
+            )
         context_img = context[:, :257]
         context = context[:, 257:]
 
@@ -297,8 +303,18 @@ class WanI2VCrossAttention(WanSelfAttention):
         v_img, _ = self.add_v_proj(context_img)
         v_img = v_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        img_x = self.attn(q, k_img, v_img)
-        x = self.attn(q, k, v)
+        if not WanTransformerBlock._attn_shape_logged:
+            logger.info(
+                f"[I2V CrossAttn] image path: Q={list(q.shape)}, K_img={list(k_img.shape)}, V_img={list(v_img.shape)}"
+            )
+        img_x = self.attn(q, k_img, v_img, skip_sp=True)
+
+        if not WanTransformerBlock._attn_shape_logged:
+            logger.info(
+                f"[I2V CrossAttn] text path:  Q={list(q.shape)}, K_txt={list(k.shape)}, V_txt={list(v.shape)}"
+            )
+            WanTransformerBlock._attn_shape_logged = True
+        x = self.attn(q, k, v, skip_sp=True)
 
         # output
         x = x.flatten(2)
@@ -309,6 +325,8 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanTransformerBlock(nn.Module):
+
+    _attn_shape_logged = False
 
     def __init__(
         self,
@@ -503,6 +521,10 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        if not WanTransformerBlock._attn_shape_logged:
+            logger.info(
+                f"[Self-Attn] Q={list(query.shape)}, K={list(key.shape)}, V={list(value.shape)}"
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -519,6 +541,11 @@ class WanTransformerBlock(nn.Module):
         ), hidden_states.to(orig_dtype)
 
         # 2. Cross-attention
+        if not WanTransformerBlock._attn_shape_logged:
+            logger.info(
+                f"[Block CrossAttn call] video_hidden={list(norm_hidden_states.shape)}, "
+                f"encoder_hidden_states={list(encoder_hidden_states.shape)}"
+            )
         attn_output = self.attn2(
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
