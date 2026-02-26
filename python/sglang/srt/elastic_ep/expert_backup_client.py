@@ -95,9 +95,7 @@ class ExpertBackupClient:
             )
             if ret_value != 0:
                 self.use_backup = False
-                logger.warning(
-                    "Register fails. Stop using expert weight backup!"
-                )
+                logger.warning("Register fails. Stop using expert weight backup!")
                 break
 
     def update_weights(self):
