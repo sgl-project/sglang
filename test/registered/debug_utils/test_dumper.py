@@ -2002,7 +2002,7 @@ class TestDumperE2E:
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 
-            for field in ("input_ids", "positions"):
+            for field in ("input_ids", "positions", "rids"):
                 assert any(f"name={field}" in f for f in filenames), (
                     f"Missing {field} dump from non-intrusive hooks, "
                     f"got: {sorted(filenames)[:10]}"
@@ -2022,6 +2022,19 @@ class TestDumperE2E:
             assert "name" in loaded["meta"]
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
+
+            rids_files = [f for f in dump_files if "name=rids" in f.name]
+            rids_loaded = torch.load(
+                rids_files[0], map_location="cpu", weights_only=False
+            )
+            rids_value = rids_loaded["value"]
+            assert isinstance(
+                rids_value, list
+            ), f"rids should be a list, got {type(rids_value)}"
+            assert len(rids_value) > 0, "rids should be non-empty"
+            assert all(
+                isinstance(r, str) for r in rids_value
+            ), f"each rid should be a str, got {[type(r) for r in rids_value]}"
         finally:
             kill_process_tree(proc.pid)
 
@@ -2114,7 +2127,9 @@ class TestRegisterForwardHook:
 class TestPluginCoreFields:
     def test_sglang_core_fields(self):
         plugin = _SGLangPlugin()
-        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
 
     def test_megatron_core_fields(self):
         plugin = _MegatronPlugin()
