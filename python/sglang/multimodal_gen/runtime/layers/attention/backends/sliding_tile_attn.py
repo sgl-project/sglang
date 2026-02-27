@@ -8,7 +8,6 @@ from typing import Any
 import torch
 from einops import rearrange
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -21,6 +20,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
@@ -120,12 +120,14 @@ class SlidingTileAttentionImpl(AttentionImpl):
             raise ValueError("st attn not supported")
         # TODO(will-refactor): for now this is the mask strategy, but maybe we should
         # have a more general config for STA?
-        config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
-        if config_file is None:
+        mask_strategy_file_path = (
+            get_global_server_args().attention_backend_config.mask_strategy_file_path
+        )
+        if mask_strategy_file_path is None:
             raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
 
         # TODO(kevin): get mask strategy for different STA modes
-        with open(config_file) as f:
+        with open(mask_strategy_file_path) as f:
             mask_strategy = json.load(f)
         self.mask_strategy = dict_to_3d_list(mask_strategy)
 

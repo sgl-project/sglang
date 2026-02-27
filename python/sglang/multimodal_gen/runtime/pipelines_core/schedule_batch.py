@@ -24,9 +24,12 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    _sanitize_for_logging,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
@@ -82,16 +85,32 @@ class Req:
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
+    # Audio Embeddings (LTX-2)
+    audio_prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
+    negative_audio_prompt_embeds: list[torch.Tensor] | torch.Tensor = field(
+        default_factory=list
+    )
+
     # Latent tensors
     latents: torch.Tensor | None = None
+    y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
+
+    # Audio Latents
+    audio_latents: torch.Tensor | None = None
+    audio_noise: torch.Tensor | None = None
+    raw_audio_latent_shape: tuple[int, ...] | None = None
+
+    # Audio Parameters
+    generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
+    vae_image_sizes: list[tuple[int, int]] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -99,6 +118,7 @@ class Req:
 
     # Timesteps
     timesteps: torch.Tensor | None = None
+    paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
 
@@ -115,6 +135,7 @@ class Req:
 
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
+    trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
     extra: dict[str, Any] = field(default_factory=dict)
@@ -134,10 +155,12 @@ class Req:
     VSA_sparsity: float = 0.0
 
     # stage logging
-    timings: Optional["RequestTimings"] = None
+    metrics: Optional["RequestMetrics"] = None
 
     # results
     output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -232,6 +255,8 @@ class Req:
 
     def set_as_warmup(self):
         self.is_warmup = True
+        self.save_output = False
+        self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = 1
 
@@ -245,7 +270,7 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        self.timings = RequestTimings(request_id=self.request_id)
+        self.metrics = RequestMetrics(request_id=self.request_id)
 
         if self.is_warmup:
             self.set_as_warmup()
@@ -257,7 +282,7 @@ class Req:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
-        if self.is_warmup:
+        if self.is_warmup or self.suppress_logs:
             return
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
@@ -269,13 +294,20 @@ class Req:
         else:
             target_width = -1
 
+        # sanitize prompts for info-level logging
+        sanitized_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
+        sanitized_neg_prompt = _sanitize_for_logging(
+            self.negative_prompt, key_hint="negative_prompt"
+        )
+
         # Log sampling parameters
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
-                      prompt: {self.prompt}
-                  neg_prompt: {self.negative_prompt}
+                         fps: {self.fps}
+                      prompt: {sanitized_prompt}
+                  neg_prompt: {sanitized_neg_prompt}
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
@@ -287,7 +319,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        logger.info(debug_str)
+        logger.debug(debug_str)
 
 
 @dataclass
@@ -297,13 +329,16 @@ class OutputBatch:
     """
 
     output: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    audio_sample_rate: int | None = None
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    output_file_paths: list[str] | None = None
 
-    # logged timings info, directly from Req.timings
-    timings: Optional["RequestTimings"] = None
+    # logged metrics info, directly from Req.timings
+    metrics: Optional["RequestMetrics"] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

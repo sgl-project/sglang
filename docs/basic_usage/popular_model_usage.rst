@@ -1,6 +1,8 @@
 Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, MiniMax, Qwen, and more)
 ===============================================================
 
+For more usage examples and recipes, visit the `SGLang Cookbook <https://cookbook.sglang.io/>`_.
+
 .. toctree::
    :maxdepth: 1
 
@@ -12,4 +14,5 @@ Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, MiniMax, Qwen, and more)
    minimax_m2.md
    qwen3.md
    qwen3_vl.md
+   deepseek_ocr.md
    llama4.md

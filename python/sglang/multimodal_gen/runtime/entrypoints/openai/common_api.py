@@ -6,7 +6,7 @@ from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -180,7 +180,7 @@ async def available_models():
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, backend=server_args.backend)
 
     card_kwargs = {
         "id": server_args.model_path,
@@ -222,7 +222,7 @@ async def retrieve_model(model: str):
             },
         )
 
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, backend=server_args.backend)
 
     card_kwargs = {
         "id": model,

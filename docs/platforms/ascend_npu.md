@@ -7,11 +7,10 @@ You can install SGLang using any of the methods below. Please go through `System
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | HDK               | 25.3.RC1                  | [link](https://hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
-| CANN              | 8.3.rc2                 | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
+| CANN              | 8.5.0                     | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
 | Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
-| MemFabric         | 1.0.3                   | `pip install memfabric-hybrid==1.0.3`                                                                                                                                                                 |
-| Triton            | 3.2.0.dev2025112116     | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)                                           |
-| Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
+| MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
+| Triton            | 3.2.0                   | `pip install triton-ascend`|
 | SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
 
 <a id="obtain-cann-image"></a>
@@ -19,9 +18,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
@@ -46,7 +45,7 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-pip install memfabric-hybrid==1.0.3
+pip install memfabric-hybrid==1.0.5
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
@@ -66,12 +65,7 @@ If you are using other versions of `torch` and install `torch_npu`, check [insta
 We provide our own implementation of Triton for Ascend.
 
 ```shell
-BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
-BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
-wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
-```
-```shell
-pip install -i https://test.pypi.org/simple/ "triton-ascend<3.2.0rc" --pre --no-cache-dir
+pip install triton-ascend
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
@@ -81,27 +75,14 @@ We provide SGL kernels for Ascend NPU, check [installation guide](https://github
 #### DeepEP-compatible Library
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
-#### CustomOps
-_TODO: to be removed once merged into sgl-kernel-npu._
-Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
-
-```shell
-DEVICE_TYPE="a3"
-wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
-chmod a+x ./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run
-./CANN-custom_ops-8.3.0.1-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
-wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-pip install ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-```
-
 #### Installing SGLang from source
 
 ```shell
 # Use the last release branch
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-mv python/pyproject_other.toml python/pyproject.toml
-pip install -e python[srt_npu]
+mv python/pyproject_npu.toml python/pyproject.toml
+pip install -e python[all_npu]
 ```
 
 ### Method 2: Using Docker Image
@@ -112,8 +93,8 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 dockerhub: docker.io/lmsysorg/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas 800I A3 : {main}-cann8.3.rc2-a3
-Atlas 800I A2: {main}-cann8.3.rc2-910b
+Atlas 800I A3 : {main}-cann8.5.0-a3
+Atlas 800I A2: {main}-cann8.5.0-910b
 ```
 2. Build an image based on Dockerfile
 ```shell

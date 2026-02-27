@@ -20,12 +20,15 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
-from sglang.multimodal_gen.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
-    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -131,8 +134,14 @@ def shard_rotary_emb_for_sp(emb):
 
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
-    width, height = batch.raw_latent_shape[-1], batch.raw_latent_shape[-2]
-    target_tokens = width * height
+    raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 3:
+        # Sequence format [B, S, D]: use seq_len directly
+        target_tokens = raw_shape[1]
+    else:
+        # Spatial format [B, C, H, W] or [B, C, T, H, W]: use width * height
+        width, height = raw_shape[-1], raw_shape[-2]
+        target_tokens = width * height
     if latents.shape[1] > target_tokens:
         latents = latents[:, :target_tokens, :]
     return latents
@@ -144,6 +153,7 @@ class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
+    skip_input_image_preprocess: bool = False
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -335,12 +345,17 @@ class PipelineConfig:
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard and sp_world_size > 1:
+            return latents, False
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
 
         # Pad to next multiple of SP degree if needed
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            logger.debug(
+                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            )
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
                 (*latents.shape[:2], pad_len, *latents.shape[3:]),
@@ -486,6 +501,11 @@ class PipelineConfig:
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 
+        # Add T5 configuration arguments
+        from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+
+        T5Config.add_cli_args(parser, prefix=f"{prefix_with_dot}t5-config")
+
         return parser
 
     def update_config_from_dict(self, args: dict[str, Any], prefix: str = "") -> None:
@@ -497,6 +517,14 @@ class PipelineConfig:
         update_config_from_args(
             self.dit_config, args, f"{prefix_with_dot}dit_config", pop_args=True
         )
+        for text_encoder_config in self.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                update_config_from_args(
+                    text_encoder_config,
+                    args,
+                    f"{prefix_with_dot}t5_config",
+                    pop_args=True,
+                )
 
     @classmethod
     def from_kwargs(
@@ -547,7 +575,7 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path)
+                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -563,7 +591,7 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path)
+            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
@@ -572,6 +600,12 @@ class PipelineConfig:
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        if vae_path is None:
+            component_paths = kwargs.get(
+                prefix_with_dot + "component_paths"
+            ) or kwargs.get("component_paths")
+            if isinstance(component_paths, dict):
+                vae_path = component_paths.get("vae")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (
@@ -736,6 +770,49 @@ class ImagePipelineConfig(PipelineConfig):
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         return latents, batch_size, channels, height, width
+
+
+@dataclass
+class SpatialImagePipelineConfig(ImagePipelineConfig):
+    """Base config for spatial image pipelines (e.g. GLM-Image) with 4D latents (B, C, H', W').
+
+    Overrides shard_latents_for_sp / gather_latents_for_sp to shard along the height dimension
+    so that each SP rank gets (B, C, H'_local, W') instead of using the token-style (B, S, C) path.
+    """
+
+    def shard_latents_for_sp(self, batch, latents):
+        # 4D latents (B, C, H', W') -> shard along H' (dim=2); otherwise fall back to base (B, S, C)
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return latents, False
+        if latents.dim() != 4:
+            return super().shard_latents_for_sp(batch, latents)
+
+        # (B, C, H', W')
+        _, _, h_lat, w_lat = latents.shape
+        if h_lat % sp_world_size != 0:
+            pad_len = sp_world_size - (h_lat % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], latents.shape[1], pad_len, latents.shape[3]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=2)
+            h_lat = latents.shape[2]
+        rank_in_sp_group = get_sp_parallel_rank()
+        chunk_size = h_lat // sp_world_size
+        h0 = rank_in_sp_group * chunk_size
+        h1 = h0 + chunk_size
+        sharded = latents[:, :, h0:h1, :].contiguous()
+        return sharded, True
+
+    def gather_latents_for_sp(self, latents):
+        if get_sp_world_size() <= 1:
+            return latents
+        if latents.dim() != 4:
+            return super().gather_latents_for_sp(latents)
+        # Gather along dim=2 (H') to match shard_latents_for_sp
+        return sequence_model_parallel_all_gather(latents, dim=2)
 
 
 @dataclass
