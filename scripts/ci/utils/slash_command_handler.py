@@ -415,12 +415,8 @@ def main():
     comment_body = get_env_var("COMMENT_BODY").strip()
     user_login = get_env_var("USER_LOGIN")
 
-    # 2. Load Permissions (Local Check)
+    # 2. Load Permissions (local file check first to avoid unnecessary API calls)
     user_perms = load_permissions(user_login)
-
-    if not user_perms:
-        print(f"User {user_login} does not have any configured permissions. Exiting.")
-        return
 
     # 3. Initialize GitHub API with Auth
     auth = Auth.Token(token)
@@ -429,6 +425,25 @@ def main():
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
+
+    # PR authors can always rerun CI and tag their own PRs,
+    # even if they are not listed in CI_PERMISSIONS.json.
+    # Note: /rerun-stage still requires CI_PERMISSIONS.json membership.
+    if pr.user.login == user_login:
+        if user_perms is None:
+            print(
+                f"User {user_login} is the PR author (not in CI_PERMISSIONS.json). "
+                "Granting CI rerun permissions."
+            )
+            user_perms = {}
+        else:
+            print(f"User {user_login} is the PR author and has existing CI permissions.")
+        user_perms["can_tag_run_ci_label"] = True
+        user_perms["can_rerun_failed_ci"] = True
+
+    if not user_perms:
+        print(f"User {user_login} does not have any configured permissions. Exiting.")
+        return
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
