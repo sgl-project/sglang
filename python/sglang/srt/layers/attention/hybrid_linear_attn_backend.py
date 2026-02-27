@@ -146,7 +146,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
-        self.intermediate_state_indices_list = []  # Pre-allocated for CUDA graph
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -409,10 +408,6 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-            # Pre-allocate intermediate_state_indices: [0, 1, 2, ..., i]
-            self.intermediate_state_indices_list.append(
-                torch.arange(i + 1, dtype=torch.int32, device=self.device)
-            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -455,14 +450,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
-            )
-        elif forward_mode.is_target_verify():
-            # topk == 1, still need intermediate_state_indices for speculative decoding
-            return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -528,14 +515,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
-            )
-        elif forward_mode.is_target_verify():
-            # topk == 1, still need intermediate_state_indices for speculative decoding
-            return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(

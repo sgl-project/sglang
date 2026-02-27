@@ -10,7 +10,6 @@ Requires ``flashinfer`` with GDN kernel support to be installed, e.g.
 
 import logging
 import os
-import time
 from typing import Optional
 
 import torch
@@ -75,82 +74,6 @@ def _get_flashinfer_gdn_kernels():
 
 
 # ---------------------------------------------------------------------------
-# Warmup helpers
-# ---------------------------------------------------------------------------
-
-
-def _warmup_kernels(mtp_fn, decode_fn) -> None:
-    """Warmup FlashInfer MTP and decode kernels to trigger JIT compilation."""
-    batch_size, seq_len, num_heads = 4, 4, 4
-    k_dim, v_dim = 128, 128
-    device = torch.cuda.current_device()
-    dtype = torch.bfloat16
-
-    A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
-
-    # ---- MTP (verify) kernel ----
-    if mtp_fn is not None:
-        logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
-        start = time.perf_counter()
-        try:
-            q = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-            k = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-            v = torch.randn(batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype)
-            a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
-            b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
-
-            pool_size = batch_size + 16
-            initial_state = torch.randn(
-                pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
-            )
-            cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
-            intermediate_state_cache = torch.zeros(
-                pool_size, seq_len, num_heads, v_dim, k_dim,
-                device=device, dtype=torch.float32,
-            )
-
-            mtp_fn(
-                q=q, k=k, v=v,
-                initial_state=initial_state,
-                initial_state_indices=cache_indices,
-                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
-                scale=None, output=None,
-                intermediate_states_buffer=intermediate_state_cache,
-                disable_state_update=True,
-                use_qk_l2norm=True,
-            )
-            torch.cuda.synchronize()
-            logger.info(f"FlashInfer GDN MTP kernel warmup completed in {time.perf_counter() - start:.2f}s")
-        except Exception as e:
-            logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
-
-    # ---- Decode kernel ----
-    if decode_fn is not None:
-        logger.info("Warming up FlashInfer GDN decode kernel (may take a few seconds)...")
-        start = time.perf_counter()
-        try:
-            q = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
-            k = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
-            v = torch.randn(batch_size, 1, num_heads, v_dim, device=device, dtype=dtype)
-            a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
-            b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
-            state = torch.randn(
-                batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
-            )
-
-            decode_fn(
-                q=q, k=k, v=v, state=state,
-                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
-                scale=None, output=None,
-                use_qk_l2norm=True,
-            )
-            torch.cuda.synchronize()
-            logger.info(f"FlashInfer GDN decode kernel warmup completed in {time.perf_counter() - start:.2f}s")
-        except Exception as e:
-            logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
-
-# ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
 
@@ -186,8 +109,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             "K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels"
         )
 
-        # Warmup kernels to avoid JIT overhead during serving
-        _warmup_kernels(self._mtp_fn, self._decode_fn)
 
     # ---- decode ----
 
