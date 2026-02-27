@@ -23,8 +23,6 @@ _UNNAMED_TOKEN_DIM_FALLBACK: int = 0
 def execute_token_aligner(
     plan: TokenAlignerPlan,
     tensor_of_step_pair: Pair[dict[int, torch.Tensor]],
-    *,
-    token_dims: Pair[int] = Pair(x=0, y=0),
 ) -> Pair[torch.Tensor]:
     flat_pair: Pair[dict[int, torch.Tensor]] = Pair(
         x=_collapse_bs_to_t(
@@ -140,7 +138,6 @@ def _extract_and_stack_tokens(
     *,
     tensor_of_step: dict[int, torch.Tensor],
     locator: TokenLocator,
-    token_dim: int,
 ) -> torch.Tensor:
     some_tensor: torch.Tensor = next(iter(tensor_of_step.values()))
     token_dim: int = _resolve_dim_or_fallback(some_tensor, TOKEN_DIM_NAME)
