@@ -2403,7 +2403,7 @@ class Scheduler(
 
         if (
             self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend == "mooncake"
+            and self.server_args.elastic_ep_backend is not None
         ):
             # Get the tensors indicating rank activeness
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
@@ -2441,6 +2441,8 @@ class Scheduler(
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
