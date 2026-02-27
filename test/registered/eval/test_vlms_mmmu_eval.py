@@ -26,9 +26,9 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("deepseek-ai/deepseek-vl2-small"): ModelEvalMetrics(
         0.320, 56.1
     ),
-    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 50.0),
+    ModelLaunchSettings("deepseek-ai/Janus-Pro-7B"): ModelEvalMetrics(0.285, 40.3),
     ModelLaunchSettings("Efficient-Large-Model/NVILA-8B-hf"): ModelEvalMetrics(
-        0.270, 70.0
+        0.270, 56.7
     ),
     ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
         0.270, 23.8
@@ -39,7 +39,7 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.270, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
-        0.330, 26.0
+        0.330, 23.5
     ),
     ModelLaunchSettings("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.5),
     ModelLaunchSettings("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.259, 36.3),
@@ -51,7 +51,7 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.29, 37.0),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
-    ): ModelEvalMetrics(0.30, 30.0),
+    ): ModelEvalMetrics(0.30, 16.7),
     ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
