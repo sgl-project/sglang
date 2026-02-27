@@ -1238,6 +1238,18 @@ class _MegatronPlugin(_FrameworkPlugin):
         except (AttributeError, AssertionError):
             info["megatron_error"] = True
 
+        # Megatron sequence parallel reuses the TP group (no dedicated parallel state API).
+        # When sequence_parallel=True, inject sp_rank/sp_size for the comparator unsharder.
+        try:
+            from megatron.training.global_vars import get_args
+
+            args = get_args()
+            if getattr(args, "sequence_parallel", False) and "tp_rank" in info:
+                info["sp_rank"] = info["tp_rank"]
+                info["sp_size"] = info["tp_size"]
+        except (ImportError, AssertionError, AttributeError):
+            pass
+
         return info
 
     def convert_value(

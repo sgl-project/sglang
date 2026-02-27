@@ -31,9 +31,15 @@ def compute_unsharder_plan(
     sharded_axis_infos: dict[ParallelAxis, DimSpec] = {
         spec.parallel: spec for spec in dim_specs if spec.parallel is not None
     }
-    sharded_axes: set[ParallelAxis] = set(sharded_axis_infos)
+    sharded_axes_raw: set[ParallelAxis] = set(sharded_axis_infos)
 
     all_axes: set[ParallelAxis] = {axis for info in parallel_infos for axis in info}
+
+    # axis annotated in dims but absent from all parallel_infos -> axis_size=1, skip
+    sharded_axes: set[ParallelAxis] = sharded_axes_raw & all_axes
+    sharded_axis_infos = {
+        k: v for k, v in sharded_axis_infos.items() if k in sharded_axes
+    }
     replicated_axes: set[ParallelAxis] = all_axes - sharded_axes
 
     if not sharded_axes and not replicated_axes:

@@ -38,10 +38,13 @@ class TestComputeUnsharderPlan:
         with pytest.raises(ValueError, match="Inconsistent axis_size"):
             compute_unsharder_plan(dim_specs, parallel_infos)
 
-    def test_missing_axis_in_parallel_info_raises(self) -> None:
+    def test_missing_axis_in_all_parallel_infos_skipped(self) -> None:
+        """Axis in dims but absent from all parallel_infos -> axis_size=1, auto-skip."""
         dim_specs = parse_dims("h(tp)")
         parallel_infos = [{ParallelAxis.CP: AxisInfo(axis_rank=0, axis_size=2)}]
-        with pytest.raises(ValueError, match="missing parallel_info"):
+        # TP not in any parallel_info → skipped; CP is replicated but only 1 rank
+        # with size=2 → incomplete coverage
+        with pytest.raises(ValueError, match="axis_rank coverage"):
             compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_empty_parallel_infos_raises(self) -> None:
@@ -231,6 +234,24 @@ class TestComputeUnsharderPlan:
         # Step 2 (TP): 2 tensors → 1 (single group of 2)
         assert len(plans[2].groups) == 1
         assert len(plans[2].groups[0]) == 2
+
+    def test_sp_in_dims_but_not_in_parallel_info(self) -> None:
+        """s(sp) in dims but SP absent from parallel_info (SP disabled), should auto-skip."""
+        dim_specs = parse_dims("s(sp) b h(tp)")
+        parallel_infos = [
+            {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.TP
+
+    def test_all_dims_sharded_but_single_gpu(self) -> None:
+        """Single GPU (TP=1, CP=1), dims has s(cp) h(tp) but parallel_info is empty."""
+        dim_specs = parse_dims("b s(cp) h(tp) d")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [{}]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+        assert plans == []
 
     def test_sharded_axis_missing_from_rank_raises(self) -> None:
         """A world_rank missing a sharded axis raises ValueError."""
