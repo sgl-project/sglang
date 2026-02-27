@@ -239,8 +239,8 @@ class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     guidance_scale_2: float = 3.0  # low_noise
     num_inference_steps: int = 40
     fps: int = 16
-    # NOTE(will): default boundary timestep is tracked by PipelineConfig, but
-    # can be overridden during sampling
+
+    num_frames: int = 81
 
     # Wan2.2 T2V A14B supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(
@@ -259,8 +259,8 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     guidance_scale_2: float = 3.5  # low_noise
     num_inference_steps: int = 40
     fps: int = 16
-    # NOTE(will): default boundary timestep is tracked by PipelineConfig, but
-    # can be overridden during sampling
+
+    num_frames: int = 81
 
     # Wan2.2 I2V A14B supported resolutions
     supported_resolutions: list[tuple[int, int]] | None = field(

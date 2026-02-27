@@ -97,6 +97,8 @@ class SamplingParams:
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
+    output_quality: str | None = "default"
+    output_compression: int | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -126,6 +128,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -149,6 +152,11 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
+    # if True, suppress verbose logging for this request
+    suppress_logs: bool = False
+
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -201,12 +209,25 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
+        # Handle output_quality to output_compression conversion
+        if self.output_compression is None and self.output_quality is not None:
+            self.output_compression = self._adjust_output_quality(
+                self.output_quality, self.data_type
+            )
+
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
+        """Convert output_quality string to compression level."""
+        output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+        if output_quality == "default":
+            return 50 if data_type == DataType.VIDEO else 75
+        return output_quality_mapper.get(output_quality)
 
     def _validate(self):
         """
@@ -273,6 +294,11 @@ class SamplingParams:
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
 
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
+
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
                 self.boundary_ratio, (int, float)
@@ -302,6 +328,13 @@ class SamplingParams:
             if self.image_path is None:
                 raise ValueError(
                     f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_image_input():
+            # does not support image input
+            if self.image_path is not None:
+                raise ValueError(
+                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
                 )
 
     def _adjust(
@@ -357,58 +390,88 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
+
+        if "wan" in pipeline_name_lower and (
+            self.enable_sequence_shard is None or self.enable_sequence_shard
+        ):
+            self.enable_sequence_shard = True
+            logger.debug("Automatically enabled enable_sequence_shard")
+        else:
+            self.enable_sequence_shard = False
+
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
+            )
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
-        elif self.adjust_frames:
+        else:
+            # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
+            original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
+                original_num_frames
+            )
+            logger.info(
+                "Adjusting number of frames from %s to %s based on model",
+                original_num_frames,
+                self.num_frames,
             )
 
-            # Adjust number of frames based on number of GPUs for video task
-            use_temporal_scaling_frames = (
-                pipeline_config.vae_config.use_temporal_scaling_frames
-            )
-            num_frames = self.num_frames
-            num_gpus = server_args.num_gpus
-            temporal_scale_factor = (
-                pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
-
-            if use_temporal_scaling_frames:
-                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-
-            if orig_latent_num_frames % server_args.num_gpus != 0:
-                # Adjust latent frames to be divisible by number of GPUs
-                if self.num_frames_round_down:
-                    # Ensure we have at least 1 batch per GPU
-                    new_latent_num_frames = (
-                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                    )
-                else:
-                    new_latent_num_frames = (
-                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                    )
+            if self.adjust_frames:
+                # Adjust number of frames based on number of GPUs for video task
+                use_temporal_scaling_frames = (
+                    pipeline_config.vae_config.use_temporal_scaling_frames
+                )
+                num_frames = self.num_frames
+                num_gpus = server_args.num_gpus
+                temporal_scale_factor = (
+                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                )
 
                 if use_temporal_scaling_frames:
-                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                    new_num_frames = (
-                        new_latent_num_frames - 1
-                    ) * temporal_scale_factor + 1
+                    orig_latent_num_frames = (
+                        num_frames - 1
+                    ) // temporal_scale_factor + 1
+                else:
+                    orig_latent_num_frames = num_frames
 
-                logger.info(
-                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                    self.num_frames,
-                    new_num_frames,
-                    server_args.num_gpus,
-                )
-                self.num_frames = new_num_frames
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
+                    if self.num_frames_round_down:
+                        # Ensure we have at least 1 batch per GPU
+                        new_latent_num_frames = (
+                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                        )
+                    else:
+                        new_latent_num_frames = (
+                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                        )
+
+                    if use_temporal_scaling_frames:
+                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                        new_num_frames = (
+                            new_latent_num_frames - 1
+                        ) * temporal_scale_factor + 1
+                    else:
+                        new_num_frames = new_latent_num_frames
+
+                    logger.info(
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                        self.num_frames,
+                        new_num_frames,
+                        server_args.num_gpus,
+                    )
+                    self.num_frames = new_num_frames
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
@@ -417,14 +480,17 @@ class SamplingParams:
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
 
-        model_info = get_model_info(model_path)
+        backend = kwargs.pop("backend", None)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
-            sampling_params = SamplingParams.from_pretrained(model_path)
+            sampling_params = SamplingParams.from_pretrained(
+                model_path, backend=server_args.backend
+            )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
@@ -548,6 +614,18 @@ class SamplingParams:
             help="Name of the output file",
         )
         parser.add_argument(
+            "--output-quality",
+            type=str,
+            default=SamplingParams.output_quality,
+            help="Output quality setting (default, low, medium, high, maximum)",
+        )
+        parser.add_argument(
+            "--output-compression",
+            type=int,
+            default=SamplingParams.output_compression,
+            help="Output compression level (0-100, higher means better quality but larger file size)",
+        )
+        parser.add_argument(
             "--num-outputs-per-prompt",
             type=int,
             default=SamplingParams.num_outputs_per_prompt,
@@ -642,6 +720,13 @@ class SamplingParams:
             help="Guidance rescale factor",
         )
         parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
+        )
+        parser.add_argument(
             "--boundary-ratio",
             type=float,
             default=SamplingParams.boundary_ratio,
@@ -720,6 +805,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -788,9 +885,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass

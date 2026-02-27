@@ -124,6 +124,24 @@ def load_permissions(user_login):
         sys.exit(1)
 
 
+def has_sgl_kernel_changes(pr):
+    """
+    Check if the PR has changes to the sgl-kernel directory.
+    This is used to determine if we need a full workflow rerun
+    (to rebuild the kernel) vs just rerunning failed jobs.
+    """
+    try:
+        files = pr.get_files()
+        for f in files:
+            if f.filename.startswith("sgl-kernel/"):
+                return True
+        return False
+    except Exception as e:
+        print(f"Warning: Could not check PR files for sgl-kernel changes: {e}")
+        # Default to False to avoid unnecessary full reruns
+        return False
+
+
 def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /tag-run-ci-label command.
@@ -157,6 +175,12 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
+    # Check if PR has sgl-kernel changes - if so, we need full reruns
+    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts
+    sgl_kernel_changes = has_sgl_kernel_changes(pr)
+    if sgl_kernel_changes:
+        print("PR has sgl-kernel changes - will use full rerun to rebuild kernel")
+
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
@@ -170,11 +194,15 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             continue
 
         if run.conclusion == "failure":
-            # DEBUG
             print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
             try:
-                # Use rerun_failed_jobs for efficiency on failures
-                run.rerun_failed_jobs()
+                if sgl_kernel_changes:
+                    # Full rerun to ensure sgl-kernel-build-wheels runs
+                    # and produces fresh artifacts for dependent jobs
+                    run.rerun()
+                else:
+                    # Use rerun_failed_jobs for efficiency on failures
+                    run.rerun_failed_jobs()
                 rerun_count += 1
             except Exception as e:
                 print(f"Failed to rerun workflow {run.id}: {e}")
@@ -228,44 +256,31 @@ def handle_rerun_stage(
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
-        "stage-c-test-large-4-gpu-b200",
+        "stage-b-test-4-gpu-b200",
+        "stage-c-test-4-gpu-h100",
+        "stage-c-test-8-gpu-h200",
+        "stage-c-test-8-gpu-h20",
+        "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-gb200",
+        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
-        "quantization-test",
-        "stage-b-test-4-gpu-b200",
-        "unit-test-backend-4-gpu",
-        "unit-test-backend-8-gpu-h200",
-        "unit-test-backend-8-gpu-h20",
-        "unit-test-backend-8-gpu-b200",
-        "performance-test-1-gpu-part-1",
-        "performance-test-1-gpu-part-2",
-        "performance-test-1-gpu-part-3",
-        "performance-test-2-gpu",
-        "accuracy-test-1-gpu",
-        "accuracy-test-2-gpu",
-        "unit-test-deepep-4-gpu",
-        "unit-test-deepep-8-gpu",
-        "unit-test-backend-4-gpu-b200",
-        "unit-test-backend-4-gpu-gb200",
     ]
 
     # Valid AMD stage names that support target_stage
     amd_stages = [
         "sgl-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
-        "stage-b-test-small-1-gpu-performance-amd",
-        "stage-b-test-large-1-gpu-performance-amd",
-        "stage-b-test-large-2-gpu-performance-amd",
+        "multimodal-gen-test-1-gpu-amd",
+        "multimodal-gen-test-2-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
-        "unit-test-backend-1-gpu-amd",
-        "unit-test-backend-2-gpu-amd",
-        "unit-test-backend-8-gpu-amd",
-        "accuracy-test-1-gpu-amd",
-        "accuracy-test-2-gpu-amd",
     ]
 
     valid_stages = nvidia_stages + amd_stages

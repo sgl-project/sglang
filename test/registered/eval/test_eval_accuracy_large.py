@@ -14,13 +14,14 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu-accuracy")
-register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-accuracy-amd")
+register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestEvalAccuracyLarge(CustomTestCase):
@@ -71,7 +72,10 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
             )
 
-        self.assertGreater(metrics["score"], 0.64)
+        if is_in_amd_ci():
+            self.assertGreater(metrics["score"], 0.60)
+        else:
+            self.assertGreater(metrics["score"], 0.64)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

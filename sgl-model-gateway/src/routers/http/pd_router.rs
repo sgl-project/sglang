@@ -30,8 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
@@ -1373,6 +1375,34 @@ impl RouterTrait for PDRouter {
         };
 
         self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/embeddings; returning bad request");
+        error::bad_request(
+            "pd_unsupported_embeddings",
+            "PD mode does not support /v1/embeddings",
+        )
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/classify; returning bad request");
+        error::bad_request(
+            "pd_unsupported_classify",
+            "PD mode does not support /v1/classify",
+        )
     }
 
     fn router_type(&self) -> &'static str {

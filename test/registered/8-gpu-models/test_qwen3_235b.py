@@ -31,10 +31,10 @@ class TestQwen3235BFP8(unittest.TestCase):
         """Run performance and accuracy for Qwen3-235B-FP8."""
         base_args = [
             "--tp=8",
+            "--ep=2",
             "--trust-remote-code",
         ]
         eagle3_args = [
-            "--ep=2",
             "--speculative-algorithm=EAGLE3",
             f"--speculative-draft-model-path={QWEN3_235B_EAGLE3_MODEL_PATH}",
             "--speculative-num-steps=3",
@@ -55,6 +55,7 @@ class TestQwen3235BFP8(unittest.TestCase):
                 QWEN3_235B_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle3_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+EP2+EAGLE3",
             ),
         ]

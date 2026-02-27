@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -92,9 +93,10 @@ class EagleDraftInputV2Mixin:
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
+        alloc_len_per_decode = get_alloc_len_per_decode()
         for r in batch.reqs:
             # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
+            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
@@ -167,8 +169,8 @@ class EagleDraftInputV2Mixin:
             )
 
         # Get a forward batch
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_req = topk
+        self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -230,6 +232,17 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                batch.mamba_track_indices = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -265,7 +278,7 @@ class EagleVerifyInputV2Mixin:
         (which contains spec decoding information).
         """
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
             accept_length = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )

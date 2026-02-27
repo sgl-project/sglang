@@ -18,7 +18,9 @@ apt update -y && apt install -y \
     clang \
     locales \
     ccache \
-    ca-certificates
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0
 update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
@@ -42,14 +44,14 @@ ${PIP_INSTALL} triton-ascend
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.01.21"
+SGLANG_KERNEL_NPU_TAG="2026.02.01.post2"
 mkdir sgl-kernel-npu
-(cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.5.0_${DEVICE_TYPE}.zip \
-&& unzip sgl-kernel-npu_${SGLANG_KERNEL_NPU_TAG}_8.5.0_${DEVICE_TYPE}.zip \
-&& ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl \
+(cd sgl-kernel-npu && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \
+&& unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \
+&& ${PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \
 && (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
 
 
 ### Install SGLang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${PIP_INSTALL} -v -e "python[dev_npu]"

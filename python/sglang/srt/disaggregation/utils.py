@@ -5,15 +5,23 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Literal, Optional, Type, overload
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.common.conn import (
+        CommonKVBootstrapServer,
+        CommonKVManager,
+        CommonKVReceiver,
+        CommonKVSender,
+    )
     from sglang.srt.managers.schedule_batch import Req
 
 #########################
@@ -90,13 +98,18 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+            # TODO: Fix me when npu backend supports torch.uint64
+            bootstrap_room_dtype = torch.int64
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
+        elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
+            device = "cuda"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -132,6 +145,10 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            # Request validation: store bootstrap_room to detect metadata corruption
+            self.bootstrap_room = torch.zeros(
+                (size, 8), dtype=bootstrap_room_dtype, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -144,6 +161,7 @@ class MetadataBuffers:
             self.output_topk_p.data_ptr(),
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
+            self.bootstrap_room.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -155,6 +173,7 @@ class MetadataBuffers:
             self.output_topk_p.nbytes,
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
+            self.bootstrap_room.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -166,6 +185,7 @@ class MetadataBuffers:
             self.output_topk_p[0].nbytes,
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
+            self.bootstrap_room[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -180,6 +200,7 @@ class MetadataBuffers:
             self.output_topk_p[idx],
             self.output_topk_index[idx],
             self.output_hidden_states[idx],
+            self.bootstrap_room[idx],
         )
 
     def set_buf(self, req: Req):
@@ -222,6 +243,10 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        # Store bootstrap_room for validation on decode side
+        self.bootstrap_room[req.metadata_buffer_index, 0] = (
+            req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
 
 
 #########################
@@ -231,6 +256,7 @@ class MetadataBuffers:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
+    MORI = "mori"
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
@@ -242,6 +268,28 @@ class KVClassType(Enum):
     SENDER = "sender"
     RECEIVER = "receiver"
     BOOTSTRAP_SERVER = "bootstrap_server"
+
+
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.KVARGS]
+) -> Type[KVArgs]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.MANAGER]
+) -> Type[CommonKVManager]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.SENDER]
+) -> Type[CommonKVSender]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.RECEIVER]
+) -> Type[CommonKVReceiver]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
+) -> Type[CommonKVBootstrapServer]: ...
 
 
 def get_kv_class(
@@ -264,6 +312,23 @@ def get_kv_class(
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.MORI:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.mori import (
+            MoriKVBootstrapServer,
+            MoriKVManager,
+            MoriKVReceiver,
+            MoriKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: MoriKVManager,
+            KVClassType.SENDER: MoriKVSender,
+            KVClassType.RECEIVER: (MoriKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: MoriKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
@@ -302,10 +367,15 @@ def get_kv_class(
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
-        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+        from sglang.srt.disaggregation.fake import (
+            FakeKVManager,
+            FakeKVReceiver,
+            FakeKVSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
         }

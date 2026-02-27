@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -119,9 +119,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        self.metrics_collector = RadixCacheMetricsCollector(
-            labels={"cache_type": self.__class__.__name__}
-        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        labels = {"cache_type": self.__class__.__name__}
+        if server_args.extra_metric_labels:
+            labels.update(server_args.extra_metric_labels)
+        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -218,3 +222,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
+
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.evictable_size()
+        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

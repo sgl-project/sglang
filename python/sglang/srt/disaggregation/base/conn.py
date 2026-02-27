@@ -32,6 +32,7 @@ class KVArgs:
     # for different tp
     decode_tp_size: int
     kv_head_num: int
+    total_kv_head_num: int
     page_size: int
     # for pp prefill
     prefill_pp_size: int
@@ -60,6 +61,11 @@ class BaseKVManager(ABC):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ): ...
+
+    @abstractmethod
+    def register_to_bootstrap(self):
+        """Register prefill server info to the bootstrap server."""
+        ...
 
 
 class BaseKVSender(ABC):
@@ -158,4 +164,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, host: str, port: int): ...
+    def __init__(self, host: str, port: int, dp_size: int = 1): ...
