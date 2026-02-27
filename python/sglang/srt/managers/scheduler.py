@@ -774,18 +774,19 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
+        self.max_prefill_bs: int = 0
         if self.server_args.enable_prefill_delayer:
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                device=self.tp_worker.get_tp_group().device if self.server_args.disable_overlap_schedule else "cpu"
+                device=self.tp_group.device if self.server_args.disable_overlap_schedule else "cpu"
             )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
