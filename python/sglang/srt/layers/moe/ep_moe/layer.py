@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -14,21 +15,29 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FlashInferFusedMoE,
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
+from sglang.srt.layers.moe.rocm_moe_utils import upscale
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPLLCombineInput,
+    MoriEPNormalCombineInput,
+)
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    NPUCompressedTensorsW4A16Int4DynamicMoE,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
@@ -120,20 +129,20 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
-            self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
 
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
+            and not _is_hip
             and not (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"
             )
         ):
-            # NPU supports low_latency deepep without deepgemm
-            # FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
+            # AMD HIP, NPU supports low_latency deepep without deepgemm
+            # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
@@ -243,6 +252,7 @@ class DeepEPMoE(FusedMoE):
             if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
             else DeepEPLLCombineInput
         )
+
         return combine_input_wrapper(
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,
@@ -272,8 +282,10 @@ class DeepEPMoE(FusedMoE):
             dispatch_output.topk_ids,
             dispatch_output.topk_weights,
         )
+
         if hidden_states.shape[0] == 0:
             return hidden_states
+
         # in original deepep, idx == -1 meaning invalid and will not be processed.
         # aiter does not accept -1, we use a expert mask to make these idx invalid
         # (idx == num_local_experts) meaning not used in aiter fused_moe
@@ -374,7 +386,11 @@ class DeepEPMoE(FusedMoE):
             else:
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                 if not input_quant and not isinstance(
-                    self.quant_method, NPUCompressedTensorsW4A16Int4DynamicMoEMethod
+                    self.quant_method,
+                    (
+                        NPUCompressedTensorsW4A16Int4DynamicMoE,
+                        CompressedTensorsFusedMoEMethod,
+                    ),
                 ):
                     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
                         hidden_states
@@ -472,13 +488,6 @@ class NpuFuseEPMoE(DeepEPMoE):
             gmm2_weight_scale=self.w2_weight_scale,
         ).hidden_state
 
-    def release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
-
     def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
         if tile_n % 2 != 0:
             raise ValueError(f"tile_n must be even, got {tile_n}")
@@ -520,14 +529,12 @@ class NpuFuseEPMoE(DeepEPMoE):
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13 = self.release_weight_cache(layer.w13_weight)
-        torch_npu.npu_format_cast_(w13, 2)
-        cpu_w13 = w13.cpu()
+        cpu_w13 = layer.w13_weight.transpose(1, 2).cpu()
         w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
-        torch_npu.npu_format_cast_(w13, 29)
+        w13 = npu_format_cast(w13)
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
 
-        w2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        w2 = npu_format_cast(layer.w2_weight)
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
 
         w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
@@ -553,7 +560,167 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
+class MoriEPMoE(DeepEPMoE):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
+        )
+
+        assert _use_aiter, "Mori need to be used together with aiter as of now"
+        self.expert_mask = torch.zeros(
+            (self.num_experts),
+            device=torch.cuda.current_device(),
+            dtype=torch.int32,
+        )
+        expert_start_idx = self.moe_ep_rank * self.num_local_experts
+        expert_end_idx = expert_start_idx + self.num_local_experts
+        self.expert_mask[expert_start_idx:expert_end_idx] = 1
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        num_token = hidden_states.shape[0]
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        combine_input = self.run_moe_core(dispatch_output)
+        hidden_states = self.dispatcher.combine(
+            combine_input=combine_input,
+        )
+
+        return hidden_states[:num_token]
+
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+    ):
+        scale = None
+        is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
+        is_quark_w4a4 = hasattr(self, "scheme") and isinstance(
+            self.scheme, QuarkW4A4MXFp4MoE
+        )
+
+        (
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            dispatch_recv_token_num,
+            origin_topk_ids,
+            origin_topk_weights,
+            output_dtype,
+        ) = (
+            dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+            dispatch_output.num_recv_tokens_per_expert,
+            dispatch_output.origin_topk_ids,
+            dispatch_output.origin_topk_weights,
+            dispatch_output.out_dtype,
+        )
+
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+
+        w13_scale = None
+        w2_scale = None
+
+        quant_type = QuantType.No
+
+        if not is_fp8_quant and dispatch_scale is not None:
+            dispatch_a1 = upscale(
+                dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
+            )
+            dispatch_scale = None
+
+        if is_quark_w4a4:
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = self.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = self.w2_weight.view(torch.float4_e2m1fn_x2)
+
+            w13_scale = self.w13_weight_scale
+            w2_scale = self.w2_weight_scale
+            quant_type = QuantType.per_1x32
+
+            if hasattr(self.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+        elif is_fp8_quant:
+            if hasattr(self, "w13_weight_scale_inv"):
+                w13_scale = self.w13_weight_scale_inv
+            if hasattr(self, "w2_weight_scale_inv"):
+                w2_scale = self.w2_weight_scale_inv
+
+            quant_type = QuantType.per_128x128
+
+        # [KK TODO] should to call the apply of quant method to handle fused moe
+        hidden_states = fused_moe(
+            hidden_states=dispatch_a1,
+            w1=w13_weight,
+            w2=w2_weight,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            a1_scale=dispatch_scale,
+            topk_weight=dispatch_weights,
+            topk_ids=dispatch_ids,
+            quant_type=quant_type,
+            activation=(
+                ActivationType.Silu
+                if self.moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            expert_mask=self.expert_mask,
+            num_local_tokens=dispatch_recv_token_num,
+            dtype=output_dtype,
+        )
+
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        combine_input_wrapper = (
+            MoriEPNormalCombineInput
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            else MoriEPLLCombineInput
+        )
+
+        return combine_input_wrapper(
+            hidden_states=hidden_states,
+            topk_ids=dispatch_output.origin_topk_ids,
+            topk_weights=dispatch_output.origin_topk_weights,
+        )
+
+
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    # [TODO] kk, temporary solution
+    if get_moe_a2a_backend().is_mori():
+        return MoriEPMoE
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():
@@ -574,7 +741,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             or quant_config.get_name() == "compressed_tensors"
         ):
             # FlashInferFusedMoE support bf16, fp8 and compressed_tensors
-            return FlashInferFusedMoE
+            return FusedMoE
 
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE

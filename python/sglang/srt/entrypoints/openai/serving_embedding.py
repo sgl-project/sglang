@@ -126,12 +126,16 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
 
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             dimensions=request.dimensions,
+            lora_path=lora_path,
         )
 
         return adapted_request, request

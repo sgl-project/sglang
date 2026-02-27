@@ -2,11 +2,19 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, suite="stage-b-test-large-1-gpu")
@@ -31,7 +39,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -83,7 +91,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -126,8 +134,8 @@ class TestSWA(unittest.TestCase):
                 token_to_kv_pool_allocator=allocator,
                 disable=False,
                 page_size=page_size,
+                sliding_window_size=sliding_window_size,
             ),
-            sliding_window_size=sliding_window_size,
         )
 
         # test
@@ -139,7 +147,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req1_token_ids), req1_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req1_token_ids), value=req1_kv_indices)
+        )
+        prefix_len = result.prefix_len
         print(
             f"req1: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -148,7 +159,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req2_token_ids), req2_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req2_token_ids), value=req2_kv_indices)
+        )
+        prefix_len = result.prefix_len
         print(
             f"req2: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -157,7 +171,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req3_token_ids), req3_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req3_token_ids), value=req3_kv_indices)
+        )
+        prefix_len = result.prefix_len
         print(
             f"req3: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -166,7 +183,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req4_token_ids), req4_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req4_token_ids), value=req4_kv_indices)
+        )
+        prefix_len = result.prefix_len
         print(
             f"req4: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
         )
@@ -174,21 +194,27 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
         full_num_tokens, swa_num_tokens = 1, 0
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
         tree.pretty_print()
 
         full_num_tokens, swa_num_tokens = 0, 1
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
         tree.pretty_print()
 
         full_num_tokens, swa_num_tokens = 1, 2
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(RadixKey(req5_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -196,7 +222,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req6_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -205,6 +231,10 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(last_node.key), 2)
         self.assertEqual(last_node.key.token_ids[0], 60)
         self.assertEqual(last_node.key.token_ids[1], 70)
+
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+        tree.sanity_check()
 
     def test_swa_radix_cache_eagle(self):
         # args
@@ -219,7 +249,7 @@ class TestSWA(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
         full_attention_layer_ids_set = set(full_attention_layer_ids)
         swa_attention_layer_ids = [
@@ -263,8 +293,8 @@ class TestSWA(unittest.TestCase):
                 page_size=page_size,
                 disable=False,
                 is_eagle=True,
+                sliding_window_size=sliding_window_size,
             ),
-            sliding_window_size=sliding_window_size,
         )
 
         # test
@@ -276,7 +306,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req1_token_ids), req1_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req1_token_ids), value=req1_kv_indices)
+        )
+        prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 0)
         print(
             f"req1: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
@@ -286,7 +319,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req2_token_ids), req2_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req2_token_ids), value=req2_kv_indices)
+        )
+        prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 2)
         print(
             f"req2: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
@@ -296,7 +332,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req3_token_ids), req3_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req3_token_ids), value=req3_kv_indices)
+        )
+        prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 0)
         print(
             f"req3: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
@@ -306,7 +345,10 @@ class TestSWA(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        prefix_len = tree.insert(RadixKey(req4_token_ids), req4_kv_indices)
+        result = tree.insert(
+            InsertParams(key=RadixKey(req4_token_ids), value=req4_kv_indices)
+        )
+        prefix_len = result.prefix_len
         self.assertEqual(prefix_len, 4)
         print(
             f"req4: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
@@ -315,21 +357,45 @@ class TestSWA(unittest.TestCase):
         tree.pretty_print()
         full_num_tokens, swa_num_tokens = 1, 0
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        evict_result = tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
+        assert isinstance(evict_result, EvictResult)
+        assert (
+            evict_result.num_tokens_evicted >= full_num_tokens
+        )  # May evict more due to node granularity
+        print(
+            f"evicted {evict_result.num_tokens_evicted} full tokens, {evict_result.swa_num_tokens_evicted} swa tokens"
+        )
         tree.pretty_print()
 
         full_num_tokens, swa_num_tokens = 0, 1
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        evict_result = tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
+        assert isinstance(evict_result, EvictResult)
+        assert (
+            evict_result.swa_num_tokens_evicted >= swa_num_tokens
+        ), f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
         tree.pretty_print()
 
         full_num_tokens, swa_num_tokens = 1, 2
         print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(full_num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        evict_result = tree.evict(
+            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+        )
+        assert isinstance(evict_result, EvictResult)
+        assert (
+            evict_result.num_tokens_evicted >= full_num_tokens
+        ), f"evicted {evict_result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        assert (
+            evict_result.swa_num_tokens_evicted >= swa_num_tokens
+        ), f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(RadixKey(req5_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -337,7 +403,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(kv_indices), 0)  # no swa prefix matched
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req6_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"

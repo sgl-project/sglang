@@ -1,6 +1,6 @@
 # AMD GPUs
 
-This document describes how run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how to run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## System Configuration
 
@@ -55,7 +55,7 @@ python setup_rocm.py install
 # Install sglang python package along with diffusion support
 cd ..
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_hip,diffusion_hip]"
+pip install -e "python[all_hip]"
 ```
 
 ### Install Using Docker (Recommended)

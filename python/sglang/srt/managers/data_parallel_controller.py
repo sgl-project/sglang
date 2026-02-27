@@ -29,26 +29,21 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    ActiveRanksOutput,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
-)
-from sglang.srt.tracing.trace import (
-    process_tracing_init,
-    trace_get_proc_propagate_context,
-    trace_set_proc_propagate_context,
-    trace_set_thread_info,
-    trace_slice_end,
-    trace_slice_start,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -158,6 +153,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -179,8 +175,9 @@ class DataParallelController:
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
-        for worker in self.workers:
-            worker.send_pyobj(obj)
+        for i, worker in enumerate(self.workers):
+            if self.status[i]:
+                worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
@@ -190,16 +187,15 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    def update_active_ranks(self, ranks: ActiveRanksOutput):
+        self.status = ranks.status
+
     def dispatching_with_trace(self, req: Req):
-        if self.server_args.enable_trace:
-            trace_set_proc_propagate_context(req.rid, req.trace_context)
-            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
-            req.trace_context = trace_get_proc_propagate_context(req.rid)
+        req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
+        req.time_stats.set_dp_dispatch_time()
         self.dispatching(req)
-
-        if self.server_args.enable_trace:
-            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+        req.time_stats.set_dp_dispatch_finish_time()
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -208,6 +204,7 @@ class DataParallelController:
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
+                (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -411,6 +408,8 @@ class DataParallelController:
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
         )
 
+        attn_cp_rank = 0
+        moe_dp_rank = 0
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
@@ -422,6 +421,7 @@ class DataParallelController:
                         tp_rank,
                         server_args.tp_size,
                         server_args.dp_size,
+                        server_args.attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
@@ -438,7 +438,30 @@ class DataParallelController:
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                attn_dp_size = (
+                    server_args.dp_size if server_args.enable_dp_attention else 1
+                )
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
+                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
+
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
@@ -447,6 +470,8 @@ class DataParallelController:
                             rank_port_args,
                             gpu_id,
                             tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
                             moe_ep_rank,
                             pp_rank,
                             dp_rank,
@@ -469,9 +494,9 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+        if req.routed_dp_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
 
@@ -479,8 +504,17 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        self.workers[self.round_robin_counter].send_pyobj(req)
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        while True:
+            if self.status[self.round_robin_counter]:
+                logger.debug(f"Choose worker {self.round_robin_counter}")
+                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
+                break
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -489,7 +523,7 @@ class DataParallelController:
         # Set default bootstrap_room if in FAKE auto mode and room is None
         if (
             req.bootstrap_room is None
-            and self.server_args.disaggregation_decode_enable_fake_auto
+            and self.server_args.disaggregation_transfer_backend == "fake"
         ):
             req.bootstrap_room = self.round_robin_counter
             self.round_robin_counter = (self.round_robin_counter + 1) % len(

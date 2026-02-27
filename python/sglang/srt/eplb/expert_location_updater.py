@@ -92,6 +92,13 @@ class ExpertLocationUpdater:
                 )
                 weight_name_filter = None
 
+            if (
+                model_runner.expert_backup_client is not None
+                and model_runner.expert_backup_client.use_backup
+            ):
+                model_runner.expert_backup_client.update_weights(weight_name_filter)
+                return
+
             model_runner.update_weights_from_disk(
                 model_runner.server_args.model_path,
                 model_runner.server_args.load_format,

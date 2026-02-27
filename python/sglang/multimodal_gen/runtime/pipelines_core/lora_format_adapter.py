@@ -21,11 +21,6 @@ class LoRAFormat(str, Enum):
     WAN = "wan"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
     out = []
     for i, key in enumerate(keys):
@@ -41,11 +36,6 @@ def _has_substring_key(keys: Iterable[str], substr: str) -> bool:
 
 def _has_prefix_key(keys: Iterable[str], prefix: str) -> bool:
     return any(k.startswith(prefix) for k in keys)
-
-
-# ---------------------------------------------------------------------------
-# Format-specific heuristics
-# ---------------------------------------------------------------------------
 
 
 def _looks_like_xlabs_flux_key(k: str) -> bool:
@@ -114,11 +104,6 @@ def _looks_like_qwen_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Format detection
-# ---------------------------------------------------------------------------
-
-
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> LoRAFormat:
@@ -148,11 +133,6 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.NON_DIFFUSERS_SD
 
     return LoRAFormat.STANDARD
-
-
-# ---------------------------------------------------------------------------
-# Converters
-# ---------------------------------------------------------------------------
 
 
 def _convert_qwen_image_standard(
@@ -329,11 +309,6 @@ def _convert_kohya_flux_via_diffusers(
     )
 
 
-# ---------------------------------------------------------------------------
-# Conversion dispatcher
-# ---------------------------------------------------------------------------
-
-
 def convert_lora_state_dict_by_format(
     state_dict: Mapping[str, torch.Tensor],
     fmt: LoRAFormat,
@@ -378,11 +353,6 @@ def convert_lora_state_dict_by_format(
         fmt,
     )
     return dict(state_dict)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 
 
 def normalize_lora_state_dict(

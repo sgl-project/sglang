@@ -55,13 +55,13 @@ class LoRAManager:
         max_loras_per_batch: int,
         load_config: LoadConfig,
         dtype: torch.dtype,
+        server_args: ServerArgs,
         lora_backend: str = "triton",
         tp_size: int = 1,
         tp_rank: int = 0,
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
-        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -154,6 +154,10 @@ class LoRAManager:
         """
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
+        if lora_config.lora_added_tokens_size > 0:
+            raise ValueError(
+                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
 
         # Check if this LoRA adapter is already loaded
         for existing_lora_ref in self.lora_refs.values():
@@ -383,6 +387,33 @@ class LoRAManager:
         )
 
         for lora_id, config in self.configs.items():
+            # Handle PEFT shorthand strings like "all-linear" or "all".
+            # These cannot be resolved to concrete module names without
+            # inspecting the base model, so we require the user to specify
+            # --lora-target-modules explicitly when such shorthands are used.
+            if isinstance(config.target_modules, str):
+                if config.target_modules in ("all-linear", "all"):
+                    if target_modules is not None:
+                        # CLI --lora-target-modules already provided; skip
+                        # per-adapter inference for this adapter.
+                        continue
+                    else:
+                        lora_name = self.lora_refs[lora_id].lora_name
+                        raise ValueError(
+                            f"LoRA adapter '{lora_name}' uses "
+                            f"target_modules='{config.target_modules}' which cannot "
+                            "be resolved automatically. Please explicitly specify "
+                            "--lora-target-modules during server startup. You can "
+                            "specify 'all' to enable all supported module types."
+                        )
+                else:
+                    raise ValueError(
+                        f"SGLang does not recognize target_modules="
+                        f"'{config.target_modules}'. Please use a list of module "
+                        "name suffixes in the adapter's PEFT config, or explicitly "
+                        "specify --lora-target-modules during server startup."
+                    )
+
             if not isinstance(config.target_modules, list):
                 raise ValueError(
                     f"SGLang currently only supports inferring LoRA target modules when a list of "
@@ -536,6 +567,40 @@ class LoRAManager:
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+
+        # When tie_word_embeddings=True, lm_head is the same Python object as
+        # embed_tokens. PyTorch's named_modules() deduplicates by object identity,
+        # so lm_head will not appear as a separate entry in the scan below,
+        # preventing LoRA from wrapping it. To fix this, we create a new
+        # ParallelLMHead that shares the same base weight tensor (no extra GPU
+        # memory) so that named_modules() yields it as an independent module.
+        if "lm_head" in self.target_modules:
+            lm_head = getattr(self.base_model, "lm_head", None)
+            embed_tokens = None
+            for name, mod in self.base_model.named_modules():
+                if name.endswith("embed_tokens"):
+                    embed_tokens = mod
+                    break
+            if (
+                lm_head is not None
+                and embed_tokens is not None
+                and lm_head is embed_tokens
+            ):
+                logger.info(
+                    "lm_head is tied with embed_tokens. Creating a separate "
+                    "ParallelLMHead that shares the base weight for LoRA support."
+                )
+                untied_lm_head = ParallelLMHead(
+                    num_embeddings=embed_tokens.org_vocab_size,
+                    embedding_dim=embed_tokens.embedding_dim,
+                    params_dtype=embed_tokens.weight.dtype,
+                    org_num_embeddings=embed_tokens.org_vocab_size,
+                )
+                # Share the base weight tensor — no additional GPU memory.
+                untied_lm_head.weight = embed_tokens.weight
+                # Replace the model attribute so named_modules() sees it
+                # independently.
+                self.base_model.lm_head = untied_lm_head
 
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
