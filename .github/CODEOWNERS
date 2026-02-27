@@ -2,7 +2,7 @@
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
-/python/sglang/jit_kernel @DarkSharpness @BBuf
+/python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
