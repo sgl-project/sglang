@@ -218,7 +218,7 @@ class DiffusionSamplingParams:
     # TeaCache acceleration
     enable_teacache: bool = False
 
-    # Frame interpolation (RIFE)
+    # Frame interpolation
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
 
@@ -488,8 +488,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
     ),
     # Frame interpolation correctness (2× / exp=1)
-    # Uses the same 1.3B model already in the suite; run_perf_check=False
-    # (no perf baseline needed – this is a correctness test)
+    # Uses the same 1.3B model already in the suite;
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_frame_interp_2x",
         DiffusionServerArgs(
@@ -503,7 +502,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             enable_frame_interpolation=True,
             frame_interpolation_exp=1,
         ),
-        run_perf_check=False,
     ),
     # LoRA test case for single transformer + merge/unmerge API test
     # Note: Uses dynamic_lora_path instead of lora_path to test LayerwiseOffload + set_lora interaction

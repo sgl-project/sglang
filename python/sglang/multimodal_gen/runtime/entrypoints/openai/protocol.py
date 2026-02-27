@@ -90,7 +90,7 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
-    # Frame interpolation (RIFE)
+    # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×
     frame_interpolation_scale: Optional[float] = 1.0

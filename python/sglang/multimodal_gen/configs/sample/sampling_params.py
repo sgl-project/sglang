@@ -100,7 +100,7 @@ class SamplingParams:
     output_quality: str | None = "default"
     output_compression: int | None = None
 
-    # Frame interpolation (RIFE 4.22.lite)
+    # Frame interpolation
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1  # 1=2x, 2=4x
     frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
