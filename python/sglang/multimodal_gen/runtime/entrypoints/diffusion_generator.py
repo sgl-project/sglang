@@ -168,13 +168,14 @@ class DiffGenerator:
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
         requests: list[Req] = []
         for p in prompts:
             sampling_params = dataclasses.replace(
                 sampling_params_orig,
                 prompt=p,
-                output_file_name=None,
+                output_file_name=user_output_file_name,
             )
             sampling_params._set_output_file_name()
             req = prepare_request(
