@@ -850,6 +850,12 @@ def _compute_static_meta():
         if info := plugin.collect_parallel_info():
             result[f"{plugin.name}_parallel_info"] = info
 
+    for plugin in _plugins:
+        tokenizer_path: Optional[str] = plugin.get_tokenizer_path()
+        if tokenizer_path is not None:
+            result["tokenizer_path"] = tokenizer_path
+            break
+
     return result
 
 
@@ -1105,6 +1111,9 @@ class _FrameworkPlugin(ABC):
     def core_fields(self) -> frozenset[str]:
         return frozenset()
 
+    def get_tokenizer_path(self) -> Optional[str]:
+        return None
+
 
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
@@ -1188,6 +1197,21 @@ class _SGLangPlugin(_FrameworkPlugin):
         return frozenset(
             {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
         )
+
+    def get_tokenizer_path(self) -> Optional[str]:
+        if not self._available:
+            return None
+
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            args = get_global_server_args()
+            if args is None:
+                return None
+
+            return args.tokenizer_path
+        except Exception:
+            return None
 
 
 class _MegatronPlugin(_FrameworkPlugin):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import polars as pl
 
@@ -21,6 +21,7 @@ from sglang.srt.debug_utils.comparator.bundle_matcher import (
     TensorBundleInfo,
     match_bundles,
 )
+from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
@@ -30,7 +31,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
-from sglang.srt.debug_utils.dump_loader import read_meta
+from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 
 def main() -> None:
@@ -47,6 +48,20 @@ def run(args: argparse.Namespace) -> None:
     warning_sink.set_output_format(args.output_format)
 
     dfs: Pair[pl.DataFrame] = _read_df(args)
+
+    tokenizer: Any = _maybe_load_tokenizer(args)
+    for label, df, dump_dir in [
+        ("baseline", dfs.x, Path(args.baseline_path)),
+        ("target", dfs.y, Path(args.target_path)),
+    ]:
+        emit_display_records(
+            df=df,
+            dump_dir=dump_dir,
+            label=label,
+            tokenizer=tokenizer,
+            output_format=args.output_format,
+        )
+
     ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
 
     dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
@@ -69,6 +84,26 @@ def run(args: argparse.Namespace) -> None:
     _consume_comparison_records(
         comparison_records=comparison_records, output_format=args.output_format
     )
+
+
+def _maybe_load_tokenizer(args: argparse.Namespace) -> Any:
+    tokenizer_path: Optional[str] = getattr(args, "tokenizer", None)
+
+    if tokenizer_path is None:
+        for directory in [Path(args.baseline_path), Path(args.target_path)]:
+            tokenizer_path = read_tokenizer_path(directory)
+            if tokenizer_path is not None:
+                break
+
+    if tokenizer_path is None:
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception:
+        return None
 
 
 def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
@@ -162,5 +197,11 @@ def _parse_args() -> argparse.Namespace:
         choices=["logical", "raw"],
         default="logical",
         help="Grouping mode: logical (cross-rank unshard) or raw (rank-by-rank)",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer path for decoding input_ids (auto-discovered from dump metadata if not set)",
     )
     return parser.parse_args()

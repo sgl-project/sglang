@@ -6,7 +6,6 @@ import torch
 from einops import rearrange
 
 from sglang.srt.debug_utils.comparator.dims import parse_dims
-from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
 from sglang.srt.debug_utils.comparator.utils import Pair, _FrozenBase
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 
@@ -33,6 +32,10 @@ def compute_axis_swapper_plan(
         return None
 
     if set(x_names) != set(y_names):
+        # Local import to avoid circular dependency:
+        # output_types -> aligner/entrypoint/types -> axis_swapper -> output_types
+        from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
+
         warning_sink.add(
             GeneralWarning(
                 category="axis_swapper_dim_mismatch",

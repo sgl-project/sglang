@@ -45,6 +45,7 @@ UnsharderParams = Annotated[
 
 
 class UnsharderPlan(_FrozenBase):
+    type: Literal["unsharder"] = "unsharder"
     axis: ParallelAxis
     params: UnsharderParams
     # groups[i] = indices in the input tensor list, which will be operated (e.g. concat) into i-th output tensor.

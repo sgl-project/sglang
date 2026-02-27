@@ -1,7 +1,10 @@
-from abc import abstractmethod
-from typing import Annotated, Any, Literal, Union
+from __future__ import annotations
 
-from pydantic import Discriminator, Field, TypeAdapter, model_validator
+from abc import abstractmethod
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
+
+import polars as pl
+from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
@@ -10,6 +13,11 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
+
+if TYPE_CHECKING:
+    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+        AlignerPlan,
+    )
 
 
 class ReplicatedMismatchWarning(_StrictBase):
@@ -84,8 +92,40 @@ class SkipRecord(_OutputRecord):
         return f"Skip: {self.name} ({self.reason})"
 
 
+class _TableRecord(_OutputRecord):
+    label: str
+    rows: list[dict[str, Any]]
+
+    @abstractmethod
+    def _table_title(self) -> str: ...
+
+    def _format_body(self) -> str:
+        from sglang.srt.debug_utils.comparator.display import _render_polars_as_text
+
+        return _render_polars_as_text(
+            pl.DataFrame(self.rows), title=self._table_title()
+        )
+
+
+class RankInfoRecord(_TableRecord):
+    type: Literal["rank_info"] = "rank_info"
+
+    def _table_title(self) -> str:
+        return f"{self.label} ranks"
+
+
+class InputIdsRecord(_TableRecord):
+    type: Literal["input_ids"] = "input_ids"
+
+    def _table_title(self) -> str:
+        return f"{self.label} input_ids & positions"
+
+
 class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
+    model_config = ConfigDict(extra="forbid", defer_build=True)
+
     type: Literal["comparison"] = "comparison"
+    aligner_plan: Optional[AlignerPlan] = None
 
     @property
     def category(self) -> str:
@@ -94,7 +134,10 @@ class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def _format_body(self) -> str:
-        return format_comparison(self)
+        body: str = format_comparison(self)
+        if self.aligner_plan is not None:
+            body += "\n" + _format_aligner_plan(self.aligner_plan)
+        return body
 
 
 class SummaryRecord(_OutputRecord):
@@ -127,17 +170,56 @@ class WarningRecord(_OutputRecord):
         return ""
 
 
+def _format_aligner_plan(plan: AlignerPlan) -> str:
+    lines: list[str] = ["Aligner Plan:"]
+
+    for side_label, side_plans in [
+        ("baseline", plan.per_step_plans.x),
+        ("target", plan.per_step_plans.y),
+    ]:
+        if not side_plans:
+            lines.append(f"  {side_label}: (no steps)")
+            continue
+
+        step_summaries: list[str] = []
+        for step_plan in side_plans:
+            sub_strs: list[str] = []
+            for sub in step_plan.sub_plans:
+                sub_strs.append(f"{sub.type}")
+            summary: str = ", ".join(sub_strs) if sub_strs else "passthrough"
+            step_summaries.append(f"step={step_plan.step}: {summary}")
+        lines.append(f"  {side_label}: [{'; '.join(step_summaries)}]")
+
+    if plan.token_aligner_plan is not None:
+        num_tokens: int = len(plan.token_aligner_plan.locators.x.steps)
+        lines.append(f"  token_aligner: {num_tokens} tokens aligned")
+
+    if plan.axis_swapper_plan is not None:
+        lines.append(f"  axis_swapper: {plan.axis_swapper_plan.pattern}")
+
+    return "\n".join(lines)
+
+
 AnyRecord = Annotated[
-    Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord, WarningRecord],
+    Union[
+        ConfigRecord,
+        RankInfoRecord,
+        InputIdsRecord,
+        SkipRecord,
+        ComparisonRecord,
+        SummaryRecord,
+        WarningRecord,
+    ],
     Discriminator("type"),
 ]
 
 
-_any_record_adapter = TypeAdapter(AnyRecord)
+def _get_any_record_adapter() -> TypeAdapter:
+    return TypeAdapter(AnyRecord)
 
 
 def parse_record_json(json_str: str | bytes) -> AnyRecord:
-    return _any_record_adapter.validate_json(json_str)
+    return _get_any_record_adapter().validate_json(json_str)
 
 
 def print_record(record: _OutputRecord, output_format: str) -> None:
