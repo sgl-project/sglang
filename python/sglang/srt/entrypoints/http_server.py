@@ -676,13 +676,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
+                        out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
+                    out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
                 ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -696,7 +696,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return ret
+            return Response(
+                content=orjson.dumps(
+                    ret, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
+                ),
+                media_type="application/json",
+            )
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)

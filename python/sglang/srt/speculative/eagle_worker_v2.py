@@ -785,6 +785,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
+
+        # Update mamba state for hybrid GDN models after verification
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+        ):
+            self._mamba_verify_update(
+                batch, verify_input, accept_length, accept_index, bs
+            )
+
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
@@ -814,6 +824,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
         )
+
+    def _mamba_verify_update(
+        self,
+        batch: ModelWorkerBatch,
+        verify_input: EagleVerifyInput,
+        accept_length: torch.Tensor,
+        accept_index: torch.Tensor,
+        bs: int,
+    ):
+        """Update mamba state for hybrid GDN models after verification."""
+        # Calculate accepted_steps for mamba state update
+        # Include the bonus token (+1)
+        accepted_length_with_bonus = accept_length
+        if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+            if verify_input.topk != 1:
+                raise ValueError("Spec v2 currently only supports topk = 1.")
+
+            accepted_indices_offset = torch.arange(
+                0,
+                bs * self.speculative_num_draft_tokens,
+                step=self.speculative_num_draft_tokens,
+                dtype=accepted_length_with_bonus.dtype,
+                device=accepted_length_with_bonus.device,
+            )
+            accepted_steps = accepted_length_with_bonus - 1
+
+            if batch.mamba_track_indices is not None:
+                # If after verify, the request's seq_lens has crossed a mamba track interval,
+                # we need to update the mamba state for the request at the crossing point.
+                seq_lens_pre_verify = batch.seq_lens
+                seq_lens_post_verify = batch.seq_lens + accepted_length_with_bonus
+                mamba_track_interval = self.server_args.mamba_track_interval
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                ).to(torch.int64)
+                req_idx = torch.arange(
+                    bs,
+                    dtype=torch.int64,
+                    device=accepted_length_with_bonus.device,
+                )
+                candidate_track_steps = (
+                    accept_index[req_idx, to_track_ith] - accepted_indices_offset
+                )
+                mamba_steps_to_track = torch.where(
+                    to_track_mask,
+                    candidate_track_steps,
+                    torch.full_like(candidate_track_steps, -1),
+                )
+            else:
+                mamba_steps_to_track = None
+
+            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_steps=accepted_steps,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=self.target_worker.model_runner.model,
+            )
 
     def move_accepted_tokens_to_target_kvcache(
         self,
