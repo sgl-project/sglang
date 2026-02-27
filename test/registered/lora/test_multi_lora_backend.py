@@ -14,60 +14,22 @@
 
 import multiprocessing as mp
 import os
-import re
 import unittest
 
-from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-if is_hip():
-    os.environ.setdefault("SGLANG_USE_AITER", "0")
-
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
     run_lora_multiple_batch_on_model_cases,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_amd_ci, is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=200, suite="stage-b-test-small-1-gpu-amd-nondeterministic")
+register_amd_ci(est_time=100, suite="stage-b-test-small-1-gpu-amd-nondeterministic")
 
 
 class TestMultiLoRABackend(CustomTestCase):
-    def _callTestMethod(self, method):
-        from sglang.srt.environ import envs
-        from sglang.srt.utils.common import retry
-
-        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
-        if max_retry is None:
-            max_retry = 1 if is_in_ci() else 0
-
-        if is_in_amd_ci():
-            attempt_count = [0]
-
-            def should_retry(e):
-                attempt_count[0] += 1
-                match = re.search(r"ROUGE-L score ([\d.]+)", str(e))
-                if match:
-                    score = float(match.group(1))
-                    if score < 0.977:
-                        return False
-                    return True
-                return attempt_count[0] <= max_retry
-
-            retry(
-                lambda: super(CustomTestCase, self)._callTestMethod(method),
-                max_retry=max_retry + 3,
-                should_retry=should_retry,
-            )
-        else:
-            retry(
-                lambda: super(CustomTestCase, self)._callTestMethod(method),
-                max_retry=max_retry,
-            )
-
     def test_ci_lora_models_batch_splitting(self):
         run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
 
