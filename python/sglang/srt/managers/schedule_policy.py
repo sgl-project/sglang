@@ -553,7 +553,7 @@ class PrefillAdder:
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
-    def _req_ensure_lock_ref(self, req: Req):
+    def _req_inc_lock_ref(self, req: Req):
         if self.is_hybrid_swa:
             swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
             req.swa_uuid_for_lock = swa_uuid_for_lock
@@ -782,12 +782,12 @@ class PrefillAdder:
                 ), "truncation_align_size is not supported for dllm prefill"
 
                 self._add_dllm_req(req, prefix_len)
-                self._req_ensure_lock_ref(req)
+                self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 
-                self._req_ensure_lock_ref(req)
+                self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -821,7 +821,7 @@ class PrefillAdder:
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
 
-                self._req_ensure_lock_ref(req)
+                self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
