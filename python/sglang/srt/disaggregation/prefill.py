@@ -370,7 +370,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result_disagg_prefill(batch, result)
+                self.process_batch_result(batch, result)
             else:
                 self.self_check_during_idle()
 
@@ -405,7 +405,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -533,9 +533,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.maybe_send_health_check_signal()
-
-        if self.current_scheduler_metrics_enabled and batch.prefill_stats is not None:
+        if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
             self.log_prefill_stats(
                 prefill_stats=batch.prefill_stats,
