@@ -437,7 +437,9 @@ def main():
             )
             user_perms = {}
         else:
-            print(f"User {user_login} is the PR author and has existing CI permissions.")
+            print(
+                f"User {user_login} is the PR author and has existing CI permissions."
+            )
         user_perms["can_rerun_failed_ci"] = True
 
     if not user_perms:
