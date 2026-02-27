@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    is_ssm_pretransposed: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -56,6 +57,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        is_ssm_pretransposed=is_ssm_pretransposed,
     )
     o = chunk_fwd_o(
         q=q,
@@ -124,6 +126,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    is_ssm_pretransposed: bool = False,
 ):
     r"""
     Args:
@@ -227,18 +230,43 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, h = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        initial_state,
-        initial_state_indices,
-        cu_seqlens,
-        use_qk_l2norm_in_kernel,
-    )
+    if is_ssm_pretransposed:
+        # Bypass ChunkGatedDeltaRuleFunction (@input_guard would call .contiguous() on
+        # initial_state, creating a disconnected copy and breaking the in-place pool update).
+        # We are inference-only, so autograd is not needed. Make all inputs except
+        # initial_state contiguous manually; initial_state stays K-contiguous so the
+        # Triton kernel can update the pool directly via IS_PRETRANSPOSED strides.
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        if use_qk_l2norm_in_kernel:
+            q_c = l2norm_fwd(q_c)
+            k_c = l2norm_fwd(k_c)
+        _, o, _, _, h, _ = chunk_gated_delta_rule_fwd(
+            q=q_c,
+            k=k_c,
+            v=v.contiguous(),
+            g=g.contiguous(),
+            beta=beta.contiguous(),
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            is_ssm_pretransposed=True,
+        )
+        o = o.to(q.dtype)
+    else:
+        o, h = ChunkGatedDeltaRuleFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            initial_state_indices,
+            cu_seqlens,
+            use_qk_l2norm_in_kernel,
+        )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, None, h

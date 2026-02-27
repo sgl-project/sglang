@@ -394,16 +394,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if self._use_flashinfer_pool:
-                extend_states = ssm_states[cache_indices].transpose(-1, -2).contiguous()
-                extend_indices = torch.arange(
-                    cache_indices.shape[0],
-                    dtype=torch.int32,
-                    device=cache_indices.device,
-                )
-            else:
-                extend_states = ssm_states
-                extend_indices = cache_indices
+            # K-contiguous pool (flashinfer decode): pass the pool directly using
+            # IS_PRETRANSPOSED strides in the Triton kernel — no gather/scatter needed.
+            use_pretransposed = self._use_flashinfer_pool and not (
+                is_npu() or is_cpu()
+            )
 
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
@@ -411,14 +406,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=extend_states,
-                cache_indices=extend_indices,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                is_ssm_pretransposed=use_pretransposed,
             )
 
-            if self._use_flashinfer_pool:
-                ssm_states[cache_indices] = extend_states.transpose(-1, -2)
-            elif (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if is_npu() or is_cpu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
