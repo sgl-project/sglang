@@ -41,6 +41,9 @@ def compare_bundle_pair(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
+        x=None, y=None
+    ),
 ) -> Union[ComparisonRecord, SkipRecord]:
     with warning_sink.context() as collected_warnings:
         result = _compare_bundle_pair_raw(
@@ -50,6 +53,7 @@ def compare_bundle_pair(
             target_path=target_path,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
+            thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         )
 
     return result.model_copy(update={"warnings": collected_warnings})
@@ -63,6 +67,9 @@ def _compare_bundle_pair_raw(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
+        x=None, y=None
+    ),
 ) -> Union[ComparisonRecord, SkipRecord]:
     # 1. Load (tensor + meta, ungrouped)
     valid_pair: Pair[list[ValueWithMeta]] = Pair(
@@ -79,7 +86,9 @@ def _compare_bundle_pair_raw(
         lambda items: [it.meta for it in items]
     )
     plan: AlignerPlan = compute_aligner_plan(
-        metas_pair=metas_pair, token_aligner_plan=token_aligner_plan
+        metas_pair=metas_pair,
+        token_aligner_plan=token_aligner_plan,
+        thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
     )
 
     # 3. Apply dim names to tensors, then execute

@@ -10,7 +10,8 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_loader import (
     AUX_NAMES,
 )
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.entrypoint import (
-    compute_maybe_token_aligner_plan,
+    TokenAlignerResult,
+    compute_maybe_token_aligner_result,
 )
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
@@ -46,14 +47,14 @@ def run(args: argparse.Namespace) -> None:
     warning_sink.set_output_format(args.output_format)
 
     dfs: Pair[pl.DataFrame] = _read_df(args)
-    token_aligner_plan = compute_maybe_token_aligner_plan(args, dfs)
+    ta_result: TokenAlignerResult = compute_maybe_token_aligner_result(args, dfs)
 
     dfs = dfs.map(lambda df: df.filter(~pl.col("name").is_in(AUX_NAMES)))
 
     bundle_info_pairs: list[Pair[TensorBundleInfo]] = match_bundles(
         dfs=dfs,
         skip_keys=_compute_skip_keys(
-            args, has_token_aligner_plan=token_aligner_plan is not None
+            args, has_token_aligner_plan=ta_result.plan is not None
         ),
     )
 
@@ -61,8 +62,9 @@ def run(args: argparse.Namespace) -> None:
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
         target_path=Path(args.target_path),
-        token_aligner_plan=token_aligner_plan,
+        token_aligner_plan=ta_result.plan,
         diff_threshold=args.diff_threshold,
+        thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
     )
     _consume_comparison_records(
         comparison_records=comparison_records, output_format=args.output_format
@@ -99,6 +101,7 @@ def _compare_bundle_pairs(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
 ) -> Iterator[Union[ComparisonRecord, SkipRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
@@ -115,6 +118,7 @@ def _compare_bundle_pairs(
             target_path=target_path,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
+            thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         )
 
 
