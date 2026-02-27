@@ -460,7 +460,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
             self.qkv_a_proj.quant_method is not None
-            and self.qkv_a_proj.quant_method.quantization_configis is not None
+            and self.qkv_a_proj.quant_method.quantization_config is not None
             and self.qkv_a_proj.quant_method.quantization_config.get_name()
             == "modelslim"
         )
