@@ -6,6 +6,11 @@ The K-last layout stores SSM states as [pool, HV, V, K] instead of V-last
 
 Requires ``flashinfer`` with GDN kernel support to be installed, e.g.
 ``pip install -e ".[cutlass]"`` from the FlashInfer repo.
+
+NOTE: FlashInfer >= 0.6.4 includes a fix (PR#2509) that caches
+cudaGetDeviceProperties in the GDN prefill JIT launcher, eliminating ~80ms
+of CPU overhead per prefill. Upgrading from 0.6.3 to 0.6.4 recovers ~50%
+prefill throughput regression observed with stock FlashInfer.
 """
 
 import logging
@@ -127,7 +132,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """K-last decode using FlashInfer pretranspose kernel (stock, no pool indexing)."""
+        """K-last decode using FlashInfer pretranspose kernel (stock, no pool indexing).
+        
+        TODO: Once FlashInfer PR#2521 is merged and released, switch back
+        to pool-indexed decode (passing state_indices directly) to avoid
+        the gather/scatter overhead (~7-9% decode regression).
+        https://github.com/flashinfer-ai/flashinfer/pull/2521
+        """
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
