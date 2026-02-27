@@ -625,6 +625,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
                         }
                     }
                     _ = tx.closed() => {
+                        tracing::info!("Client disconnected, cancelling upstream stream");
                         break;
                     }
                 }
@@ -745,6 +746,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Check if the client has already disconnected before making a new
             // upstream request (e.g. between tool-call iterations).
             if tx.is_closed() {
+                tracing::info!("Client disconnected before next tool-call iteration, cancelling");
                 return;
             }
 
@@ -794,6 +796,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     chunk = upstream_stream.next() => chunk,
                     _ = tx.closed() => {
                         // Client disconnected — drop the stream and exit
+                        tracing::info!("Client disconnected, cancelling upstream tool-interception stream");
                         return;
                     }
                 };

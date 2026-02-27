@@ -654,6 +654,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                         }
                                     }
                                     _ = tx.closed() => {
+                                        tracing::info!("Client disconnected, cancelling upstream stream");
                                         break;
                                     }
                                 }

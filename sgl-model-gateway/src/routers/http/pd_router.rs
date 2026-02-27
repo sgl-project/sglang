@@ -884,6 +884,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
+                        tracing::info!("Client disconnected, cancelling upstream PD stream");
                         break;
                     }
                 }
