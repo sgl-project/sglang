@@ -649,8 +649,15 @@ def get_generate_fn(
     sampling_params: DiffusionSamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
+
+    # Pick size from explicit width/height when provided; otherwise use configured output_size.
     # Allow override via environment variable (useful for AMD where large resolutions cause slow VAE)
-    output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size)
+    if sampling_params.width is not None and sampling_params.height is not None:
+        output_size = f"{sampling_params.width}x{sampling_params.height}"
+    else:
+        output_size = os.environ.get(
+            "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
+        )
     n = sampling_params.num_outputs_per_prompt
 
     def _create_and_download_video(
@@ -758,6 +765,24 @@ def get_generate_fn(
         return video_id
 
     video_seconds = sampling_params.seconds or 4
+
+    def _video_extra_body(
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        body: dict[str, Any] = {}
+        if sampling_params.num_inference_steps is not None:
+            body["num_inference_steps"] = sampling_params.num_inference_steps
+        if sampling_params.num_frames is not None:
+            body["num_frames"] = sampling_params.num_frames
+        if sampling_params.fps is not None:
+            body["fps"] = sampling_params.fps
+        if sampling_params.guidance_scale is not None:
+            body["guidance_scale"] = sampling_params.guidance_scale
+
+        if extra_fields:
+            body.update(extra_fields)
+
+        return body or None
 
     def generate_image(case_id, client) -> str:
         """T2I: Text to Image generation."""
@@ -984,7 +1009,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
-            extra_body=extra_body if extra_body else None,
+            extra_body=_video_extra_body(extra_body if extra_body else None),
         )
 
     def generate_image_to_video(case_id, client) -> str:
@@ -1013,7 +1038,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
-                extra_body=extra_body if extra_body else None,
+                extra_body=_video_extra_body(extra_body if extra_body else None),
             )
 
     def generate_text_url_image_to_video(case_id, client) -> str:
@@ -1030,13 +1055,9 @@ def get_generate_fn(
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=sampling_params.output_size,
+            size=output_size,
             seconds=video_seconds,
-            extra_body={
-                "reference_url": sampling_params.image_path,
-                "fps": sampling_params.fps,
-                "num_frames": sampling_params.num_frames,
-            },
+            extra_body=_video_extra_body(extra_body),
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -1065,10 +1086,7 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
-                extra_body={
-                    "fps": sampling_params.fps,
-                    "num_frames": sampling_params.num_frames,
-                },
+                extra_body=_video_extra_body(extra_body if extra_body else None),
             )
 
     if modality == "video":
