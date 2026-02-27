@@ -1001,6 +1001,13 @@ class Glm4MoeModel(nn.Module):
 
 
 class Glm4MoeForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1047,6 +1054,15 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        elif (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "ignore")
+            and any(".mlp.shared_experts." in item for item in self.quant_config.ignore)
+        ):
+            disable_reason = (
+                "Shared experts are marked as ignored/non-quantized in this checkpoint. "
+                "Disable shared experts fusion to keep dedicated shared MLP weights."
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True

@@ -132,16 +132,13 @@ class Glm4MoeLiteMLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        # Some quantization wrappers store the underlying parameter as `weight_packed`.
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+        gate_up_proj_weight = getattr(self.gate_up_proj, "weight", None)
 
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
-            and self.gate_up_proj.weight.dtype == torch.uint8
+            and gate_up_proj_weight is not None
+            and gate_up_proj_weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
                 x.shape[0] * self.gate_up_proj.output_size_per_partition
@@ -467,6 +464,17 @@ class Glm4MoeLiteModel(DeepseekV2Model):
 
 
 class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": [
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -532,6 +540,15 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             disable_reason = "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "GLM-4.5 or GLM-4.6 cannot use shared experts fusion optimization under expert parallelism."
+        elif (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "ignore")
+            and any(".mlp.shared_experts." in item for item in self.quant_config.ignore)
+        ):
+            disable_reason = (
+                "Shared experts are marked as ignored/non-quantized in this checkpoint. "
+                "Disable shared experts fusion to keep dedicated shared MLP weights."
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -608,6 +625,33 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+
+        def _fuse_qkv_a_proj_weight(
+            name: str, q_a_proj_weight: torch.Tensor, kv_a_proj_weight: torch.Tensor
+        ) -> torch.Tensor:
+            # For compressed-tensors wNa16, `weight_shape` stores packed metadata
+            # with shape [2] and should not be concatenated directly.
+            if name.endswith("weight_shape"):
+                if (
+                    q_a_proj_weight.numel() != 2
+                    or kv_a_proj_weight.numel() != 2
+                    or q_a_proj_weight.ndim != 1
+                    or kv_a_proj_weight.ndim != 1
+                ):
+                    raise ValueError(
+                        f"Unexpected qkv_a_proj weight_shape for {name}: "
+                        f"{q_a_proj_weight.shape=} {kv_a_proj_weight.shape=}"
+                    )
+                if q_a_proj_weight[1] != kv_a_proj_weight[1]:
+                    raise ValueError(
+                        f"Mismatched qkv_a_proj weight_shape for {name}: "
+                        f"{q_a_proj_weight.tolist()} {kv_a_proj_weight.tolist()}"
+                    )
+                fused_weight = q_a_proj_weight.clone()
+                fused_weight[0] = q_a_proj_weight[0] + kv_a_proj_weight[0]
+                return fused_weight
+
+            return torch.cat([q_a_proj_weight, kv_a_proj_weight], dim=0)
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -751,8 +795,8 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                            fused_weight = _fuse_qkv_a_proj_weight(
+                                name, q_a_proj_weight, kv_a_proj_weight
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
