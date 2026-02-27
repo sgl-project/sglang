@@ -1356,16 +1356,6 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-            if (
-                prefill_attn_backend == "trtllm_mha"
-                or decode_attn_backend == "trtllm_mha"
-            ):
-                # TODO: support swa kv indices translation for trtllm_mha attention backend
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
-                )
-
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_blackwell_supported():
