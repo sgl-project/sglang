@@ -3,6 +3,17 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+import torch
+
+TOKEN_DIM_NAME: str = "t"
+BATCH_DIM_NAME: str = "b"
+SEQ_DIM_NAME: str = "s"
+
+
+class TokenLayout(Enum):
+    T = "t"  # single flat token dim
+    BS = "bs"  # separate batch + seq dims, need collapse
+
 
 class ParallelAxis(Enum):
     TP = "tp"
@@ -78,3 +89,31 @@ def parse_dims(dims_str: str) -> list[DimSpec]:
         raise ValueError(f"Duplicate dim names: {duplicates}")
 
     return result
+
+
+def parse_dim_names(dims_str: str) -> list[str]:
+    return [spec.name for spec in parse_dims(dims_str)]
+
+
+def find_dim_index(dim_specs: list[DimSpec], name: str) -> Optional[int]:
+    names: list[str] = [spec.name for spec in dim_specs]
+    return names.index(name) if name in names else None
+
+
+def resolve_dim_by_name(tensor: torch.Tensor, name: str) -> int:
+    if tensor.names[0] is None:
+        raise ValueError(f"Tensor has no names, cannot resolve {name!r}")
+
+    names: tuple[Optional[str], ...] = tensor.names
+    try:
+        return list(names).index(name)
+    except ValueError:
+        raise ValueError(f"Dim name {name!r} not in tensor names {names}")
+
+
+def apply_dim_names(tensor: torch.Tensor, dim_names: list[str]) -> torch.Tensor:
+    return tensor.refine_names(*dim_names)
+
+
+def strip_dim_names(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.rename(None)
