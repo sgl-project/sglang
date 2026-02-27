@@ -83,14 +83,16 @@ WEATHER_TOOL_STRICT = {
 }
 
 
-def _call(client, model, content, tools=None, tool_choice="required", **kwargs):
+def _call(
+    client, model, content, tools=None, tool_choice="required", temperature=0.1, **kwargs
+):
     """Single-turn tool call request. Defaults to ADD_TOOL_STRICT + required."""
     return client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": content}],
         tools=tools or [ADD_TOOL_STRICT],
         tool_choice=tool_choice,
-        temperature=0.1,
+        temperature=temperature,
         **kwargs,
     )
 
@@ -267,14 +269,10 @@ def _test_reasoning_usage(client, model):
 
 def _test_parallel(client, model):
     """Single request should return multiple tool calls."""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": "Please call both functions: use add to compute 3+5, and use get_weather to check the weather in Tokyo.",
-            }
-        ],
+    response = _call(
+        client,
+        model,
+        "Please call both functions: use add to compute 3+5, and use get_weather to check the weather in Tokyo.",
         tools=[ADD_TOOL_STRICT, WEATHER_TOOL_STRICT],
         tool_choice="auto",
         temperature=0,
