@@ -28,12 +28,18 @@ class ConcatParams(_FrozenBase):
     dim_name: str
 
 
+class CpThdConcatParams(_FrozenBase):
+    op: Literal["cp_thd_concat"] = "cp_thd_concat"
+    dim_name: str
+    seq_lens_per_rank: list[int]  # per-seq token count on each rank, e.g. [50, 32, 46]
+
+
 class PickParams(_FrozenBase):
     op: Literal["pick"] = "pick"
 
 
 UnsharderParams = Annotated[
-    Union[ConcatParams, PickParams],
+    Union[ConcatParams, CpThdConcatParams, PickParams],
     Field(discriminator="op"),
 ]
 

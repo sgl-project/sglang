@@ -1,14 +1,19 @@
 from collections import defaultdict
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
+    CpThdConcatParams,
     PickParams,
     UnsharderParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import DimSpec, ParallelAxis
+from sglang.srt.debug_utils.comparator.dims import (
+    TOKEN_DIM_NAME,
+    DimSpec,
+    ParallelAxis,
+)
 
 # _CoordsList[tensor_index][axis] =
 #     the axis_rank (shard position) of the tensor_index-th tensor along `axis`
@@ -24,6 +29,8 @@ class _GroupResult(NamedTuple):
 def compute_unsharder_plan(
     dim_specs: list[DimSpec],
     parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    *,
+    thd_global_seq_lens: Optional[list[int]] = None,
 ) -> list[UnsharderPlan]:
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
@@ -58,7 +65,14 @@ def compute_unsharder_plan(
     axis_and_params: list[tuple[ParallelAxis, UnsharderParams]] = [
         (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
-        (axis, _resolve_unshard_params(spec=spec))
+        (
+            axis,
+            _resolve_unshard_params(
+                spec=spec,
+                parallel_infos=parallel_infos,
+                thd_global_seq_lens=thd_global_seq_lens,
+            ),
+        )
         for axis, spec in sharded_axis_infos.items()
     ]
 
@@ -134,9 +148,32 @@ def _group_and_project(
     return _GroupResult(groups=groups, projected_coords=projected)
 
 
-def _resolve_unshard_params(*, spec: DimSpec) -> UnsharderParams:
+def _resolve_unshard_params(
+    *,
+    spec: DimSpec,
+    parallel_infos: list[dict[ParallelAxis, AxisInfo]],
+    thd_global_seq_lens: Optional[list[int]] = None,
+) -> UnsharderParams:
     if spec.reduction is not None:
         raise NotImplementedError(
             f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
         )
+
+    if spec.name == TOKEN_DIM_NAME and thd_global_seq_lens is not None:
+        if spec.parallel is None:
+            raise ValueError(
+                f"THD unshard requires a parallel axis on dim '{spec.name}', but got None"
+            )
+        axis_size: int = parallel_infos[0][spec.parallel].axis_size
+        for s in thd_global_seq_lens:
+            if s % axis_size != 0:
+                raise ValueError(
+                    f"THD seq_len {s} is not divisible by cp_size {axis_size}. "
+                    f"Sequences must be padded to a multiple of cp_size for CP zigzag."
+                )
+        seq_lens_per_rank: list[int] = [s // axis_size for s in thd_global_seq_lens]
+        return CpThdConcatParams(
+            dim_name=spec.name, seq_lens_per_rank=seq_lens_per_rank
+        )
+
     return ConcatParams(dim_name=spec.name)
