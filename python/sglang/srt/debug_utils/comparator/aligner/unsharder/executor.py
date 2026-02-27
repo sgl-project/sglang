@@ -6,7 +6,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     UnsharderParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims import ParallelAxis, resolve_dim_by_name
 from sglang.srt.debug_utils.comparator.output_types import ReplicatedMismatchWarning
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 
@@ -46,7 +46,8 @@ def _apply_unshard(
         return ordered_tensors[0]
 
     if isinstance(params, ConcatParams):
-        return torch.cat(ordered_tensors, dim=params.dim)
+        dim: int = resolve_dim_by_name(ordered_tensors[0], params.dim_name)
+        return torch.cat(ordered_tensors, dim=dim)
 
     # Phase 2: ReduceSumParams, CpZigzagParams
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
@@ -58,10 +59,10 @@ def _verify_replicated_group(
     axis: ParallelAxis,
     group_index: int,
 ) -> None:
-    baseline = ordered_tensors[0]
+    baseline = ordered_tensors[0].rename(None)
 
     for i in range(1, len(ordered_tensors)):
-        other = ordered_tensors[i]
+        other = ordered_tensors[i].rename(None)
         if not torch.allclose(baseline, other, atol=1e-6):
             warning_sink.add(
                 ReplicatedMismatchWarning(

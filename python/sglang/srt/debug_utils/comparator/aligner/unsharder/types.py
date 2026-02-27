@@ -25,7 +25,7 @@ class AxisInfo(_FrozenBase):
 
 class ConcatParams(_FrozenBase):
     op: Literal["concat"] = "concat"
-    dim: int
+    dim_name: str
 
 
 class PickParams(_FrozenBase):

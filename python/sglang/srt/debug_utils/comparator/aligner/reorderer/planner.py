@@ -19,7 +19,7 @@ def compute_reorderer_plans(
 ) -> list[ReordererPlan]:
     plans: list[ReordererPlan] = []
 
-    for dim_index, spec in enumerate(dim_specs):
+    for spec in dim_specs:
         if (
             spec.ordering is not None
             and spec.ordering != Ordering.NATURAL
@@ -37,7 +37,7 @@ def compute_reorderer_plans(
             axis_size: int = parallel_infos[0][spec.parallel].axis_size
             plans.append(
                 ReordererPlan(
-                    params=ZigzagToNaturalParams(dim=dim_index, cp_size=axis_size),
+                    params=ZigzagToNaturalParams(dim_name=spec.name, cp_size=axis_size),
                 )
             )
 

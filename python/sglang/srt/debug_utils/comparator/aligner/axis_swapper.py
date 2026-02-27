@@ -54,4 +54,4 @@ def compute_axis_swapper_plan(
 def execute_axis_swapper_plan(
     tensor: torch.Tensor, plan: AxisSwapperPlan
 ) -> torch.Tensor:
-    return rearrange(tensor, plan.pattern)
+    return rearrange(tensor.rename(None), plan.pattern)

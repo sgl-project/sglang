@@ -26,7 +26,7 @@ class TestComputeUnsharderPlan:
 
         assert len(plans) == 1
         assert plans[0].axis == ParallelAxis.TP
-        assert plans[0].params.dim == 2
+        assert plans[0].params.dim_name == "h"
         assert plans[0].groups == [[0, 1, 2, 3]]
 
     def test_inconsistent_axis_size_raises(self) -> None:
@@ -282,7 +282,7 @@ class TestReplicatedAxes:
 
         assert plans[1].axis == ParallelAxis.CP
         assert isinstance(plans[1].params, ConcatParams)
-        assert plans[1].params.dim == 1
+        assert plans[1].params.dim_name == "s"
 
     def test_fully_replicated(self) -> None:
         """CP2 TP2, dims='b h d' → PickPlan(CP) + PickPlan(TP)."""

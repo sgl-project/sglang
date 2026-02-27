@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import torch
 
 from sglang.srt.debug_utils.comparator.dims import (
     BATCH_DIM_NAME,
@@ -10,9 +11,13 @@ from sglang.srt.debug_utils.comparator.dims import (
     Ordering,
     ParallelAxis,
     Reduction,
+    apply_dim_names,
     find_dim_index,
     parse_dim,
+    parse_dim_names,
     parse_dims,
+    resolve_dim_by_name,
+    strip_dim_names,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -101,6 +106,14 @@ class TestParseDims:
             parse_dims("h h")
 
 
+class TestParseDimNames:
+    def test_plain(self) -> None:
+        assert parse_dim_names("b s h d") == ["b", "s", "h", "d"]
+
+    def test_strips_modifiers(self) -> None:
+        assert parse_dim_names("b s(cp,zigzag) h(tp) d") == ["b", "s", "h", "d"]
+
+
 class TestDimConstants:
     def test_token_dim_name(self) -> None:
         assert TOKEN_DIM_NAME == "t"
@@ -135,6 +148,49 @@ class TestFindDimIndex:
 
     def test_empty_list(self) -> None:
         assert find_dim_index([], "t") is None
+
+
+class TestResolveDimByName:
+    def test_resolve_found(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3, 4).refine_names("b", "s", "h")
+        assert resolve_dim_by_name(tensor, "b") == 0
+        assert resolve_dim_by_name(tensor, "s") == 1
+        assert resolve_dim_by_name(tensor, "h") == 2
+
+    def test_resolve_not_found_raises(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3).refine_names("b", "s")
+        with pytest.raises(ValueError, match="not in tensor names"):
+            resolve_dim_by_name(tensor, "h")
+
+    def test_resolve_unnamed_raises(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3)
+        with pytest.raises(ValueError, match="no names"):
+            resolve_dim_by_name(tensor, "b")
+
+
+class TestApplyDimNames:
+    def test_apply(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3, 4)
+        named: torch.Tensor = apply_dim_names(tensor, ["b", "s", "h"])
+        assert named.names == ("b", "s", "h")
+        assert named.shape == (2, 3, 4)
+
+    def test_apply_preserves_data(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3)
+        named: torch.Tensor = apply_dim_names(tensor, ["x", "y"])
+        assert torch.equal(strip_dim_names(named), tensor)
+
+
+class TestStripDimNames:
+    def test_strip(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3).refine_names("a", "b")
+        stripped: torch.Tensor = strip_dim_names(tensor)
+        assert stripped.names == (None, None)
+
+    def test_strip_already_unnamed(self) -> None:
+        tensor: torch.Tensor = torch.randn(2, 3)
+        stripped: torch.Tensor = strip_dim_names(tensor)
+        assert stripped.names == (None, None)
 
 
 if __name__ == "__main__":

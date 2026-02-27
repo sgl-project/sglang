@@ -5,7 +5,7 @@ from sglang.srt.debug_utils.comparator.utils import _FrozenBase
 
 class ZigzagToNaturalParams(_FrozenBase):
     op: Literal["zigzag_to_natural"] = "zigzag_to_natural"
-    dim: int
+    dim_name: str
     cp_size: int
 
 

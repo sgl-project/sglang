@@ -50,12 +50,12 @@ class TestExecuteSubPlans:
         assert result is None
 
     def test_with_unsharder_plan(self) -> None:
-        t0: torch.Tensor = torch.tensor([[1.0, 2.0]])
-        t1: torch.Tensor = torch.tensor([[3.0, 4.0]])
+        t0: torch.Tensor = torch.tensor([[1.0, 2.0]]).refine_names("b", "h")
+        t1: torch.Tensor = torch.tensor([[3.0, 4.0]]).refine_names("b", "h")
 
         plan = UnsharderPlan(
             axis=ParallelAxis.TP,
-            params=ConcatParams(dim=1),
+            params=ConcatParams(dim_name="h"),
             groups=[[0, 1]],
         )
 
@@ -65,7 +65,7 @@ class TestExecuteSubPlans:
 
         assert result is not None
         expected: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        assert torch.equal(result, expected)
+        assert torch.equal(result.rename(None), expected)
 
 
 class TestExecuteSubPlan:
@@ -214,12 +214,12 @@ class TestExecuteAlignerPlanWithTokenDim:
         return AlignerPerStepPlan(step=step, input_object_indices=indices, sub_plans=[])
 
     def test_token_dim_nonzero_e2e(self) -> None:
-        """AlignerPlan with token_dim=1 passes through to token aligner correctly."""
+        """AlignerPlan with token at dim 1 passes through to token aligner correctly."""
         torch.manual_seed(42)
 
-        # shape [3, 4, 8]: dim0=batch, dim1=token(4 tokens), dim2=hidden
-        tensor_x: torch.Tensor = torch.randn(3, 4, 8)
-        tensor_y: torch.Tensor = torch.randn(3, 4, 8)
+        # shape [3, 4, 8]: dim0=a, dim1=token(4 tokens), dim2=hidden
+        tensor_x: torch.Tensor = torch.randn(3, 4, 8).refine_names("a", "t", "h")
+        tensor_y: torch.Tensor = torch.randn(3, 4, 8).refine_names("a", "t", "h")
 
         locator_x = TokenLocator(
             steps=[0, 0, 0],
@@ -237,7 +237,6 @@ class TestExecuteAlignerPlanWithTokenDim:
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
             token_aligner_plan=token_plan,
-            token_dims=Pair(x=1, y=1),
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(x=[tensor_x], y=[tensor_y])
@@ -251,14 +250,16 @@ class TestExecuteAlignerPlanWithTokenDim:
         assert result.tensors.x.shape == (3, 3, 8)
         assert result.tensors.y.shape == (3, 3, 8)
 
+        plain_x: torch.Tensor = tensor_x.rename(None)
+        plain_y: torch.Tensor = tensor_y.rename(None)
         for i in range(3):
             assert torch.equal(
                 result.tensors.x.select(dim=1, index=i),
-                tensor_x.select(dim=1, index=i),
+                plain_x.select(dim=1, index=i),
             )
             assert torch.equal(
                 result.tensors.y.select(dim=1, index=i),
-                tensor_y.select(dim=1, index=i),
+                plain_y.select(dim=1, index=i),
             )
 
 

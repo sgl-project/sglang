@@ -36,8 +36,6 @@ def compute_aligner_plan(
     metas_pair: Pair[list[dict[str, Any]]],
     token_aligner_plan: Optional[TokenAlignerPlan],
 ) -> AlignerPlan:
-    token_dims: Pair[int] = metas_pair.map(_compute_token_dim)
-
     dims_str_pair: Pair[Optional[str]] = metas_pair.map(
         lambda metas: metas[0].get("dims") if metas else None
     )
@@ -50,7 +48,6 @@ def compute_aligner_plan(
             lambda metas: _compute_per_step_plans(metas=metas)
         ),
         token_aligner_plan=token_aligner_plan,
-        token_dims=token_dims,
         axis_swapper_plan=axis_swapper_plan,
     )
 

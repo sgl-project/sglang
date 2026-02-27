@@ -28,10 +28,8 @@ def compute_unsharder_plan(
     if not parallel_infos:
         raise ValueError("parallel_infos must not be empty")
 
-    sharded_axis_infos: dict[ParallelAxis, tuple[int, DimSpec]] = {
-        spec.parallel: (dim_idx, spec)
-        for dim_idx, spec in enumerate(dim_specs)
-        if spec.parallel is not None
+    sharded_axis_infos: dict[ParallelAxis, DimSpec] = {
+        spec.parallel: spec for spec in dim_specs if spec.parallel is not None
     }
     sharded_axes: set[ParallelAxis] = set(sharded_axis_infos)
 
@@ -54,8 +52,8 @@ def compute_unsharder_plan(
     axis_and_params: list[tuple[ParallelAxis, UnsharderParams]] = [
         (axis, PickParams()) for axis in sorted(replicated_axes, key=lambda a: a.value)
     ] + [
-        (axis, _resolve_unshard_params(spec=spec, dim_index=dim_index))
-        for axis, (dim_index, spec) in sharded_axis_infos.items()
+        (axis, _resolve_unshard_params(spec=spec))
+        for axis, spec in sharded_axis_infos.items()
     ]
 
     plans: list[UnsharderPlan] = []
@@ -130,9 +128,9 @@ def _group_and_project(
     return _GroupResult(groups=groups, projected_coords=projected)
 
 
-def _resolve_unshard_params(*, spec: DimSpec, dim_index: int) -> UnsharderParams:
+def _resolve_unshard_params(*, spec: DimSpec) -> UnsharderParams:
     if spec.reduction is not None:
         raise NotImplementedError(
             f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
         )
-    return ConcatParams(dim=dim_index)
+    return ConcatParams(dim_name=spec.name)
