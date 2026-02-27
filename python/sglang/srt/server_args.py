@@ -2367,8 +2367,9 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
-        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
+        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
+        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
+        # end to end, so we just avoid using trtllm_moe for speculative decoding.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         if self.speculative_moe_runner_backend is None:
@@ -2380,7 +2381,7 @@ class ServerArgs:
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
