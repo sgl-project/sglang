@@ -161,9 +161,7 @@ class PrefillDelayer:
             return _NegotiateOutput(
                 next_state=None,
                 output_allow=True,
-                output_reason=(
-                    "wait_success" if exist_previous_wait else "no_wait"
-                ),
+                output_reason="wait_success" if exist_previous_wait else "no_wait",
                 **debug_info,
             )
         elif prefillable_status == "none":
