@@ -3,13 +3,13 @@ import torch
 from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
 from utils import is_hopper
 
+from sglang.srt.layers.moe.ep_moe.kernels import deepep_ll_get_cutlass_w4a8_moe_mm_data
 from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_8bit,
+    sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_ll_get_cutlass_w4a8_moe_mm_data,
-)
+
+
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
     if int4_values_interleaved.shape[-1] % 2 != 0:
         raise ValueError(
@@ -58,8 +58,8 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
 @pytest.mark.parametrize("num_experts", [8, 16, 32])
 @pytest.mark.parametrize("m", [32, 128, 512])
 @pytest.mark.parametrize("k", [128, 256, 512, 768, 7168])
-@pytest.mark.parametrize("n", [ 512, 1024, 7168])
-def test_int4_fp8_grouped_gemm3d_expert(num_experts, m, k, n): # low-latency 3d input
+@pytest.mark.parametrize("n", [512, 1024, 7168])
+def test_int4_fp8_grouped_gemm3d_expert(num_experts, m, k, n):  # low-latency 3d input
     # Test parameters
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -93,30 +93,24 @@ def test_int4_fp8_grouped_gemm3d_expert(num_experts, m, k, n): # low-latency 3d 
             a_i = torch.ones(m_i, k, dtype=dtype, device=device)
         else:
             a_i = torch.randn(m_i, k, dtype=dtype, device=device)
-        a[i, : m_i, :] = a_i
+        a[i, :m_i, :] = a_i
 
         expert_offsets.append(offset)
         offset += m_i
-        
 
     expert_offsets = torch.tensor(expert_offsets, dtype=torch.int32, device=device)
     masked_m = torch.tensor(masked_m_list, dtype=torch.int32, device=device)
 
-    problem_sizes1 = torch.empty(
-        (num_experts, 3), dtype=torch.int32, device=device
-    )
-    problem_sizes2 = torch.empty(
-        (num_experts, 3), dtype=torch.int32, device=device
-    )
+    problem_sizes1 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
     problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
         masked_m,
         problem_sizes1,
         problem_sizes2,
         num_experts,
-        n/2,
+        n / 2,
         k,
     )
-    
 
     a_strides = torch.full((num_experts, 3), k, device=device, dtype=torch.int64)
     c_strides = torch.full((num_experts, 3), n, device=device, dtype=torch.int64)
@@ -139,12 +133,7 @@ def test_int4_fp8_grouped_gemm3d_expert(num_experts, m, k, n): # low-latency 3d 
 
     if k % 512 != 0:  # K need padding to 4 for B scale
         assert k % 128 == 0, "k must be multiple of 128 or 512"
-        a_scale_padded = torch.empty(
-            (a_scale.shape[0], a_scale.shape[1], a_scale.shape[2] * 4), device=device, dtype=a_scale.dtype
-        )
-        for i in range(a_scale.shape[0]):
-            for j in range(a_scale.shape[1]):
-                a_scale_padded[i, j] = a_scale[i, j].repeat_interleave(4, dim=0)
+        a_scale_padded = a_scale.repeat_interleave(4, dim=-1)
         sa_strides = torch.full(
             (num_experts, 3), k // 128 * 4, device=device, dtype=torch.int64
         )
@@ -156,7 +145,7 @@ def test_int4_fp8_grouped_gemm3d_expert(num_experts, m, k, n): # low-latency 3d 
 
     # Create output tensor
     c = torch.zeros((num_experts, m, n), dtype=torch.bfloat16, device=device)
-    cutlass_w4a8_moe_mm( 
+    cutlass_w4a8_moe_mm(
         c,
         a_q,
         w,
@@ -225,7 +214,9 @@ def _per_tensor_quant_fp8(
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 4096, 7168])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
-def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts): # normal 2d input
+def test_int4_fp8_grouped_gemm_multi_experts(
+    batch_size, k, n, num_experts
+):  # normal 2d input
     torch.manual_seed(0)
     dtype = torch.bfloat16
     device = "cuda"
@@ -234,7 +225,7 @@ def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts): # n
     print(
         f"\nTesting with batch_size={batch_size}, k={k}, n={n}, num_experts={num_experts}"
     )
-
+    batch_size = batch_size * 8  # topk = 8
     if debug:
         a = torch.ones(batch_size, k, dtype=torch.bfloat16, device=device)
         ref_w = torch.ones(num_experts, n, k, dtype=torch.int8, device=device)
@@ -279,11 +270,7 @@ def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts): # n
 
     if k % 512 != 0:  # K need padding to 4 for B scale
         assert k % 128 == 0, "k must be multiple of 128 or 512"
-        a_scale_padded = torch.empty(
-            (a_scale.shape[0], a_scale.shape[1] * 4), device=device, dtype=a_scale.dtype
-        )
-        for i in range(a_scale.shape[0]):
-            a_scale_padded[i] = a_scale[i].repeat_interleave(4, dim=0)
+        a_scale_padded = a_scale.repeat_interleave(4, dim=-1)
         sa_strides = torch.full(
             (num_experts, 3), k // 128 * 4, device=device, dtype=torch.int64
         )
@@ -365,11 +352,10 @@ def ref_grouped_gemm(
 
     return c_ref
 
-def ref_grouped_gemm3d(
-    c, a_q, a_scale, w, w_scale, num_experts
-):
+
+def ref_grouped_gemm3d(c, a_q, a_scale, w, w_scale, num_experts):
     dtype = torch.bfloat16
-    c_ref = torch.zeros_like(c)    
+    c_ref = torch.zeros_like(c)
     for i in range(num_experts):
         a = a_q[i].to(torch.float32) * a_scale[i].repeat_interleave(128, dim=-1).to(
             torch.float32

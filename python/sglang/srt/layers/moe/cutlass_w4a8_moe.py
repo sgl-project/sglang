@@ -14,31 +14,24 @@ if _is_cuda_alike:
         get_cutlass_w4a8_moe_mm_data,
     )
 
-from sgl_kernel import silu_and_mul
-
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    cutlass_w4_run_moe_ep_preproess,
-    deepep_ll_get_cutlass_w4a8_moe_mm_data,
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-    post_reorder_for_cutlass_moe,
-    pre_reorder_for_cutlass_moe,
-    silu_and_mul_masked_post_per_tensor_quant_fwd,
-    silu_mul_static_tensorwise_quant_for_cutlass_moe,
-    silu_and_mul_masked_post_quant_fwd,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_8bit,
-)
-
 from sgl_kernel import (
     apply_shuffle_mul_sum,
     prepare_moe_input,
     shuffle_rows,
+    silu_and_mul,
+)
+
+from sglang.srt.distributed import get_moe_expert_parallel_world_size
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
+    deepep_permute_triton_kernel,
+    deepep_post_reorder_triton_kernel,
+    deepep_run_moe_deep_preprocess,
+    silu_and_mul_masked_post_quant_fwd,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_8bit,
+    sglang_per_token_group_quant_fp8,
 )
 
 
@@ -156,6 +149,15 @@ def cutlass_w4a8_moe(
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
+
+    if rep_a1_scales.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        rep_a1_scales = rep_a1_scales.repeat_interleave(4, dim=-1)
+        sa_strides13 = torch.full(
+            (num_local_experts, 3),
+            rep_a1_scales.shape[-1],
+            device=device,
+            dtype=torch.int64,
+        )
     cutlass_w4a8_moe_mm(
         c1,
         rep_a_q,
@@ -176,6 +178,11 @@ def cutlass_w4a8_moe(
     silu_and_mul(c1, intermediate)
     intermediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
+    if a2_scale.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        a2_scale = a2_scale.repeat_interleave(4, dim=-1)
+        sa_strides2 = torch.full(
+            (num_local_experts, 3), a2_scale.shape[-1], device=device, dtype=torch.int64
+        )
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
@@ -332,6 +339,14 @@ def cutlass_w4a8_moe_deepep_normal(
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
 
+    if gateup_scale_pre_reorder.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        gateup_scale_pre_reorder = gateup_scale_pre_reorder.repeat_interleave(4, dim=-1)
+        sa_strides13 = torch.full(
+            (num_experts, 3),
+            gateup_scale_pre_reorder.shape[-1],
+            device=device,
+            dtype=torch.int64,
+        )
     cutlass_w4a8_moe_mm(
         c1,
         gateup_input_pre_reorder,
@@ -351,6 +366,12 @@ def cutlass_w4a8_moe_deepep_normal(
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
     silu_and_mul(c1, intermediate)
     intermediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+
+    if a2_scale.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        a2_scale = a2_scale.repeat_interleave(4, dim=-1)
+        sa_strides2 = torch.full(
+            (num_experts, 3), a2_scale.shape[-1], device=device, dtype=torch.int64
+        )
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,
@@ -483,7 +504,12 @@ def cutlass_w4a8_moe_deepep_ll(
     a1_scale2 = a1_scale.contiguous()
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
-          
+
+    if a1_scale2.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        a1_scale2 = a1_scale2.repeat_interleave(4, dim=-1)
+        sa_strides13 = torch.full(
+            (num_experts, 3), a1_scale2.shape[-1], device=device, dtype=torch.int64
+        )
     cutlass_w4a8_moe_mm(
         c1,
         a,
@@ -531,6 +557,15 @@ def cutlass_w4a8_moe_deepep_ll(
             masked_m,
         )
     del c1
+
+    if down_input_scale.shape[-1] % 4 != 0:  # need padding to 4 for TMA copy
+        down_input_scale = down_input_scale.repeat_interleave(4, dim=-1)
+        sa_strides2 = torch.full(
+            (num_experts, 3),
+            down_input_scale.shape[-1],
+            device=device,
+            dtype=torch.int64,
+        )
     cutlass_w4a8_moe_mm(
         c2,
         down_input,
