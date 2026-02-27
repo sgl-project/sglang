@@ -47,7 +47,7 @@ def _maybe_download_model(
     from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import hf_hub_download
 
     if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
+        logger.debug("Model already exists locally")
         return model_name_or_path
 
     if not download:
@@ -57,7 +57,7 @@ def _maybe_download_model(
         # Try `model_index.json` first (diffusers models)
         source_hub = "MS Hub" if envs.SGLANG_USE_MODELSCOPE.get() else "HF Hub"
         try:
-            logger.info(
+            logger.debug(
                 "Downloading model_index.json from %s for %s...",
                 source_hub,
                 model_name_or_path,
@@ -67,14 +67,14 @@ def _maybe_download_model(
                 filename="model_index.json",
                 local_dir=local_dir,
             )
-            logger.info("Downloaded to %s", file_path)
+            logger.debug("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_index:
             logger.debug("model_index.json not found or failed: %s", e_index)
 
         # Fallback to `config.json`
         try:
-            logger.info(
+            logger.debug(
                 "Downloading config.json from %s for %s...",
                 source_hub,
                 model_name_or_path,
@@ -84,7 +84,7 @@ def _maybe_download_model(
                 filename="config.json",
                 local_dir=local_dir,
             )
-            logger.info("Downloaded to %s", file_path)
+            logger.debug("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_config:
             raise ValueError(

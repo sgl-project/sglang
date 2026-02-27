@@ -15,7 +15,7 @@ on:
   #     - "test/**"
   #     - "sgl-kernel/**"
   #     - ".github/workflows/pr-test-amd-rocm720.yml"
-  #     - "docker/rocm720.Dockerfile"
+  #     - "docker/rocm.Dockerfile"
   # pull_request:
   #   branches: [ main ]
   #   paths:
@@ -24,7 +24,7 @@ on:
   #     - "test/**"
   #     - "sgl-kernel/**"
   #     - ".github/workflows/pr-test-amd-rocm720.yml"
-  #     - "docker/rocm720.Dockerfile"
+  #     - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage:

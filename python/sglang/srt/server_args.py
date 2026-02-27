@@ -216,6 +216,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -516,6 +517,7 @@ class ServerArgs:
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
+    enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
     # Mamba cache
@@ -524,6 +526,9 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    linear_attn_backend: str = "triton"
+    linear_attn_decode_backend: Optional[str] = None
+    linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -887,12 +892,7 @@ class ServerArgs:
 
     def _handle_npu_backends(self):
         if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import (
-                init_npu_backend,
-                set_default_server_args,
-            )
-
-            init_npu_backend()
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
 
@@ -1049,7 +1049,7 @@ class ServerArgs:
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
-                    reserved_mem += 2 * 1024
+                    reserved_mem += 4 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1481,9 +1481,10 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
+                "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -2368,8 +2369,9 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
-        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
+        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
+        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
+        # end to end, so we just avoid using trtllm_moe for speculative decoding.
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         if self.speculative_moe_runner_backend is None:
@@ -2381,7 +2383,7 @@ class ServerArgs:
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -2563,8 +2565,8 @@ class ServerArgs:
                 )
                 self.load_format = "auto"
             elif (
-                not self.validate_transfer_engine()
-                and self.remote_instance_weight_loader_backend == "transfer_engine"
+                self.remote_instance_weight_loader_backend == "transfer_engine"
+                and not self.validate_transfer_engine()
             ):
                 logger.warning(
                     "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
@@ -4255,6 +4257,12 @@ class ServerArgs:
             help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
         )
         parser.add_argument(
+            "--enable-elastic-expert-backup",
+            action="store_true",
+            default=ServerArgs.enable_elastic_expert_backup,
+            help="Enable elastic expert backup feature.",
+        )
+        parser.add_argument(
             "--mooncake-ib-device",
             type=str,
             default=ServerArgs.mooncake_ib_device,
@@ -4304,6 +4312,31 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+        )
+        parser.add_argument(
+            "--linear-attn-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_backend,
+            help="The default kernel backend for linear attention (GDN/KDA). "
+            "Can be overridden per-mode by --linear-attn-decode-backend "
+            "and --linear-attn-prefill-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-decode-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_decode_backend,
+            help="Override the kernel backend for linear attention decode. "
+            "If not set, uses --linear-attn-backend.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="Override the kernel backend for linear attention prefill/extend. "
+            "If not set, uses --linear-attn-backend.",
         )
 
         # Hierarchical cache
