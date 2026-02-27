@@ -1048,7 +1048,7 @@ class ServerArgs:
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
-                    reserved_mem += 2 * 1024
+                    reserved_mem += 4 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)

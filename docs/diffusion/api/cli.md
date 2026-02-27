@@ -296,3 +296,7 @@ For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in 
 ```bash
 sglang generate --config config.json
 ```
+
+### Cache-DiT Acceleration
+
+Users who use the diffusers backend can also leverage Cache-DiT acceleration and load custom cache configs from a YAML file to boost performance of diffusers pipelines. See the [Cache-DiT Acceleration](https://docs.sglang.io/diffusion/performance/cache/cache_dit.html) documentation for details.
