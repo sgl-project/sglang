@@ -44,6 +44,7 @@ class PrefillDelayer:
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
+        device: Optional["torch.device"] = "cpu",
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
@@ -57,7 +58,7 @@ class PrefillDelayer:
         self._global_info_buffer = torch.empty(
             (dp_size, attn_tp_size, 4),
             dtype=torch.int64,
-            device="cpu",
+            device=device,
         )
         self._cpu_group = cpu_group
 
@@ -134,31 +135,7 @@ class PrefillDelayer:
 
         # Compute outputs
         if prefillable_status == "all":
-            if kwargs is not None:
-                max_running_requests = kwargs.get("max_running_requests", 0)
-                if (
-                    max_running_requests - global_running_batch.max().item()
-                    < global_max_prefill_bs.max().item()
-                ):
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
-                    return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
-                        **debug_info,
-                    )
-                else:
-                    exist_previous_wait = prev_state is not None
-                    return _NegotiateOutput(
-                        next_state=None,
-                        output_allow=True,
-                        output_reason=(
-                            "wait_success" if exist_previous_wait else "no_wait"
-                        ),
-                        **debug_info,
-                    )
-            else:
+            if kwargs is None:
                 exist_previous_wait = prev_state is not None
                 return _NegotiateOutput(
                     next_state=None,
@@ -166,6 +143,29 @@ class PrefillDelayer:
                     output_reason="wait_success" if exist_previous_wait else "no_wait",
                     **debug_info,
                 )
+
+            max_running_requests = kwargs.get("max_running_requests", 0)
+            if (
+                max_running_requests - global_running_batch.max().item()
+                < global_max_prefill_bs.max().item()
+            ):
+                next_state = prev_state or _State()
+                next_state = next_state.bump_delayed_count()
+                return _NegotiateOutput(
+                    next_state=next_state,
+                    output_allow=False,
+                    output_reason="delay",
+                    **debug_info,
+                )
+            exist_previous_wait = prev_state is not None
+            return _NegotiateOutput(
+                next_state=None,
+                output_allow=True,
+                output_reason=(
+                    "wait_success" if exist_previous_wait else "no_wait"
+                ),
+                **debug_info,
+            )
         elif prefillable_status == "none":
             return _NegotiateOutput(
                 next_state=None,
