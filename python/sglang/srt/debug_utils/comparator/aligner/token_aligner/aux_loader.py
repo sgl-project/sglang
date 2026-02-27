@@ -24,7 +24,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
 from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.dims import ParallelAxis
+from sglang.srt.debug_utils.comparator.dims import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta, filter_rows
@@ -61,7 +61,7 @@ def load_and_normalize_aux(
         if step_data:
             steps_data[step] = step_data
 
-    layout: str = plugin.detect_layout(steps_data)
+    layout: TokenLayout = plugin.detect_layout(steps_data)
 
     step_auxs: dict[int, TokenAlignerStepAux] = {
         step: plugin.compute_step_aux(step_data, layout=layout, step=step)

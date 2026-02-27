@@ -5,6 +5,7 @@ from typing import NamedTuple, Union
 
 from pydantic import model_validator
 
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import (
     Pair,
     _check_equal_lengths,
@@ -50,7 +51,7 @@ class TokenAlignerGlobalAux:
 
     step_auxs: dict[int, TokenAlignerStepAux]
     framework: str  # "sglang" | "megatron"
-    layout: str  # "thd"
+    layout: TokenLayout
 
 
 class TokenLocator(_FrozenBase):
@@ -106,7 +107,7 @@ class TokenAlignerSeqsInfo(_FrozenBase):
     """All sequences for one side across all steps."""
 
     sequences: dict[SeqId, TokenAlignerSeqInfo]
-    layout: str
+    layout: TokenLayout
 
 
 class TokenAlignerPlan(_FrozenBase):

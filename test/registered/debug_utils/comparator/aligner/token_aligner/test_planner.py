@@ -19,6 +19,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerStepAux,
     TokenLocator,
 )
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -40,7 +41,7 @@ class TestBuildTokenIndexSGLangThd:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -75,7 +76,7 @@ class TestBuildTokenIndexSGLangThd:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -108,7 +109,7 @@ class TestBuildTokenIndexSGLangThd:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -132,7 +133,7 @@ class TestBuildTokenIndexSGLangThd:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -163,7 +164,7 @@ class TestBuildTokenIndexMegatronThd:
                 ),
             },
             framework="megatron",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -204,7 +205,7 @@ class TestBuildTokenIndexMegatronThd:
                 ),
             },
             framework="megatron",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)
@@ -389,7 +390,7 @@ class TestComputeAlignmentPlanCrossLayout:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
         side_aux_b = TokenAlignerGlobalAux(
             step_auxs={
@@ -401,7 +402,7 @@ class TestComputeAlignmentPlanCrossLayout:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index_a = build_seqs_info(side_aux_a)
@@ -428,7 +429,7 @@ class TestComputeAlignmentPlanCrossLayout:
                 ),
             },
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
         side_aux_b = TokenAlignerGlobalAux(
             step_auxs={
@@ -443,7 +444,7 @@ class TestComputeAlignmentPlanCrossLayout:
                 ),
             },
             framework="megatron",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index_a = build_seqs_info(side_aux_a)
@@ -467,7 +468,7 @@ def _int_to_seq_id(k: int) -> SeqId:
 def _make_index(
     *,
     sequences: dict[int, tuple[int, ...]],
-    layout: str = "thd",
+    layout: TokenLayout = TokenLayout.T,
 ) -> TokenAlignerSeqsInfo:
     """Create a TokenAlignerSeqsInfo from simplified input_ids-only specification."""
     records: dict[SeqId, TokenAlignerSeqInfo] = {}

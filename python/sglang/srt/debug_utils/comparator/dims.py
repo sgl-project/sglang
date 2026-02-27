@@ -8,6 +8,11 @@ BATCH_DIM_NAME: str = "b"
 SEQ_DIM_NAME: str = "s"
 
 
+class TokenLayout(Enum):
+    T = "t"  # single flat token dim
+    BS = "bs"  # separate batch + seq dims, need collapse
+
+
 class ParallelAxis(Enum):
     TP = "tp"
     CP = "cp"

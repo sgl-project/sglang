@@ -185,6 +185,7 @@ def _make_diff_info(*, passed: bool) -> DiffInfo:
         max_diff_coord=[0, 0],
         baseline_at_max=1.0,
         target_at_max=1.01,
+        diff_threshold=1e-3,
         passed=passed,
     )
 

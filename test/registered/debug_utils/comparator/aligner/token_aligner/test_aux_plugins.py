@@ -13,6 +13,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     SGLangSeqId,
     TokenAlignerStepAux,
 )
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="default", nightly=True)
@@ -34,7 +35,7 @@ class TestNormalizeSGLang:
         }
 
         result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
-            step_data, layout="thd", step=0
+            step_data, layout=TokenLayout.T, step=0
         )
 
         assert result.input_ids == [10, 20, 30]
@@ -51,7 +52,7 @@ class TestNormalizeSGLang:
         }
 
         result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
-            step_data, layout="thd", step=3
+            step_data, layout=TokenLayout.T, step=3
         )
         assert result.seq_ids == [PositionalSeqId(step=3, seq_index=0)]
 
@@ -65,7 +66,7 @@ class TestNormalizeSGLang:
         }
 
         result: TokenAlignerStepAux = _sglang_plugin.compute_step_aux(
-            step_data, layout="thd", step=0
+            step_data, layout=TokenLayout.T, step=0
         )
         assert result.seq_ids == [SGLangSeqId(rid="A"), SGLangSeqId(rid="B")]
 
@@ -81,7 +82,7 @@ class TestNormalizeMegatron:
         }
 
         result: TokenAlignerStepAux = _megatron_plugin.compute_step_aux(
-            step_data, layout="thd", step=0
+            step_data, layout=TokenLayout.T, step=0
         )
 
         assert result.seq_lens == [3, 2]
@@ -94,7 +95,7 @@ class TestNormalizeMegatron:
         }
 
         result: TokenAlignerStepAux = _megatron_plugin.compute_step_aux(
-            step_data, layout="thd", step=0
+            step_data, layout=TokenLayout.T, step=0
         )
 
         assert result.positions == [0, 1, 2, 0, 1]
@@ -108,7 +109,7 @@ class TestNormalizeMegatron:
         }
 
         result: TokenAlignerStepAux = _megatron_plugin.compute_step_aux(
-            step_data, layout="thd", step=0
+            step_data, layout=TokenLayout.T, step=0
         )
 
         assert result.positions == [5, 6, 7, 8, 9]
@@ -121,7 +122,7 @@ class TestNormalizeMegatron:
         }
 
         result: TokenAlignerStepAux = _megatron_plugin.compute_step_aux(
-            step_data, layout="thd", step=5
+            step_data, layout=TokenLayout.T, step=5
         )
         assert result.seq_ids == [
             PositionalSeqId(step=5, seq_index=0),

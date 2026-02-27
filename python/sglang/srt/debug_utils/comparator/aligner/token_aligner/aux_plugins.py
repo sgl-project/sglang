@@ -10,6 +10,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     SGLangSeqId,
     TokenAlignerStepAux,
 )
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import GeneralWarning
 from sglang.srt.debug_utils.comparator.warning_sink import warning_sink
 
@@ -45,11 +46,11 @@ class _AuxFrameworkPlugin(ABC):
         return frozenset()
 
     @abstractmethod
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str: ...
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout: ...
 
     @abstractmethod
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux: ...
 
     @abstractmethod
@@ -89,11 +90,11 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
     def has_required_names(self, names: set[str]) -> bool:
         return "input_ids" in names and "seq_lens" in names
 
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str:
-        return "thd"
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
+        return TokenLayout.T
 
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux:
         input_ids = step_data["input_ids"]
         positions = step_data["positions"]
@@ -154,13 +155,13 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
     def has_required_names(self, names: set[str]) -> bool:
         return "input_ids" in names and "cu_seqlens_q" in names
 
-    def detect_layout(self, raw: dict[int, dict[str, object]]) -> str:
+    def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
         for step_data in raw.values():
             if (qkv_format := step_data.get("qkv_format")) is not None:
                 fmt = qkv_format if isinstance(qkv_format, str) else str(qkv_format)
                 if "bshd" in fmt.lower():
                     raise NotImplementedError(_BSHD_NOT_SUPPORTED_MSG)
-                return "thd"
+                return TokenLayout.T
 
             input_ids = step_data.get("input_ids")
             if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
@@ -175,10 +176,10 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
                 ),
             )
         )
-        return "thd"
+        return TokenLayout.T
 
     def compute_step_aux(
-        self, step_data: dict[str, object], *, layout: str, step: int
+        self, step_data: dict[str, object], *, layout: TokenLayout, step: int
     ) -> TokenAlignerStepAux:
         input_ids: torch.Tensor = step_data["input_ids"]
 

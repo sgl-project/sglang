@@ -21,6 +21,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerStepAux,
     TokenLocator,
 )
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -52,7 +53,7 @@ class TestExecuteAlignment:
         side_aux = TokenAlignerGlobalAux(
             step_auxs={0: aux, 1: aux_step1},
             framework="sglang",
-            layout="thd",
+            layout=TokenLayout.T,
         )
 
         index = build_seqs_info(side_aux)

@@ -35,6 +35,7 @@ def _make_diff(
     rel_diff: float = 0.0001,
     max_abs_diff: float = 0.0005,
     mean_abs_diff: float = 0.0002,
+    diff_threshold: float = 1e-3,
     passed: bool = True,
 ) -> DiffInfo:
     return DiffInfo(
@@ -44,6 +45,7 @@ def _make_diff(
         max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
+        diff_threshold=diff_threshold,
         passed=passed,
     )
 
@@ -94,7 +96,7 @@ class TestFormatComparison:
             "[p5] -1.5000 vs -1.5000 (diff: 0.0000)\n"
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
-            "✅ rel_diff=0.0001\tmax_abs_diff=0.0005\tmean_abs_diff=0.0002\n"
+            "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005"
         )
@@ -153,11 +155,11 @@ class TestFormatComparison:
             "[p5] -1.5000 vs -1.5000 (diff: 0.0000)\n"
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
-            "❌ rel_diff=0.002\tmax_abs_diff=0.005\tmean_abs_diff=0.001\n"
+            "❌ rel_diff=0.002\t❌ max_abs_diff=0.005\t✅ mean_abs_diff=0.001\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
             "When downcast to torch.bfloat16: "
-            "✅ rel_diff=0.0001\tmax_abs_diff=0.0005\tmean_abs_diff=0.0002\n"
+            "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005"
         )
@@ -187,7 +189,7 @@ class TestFormatComparison:
             "[p5] -1.5000 vs -1.5000 (diff: 0.0000)\n"
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
-            "✅ rel_diff=0.0001\tmax_abs_diff=0.0005\tmean_abs_diff=0.0002\n"
+            "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005"
         )
@@ -215,7 +217,7 @@ class TestFormatComparison:
             "[p5] -1.5000 vs -1.5000 (diff: 0.0000)\n"
             "[p95] 1.5000 vs 1.5000 (diff: 0.0000)\n"
             "[p99] 1.8000 vs 1.8000 (diff: 0.0000)\n"
-            "✅ rel_diff=0.0001\tmax_abs_diff=0.0005\tmean_abs_diff=0.0002\n"
+            "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005\n"
             "x_baseline(sample)=tensor([0.1, 0.2, ...])\n"
@@ -243,7 +245,7 @@ class TestFormatComparison:
             "[std] 1.0000 vs 1.0000 (diff: 0.0000)\n"
             "[min] -2.0000 vs -2.0000 (diff: 0.0000)\n"
             "[max] 2.0000 vs 2.0000 (diff: 0.0000)\n"
-            "✅ rel_diff=0.0001\tmax_abs_diff=0.0005\tmean_abs_diff=0.0002\n"
+            "✅ rel_diff=0.0001\t✅ max_abs_diff=0.0005\t✅ mean_abs_diff=0.0002\n"
             "max_abs_diff happens at coord=[2, 3] with "
             "baseline=1.0 target=1.0005"
         )
