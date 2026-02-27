@@ -80,6 +80,7 @@ class TestExecuteAlignment:
                 x=TokenLocator(steps=[], token_index_in_step=[]),
                 y=TokenLocator(steps=[], token_index_in_step=[]),
             ),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
 
         tensors = {0: torch.randn(5, 8).refine_names("t", "h")}
@@ -101,7 +102,10 @@ class TestTokenDim:
             steps=[0] * num_tokens,
             token_index_in_step=list(range(num_tokens)),
         )
-        return TokenAlignerPlan(locators=Pair(x=locator, y=locator))
+        return TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
+        )
 
     def test_token_dim_nonzero(self) -> None:
         """tensor shape [3, 5, 8], token_dim=1 -> token dim stays at dim 1."""
@@ -168,6 +172,7 @@ class TestTokenDim:
                 x=TokenLocator(steps=[], token_index_in_step=[]),
                 y=TokenLocator(steps=[], token_index_in_step=[]),
             ),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
 
         tensors: dict[int, torch.Tensor] = {
@@ -202,6 +207,247 @@ class TestTokenDim:
             assert torch.equal(
                 aligned.x.select(dim=2, index=i), plain.select(dim=2, index=i)
             )
+
+
+class TestBSHDExecutor:
+    """BSHD tensor collapse: B+S dims -> flat token dim for alignment."""
+
+    def test_bshd_standard_bs_at_front(self):
+        """Standard "b s h d": B=dim0, S=dim1. [2, 3, 4, 5] -> collapse -> [6, 4, 5]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(torch.randn(2, 3, 4, 5), ["b", "s", "h", "d"])
+        flat: torch.Tensor = tensor.rename(None).reshape(6, 4, 5)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[0, 3, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (3, 4, 5)
+        assert torch.equal(aligned.x[0], flat[0])
+        assert torch.equal(aligned.x[1], flat[3])
+        assert torch.equal(aligned.x[2], flat[5])
+
+    def test_bshd_3d_bs_at_front(self):
+        """Minimal 3D "b s h": B=dim0, S=dim1. [2, 3, 4] -> collapse -> [6, 4]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(torch.randn(2, 3, 4), ["b", "s", "h"])
+        flat: torch.Tensor = tensor.rename(None).reshape(6, 4)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0, 0],
+            token_index_in_step=[0, 2, 3, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (4, 4)
+        assert torch.equal(aligned.x[0], flat[0])
+        assert torch.equal(aligned.x[1], flat[2])
+        assert torch.equal(aligned.x[2], flat[3])
+        assert torch.equal(aligned.x[3], flat[5])
+
+    def test_bshd_bs_not_at_front(self):
+        """Non-leading "h b s d": B=dim1, S=dim2. [4, 2, 3, 5] -> collapse -> [4, 6, 5]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(torch.randn(4, 2, 3, 5), ["h", "b", "s", "d"])
+        flat: torch.Tensor = tensor.rename(None).reshape(4, 6, 5)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[0, 3, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (4, 3, 5)
+        for idx, flat_idx in enumerate([0, 3, 5]):
+            assert torch.equal(
+                aligned.x.select(dim=1, index=idx),
+                flat.select(dim=1, index=flat_idx),
+            )
+
+    def test_bshd_expert_before_bs(self):
+        """Expert dim before B: "e b s h d". [2, 3, 4, 5, 6] -> collapse -> [2, 12, 5, 6]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(
+            torch.randn(2, 3, 4, 5, 6), ["e", "b", "s", "h", "d"]
+        )
+        flat: torch.Tensor = tensor.rename(None).reshape(2, 12, 5, 6)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[0, 5, 11],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (2, 3, 5, 6)
+        for idx, flat_idx in enumerate([0, 5, 11]):
+            assert torch.equal(
+                aligned.x.select(dim=1, index=idx),
+                flat.select(dim=1, index=flat_idx),
+            )
+
+    def test_bshd_bs_at_end(self):
+        """B and S at end: "h d b s". [4, 5, 2, 3] -> collapse -> [4, 5, 6]."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(torch.randn(4, 5, 2, 3), ["h", "d", "b", "s"])
+        flat: torch.Tensor = tensor.rename(None).reshape(4, 5, 6)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[1, 3, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (4, 5, 3)
+        for idx, flat_idx in enumerate([1, 3, 5]):
+            assert torch.equal(
+                aligned.x.select(dim=2, index=idx),
+                flat.select(dim=2, index=flat_idx),
+            )
+
+    def test_cross_layout_thd_vs_bshd(self):
+        """Cross-layout: x=THD [6, 8], y=BSHD [2, 3, 8] -> y collapse -> [6, 8]."""
+        torch.manual_seed(42)
+        tensor_thd: torch.Tensor = _named(torch.randn(6, 8), ["t", "h"])
+        tensor_bshd: torch.Tensor = _named(torch.randn(2, 3, 8), ["b", "s", "h"])
+        flat_bshd: torch.Tensor = tensor_bshd.rename(None).reshape(6, 8)
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[0, 2, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.BS),
+        )
+
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x={0: tensor_thd}, y={0: tensor_bshd}),
+        )
+
+        assert aligned.x.shape == (3, 8)
+        assert aligned.y.shape == (3, 8)
+        assert torch.equal(aligned.x[0], tensor_thd.rename(None)[0])
+        assert torch.equal(aligned.y[0], flat_bshd[0])
+        assert torch.equal(aligned.y[2], flat_bshd[5])
+
+    def test_bshd_reversed_sb_order(self):
+        """Reversed "s b h": S=dim0, B=dim1. Collapse is batch-major: (b s)."""
+        torch.manual_seed(42)
+        tensor: torch.Tensor = _named(torch.randn(3, 2, 4), ["s", "b", "h"])
+        # batch-major flatten: rearrange("s b h -> (b s) h")
+        from einops import rearrange
+
+        flat: torch.Tensor = rearrange(tensor.rename(None), "s b h -> (b s) h")
+
+        locator = TokenLocator(
+            steps=[0, 0, 0],
+            token_index_in_step=[0, 2, 5],
+        )
+        plan = TokenAlignerPlan(
+            locators=Pair(x=locator, y=locator),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {0: tensor}
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (3, 4)
+        assert torch.equal(aligned.x[0], flat[0])
+        assert torch.equal(aligned.x[1], flat[2])
+        assert torch.equal(aligned.x[2], flat[5])
+
+    def test_bshd_empty_plan_bs_not_at_front(self):
+        """Empty plan with non-leading B,S: "h b s d". [4, 2, 3, 5] -> collapse -> [4, 0, 5]."""
+        plan = TokenAlignerPlan(
+            locators=Pair(
+                x=TokenLocator(steps=[], token_index_in_step=[]),
+                y=TokenLocator(steps=[], token_index_in_step=[]),
+            ),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {
+            0: _named(torch.randn(4, 2, 3, 5), ["h", "b", "s", "d"])
+        }
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (4, 0, 5)
+        assert aligned.y.shape == (4, 0, 5)
+
+    def test_bshd_empty_plan_bs_at_front(self):
+        """Empty plan with standard BSHD: "b s h". [2, 3, 4] -> collapse -> [0, 4]."""
+        plan = TokenAlignerPlan(
+            locators=Pair(
+                x=TokenLocator(steps=[], token_index_in_step=[]),
+                y=TokenLocator(steps=[], token_index_in_step=[]),
+            ),
+            layouts=Pair(x=TokenLayout.BS, y=TokenLayout.BS),
+        )
+
+        tensors: dict[int, torch.Tensor] = {
+            0: _named(torch.randn(2, 3, 4), ["b", "s", "h"])
+        }
+        aligned: Pair[torch.Tensor] = execute_token_aligner(
+            plan=plan,
+            tensor_of_step_pair=Pair(x=tensors, y=tensors),
+        )
+
+        assert aligned.x.shape == (0, 4)
+        assert aligned.y.shape == (0, 4)
 
 
 if __name__ == "__main__":

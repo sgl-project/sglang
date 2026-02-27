@@ -114,6 +114,7 @@ class TokenAlignerPlan(_FrozenBase):
     """Token alignment plan. locators.x[i] and locators.y[i] correspond to the same logical token."""
 
     locators: Pair[TokenLocator]
+    layouts: Pair[TokenLayout]
 
     @model_validator(mode="after")
     def _validate_fields(self) -> TokenAlignerPlan:

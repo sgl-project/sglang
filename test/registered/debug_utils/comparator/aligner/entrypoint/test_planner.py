@@ -15,6 +15,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
 )
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -154,6 +155,7 @@ class TestComputeAlignerPlan:
                 x=TokenLocator(steps=[0], token_index_in_step=[0]),
                 y=TokenLocator(steps=[0], token_index_in_step=[0]),
             ),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
 
         plan: AlignerPlan = compute_aligner_plan(

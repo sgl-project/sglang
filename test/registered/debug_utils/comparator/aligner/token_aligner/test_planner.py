@@ -369,8 +369,8 @@ class TestMatchSequences:
         assert matched == []
 
 
-class TestComputeAlignmentPlanCrossLayout:
-    """Tests for alignment plan across different step distributions."""
+class TestComputeAlignmentPlanCrossFramework:
+    """Tests for alignment plan across different frameworks and layouts."""
 
     def test_thd_vs_thd_different_step_splits(self):
         """Two thd sides with same tokens but different step distributions."""
@@ -453,6 +453,57 @@ class TestComputeAlignmentPlanCrossLayout:
         plan = compute_token_aligner_plan(seqs_info_pair=Pair(x=index_a, y=index_b))
 
         assert len(plan.locators.x.steps) == 7
+
+    def test_cross_layout_sglang_thd_vs_megatron_bshd(self):
+        """SGLang THD vs Megatron BSHD end-to-end alignment via planner.
+
+        SGLang side: two sequences [10,20,30] and [40,50] across 2 steps.
+        Megatron BSHD side: same tokens as 2 batch slots [10,20,30,PAD] and [40,50,PAD,PAD],
+        where PAD tokens (99) are included because BSHD treats whole padded row as one seq.
+        Planner should match by prefix and align the common 5 tokens.
+        """
+        side_sglang = TokenAlignerGlobalAux(
+            step_auxs={
+                0: TokenAlignerStepAux(
+                    input_ids=[10, 20, 30, 40, 50],
+                    positions=[0, 1, 2, 0, 1],
+                    seq_lens=[3, 2],
+                    seq_ids=[SGLangSeqId(rid="A"), SGLangSeqId(rid="B")],
+                ),
+            },
+            framework="sglang",
+            layout=TokenLayout.T,
+        )
+
+        side_megatron_bshd = TokenAlignerGlobalAux(
+            step_auxs={
+                # BSHD normalized: flat [B*S] with each batch slot as one seq
+                0: TokenAlignerStepAux(
+                    input_ids=[10, 20, 30, 99, 40, 50, 99, 99],
+                    positions=[0, 1, 2, 3, 0, 1, 2, 3],
+                    seq_lens=[4, 4],
+                    seq_ids=[
+                        PositionalSeqId(step=0, seq_index=0),
+                        PositionalSeqId(step=0, seq_index=1),
+                    ],
+                ),
+            },
+            framework="megatron",
+            layout=TokenLayout.BS,
+        )
+
+        index_sglang = build_seqs_info(side_sglang)
+        index_megatron = build_seqs_info(side_megatron_bshd)
+
+        plan = compute_token_aligner_plan(
+            seqs_info_pair=Pair(x=index_sglang, y=index_megatron)
+        )
+
+        # Seq A: [10,20,30] matches prefix of [10,20,30,99] → 3 tokens
+        # Seq B: [40,50] matches prefix of [40,50,99,99] → 2 tokens
+        assert len(plan.locators.x.steps) == 5
+        assert plan.layouts.x == TokenLayout.T
+        assert plan.layouts.y == TokenLayout.BS
 
 
 # ---------------------------------------------------------------------------
