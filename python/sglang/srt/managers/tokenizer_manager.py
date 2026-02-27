@@ -2118,11 +2118,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
-
-        if self.request_metrics_exporter_manager.exporter_enabled():
-            asyncio.create_task(
-                self.request_metrics_exporter_manager.write_record(state.obj, out)
-            )
         state.out_list.append(out)
         state.event.set()
 
