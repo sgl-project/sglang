@@ -721,6 +721,10 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+
+        self.tree_cache = SessionAwareCache(self.tree_cache)
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -2950,17 +2954,12 @@ class Scheduler(
 
     def _close_session(self, session_id: str):
         session = self.sessions[session_id]
-        # For streaming sessions, need to release the lock upon close.
         if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             req = next(iter(session.req_nodes.values())).req
-            if req.finished():
-                is_insert = not req.skip_cache_finished
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
-            else:
-                # Request is still running. Detach it from the session so it gets
-                # cleaned up later on finish, like normal requests.
+            if not req.finished():
                 req.session = None
+        self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
 
     def reap_timed_out_sessions(self):

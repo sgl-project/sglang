@@ -92,10 +92,11 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        memory_leak = full_num_used != 0 or swa_num_used != 0
+        session_held = self.tree_cache.session_held_tokens()
+        memory_leak = (full_num_used - session_held) != 0 or swa_num_used != 0
         token_msg = (
             f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}, {session_held=}\n"
         )
         return memory_leak, token_msg
 
@@ -110,8 +111,9 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size,
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
+        session_held = self.tree_cache.session_held_tokens()
         memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size()
+            full_num_used != self.tree_cache.full_protected_size() + session_held
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
         if memory_leak:
@@ -150,14 +152,11 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        session_held = self.tree_cache.session_held_tokens()
         memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
-            self.max_total_num_tokens
-            - protected_size
+            self.max_total_num_tokens - protected_size - session_held
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -205,7 +204,14 @@ class SchedulerRuntimeCheckerMixin:
             log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
             logger.info(log_msg)
 
-        total_tokens = available_size + evictable_size + protected_size + uncached_size
+        session_held = self.tree_cache.session_held_tokens()
+        total_tokens = (
+            available_size
+            + evictable_size
+            + protected_size
+            + uncached_size
+            + session_held
+        )
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
@@ -218,10 +224,12 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
+        session_req_count = self.tree_cache.session_held_req_count()
+        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"session_held={session_req_count}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise_error_or_warn(
@@ -315,16 +323,6 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
-        if any(s.streaming for s in self.sessions.values()):
-            # Disable if there are any streaming sessions open. This is because:
-            # - We want to avoid blocking new streaming session requests (which
-            #   are latency-sensitive) on the idle memory check.
-            # - In between streaming session requests, we hold onto kv memory but
-            #   the request is not part of the scheduler's running batch. The
-            #   memory checker doesn't currently handle this case.
-            self.new_token_ratio = self.init_new_token_ratio
-            self.maybe_sleep_on_idle()
-            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

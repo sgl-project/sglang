@@ -81,13 +81,7 @@ class SchedulerOutputProcessorMixin:
         return None
 
     def maybe_release_kv_cache(self: Scheduler, req: Req):
-        if req.session and req.session.streaming:
-            # For streaming sessions, hold onto the kv prefix so the next request
-            # can inherit it (low-overhead) without radix match (high-overhead).
-            assert req.session.req_nodes[req.rid].req is req
-        else:
-            is_insert = not req.skip_cache_finished
-            release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        release_kv_cache(req, self.tree_cache)
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -184,8 +178,7 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_release_kv_cache(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        if not req.skip_cache_unfinished:
-                            self.tree_cache.cache_unfinished_req(req)
+                        self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -307,7 +300,7 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_release_kv_cache(req)
                         req.time_stats.set_completion_time()
-                    elif not req.skip_cache_unfinished:
+                    else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
@@ -391,8 +384,7 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_completion_time()
                     break
 
-                if not req.skip_cache_unfinished:
-                    self.tree_cache.cache_unfinished_req(req)
+                self.tree_cache.cache_unfinished_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

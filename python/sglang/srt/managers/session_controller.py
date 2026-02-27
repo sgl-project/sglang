@@ -198,13 +198,7 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
-            # For streaming sessions, avoid caching (slow) after request is finished.
-            new_req.skip_cache_finished = True
             if last_req is not None:
-                # Inherit KV states from previous request if available (fast).
-                new_req.inherit_kv_states(last_req)
-                # Skip caching the prompt (slow) for all but the first request.
-                new_req.skip_cache_unfinished = True
                 last_req.session = None
             self.req_nodes[req.rid] = SessionReqNode(new_req)
         else:
