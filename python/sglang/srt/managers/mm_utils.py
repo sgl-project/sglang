@@ -473,8 +473,7 @@ def _get_precomputed_embedding(
     if any(feature is not None for feature in precomputed_embeddings):
         if not all(feature is not None for feature in precomputed_embeddings):
             raise NotImplementedError(
-                "MM inputs where only some items are precomputed. "
-                "Use _embed_mm_inputs_with_split so batches are uniform."
+                "MM inputs where only some items are precomputed."
             )
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
@@ -557,7 +556,6 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
-    allow_mixed: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
@@ -594,10 +592,6 @@ def _get_chunked_prefill_embedding(
         extend_seq_len = extend_length[i] if i < len(extend_length) else 0
 
         if isinstance(embedding_per_req, EVSEmbeddingResult):
-            if allow_mixed:
-                raise NotImplementedError(
-                    "EVS is not supported with precomputed and computed embeddings mixed mode."
-                )
             item = embedding_items_per_req[0]
             input_ids, items_offset = (
                 embedding_per_req.redistribute_pruned_frames_placeholders(
@@ -618,10 +612,7 @@ def _get_chunked_prefill_embedding(
         embedding_list.append(embedding_per_req_chunk)
     if len(embedding_list) == 0:
         return None, input_ids
-    if not allow_mixed:
-        return torch.concat(embedding_list, dim=0), input_ids
-    else:
-        return embedding_list, input_ids
+    return torch.concat(embedding_list, dim=0), input_ids
 
 
 def get_embedding_chunk_remove_extra_padding(
@@ -893,7 +884,7 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
-    # 1. Get embedding (batch is always uniform: all precomputed or all non-precomputed via _embed_mm_inputs_with_split)
+    # 1. Get embedding
     embedding = _get_precomputed_embedding(
         embedding_items, prefix_length, extend_length, items_offset_list
     )
@@ -907,10 +898,8 @@ def get_embedding_and_mask(
             items_offset_list,
             input_ids,
         )
-
-    if embedding is None:
-        return None, None, input_ids
-
+        if embedding is None:
+            return None, None, input_ids
     # 2. Get mask
     if _is_npu:
         torch.npu.current_stream().synchronize()
@@ -1107,20 +1096,21 @@ def _embed_mm_inputs_with_split(
         token_starts.append(cumulative)
         cumulative += sl
 
-    vocab_size = input_embedding.num_embeddings
-    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1)).clone()
+    total_tokens = input_ids.shape[0]
+    hidden_size = input_embedding.embedding_dim
+    device = input_ids.device
+    dtype = input_embedding.weight.dtype
+    input_embeds = torch.empty(total_tokens, hidden_size, device=device, dtype=dtype)
     other_info = {}
-    # Pre-allocate full-batch deepstack embeds when needed; merge by position instead of update
+
     input_deepstack_embeds = None
     if use_deepstack and multimodal_model is not None:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
-        deepstack_shape = input_embeds.shape[:-1] + (
-            input_embeds.shape[-1] * num_deepstack_embeddings,
-        )
         input_deepstack_embeds = torch.zeros(
-            deepstack_shape,
-            device=input_embeds.device,
-            dtype=input_embeds.dtype,
+            total_tokens,
+            hidden_size * num_deepstack_embeddings,
+            device=device,
+            dtype=dtype,
         )
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
@@ -1156,10 +1146,7 @@ def _embed_mm_inputs_with_split(
             ):
                 input_deepstack_embeds[start : start + req_len] = sub_info[
                     "input_deepstack_embeds"
-                ][offset : offset + req_len].to(
-                    input_deepstack_embeds.device,
-                    input_deepstack_embeds.dtype,
-                )
+                ][offset : offset + req_len]
             offset += req_len
 
     return input_embeds, other_info
@@ -1211,19 +1198,34 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-            input_embeds, other_info = _embed_mm_inputs_with_split(
-                mm_inputs_list=mm_inputs_list,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens=extend_seq_lens,
-                input_ids=input_ids,
-                forward_batch=forward_batch,
-                input_embedding=embed_tokens,
-                multimodal_model=multimodal_model,
-                data_embedding_func_mapping=data_embedding_funcs,
-                placeholder_tokens=placeholder_tokens,
-                use_deepstack=use_deepstack,
-            )
+            server_args = get_global_server_args()
+            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                input_embeds, other_info = _embed_mm_inputs_with_split(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+            else:
+                input_embeds, other_info = embed_mm_inputs(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    input_embedding=embed_tokens,
+                    multimodal_model=multimodal_model,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]

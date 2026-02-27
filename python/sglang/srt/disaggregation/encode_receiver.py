@@ -335,12 +335,17 @@ class MMReceiverHTTP(MMReceiverBase):
                         )
                     else:
                         raise e
+
+                # Skip mm_pool if not adaptive dispatch to encoder
+                enable_adaptive_dispatch_to_encoder = (
+                    server_args.enable_adaptive_dispatch_to_encoder
+                )
                 self.mm_processor = get_mm_processor(
                     hf_config,
                     server_args,
                     _processor,
                     transport_mode,
-                    skip_mm_pool=True,
+                    skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):

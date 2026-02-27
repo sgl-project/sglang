@@ -2280,8 +2280,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ) -> bool:
         """Check if the request should be dispatched to encoder for processing.
 
-        Returns True if the request should be dispatched to encoder (multiple images),
-        False if it should be processed locally (single image or no images).
+        Returns True if the request should be dispatched to encoder (multiple multimodal items),
+        False if it should be processed locally (single multimodal item or no multimodal items).
 
         Args:
             obj: The request input object
