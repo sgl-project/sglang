@@ -347,41 +347,6 @@ def silu_and_mul_scaled_fp4_grouped_quant(
     )
 
 
-def scaled_fp4_experts_quant(
-    input_tensor: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    blockscale_offsets: torch.Tensor,
-    topk: int,
-    expert_map: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale, for
-    packed MoE Inputs.
-    Args:
-        input: The input tensor to be quantized to FP4
-        expert_map: The expert map tensor
-        input_global_scale: A scalar scaling factor for the entire tensor.
-        expert_offsets: The expert offsets tensor
-        blockscale_offsets: The blockscale offsets tensor
-    Outputs:
-        output: The quantized tensor in FP4
-        output_scales: The blockscale tensor in FP8-E4M3
-    """
-    from sglang.jit_kernel.nvfp4 import (
-        scaled_fp4_experts_quant as jit_scaled_fp4_experts_quant,
-    )
-
-    return jit_scaled_fp4_experts_quant(
-        input_tensor=input_tensor,
-        input_global_scale=input_global_scale,
-        expert_offsets=expert_offsets,
-        blockscale_offsets=blockscale_offsets,
-        topk=topk,
-        expert_map=expert_map,
-    )
-
-
 # GPTQ kernels
 def gptq_gemm(
     a: torch.Tensor,

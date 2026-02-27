@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include "nvfp4_quant.cuh"
@@ -12,7 +13,7 @@ using namespace host;
 
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
+SGL_DEVICE uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);
@@ -65,11 +66,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
-    }
+    fp2Vals[i] = device::cast<float2>(vec.elts[i]);
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
   }
@@ -84,30 +81,22 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
-__device__ __forceinline__ float silu(const float& val) {
+SGL_DEVICE float silu(const float& val) {
   return val / (1.0f + __expf(-val));
 }
 
 template <class Type>
-inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
+SGL_DEVICE void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
   float2 x[CVT_FP4_ELTS_PER_THREAD / 2];
   float2 y[CVT_FP4_ELTS_PER_THREAD / 2];
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      x[i] = __half22float2(x_vec.elts[i]);
-      y[i] = __half22float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22half2_rn(x[i]);
-    } else {
-      x[i] = __bfloat1622float2(x_vec.elts[i]);
-      y[i] = __bfloat1622float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
-    }
+    x[i] = device::cast<float2>(x_vec.elts[i]);
+    y[i] = device::cast<float2>(y_vec.elts[i]);
+    x[i].x = silu(x[i].x) * y[i].x;
+    x[i].y = silu(x[i].y) * y[i].y;
+    x_vec.elts[i] = device::cast<packed_t<Type>>(x[i]);
   }
 }
 
@@ -559,46 +548,51 @@ void scaled_fp4_experts_quant_sm100a(
     tvm::ffi::TensorView input_global_scale,
     tvm::ffi::TensorView input_offset_by_experts,
     tvm::ffi::TensorView output_scale_offset_by_experts) {
-  RuntimeCheck(input.device().device_type == kDLCUDA, "input must be a CUDA tensor");
-  RuntimeCheck(output.device() == input.device(), "output and input must be on same device");
-  RuntimeCheck(output_scale.device() == input.device(), "output_scale and input must be on same device");
-  RuntimeCheck(input_global_scale.device() == input.device(), "input_global_scale and input must be on same device");
-  RuntimeCheck(
-      input_offset_by_experts.device() == input.device(), "input_offset_by_experts and input must be on same device");
-  RuntimeCheck(
-      output_scale_offset_by_experts.device() == input.device(),
-      "output_scale_offset_by_experts and input must be on same device");
+  auto MTopK = SymbolicSize{"m_topk"};
+  auto K = SymbolicSize{"k"};
+  auto OutputCols = SymbolicSize{"output_cols"};
+  auto OutputScaleRows = SymbolicSize{"output_scale_rows"};
+  auto OutputScaleCols = SymbolicSize{"output_scale_cols"};
+  auto NExperts = SymbolicSize{"n_experts"};
+  auto OffsetSize = SymbolicSize{"offset_size"};
+  auto device = SymbolicDevice{};
 
-  RuntimeCheck(output.dim() == 2, "output must be 2D");
-  RuntimeCheck(output_scale.dim() == 2, "output_scale must be 2D");
-  RuntimeCheck(input.dim() == 2, "input must be 2D");
-  RuntimeCheck(input_global_scale.dim() == 1, "input_global_scale must be 1D");
-  RuntimeCheck(input_offset_by_experts.dim() == 1, "input_offset_by_experts must be 1D");
-  RuntimeCheck(output_scale_offset_by_experts.dim() == 1, "output_scale_offset_by_experts must be 1D");
-
-  RuntimeCheck(host::is_type<fp16_t>(input.dtype()) || host::is_type<bf16_t>(input.dtype()), "input must be fp16/bf16");
-  RuntimeCheck(host::is_type<float>(input_global_scale.dtype()), "input_global_scale must be fp32");
-  RuntimeCheck(host::is_type<int32_t>(input_offset_by_experts.dtype()), "input_offset_by_experts must be int32");
-  RuntimeCheck(
-      host::is_type<int32_t>(output_scale_offset_by_experts.dtype()), "output_scale_offset_by_experts must be int32");
-  RuntimeCheck(host::is_type<uint8_t>(output.dtype()), "output must be uint8");
-  RuntimeCheck(host::is_type<int32_t>(output_scale.dtype()), "output_scale must be int32");
+  TensorMatcher({MTopK, K})  //
+      .with_dtype<fp16_t, bf16_t>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
+  TensorMatcher({MTopK, OutputCols})  //
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({OutputScaleRows, OutputScaleCols})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(output_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(input_global_scale);
+  TensorMatcher({OffsetSize})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(input_offset_by_experts)
+      .verify(output_scale_offset_by_experts);
 
   const int device_id = input.device().device_id;
   RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
-  const auto m_topk = static_cast<int>(input.size(0));
-  const auto k = static_cast<int>(input.size(1));
+  const auto m_topk = static_cast<int>(MTopK.unwrap());
+  const auto k = static_cast<int>(K.unwrap());
   RuntimeCheck(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
-  const auto n_experts = static_cast<int>(input_global_scale.size(0));
-  RuntimeCheck(input_offset_by_experts.size(0) == n_experts + 1, "input_offset_by_experts size mismatch");
-  RuntimeCheck(output_scale_offset_by_experts.size(0) == n_experts + 1, "output_scale_offset_by_experts size mismatch");
-  RuntimeCheck(output.size(0) == m_topk, "output first dim mismatch");
-  RuntimeCheck(output.size(1) == k / 2, "output second dim mismatch");
+  const auto n_experts = static_cast<int>(NExperts.unwrap());
+  const auto offset_size = static_cast<int>(OffsetSize.unwrap());
+  RuntimeCheck(offset_size == n_experts + 1, "input/output offset size mismatch");
+  RuntimeCheck(static_cast<int>(OutputCols.unwrap()) == k / 2, "output second dim mismatch");
   const int scales_k = k / BLOCK_SIZE;
   const int padded_k = (scales_k + 3) / 4 * 4;
-  RuntimeCheck(output_scale.size(1) * 4 == padded_k, "output_scale second dim mismatch");
+  RuntimeCheck(static_cast<int>(OutputScaleCols.unwrap()) * 4 == padded_k, "output_scale second dim mismatch");
 
   const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
   if (host::is_type<fp16_t>(input.dtype())) {
@@ -639,42 +633,51 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     tvm::ffi::TensorView input_global_scale,
     tvm::ffi::TensorView mask,
     bool use_silu_and_mul) {
-  RuntimeCheck(input.device().device_type == kDLCUDA, "input must be a CUDA tensor");
-  RuntimeCheck(output.device() == input.device(), "output and input must be on same device");
-  RuntimeCheck(output_scale.device() == input.device(), "output_scale and input must be on same device");
-  RuntimeCheck(input_global_scale.device() == input.device(), "input_global_scale and input must be on same device");
-  RuntimeCheck(mask.device() == input.device(), "mask and input must be on same device");
+  auto MTopK = SymbolicSize{"m_topk"};
+  auto KBy2 = SymbolicSize{"k_by_2"};
+  auto OutputCols = SymbolicSize{"output_cols"};
+  auto OutputScaleRows = SymbolicSize{"output_scale_rows"};
+  auto OutputScaleCols = SymbolicSize{"output_scale_cols"};
+  auto NExperts = SymbolicSize{"n_experts"};
+  auto device = SymbolicDevice{};
 
-  RuntimeCheck(output.dim() == 2, "output must be 2D");
-  RuntimeCheck(output_scale.dim() == 2, "output_scale must be 2D");
-  RuntimeCheck(input.dim() == 2, "input must be 2D");
-  RuntimeCheck(input_global_scale.dim() == 1, "input_global_scale must be 1D");
-  RuntimeCheck(mask.dim() == 1, "mask must be 1D");
-
-  RuntimeCheck(host::is_type<fp16_t>(input.dtype()) || host::is_type<bf16_t>(input.dtype()), "input must be fp16/bf16");
-  RuntimeCheck(host::is_type<float>(input_global_scale.dtype()), "input_global_scale must be fp32");
-  RuntimeCheck(host::is_type<int32_t>(mask.dtype()), "mask must be int32");
-  RuntimeCheck(host::is_type<uint8_t>(output.dtype()), "output must be uint8");
-  RuntimeCheck(host::is_type<int32_t>(output_scale.dtype()), "output_scale must be int32");
+  TensorMatcher({MTopK, KBy2})  //
+      .with_dtype<fp16_t, bf16_t>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
+  TensorMatcher({MTopK, OutputCols})  //
+      .with_dtype<uint8_t>()
+      .with_device(device)
+      .verify(output);
+  TensorMatcher({OutputScaleRows, OutputScaleCols})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(output_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(input_global_scale);
+  TensorMatcher({NExperts})  //
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(mask);
 
   const int device_id = input.device().device_id;
   RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
-  const auto m_topk = static_cast<int>(input.size(0));
-  const auto k_by_2 = static_cast<int>(input.size(1));
+  const auto m_topk = static_cast<int>(MTopK.unwrap());
+  const auto k_by_2 = static_cast<int>(KBy2.unwrap());
   int k = k_by_2;
   if (use_silu_and_mul) {
     RuntimeCheck(k_by_2 % 2 == 0, "k must be a multiple of 2");
     k = k_by_2 / 2;
   }
-  const auto n_experts = static_cast<int>(input_global_scale.size(0));
-  RuntimeCheck(mask.size(0) == n_experts, "mask size mismatch");
-  RuntimeCheck(output.size(0) == m_topk, "output first dim mismatch");
-  RuntimeCheck(output.size(1) == k / 2, "output second dim mismatch");
+  const auto n_experts = static_cast<int>(NExperts.unwrap());
+  RuntimeCheck(static_cast<int>(OutputCols.unwrap()) == k / 2, "output second dim mismatch");
   const int scales_k = k / BLOCK_SIZE;
   const int padded_k = (scales_k + 3) / 4 * 4;
-  RuntimeCheck(output_scale.size(1) * 4 == padded_k, "output_scale second dim mismatch");
+  RuntimeCheck(static_cast<int>(OutputScaleCols.unwrap()) * 4 == padded_k, "output_scale second dim mismatch");
 
   const cudaStream_t stream = LaunchKernel::resolve_device(input.device());
   if (host::is_type<fp16_t>(input.dtype())) {

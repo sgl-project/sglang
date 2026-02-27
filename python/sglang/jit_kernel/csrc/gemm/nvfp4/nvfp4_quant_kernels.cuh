@@ -27,7 +27,7 @@ using namespace host;
 
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
+SGL_DEVICE uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);

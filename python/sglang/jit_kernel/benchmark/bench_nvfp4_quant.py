@@ -10,6 +10,11 @@ FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 BLOCK_SIZE = 16
 
+try:
+    from flashinfer import fp4_quantize as flashinfer_fp4_quantize
+except Exception:
+    flashinfer_fp4_quantize = None
+
 
 def _torch_ref_quant(input: torch.Tensor, input_global_scale: torch.Tensor):
     m, n = input.shape
@@ -77,14 +82,47 @@ def _probe_legacy_aot_quant() -> tuple[bool, str]:
 
 _AOT_QUANT_AVAILABLE, _AOT_QUANT_REASON = _probe_legacy_aot_quant()
 
+
+def _probe_flashinfer_quant() -> tuple[bool, str]:
+    if flashinfer_fp4_quantize is None:
+        return False, "import flashinfer.fp4_quantize failed."
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available."
+    try:
+        x = torch.randn((16, 64), dtype=torch.bfloat16, device="cuda")
+        global_scale = (
+            FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / torch.abs(x).max().to(torch.float32)
+        )
+        flashinfer_fp4_quantize(
+            x,
+            global_scale,
+            BLOCK_SIZE,  # sf_vec_size
+            False,  # use_ue8m0
+            True,  # is_sf_swizzled_layout
+        )
+        torch.cuda.synchronize()
+    except Exception as e:
+        return False, f"calling flashinfer.fp4_quantize failed: {e}"
+    return True, ""
+
+
+_FLASHINFER_QUANT_AVAILABLE, _FLASHINFER_QUANT_REASON = _probe_flashinfer_quant()
+
 shape_range = get_benchmark_range(
     full_range=[(128, 2048), (512, 4096), (1024, 4096), (2048, 8192)],
     ci_range=[(128, 2048)],
 )
 
-line_vals = ["jit"]
-line_names = ["JIT NVFP4 Quant"]
-styles = [("green", "-")]
+line_vals = []
+line_names = []
+styles = []
+if _FLASHINFER_QUANT_AVAILABLE:
+    line_vals.append("flashinfer")
+    line_names.append("FlashInfer FP4 Quant")
+    styles.append(("purple", "-"))
+line_vals.append("jit")
+line_names.append("JIT NVFP4 Quant")
+styles.append(("green", "-"))
 if _AOT_QUANT_AVAILABLE:
     line_vals.append("aot_sgl_kernel")
     line_names.append("AOT NVFP4 Quant")
@@ -115,6 +153,14 @@ def benchmark(m, n, provider):
 
     if provider == "jit":
         fn = lambda: scaled_fp4_quant(x, global_scale)
+    elif provider == "flashinfer":
+        fn = lambda: flashinfer_fp4_quantize(
+            x,
+            global_scale,
+            BLOCK_SIZE,  # sf_vec_size
+            False,  # use_ue8m0
+            True,  # is_sf_swizzled_layout
+        )
     elif provider == "aot_sgl_kernel":
         fn = lambda: _aot_scaled_fp4_quant(x, global_scale)
     elif provider == "torch_ref":
@@ -126,6 +172,10 @@ def benchmark(m, n, provider):
 
 
 if __name__ == "__main__":
+    if not _FLASHINFER_QUANT_AVAILABLE:
+        print(
+            f"[info] flashinfer quant baseline unavailable: {_FLASHINFER_QUANT_REASON}"
+        )
     if not _AOT_QUANT_AVAILABLE:
         print(f"[info] legacy AOT quant baseline unavailable: {_AOT_QUANT_REASON}")
     benchmark.run(print_data=True)

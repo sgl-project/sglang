@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 
@@ -286,46 +286,4 @@ def fused_qk_norm_rope(
         high,
         attention_factor,
         rotary_dim if rotary_dim is not None else head_dim,
-    )
-
-
-def cutlass_fp4_group_mm(
-    a_fp4,
-    b_fp4,
-    a_blockscale,
-    b_blockscale,
-    alphas,
-    out_dtype,
-    device,
-    params: Dict[str, Any],
-):
-    """
-    An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
-    the gemms for each combination based on the specified problem sizes.
-
-    This is used as the MoE gemm during NVFP4 Quantized FusedMoE forward.
-    - a/b_tensors: the NVFP4 a_ptrs and b_ptrs tensors which are quantized
-                     input and expert weights.
-    - a_/b_scales: The blockscales in FP8-E4M3 precision
-    - ab_strides/c_strides: Strides for the a/b tensors between rows.
-    - expert_offsets/sf_offsets: Indices that mark at which token index
-                    each expert begins its computation. The number of tokens
-                    computed with expert E is expert_offsets[E + 1] -
-                    expert_offsets[E] And the sf_size per expert is
-                    sf_offset[E+1] - sf_offset[E]
-    - problem_sizes: MxNxK sizes of each expert's multiplication in two grouped
-                     MMs used in the fused MoE operation.
-    """
-    del device  # Kept for backward-compatible call sites.
-
-    from sglang.jit_kernel.nvfp4 import cutlass_fp4_group_mm as jit_cutlass_fp4_group_mm
-
-    return jit_cutlass_fp4_group_mm(
-        a_fp4,
-        b_fp4,
-        a_blockscale,
-        b_blockscale,
-        alphas,
-        out_dtype,
-        params,
     )
