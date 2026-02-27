@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Union
 
+from sglang.srt.debug_utils.comparator.aligner.axis_swapper import AxisSwapperPlan
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
@@ -25,3 +26,4 @@ class AlignerPlan:
     per_step_plans: Pair[list[AlignerPerStepPlan]]
     token_aligner_plan: Optional[TokenAlignerPlan]
     token_dims: Pair[int]
+    axis_swapper_plan: Optional[AxisSwapperPlan] = None
