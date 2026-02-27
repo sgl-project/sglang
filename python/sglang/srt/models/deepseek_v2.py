@@ -1513,8 +1513,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-        _use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
-        if not hasattr(config, "q_lora_rank") and _use_ag_after_qlora:
+        if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
                 "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
             )
