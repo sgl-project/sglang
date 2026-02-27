@@ -670,6 +670,9 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
+    # KV return: transfer generated KV from decode back to prefill for prefix caching
+    enable_kv_return: bool = False
+
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
@@ -2584,10 +2587,21 @@ class ServerArgs:
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
+            if self.enable_kv_return:
+                logger.info(
+                    "KV return enabled on decode side — generated KV will be "
+                    "transferred back to originating prefill worker on sequence completion"
+                )
+
         elif self.disaggregation_mode == "prefill":
             assert (
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
+            if self.enable_kv_return:
+                logger.info(
+                    "KV return enabled on prefill side — all available KV memory "
+                    "will be used for receiving returned KV from decode workers"
+                )
             if self.disaggregation_decode_tp is None:
                 self.disaggregation_decode_tp = self.tp_size
             if self.disaggregation_decode_dp is None:
@@ -2732,6 +2746,12 @@ class ServerArgs:
                 raise ValueError(
                     "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
                 )
+        if self.enable_kv_return:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--enable-kv-return requires --disaggregation-mode to be 'prefill' or 'decode'."
+                )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -4982,6 +5002,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--enable-kv-return",
+            action="store_true",
+            help="Enable KV return: transfer generated KV from decode back to prefill for prefix caching. "
+            "Requires --disaggregation-mode prefill or decode.",
         )
 
         # Encode prefill disaggregation

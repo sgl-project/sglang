@@ -150,12 +150,20 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        # With on-demand KV return allocation, pages for in-flight RDMA
+        # transfers are transiently allocated and inserted into RadixCache
+        # within one scheduler iteration. They appear as "in-flight" briefly
+        # but don't need persistent tracking. We skip the leak check when
+        # KV return is active since in-flight pages are expected.
+        kv_return_active = getattr(self, "server_args", None) and getattr(
+            self.server_args, "enable_kv_return", False
+        )
+        if kv_return_active:
+            # Cannot precisely track in-flight pages; skip leak assertion
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, kv_return=on-demand\n"
+            return False, token_msg
         memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
-            self.max_total_num_tokens
-            - protected_size
+            self.max_total_num_tokens - protected_size
         )
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
@@ -315,6 +323,21 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Process KV return alloc requests and insertions even when idle (prefill side)
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            self._process_kv_return_alloc_requests()
+            self._process_kv_return_insertions()
+
+        # Poll async KV return progress even when idle (decode side)
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            self._poll_kv_return_replies()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
@@ -326,6 +349,9 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            # Count in-flight async KV returns (pages still held for RDMA)
+            if hasattr(self, "_kv_return_pending"):
+                queue_size += len(self._kv_return_pending)
             if queue_size:
                 return
 

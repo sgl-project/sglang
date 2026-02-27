@@ -5,6 +5,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.base.conn import (
+    BaseKVBootstrapServer,
     BaseKVManager,
     BaseKVReceiver,
     BaseKVSender,
@@ -108,3 +109,16 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+
+class FakeKVBootstrapServer(BaseKVBootstrapServer):
+    """No-op bootstrap server for the fake transfer backend.
+
+    The bootstrap server coordinates KV transfer metadata between prefill and
+    decode workers. For the fake backend, no actual transfer happens, so this
+    just needs to exist and accept connections without doing anything.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
