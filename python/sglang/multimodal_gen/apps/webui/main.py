@@ -117,6 +117,7 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            return_file_paths_only=False,
         )
         sampling_params = SamplingParams.from_user_sampling_params_args(
             server_args.model_path,
