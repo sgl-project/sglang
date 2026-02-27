@@ -443,7 +443,22 @@ class MiMoV2Attention(nn.Module):
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
 
-        self.v_scale = v_scale
+        if quant_config is not None:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsConfig
+            )
+            from sglang.srt.layers.quantization.w8a8_int8 import (
+                W8A8Int8Config
+            )
+            if (isinstance(quant_config, CompressedTensorsConfig)
+                and quant_config.quant_format == "int-quantized"):
+                self.v_scale = None
+            elif isinstance(quant_config, W8A8Int8Config):
+                self.v_scale = None
+            else:
+                self.v_scale = v_scale
+        else:
+            self.v_scale = v_scale
 
         self.scaling = self.head_dim**-0.5
 

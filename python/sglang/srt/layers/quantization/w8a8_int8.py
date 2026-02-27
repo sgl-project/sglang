@@ -107,13 +107,17 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if should_ignore_layer(
-            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-        ):
-            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedLinearMethod()
             return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if should_ignore_layer(
+                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+            ):
+                return UnquantizedFusedMoEMethod()
             return W8A8Int8MoEMethod(self)
         return None
 
