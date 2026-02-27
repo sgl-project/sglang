@@ -1117,12 +1117,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     request=request,
                 )
 
-                if self.request_metrics_exporter_manager.exporter_enabled():
-                    # Asynchronously write metrics for this request using the exporter manager.
-                    asyncio.create_task(
-                        self.request_metrics_exporter_manager.write_record(obj, out)
-                    )
-
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
@@ -1587,6 +1581,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     meta_info.update(
                         state.time_stats.convert_to_output_meta_info(
                             scheduler_time_stats, completion_tokens
+                        )
+                    )
+
+                if self.request_metrics_exporter_manager.exporter_enabled():
+                    asyncio.create_task(
+                        self.request_metrics_exporter_manager.write_record(
+                            state.obj, out_dict
                         )
                     )
 
@@ -2117,6 +2118,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+
+        if self.request_metrics_exporter_manager.exporter_enabled():
+            asyncio.create_task(
+                self.request_metrics_exporter_manager.write_record(state.obj, out)
+            )
         state.out_list.append(out)
         state.event.set()
 
