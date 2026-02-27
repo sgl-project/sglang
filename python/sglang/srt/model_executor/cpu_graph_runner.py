@@ -802,18 +802,15 @@ class CPUGraphRunner:
         if forward_batch.batch_size in self.graphs:
             return output
 
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
-            )
-        else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+        assert isinstance(output, LogitsProcessorOutput)
+        return LogitsProcessorOutput(
+            next_token_logits=output.next_token_logits[: self.raw_num_token],
+            hidden_states=(
+                output.hidden_states[: self.raw_num_token]
+                if output.hidden_states is not None
+                else None
+            ),
+        )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
