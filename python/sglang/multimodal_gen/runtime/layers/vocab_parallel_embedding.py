@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
     method_has_implemented_embedding,

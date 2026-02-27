@@ -513,8 +513,10 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset += extend_input_len
+        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
+        page_overhead = self.page_size
+        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
+        self.cur_rem_token_offset += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
 
         if self.dllm_config is not None:
@@ -834,8 +836,16 @@ class PrefillAdder:
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
+        # NOTE: A request finishes in two phases:
+        #   1) check_finished + release_kv_cache  (in process_batch_result)
+        #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
+        # Preemption runs between these two phases (inside get_new_batch_prefill),
+        # so running_batch may still contain requests whose KV cache is already freed.
+        # We must skip them here to avoid a double-free on release_req.
         valid_running_reqs = (
-            r for r in self.running_batch.reqs if r not in self.preempt_list
+            r
+            for r in self.running_batch.reqs
+            if r not in self.preempt_list and not r.finished()
         )
 
         sorted_valid_running_reqs = sorted(
