@@ -53,7 +53,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def initialize(self) -> None:
         from sglang.srt.distributed.parallel_state import (
             get_world_group,
-            get_world_size, 
+            get_world_size,
         )
 
         transfer_protocol = self._get_transfer_protocol()
