@@ -3,8 +3,11 @@ import logging
 import pickle
 import random
 import threading
+import time
 import uuid
+from abc import ABC, abstractmethod
 from enum import IntEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
@@ -13,8 +16,11 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_mooncake_transfer_engine,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -103,6 +109,7 @@ class WaitingImageRequestStatus(IntEnum):
     FAIL = -1
     PENDING = 0
     SUCCESS = 1
+    TIMEOUT = -2
 
 
 # For zmq_to_scheduler
@@ -135,6 +142,7 @@ class WaitingImageRequest:
         self.status = WaitingImageRequestStatus.PENDING
         self.error_msg = None
         self.error_code = None
+        self.start_time = time.time()
 
     def send_encode_request(self):
         async def _send_single_request(session, url, payload):
@@ -241,7 +249,33 @@ def _determine_tensor_transport_mode(server_args):
         return "cuda_ipc"
 
 
-class MMReceiver:
+class MMReceiverBase(ABC):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        dtype: Optional[torch.dtype] = None,
+        hf_config: Optional[PretrainedConfig] = None,
+        pp_rank: Optional[int] = None,
+        tp_rank: Optional[int] = None,
+        tp_group: Optional[GroupCoordinator] = None,
+        scheduler: Optional["Scheduler"] = None,
+    ):
+        pass
+
+    @abstractmethod
+    def process_waiting_requests(self, recv_reqs):
+        pass
+
+    @abstractmethod
+    async def recv_mm_data(self, img_data, mm_processor, prompt):
+        pass
+
+    @abstractmethod
+    def send_encode_request(self, obj):
+        pass
+
+
+class MMReceiverHTTP(MMReceiverBase):
 
     def __init__(
         self,
@@ -257,14 +291,10 @@ class MMReceiver:
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.encode_idx = list(range(len(self.encode_urls)))
-        self.host = server_args.host
+        self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
-            self.embeddings_engine = MooncakeTransferEngine(
-                hostname=get_local_ip_auto(),
-                gpu_id=None,
-                ib_device=server_args.disaggregation_ib_device,
-            )
+            self.embeddings_engine = get_mooncake_transfer_engine()
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
@@ -275,6 +305,7 @@ class MMReceiver:
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -310,7 +341,7 @@ class MMReceiver:
                     skip_mm_pool=True,
                 )
 
-    def create_req(self, recv_req):
+    def create_req(self, recv_req: TokenizedGenerateReqInput):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -331,7 +362,8 @@ class MMReceiver:
             bootstrap_port=recv_req.bootstrap_port,
             bootstrap_room=recv_req.bootstrap_room,
             disagg_mode=self.scheduler.disaggregation_mode,
-            data_parallel_rank=recv_req.data_parallel_rank,
+            routed_dp_rank=recv_req.routed_dp_rank,
+            disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
             vocab_size=self.scheduler.model_config.vocab_size,
             priority=recv_req.priority,
             metrics_collector=(
@@ -369,9 +401,12 @@ class MMReceiver:
         if len(self.waiting_list) == 0:
             return new_recv_reqs, []
 
+        current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
+            if current_time - waiting_req.start_time > self.wait_timeout:
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
@@ -397,6 +432,17 @@ class MMReceiver:
                         self.create_req(waiting_req.recv_req),
                         waiting_req.error_msg,
                         waiting_req.error_code,
+                    )
+                )
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"Timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING
@@ -602,7 +648,7 @@ class MMReceiver:
 
     # For zmq_to_tokenizer and mooncake
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
-        # Bypass MMReceiver
+        # Bypass MMReceiverHTTP
         if req_id is None:
             return None
 
