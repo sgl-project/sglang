@@ -23,7 +23,10 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
