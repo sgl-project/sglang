@@ -416,7 +416,7 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        # Only once Device-to-Host (D2H) memory copy
+        # Perform only one Device-to-Host (D2H) memory copy
         cpu_data = partial_global_info[:, :2].cpu()
         local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
         forward_modes = cpu_data[:, 1].tolist()

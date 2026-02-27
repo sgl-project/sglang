@@ -94,7 +94,7 @@ class MLPSyncBatchInfo:
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
-        # Only once Device-to-Host (D2H) memory copy
+        # Perform only one Device-to-Host (D2H) memory copy
         cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
