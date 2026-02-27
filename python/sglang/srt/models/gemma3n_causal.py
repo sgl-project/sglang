@@ -12,6 +12,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -183,21 +184,21 @@ class Gemma3nAltUp(nn.Module):
         self.correct_output_scale = nn.Parameter(
             torch.zeros(config.hidden_size, dtype=torch.float32)
         )
-        self.correction_coefs = ColumnParallelLinear(
+        self.correction_coefs = ReplicatedLinear(
             config.altup_num_inputs,
             config.altup_num_inputs,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("correction_coefs", prefix),
         )
-        self.prediction_coefs = ColumnParallelLinear(
+        self.prediction_coefs = ReplicatedLinear(
             config.altup_num_inputs,
             config.altup_num_inputs**2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("prediction_coefs", prefix),
         )
-        self.modality_router = ColumnParallelLinear(
+        self.modality_router = ReplicatedLinear(
             config.hidden_size,
             config.altup_num_inputs,
             bias=False,
@@ -545,14 +546,14 @@ class Gemma3nDecoderLayer(nn.Module):
             config, quant_config, prefix=add_prefix("laurel", prefix)
         )
 
-        self.per_layer_input_gate = ColumnParallelLinear(
+        self.per_layer_input_gate = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size_per_layer_input,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_input_gate", prefix),
         )
-        self.per_layer_projection = RowParallelLinear(
+        self.per_layer_projection = ReplicatedLinear(
             self.hidden_size_per_layer_input,
             self.hidden_size,
             bias=False,
