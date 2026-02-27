@@ -426,9 +426,9 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun CI and tag their own PRs,
+    # PR authors can always rerun failed CI on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
-    # Note: /rerun-stage still requires CI_PERMISSIONS.json membership.
+    # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -438,7 +438,6 @@ def main():
             user_perms = {}
         else:
             print(f"User {user_login} is the PR author and has existing CI permissions.")
-        user_perms["can_tag_run_ci_label"] = True
         user_perms["can_rerun_failed_ci"] = True
 
     if not user_perms:
