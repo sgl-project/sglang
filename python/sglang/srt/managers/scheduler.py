@@ -2403,7 +2403,7 @@ class Scheduler(
 
         if (
             self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend == "mooncake"
+            and self.server_args.elastic_ep_backend is not None
         ):
             # Get the tensors indicating rank activeness
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()

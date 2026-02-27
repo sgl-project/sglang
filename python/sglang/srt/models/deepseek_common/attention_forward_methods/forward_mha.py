@@ -17,7 +17,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import BumpAllocator, next_power_of_2
+from sglang.srt.utils import BumpAllocator, get_bool_env_var, next_power_of_2
+
+_use_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -28,6 +32,7 @@ if _is_cuda:
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 # Configs for DeepSeek-V3:
@@ -232,17 +237,31 @@ class DeepseekMHAForwardMixin:
                     q.dtype,
                     forward_batch,
                 )
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv = self.kv_b_proj(
-                kv_a_quanted,
+        if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
+            # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
+            # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
+            # directly in FP8, avoiding a separate elementwise cast
+            k, v = self.kv_b_proj(
+                (
+                    kv_a,
+                    k_pe.expand(-1, self.num_local_heads, -1),
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    fp8_dtype,
+                )
             )[0]
         else:
-            kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
+            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+                kv = self.kv_b_proj(kv_a_quanted)[0]
+            else:
+                kv = self.kv_b_proj(kv_a)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            v = kv[..., self.qk_nope_head_dim :]
 
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(

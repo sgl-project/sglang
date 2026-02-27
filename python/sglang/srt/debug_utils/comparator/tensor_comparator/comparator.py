@@ -125,6 +125,7 @@ def _compute_diff(
         max_diff_coord=list(max_diff_coord),
         baseline_at_max=x_baseline[max_diff_coord].item(),
         target_at_max=x_target[max_diff_coord].item(),
+        diff_threshold=diff_threshold,
         passed=(
             rel_diff <= diff_threshold
             and max_abs_diff <= diff_threshold

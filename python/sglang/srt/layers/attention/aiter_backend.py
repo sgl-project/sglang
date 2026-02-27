@@ -92,6 +92,7 @@ class ForwardMetadata:
     custom_mask: Optional[torch.Tensor] = None
     mask_indptr: Optional[torch.Tensor] = None
     max_extend_len: Optional[int] = None
+    fp8_prefill_kv_indices: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -757,6 +758,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr = None
                 reduce_final_map = None
                 reduce_partial_map = None
+                fp8_prefill_kv_indices = None
 
                 if _use_fp8_prefill_attn:
                     tile_q = 256
@@ -785,6 +787,11 @@ class AiterAttnBackend(AttentionBackend):
                         is_causal=True,
                     )
 
+                    total_s = int(forward_batch.extend_seq_lens.sum())
+                    fp8_prefill_kv_indices = torch.arange(
+                        total_s, device=self.device, dtype=torch.int32
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
                     self.mla_indices_updater_prefill.kv_indices,
@@ -798,6 +805,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
+                    fp8_prefill_kv_indices=fp8_prefill_kv_indices,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -1470,20 +1478,19 @@ class AiterAttnBackend(AttentionBackend):
                         nhead = layer.tp_q_head_num
                         v_head_dim = layer.v_head_dim
 
+                        # q is cast here (after RoPE).
+                        # k/v are already FP8 for MXFP4 main model (fused kv_b_proj),
+                        # but need casting for FP8/BF16 weights (e.g. MTP draft model).
                         if q.dtype != fp8_dtype:
-                            q = q.float().to(fp8_dtype)
+                            q = q.to(fp8_dtype)
                         if k.dtype != fp8_dtype:
-                            k = k.float().to(fp8_dtype)
+                            k = k.to(fp8_dtype)
                         if v.dtype != fp8_dtype:
-                            v = v.float().to(fp8_dtype)
-                        one_scale = torch.tensor(
-                            1.0, dtype=torch.float32, device=q.device
-                        )
+                            v = v.to(fp8_dtype)
+                        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
 
                         kv_indptr_asm = qo_indptr
-                        kv_indices_asm = torch.arange(
-                            total_s, device=q.device, dtype=torch.int32
-                        )
+                        kv_indices_asm = self.forward_metadata.fp8_prefill_kv_indices
 
                         tile_q = 256
                         reduce_indptr = self.forward_metadata.reduce_indptr

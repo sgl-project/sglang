@@ -882,6 +882,80 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
 
+class TestEntrypointAxisSwapper:
+    """Test cross-framework dim reordering through the full entrypoint pipeline."""
+
+    def test_axis_swap_different_dim_order(self, tmp_path, capsys):
+        """Baseline dims 'b h d' vs target dims 'b d h': axis swapper rearranges baseline to match."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h d",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            dims="b d h",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 16, 8]
+        assert comp.target.shape == [4, 16, 8]
+
+    def test_axis_swap_with_tp_unshard(self, tmp_path, capsys):
+        """Baseline TP=2 with dims 'b h(tp) d' vs target TP=2 with dims 'b d h(tp)': unshard + axis swap."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp) d",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            name="hidden",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="b d h(tp)",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+
 class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
@@ -1325,9 +1399,14 @@ def _create_rank_dump(
     tensor: torch.Tensor,
     dims: str | None = None,
     parallel_info: dict | None = None,
+    framework: str = "sglang",
     num_steps: int = 1,
+    extra_dumps: list[tuple[str, object]] | None = None,
 ) -> Path:
-    """Create a dump file via the real dumper, as if running on the given rank."""
+    """Create a dump file via the real dumper, as if running on the given rank.
+
+    extra_dumps: additional (name, value) pairs to dump alongside the main tensor each step.
+    """
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_dumper_module, "_get_rank", lambda: rank)
 
@@ -1342,11 +1421,13 @@ def _create_rank_dump(
 
         static_meta: dict = {"world_rank": rank, "world_size": 1}
         if parallel_info is not None:
-            static_meta["sglang_parallel_info"] = parallel_info
+            static_meta[f"{framework}_parallel_info"] = parallel_info
         dumper.__dict__["_static_meta"] = static_meta
 
         for _ in range(num_steps):
             dumper.dump(name, tensor, dims=dims)
+            for extra_name, extra_value in extra_dumps or []:
+                dumper.dump(extra_name, extra_value)
             dumper.step()
 
     return directory / _FIXED_EXP_NAME
@@ -1555,6 +1636,243 @@ def _create_tp_sharded_dumps(
             num_steps=num_steps,
         )
     return directory / _FIXED_EXP_NAME
+
+
+def _zigzag_split_seq(seq_natural: torch.Tensor, *, cp_size: int) -> list[torch.Tensor]:
+    """Split a natural-order seq into per-rank zigzag segments."""
+    num_chunks: int = cp_size * 2
+    chunks: list[torch.Tensor] = list(seq_natural.chunk(num_chunks, dim=0))
+    order: list[int] = []
+    for i in range(cp_size):
+        order.append(i)
+        order.append(num_chunks - 1 - i)
+    zigzagged: torch.Tensor = torch.cat([chunks[i] for i in order], dim=0)
+    return list(zigzagged.chunk(cp_size, dim=0))
+
+
+def _create_thd_cp_zigzag_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    seq_lens: list[int],
+    cp_size: int,
+    total_per_rank: int,
+    dims_str: str = "t(cp,zigzag)",
+    num_steps: int = 1,
+) -> Path:
+    """Create THD CP-zigzag sharded dump files simulating Megatron forward.
+
+    Args:
+        full_tensor: 1D tensor of shape [T] in natural order.
+        seq_lens: per-seq token counts in natural order (e.g. [100, 64]).
+        cp_size: context parallelism size.
+        total_per_rank: total tokens per rank (including padding).
+        dims_str: dims annotation for the main tensor.
+    """
+    # Build per-rank tensors from natural-order full_tensor
+    offset: int = 0
+    rank_segments: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
+
+    for seq_len in seq_lens:
+        seq_natural: torch.Tensor = full_tensor[offset : offset + seq_len]
+        seq_ranks: list[torch.Tensor] = _zigzag_split_seq(seq_natural, cp_size=cp_size)
+        for rank_idx in range(cp_size):
+            rank_segments[rank_idx].append(seq_ranks[rank_idx])
+        offset += seq_len
+
+    # Build cu_seqlens from seq_lens (global, replicated across ranks)
+    cu_seqlens_values: list[int] = [0]
+    for slen in seq_lens:
+        cu_seqlens_values.append(cu_seqlens_values[-1] + slen)
+
+    # Pad to total_per_rank per rank (global pad = last cu_seqlens entry to total_per_rank * cp_size)
+    total_global: int = total_per_rank * cp_size
+    if cu_seqlens_values[-1] < total_global:
+        pad_global: int = total_global - cu_seqlens_values[-1]
+        cu_seqlens_values.append(total_global)
+        pad_per_rank: int = pad_global // cp_size
+        for rank_idx in range(cp_size):
+            rank_segments[rank_idx].append(torch.zeros(pad_per_rank))
+
+    cu_seqlens_q: torch.Tensor = torch.tensor(cu_seqlens_values, dtype=torch.int64)
+
+    # Dump each rank
+    for cp_rank in range(cp_size):
+        rank_tensor: torch.Tensor = torch.cat(rank_segments[cp_rank], dim=0)
+        assert (
+            rank_tensor.shape[0] == total_per_rank
+        ), f"rank {cp_rank}: expected {total_per_rank} tokens, got {rank_tensor.shape[0]}"
+
+        _create_rank_dump(
+            directory,
+            rank=cp_rank,
+            name=name,
+            tensor=rank_tensor,
+            dims=dims_str,
+            parallel_info={
+                "cp_rank": cp_rank,
+                "cp_size": cp_size,
+            },
+            framework="megatron",
+            num_steps=num_steps,
+            extra_dumps=[
+                ("cu_seqlens_q", cu_seqlens_q),
+                ("input_ids", rank_tensor.to(torch.int64)),
+            ],
+        )
+
+    return directory / _FIXED_EXP_NAME
+
+
+class TestEntrypointThdCpZigzag:
+    """E2E entrypoint tests for THD CP zigzag format.
+
+    Tests the full pipeline: dump creation → metadata loading → aligner plan →
+    unshard + reorder → tensor comparison.
+    """
+
+    def test_sglang_vs_megatron_zigzag_cp(self, tmp_path: Path, capsys) -> None:
+        """SGLang single-rank THD baseline vs Megatron CP=2 zigzag target."""
+        torch.manual_seed(42)
+        hidden_dim: int = 8
+        cp_size: int = 2
+
+        # Two sequences: 8 and 4 tokens (divisible by cp_size*2=4 for clean zigzag)
+        seq_a_ids: list[int] = [10, 20, 30, 40, 50, 60, 70, 80]
+        seq_b_ids: list[int] = [100, 200, 300, 400]
+        all_ids: list[int] = seq_a_ids + seq_b_ids
+        total_tokens: int = len(all_ids)
+        seq_lens: list[int] = [len(seq_a_ids), len(seq_b_ids)]
+
+        hidden_states: torch.Tensor = torch.randn(total_tokens, hidden_dim)
+
+        # --- SGLang baseline: single rank, 1 step ---
+        sglang_dir: Path = tmp_path / "baseline"
+        sglang_dir.mkdir()
+        sglang_dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(sglang_dir),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
+
+        positions: list[int] = list(range(seq_lens[0])) + list(range(seq_lens[1]))
+        sglang_dumper.dump("input_ids", torch.tensor(all_ids))
+        sglang_dumper.dump("positions", torch.tensor(positions))
+        sglang_dumper.dump("seq_lens", torch.tensor(seq_lens))
+        sglang_dumper.dump("rids", ["A", "B"])
+        sglang_dumper.dump("hidden_states", hidden_states)
+        sglang_dumper.step()
+
+        # --- Megatron target: CP=2, zigzag, 1 step ---
+        megatron_dir: Path = tmp_path / "target"
+        megatron_dir.mkdir()
+
+        # Zigzag-split input_ids and hidden_states per sequence, then concat
+        ids_tensor: torch.Tensor = torch.tensor(all_ids, dtype=torch.int64)
+        offset: int = 0
+        rank_id_segments: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
+        rank_hidden_segments: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
+        for slen in seq_lens:
+            seq_ids: torch.Tensor = ids_tensor[offset : offset + slen]
+            seq_hidden: torch.Tensor = hidden_states[offset : offset + slen]
+            zigzag_ids: list[torch.Tensor] = _zigzag_split_seq(seq_ids, cp_size=cp_size)
+            zigzag_hidden: list[torch.Tensor] = _zigzag_split_seq(
+                seq_hidden, cp_size=cp_size
+            )
+            for rank_idx in range(cp_size):
+                rank_id_segments[rank_idx].append(zigzag_ids[rank_idx])
+                rank_hidden_segments[rank_idx].append(zigzag_hidden[rank_idx])
+            offset += slen
+
+        cu_seqlens_q: torch.Tensor = torch.tensor(
+            [0] + [sum(seq_lens[: i + 1]) for i in range(len(seq_lens))],
+            dtype=torch.int64,
+        )
+
+        for cp_rank in range(cp_size):
+            rank_ids: torch.Tensor = torch.cat(rank_id_segments[cp_rank])
+            rank_hidden: torch.Tensor = torch.cat(rank_hidden_segments[cp_rank])
+            _create_rank_dump(
+                megatron_dir,
+                rank=cp_rank,
+                name="hidden_states",
+                tensor=rank_hidden,
+                dims="t(cp,zigzag) h",
+                parallel_info={"cp_rank": cp_rank, "cp_size": cp_size},
+                framework="megatron",
+                extra_dumps=[
+                    ("cu_seqlens_q", cu_seqlens_q),
+                    ("input_ids", rank_ids),
+                ],
+            )
+
+        # --- Run comparison ---
+        args: Namespace = _make_args(
+            sglang_dir / _FIXED_EXP_NAME,
+            megatron_dir / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        comparisons: list[ComparisonRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonRecord] = [
+            c for c in comparisons if c.name == "hidden_states"
+        ]
+        assert len(hidden_comparisons) >= 1
+        assert all(c.diff is not None and c.diff.passed for c in hidden_comparisons)
+
+    def test_thd_cp_zigzag_unshard(self, tmp_path: Path, capsys) -> None:
+        """Both sides THD CP=2 zigzag, comparison should pass."""
+        torch.manual_seed(42)
+        cp_size: int = 2
+        seq_lens: list[int] = [100, 64]
+        total_tokens: int = sum(seq_lens)
+        total_per_rank: int = 128
+
+        full_tensor: torch.Tensor = torch.randn(total_tokens + 92)
+
+        baseline_dir: Path = tmp_path / "baseline"
+        target_dir: Path = tmp_path / "target"
+        baseline_dir.mkdir()
+        target_dir.mkdir()
+
+        baseline_path: Path = _create_thd_cp_zigzag_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden_states",
+            seq_lens=seq_lens,
+            cp_size=cp_size,
+            total_per_rank=total_per_rank,
+        )
+
+        # Target: same data with small noise
+        target_tensor: torch.Tensor = full_tensor + torch.randn_like(full_tensor) * 1e-5
+        target_path: Path = _create_thd_cp_zigzag_dumps(
+            target_dir,
+            full_tensor=target_tensor,
+            name="hidden_states",
+            seq_lens=seq_lens,
+            cp_size=cp_size,
+            total_per_rank=total_per_rank,
+        )
+
+        args: Namespace = _make_args(
+            baseline_path, target_path, grouping="logical", diff_threshold=1e-3
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        # hidden_states should pass comparison (after unshard + reorder)
+        comparisons: list[ComparisonRecord] = _get_comparisons(records)
+        hidden_comparisons: list[ComparisonRecord] = [
+            c for c in comparisons if c.name == "hidden_states"
+        ]
+        assert len(hidden_comparisons) >= 1
+        assert all(c.diff is not None and c.diff.passed for c in hidden_comparisons)
 
 
 if __name__ == "__main__":
