@@ -1376,9 +1376,7 @@ def run_embeddings_benchmark(
 
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
-            # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
-            # Verify it's a single token
             text = special_token * num_tokens
             return text
 
