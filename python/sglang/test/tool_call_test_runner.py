@@ -263,14 +263,14 @@ def _test_reasoning_usage(client, model):
     )
     usage = response.usage
     assert usage is not None, "usage should not be None"
-    assert usage.reasoning_tokens and usage.reasoning_tokens > 0, (
-        f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
-    )
+    assert (
+        usage.reasoning_tokens and usage.reasoning_tokens > 0
+    ), f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
     if usage.completion_tokens_details:
         detail_reasoning = usage.completion_tokens_details.get("reasoning_tokens", 0)
-        assert detail_reasoning > 0, (
-            f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
-        )
+        assert (
+            detail_reasoning > 0
+        ), f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
 
 
 def _test_parallel(client, model):
