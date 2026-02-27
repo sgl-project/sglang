@@ -79,90 +79,76 @@ def _get_flashinfer_gdn_kernels():
 # ---------------------------------------------------------------------------
 
 
-def _warmup_mtp_kernel(mtp_fn) -> None:
-    """Warmup FlashInfer MTP kernel to trigger JIT compilation (~4s)."""
-    if mtp_fn is None:
-        return
-
-    logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
-    start = time.perf_counter()
-
+def _warmup_kernels(mtp_fn, decode_fn) -> None:
+    """Warmup FlashInfer MTP and decode kernels to trigger JIT compilation."""
     batch_size, seq_len, num_heads = 4, 4, 4
     k_dim, v_dim = 128, 128
     device = torch.cuda.current_device()
     dtype = torch.bfloat16
 
-    try:
-        q = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-        k = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-        v = torch.randn(batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype)
-        A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
-        dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
-        a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
-        b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
+    A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
 
-        pool_size = batch_size + 16
-        initial_state = torch.randn(
-            pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
-        )
-        cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
-        intermediate_state_cache = torch.zeros(
-            pool_size, seq_len, num_heads, v_dim, k_dim,
-            device=device, dtype=torch.float32,
-        )
+    # ---- MTP (verify) kernel ----
+    if mtp_fn is not None:
+        logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
+        start = time.perf_counter()
+        try:
+            q = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype)
+            a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
+            b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
 
-        mtp_fn(
-            q=q, k=k, v=v,
-            initial_state=initial_state,
-            initial_state_indices=cache_indices,
-            A_log=A_log, a=a, dt_bias=dt_bias, b=b,
-            scale=None, output=None,
-            intermediate_states_buffer=intermediate_state_cache,
-            disable_state_update=True,
-            use_qk_l2norm=True,
-        )
-        torch.cuda.synchronize()
-        logger.info(f"FlashInfer GDN MTP kernel warmup completed in {time.perf_counter() - start:.2f}s")
-    except Exception as e:
-        logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
+            pool_size = batch_size + 16
+            initial_state = torch.randn(
+                pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
+            )
+            cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
+            intermediate_state_cache = torch.zeros(
+                pool_size, seq_len, num_heads, v_dim, k_dim,
+                device=device, dtype=torch.float32,
+            )
 
+            mtp_fn(
+                q=q, k=k, v=v,
+                initial_state=initial_state,
+                initial_state_indices=cache_indices,
+                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                scale=None, output=None,
+                intermediate_states_buffer=intermediate_state_cache,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
+            torch.cuda.synchronize()
+            logger.info(f"FlashInfer GDN MTP kernel warmup completed in {time.perf_counter() - start:.2f}s")
+        except Exception as e:
+            logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
 
-def _warmup_decode_kernel(decode_fn) -> None:
-    """Warmup FlashInfer decode kernel to trigger JIT compilation."""
-    if decode_fn is None:
-        return
+    # ---- Decode kernel ----
+    if decode_fn is not None:
+        logger.info("Warming up FlashInfer GDN decode kernel (may take a few seconds)...")
+        start = time.perf_counter()
+        try:
+            q = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, 1, num_heads, v_dim, device=device, dtype=dtype)
+            a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
+            b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
+            state = torch.randn(
+                batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
+            )
 
-    logger.info("Warming up FlashInfer GDN decode kernel (may take a few seconds)...")
-    start = time.perf_counter()
-
-    batch_size, num_heads = 4, 4
-    k_dim, v_dim = 128, 128
-    device = torch.cuda.current_device()
-    dtype = torch.bfloat16
-
-    try:
-        q = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
-        k = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
-        v = torch.randn(batch_size, 1, num_heads, v_dim, device=device, dtype=dtype)
-        A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
-        dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
-        a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
-        b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
-        state = torch.randn(
-            batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
-        )
-
-        decode_fn(
-            q=q, k=k, v=v, state=state,
-            A_log=A_log, a=a, dt_bias=dt_bias, b=b,
-            scale=None, output=None,
-            use_qk_l2norm=True,
-        )
-        torch.cuda.synchronize()
-        logger.info(f"FlashInfer GDN decode kernel warmup completed in {time.perf_counter() - start:.2f}s")
-    except Exception as e:
-        logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
-
+            decode_fn(
+                q=q, k=k, v=v, state=state,
+                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                scale=None, output=None,
+                use_qk_l2norm=True,
+            )
+            torch.cuda.synchronize()
+            logger.info(f"FlashInfer GDN decode kernel warmup completed in {time.perf_counter() - start:.2f}s")
+        except Exception as e:
+            logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
 
 # ---------------------------------------------------------------------------
 # Kernel implementation
@@ -201,8 +187,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         # Warmup kernels to avoid JIT overhead during serving
-        _warmup_mtp_kernel(self._mtp_fn)
-        _warmup_decode_kernel(self._decode_fn)
+        _warmup_kernels(self._mtp_fn, self._decode_fn)
 
     # ---- decode ----
 
@@ -294,7 +279,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         v_fi = v[0].contiguous()
 
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0]).to(torch.float32)
+        alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
         cu_seqlens_fi = query_start_loc.to(torch.int64)
@@ -304,7 +289,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             cache_indices >= 0,
             cache_indices,
             ssm_states.shape[0] - 1,
-        )
+        ).to(torch.int64)
 
         # FlashInfer requires float32 initial state, K-last layout [B, HV, V, K]
         initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
@@ -325,7 +310,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Write back state to pool
         ssm_states.index_copy_(
             0,
-            ssm_cache_indices.to(torch.int64),
+            ssm_cache_indices,
             output_state_fi.to(ssm_states.dtype),
         )
 
