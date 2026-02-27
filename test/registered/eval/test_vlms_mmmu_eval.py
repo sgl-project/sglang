@@ -34,9 +34,9 @@ MODEL_THRESHOLDS = {
         0.270, 23.8
     ),
     ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings(
-        "google/gemma-3n-E4B-it", extra_args=["--tp=2"]
-    ): ModelEvalMetrics(0.270, 30.0),
+    # gemma-3n-E4B-it removed: OOMs on single GPU and lacks TP>1 support
+    # (pervasive ColumnParallelLinear issues in both text and vision models).
+    # See https://github.com/sgl-project/sglang/issues/19480
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 26.0
