@@ -267,6 +267,7 @@ class GPUWorker:
                     enable_frame_interpolation=req.enable_frame_interpolation,
                     frame_interpolation_exp=req.frame_interpolation_exp,
                     frame_interpolation_scale=req.frame_interpolation_scale,
+                    frame_interpolation_model_path=req.frame_interpolation_model_path,
                 )
                 output_batch.output_file_paths = output_paths
                 output_batch.output = None

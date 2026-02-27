@@ -346,20 +346,22 @@ class FrameInterpolator:
     per model_path to avoid reloading across requests.
     """
 
-    def __init__(self):
+    def __init__(self, model_path: Optional[str] = None):
+        self._model_path = model_path
         self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
-        """Load RIFE model weights from the default HF repo.
+        """Load RIFE model weights.
 
-        Weights are downloaded (and cached) automatically from
-        ``elfgum/RIFE-4.22.lite`` via ``maybe_download_model()``.
+        Accepts a local directory **or** a HuggingFace repo ID.  When *None*
+        (the default) the weights are downloaded (and cached) automatically
+        from ``elfgum/RIFE-4.22.lite`` via ``maybe_download_model()``.
         """
         from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
             maybe_download_model,
         )
 
-        model_path = _DEFAULT_RIFE_HF_REPO
+        model_path = self._model_path or _DEFAULT_RIFE_HF_REPO
 
         # Resolve: local path pass-through, HF repo ID → download & cache
         model_path = maybe_download_model(model_path)
@@ -462,6 +464,7 @@ def interpolate_video_frames(
     frames: list[np.ndarray],
     exp: int = 1,
     scale: float = 1.0,
+    model_path: Optional[str] = None,
 ) -> tuple[list[np.ndarray], int]:
     """
     Convenience wrapper around FrameInterpolator.
@@ -470,9 +473,11 @@ def interpolate_video_frames(
         frames:     List of uint8 HWC numpy frames.
         exp:        Interpolation exponent (1=2×, 2=4×).
         scale:      RIFE inference scale (default 1.0; use 0.5 for high-res).
+        model_path: Local directory or HuggingFace repo ID containing
+                    ``flownet.pkl``.  *None* → default ``elfgum/RIFE-4.22.lite``.
 
     Returns:
         (interpolated_frames, multiplier)
     """
-    interpolator = FrameInterpolator()
+    interpolator = FrameInterpolator(model_path=model_path)
     return interpolator.interpolate(frames, exp=exp, scale=scale)

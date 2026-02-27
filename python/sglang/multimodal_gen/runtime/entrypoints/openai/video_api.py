@@ -72,6 +72,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         enable_frame_interpolation=request.enable_frame_interpolation,
         frame_interpolation_exp=request.frame_interpolation_exp,
         frame_interpolation_scale=request.frame_interpolation_scale,
+        frame_interpolation_model_path=request.frame_interpolation_model_path,
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
@@ -164,6 +165,7 @@ async def create_video(
     enable_frame_interpolation: Optional[bool] = Form(False),
     frame_interpolation_exp: Optional[int] = Form(1),
     frame_interpolation_scale: Optional[float] = Form(1.0),
+    frame_interpolation_model_path: Optional[str] = Form(None),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -220,6 +222,7 @@ async def create_video(
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
             output_compression=output_compression,
             output_quality=output_quality,
             **(

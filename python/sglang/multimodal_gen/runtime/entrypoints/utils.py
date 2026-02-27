@@ -344,6 +344,7 @@ def save_outputs(
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -364,6 +365,7 @@ def save_outputs(
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
         )
 
         if samples_out is not None:
@@ -395,6 +397,7 @@ def post_process_sample(
     enable_frame_interpolation: bool = False,
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -446,6 +449,7 @@ def post_process_sample(
             frames,
             exp=frame_interpolation_exp,
             scale=frame_interpolation_scale,
+            model_path=frame_interpolation_model_path,
         )
         fps = fps * multiplier
 

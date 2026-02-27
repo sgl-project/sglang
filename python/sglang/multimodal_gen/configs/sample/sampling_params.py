@@ -104,6 +104,9 @@ class SamplingParams:
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1  # 1=2x, 2=4x
     frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
+    frame_interpolation_model_path: str | None = (
+        None  # local dir or HF repo ID with flownet.pkl (default: elfgum/RIFE-4.22.lite)
+    )
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -814,6 +817,13 @@ class SamplingParams:
             type=float,
             default=SamplingParams.frame_interpolation_scale,
             help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-model-path",
+            type=str,
+            default=SamplingParams.frame_interpolation_model_path,
+            help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
+            "(default: elfgum/RIFE-4.22.lite, downloaded automatically).",
         )
         return parser
 

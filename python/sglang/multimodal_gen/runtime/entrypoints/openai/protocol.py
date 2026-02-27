@@ -94,6 +94,7 @@ class VideoGenerationsRequest(BaseModel):
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×
     frame_interpolation_scale: Optional[float] = 1.0
+    frame_interpolation_model_path: Optional[str] = None
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
