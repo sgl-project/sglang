@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 
@@ -56,6 +57,21 @@ class _AuxFrameworkPlugin(ABC):
     def all_names(self) -> frozenset[str]:
         return self.tensor_names | self.non_tensor_names
 
+    def extract_global_seq_lens(
+        self, step_data: dict[str, object]
+    ) -> Optional[list[int]]:
+        """Extract per-seq token counts from loaded step data.
+
+        Returns None if this framework doesn't support THD / no relevant data available.
+        """
+        return None
+
+    def infer_cp_sharded_dims(self, name: str, ndim: int) -> str:
+        """Infer dims string for a CP-sharded aux tensor based on its ndim."""
+        raise NotImplementedError(
+            f"infer_cp_sharded_dims not implemented for {type(self).__name__}"
+        )
+
 
 # ── sglang plugin ─────────────────────────────────────────────────
 
@@ -86,6 +102,30 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
 
     def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
         return TokenLayout.T
+
+    def extract_global_seq_lens(
+        self, step_data: dict[str, object]
+    ) -> Optional[list[int]]:
+        if not self.cp_sharded_names:
+            return None
+
+        seq_lens = step_data.get("seq_lens")
+        if not isinstance(seq_lens, torch.Tensor):
+            return None
+
+        return seq_lens.tolist()
+
+    def infer_cp_sharded_dims(self, name: str, ndim: int) -> str:
+        """Infer dims for CP-sharded aux tensors.
+
+        NOTE: assumes zigzag ordering — natural-order CP without explicit dims
+        will be mishandled. Callers should set dims explicitly for non-zigzag CP.
+        """
+        if ndim == 1:
+            return "t(cp,zigzag)"
+        raise ValueError(
+            f"SGLang: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
+        )
 
     def compute_step_aux(
         self, step_data: dict[str, object], *, layout: TokenLayout, step: int
@@ -148,6 +188,32 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
 
     def has_required_names(self, names: set[str]) -> bool:
         return "input_ids" in names
+
+    def extract_global_seq_lens(
+        self, step_data: dict[str, object]
+    ) -> Optional[list[int]]:
+        if not self.cp_sharded_names:
+            return None
+
+        cu_seqlens_q = step_data.get("cu_seqlens_q")
+        if not isinstance(cu_seqlens_q, torch.Tensor):
+            return None
+
+        return (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+
+    def infer_cp_sharded_dims(self, name: str, ndim: int) -> str:
+        """Infer dims for CP-sharded aux tensors.
+
+        NOTE: assumes zigzag ordering — natural-order CP without explicit dims
+        will be mishandled. Callers should set dims explicitly for non-zigzag CP.
+        """
+        if ndim == 1:
+            return "t(cp,zigzag)"
+        if ndim == 2:
+            return "b s(cp,zigzag)"
+        raise ValueError(
+            f"Megatron: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
+        )
 
     def detect_layout(self, raw: dict[int, dict[str, object]]) -> TokenLayout:
         for step_data in raw.values():

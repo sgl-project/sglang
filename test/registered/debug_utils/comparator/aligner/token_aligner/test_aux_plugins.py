@@ -214,5 +214,34 @@ class TestInferPositions:
         assert torch.equal(result, torch.tensor([0, 1, 0, 1, 2]))
 
 
+class TestInferCpShardedDims:
+    """Tests for infer_cp_sharded_dims on each plugin."""
+
+    def test_megatron_infer_1d(self) -> None:
+        """Megatron 1D → 't(cp,zigzag)'."""
+        result: str = _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
+        assert result == "t(cp,zigzag)"
+
+    def test_megatron_infer_2d(self) -> None:
+        """Megatron 2D → 'b s(cp,zigzag)'."""
+        result: str = _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
+        assert result == "b s(cp,zigzag)"
+
+    def test_sglang_infer_1d(self) -> None:
+        """SGLang 1D → 't(cp,zigzag)'."""
+        result: str = _sglang_plugin.infer_cp_sharded_dims(name="input_ids", ndim=1)
+        assert result == "t(cp,zigzag)"
+
+    def test_megatron_infer_3d_raises(self) -> None:
+        """Megatron 3D raises ValueError."""
+        with pytest.raises(ValueError, match="cannot infer dims"):
+            _megatron_plugin.infer_cp_sharded_dims(name="input_ids", ndim=3)
+
+    def test_sglang_infer_2d_raises(self) -> None:
+        """SGLang 2D raises ValueError."""
+        with pytest.raises(ValueError, match="cannot infer dims"):
+            _sglang_plugin.infer_cp_sharded_dims(name="input_ids", ndim=2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import NamedTuple, Union
+from dataclasses import dataclass, field
+from typing import NamedTuple, Optional, Union
 
 from pydantic import model_validator
 
@@ -52,6 +52,7 @@ class TokenAlignerGlobalAux:
     step_auxs: dict[int, TokenAlignerStepAux]
     framework: str  # "sglang" | "megatron"
     layout: TokenLayout
+    thd_seq_lens_by_step: Optional[dict[int, list[int]]] = field(default=None)
 
 
 class TokenLocator(_FrozenBase):
