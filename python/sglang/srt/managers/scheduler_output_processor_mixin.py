@@ -80,9 +80,6 @@ class SchedulerOutputProcessorMixin:
             return details
         return None
 
-    def maybe_release_kv_cache(self: Scheduler, req: Req):
-        release_kv_cache(req, self.tree_cache)
-
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -90,7 +87,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.maybe_release_kv_cache(req)
+                release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -175,7 +172,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        self.maybe_release_kv_cache(req)
+                        release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
@@ -298,7 +295,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        self.maybe_release_kv_cache(req)
+                        release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -380,7 +377,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    self.maybe_release_kv_cache(req)
+                    release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
                     break
 
@@ -467,9 +464,9 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        self.maybe_release_kv_cache(req)
+                        release_kv_cache(req, self.tree_cache)
                 else:
-                    self.maybe_release_kv_cache(req)
+                    release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
 
