@@ -45,7 +45,8 @@ def get_is_diffusion_model(model_path: str) -> bool:
             file_path = hf_hub_download(repo_id=model_path, filename="model_index.json")
 
         return _is_diffusers_model_dir(os.path.dirname(file_path))
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
         return False
 
 
