@@ -978,7 +978,9 @@ class Scheduler(
         # from the normal KV pool on the main thread.
         if self.server_args.enable_kv_return:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                logger.info("KV return enabled — decode will send generated KV back to prefill")
+                logger.info(
+                    "KV return enabled — decode will send generated KV back to prefill"
+                )
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
                 if hasattr(kv_mgr, "start_kv_return_receiver"):
@@ -2473,12 +2475,18 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         # Process KV return queues on the prefill side (main thread only)
-        if self.server_args.enable_kv_return and self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
             self._process_kv_return_alloc_requests()
             self._process_kv_return_insertions()
 
         # Poll async KV return progress on the decode side
-        if self.server_args.enable_kv_return and self.disaggregation_mode == DisaggregationMode.DECODE:
+        if (
+            self.server_args.enable_kv_return
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
             self._poll_kv_return_replies()
 
         self.log_batch_result_stats(batch, result)
@@ -2522,38 +2530,39 @@ class Scheduler(
                 logger.debug(
                     "KV return alloc: insufficient capacity for %d tokens "
                     "(avail=%d), declining request %s",
-                    num_tokens, avail, request_id,
+                    num_tokens,
+                    avail,
+                    request_id,
                 )
-                self._send_kv_return_alloc_reply(
-                    reply_ip, reply_port, request_id, b""
-                )
+                self._send_kv_return_alloc_reply(reply_ip, reply_port, request_id, b"")
                 continue
 
             reserved = self.token_to_kv_pool_allocator.alloc(num_tokens)
             if reserved is not None:
-                page_indices = kv_to_page_indices(
-                    reserved.cpu().numpy(), page_size
-                )
+                page_indices = kv_to_page_indices(reserved.cpu().numpy(), page_size)
                 self._send_kv_return_alloc_reply(
-                    reply_ip, reply_port, request_id,
+                    reply_ip,
+                    reply_port,
+                    request_id,
                     np.asarray(page_indices, dtype=np.int32).tobytes(),
                 )
                 alloc_count += 1
                 logger.debug(
                     "KV return alloc: granted %d pages (%d tokens) for request %s, "
                     "remaining avail=%d",
-                    len(page_indices), num_tokens, request_id,
+                    len(page_indices),
+                    num_tokens,
+                    request_id,
                     self.token_to_kv_pool_allocator.available_size(),
                 )
             else:
                 logger.debug(
                     "KV return alloc: allocator returned None for %d tokens, "
                     "declining request %s",
-                    num_tokens, request_id,
+                    num_tokens,
+                    request_id,
                 )
-                self._send_kv_return_alloc_reply(
-                    reply_ip, reply_port, request_id, b""
-                )
+                self._send_kv_return_alloc_reply(reply_ip, reply_port, request_id, b"")
 
         if alloc_count > 0:
             logger.info("Processed %d KV return allocation requests", alloc_count)
@@ -2573,10 +2582,12 @@ class Scheduler(
             self._kv_return_reply_sockets[endpoint] = sock
         sock = self._kv_return_reply_sockets[endpoint]
         try:
-            sock.send_multipart([
-                request_id.encode("ascii"),
-                payload,
-            ])
+            sock.send_multipart(
+                [
+                    request_id.encode("ascii"),
+                    payload,
+                ]
+            )
         except Exception as e:
             logger.warning(
                 "Failed to send KV return alloc reply to %s: %s", endpoint, e
@@ -2608,17 +2619,19 @@ class Scheduler(
         insertion_count = 0
         while True:
             try:
-                token_ids, dst_page_indices, cancel = kv_mgr.kv_return_insertion_queue.get_nowait()
+                token_ids, dst_page_indices, cancel = (
+                    kv_mgr.kv_return_insertion_queue.get_nowait()
+                )
             except queue_mod.Empty:
                 break
 
             # If decode cancelled this transfer, free the allocated pages and move on
             if cancel:
-                gen_pages = torch.tensor(dst_page_indices, dtype=torch.int64, device=self.device)
-                self.token_to_kv_pool_allocator.free(gen_pages)
-                logger.debug(
-                    "KV return: freed %d cancelled pages", len(gen_pages)
+                gen_pages = torch.tensor(
+                    dst_page_indices, dtype=torch.int64, device=self.device
                 )
+                self.token_to_kv_pool_allocator.free(gen_pages)
+                logger.debug("KV return: freed %d cancelled pages", len(gen_pages))
                 continue
 
             # Convert returned page indices to torch.Tensor
@@ -2642,7 +2655,8 @@ class Scheduler(
                 logger.debug(
                     "KV return: tree already has full sequence (%d tokens), "
                     "freeing %d orphaned gen pages",
-                    len(token_ids), len(gen_pages),
+                    len(token_ids),
+                    len(gen_pages),
                 )
                 self.token_to_kv_pool_allocator.free(gen_pages)
                 insertion_count += 1
@@ -2657,22 +2671,16 @@ class Scheduler(
                 aligned_len = len(full_value) // page_size * page_size
                 if aligned_len == 0:
                     continue
-                insert_key = RadixKey(
-                    token_ids=token_ids[:aligned_len], extra_key=None
-                )
+                insert_key = RadixKey(token_ids=token_ids[:aligned_len], extra_key=None)
                 insert_value = full_value[:aligned_len]
             else:
                 aligned_len = len(full_value)
                 if aligned_len > len(token_ids):
                     aligned_len = len(token_ids)
-                insert_key = RadixKey(
-                    token_ids=token_ids[:aligned_len], extra_key=None
-                )
+                insert_key = RadixKey(token_ids=token_ids[:aligned_len], extra_key=None)
                 insert_value = full_value[:aligned_len]
 
-            self.tree_cache.insert(
-                InsertParams(key=insert_key, value=insert_value)
-            )
+            self.tree_cache.insert(InsertParams(key=insert_key, value=insert_value))
 
             # Free any gen pages that were truncated by page alignment
             n_prefix = len(prefix_indices)
@@ -2685,7 +2693,10 @@ class Scheduler(
             insertion_count += 1
             logger.debug(
                 "KV return insertion: %d tokens (%d prefix + %d gen), %d pages inserted",
-                len(token_ids), len(prefix_indices), len(gen_pages), aligned_len,
+                len(token_ids),
+                len(prefix_indices),
+                len(gen_pages),
+                aligned_len,
             )
 
         if insertion_count > 0:

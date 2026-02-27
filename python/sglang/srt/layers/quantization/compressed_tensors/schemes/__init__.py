@@ -4,6 +4,7 @@ from .compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
 )
+
 try:
     from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 except ImportError:

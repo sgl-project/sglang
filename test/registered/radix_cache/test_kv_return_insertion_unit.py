@@ -25,16 +25,14 @@ register_amd_ci(est_time=5, suite="stage-b-test-small-1-gpu-amd")
 
 import queue
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
-    MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 def _make_scheduler(

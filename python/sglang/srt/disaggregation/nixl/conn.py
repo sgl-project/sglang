@@ -283,7 +283,10 @@ class NixlKVManager(CommonKVManager):
                     msg = msg[1:]
                     tag = msg[0].decode("ascii")
                     if tag == "KVReturn":
-                        logger.info("KV return listener: received KVReturn message (%d parts)", len(msg))
+                        logger.info(
+                            "KV return listener: received KVReturn message (%d parts)",
+                            len(msg),
+                        )
                         self._register_prefill_for_kv_return(msg[1:])
                     else:
                         # Not a KV return message — this shouldn't happen on decode
@@ -386,7 +389,9 @@ class NixlKVManager(CommonKVManager):
         logger.debug(
             "KV return: sending registration to endpoint=%s, "
             "decode_agent=%s, local_agent=%s",
-            endpoint, decode_kv_args.agent_name, self.agent.name,
+            endpoint,
+            decode_kv_args.agent_name,
+            self.agent.name,
         )
         try:
             ctx = zmq.Context.instance()
@@ -400,21 +405,25 @@ class NixlKVManager(CommonKVManager):
             alloc_port = getattr(self, "_kv_return_alloc_port", 0)
             logger.debug(
                 "KV return: sending %d kv_ptrs, gpu_id=%d, metadata_port=%d, alloc_port=%d",
-                len(self.kv_args.kv_data_ptrs), self.kv_args.gpu_id,
-                metadata_port, alloc_port,
+                len(self.kv_args.kv_data_ptrs),
+                self.kv_args.gpu_id,
+                metadata_port,
+                alloc_port,
             )
-            sock.send_multipart([
-                GUARD,
-                b"KVReturn",
-                self.agent.name.encode("ascii"),
-                self.agent.get_agent_metadata(),
-                packed_kv_ptrs,
-                str(self.kv_args.gpu_id).encode("ascii"),
-                b"",  # empty — no pre-allocated pages (on-demand allocation)
-                str(metadata_port).encode("ascii"),
-                self.local_ip.encode("ascii"),
-                str(alloc_port).encode("ascii"),
-            ])
+            sock.send_multipart(
+                [
+                    GUARD,
+                    b"KVReturn",
+                    self.agent.name.encode("ascii"),
+                    self.agent.get_agent_metadata(),
+                    packed_kv_ptrs,
+                    str(self.kv_args.gpu_id).encode("ascii"),
+                    b"",  # empty — no pre-allocated pages (on-demand allocation)
+                    str(metadata_port).encode("ascii"),
+                    self.local_ip.encode("ascii"),
+                    str(alloc_port).encode("ascii"),
+                ]
+            )
             sock.close()
             logger.info(
                 f"Sent KV return registration to decode agent {decode_kv_args.agent_name} "
@@ -437,26 +446,22 @@ class NixlKVManager(CommonKVManager):
         # frame 4 is reserved (was dst_page_pool, now empty for on-demand alloc)
         # Parse metadata port (frame 5) and IP (frame 6)
         metadata_port = (
-            int(msg[5].decode("ascii"))
-            if len(msg) > 5 and len(msg[5]) > 0
-            else 0
+            int(msg[5].decode("ascii")) if len(msg) > 5 and len(msg[5]) > 0 else 0
         )
-        prefill_ip = (
-            msg[6].decode("ascii")
-            if len(msg) > 6 and len(msg[6]) > 0
-            else ""
-        )
+        prefill_ip = msg[6].decode("ascii") if len(msg) > 6 and len(msg[6]) > 0 else ""
         # Parse alloc port (frame 7) for on-demand page allocation
         alloc_port = (
-            int(msg[7].decode("ascii"))
-            if len(msg) > 7 and len(msg[7]) > 0
-            else 0
+            int(msg[7].decode("ascii")) if len(msg) > 7 and len(msg[7]) > 0 else 0
         )
         logger.debug(
             "KV return registration: agent_name=%s, num_kv_ptrs=%d, "
             "gpu_id=%d, metadata_port=%d, alloc_port=%d, prefill_ip=%s",
-            prefill_agent_name, len(prefill_kv_ptrs),
-            prefill_gpu_id, metadata_port, alloc_port, prefill_ip,
+            prefill_agent_name,
+            len(prefill_kv_ptrs),
+            prefill_gpu_id,
+            metadata_port,
+            alloc_port,
+            prefill_ip,
         )
 
         if prefill_agent_name not in self.prefill_kv_return_info:
@@ -552,7 +557,9 @@ class NixlKVManager(CommonKVManager):
             sock.send_multipart([token_ids_bytes, page_indices_bytes, status])
             logger.debug(
                 "KV return metadata sent: %d tokens, %d pages to %s",
-                len(token_ids), len(dst_page_indices), prefill_info["agent_name"],
+                len(token_ids),
+                len(dst_page_indices),
+                prefill_info["agent_name"],
             )
         except Exception as e:
             logger.warning("Failed to send KV return metadata: %s", e)
@@ -612,7 +619,9 @@ class NixlKVManager(CommonKVManager):
                     token_ids = np.frombuffer(msg[0], dtype=np.int32).tolist()
                     dst_page_indices = np.frombuffer(msg[1], dtype=np.int32)
                     cancel = len(msg) > 2 and msg[2] == b"cancel"
-                    self.kv_return_insertion_queue.put((token_ids, dst_page_indices, cancel))
+                    self.kv_return_insertion_queue.put(
+                        (token_ids, dst_page_indices, cancel)
+                    )
                     self._kv_return_receive_count += 1
                     if self._kv_return_receive_count % 50 == 1:
                         logger.info(
@@ -642,14 +651,19 @@ class NixlKVManager(CommonKVManager):
                     )
                     logger.debug(
                         "KV return alloc request queued: %d pages, id=%s, reply=%s:%d",
-                        num_pages, request_id, reply_ip, reply_port,
+                        num_pages,
+                        request_id,
+                        reply_ip,
+                        reply_port,
                     )
                 except Exception as e:
                     logger.debug("KV return alloc request recv error: %s", e)
 
         threading.Thread(target=recv_kv_return_metadata, daemon=True).start()
         threading.Thread(target=recv_kv_return_alloc_requests, daemon=True).start()
-        logger.info("KV return receiver started on prefill worker (metadata + on-demand alloc)")
+        logger.info(
+            "KV return receiver started on prefill worker (metadata + on-demand alloc)"
+        )
 
     def _send_kvcache_generic(
         self,
@@ -1185,7 +1199,9 @@ class NixlKVManager(CommonKVManager):
                     # Register new peer and save KV base pointers.
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     self._add_remote_peer(decode_kv_args)
-                    logger.info(f"Register KVArgs from {agent_name} successfully (enable_kv_return={self.server_args.enable_kv_return})")
+                    logger.info(
+                        f"Register KVArgs from {agent_name} successfully (enable_kv_return={self.server_args.enable_kv_return})"
+                    )
 
                     # KV return bootstrap reply: send this prefill's NIXL agent
                     # metadata + pre-allocated page indices back to the decode

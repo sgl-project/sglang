@@ -39,12 +39,13 @@ DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 # KV return async states
 _KVR_WAITING_ALLOC = 0  # alloc request sent, waiting for reply
-_KVR_TRANSFERRING = 1   # RDMA transfer posted, waiting for completion
+_KVR_TRANSFERRING = 1  # RDMA transfer posted, waiting for completion
 
 
 @dataclasses.dataclass
 class PendingKvReturn:
     """Tracks an in-flight async KV return for one finished request."""
+
     state: int  # _KVR_WAITING_ALLOC or _KVR_TRANSFERRING
     request_id: str
     rid: str
@@ -575,14 +576,18 @@ class SchedulerOutputProcessorMixin:
         num_generated = len(req.output_ids)
         logger.debug(
             "KV return: _try_kv_return called for req %s (num_generated=%d)",
-            req.rid, num_generated,
+            req.rid,
+            num_generated,
         )
         if num_generated == 0:
             return False
 
         kv_mgr = self.disagg_decode_prealloc_queue.kv_manager
         if not kv_mgr.prefill_kv_return_info:
-            logger.debug("KV return: no prefill_kv_return_info registered, skipping req %s", req.rid)
+            logger.debug(
+                "KV return: no prefill_kv_return_info registered, skipping req %s",
+                req.rid,
+            )
             return False
 
         # Use the first registered prefill peer (multi-prefill lookup is future work)
@@ -620,12 +625,14 @@ class SchedulerOutputProcessorMixin:
 
             request_id = f"kvr_{req.rid}"
             alloc_reply_port = prefill_info.get("alloc_reply_port", 0)
-            alloc_req_sock.send_multipart([
-                str(num_pages).encode("ascii"),
-                request_id.encode("ascii"),
-                kv_mgr.local_ip.encode("ascii"),
-                str(alloc_reply_port).encode("ascii"),
-            ])
+            alloc_req_sock.send_multipart(
+                [
+                    str(num_pages).encode("ascii"),
+                    request_id.encode("ascii"),
+                    kv_mgr.local_ip.encode("ascii"),
+                    str(alloc_reply_port).encode("ascii"),
+                ]
+            )
 
             # Store pending state — caller must defer release_kv_cache
             pending = PendingKvReturn(
@@ -651,7 +658,9 @@ class SchedulerOutputProcessorMixin:
             logger.debug(
                 "KV return: posted alloc request for req %s (%d pages), "
                 "request_id=%s",
-                req.rid, num_pages, request_id,
+                req.rid,
+                num_pages,
+                request_id,
             )
             return True
         except Exception as e:
@@ -668,15 +677,11 @@ class SchedulerOutputProcessorMixin:
         RDMA post failed — in both cases the KV pages are released here.
         """
         if not page_data:
-            logger.debug(
-                "KV return: prefill declined alloc for req %s", pending.rid
-            )
+            logger.debug("KV return: prefill declined alloc for req %s", pending.rid)
             release_kv_cache(pending.req, self.tree_cache)
             return False
 
-        pending.dst_page_indices = np.frombuffer(
-            page_data, dtype=np.int32
-        ).copy()
+        pending.dst_page_indices = np.frombuffer(page_data, dtype=np.int32).copy()
         try:
             pending.xfer_handle = kv_mgr.send_kvcache(
                 peer_name=pending.prefill_info["agent_name"],
@@ -692,11 +697,14 @@ class SchedulerOutputProcessorMixin:
         except Exception as e:
             logger.warning(
                 "KV return: RDMA post failed for req %s: %s",
-                pending.rid, e,
+                pending.rid,
+                e,
             )
             kv_mgr.send_kv_return_metadata(
-                pending.prefill_info, [],
-                pending.dst_page_indices, cancel=True,
+                pending.prefill_info,
+                [],
+                pending.dst_page_indices,
+                cancel=True,
             )
             release_kv_cache(pending.req, self.tree_cache)
             return False
@@ -721,7 +729,8 @@ class SchedulerOutputProcessorMixin:
             logger.warning(
                 "KV return: unexpected error in poll, releasing %d pending "
                 "entries to avoid page leak: %s",
-                len(self._kv_return_pending), e,
+                len(self._kv_return_pending),
+                e,
             )
             for pending in self._kv_return_pending.values():
                 try:
@@ -742,7 +751,8 @@ class SchedulerOutputProcessorMixin:
         if any(p.state == _KVR_WAITING_ALLOC for p in self._kv_return_pending.values()):
             # Get the alloc_reply_sock from the first pending (all share same peer for now)
             first_pending = next(
-                p for p in self._kv_return_pending.values()
+                p
+                for p in self._kv_return_pending.values()
                 if p.state == _KVR_WAITING_ALLOC
             )
             alloc_reply_sock = first_pending.prefill_info.get("alloc_reply_sock")
@@ -755,9 +765,7 @@ class SchedulerOutputProcessorMixin:
                     reply_id = reply[0].decode("ascii")
                     if reply_id in self._kv_return_pending:
                         pending = self._kv_return_pending[reply_id]
-                        if not self._start_kv_return_rdma(
-                            pending, reply[1], kv_mgr
-                        ):
+                        if not self._start_kv_return_rdma(pending, reply[1], kv_mgr):
                             completed_ids.append(reply_id)
                     else:
                         # Buffer for a request we haven't seen yet (shouldn't happen
@@ -772,16 +780,15 @@ class SchedulerOutputProcessorMixin:
                 # Check the buffer in case reply arrived out of band
                 if pending.request_id in kv_mgr._alloc_reply_buffer:
                     page_data = kv_mgr._alloc_reply_buffer.pop(pending.request_id)
-                    if not self._start_kv_return_rdma(
-                        pending, page_data, kv_mgr
-                    ):
+                    if not self._start_kv_return_rdma(pending, page_data, kv_mgr):
                         completed_ids.append(req_id)
                     continue
 
                 if now - pending.posted_at > 5.0:
                     logger.warning(
                         "KV return: alloc timeout for req %s (%.1fs)",
-                        pending.rid, now - pending.posted_at,
+                        pending.rid,
+                        now - pending.posted_at,
                     )
                     release_kv_cache(pending.req, self.tree_cache)
                     completed_ids.append(req_id)
@@ -797,32 +804,44 @@ class SchedulerOutputProcessorMixin:
             if state == "DONE":
                 full_token_ids = pending.origin_input_ids + pending.output_ids
                 kv_mgr.send_kv_return_metadata(
-                    pending.prefill_info, full_token_ids, pending.dst_page_indices,
+                    pending.prefill_info,
+                    full_token_ids,
+                    pending.dst_page_indices,
                 )
                 xfer_ms = (time.time() - pending.xfer_started_at) * 1000
                 alloc_ms = (pending.xfer_started_at - pending.posted_at) * 1000
                 logger.info(
                     "KV return completed for req %s (%d tokens, %d pages, "
                     "alloc=%.1fms, xfer=%.1fms)",
-                    pending.rid, len(pending.output_ids), pending.num_pages,
-                    alloc_ms, xfer_ms,
+                    pending.rid,
+                    len(pending.output_ids),
+                    pending.num_pages,
+                    alloc_ms,
+                    xfer_ms,
                 )
                 release_kv_cache(pending.req, self.tree_cache)
                 completed_ids.append(req_id)
             elif state == "ERR":
                 logger.warning("KV return transfer error for req %s", pending.rid)
                 kv_mgr.send_kv_return_metadata(
-                    pending.prefill_info, [], pending.dst_page_indices, cancel=True,
+                    pending.prefill_info,
+                    [],
+                    pending.dst_page_indices,
+                    cancel=True,
                 )
                 release_kv_cache(pending.req, self.tree_cache)
                 completed_ids.append(req_id)
             elif now - pending.xfer_started_at > 10.0:
                 logger.warning(
                     "KV return transfer timed out for req %s after %.1fs",
-                    pending.rid, now - pending.xfer_started_at,
+                    pending.rid,
+                    now - pending.xfer_started_at,
                 )
                 kv_mgr.send_kv_return_metadata(
-                    pending.prefill_info, [], pending.dst_page_indices, cancel=True,
+                    pending.prefill_info,
+                    [],
+                    pending.dst_page_indices,
+                    cancel=True,
                 )
                 release_kv_cache(pending.req, self.tree_cache)
                 completed_ids.append(req_id)
