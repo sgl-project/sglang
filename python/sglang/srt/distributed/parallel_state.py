@@ -1519,6 +1519,14 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
+_DCP: Optional[GroupCoordinator] = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
+
+
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
@@ -1552,7 +1560,9 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     """
     with get_tp_group().graph_capture(
         stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    ) as context, get_pp_group().graph_capture(context), get_dcp_group().graph_capture(
+        context
+    ):
         yield context
 
 
@@ -1665,6 +1675,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -1836,6 +1847,26 @@ def initialize_model_parallel(
             group_name="attention_tp",
         )
 
+    # Build the decode context parallel groups.
+    num_decode_context_parallel_groups: int = world_size // decode_context_parallel_size
+    global _DCP
+    assert _DCP is None, "decode context parallel group is already initialized"
+    group_ranks = []
+    for i in range(num_decode_context_parallel_groups):
+        ranks = list(
+            range(
+                i * decode_context_parallel_size,
+                (i + 1) * decode_context_parallel_size,
+            )
+        )
+        group_ranks.append(ranks)
+    _DCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="dcp",
+    )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -1986,6 +2017,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -1998,6 +2030,7 @@ def ensure_model_parallel_initialized(
             tensor_model_parallel_size,
             expert_model_parallel_size,
             pipeline_model_parallel_size,
+            decode_context_parallel_size,
             backend,
         )
         return
@@ -2139,6 +2172,11 @@ def destroy_model_parallel():
     if _TP:
         _TP.destroy()
     _TP = None
+
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
 
     global _PP
     if _PP:

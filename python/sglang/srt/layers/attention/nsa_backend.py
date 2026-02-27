@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -28,6 +29,7 @@ from sglang.srt.layers.attention.nsa.transform_index import (
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
+    is_nsa_enable_decode_cp,
     is_nsa_enable_prefill_cp,
     nsa_cp_round_robin_split_data,
     nsa_cp_round_robin_split_q_seqs,
@@ -37,6 +39,7 @@ from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
 )
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
@@ -357,6 +360,9 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+        self.dcp_size = get_dcp_group().world_size
+        self.dcp_rank = get_dcp_group().rank_in_group
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -1291,6 +1297,33 @@ class NativeSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    def _save_kv_cache(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        k_rope: Optional[torch.Tensor],
+    ) -> None:
+        """Save KV cache to the token pool."""
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        args = (
+            layer,
+            cache_loc,
+            k,
+            k_rope,
+        )
+        kwargs = {}
+        if self.dcp_size > 1:
+            kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
+            kwargs["dcp_size"] = self.dcp_size
+        forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+            *args, **kwargs
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1341,17 +1374,7 @@ class NativeSparseAttnBackend(
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                self._save_kv_cache(layer, forward_batch, k, k_rope)
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1412,6 +1435,7 @@ class NativeSparseAttnBackend(
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                     page_size=1,
+                    dcp_size=self.dcp_size,
                 )
 
         if nsa_impl == "tilelang":
@@ -1435,23 +1459,27 @@ class NativeSparseAttnBackend(
                     )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
+                        kv_cache, page_table_1_flattened, dcp_size=self.dcp_size
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
 
-            return self._forward_flashmla_sparse(
+            o, s = self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_kv(
+            o, s = self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
@@ -1460,9 +1488,13 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         elif nsa_impl == "fa3":
-            return self._forward_fa3(
+            o, s = self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -1475,7 +1507,11 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         else:
             raise ValueError(f"Unsupported {nsa_impl = }")
 
@@ -1520,17 +1556,7 @@ class NativeSparseAttnBackend(
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
-                )
+                self._save_kv_cache(layer, forward_batch, k, k_rope)
 
         # Do absorbed multi-latent attention
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1555,22 +1581,27 @@ class NativeSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_sparse(
+            o, s = self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_kv(
+            o, s = self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
@@ -1579,7 +1610,11 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1591,7 +1626,7 @@ class NativeSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.nsa_decode_impl == "fa3":
-            return self._forward_fa3(
+            o, s = self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -1604,7 +1639,11 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                return_softmax_lse=True,
             )
+            if self.dcp_size > 1:
+                return cp_lse_ag_out_rs(o, s, get_dcp_group())
+            return o
         elif self.nsa_decode_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1634,13 +1673,14 @@ class NativeSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
+        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
-        o = flash_attn_with_kvcache(
+        out = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
@@ -1653,10 +1693,13 @@ class NativeSparseAttnBackend(
             softmax_scale=sm_scale,
             causal=True,
             softcap=logit_cap,
-            return_softmax_lse=False,
+            return_softmax_lse=return_softmax_lse,
             num_splits=self.num_splits,
         )
-        return o  # type: ignore
+        if return_softmax_lse:
+            out, lse, *reset = out
+            return out, lse
+        return out  # type: ignore
 
     def _forward_flashmla_sparse(
         self,
@@ -1665,7 +1708,11 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self.dcp_size > 1:
+            q_all = get_dcp_group().all_gather(q_all.contiguous(), dim=1)
+
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
@@ -1693,7 +1740,7 @@ class NativeSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, lse = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -1704,8 +1751,10 @@ class NativeSparseAttnBackend(
         # Trim output back to original num_heads if we padded
         if need_padding:
             o = o[:, :num_heads, :]
+            if self.dcp_size > 1:
+                o = o.contiguous()
 
-        return o
+        return (o, lse) if return_softmax_lse else o
 
     def _forward_flashmla_kv(
         self,
@@ -1716,13 +1765,17 @@ class NativeSparseAttnBackend(
         layer,
         metadata: NSAMetadata,
         page_table_1,
+        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self.dcp_size > 1:
+            q_all = get_dcp_group().all_gather(q_all.contiguous(), dim=1)
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        q_all = q_all.view(-1, 1, layer.tp_q_head_num * self.dcp_size, layer.head_dim)
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
@@ -1735,7 +1788,7 @@ class NativeSparseAttnBackend(
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
+        o, lse = flash_mla_with_kvcache(
             q=q_all,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -1750,7 +1803,7 @@ class NativeSparseAttnBackend(
             ),
             is_fp8_kvcache=True,
         )
-        return o
+        return (o, lse) if return_softmax_lse else o
 
     def _forward_standard_mha(
         self,
@@ -2050,6 +2103,7 @@ class NativeSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
+                and (not is_nsa_enable_decode_cp())  # DCP not enabled
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA

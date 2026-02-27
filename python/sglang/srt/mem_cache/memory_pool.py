@@ -1523,6 +1523,8 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+        dcp_size: Optional[int] = None,
     ):
         layer_id = layer.layer_id
 
@@ -1542,6 +1544,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
+                dcp_kv_mask=dcp_kv_mask,
+                dcp_size=dcp_size,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
@@ -1556,6 +1560,8 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                dcp_kv_mask=dcp_kv_mask,
+                dcp_size=dcp_size,
             )
 
     def get_mla_kv_buffer(
@@ -1755,6 +1761,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_head_dim: int,
         enable_memory_saver: bool,
         kv_cache_dim: int,
+        dcp_size: int = 1,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -1801,7 +1808,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
                     (
-                        (size + page_size + 1) // self.page_size,
+                        # We do not shard the indexer K cache when DCP is enabled.
+                        (size * dcp_size + page_size + 1) // self.page_size,
                         self.page_size
                         * (
                             index_head_dim + index_head_dim // self.quant_block_size * 4

@@ -169,6 +169,7 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    dcp_size: int = 1,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
@@ -226,6 +227,7 @@ def dequantize_k_cache_paged(
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
+        DCP_SIZE=dcp_size,
     )
 
     return output
@@ -246,9 +248,10 @@ def _dequantize_k_cache_paged_kernel(
     GROUP_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32) // DCP_SIZE
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:

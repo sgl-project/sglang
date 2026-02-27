@@ -82,11 +82,81 @@ def set_mla_kv_buffer_kernel(
     tl.store(dst_ptr, src, mask=mask)
 
 
+@triton.jit
+def set_mla_kv_buffer_with_mask_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    dcp_kv_mask_ptr,
+    dcp_size: tl.constexpr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    dcp_mask = tl.load(dcp_kv_mask_ptr + pid_loc)
+
+    # Skip write if mask is 0
+    if dcp_mask == 0:
+        return
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64) // dcp_size
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    # Three-way branch to handle boundary correctly while preserving fast path
+    if base + BLOCK <= nope_dim:
+        # Fast path: entire block is in nope region
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+        )
+    elif base >= nope_dim:
+        # Fast path: entire block is in rope region
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+            mask=mask,
+        )
+    else:
+        # Boundary case: block spans nope/rope boundary (e.g., FP8 with nope_dim=528)
+        # Handle each offset individually to avoid negative indexing
+        is_nope = offs < nope_dim
+        is_rope = (offs >= nope_dim) & (offs < (nope_dim + rope_dim))
+
+        src_nope = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask & is_nope,
+            other=0,
+        )
+        src_rope = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+            mask=mask & is_rope,
+            other=0,
+        )
+
+        src = tl.where(is_nope, src_nope, src_rope)
+
+    tl.store(dst_ptr, src, mask=mask)
+
+
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    dcp_kv_mask: Optional[torch.Tensor] = None,
+    dcp_size: Optional[int] = None,
 ):
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
@@ -95,18 +165,34 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
-    set_mla_kv_buffer_kernel[grid](
-        kv_buffer,
-        cache_k_nope,
-        cache_k_rope,
-        loc,
-        kv_buffer.stride(0),
-        cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-        BLOCK=BLOCK,
-    )
+    if dcp_kv_mask is None:
+        set_mla_kv_buffer_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK=BLOCK,
+        )
+    else:
+        set_mla_kv_buffer_with_mask_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            dcp_kv_mask,
+            dcp_size,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK=BLOCK,
+        )
 
 
 @triton.jit

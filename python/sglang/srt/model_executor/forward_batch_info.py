@@ -376,6 +376,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For decode context parallel
+    dcp_kv_mask: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
@@ -526,6 +529,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        # For DCP
+        if model_runner.dcp_size > 1:
+            dcp_size = model_runner.dcp_size
+            dcp_rank = model_runner.dcp_rank
+            ret.dcp_kv_mask = ret.out_cache_loc % dcp_size == dcp_rank
+            # ret.out_cache_loc = ret.out_cache_loc // dcp_size
 
         return ret
 
