@@ -127,15 +127,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """K-last pooled decode using FlashInfer pretranspose kernel.
-
-        State layout: [pool_size+1, HV, V, K] (K-last / V-major).
-        The pooled kernel reads/writes state directly from the pool via
-        ``state_indices``, eliminating the need for gather/scatter.
-        """
-        # q, k: [1, bs, H, K]  ->  [bs, 1, H, K]
-        # v:    [1, bs, HV, V] ->  [bs, 1, HV, V]
-        # a, b: [bs, 1, HV]    (already correct from gdn_backend)
+        """K-last decode using FlashInfer pretranspose kernel (stock, no pool indexing)."""
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -148,11 +140,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
-        output_fi, _ = self._decode_fn(
+        # Gather states from pool
+        state_batch = ssm_states[cache_indices]
+
+        output_fi, new_state = self._decode_fn(
             q=query_fi,
             k=key_fi,
             v=value_fi,
-            state=ssm_states,
+            state=state_batch,
             A_log=A_log.detach(),
             a=a_fi,
             dt_bias=dt_bias.detach(),
@@ -160,8 +155,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             scale=None,
             output=None,
             use_qk_l2norm=True,
-            state_indices=cache_indices.to(torch.int32),
         )
+
+        # Scatter updated states back to pool
+        ssm_states[cache_indices] = new_state
 
         # [bs, 1, HV, V] -> [1, bs, HV, V]
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
