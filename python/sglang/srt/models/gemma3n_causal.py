@@ -786,9 +786,6 @@ class Gemma3nTextModel(PreTrainedModel):
 
         per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
 
-        if positions.dim() == 1:
-            positions = positions.unsqueeze(0)
-
         # Expand hidden_states to support per-layer inputs
         target_magnitude = torch.mean(input_embeds**2, dim=-1, keepdim=True) ** 0.5
         epsilon_tensor = torch.tensor(torch.finfo(input_embeds.dtype).min)
