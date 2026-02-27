@@ -29,6 +29,16 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    import warnings
+
+    warnings.warn(
+        "'python -m sglang.launch_server' is deprecated and will be removed "
+        "in a future release. Use 'sglang serve' instead.\n"
+        "  Example: sglang serve --model-path <model> [options]",
+        FutureWarning,
+        stacklevel=1,
+    )
+
     server_args = prepare_server_args(sys.argv[1:])
 
     try:
