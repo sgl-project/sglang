@@ -1034,7 +1034,9 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-            out_cache_loc=forward_batch.out_cache_loc,
+        )
+        attn_backend.update_fused_rope_metadata_for_replay(
+            bs, forward_batch.out_cache_loc
         )
 
         # Store fields

@@ -108,6 +108,9 @@ class HybridAttnBackend(AttentionBackend):
             seq_lens_cpu,
         )
 
+    def update_fused_rope_metadata_for_replay(self, bs, out_cache_loc):
+        self.decode_backend.update_fused_rope_metadata_for_replay(bs, out_cache_loc)
+
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 

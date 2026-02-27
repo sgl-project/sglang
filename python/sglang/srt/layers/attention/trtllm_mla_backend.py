@@ -608,7 +608,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
@@ -664,8 +663,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
-        # Initialize fused kernel metadata for CUDA graph replay
+    def update_fused_rope_metadata_for_replay(
+        self, bs: int, out_cache_loc: Optional[torch.Tensor]
+    ):
+        """Update fused RoPE+quantize+append metadata for CUDA graph replay.
+
+        Args:
+            bs: Padded captured batch size (key into decode_cuda_graph_metadata).
+            out_cache_loc: Raw (unpadded) cache slot indices from the forward batch.
+        """
         if self.data_type == torch.float8_e4m3fn and out_cache_loc is not None:
+            metadata = self.decode_cuda_graph_metadata[bs]
             self._init_forward_metadata_for_rope_fusion(
                 metadata,
                 out_cache_loc,

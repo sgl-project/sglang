@@ -53,6 +53,12 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
+    def update_fused_rope_metadata_for_replay(
+        self, bs: int, out_cache_loc: Optional[torch.Tensor]
+    ):
+        """Update fused RoPE metadata for CUDA graph replay. No-op by default."""
+        pass
+
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
