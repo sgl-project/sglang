@@ -13,8 +13,15 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepSubPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
+from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
+    ReordererPlan,
+    ZigzagToNaturalThdParams,
+)
+from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+    CpThdConcatParams,
+    UnsharderPlan,
+)
+from sglang.srt.debug_utils.comparator.dims import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -154,6 +161,7 @@ class TestComputeAlignerPlan:
                 x=TokenLocator(steps=[0], token_index_in_step=[0]),
                 y=TokenLocator(steps=[0], token_index_in_step=[0]),
             ),
+            layouts=Pair(x=TokenLayout.T, y=TokenLayout.T),
         )
 
         plan: AlignerPlan = compute_aligner_plan(
@@ -162,6 +170,66 @@ class TestComputeAlignerPlan:
         )
 
         assert plan.token_aligner_plan is ta_plan
+
+
+class TestComputePerStepSubPlansThd:
+    def test_thd_zigzag_returns_thd_plans(self) -> None:
+        """t(cp,zigzag) h(tp) generates THD-typed unsharder + reorderer plans."""
+        thd_global_seq_lens: list[int] = [100, 64, 92]
+        result: list[AlignerPerStepSubPlan] = compute_per_step_sub_plans(
+            metas=[
+                _make_meta(
+                    dims="t(cp,zigzag) h(tp)",
+                    cp_rank=0,
+                    cp_size=2,
+                    tp_rank=0,
+                    tp_size=2,
+                ),
+                _make_meta(
+                    dims="t(cp,zigzag) h(tp)",
+                    cp_rank=0,
+                    cp_size=2,
+                    tp_rank=1,
+                    tp_size=2,
+                ),
+                _make_meta(
+                    dims="t(cp,zigzag) h(tp)",
+                    cp_rank=1,
+                    cp_size=2,
+                    tp_rank=0,
+                    tp_size=2,
+                ),
+                _make_meta(
+                    dims="t(cp,zigzag) h(tp)",
+                    cp_rank=1,
+                    cp_size=2,
+                    tp_rank=1,
+                    tp_size=2,
+                ),
+            ],
+            thd_global_seq_lens=thd_global_seq_lens,
+        )
+
+        unsharder_plans: list[UnsharderPlan] = [
+            p for p in result if isinstance(p, UnsharderPlan)
+        ]
+        reorderer_plans: list[ReordererPlan] = [
+            p for p in result if isinstance(p, ReordererPlan)
+        ]
+
+        # Should have at least one THD concat plan for CP axis
+        thd_concat_plans: list[UnsharderPlan] = [
+            p for p in unsharder_plans if isinstance(p.params, CpThdConcatParams)
+        ]
+        assert len(thd_concat_plans) == 1
+        assert thd_concat_plans[0].params.seq_lens_per_rank == [50, 32, 46]
+
+        # Should have exactly one THD reorder plan
+        assert len(reorderer_plans) == 1
+        assert isinstance(reorderer_plans[0].params, ZigzagToNaturalThdParams)
+        assert reorderer_plans[0].params.cp_size == 2
+        # Reorder seq_lens = global seq_lens (reorder happens after unshard)
+        assert reorderer_plans[0].params.seq_lens == [100, 64, 92]
 
 
 if __name__ == "__main__":
