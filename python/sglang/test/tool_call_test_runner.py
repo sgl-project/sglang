@@ -84,7 +84,13 @@ WEATHER_TOOL_STRICT = {
 
 
 def _call(
-    client, model, content, tools=None, tool_choice="required", temperature=0.1, **kwargs
+    client,
+    model,
+    content,
+    tools=None,
+    tool_choice="required",
+    temperature=0.1,
+    **kwargs,
 ):
     """Single-turn tool call request. Defaults to ADD_TOOL_STRICT + required."""
     return client.chat.completions.create(
@@ -257,14 +263,14 @@ def _test_reasoning_usage(client, model):
     )
     usage = response.usage
     assert usage is not None, "usage should not be None"
-    assert (
-        usage.reasoning_tokens and usage.reasoning_tokens > 0
-    ), f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
+    assert usage.reasoning_tokens and usage.reasoning_tokens > 0, (
+        f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
+    )
     if usage.completion_tokens_details:
         detail_reasoning = usage.completion_tokens_details.get("reasoning_tokens", 0)
-        assert (
-            detail_reasoning > 0
-        ), f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+        assert detail_reasoning > 0, (
+            f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+        )
 
 
 def _test_parallel(client, model):
@@ -338,11 +344,11 @@ def run_tool_call_test(
     """Launch server, run enabled test cases, return results."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running TOOL CALL test for {model.model_path}")
     if model.variant:
         print(f"  Variant: {model.variant}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     process = None
     try:
