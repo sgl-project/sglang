@@ -846,33 +846,44 @@ impl PDRouter {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Uses select! to race stream.next() against tx.closed() so that
+        // when the client disconnects the upstream HTTP connection is dropped
+        // promptly, allowing the engine to abort the request.
         tokio::spawn(async move {
             futures_util::pin_mut!(stream);
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+            loop {
+                tokio::select! {
+                    chunk_result = stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                .unwrap_or(chunk)
-                        } else {
-                            chunk
-                        };
+                                let result = if return_logprob && prefill_logprobs.is_some() {
+                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
+                                        .unwrap_or(chunk)
+                                } else {
+                                    chunk
+                                };
 
-                        if tx.send(Ok(result)).is_err() {
-                            break;
-                        }
+                                if tx.send(Ok(result)).is_err() {
+                                    break;
+                                }
 
-                        if is_done {
-                            break;
+                                if is_done {
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                if let Some(ref url) = decode_url {
+                                    error!("Stream error from decode server {}: {}", url, e);
+                                }
+                                let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                        }
-                        let _ = tx.send(Err(format!("Stream error: {}", e)));
+                    _ = tx.closed() => {
                         break;
                     }
                 }

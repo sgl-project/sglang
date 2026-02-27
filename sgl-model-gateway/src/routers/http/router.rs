@@ -606,17 +606,28 @@ impl Router {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Spawn task to forward stream
+            // Uses select! to race stream.next() against tx.closed() so that
+            // when the client disconnects the upstream HTTP connection is dropped
+            // promptly, allowing the engine to abort the request.
             tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
+                futures_util::pin_mut!(stream);
+                loop {
+                    tokio::select! {
+                        chunk = stream.next() => {
+                            match chunk {
+                                Some(Ok(bytes)) => {
+                                    if tx.send(Ok(bytes)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(format!("Stream error: {}", e)));
+                                    break;
+                                }
+                                None => break,
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                        _ = tx.closed() => {
                             break;
                         }
                     }

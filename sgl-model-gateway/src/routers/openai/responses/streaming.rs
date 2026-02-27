@@ -534,52 +534,99 @@ pub(super) async fn handle_simple_streaming_passthrough(
     let previous_response_id = req.previous_response_id;
     let storage = req.storage;
 
+    // When persistence is needed (should_store || persist_needed), we must
+    // continue consuming upstream even after client disconnect to accumulate
+    // the full response. When neither is needed, we use select! to race
+    // stream.next() against tx.closed() so the upstream HTTP connection is
+    // dropped promptly when the client disconnects.
+    let need_persistence = should_store || persist_needed;
+
     tokio::spawn(async move {
         let mut accumulator = StreamingResponseAccumulator::new();
         let mut upstream_failed = false;
         let mut receiver_connected = true;
         let mut chunk_processor = ChunkProcessor::new();
 
-        while let Some(chunk_result) = upstream_stream.next().await {
-            match chunk_result {
-                Ok(chunk) => {
-                    chunk_processor.push_chunk(&chunk);
+        if need_persistence {
+            // Persistence path: keep consuming upstream even after client disconnect
+            while let Some(chunk_result) = upstream_stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        chunk_processor.push_chunk(&chunk);
 
-                    while let Some(raw_block) = chunk_processor.next_block() {
-                        let block_cow = match rewrite_streaming_block(
-                            &raw_block,
-                            &original_request,
-                            previous_response_id.as_deref(),
-                        ) {
-                            Some(modified) => Cow::Owned(modified),
-                            None => Cow::Borrowed(raw_block.as_str()),
-                        };
+                        while let Some(raw_block) = chunk_processor.next_block() {
+                            let block_cow = match rewrite_streaming_block(
+                                &raw_block,
+                                &original_request,
+                                previous_response_id.as_deref(),
+                            ) {
+                                Some(modified) => Cow::Owned(modified),
+                                None => Cow::Borrowed(raw_block.as_str()),
+                            };
 
-                        if should_store || persist_needed {
                             accumulator.ingest_block(&block_cow);
-                        }
 
-                        if receiver_connected {
-                            let chunk_to_send = format!("{}\n\n", block_cow);
-                            if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
-                                receiver_connected = false;
+                            if receiver_connected {
+                                let chunk_to_send = format!("{}\n\n", block_cow);
+                                if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                    receiver_connected = false;
+                                }
                             }
                         }
-
-                        if !receiver_connected && !should_store {
-                            break;
-                        }
                     }
-
-                    if !receiver_connected && !should_store {
+                    Err(err) => {
+                        upstream_failed = true;
+                        let io_err = io::Error::other(err);
+                        let _ = tx.send(Err(io_err));
                         break;
                     }
                 }
-                Err(err) => {
-                    upstream_failed = true;
-                    let io_err = io::Error::other(err);
-                    let _ = tx.send(Err(io_err));
-                    break;
+            }
+        } else {
+            // No persistence: use select! to cancel upstream on client disconnect
+            futures_util::pin_mut!(upstream_stream);
+            loop {
+                tokio::select! {
+                    chunk_result = upstream_stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                chunk_processor.push_chunk(&chunk);
+
+                                while let Some(raw_block) = chunk_processor.next_block() {
+                                    let block_cow = match rewrite_streaming_block(
+                                        &raw_block,
+                                        &original_request,
+                                        previous_response_id.as_deref(),
+                                    ) {
+                                        Some(modified) => Cow::Owned(modified),
+                                        None => Cow::Borrowed(raw_block.as_str()),
+                                    };
+
+                                    if receiver_connected {
+                                        let chunk_to_send = format!("{}\n\n", block_cow);
+                                        if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                            receiver_connected = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if !receiver_connected {
+                                    break;
+                                }
+                            }
+                            Some(Err(err)) => {
+                                upstream_failed = true;
+                                let io_err = io::Error::other(err);
+                                let _ = tx.send(Err(io_err));
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tx.closed() => {
+                        break;
+                    }
                 }
             }
         }
@@ -695,6 +742,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
         };
 
         loop {
+            // Check if the client has already disconnected before making a new
+            // upstream request (e.g. between tool-call iterations).
+            if tx.is_closed() {
+                return;
+            }
+
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
             if let Some(ref h) = headers_opt {
@@ -722,8 +775,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 return;
             }
 
-            // Stream events and check for tool calls
-            let mut upstream_stream = response.bytes_stream();
+            // Stream events and check for tool calls.
+            // Uses select! to race stream.next() against tx.closed() so that
+            // when the client disconnects the upstream HTTP connection is dropped
+            // promptly, allowing the engine to abort the request.
+            let upstream_stream = response.bytes_stream();
+            futures_util::pin_mut!(upstream_stream);
             let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
@@ -732,9 +789,17 @@ pub(super) async fn handle_streaming_with_tool_interception(
             let mut tool_calls_detected = false;
             let mut seen_in_progress = false;
 
-            while let Some(chunk_result) = upstream_stream.next().await {
+            loop {
+                let chunk_result = tokio::select! {
+                    chunk = upstream_stream.next() => chunk,
+                    _ = tx.closed() => {
+                        // Client disconnected — drop the stream and exit
+                        return;
+                    }
+                };
+
                 match chunk_result {
-                    Ok(chunk) => {
+                    Some(Ok(chunk)) => {
                         chunk_processor.push_chunk(&chunk);
 
                         while let Some(raw_block) = chunk_processor.next_block() {
@@ -838,11 +903,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
                             break;
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Stream error: {}\"}}}}\n\n", e);
                         let _ = tx.send(Ok(Bytes::from(error_event)));
                         return;
                     }
+                    None => break,
                 }
             }
 
