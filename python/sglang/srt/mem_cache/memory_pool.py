@@ -28,7 +28,7 @@ import abc
 import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -193,11 +193,15 @@ class MambaPool:
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            for k, v in vars(self).items():
-                if k == "conv" or k == "intermediate_conv_window":
-                    kwargs[k] = [conv[layer] for conv in v]
+            # Use fields instead of vars to avoid torch.compile graph break
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
+                if name in ("conv", "intermediate_conv_window"):
+                    kwargs[name] = [conv[layer] for conv in v]
                 else:
-                    kwargs[k] = v[layer]
+                    kwargs[name] = v[layer]
+
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):

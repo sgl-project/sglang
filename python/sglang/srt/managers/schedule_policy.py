@@ -513,8 +513,10 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset += extend_input_len
+        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
+        page_overhead = self.page_size
+        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
+        self.cur_rem_token_offset += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
 
         if self.dllm_config is not None:
