@@ -98,10 +98,13 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+            # TODO: Fix me when npu backend supports torch.uint64
+            bootstrap_room_dtype = torch.int64
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
@@ -144,7 +147,7 @@ class MetadataBuffers:
             )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.uint64, device=device
+                (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
     def get_buf_infos(self):

@@ -226,7 +226,7 @@ class CommonKVManager(BaseKVManager):
             return None
 
     def register_to_bootstrap(self):
-        """Register KVSender to bootstrap server via HTTP POST."""
+        """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
@@ -244,7 +244,6 @@ class CommonKVManager(BaseKVManager):
         bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
         payload = {
-            "role": "Prefill",
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
             "attn_dp_size": self.attn_dp_size,
@@ -666,7 +665,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
-        role = data["role"]
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
         attn_dp_size = data["attn_dp_size"]
@@ -701,29 +699,29 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
-        if role == "Prefill":
-            if system_dp_size == 1:
-                dp_group = attn_dp_rank
-            else:
-                dp_group = system_dp_rank
+        if system_dp_size == 1:
+            dp_group = attn_dp_rank
+        else:
+            dp_group = system_dp_rank
 
-            # Add lock to make sure thread-safe
-            async with self.lock:
-                if dp_group not in self.prefill_port_table:
-                    self.prefill_port_table[dp_group] = {}
-                if attn_tp_rank not in self.prefill_port_table[dp_group]:
-                    self.prefill_port_table[dp_group][attn_tp_rank] = {}
+        # Add lock to make sure thread-safe
+        async with self.lock:
+            if dp_group not in self.prefill_port_table:
+                self.prefill_port_table[dp_group] = {}
+            if attn_tp_rank not in self.prefill_port_table[dp_group]:
+                self.prefill_port_table[dp_group][attn_tp_rank] = {}
 
             self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
             self._registered_count += 1
-            expected = self.dp_size * self.attn_tp_size * self.pp_size
-            logger.debug(
-                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
-                f" ({self._registered_count}/{expected} registered)"
-            )
+
+        expected = self.dp_size * self.attn_tp_size * self.pp_size
+        logger.debug(
+            f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+            f" ({self._registered_count}/{expected} registered)"
+        )
 
         return web.Response(text="OK", status=200)
 

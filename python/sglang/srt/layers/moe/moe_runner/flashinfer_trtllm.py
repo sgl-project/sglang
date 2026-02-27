@@ -501,6 +501,8 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     # lazy import
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
     try:
         from flashinfer.fused_moe import trtllm_bf16_moe
     except ImportError as e:

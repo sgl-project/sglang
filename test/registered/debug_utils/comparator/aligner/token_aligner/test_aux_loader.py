@@ -77,7 +77,7 @@ class TestEnsureDimsInMetas:
         """Without CP parallelism, metas are returned as-is."""
         metas: list[dict] = [self._make_meta(cp_size=1)]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_sglang_plugin, metas=metas
+            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
@@ -85,38 +85,55 @@ class TestEnsureDimsInMetas:
         """If dims is already in meta, metas are returned as-is."""
         metas: list[dict] = [{**self._make_meta(cp_size=2, cp_rank=0), "dims": "t"}]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_sglang_plugin, metas=metas
+            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
-    def test_cp_sharded_sglang_input_ids_raises(self):
-        """CP + input_ids in sglang raises NotImplementedError."""
+    def test_cp_sharded_sglang_input_ids_infers_dims(self):
+        """CP + input_ids in sglang infers dims 't(cp,zigzag)'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
         ]
-        with pytest.raises(NotImplementedError, match="CP-sharded"):
-            _ensure_dims_in_metas(name="input_ids", plugin=_sglang_plugin, metas=metas)
+        result = _ensure_dims_in_metas(
+            name="input_ids", plugin=_sglang_plugin, metas=metas, ndim=1
+        )
+        assert result is not metas
+        assert result[0]["dims"] == "t(cp,zigzag)"
+        assert result[1]["dims"] == "t(cp,zigzag)"
 
-    def test_cp_sharded_sglang_positions_raises(self):
-        """CP + positions in sglang raises NotImplementedError."""
+    def test_cp_sharded_sglang_positions_infers_dims(self):
+        """CP + positions in sglang infers dims 't(cp,zigzag)'."""
         metas: list[dict] = [
             self._make_meta(cp_size=2, cp_rank=0),
             self._make_meta(cp_size=2, cp_rank=1),
         ]
-        with pytest.raises(NotImplementedError, match="CP-sharded"):
-            _ensure_dims_in_metas(name="positions", plugin=_sglang_plugin, metas=metas)
+        result = _ensure_dims_in_metas(
+            name="positions", plugin=_sglang_plugin, metas=metas, ndim=1
+        )
+        assert result[0]["dims"] == "t(cp,zigzag)"
 
-    def test_cp_sharded_megatron_input_ids_raises(self):
-        """CP + input_ids in megatron raises NotImplementedError."""
+    def test_cp_sharded_megatron_input_ids_infers_dims_1d(self):
+        """CP + input_ids in megatron (1D) infers dims 't(cp,zigzag)'."""
         metas: list[dict] = [
             {"megatron_parallel_info": {"cp_rank": 0, "cp_size": 2}},
             {"megatron_parallel_info": {"cp_rank": 1, "cp_size": 2}},
         ]
-        with pytest.raises(NotImplementedError, match="CP-sharded"):
-            _ensure_dims_in_metas(
-                name="input_ids", plugin=_megatron_plugin, metas=metas
-            )
+        result = _ensure_dims_in_metas(
+            name="input_ids", plugin=_megatron_plugin, metas=metas, ndim=1
+        )
+        assert result[0]["dims"] == "t(cp,zigzag)"
+
+    def test_cp_sharded_megatron_input_ids_infers_dims_2d(self):
+        """CP + input_ids in megatron (2D) infers dims 'b s(cp,zigzag)'."""
+        metas: list[dict] = [
+            {"megatron_parallel_info": {"cp_rank": 0, "cp_size": 2}},
+            {"megatron_parallel_info": {"cp_rank": 1, "cp_size": 2}},
+        ]
+        result = _ensure_dims_in_metas(
+            name="input_ids", plugin=_megatron_plugin, metas=metas, ndim=2
+        )
+        assert result[0]["dims"] == "b s(cp,zigzag)"
 
     def test_cp_non_sharded_name_returns_metas_unchanged(self):
         """CP + non-sharded tensor name (seq_lens) returns metas as-is."""
@@ -125,7 +142,7 @@ class TestEnsureDimsInMetas:
             self._make_meta(cp_size=2, cp_rank=1),
         ]
         result = _ensure_dims_in_metas(
-            name="seq_lens", plugin=_sglang_plugin, metas=metas
+            name="seq_lens", plugin=_sglang_plugin, metas=metas, ndim=1
         )
         assert result is metas
 
@@ -142,7 +159,7 @@ class TestEnsureDimsInMetas:
             self._make_meta(cp_size=2, cp_rank=1),
         ]
         result = _ensure_dims_in_metas(
-            name="input_ids", plugin=_DummyPlugin(), metas=metas
+            name="input_ids", plugin=_DummyPlugin(), metas=metas, ndim=1
         )
         assert result is metas
 
