@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -128,15 +129,17 @@ class DecodeReqToTokenPool:
         return len(self.free_slots)
 
     def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
-        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        # Indices of reqs that already have a req_pool_idx and will reuse
+        # their existing slot (e.g. chunked prefill continuing across chunks).
+        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         assert (
-            len(chunked) <= 1
+            len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
-        ), "request has req_pool_idx but is not chunked"
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+        ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(chunked)
+        need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -169,6 +172,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
+        enable_overlap_schedule: bool,
         mamba_size: int = None,
     ):
         DecodeReqToTokenPool.__init__(
@@ -179,9 +183,13 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+
+        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
+            raise ValueError(
+                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
+                "Please set `--mamba-scheduler-strategy extra_buffer`."
+            )
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         effective_mamba_size = (
@@ -355,15 +363,15 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            dp_rank = self._resolve_dp_rank(req)
-            if dp_rank is None:
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is None:
                 self.pending_reqs.append(req)
                 return
-            self._create_receiver_and_enqueue(req, dp_rank)
+            self._create_receiver_and_enqueue(req, prefill_dp_rank)
 
-    def _resolve_dp_rank(self, req: Req) -> Optional[int]:
-        if req.data_parallel_rank is not None:
-            return req.data_parallel_rank
+    def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+        if req.disagg_prefill_dp_rank is not None:
+            return req.disagg_prefill_dp_rank
 
         if _is_fake_transfer(req, self.scheduler.server_args):
             return 0
@@ -374,12 +382,15 @@ class DecodePreallocQueue:
         if prefill_info is None:
             return None
 
+        if prefill_info.dp_size == 1:
+            return 0
+
         if prefill_info.follow_bootstrap_room:
             return req.bootstrap_room % prefill_info.dp_size
 
         return None
 
-    def _create_receiver_and_enqueue(self, req: Req, dp_rank: int) -> None:
+    def _create_receiver_and_enqueue(self, req: Req, prefill_dp_rank: int) -> None:
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -391,7 +402,7 @@ class DecodePreallocQueue:
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
-            prefill_dp_rank=dp_rank,
+            prefill_dp_rank=prefill_dp_rank,
         )
 
         self.queue.append(
@@ -493,16 +504,16 @@ class DecodePreallocQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _resolve_pending_reqs(self) -> None:
-        """Batch-resolve dp_ranks for pending requests and create receivers."""
+        """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
         if not self.pending_reqs:
             return
 
         bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
 
         # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the dp_rank,
+        # we need get the prefill info before resolving the prefill_dp_ranks
         # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving the dp_rank
+        # so we need to ensure the parallel info before resolving it.
         if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
             return
 
@@ -510,9 +521,9 @@ class DecodePreallocQueue:
         need_query = []
         for req in self.pending_reqs:
             # NOTE: we need resolve it again because we may ensure the parallel info here
-            dp_rank = self._resolve_dp_rank(req)
-            if dp_rank is not None:
-                resolved.append((req, dp_rank))
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                resolved.append((req, prefill_dp_rank))
             else:
                 need_query.append(req)
 
@@ -534,8 +545,8 @@ class DecodePreallocQueue:
         else:
             self.pending_reqs = []
 
-        for req, dp_rank in resolved:
-            self._create_receiver_and_enqueue(req, dp_rank)
+        for req, prefill_dp_rank in resolved:
+            self._create_receiver_and_enqueue(req, prefill_dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
