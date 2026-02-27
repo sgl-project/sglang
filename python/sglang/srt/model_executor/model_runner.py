@@ -70,6 +70,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -494,6 +495,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.sampler = create_sampler()
         self.load_model()
 
+        # Load the expert backup client
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
+            )
+            else None
+        )
+
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
@@ -866,6 +877,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "mooncake"
             )
+            or (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
+            )
         )
 
         if use_mooncake_te:
@@ -1087,6 +1102,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
+                self.expert_backup_client.update_weights()
+                return
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
