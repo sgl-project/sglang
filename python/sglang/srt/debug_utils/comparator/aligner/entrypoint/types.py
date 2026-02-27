@@ -24,3 +24,4 @@ class AlignerPerStepPlan:
 class AlignerPlan:
     per_step_plans: Pair[list[AlignerPerStepPlan]]
     token_aligner_plan: Optional[TokenAlignerPlan]
+    token_dims: Pair[int]

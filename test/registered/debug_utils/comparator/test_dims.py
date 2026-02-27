@@ -3,10 +3,14 @@ import sys
 import pytest
 
 from sglang.srt.debug_utils.comparator.dims import (
+    BATCH_DIM_NAME,
+    SEQ_DIM_NAME,
+    TOKEN_DIM_NAME,
     DimSpec,
     Ordering,
     ParallelAxis,
     Reduction,
+    find_dim_index,
     parse_dim,
     parse_dims,
 )
@@ -95,6 +99,42 @@ class TestParseDims:
     def test_duplicate_name_raises(self) -> None:
         with pytest.raises(ValueError, match="Duplicate"):
             parse_dims("h h")
+
+
+class TestDimConstants:
+    def test_token_dim_name(self) -> None:
+        assert TOKEN_DIM_NAME == "t"
+
+    def test_batch_dim_name(self) -> None:
+        assert BATCH_DIM_NAME == "b"
+
+    def test_seq_dim_name(self) -> None:
+        assert SEQ_DIM_NAME == "s"
+
+
+class TestFindDimIndex:
+    def test_found(self) -> None:
+        specs: list[DimSpec] = parse_dims("b s h d")
+        assert find_dim_index(specs, "s") == 1
+
+    def test_not_found(self) -> None:
+        specs: list[DimSpec] = parse_dims("b s h d")
+        assert find_dim_index(specs, "t") is None
+
+    def test_first_dim(self) -> None:
+        specs: list[DimSpec] = parse_dims("t h d")
+        assert find_dim_index(specs, "t") == 0
+
+    def test_last_dim(self) -> None:
+        specs: list[DimSpec] = parse_dims("b s h d")
+        assert find_dim_index(specs, "d") == 3
+
+    def test_with_modifiers(self) -> None:
+        specs: list[DimSpec] = parse_dims("b s(cp,zigzag) h(tp) d")
+        assert find_dim_index(specs, "h") == 2
+
+    def test_empty_list(self) -> None:
+        assert find_dim_index([], "t") is None
 
 
 if __name__ == "__main__":
