@@ -114,13 +114,7 @@ class TestFinalizeReleaseOnFinish(unittest.TestCase):
     def _make_manager(self, *, page_size: int):
         req_to_token = torch.arange(0, 64, dtype=torch.int64).reshape(1, 64)
         req_to_token_pool = _DummyReqToTokenPool(req_to_token=req_to_token)
-        req_to_token_pool.idx_to_rid[0] = "r1"
-        req_to_token_pool.idx_to_rid[0] = "r2"
-        req_to_token_pool.idx_to_rid[0] = "r3"
-        req_to_token_pool.idx_to_rid[0] = "r4"
-        # Since all tests use req_pool_idx=0, we can just map 0 to the current req rid in each test if needed,
-        # or just use a generic way. For now, let's just make sure it doesn't crash.
-        # Better: let each test set the mapping.
+
         allocator = _DummyAllocator()
         tree_cache = _DummyTreeCache()
 
