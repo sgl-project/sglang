@@ -55,6 +55,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
+    get_default_distributed_backend,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -69,6 +70,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -118,6 +120,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
+    DecodeInputBuffers,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -127,7 +130,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -192,6 +194,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -488,6 +495,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.sampler = create_sampler()
         self.load_model()
 
+        # Load the expert backup client
+        self.expert_backup_client = (
+            ExpertBackupClient(self.server_args, self)
+            if (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
+            )
+            else None
+        )
+
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
@@ -734,29 +751,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
-        if self.device == "cuda":
-            if self.server_args.elastic_ep_backend == "mooncake":
-                backend = "mooncake"
-                if self.server_args.mooncake_ib_device:
-                    mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
-                    try:
-                        from mooncake import ep as mooncake_ep
+        backend = get_default_distributed_backend(self.device)
+        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
+            backend = "mooncake"
+            if self.server_args.mooncake_ib_device:
+                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                try:
+                    from mooncake import ep as mooncake_ep
 
-                        mooncake_ep.set_device_filter(mooncake_ib_device)
-                    except:
-                        pass  # A warning will be raised in `init_distributed_environment`
-            else:
-                backend = "nccl"
-        elif self.device == "xpu":
-            backend = "xccl"
-        elif self.device == "hpu":
-            backend = "hccl"
-        elif self.device == "cpu":
-            backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
-        elif self.device == "musa":
-            backend = "mccl"
+                    mooncake_ep.set_device_filter(mooncake_ib_device)
+                except:
+                    pass  # A warning will be raised in `init_distributed_environment`
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -871,6 +876,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "mooncake"
+            )
+            or (
+                self.server_args.enable_elastic_expert_backup
+                and self.server_args.elastic_ep_backend is not None
             )
         )
 
@@ -1093,6 +1102,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 new_expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
+                self.expert_backup_client.update_weights()
+                return
+
             self.update_weights_from_disk(
                 self.server_args.model_path,
                 self.server_args.load_format,
@@ -1908,7 +1924,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
-        buffers: GraphInputBuffers = GraphInputBuffers.create(
+        buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
             max_num_token=num_tokens,

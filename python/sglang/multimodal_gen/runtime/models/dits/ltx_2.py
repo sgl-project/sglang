@@ -66,7 +66,7 @@ def apply_split_rotary_emb(
         )
     r = last // 2
 
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]
     second_x = split_x[..., 1:, :]
 
@@ -137,6 +137,7 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         self.causal_offset = int(causal_offset)
 
         self.modality = modality
+        self.coords_dtype = torch.bfloat16 if modality == "video" else torch.float32
         if self.modality not in ["video", "audio"]:
             raise ValueError(
                 f"Modality {modality} is not supported. Supported modalities are `video` and `audio`."
@@ -243,6 +244,7 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         device = device or coords.device
         num_pos_dims = coords.shape[1]
 
+        coords = coords.to(self.coords_dtype)
         if coords.ndim == 4:
             coords_start, coords_end = coords.chunk(2, dim=-1)
             coords = (coords_start + coords_end) / 2.0
@@ -307,7 +309,9 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)
 
-        return cos_freqs, sin_freqs
+        # Cast to bf16 to match model weights dtype. coords_dtype controls
+        # intermediate coordinate precision (fp32 for audio) and differs.
+        return cos_freqs.to(torch.bfloat16), sin_freqs.to(torch.bfloat16)
 
 
 def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -1121,7 +1125,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if hasattr(arch.rope_type, "value")
             else str(arch.rope_type)
         )
-        rope_double_precision = bool(getattr(arch, "double_precision_rope", True))
+        rope_double_precision = bool(
+            hf_config.get("rope_double_precision", arch.double_precision_rope)
+        )
         causal_offset = int(hf_config.get("causal_offset", 1))
 
         pos_embed_max_pos = int(arch.positional_embedding_max_pos[0])
@@ -1351,27 +1357,30 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
         )
 
+        hidden_dtype = hidden_states.dtype
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
-            timestep.flatten()
+            timestep.flatten(), hidden_dtype=hidden_dtype
         )
         temb_ca_scale_shift = temb_ca_scale_shift.view(
             batch_size, -1, temb_ca_scale_shift.shape[-1]
         )
 
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            timestep.flatten() * ts_ca_mult
+            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
         temb_ca_audio_scale_shift, _ = self.av_ca_audio_scale_shift_adaln_single(
-            audio_timestep.flatten()
+            audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
         )
         temb_ca_audio_scale_shift = temb_ca_audio_scale_shift.view(
             batch_size, -1, temb_ca_audio_scale_shift.shape[-1]
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            audio_timestep.flatten() * ts_ca_mult
+            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
             batch_size, -1, temb_ca_audio_gate.shape[-1]
@@ -1413,7 +1422,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             device=hidden_states.device, dtype=hidden_states.dtype
         ) + embedded_timestep[:, :, None].to(dtype=hidden_states.dtype)
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-        hidden_states = self.norm_out(hidden_states)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
         hidden_states, _ = self.proj_out(hidden_states)
 
@@ -1425,7 +1435,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             audio_scale_shift_values[:, :, 0],
             audio_scale_shift_values[:, :, 1],
         )
-        audio_hidden_states = self.audio_norm_out(audio_hidden_states)
+        with torch.autocast(device_type=audio_hidden_states.device.type, enabled=False):
+            audio_hidden_states = self.audio_norm_out(audio_hidden_states)
         audio_hidden_states = audio_hidden_states * (1 + audio_scale) + audio_shift
         audio_hidden_states, _ = self.audio_proj_out(audio_hidden_states)
 
