@@ -36,6 +36,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -1067,6 +1068,12 @@ def _launch_subprocesses(
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
     )
+
+    if (
+        server_args.enable_elastic_expert_backup
+        and server_args.elastic_ep_backend is not None
+    ):
+        run_expert_backup_manager(server_args, port_args)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,

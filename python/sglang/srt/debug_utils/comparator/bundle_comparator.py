@@ -18,6 +18,7 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPl
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
 )
+from sglang.srt.debug_utils.comparator.dims import apply_dim_names, parse_dim_names
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     SkipRecord,
@@ -40,6 +41,9 @@ def compare_bundle_pair(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
+        x=None, y=None
+    ),
 ) -> Union[ComparisonRecord, SkipRecord]:
     with warning_sink.context() as collected_warnings:
         result = _compare_bundle_pair_raw(
@@ -49,6 +53,7 @@ def compare_bundle_pair(
             target_path=target_path,
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
+            thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
         )
 
     return result.model_copy(update={"warnings": collected_warnings})
@@ -62,6 +67,9 @@ def _compare_bundle_pair_raw(
     target_path: Path,
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
+    thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
+        x=None, y=None
+    ),
 ) -> Union[ComparisonRecord, SkipRecord]:
     # 1. Load (tensor + meta, ungrouped)
     valid_pair: Pair[list[ValueWithMeta]] = Pair(
@@ -78,12 +86,21 @@ def _compare_bundle_pair_raw(
         lambda items: [it.meta for it in items]
     )
     plan: AlignerPlan = compute_aligner_plan(
-        metas_pair=metas_pair, token_aligner_plan=token_aligner_plan
+        metas_pair=metas_pair,
+        token_aligner_plan=token_aligner_plan,
+        thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
     )
 
-    # 3. Execute (tensor + plan only, no meta)
-    tensors_pair: Pair[list[torch.Tensor]] = valid_pair.map(
-        lambda items: [it.value for it in items]
+    # 3. Apply dim names to tensors, then execute
+    tensors_pair: Pair[list[torch.Tensor]] = Pair(
+        x=_apply_dim_names_from_meta(
+            tensors=[it.value for it in valid_pair.x],
+            metas=metas_pair.x,
+        ),
+        y=_apply_dim_names_from_meta(
+            tensors=[it.value for it in valid_pair.y],
+            metas=metas_pair.y,
+        ),
     )
     aligner_result: AlignerResult = execute_aligner_plan(
         tensors_pair=tensors_pair, plan=plan
@@ -97,12 +114,44 @@ def _compare_bundle_pair_raw(
 
     # 4. Compare
     info = compare_tensor_pair(
-        x_baseline=aligner_result.tensors.x,
-        x_target=aligner_result.tensors.y,
+        x_baseline=aligner_result.tensors.x.rename(None),
+        x_target=aligner_result.tensors.y.rename(None),
         name=name,
         diff_threshold=diff_threshold,
     )
-    return ComparisonRecord(**info.model_dump())
+    return ComparisonRecord(**info.model_dump(), aligner_plan=plan)
+
+
+def _apply_dim_names_from_meta(
+    *,
+    tensors: list[torch.Tensor],
+    metas: list[dict[str, Any]],
+) -> list[torch.Tensor]:
+    if not metas:
+        return tensors
+
+    dims_str: Optional[str] = metas[0].get("dims")
+    if dims_str is None:
+        return tensors
+
+    dim_names: list[str] = parse_dim_names(dims_str)
+    return [apply_dim_names(t, dim_names) for t in tensors]
+
+
+def _apply_dim_names_from_meta(
+    *,
+    tensors: list[torch.Tensor],
+    metas: list[dict[str, Any]],
+) -> list[torch.Tensor]:
+    if not metas:
+        return tensors
+
+    dims_str: Optional[str] = metas[0].get("dims")
+    if dims_str is None:
+        return tensors
+
+    dim_names: list[str] = parse_dim_names(dims_str)
+    return [apply_dim_names(t, dim_names) for t in tensors]
 
 
 def _load_valid_tensors(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:

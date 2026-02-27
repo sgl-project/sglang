@@ -2,7 +2,7 @@ import functools
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 import torch
@@ -163,6 +163,16 @@ def _cast_to_polars_dtype(value, target_dtype):
         return str(value)
     else:
         return value
+
+
+def read_tokenizer_path(directory: Path) -> Optional[str]:
+    """Read tokenizer_path from any .pt file's embedded metadata in a dump directory."""
+    for p in directory.glob("*.pt"):
+        item: ValueWithMeta = ValueWithMeta.load(p)
+        tokenizer_path: Optional[str] = item.meta.get("tokenizer_path")
+        if tokenizer_path is not None:
+            return str(tokenizer_path)
+    return None
 
 
 dump_loader = DumpLoader()

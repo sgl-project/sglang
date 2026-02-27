@@ -850,6 +850,12 @@ def _compute_static_meta():
         if info := plugin.collect_parallel_info():
             result[f"{plugin.name}_parallel_info"] = info
 
+    for plugin in _plugins:
+        tokenizer_path: Optional[str] = plugin.get_tokenizer_path()
+        if tokenizer_path is not None:
+            result["tokenizer_path"] = tokenizer_path
+            break
+
     return result
 
 
@@ -1105,6 +1111,9 @@ class _FrameworkPlugin(ABC):
     def core_fields(self) -> frozenset[str]:
         return frozenset()
 
+    def get_tokenizer_path(self) -> Optional[str]:
+        return None
+
 
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
@@ -1189,6 +1198,21 @@ class _SGLangPlugin(_FrameworkPlugin):
             {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
         )
 
+    def get_tokenizer_path(self) -> Optional[str]:
+        if not self._available:
+            return None
+
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            args = get_global_server_args()
+            if args is None:
+                return None
+
+            return args.tokenizer_path
+        except Exception:
+            return None
+
 
 class _MegatronPlugin(_FrameworkPlugin):
     _available = True
@@ -1237,6 +1261,18 @@ class _MegatronPlugin(_FrameworkPlugin):
             info["dp_src_rank"] = self._mpu.get_data_parallel_src_rank()
         except (AttributeError, AssertionError):
             info["megatron_error"] = True
+
+        # Megatron sequence parallel reuses the TP group (no dedicated parallel state API).
+        # When sequence_parallel=True, inject sp_rank/sp_size for the comparator unsharder.
+        try:
+            from megatron.training.global_vars import get_args
+
+            args = get_args()
+            if getattr(args, "sequence_parallel", False) and "tp_rank" in info:
+                info["sp_rank"] = info["tp_rank"]
+                info["sp_size"] = info["tp_size"]
+        except (ImportError, AssertionError, AttributeError):
+            pass
 
         return info
 

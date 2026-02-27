@@ -48,7 +48,10 @@ def compute_token_aligner_plan(
             token_index_in_step=rec.y.locator.token_index_in_step[:common_len],
         )
 
-    return TokenAlignerPlan(locators=Pair(x=locator_x, y=locator_y))
+    return TokenAlignerPlan(
+        locators=Pair(x=locator_x, y=locator_y),
+        layouts=seqs_info_pair.map(lambda s: s.layout),
+    )
 
 
 # -------------------- Sequence matcher --------------------
