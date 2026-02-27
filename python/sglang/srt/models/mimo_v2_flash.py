@@ -445,13 +445,14 @@ class MiMoV2Attention(nn.Module):
 
         if quant_config is not None:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsConfig
+                CompressedTensorsConfig,
             )
-            from sglang.srt.layers.quantization.w8a8_int8 import (
-                W8A8Int8Config
-            )
-            if (isinstance(quant_config, CompressedTensorsConfig)
-                and quant_config.quant_format == "int-quantized"):
+            from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+            if (
+                isinstance(quant_config, CompressedTensorsConfig)
+                and quant_config.quant_format == "int-quantized"
+            ):
                 self.v_scale = None
             elif isinstance(quant_config, W8A8Int8Config):
                 self.v_scale = None
