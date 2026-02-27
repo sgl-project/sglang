@@ -1,15 +1,23 @@
+from __future__ import annotations
+
 from abc import abstractmethod
-from typing import Annotated, Literal, Union
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 
-from pydantic import Discriminator, Field, TypeAdapter
+import polars as pl
+from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_validator
 
-from sglang.srt.debug_utils.comparator.tensor_comparison.formatter import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparison.types import (
+from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
+
+if TYPE_CHECKING:
+    from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+        AlignerPlan,
+    )
 
 
 class ReplicatedMismatchWarning(_StrictBase):
@@ -28,38 +36,45 @@ class ReplicatedMismatchWarning(_StrictBase):
         )
 
 
-AlignWarning = (
-    ReplicatedMismatchWarning  # future: Annotated[Union[...], Discriminator("kind")]
-)
+class GeneralWarning(_StrictBase):
+    kind: Literal["general"] = "general"
+    category: str
+    message: str
+
+    def to_text(self) -> str:
+        return self.message
+
+
+AnyWarning = Annotated[
+    Union[ReplicatedMismatchWarning, GeneralWarning],
+    Discriminator("kind"),
+]
 
 
 class _OutputRecord(_StrictBase):
-    align_warnings: list[AlignWarning] = Field(default_factory=list)
+    warnings: list[AnyWarning] = Field(default_factory=list)
 
     @abstractmethod
     def _format_body(self) -> str: ...
 
     def to_text(self) -> str:
         body = self._format_body()
-        if self.align_warnings:
-            body += "\n" + "\n".join(f"  ⚠ {w.to_text()}" for w in self.align_warnings)
+        if self.warnings:
+            body += "\n" + "\n".join(f"  ⚠ {w.to_text()}" for w in self.warnings)
         return body
 
 
 class ConfigRecord(_OutputRecord):
     type: Literal["config"] = "config"
-    baseline_path: str
-    target_path: str
-    diff_threshold: float
-    start_step: int
-    end_step: int
+    config: dict[str, Any]
+
+    @classmethod
+    def from_args(cls, args) -> "ConfigRecord":
+        """Create ConfigRecord from argparse.Namespace."""
+        return cls(config=vars(args))
 
     def _format_body(self) -> str:
-        return (
-            f"Config: baseline={self.baseline_path} target={self.target_path}\n"
-            f"diff_threshold={self.diff_threshold} "
-            f"steps=[{self.start_step}, {self.end_step}]"
-        )
+        return f"Config: {self.config}"
 
 
 class SkipRecord(_OutputRecord):
@@ -69,7 +84,7 @@ class SkipRecord(_OutputRecord):
 
     @property
     def category(self) -> str:
-        if self.align_warnings:
+        if self.warnings:
             return "failed"
         return "skipped"
 
@@ -77,17 +92,52 @@ class SkipRecord(_OutputRecord):
         return f"Skip: {self.name} ({self.reason})"
 
 
+class _TableRecord(_OutputRecord):
+    label: str
+    rows: list[dict[str, Any]]
+
+    @abstractmethod
+    def _table_title(self) -> str: ...
+
+    def _format_body(self) -> str:
+        from sglang.srt.debug_utils.comparator.display import _render_polars_as_text
+
+        return _render_polars_as_text(
+            pl.DataFrame(self.rows), title=self._table_title()
+        )
+
+
+class RankInfoRecord(_TableRecord):
+    type: Literal["rank_info"] = "rank_info"
+
+    def _table_title(self) -> str:
+        return f"{self.label} ranks"
+
+
+class InputIdsRecord(_TableRecord):
+    type: Literal["input_ids"] = "input_ids"
+
+    def _table_title(self) -> str:
+        return f"{self.label} input_ids & positions"
+
+
 class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
+    model_config = ConfigDict(extra="forbid", defer_build=True)
+
     type: Literal["comparison"] = "comparison"
+    aligner_plan: Optional[AlignerPlan] = None
 
     @property
     def category(self) -> str:
-        if self.align_warnings:
+        if self.warnings:
             return "failed"
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def _format_body(self) -> str:
-        return format_comparison(self)
+        body: str = format_comparison(self)
+        if self.aligner_plan is not None:
+            body += "\n" + _format_aligner_plan(self.aligner_plan)
+        return body
 
 
 class SummaryRecord(_OutputRecord):
@@ -97,6 +147,15 @@ class SummaryRecord(_OutputRecord):
     failed: int
     skipped: int
 
+    @model_validator(mode="after")
+    def _validate_totals(self) -> "SummaryRecord":
+        expected: int = self.passed + self.failed + self.skipped
+        if self.total != expected:
+            raise ValueError(
+                f"total={self.total} != passed({self.passed}) + failed({self.failed}) + skipped({self.skipped}) = {expected}"
+            )
+        return self
+
     def _format_body(self) -> str:
         return (
             f"Summary: {self.passed} passed, {self.failed} failed, "
@@ -104,17 +163,63 @@ class SummaryRecord(_OutputRecord):
         )
 
 
+class WarningRecord(_OutputRecord):
+    type: Literal["warning"] = "warning"
+
+    def _format_body(self) -> str:
+        return ""
+
+
+def _format_aligner_plan(plan: AlignerPlan) -> str:
+    lines: list[str] = ["Aligner Plan:"]
+
+    for side_label, side_plans in [
+        ("baseline", plan.per_step_plans.x),
+        ("target", plan.per_step_plans.y),
+    ]:
+        if not side_plans:
+            lines.append(f"  {side_label}: (no steps)")
+            continue
+
+        step_summaries: list[str] = []
+        for step_plan in side_plans:
+            sub_strs: list[str] = []
+            for sub in step_plan.sub_plans:
+                sub_strs.append(f"{sub.type}")
+            summary: str = ", ".join(sub_strs) if sub_strs else "passthrough"
+            step_summaries.append(f"step={step_plan.step}: {summary}")
+        lines.append(f"  {side_label}: [{'; '.join(step_summaries)}]")
+
+    if plan.token_aligner_plan is not None:
+        num_tokens: int = len(plan.token_aligner_plan.locators.x.steps)
+        lines.append(f"  token_aligner: {num_tokens} tokens aligned")
+
+    if plan.axis_swapper_plan is not None:
+        lines.append(f"  axis_swapper: {plan.axis_swapper_plan.pattern}")
+
+    return "\n".join(lines)
+
+
 AnyRecord = Annotated[
-    Union[ConfigRecord, SkipRecord, ComparisonRecord, SummaryRecord],
+    Union[
+        ConfigRecord,
+        RankInfoRecord,
+        InputIdsRecord,
+        SkipRecord,
+        ComparisonRecord,
+        SummaryRecord,
+        WarningRecord,
+    ],
     Discriminator("type"),
 ]
 
 
-_any_record_adapter = TypeAdapter(AnyRecord)
+def _get_any_record_adapter() -> TypeAdapter:
+    return TypeAdapter(AnyRecord)
 
 
 def parse_record_json(json_str: str | bytes) -> AnyRecord:
-    return _any_record_adapter.validate_json(json_str)
+    return _get_any_record_adapter().validate_json(json_str)
 
 
 def print_record(record: _OutputRecord, output_format: str) -> None:
