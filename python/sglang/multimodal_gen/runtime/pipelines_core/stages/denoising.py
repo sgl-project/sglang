@@ -140,7 +140,9 @@ class DenoisingStage(PipelineStage):
         if not getattr(server_args, "enable_cuda_graph", False):
             return
         if not hasattr(module, "enable_cuda_graph_capture"):
-            logger.warning(f"Module {module.__class__.__name__} does not support CUDA graph capture")
+            logger.warning(
+                f"Module {module.__class__.__name__} does not support CUDA graph capture"
+            )
             return
         module.enable_cuda_graph_capture(True)
 

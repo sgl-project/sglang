@@ -813,6 +813,7 @@ def next_power_of_2_bitwise(n):
     n |= n >> 16
     return n + 1
 
+
 def pad_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     assert dim == 0 or dim == 1, "dim must be 0 or 1"
     seq_length = tensor.shape[dim]
@@ -821,10 +822,19 @@ def pad_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     if padding_length == 0:
         return tensor
     if dim == 0:
-        padding = torch.zeros(padding_length, *tensor.shape[1:], device=tensor.device, dtype=tensor.dtype)
+        padding = torch.zeros(
+            padding_length, *tensor.shape[1:], device=tensor.device, dtype=tensor.dtype
+        )
     else:
-        padding = torch.zeros(*tensor.shape[:dim], padding_length, *tensor.shape[dim+1:], device=tensor.device, dtype=tensor.dtype)
+        padding = torch.zeros(
+            *tensor.shape[:dim],
+            padding_length,
+            *tensor.shape[dim + 1 :],
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
     return torch.cat([tensor, padding], dim=dim)
+
 
 class QwenImageTransformerBlock(nn.Module):
     GLOBAL_GRAPH_POOL_HANDLE = torch.cuda.graphs.graph_pool_handle()
@@ -928,10 +938,10 @@ class QwenImageTransformerBlock(nn.Module):
             }
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
-        
+
         self._enable_cuda_graph_capture = False
         self._cuda_graphs = {}
-    
+
     def enable_cuda_graph_capture(self, enable: bool):
         self._enable_cuda_graph_capture = enable
 
@@ -1026,7 +1036,7 @@ class QwenImageTransformerBlock(nn.Module):
             else:
                 modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
                 return modulated, gate_result
-    
+
     def _img_pre_attention_forward(
         self,
         hidden_states: torch.Tensor,
@@ -1048,7 +1058,7 @@ class QwenImageTransformerBlock(nn.Module):
                 .transpose(1, 2)
                 .reshape(img_mod_params.shape[0], -1)
             )
-        
+
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
@@ -1057,7 +1067,7 @@ class QwenImageTransformerBlock(nn.Module):
             hidden_states, img_mod1, self.img_norm1, modulate_index
         )
         return img_modulated, img_gate1, img_mod2
-    
+
     def _txt_pre_attention_forward(
         self,
         encoder_hidden_states: torch.Tensor,
@@ -1078,7 +1088,7 @@ class QwenImageTransformerBlock(nn.Module):
                 .transpose(1, 2)
                 .reshape(txt_mod_params.shape[0], -1)
             )
-        
+
         # Split modulation parameters for norm1 and norm2
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
@@ -1089,7 +1099,7 @@ class QwenImageTransformerBlock(nn.Module):
         )
         txt_gate1 = txt_gate1_raw.unsqueeze(1)
         return txt_modulated, txt_gate1, txt_mod2
-    
+
     def _img_post_attention_forward(
         self,
         img_attn_output: torch.Tensor,
@@ -1115,9 +1125,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
-        
+
         return hidden_states
-    
+
     def _txt_post_attention_forward(
         self,
         txt_attn_output: torch.Tensor,
@@ -1165,25 +1175,48 @@ class QwenImageTransformerBlock(nn.Module):
                 hidden_states, temb_img_silu, modulate_index
             )
         elif modulate_index is not None:
-            if ("img_pre_attention_forward", hidden_states.shape, modulate_index.shape) not in self._cuda_graphs:
-                self._cuda_graphs[("img_pre_attention_forward", hidden_states.shape, modulate_index.shape)] = torch.cuda.make_graphed_callables(
-                    self._img_pre_attention_forward, 
-                    (hidden_states, temb_img_silu, modulate_index), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            if (
+                "img_pre_attention_forward",
+                hidden_states.shape,
+                modulate_index.shape,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[
+                    (
+                        "img_pre_attention_forward",
+                        hidden_states.shape,
+                        modulate_index.shape,
+                    )
+                ] = torch.cuda.make_graphed_callables(
+                    self._img_pre_attention_forward,
+                    (hidden_states, temb_img_silu, modulate_index),
+                    pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-            module = self._cuda_graphs[("img_pre_attention_forward", hidden_states.shape, modulate_index.shape)]
-            img_modulated, img_gate1, img_mod2 = module(hidden_states, temb_img_silu, modulate_index)
+            module = self._cuda_graphs[
+                ("img_pre_attention_forward", hidden_states.shape, modulate_index.shape)
+            ]
+            img_modulated, img_gate1, img_mod2 = module(
+                hidden_states, temb_img_silu, modulate_index
+            )
         else:
-            _img_pre_attention = functools.partial(self._img_pre_attention_forward, modulate_index=None)
-            if ("img_pre_attention_forward", hidden_states.shape) not in self._cuda_graphs:
-                self._cuda_graphs[("img_pre_attention_forward", hidden_states.shape)] = torch.cuda.make_graphed_callables(
-                    _img_pre_attention, 
-                    (hidden_states, temb_img_silu), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            _img_pre_attention = functools.partial(
+                self._img_pre_attention_forward, modulate_index=None
+            )
+            if (
+                "img_pre_attention_forward",
+                hidden_states.shape,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[
+                    ("img_pre_attention_forward", hidden_states.shape)
+                ] = torch.cuda.make_graphed_callables(
+                    _img_pre_attention,
+                    (hidden_states, temb_img_silu),
+                    pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-            module = self._cuda_graphs[("img_pre_attention_forward", hidden_states.shape)]
+            module = self._cuda_graphs[
+                ("img_pre_attention_forward", hidden_states.shape)
+            ]
             img_modulated, img_gate1, img_mod2 = module(hidden_states, temb_img_silu)
-        
+
         seq_len_txt = encoder_hidden_states.shape[1]
         padded_seq_len_txt = next_power_of_2_bitwise(seq_len_txt)
         if not self._enable_cuda_graph_capture:
@@ -1191,15 +1224,26 @@ class QwenImageTransformerBlock(nn.Module):
                 encoder_hidden_states, temb_txt_silu
             )
         else:
-            padded_encoder_hidden_states = pad_tensor(encoder_hidden_states, 1) # [B, S, H]
-            if ("txt_pre_attention_forward", padded_seq_len_txt) not in self._cuda_graphs:
-                self._cuda_graphs[("txt_pre_attention_forward", padded_seq_len_txt)] = torch.cuda.make_graphed_callables(
-                    self._txt_pre_attention_forward, 
-                    (padded_encoder_hidden_states, temb_txt_silu), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            padded_encoder_hidden_states = pad_tensor(
+                encoder_hidden_states, 1
+            )  # [B, S, H]
+            if (
+                "txt_pre_attention_forward",
+                padded_seq_len_txt,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[("txt_pre_attention_forward", padded_seq_len_txt)] = (
+                    torch.cuda.make_graphed_callables(
+                        self._txt_pre_attention_forward,
+                        (padded_encoder_hidden_states, temb_txt_silu),
+                        pool=self.GLOBAL_GRAPH_POOL_HANDLE,
+                    )
                 )
-            module = self._cuda_graphs[("txt_pre_attention_forward", padded_seq_len_txt)]
-            padded_txt_modulated, txt_gate1, txt_mod2 = module(padded_encoder_hidden_states, temb_txt_silu)
+            module = self._cuda_graphs[
+                ("txt_pre_attention_forward", padded_seq_len_txt)
+            ]
+            padded_txt_modulated, txt_gate1, txt_mod2 = module(
+                padded_encoder_hidden_states, temb_txt_silu
+            )
             txt_modulated = padded_txt_modulated[:, :seq_len_txt]
 
         # Use QwenAttnProcessor2_0 for joint attention computation
@@ -1227,41 +1271,95 @@ class QwenImageTransformerBlock(nn.Module):
                 img_attn_output, img_mod2, img_gate1, hidden_states, modulate_index
             )
         elif modulate_index is not None:
-            if ("img_post_attention_forward", img_attn_output.shape, modulate_index.shape) not in self._cuda_graphs:
-                self._cuda_graphs[("img_post_attention_forward", img_attn_output.shape, modulate_index.shape)] = torch.cuda.make_graphed_callables(
-                    self._img_post_attention_forward, 
-                    (img_attn_output, img_mod2, img_gate1, hidden_states, modulate_index), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            if (
+                "img_post_attention_forward",
+                img_attn_output.shape,
+                modulate_index.shape,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[
+                    (
+                        "img_post_attention_forward",
+                        img_attn_output.shape,
+                        modulate_index.shape,
+                    )
+                ] = torch.cuda.make_graphed_callables(
+                    self._img_post_attention_forward,
+                    (
+                        img_attn_output,
+                        img_mod2,
+                        img_gate1,
+                        hidden_states,
+                        modulate_index,
+                    ),
+                    pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-            module = self._cuda_graphs[("img_post_attention_forward", img_attn_output.shape, modulate_index.shape)]
-            hidden_states = module(img_attn_output, img_mod2, img_gate1, hidden_states, modulate_index)
+            module = self._cuda_graphs[
+                (
+                    "img_post_attention_forward",
+                    img_attn_output.shape,
+                    modulate_index.shape,
+                )
+            ]
+            hidden_states = module(
+                img_attn_output, img_mod2, img_gate1, hidden_states, modulate_index
+            )
         else:
-            _img_post_attention = functools.partial(self._img_post_attention_forward, modulate_index=None)
-            if ("img_post_attention_forward", img_attn_output.shape) not in self._cuda_graphs:
-                self._cuda_graphs[("img_post_attention_forward", img_attn_output.shape)] = torch.cuda.make_graphed_callables(
-                    _img_post_attention, 
-                    (img_attn_output, img_mod2, img_gate1, hidden_states), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            _img_post_attention = functools.partial(
+                self._img_post_attention_forward, modulate_index=None
+            )
+            if (
+                "img_post_attention_forward",
+                img_attn_output.shape,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[
+                    ("img_post_attention_forward", img_attn_output.shape)
+                ] = torch.cuda.make_graphed_callables(
+                    _img_post_attention,
+                    (img_attn_output, img_mod2, img_gate1, hidden_states),
+                    pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-                logger.info(f"memory usage after img_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB")
-            module = self._cuda_graphs[("img_post_attention_forward", img_attn_output.shape)]
+                logger.info(
+                    f"memory usage after img_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
+                )
+            module = self._cuda_graphs[
+                ("img_post_attention_forward", img_attn_output.shape)
+            ]
             hidden_states = module(img_attn_output, img_mod2, img_gate1, hidden_states)
-        
+
         if not self._enable_cuda_graph_capture:
             encoder_hidden_states = self._txt_post_attention_forward(
                 txt_attn_output, txt_mod2, txt_gate1, encoder_hidden_states
             )
         else:
             padded_txt_attn_output = pad_tensor(txt_attn_output, dim=1)
-            if ("txt_post_attention_forward", txt_attn_output.shape) not in self._cuda_graphs:
-                self._cuda_graphs[("txt_post_attention_forward", txt_attn_output.shape)] = torch.cuda.make_graphed_callables(
-                    self._txt_post_attention_forward, 
-                    (padded_txt_attn_output, txt_mod2, txt_gate1, padded_encoder_hidden_states), 
-                    pool=self.GLOBAL_GRAPH_POOL_HANDLE
+            if (
+                "txt_post_attention_forward",
+                txt_attn_output.shape,
+            ) not in self._cuda_graphs:
+                self._cuda_graphs[
+                    ("txt_post_attention_forward", txt_attn_output.shape)
+                ] = torch.cuda.make_graphed_callables(
+                    self._txt_post_attention_forward,
+                    (
+                        padded_txt_attn_output,
+                        txt_mod2,
+                        txt_gate1,
+                        padded_encoder_hidden_states,
+                    ),
+                    pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-                logger.info(f"memory usage after txt_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB")
-            module = self._cuda_graphs[("txt_post_attention_forward", txt_attn_output.shape)]
-            padded_encoder_hidden_states = module(padded_txt_attn_output, txt_mod2, txt_gate1, padded_encoder_hidden_states)
+                logger.info(
+                    f"memory usage after txt_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
+                )
+            module = self._cuda_graphs[
+                ("txt_post_attention_forward", txt_attn_output.shape)
+            ]
+            padded_encoder_hidden_states = module(
+                padded_txt_attn_output,
+                txt_mod2,
+                txt_gate1,
+                padded_encoder_hidden_states,
+            )
             encoder_hidden_states = padded_encoder_hidden_states[:, :seq_len_txt]
 
         return encoder_hidden_states, hidden_states
@@ -1369,7 +1467,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         modulate_index = torch.stack(modulate_index_list)
         return modulate_index
-    
+
     def enable_cuda_graph_capture(self, enable: bool):
         for block in self.transformer_blocks:
             block.enable_cuda_graph_capture(enable)
