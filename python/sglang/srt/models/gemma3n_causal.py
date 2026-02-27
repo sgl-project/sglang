@@ -677,6 +677,7 @@ class Gemma3nTextModel(PreTrainedModel):
             self.hidden_size,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_model_projection", prefix),
         )
@@ -692,6 +693,7 @@ class Gemma3nTextModel(PreTrainedModel):
                 self.hidden_size,
                 self.hidden_size,
                 bias=False,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
@@ -704,6 +706,7 @@ class Gemma3nTextModel(PreTrainedModel):
                 self.hidden_size,
                 self.hidden_size,
                 bias=False,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
