@@ -124,6 +124,7 @@ class TestExecuteAlignerPlan:
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
             token_aligner_plan=None,
+            token_dims=Pair(x=0, y=0),
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(
@@ -145,6 +146,7 @@ class TestExecuteAlignerPlan:
                 y=[self._make_step_plan(step=0, indices=[0, 1])],
             ),
             token_aligner_plan=None,
+            token_dims=Pair(x=0, y=0),
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(
@@ -166,6 +168,7 @@ class TestExecuteAlignerPlan:
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
             token_aligner_plan=None,
+            token_dims=Pair(x=0, y=0),
         )
 
         t_x: torch.Tensor = torch.tensor([1.0, 2.0])
@@ -188,6 +191,7 @@ class TestExecuteAlignerPlan:
                 y=[self._make_step_plan(step=0, indices=[0])],
             ),
             token_aligner_plan=None,
+            token_dims=Pair(x=0, y=0),
         )
 
         tensors_pair: Pair[list[torch.Tensor]] = Pair(
