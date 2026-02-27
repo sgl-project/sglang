@@ -60,15 +60,13 @@ class PrefillDelayer:
             dtype=torch.int64,
             device=device,
         )
+        self.enable_dp_attention = server_args.enable_dp_attention
         self._cpu_group = cpu_group
 
         self._metrics_collector = metrics_collector
 
         self._curr_state: Optional[_State] = None
 
-        assert (
-            server_args.enable_dp_attention
-        ), "To use PrefillDelayer, enable_dp_attention must be enabled."
         assert (
             server_args.disaggregation_mode == "null"
         ), "To use PrefillDelayer, disaggregation_mode must be null."
@@ -148,6 +146,7 @@ class PrefillDelayer:
             if (
                 max_running_requests - global_running_batch.max().item()
                 < global_max_prefill_bs.max().item()
+                and not self.enable_dp_attention
             ):
                 next_state = prev_state or _State()
                 next_state = next_state.bump_delayed_count()
