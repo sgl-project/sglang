@@ -3,11 +3,14 @@ from typing import Optional
 import torch
 
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+
+    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -20,6 +23,7 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
+@register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -41,7 +45,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: float = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -140,7 +144,7 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     )
 
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
         w1,
@@ -159,7 +163,7 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type1.id,
+        b_q_type=scalar_type1,
         size_m=M,
         size_n=2 * N,
         size_k=K,
@@ -174,7 +178,7 @@ def fused_marlin_moe(
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
         w2,
@@ -193,7 +197,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         is_ep=expert_map is not None,
-        b_q_type_id=scalar_type2.id,
+        b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
         size_k=N,
@@ -214,26 +218,3 @@ def fused_marlin_moe(
         routed_scaling_factor,
     )
     return output
-
-
-def fused_marlin_moe_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    g_idx1: Optional[torch.Tensor] = None,
-    g_idx2: Optional[torch.Tensor] = None,
-    sort_indices1: Optional[torch.Tensor] = None,
-    sort_indices2: Optional[torch.Tensor] = None,
-    w1_zeros: Optional[torch.Tensor] = None,
-    w2_zeros: Optional[torch.Tensor] = None,
-    num_bits: int = 8,
-    is_k_full: bool = True,
-    inplace: bool = False,
-    routed_scaling_factor: float = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)

@@ -23,10 +23,14 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except:
+    pass
+
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
-    direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
@@ -34,8 +38,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
-    supports_custom_op,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -43,7 +47,11 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+    from sgl_kernel import sgl_per_token_quant_fp8
+
+    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
 
     # Temporary
     try:
@@ -55,7 +63,12 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = False
 
+    from sglang.jit_kernel.per_token_group_quant_8bit import (
+        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+    )
+
 if _is_hip:
+    _has_vllm = False
     if _use_aiter:
         try:
             from aiter import (  # v0.1.3
@@ -68,8 +81,11 @@ if _is_hip:
     else:
         try:
             import vllm._C  # noqa: F401
+
+            _has_vllm = True
         except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+            # Fallback: vllm not available, will use native PyTorch implementation
+            _has_vllm = False
 
 logger = logging.getLogger(__name__)
 
@@ -90,32 +106,16 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-if supports_custom_op():
 
-    def deep_gemm_fp8_fp8_bf16_nt(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
-
-    def deep_gemm_fp8_fp8_bf16_nt_fake(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        return
-
-    direct_register_custom_op(
-        op_name="deep_gemm_fp8_fp8_bf16_nt",
-        op_func=deep_gemm_fp8_fp8_bf16_nt,
-        mutates_args=["C"],
-        fake_impl=deep_gemm_fp8_fp8_bf16_nt_fake,
-    )
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_fp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -227,7 +227,7 @@ def _per_token_group_quant_8bit_raw(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor.
@@ -505,19 +505,31 @@ def sglang_per_token_group_quant_fp8(
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
-            sgl_per_token_group_quant_8bit(
-                x,
-                x_q,
-                x_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                fuse_silu_and_mul,
-                masked_m,
-                enable_v2=enable_v2,
-            )
+            if enable_v2:
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=True,
+                )
+            else:
+                sgl_per_token_group_quant_8bit_jit(
+                    input=x,
+                    output_q=x_q,
+                    output_s=x_s,
+                    group_size=group_size,
+                    eps=eps,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    scale_ue8m0=scale_ue8m0,
+                )
         else:
             assert not enable_v2
             sgl_per_token_group_quant_fp8(
@@ -643,7 +655,7 @@ def static_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
         dtype: The dype of output tensor.
@@ -969,6 +981,11 @@ def get_w8a8_block_fp8_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
 
+    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g., device name).
+    # Returning None forces the caller to use the default config path during compile.
+    if torch._dynamo.is_compiling():
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = get_device_name().replace(" ", "_")
@@ -1081,10 +1098,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    if supports_custom_op():
-        torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-    else:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 
     return C
 
@@ -1189,6 +1203,140 @@ def w8a8_block_fp8_matmul(
     return w8a8_block_fp8_matmul_triton(
         A, B, As, Bs, block_size, output_dtype=output_dtype
     )
+
+
+# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
+@triton.jit
+def _mxfp8_block_scaled_matmul_kernel(  #
+    a_desc,  #
+    a_scale_desc,  #
+    b_desc,  #
+    b_scale_desc,  #
+    c_desc,  #
+    M: tl.constexpr,  #
+    N: tl.constexpr,  #
+    K: tl.constexpr,  #
+    output_type: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    BLOCK_K: tl.constexpr,  #
+    rep_m: tl.constexpr,  #
+    rep_n: tl.constexpr,  #
+    rep_k: tl.constexpr,  #
+    NUM_STAGES: tl.constexpr,  #
+):  #
+    if output_type == 0:
+        output_dtype = tl.float32
+    elif output_type == 1:
+        output_dtype = tl.float16
+    elif output_type == 2:
+        output_dtype = tl.bfloat16
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
+    offs_k_a = 0
+    offs_k_b = 0
+    offs_scale_m = pid_m * rep_m
+    offs_scale_n = pid_n * rep_n
+    offs_scale_k = 0
+
+    VEC_SIZE: tl.constexpr = 32
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=NUM_STAGES):
+        a = a_desc.load([offs_am, offs_k_a])
+        b = b_desc.load([offs_bn, offs_k_b])
+        scale_a = a_scale_desc.load([0, offs_scale_m, offs_scale_k, 0, 0])
+        scale_b = b_scale_desc.load([0, offs_scale_n, offs_scale_k, 0, 0])
+
+        scale_a = (
+            scale_a.reshape(rep_m, rep_k, 32, 4, 4)
+            .trans(0, 3, 2, 1, 4)
+            .reshape(BLOCK_M, BLOCK_K // VEC_SIZE)
+        )
+        scale_b = (
+            scale_b.reshape(rep_n, rep_k, 32, 4, 4)
+            .trans(0, 3, 2, 1, 4)
+            .reshape(BLOCK_N, BLOCK_K // VEC_SIZE)
+        )
+
+        accumulator = tl.dot_scaled(
+            a, scale_a, "e4m3", b.T, scale_b, "e4m3", accumulator
+        )
+
+        offs_k_a += BLOCK_K
+        offs_k_b += BLOCK_K
+        offs_scale_k += rep_k
+
+    c_desc.store([offs_am, offs_bn], accumulator.to(output_dtype))
+
+
+# Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
+def mxfp8_block_scaled_matmul_triton(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    block_m: int = 128,
+    block_n: int = 256,
+    block_k: int = 128,
+    num_stages: int = 4,
+) -> torch.Tensor:
+    """Block-scaled matmul for MXFP8 using Triton dot_scaled."""
+    M, K = a.shape
+    N, K_b = b.shape
+    assert K == K_b
+
+    if output_dtype == torch.float32:
+        output_type = 0
+    elif output_dtype == torch.float16:
+        output_type = 1
+    elif output_dtype == torch.bfloat16:
+        output_type = 2
+    else:
+        raise ValueError(f"Unsupported output dtype: {output_dtype}")
+
+    rep_m = block_m // 128
+    rep_n = block_n // 128
+    rep_k = block_k // 32 // 4
+
+    a_desc = TensorDescriptor.from_tensor(a, [block_m, block_k])
+    b_desc = TensorDescriptor.from_tensor(b, [block_n, block_k])
+
+    scale_block_shape = [1, rep_m, rep_k, 2, 256]
+    a_scale_desc = TensorDescriptor.from_tensor(a_scale, block_shape=scale_block_shape)
+    scale_block_shape = [1, rep_n, rep_k, 2, 256]
+    b_scale_desc = TensorDescriptor.from_tensor(b_scale, block_shape=scale_block_shape)
+
+    output = torch.empty((M, N), dtype=output_dtype, device=a.device)
+    c_desc = TensorDescriptor.from_tensor(output, [block_m, block_n])
+
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
+    _mxfp8_block_scaled_matmul_kernel[grid](
+        a_desc,
+        a_scale_desc,
+        b_desc,
+        b_scale_desc,
+        c_desc,
+        M,
+        N,
+        K,
+        output_type,
+        block_m,
+        block_n,
+        block_k,
+        rep_m,
+        rep_n,
+        rep_k,
+        num_stages,
+    )
+    return output
 
 
 @triton.jit
@@ -1409,6 +1557,37 @@ Raises:
 """
 if _is_hip:
 
+    def _native_dynamic_per_token_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        M, N = input.shape
+        eps = 1e-12
+        # Compute per-token scale
+        absmax = input.abs().max(dim=1, keepdim=True).values
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        scale.copy_(scale_val)
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        eps = 1e-12
+        absmax = input.abs().max()
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max
+        # Use copy_ instead of fill_ with .item() to avoid CPU-GPU sync
+        scale.view(-1).copy_(scale_val.view(-1))
+        # Quantize
+        output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
+    def _native_static_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        # Use tensor directly instead of .item() to avoid CPU-GPU sync
+        output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+        output.copy_(output_data)
+
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
@@ -1429,16 +1608,20 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                         output, input.contiguous(), scale, None
                     )
+                else:
+                    _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                else:
+                elif _has_vllm:
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                else:
+                    _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1446,8 +1629,10 @@ if _is_hip:
             ), f"Expected scalar scale, got numel={scale.numel()}"
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            else:
+            elif _has_vllm:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+            else:
+                _native_static_quant_fp8(output, input, scale)
 
         return output, scale
 
@@ -1877,14 +2062,6 @@ if _is_cuda:
         ):
             return
 
-    # FIXME: for some models, this fake registration will cause NaN outputs.
-    # So we gate the fake registration with an environment variable for them.
-    if not get_bool_env_var("SGLANG_DISABLE_SGL_KERNEL_FAKE_REGISTER"):
-
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
-        def _(input, output_q, output_s):
-            return
-
-    @torch.library.register_fake("sgl_kernel::sgl_per_tensor_quant_fp8")
-    def _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static):
+    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    def _(input, output_q, output_s):
         return

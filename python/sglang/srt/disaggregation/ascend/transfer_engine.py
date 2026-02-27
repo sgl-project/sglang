@@ -4,11 +4,13 @@ from typing import List
 
 import torch
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 
 try:
-    from mf_adapter import TransferEngine
+    from memfabric_hybrid import TransferEngine
 
     import_error = None
 except ImportError as e:
@@ -21,11 +23,14 @@ logger = logging.getLogger(__name__)
 class AscendTransferEngine(MooncakeTransferEngine):
 
     def __init__(
-        self, hostname: str, npu_id: int, disaggregation_mode: DisaggregationMode
+        self,
+        hostname: str,
+        npu_id: int,
+        disaggregation_mode: DisaggregationMode,
     ):
         if import_error is not None:
             logger.warning(
-                "Please install mf_adapter, for details, see docs/backend/pd_disaggregation.md"
+                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
             )
             raise import_error
 

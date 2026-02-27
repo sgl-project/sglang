@@ -4,6 +4,7 @@ from __future__ import annotations
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -12,18 +13,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.utils import (
+    concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
     get_num_page_per_block_flashmla,
+    mla_quantize_and_rope_for_fp8,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
     import flashinfer
@@ -33,13 +38,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
+logger = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 
 # Block constraint from flashinfer requirements
 # From flashinfer.decode._check_trtllm_gen_mla_shape:
@@ -192,6 +194,36 @@ def unpad_draft_extend_output_kernel(
         data,
         mask=head_mask[:, None] & dim_mask[None, :],
     )
+
+
+def _quantize_fp8_qkv(q, k, v, layer):
+    q = q.to(torch.float8_e4m3fn)
+
+    k_scale = getattr(layer, "k_scale_float", None)
+    if k_scale is None:
+        k_scale = 1.0
+    if k_scale != 1.0:
+        assert hasattr(layer, "k_scale"), "k_scale is not set"
+        k_2d, _ = scaled_fp8_quant(
+            k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
+        )
+        k = k_2d.reshape(k.shape)
+    else:
+        k = k.to(torch.float8_e4m3fn)
+
+    v_scale = getattr(layer, "v_scale_float", None)
+    if v_scale is None:
+        v_scale = 1.0
+    if v_scale != 1.0:
+        assert hasattr(layer, "v_scale"), "v_scale is not set"
+        v_2d, _ = scaled_fp8_quant(
+            v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
+        )
+        v = v_2d.reshape(v.shape)
+    else:
+        v = v.to(torch.float8_e4m3fn)
+
+    return q, k, v, k_scale, v_scale
 
 
 global_zero_init_workspace_buffer = None
@@ -517,10 +549,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 metadata.max_seq_len_q = 1
                 metadata.sum_seq_lens_q = bs
+            # draft_extend uses (accept_length + 1) query tokens per sequence
+            extend_seq_lens = accept_length + 1
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             )
-            metadata.seq_lens_q.copy_(accept_length)
+            metadata.seq_lens_q.copy_(extend_seq_lens)
             # see NOTE(draft_extend seq_len handling)
             seq_lens = seq_lens[:bs] - metadata.seq_lens_q + metadata.max_seq_len_q
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
@@ -551,10 +585,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
+            # Also fallback to flashinfer MLA backend when in piecewise cuda graph, since it only supports MLA forward mode.
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 self.disable_chunked_prefix_cache and has_prefix
-            )
+            ) or is_in_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -630,84 +665,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
-
-    def quantize_and_rope_for_fp8(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize and apply RoPE for FP8 attention path.
-
-        This function handles the FP8 quantization and RoPE application for MLA attention.
-        It takes separate query/key nope and rope components, applies RoPE to the rope parts,
-        quantizes all components to FP8, and merges the query components into a single tensor.
-
-        Args:
-            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            forward_batch: Forward batch containing position information
-            cos_sin_cache: Precomputed cosine/sine cache for RoPE
-                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
-            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
-
-        Returns:
-            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
-                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
-        """
-        attn_dtype = torch.float8_e4m3fn
-        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
-
-        # Allocate output tensors with FP8 dtype
-        # Query output will contain merged nope + rope components
-        q_out = q_rope.new_empty(
-            q_len,
-            num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=attn_dtype,
-        )
-
-        # Key outputs maintain original shapes but with FP8 dtype
-        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
-        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
-
-        # Apply RoPE and quantize all components in a single fused kernel call
-        # This kernel handles:
-        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-        # 2. Quantization of all components to FP8 format
-        # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=forward_batch.positions,
-            is_neox=is_neox,
-            quantize_dtype=attn_dtype,
-            # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
-            k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
-            k_nope_out=k_nope_out,
-            # Quantization scales (set to 1.0 for no additional scaling)
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
-        )
-
-        return q_out, k_nope_out, k_rope_out
 
     def pad_draft_extend_query(
         self,
@@ -811,14 +768,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = self.quantize_and_rope_for_fp8(
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch,
+                forward_batch.positions,
                 cos_sin_cache,
                 is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
             )
             merge_query = False
 
@@ -838,7 +797,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -874,15 +833,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
         # Scale components:
         # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
-        # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
+        # - k_scale: Key scaling factor from model checkpoint. Only applied when KV cache
+        #   stores FP8-quantized values, to compensate for the quantization scaling.
+        #   For BF16/FP16 KV cache, k_scale must be 1.0 since values are unscaled.
         # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
-        # This unified approach works for both FP16 and FP8 quantized attention paths.
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
+        if self.data_type == torch.float8_e4m3fn:
+            k_scale = (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
+        else:
+            if getattr(layer, "k_scale_float", None) is not None:
+                logger.warning_once(
+                    "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                    "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                    layer.k_scale_float,
+                    self.data_type,
+                )
+            k_scale = 1.0
 
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -937,14 +907,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = self.quantize_and_rope_for_fp8(
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch,
+                forward_batch.positions,
                 cos_sin_cache,
                 is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
             )
             merge_query = False
 
@@ -965,7 +937,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            q = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            q = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
 
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -998,11 +970,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q_scale = 1.0
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
+            if self.data_type == torch.float8_e4m3fn:
+                k_scale = (
+                    layer.k_scale_float
+                    if getattr(layer, "k_scale_float", None) is not None
+                    else 1.0
+                )
+            else:
+                if getattr(layer, "k_scale_float", None) is not None:
+                    logger.warning_once(
+                        "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                        "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                        layer.k_scale_float,
+                        self.data_type,
+                    )
+                k_scale = 1.0
             q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
@@ -1010,9 +992,56 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len = (
                     metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
                 )
+                # For target_verify, all sequences have the same number of draft tokens
+                q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+                needs_unpad = False
             else:
-                max_seq_len = metadata.max_seq_len_k + metadata.max_seq_len_q
-            q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+                # draft_extend: handle varying accept_lengths. If total_tokens % bs == 0,
+                # we can directly reshape q; otherwise, pad to max_seq_len_q.
+                total_tokens = q.shape[0]
+                tokens_per_seq = total_tokens // bs if bs > 0 else 0
+                can_direct_view = bs > 0 and (total_tokens % bs == 0)
+
+                if can_direct_view:
+                    max_seq_len = metadata.max_seq_len_k + tokens_per_seq
+                    q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
+                    needs_unpad = False
+                else:
+                    # Varying lengths: pad q to (bs, max_seq_len_q, ...)
+                    actual_seq_lens_q = forward_batch.extend_seq_lens
+                    actual_max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                    max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
+
+                    actual_cu_seqlens_q = torch.nn.functional.pad(
+                        torch.cumsum(actual_seq_lens_q, dim=0, dtype=torch.int32),
+                        (1, 0),
+                    )
+
+                    if self.padded_q_buffer is not None:
+                        padded_q = self.padded_q_buffer[
+                            :bs, :actual_max_seq_len_q, :, :
+                        ].to(dtype=q.dtype)
+                        padded_q.zero_()
+                    else:
+                        padded_q = torch.zeros(
+                            (
+                                bs,
+                                actual_max_seq_len_q,
+                                layer.tp_q_head_num,
+                                layer.head_dim,
+                            ),
+                            dtype=q.dtype,
+                            device=q.device,
+                        )
+
+                    q = self.pad_draft_extend_query(
+                        q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
+                    )
+                    needs_unpad = True
+                    unpad_seq_lens_q = actual_seq_lens_q
+                    unpad_cu_seqlens_q = actual_cu_seqlens_q
+                    unpad_sum_seq_lens_q = total_tokens
+
             assert kv_cache.dtype == self.data_type
 
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -1028,13 +1057,43 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 bmm1_scale=bmm1_scale,
             )
 
-            output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if needs_unpad:
+                # Unpad the output for draft_extend mode with varying lengths
+                # Use the actual values computed during padding, not from metadata
+                output = self.unpad_draft_extend_output(
+                    raw_out,
+                    unpad_cu_seqlens_q,
+                    unpad_seq_lens_q,
+                    unpad_sum_seq_lens_q,
+                )
+                output = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            else:
+                output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 
         if k_rope is not None:
             k = torch.cat([k, k_rope], dim=-1)
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+
+        q_scale = k_scale = v_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn:
+            q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+
+        common_trtllm_args = {
+            "query": q,
+            "key": k,
+            "value": v,
+            "workspace_buffer": self.workspace_buffer,
+            "batch_size": forward_batch.batch_size,
+            "window_left": -1,
+            "enable_pdl": False,
+            "max_q_len": self.forward_prefill_metadata.max_seq_len,
+            "bmm1_scale": q_scale * k_scale * layer.scaling,
+            "bmm2_scale": v_scale,
+            "cum_seq_lens_q": self.forward_prefill_metadata.cum_seq_lens,
+        }
+
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
@@ -1044,47 +1103,41 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
 
-            output_shape = (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+            out = torch.zeros(
+                q.shape[0],
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                dtype=self.q_data_type,
+                device=q.device,
+            )
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                query=q,
-                key=k,
-                value=v,
-                workspace_buffer=self.workspace_buffer,
+                **common_trtllm_args,
                 seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
-                max_q_len=self.forward_prefill_metadata.max_seq_len,
                 max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
-                bmm1_scale=layer.scaling,
-                bmm2_scale=1.0,
                 o_sf_scale=-1.0,
-                batch_size=forward_batch.batch_size,
-                window_left=-1,
-                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
                 cum_seq_lens_kv=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
-                enable_pdl=False,
                 is_causal=False,
                 return_lse=True,
-                out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
+                out=out,
             )
-
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=self.workspace_buffer,
-            seq_lens=self.forward_prefill_metadata.seq_lens,
-            max_q_len=self.forward_prefill_metadata.max_seq_len,
-            max_kv_len=self.forward_prefill_metadata.max_seq_len,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
-            o_sf_scale=1.0,
-            batch_size=forward_batch.batch_size,
-            window_left=-1,
-            cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
-            cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
-            enable_pdl=False,
-            is_causal=True,
-            return_lse=forward_batch.mha_return_lse,
-        )
+        else:
+            out = torch.zeros(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=self.q_data_type,
+            )
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                **common_trtllm_args,
+                seq_lens=self.forward_prefill_metadata.seq_lens,
+                max_kv_len=self.forward_prefill_metadata.max_seq_len,
+                o_sf_scale=1.0,
+                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+                is_causal=True,
+                return_lse=forward_batch.mha_return_lse,
+                out=out,
+            )
 
 
 class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
@@ -1102,10 +1155,3 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
-
-
-def _concat_mla_absorb_q_general(q_nope, q_rope):
-    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
-        return concat_mla_absorb_q(q_nope, q_rope)
-    else:
-        return torch.cat([q_nope, q_rope], dim=-1)

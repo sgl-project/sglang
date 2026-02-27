@@ -12,13 +12,11 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import copy
 import importlib.util
-import io
 import json
 import os
-import pickle
 import random
-import resource
 import shutil
 import sys
 import time
@@ -27,29 +25,27 @@ import uuid
 import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from functools import lru_cache
-from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
-import pybase64
 import requests
-from datasets import load_dataset
-from PIL import Image
 from tqdm.asyncio import tqdm
-from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.utils import (
+    get_tokenizer,
+    parse_custom_headers,
+    remove_prefix,
+    set_ulimit,
 )
 
-ASSISTANT_SUFFIX = "Assistant:"
+_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -79,7 +75,7 @@ def _create_bench_client_session():
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    prompt: Union[str, List[str], List[Dict[str, str]]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -88,6 +84,7 @@ class RequestFuncInput:
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
+    routing_key: Optional[str] = None
 
 
 @dataclass
@@ -110,14 +107,6 @@ class RequestFuncOutput:
         return output
 
 
-def remove_prefix(text: str, prefix: str) -> str:
-    return text[len(prefix) :] if text.startswith(prefix) else text
-
-
-def remove_suffix(text: str, suffix: str) -> str:
-    return text[: -len(suffix)] if text.endswith(suffix) else text
-
-
 def get_auth_headers() -> Dict[str, str]:
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if openai_api_key:
@@ -127,6 +116,13 @@ def get_auth_headers() -> Dict[str, str]:
         if api_key:
             return {"Authorization": f"{api_key}"}
         return {}
+
+
+def get_request_headers() -> Dict[str, str]:
+    headers = get_auth_headers()
+    if h := getattr(args, "header", None):
+        headers.update(parse_custom_headers(h))
+    return headers
 
 
 # trt llm does not support ignore_eos
@@ -214,16 +210,25 @@ async def async_request_openai_completions(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
+
+        # Merge in extra parameters - these will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -233,7 +238,9 @@ async def async_request_openai_completions(
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -335,7 +342,9 @@ async def async_request_openai_chat_completions(
             f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
         )
 
-    if request_func_input.image_data:
+    if isinstance(request_func_input.prompt, list):
+        messages = request_func_input.prompt
+    elif request_func_input.image_data:
         # Build multi-image content: a list of image_url entries followed by the text
         content_items = [
             {
@@ -355,22 +364,35 @@ async def async_request_openai_chat_completions(
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
     async with _create_bench_client_session() as session:
+        # Build payload with defaults that can be overridden by extra_request_body
         payload = {
             "model": request_func_input.model,
             "messages": messages,
-            "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": not args.disable_ignore_eos,
-            **request_func_input.extra_request_body,
         }
+
+        # Add temperature default only if not specified in extra_request_body
+        if "temperature" not in request_func_input.extra_request_body:
+            payload["temperature"] = 0.0
+
+        # Add ignore_eos default only if not specified in extra_request_body
+        # Default to False for more realistic behavior (respect EOS tokens)
+        if "ignore_eos" not in request_func_input.extra_request_body:
+            payload["ignore_eos"] = not args.disable_ignore_eos
+
+        # Merge in extra parameters (tools, temperature, top_p, etc.)
+        # These will override defaults if present
+        payload.update(request_func_input.extra_request_body)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
             payload["lora_path"] = request_func_input.lora_name
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -486,7 +508,7 @@ async def async_request_truss(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
-        headers = get_auth_headers()
+        headers = get_request_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -565,6 +587,7 @@ async def async_request_sglang_generate(
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
+            "return_routed_experts": args.return_routed_experts,
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
@@ -573,7 +596,9 @@ async def async_request_sglang_generate(
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
-        headers = get_auth_headers()
+        headers = get_request_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -657,12 +682,32 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            body = {
-                "activities": getattr(args, "profile_activities", []),
-                "num_steps": getattr(args, "profile_num_steps", None),
-                "profile_by_stage": getattr(args, "profile_by_stage", None),
-                "profile_stages": getattr(args, "profile_stages", None),
-            }
+            if api_url.endswith("/start_profile"):
+                num_steps = getattr(args, "profile_num_steps", None)
+                profile_by_stage = getattr(args, "profile_by_stage", None)
+                if profile_by_stage and num_steps is None:
+                    num_steps = 5
+
+                output_dir = getattr(args, "profile_output_dir", None)
+                if output_dir is None:
+                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
+                    time.time()
+                )
+                output_dir.mkdir(exist_ok=True, parents=True)
+                output_dir = str(output_dir)
+
+                body = {
+                    "activities": getattr(args, "profile_activities", []),
+                    "num_steps": num_steps,
+                    "profile_by_stage": profile_by_stage,
+                    "profile_stages": getattr(args, "profile_stages", None),
+                    "output_dir": output_dir,
+                    "profile_prefix": getattr(args, "profile_prefix", None),
+                }
+            else:
+                # stop_profile doesn't need any parameters
+                body = {}
             print(f"async_request_profile {api_url=} {body=}")
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
@@ -722,149 +767,6 @@ async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> No
             )
 
 
-def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
-        import huggingface_hub.constants
-        from modelscope import snapshot_download
-
-        model_path = snapshot_download(
-            model_id=pretrained_model_name_or_path,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-            ignore_file_pattern=[".*.pt", ".*.safetensors", ".*.bin"],
-        )
-
-        return model_path
-    return pretrained_model_name_or_path
-
-
-def get_tokenizer(
-    pretrained_model_name_or_path: str,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-    assert (
-        pretrained_model_name_or_path is not None
-        and pretrained_model_name_or_path != ""
-    )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        return get_tokenizer(pretrained_model_name_or_path)
-
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
-        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
-    )
-
-
-def get_processor(
-    pretrained_model_name_or_path: str,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
-    assert (
-        pretrained_model_name_or_path is not None
-        and pretrained_model_name_or_path != ""
-    )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.utils.hf_transformers_utils import get_processor
-
-        return get_processor(pretrained_model_name_or_path)
-
-    if pretrained_model_name_or_path is not None and not os.path.exists(
-        pretrained_model_name_or_path
-    ):
-        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
-    )
-
-
-def get_dataset(args, tokenizer, model_id=None):
-    tokenize_prompt = getattr(args, "tokenize_prompt", False)
-    if args.dataset_name == "sharegpt":
-        assert not tokenize_prompt
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-            context_len=args.sharegpt_context_len,
-            prompt_suffix=args.prompt_suffix,
-            apply_chat_template=args.apply_chat_template,
-        )
-    elif args.dataset_name.startswith("random"):
-        input_requests = sample_random_requests(
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
-            tokenizer=tokenizer,
-            dataset_path=args.dataset_path,
-            random_sample=args.dataset_name == "random",
-            return_text=not tokenize_prompt,
-        )
-    elif args.dataset_name == "image":
-        processor = get_processor(model_id)
-        input_requests = sample_image_requests(
-            num_requests=args.num_prompts,
-            image_count=args.image_count,
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            range_ratio=args.random_range_ratio,
-            processor=processor,
-            image_content=args.image_content,
-            image_format=args.image_format,
-            image_resolution=args.image_resolution,
-            backend=args.backend,
-        )
-    elif args.dataset_name == "generated-shared-prefix":
-        assert not tokenize_prompt
-        input_requests = sample_generated_shared_prefix_requests(
-            num_groups=args.gsp_num_groups,
-            prompts_per_group=args.gsp_prompts_per_group,
-            system_prompt_len=args.gsp_system_prompt_len,
-            question_len=args.gsp_question_len,
-            output_len=args.gsp_output_len,
-            range_ratio=getattr(args, "gsp_range_ratio", 1.0),
-            tokenizer=tokenizer,
-            args=args,
-        )
-    elif args.dataset_name == "mmmu":
-        processor = get_processor(model_id)
-        input_requests = sample_mmmu_requests(
-            num_requests=args.num_prompts,
-            processor=processor,
-            backend=args.backend,
-            fixed_output_len=args.random_output_len,
-            random_sample=True,
-        )
-    elif args.dataset_name == "mooncake":
-        # For mooncake, we don't generate the prompts here.
-        # We just load the raw trace data. The async generator will handle the rest.
-        if not args.dataset_path:
-            local_path = os.path.join("/tmp", args.mooncake_workload + "_trace.jsonl")
-        else:
-            local_path = args.dataset_path
-
-        if not os.path.exists(local_path):
-            download_and_cache_file(
-                MOONCAKE_DATASET_URL[args.mooncake_workload], local_path
-            )
-
-        with open(local_path, "r") as f:
-            all_requests_data = [json.loads(line) for line in f if line.strip()]
-
-        # Limit the number of requests based on --num-prompts
-        input_requests = all_requests_data[: args.num_prompts]
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
-    return input_requests
-
-
 ASYNC_REQUEST_FUNCS = {
     "sglang": async_request_sglang_generate,
     "sglang-native": async_request_sglang_generate,
@@ -911,792 +813,11 @@ class BenchmarkMetrics:
     mean_e2e_latency_ms: float
     median_e2e_latency_ms: float
     std_e2e_latency_ms: float
+    p90_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
-
-
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-MOONCAKE_DATASET_URL = {
-    "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
-    "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
-    "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
-    "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
-}
-
-
-def download_and_cache_file(url: str, filename: Optional[str] = None):
-    """Read and cache a file from a url."""
-    if filename is None:
-        filename = os.path.join("/tmp", url.split("/")[-1])
-
-    # Check if the cache file already exists
-    if is_file_valid_json(filename):
-        return filename
-
-    print(f"Downloading from {url} to {filename}")
-
-    # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
-    response.raise_for_status()  # Check for request errors
-
-    # Total size of the file in bytes
-    total_size = int(response.headers.get("content-length", 0))
-    chunk_size = 1024  # Download in chunks of 1KB
-
-    # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            f.write(chunk)
-            bar.update(len(chunk))
-
-    return filename
-
-
-def is_file_valid_json(path):
-    if not os.path.isfile(path):
-        return False
-
-    # TODO can fuse into the real file open later
-    try:
-        with open(path) as f:
-            json.load(f)
-        return True
-    except JSONDecodeError as e:
-        print(
-            f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
-        )
-        return False
-
-
-@dataclass
-class DatasetRow:
-    prompt: str
-    prompt_len: int
-    output_len: int
-    text_prompt_len: Optional[int] = None
-    vision_prompt_len: Optional[int] = None
-    image_data: Optional[List[str]] = None
-    timestamp: Optional[float] = None
-
-    def __post_init__(self):
-        if self.text_prompt_len is None:
-            self.text_prompt_len = self.prompt_len
-        if self.vision_prompt_len is None:
-            self.vision_prompt_len = 0
-
-
-async def get_mooncake_request_over_time(
-    input_requests: List[Dict],
-    tokenizer: PreTrainedTokenizerBase,
-    slowdown_factor: float,
-    num_rounds: int,
-) -> AsyncGenerator[DatasetRow, None]:
-    """
-    An async generator that yields requests based on the timestamps in the Mooncake trace file,
-    with support for multi-round sessions.
-    """
-    if not input_requests:
-        return
-
-    input_requests.sort(key=lambda r: r["timestamp"])
-
-    start_time = time.perf_counter()
-    trace_start_time_ms = input_requests[0]["timestamp"]
-
-    for record in input_requests:
-        # Calculate when this entire session should start
-        relative_arrival_time_s = (record["timestamp"] - trace_start_time_ms) / 1000.0
-        target_arrival_time_s = relative_arrival_time_s * slowdown_factor
-
-        current_elapsed_time_s = time.perf_counter() - start_time
-        sleep_duration_s = target_arrival_time_s - current_elapsed_time_s
-        if sleep_duration_s > 0:
-            await asyncio.sleep(sleep_duration_s)
-
-        # Once the session starts, generate all rounds for it as a burst
-        # This simulates a user engaging in a multi-turn conversation
-
-        # Base user query constructed from hash_ids
-        user_query_base = ""
-        hash_ids = record.get("hash_ids", [])
-        for hash_id in hash_ids:
-            user_query_base += f"{hash_id}" + " ".join(
-                ["hi"] * 128
-            )  # Shorter for multi-round
-        user_query_base += "Tell me a story based on this context."
-
-        output_len_per_round = record.get("output_length", 256)
-        chat_history = []
-
-        for i in range(num_rounds):
-            # Add user query for the current round
-            chat_history.append(
-                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
-            )
-
-            # Form the full prompt from history
-            try:
-                full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
-            except Exception:
-                full_prompt_text = "\n".join(
-                    [f"{msg['role']}: {msg['content']}" for msg in chat_history]
-                )
-
-            prompt_len = len(tokenizer.encode(full_prompt_text))
-
-            yield DatasetRow(
-                prompt=full_prompt_text,
-                prompt_len=prompt_len,
-                output_len=output_len_per_round,
-            )
-
-            # Add a placeholder assistant response for the next round's context
-            # We use a placeholder because we don't know the real response
-            placeholder_response = " ".join(["story"] * output_len_per_round)
-            chat_history.append({"role": "assistant", "content": placeholder_response})
-
-
-def sample_mmmu_requests(
-    num_requests: int,
-    processor: AutoProcessor | AutoTokenizer,
-    backend: str = "sglang",
-    fixed_output_len: Optional[int] = None,
-    random_sample: bool = True,
-) -> List[DatasetRow]:
-    """
-    Sample requests from the MMMU dataset using HuggingFace datasets.
-
-    Args:
-        num_requests: Number of requests to sample.
-        fixed_output_len: If provided, use this fixed output length for all requests.
-        random_sample: Whether to randomly sample or take the first N.
-
-    Returns:
-        List of tuples (prompt, prompt_token_len, output_token_len).
-    """
-    print("Loading MMMU dataset from HuggingFace...")
-
-    try:
-        print("Attempting to load MMMU Math dataset...")
-        mmmu_dataset = load_dataset("MMMU/MMMU", "Math", split="test")
-        print(
-            f"Successfully loaded MMMU Math dataset from HuggingFace with {len(mmmu_dataset)} examples"
-        )
-    except Exception as e:
-        print(f"Failed to load MMMU Math dataset: {e}")
-        raise ValueError(f"Failed to load MMMU dataset: {e}")
-
-    # Sample from the dataset
-    if len(mmmu_dataset) > num_requests:
-        if random_sample:
-            # Random sample
-            indices = random.sample(range(len(mmmu_dataset)), num_requests)
-            sample_dataset = mmmu_dataset.select(indices)
-        else:
-            # Take first N
-            sample_dataset = mmmu_dataset.select(
-                range(min(num_requests, len(mmmu_dataset)))
-            )
-    else:
-        print(f"Dataset has less than {num_requests} examples, using all examples")
-        sample_dataset = mmmu_dataset
-
-    print(f"Selected {len(sample_dataset)} examples for benchmarking")
-
-    # Create prompts
-    filtered_dataset = []
-
-    for i, example in enumerate(sample_dataset):
-        try:
-            # Extract image_1
-            image = example.get("image_1")
-
-            if image is not None:
-                if hasattr(image, "save"):
-                    # Convert RGBA images to RGB before encoding
-                    if image.mode == "RGBA":
-                        image = image.convert("RGB")
-
-                    # Encode image to base64 (save as PNG to support palette/alpha modes)
-                    buffered = io.BytesIO()
-                    image.save(buffered, format="PNG")
-                    img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
-                    image_data = f"data:image/png;base64,{img_str}"
-                else:
-                    continue
-
-                # Extract the question
-                question = example.get("question")
-
-                # Construct the prompt
-                text_prompt = f"Question: {question}\n\nAnswer: "
-                output_len = fixed_output_len if fixed_output_len is not None else 256
-                data_row = create_mm_data_row(
-                    text_prompt, [image], [image_data], output_len, processor, backend
-                )
-                filtered_dataset.append(data_row)
-
-        except Exception as e:
-            print(f"Error processing example {i}: {e}")
-
-    print(f"\nCreated {len(filtered_dataset)} MMMU prompts")
-    return filtered_dataset
-
-
-def sample_sharegpt_requests(
-    dataset_path: str,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-    context_len: Optional[int] = None,
-    prompt_suffix: Optional[str] = "",
-    apply_chat_template=False,
-) -> List[DatasetRow]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
-
-    # Download sharegpt if necessary
-    if not is_file_valid_json(dataset_path) and dataset_path == "":
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
-
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-
-    # Filter out the conversations with less than 2 turns.
-    dataset = [
-        data
-        for data in dataset
-        if len(data.get("conversations", data.get("conversation", []))) >= 2
-    ]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (
-            data.get("conversations", data.get("conversation", []))[0]["value"],
-            data.get("conversations", data.get("conversation", []))[1]["value"],
-        )
-        for data in dataset
-    ]
-
-    # Shuffle the dataset.
-    random.shuffle(dataset)
-
-    # Filter out sequences that are too long or too short
-    filtered_dataset: List[DatasetRow] = []
-    for i in range(len(dataset)):
-        if len(filtered_dataset) == num_requests:
-            break
-
-        # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
-        if prompt_suffix:
-            prompt = (
-                remove_suffix(prompt, ASSISTANT_SUFFIX)
-                + prompt_suffix
-                + ASSISTANT_SUFFIX
-            )
-
-        if apply_chat_template:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-                return_dict=False,
-            )
-            if tokenizer.bos_token:
-                prompt = prompt.replace(tokenizer.bos_token, "")
-
-        prompt_token_ids = tokenizer.encode(prompt)
-        completion = dataset[i][1]
-        completion_token_ids = tokenizer.encode(completion)
-        prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
-
-        if prompt_len < 2 or output_len < 2:
-            # Prune too short sequences.
-            continue
-
-        if context_len and prompt_len + output_len > context_len:
-            # Prune too long sequences.
-            continue
-
-        filtered_dataset.append(
-            DatasetRow(
-                prompt=prompt,
-                prompt_len=prompt_len,
-                output_len=output_len,
-            )
-        )
-
-    print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
-    print(f"#Output tokens: {np.sum([x.output_len for x in filtered_dataset])}")
-    return filtered_dataset
-
-
-def compute_random_lens(full_len: int, range_ratio: float, num: int):
-    return np.random.randint(
-        max(int(full_len * range_ratio), 1),
-        full_len + 1,
-        size=num,
-    )
-
-
-def sample_random_requests(
-    input_len: int,
-    output_len: int,
-    num_prompts: int,
-    range_ratio: float,
-    tokenizer: PreTrainedTokenizerBase,
-    dataset_path: str,
-    random_sample: bool = True,
-    return_text: bool = True,
-) -> List[DatasetRow]:
-    input_lens = compute_random_lens(
-        full_len=input_len,
-        range_ratio=range_ratio,
-        num=num_prompts,
-    )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_prompts,
-    )
-
-    if random_sample:
-        # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
-
-        # Download sharegpt if necessary
-        if not is_file_valid_json(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
-
-        # Load the dataset.
-        with open(dataset_path) as f:
-            dataset = json.load(f)
-        # Filter out the conversations with less than 2 turns.
-        dataset = [
-            data
-            for data in dataset
-            if len(data.get("conversations", data.get("conversation", []))) >= 2
-        ]
-        # Only keep the first two turns of each conversation.
-        dataset = [
-            (
-                data.get("conversations", data.get("conversation", []))[0]["value"],
-                data.get("conversations", data.get("conversation", []))[1]["value"],
-            )
-            for data in dataset
-        ]
-        # Shuffle the dataset.
-        random.shuffle(dataset)
-
-        # Filter out sequences that are too long or too short
-        input_requests: List[DatasetRow] = []
-        for data in dataset:
-            i = len(input_requests)
-            if i == num_prompts:
-                break
-
-            # Tokenize the prompts and completions.
-            prompt = data[0]
-            prompt_token_ids = tokenizer.encode(prompt)
-            prompt_len = len(prompt_token_ids)
-
-            # Skip empty prompt
-            if prompt_len == 0:
-                continue
-
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
-                )
-            )
-    else:
-        # Sample token ids from random integers. This can cause some NaN issues.
-        offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-        input_requests = []
-        for i in range(num_prompts):
-            input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
-            ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
-                )
-            )
-
-    print(f"#Input tokens: {np.sum(input_lens)}")
-    print(f"#Output tokens: {np.sum(output_lens)}")
-    return input_requests
-
-
-def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
-    """Parse image resolution into (width, height).
-
-    Supports presets '1080p', '720p', '360p' and custom 'heightxwidth' format
-    (e.g., '1080x1920' means height=1080, width=1920).
-    """
-    resolution_to_size = {
-        "4k": (3840, 2160),
-        "1080p": (1920, 1080),
-        "720p": (1280, 720),
-        "360p": (640, 360),
-    }
-    if image_resolution in resolution_to_size:
-        return resolution_to_size[image_resolution]
-
-    res = image_resolution.strip().lower()
-    if "x" in res:
-        parts = res.split("x")
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            height = int(parts[0])
-            width = int(parts[1])
-            if height > 0 and width > 0:
-                return (width, height)
-
-    raise ValueError(
-        f"Unsupported image resolution: {image_resolution}. "
-        "Choose from 4k, 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
-    )
-
-
-def create_mm_data_row(
-    text_prompt, images: list, images_base64, output_len, processor, backend
-):
-    try:
-        if type(processor).__name__ == "Phi4MMProcessor":
-            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
-            content_items = text_prompt.replace("image 1", "|endoftext10|")
-        else:
-            content_items = [
-                {"type": "image", "image": {"url": image_base64}}
-                for image_base64 in images_base64
-            ]
-            content_items.append({"type": "text", "text": text_prompt})
-        prompt_str = processor.apply_chat_template(
-            [{"role": "user", "content": content_items}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-    except Exception as e:
-        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-        print(f"Error applying chat template: {e}, fallback to <image> tag")
-        # Some tokenizers do not support list content; fall back to a placeholder in the text
-        prompt_str = f"<image>{text_prompt}"
-
-    # Calculate total tokens (text + vision)
-    prompt_len = processor(
-        text=[prompt_str],
-        images=images,
-        padding=False,
-        return_tensors="pt",
-    )["input_ids"].numel()
-
-    # Calculate text-only tokens
-    try:
-        # Create text-only version of the prompt
-        text_only_prompt = processor.apply_chat_template(
-            [{"role": "user", "content": text_prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        text_prompt_len = processor(
-            text=[text_only_prompt],
-            padding=False,
-            return_tensors="pt",
-        )["input_ids"].numel()
-    except Exception:
-        # Fallback: just tokenize the text prompt directly
-        tokenizer_to_use = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        text_prompt_len = len(tokenizer_to_use.encode(text_prompt))
-
-    # Vision tokens = total tokens - text tokens
-    vision_prompt_len = prompt_len - text_prompt_len
-
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
-    return DatasetRow(
-        prompt=text_prompt if use_raw_prompt else prompt_str,
-        prompt_len=prompt_len,
-        output_len=output_len,
-        text_prompt_len=text_prompt_len,
-        vision_prompt_len=vision_prompt_len,
-        image_data=images_base64,
-    )
-
-
-def sample_image_requests(
-    num_requests: int,
-    image_count: int,
-    input_len: int,
-    output_len: int,
-    range_ratio: float,
-    processor: AutoProcessor,
-    image_content: str,
-    image_format: str,
-    image_resolution: str,
-    backend: str,
-) -> List[DatasetRow]:
-    """Generate requests with images.
-
-    - Each request includes ``image_count`` images.
-    - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
-      or custom 'heightxwidth' (e.g., 1080x1920).
-    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
-      only counts text tokens and excludes image data.
-    """
-
-    # Parse resolution (supports presets and 'heightxwidth')
-    width, height = parse_image_resolution(image_resolution)
-
-    # Check for potentially problematic combinations and warn user
-    if width * height >= 1920 * 1080 and image_count * num_requests >= 100:
-        warnings.warn(
-            f"High resolution ({width}x{height}) with {image_count * num_requests} total images "
-            f"may take a long time. Consider reducing resolution or image count.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    # Sample text lengths
-    input_lens = compute_random_lens(
-        full_len=input_len,
-        range_ratio=range_ratio,
-        num=num_requests,
-    )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_requests,
-    )
-
-    def _gen_random_image_data_uri(
-        width: int = width, height: int = height
-    ) -> (Image, str, int):
-        if image_content == "blank":
-            # Generate blank white image
-            arr = np.full((height, width, 3), 255, dtype=np.uint8)
-        else:
-            # Generate random colored image
-            arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
-        img = Image.fromarray(arr)
-        buf = io.BytesIO()
-        img.save(buf, format=image_format, quality=85)
-        encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
-        image_data = f"data:image/{image_format};base64,{encoded}"
-        image_bytes = len(image_data.encode("utf-8"))
-        return img, image_data, image_bytes
-
-    dataset: List[DatasetRow] = []
-    total_image_bytes = 0
-    for i in range(num_requests):
-        # Generate text prompt
-        text_prompt = gen_mm_prompt(
-            processor.tokenizer,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            int(input_lens[i]),
-        )
-
-        # Generate image list
-        images, images_base64, images_bytes = zip(
-            *[_gen_random_image_data_uri() for _ in range(image_count)]
-        )
-        total_image_bytes += sum(list(images_bytes))
-
-        data_row = create_mm_data_row(
-            text_prompt,
-            list(images),
-            list(images_base64),
-            int(output_lens[i]),
-            processor,
-            backend,
-        )
-
-        dataset.append(data_row)
-
-    print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
-    print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
-    print(
-        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
-    )
-    return dataset
-
-
-@lru_cache(maxsize=1)
-def get_available_tokens(tokenizer):
-    """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
-
-
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = get_available_tokens(tokenizer)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def gen_mm_prompt(tokenizer, image_pad_id, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def get_gen_prefix_cache_path(args, tokenizer):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
-
-    # Create a unique cache filename based on the generation parameters
-    cache_key = (
-        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
-    )
-    return cache_dir / cache_key
-
-
-def sample_generated_shared_prefix_requests(
-    num_groups: int,
-    prompts_per_group: int,
-    system_prompt_len: int,
-    question_len: int,
-    output_len: int,
-    range_ratio: float,
-    tokenizer: PreTrainedTokenizerBase,
-    args: argparse.Namespace,
-) -> List[DatasetRow]:
-    """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
-
-    # Try to load from cache first
-    if cache_path.exists() and range_ratio == 1:
-        print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    print(
-        f"\nGenerating new input data... "
-        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=})"
-    )
-
-    system_prompt_lens = compute_random_lens(
-        full_len=system_prompt_len,
-        range_ratio=range_ratio,
-        num=num_groups,
-    )
-    question_lens = compute_random_lens(
-        full_len=question_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
-    )
-    output_lens = compute_random_lens(
-        full_len=output_len,
-        range_ratio=range_ratio,
-        num=num_groups * prompts_per_group,
-    )
-    del system_prompt_len, question_len, output_len
-
-    # Generate system prompts for each group
-    system_prompts = []
-    for i in range(num_groups):
-        system_prompt = gen_prompt(tokenizer, system_prompt_lens[i].item())
-        system_prompts.append(system_prompt)
-
-    # Generate questions
-    questions = []
-    for i in range(num_groups * prompts_per_group):
-        question = gen_prompt(tokenizer, question_lens[i].item())
-        questions.append(question)
-
-    # Combine system prompts with questions
-    input_requests = []
-    total_input_tokens = 0
-    total_output_tokens = 0
-
-    for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
-        system_prompt = system_prompts[group_idx]
-        for prompt_idx in tqdm(
-            range(prompts_per_group), desc="Generating questions", leave=False
-        ):
-            flat_index = group_idx * prompts_per_group + prompt_idx
-            question = questions[flat_index]
-            full_prompt = f"{system_prompt}\n\n{question}"
-            prompt_len = len(tokenizer.encode(full_prompt))
-
-            input_requests.append(
-                DatasetRow(
-                    prompt=full_prompt,
-                    prompt_len=prompt_len,
-                    output_len=output_lens[flat_index].item(),
-                )
-            )
-            total_input_tokens += prompt_len
-            total_output_tokens += output_lens[flat_index].item()
-
-    # Shuffle questions
-    random.shuffle(input_requests)
-
-    # Print statistics
-    print(f"\nGenerated shared prefix dataset statistics:")
-    print(f"Number of groups: {num_groups}")
-    print(f"Prompts per group: {prompts_per_group}")
-    print(f"Total prompts: {len(input_requests)}")
-    print(f"Total input tokens: {total_input_tokens}")
-    print(f"Total output tokens: {total_output_tokens}")
-    print(
-        f"Average system prompt length: {sum(len(tokenizer.encode(sp)) for sp in system_prompts) / len(system_prompts):.1f} tokens"
-    )
-    print(
-        f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
-    )
-
-    # Save to cache
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Caching generated input data to {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(input_requests, f)
-
-    return input_requests
 
 
 async def get_request(
@@ -1740,7 +861,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[DatasetRow],
+    input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -1774,9 +895,10 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += input_requests[i].prompt_len
-            total_input_text += input_requests[i].text_prompt_len
-            total_input_vision += input_requests[i].vision_prompt_len
+            if input_requests is not None:
+                total_input += input_requests[i].prompt_len
+                total_input_text += input_requests[i].text_prompt_len
+                total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1903,6 +1025,7 @@ def calculate_metrics(
         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
+        p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
@@ -1910,6 +1033,42 @@ def calculate_metrics(
     )
 
     return metrics, output_lens
+
+
+MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
+
+
+def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+    assert (
+        backend in MULTI_TURN_BACKENDS
+    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+
+    async def f(
+        request_func_input: RequestFuncInput,
+        pbar: Optional[tqdm] = None,
+    ) -> List[RequestFuncOutput]:
+        prompts: List[str] = request_func_input.prompt
+        prev_messages: List[Dict[str, str]] = []
+        outputs = []
+
+        for round_index in range(len(prompts)):
+            prev_messages.append({"role": "user", "content": prompts[round_index]})
+
+            inner_input = replace(
+                copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
+            )
+            output = await request_func(
+                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
+            )
+            outputs.append(output)
+
+            prev_messages.append(
+                {"role": "assistant", "content": output.generated_text}
+            )
+
+        return outputs
+
+    return f
 
 
 async def benchmark(
@@ -1940,6 +1099,18 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
+    # Multi-turn format: ["turn1", "turn2", ...] - list of strings
+    # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
+    first_prompt = input_requests[0].prompt
+    is_multi_turn = (
+        isinstance(first_prompt, list)
+        and len(first_prompt) > 0
+        and isinstance(first_prompt[0], str)
+    )
+    if is_multi_turn:
+        request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2006,6 +1177,8 @@ async def benchmark(
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    if is_multi_turn:
+        warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
     if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
@@ -2092,6 +1265,10 @@ async def benchmark(
         else:
             lora_name = None
 
+        # Merge global extra_request_body with per-request extras
+        # Per-request parameters take precedence over global ones
+        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=request.prompt,
@@ -2100,8 +1277,9 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
-            extra_request_body=extra_request_body,
+            extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
+            routing_key=request.routing_key,
         )
 
         tasks.append(
@@ -2110,6 +1288,8 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    if is_multi_turn:
+        outputs = [x for output in outputs for x in output]
 
     # Stop profiler
     if profile:
@@ -2153,7 +1333,7 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=input_requests,
+        input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -2179,9 +1359,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
-    print(
-        "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
-    )
+    if args.dataset_name in ["image", "mmmu"]:
+        print(
+            "{:<40} {:<10}".format(
+                "Total input vision tokens:", metrics.total_input_vision
+            )
+        )
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10}".format(
@@ -2229,6 +1412,12 @@ async def benchmark(
         "{:<40} {:<10.2f}".format(
             "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
         )
+    )
+    print(
+        "{:<40} {:<10.2f}".format("P90 E2E Latency (ms):", metrics.p90_e2e_latency_ms)
+    )
+    print(
+        "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
     )
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
@@ -2284,6 +1473,7 @@ async def benchmark(
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
+            "p90_e2e_latency_ms": metrics.p90_e2e_latency_ms,
             "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
@@ -2568,17 +1758,6 @@ def run_benchmark(args_: argparse.Namespace):
     )
 
 
-def set_ulimit(target_soft_limit=65535):
-    resource_type = resource.RLIMIT_NOFILE
-    current_soft, current_hard = resource.getrlimit(resource_type)
-
-    if current_soft < target_soft_limit:
-        try:
-            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
-        except ValueError as e:
-            print(f"Fail to set RLIMIT_NOFILE: {e}")
-
-
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, [])
@@ -2615,6 +1794,8 @@ if __name__ == "__main__":
         default="sharegpt",
         choices=[
             "sharegpt",
+            "custom",
+            "openai",
             "random",
             "random-ids",
             "generated-shared-prefix",
@@ -2696,6 +1877,11 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--random-image-count",
+        action="store_true",
+        help="Enable Random Image Count",
+    )
+    parser.add_argument(
         "--image-format",
         type=str,
         default="jpeg",
@@ -2756,6 +1942,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Return logprob.",
     )
+    parser.add_argument(
+        "--return-routed-experts",
+        action="store_true",
+        help="Return routed experts.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--disable-ignore-eos",
@@ -2796,6 +1987,18 @@ if __name__ == "__main__":
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)
     parser.add_argument("--profile-stages", nargs="+", default=None)
+    parser.add_argument(
+        "--profile-output-dir",
+        type=str,
+        default=None,
+        help="Output directory for profile traces.",
+    )
+    parser.add_argument(
+        "--profile-prefix",
+        type=str,
+        default=None,
+        help="Prefix for profile trace filenames.",
+    )
     parser.add_argument(
         "--lora-name",
         type=str,
@@ -2915,6 +2118,27 @@ if __name__ == "__main__":
         default=1.0,
         help="Range of sampled ratio of input/output length, used only for gsp dataset.",
     )
+    group.add_argument(
+        "--gsp-fast-prepare",
+        action="store_true",
+        help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
+    )
+    group.add_argument(
+        "--gsp-send-routing-key",
+        action="store_true",
+        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
+    )
+    group.add_argument(
+        "--gsp-num-turns",
+        type=int,
+        default=1,
+        help="Number of turns for multi-turn conversations. If > 1, each prompt becomes a list of questions sharing the same system prefix.",
+    )
+    group.add_argument(
+        "--gsp-ordered",
+        action="store_true",
+        help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",
@@ -2945,6 +2169,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
+    )
+    parser.add_argument(
+        "--header",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
     )
     args = parser.parse_args()
     run_benchmark(args)

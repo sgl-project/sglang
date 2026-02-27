@@ -19,7 +19,11 @@ import regex as re
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -194,6 +198,7 @@ class NemotronHConfig(PretrainedConfig):
         n_shared_experts=1,
         moe_intermediate_size=7688,
         moe_shared_expert_intermediate_size=7688,
+        moe_latent_size=None,
         num_experts_per_tok=2,
         routed_scaling_factor=1.0,
         n_group=1,
@@ -259,6 +264,7 @@ class NemotronHConfig(PretrainedConfig):
         self.n_shared_experts = n_shared_experts
         self.moe_intermediate_size = moe_intermediate_size
         self.moe_shared_expert_intermediate_size = moe_shared_expert_intermediate_size
+        self.moe_latent_size = moe_latent_size
         self.num_experts_per_tok = num_experts_per_tok
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
@@ -303,4 +309,6 @@ class NemotronHConfig(PretrainedConfig):
             conv_kernel=self.conv_kernel,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.mamba_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
+        )

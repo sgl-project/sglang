@@ -1,8 +1,14 @@
 //! Unified gRPC client wrapper for SGLang and vLLM backends
 
+use std::sync::Arc;
+
+use smg_grpc_client::{SglangSchedulerClient, VllmEngineClient};
+
 use crate::{
-    grpc_client::{SglangSchedulerClient, VllmEngineClient},
-    routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoStream},
+    observability::otel_trace::OtelTraceInjector,
+    routers::grpc::proto_wrapper::{
+        ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
+    },
 };
 
 /// Health check response (common across backends)
@@ -67,9 +73,14 @@ impl GrpcClient {
         url: &str,
         runtime_type: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let trace_injector = Arc::new(OtelTraceInjector);
         match runtime_type {
-            "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
-            "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
+            "sglang" => Ok(Self::Sglang(
+                SglangSchedulerClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
+            "vllm" => Ok(Self::Vllm(
+                VllmEngineClient::connect_with_trace_injector(url, trace_injector).await?,
+            )),
             _ => Err(format!("Unknown runtime type: {}", runtime_type).into()),
         }
     }
@@ -103,7 +114,7 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => {
                 let info = client.get_model_info().await?;
-                Ok(ModelInfo::Sglang(info))
+                Ok(ModelInfo::Sglang(Box::new(info)))
             }
             Self::Vllm(client) => {
                 let info = client.get_model_info().await?;
@@ -131,12 +142,26 @@ impl GrpcClient {
             _ => panic!("Mismatched client and request types"),
         }
     }
+
+    /// Submit an embedding request
+    pub async fn embed(
+        &mut self,
+        req: ProtoEmbedRequest,
+    ) -> Result<ProtoEmbedResponse, Box<dyn std::error::Error + Send + Sync>> {
+        match (self, req) {
+            (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
+                let resp = client.embed(*boxed_req).await?;
+                Ok(ProtoEmbedResponse::Sglang(resp))
+            }
+            _ => panic!("Mismatched client and request types or unsupported embedding backend"),
+        }
+    }
 }
 
 /// Unified ModelInfo wrapper
 pub enum ModelInfo {
-    Sglang(crate::grpc_client::sglang_proto::GetModelInfoResponse),
-    Vllm(crate::grpc_client::vllm_proto::GetModelInfoResponse),
+    Sglang(Box<smg_grpc_client::sglang_proto::GetModelInfoResponse>),
+    Vllm(smg_grpc_client::vllm_proto::GetModelInfoResponse),
 }
 
 impl ModelInfo {

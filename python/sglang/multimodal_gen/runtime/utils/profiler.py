@@ -1,8 +1,19 @@
+import gzip
 import os
 
 import torch
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+
+if current_platform.is_npu():
+    import torch_npu
+
+    patches = [
+        ["profiler.profile", torch_npu.profiler.profile],
+        ["profiler.schedule", torch_npu.profiler.schedule],
+    ]
+    torch_npu._apply_patches(patches)
 
 logger = init_logger(__name__)
 
@@ -26,12 +37,17 @@ class SGLDiffusionProfiler:
         full_profile: bool = False,
         num_steps: int | None = None,
         num_inference_steps: int | None = None,
-        log_dir: str = "./logs",
+        log_dir: str | None = None,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
-        self.log_dir = log_dir
+
+        self.log_dir = (
+            log_dir
+            if log_dir is not None
+            else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        )
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -41,12 +57,18 @@ class SGLDiffusionProfiler:
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if current_platform.is_npu():
+            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=None,
+            on_trace_ready=(
+                None
+                if not current_platform.is_npu()
+                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+            ),
         )
         if self.full_profile:
             # profile all stages
@@ -107,16 +129,20 @@ class SGLDiffusionProfiler:
         logger.info("Stopping Profiler...")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if current_platform.is_npu():
+            torch.npu.synchronize()
+            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
         self.profiler.stop()
 
         if export_trace:
-            self._export_trace(dump_rank)
+            if dump_rank is not None and dump_rank != self.rank:
+                pass
+            else:
+                self._export_trace()
 
         SGLDiffusionProfiler._instance = None
 
-    def _export_trace(self, dump_rank: int | None = None):
-        if dump_rank is None:
-            dump_rank = self.rank
+    def _export_trace(self):
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -124,10 +150,30 @@ class SGLDiffusionProfiler:
             trace_path = os.path.abspath(
                 os.path.join(
                     self.log_dir,
-                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
+                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
                 )
             )
-            logger.info(f"Saving profiler traces to: {trace_path}")
             self.profiler.export_chrome_trace(trace_path)
+
+            if self._check_trace_integrity(trace_path):
+                logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
+            else:
+                logger.warning(f"Trace file may be corrupted: {trace_path}")
         except Exception as e:
-            logger.error(f"Failed to export trace: {e}")
+            logger.error(f"Failed to save trace: {e}")
+
+    def _check_trace_integrity(self, trace_path: str) -> bool:
+        try:
+            if not os.path.exists(trace_path) or os.path.getsize(trace_path) == 0:
+                return False
+
+            with gzip.open(trace_path, "rb") as f:
+                content = f.read()
+                if content.count(b"\x1f\x8b") > 1:
+                    logger.warning("Multiple gzip headers detected")
+                    return False
+
+            return True
+        except Exception as e:
+            logger.warning(f"Trace file integrity check failed: {e}")
+            return False

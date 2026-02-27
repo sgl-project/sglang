@@ -4,14 +4,15 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
-IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip
+IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or _is_musa
 IS_QUICK_AR_AVAILABLE = _is_hip
 # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
 IS_MSCCLPP_AR_AVAILABLE = _is_cuda
@@ -30,7 +31,7 @@ except ImportError as e:
 if not IS_CUSTOM_AR_AVAILABLE:
     pass
 
-elif _is_cuda:
+elif _is_cuda or _is_musa:
     # CUDA custom allreduce
 
     def init_custom_ar(
@@ -89,6 +90,16 @@ elif _is_hip:
         fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
     ) -> None:
         _custom_ar.all_reduce_unreg(fa, inp, reg_buffer, out)
+
+    def deterministic_all_reduce_reg(
+        fa: int, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        _custom_ar.deterministic_all_reduce_reg(fa, inp, out)
+
+    def deterministic_all_reduce_unreg(
+        fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        _custom_ar.deterministic_all_reduce_unreg(fa, inp, reg_buffer, out)
 
     def dispose(fa: int) -> None:
         _custom_ar.dispose(fa)

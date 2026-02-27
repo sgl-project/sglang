@@ -105,6 +105,7 @@ class SGLangCIAnalyzer:
                 "stage-a-test-1",
                 "unit-test-backend-1-gpu",
                 "unit-test-backend-2-gpu",
+                "stage-b-test-4-gpu-b200",
                 "unit-test-backend-4-gpu",
                 "unit-test-backend-8-gpu",
             ],
@@ -134,6 +135,7 @@ class SGLangCIAnalyzer:
                 "nightly-test-general-4-gpu-h100",
                 "nightly-test-general-8-gpu-h200",
                 "nightly-test-general-8-gpu-h20",
+                "nightly-test-general-8-gpu-b200",
                 "nightly-test-text-accuracy-2-gpu-runner",
                 "nightly-test-text-perf-2-gpu-runner",
                 "nightly-test-vlm-accuracy-2-gpu-runner",
@@ -212,6 +214,7 @@ class SGLangCIAnalyzer:
                     "stage-a-test-1",
                     "unit-test-backend-1-gpu",
                     "unit-test-backend-2-gpu",
+                    "stage-b-test-4-gpu-b200",
                     "unit-test-backend-4-gpu",
                     "unit-test-backend-8-gpu-h200",
                     "unit-test-backend-8-gpu-h20",
@@ -232,6 +235,7 @@ class SGLangCIAnalyzer:
                     "nightly-test-general-4-gpu-h100",
                     "nightly-test-general-8-gpu-h200",
                     "nightly-test-general-8-gpu-h20",
+                    "nightly-test-general-8-gpu-b200",
                     "nightly-test-text-accuracy-2-gpu-runner",
                     "nightly-test-text-perf-2-gpu-runner",
                     "nightly-test-vlm-accuracy-2-gpu-runner",
@@ -614,7 +618,9 @@ class SGLangCIAnalyzer:
                                         if change_pct < -10:
                                             trend_indicator = f"📈 {change_pct:.1f}%"
                                         elif change_pct > 10:
-                                            trend_indicator = f"⚠️ 📉 +{change_pct:.1f}%"
+                                            trend_indicator = (
+                                                f"⚠️ 📉 +{change_pct:.1f}%"
+                                            )
                                         else:
                                             trend_indicator = f"➡️ {change_pct:+.1f}%"
                                     else:
@@ -728,6 +734,7 @@ class SGLangCIAnalyzer:
             "nightly-test-general-4-gpu-h100",
             "nightly-test-general-8-gpu-h200",
             "nightly-test-general-8-gpu-h20",
+            "nightly-test-general-8-gpu-b200",
             "nightly-test-text-accuracy-2-gpu-runner",
             "nightly-test-text-perf-2-gpu-runner",
             "nightly-test-vlm-accuracy-2-gpu-runner",

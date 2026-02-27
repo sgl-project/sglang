@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.disaggregation.utils import prepare_abort
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -120,25 +118,28 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
+                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
+                    # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
+                    # handles the release via check_finished -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    release_kv_cache(req, self.tree_cache)
-                    prepare_abort(
-                        req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    req.to_finish = FINISH_ABORT(
+                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
-
-            b = len(self.reqs)
-            topk = server_args.speculative_eagle_topk
+            num_states = server_args.speculative_eagle_topk
+            if server_args.enable_multi_layer_eagle:
+                num_states *= server_args.speculative_num_steps
             topk_p = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_p[:topk],
+                        req.output_topk_p[:num_states],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -149,7 +150,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             topk_index = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_index[:topk],
+                        req.output_topk_index[:num_states],
                         device=self.device,
                         dtype=torch.int64,
                     )

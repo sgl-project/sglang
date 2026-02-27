@@ -15,7 +15,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, numa_utils, prepare_model_and_tokenizer
+from sglang.srt.utils import configure_logger, numa_utils
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -77,11 +77,6 @@ def launch_scheduler_process_only(
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
-    # Prepare model and tokenizer paths
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
-
     scheduler_procs = []
 
     if server_args.dp_size == 1:
@@ -117,8 +112,26 @@ def launch_scheduler_process_only(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
 
-                # Calculate MoE expert parallel rank
-                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                # Calculate parallelism ranks (matching engine.py logic)
+                attn_dp_size = (
+                    server_args.dp_size if server_args.enable_dp_attention else 1
+                )
+                attn_tp_size = (
+                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                )
+                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
+                )
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // server_args.moe_dp_size)
+                    // (
+                        server_args.tp_size
+                        // server_args.moe_dp_size
+                        // server_args.ep_size
+                    )
+                )
 
                 # Create scheduler process
                 proc = mp.Process(
@@ -128,6 +141,8 @@ def launch_scheduler_process_only(
                         port_args,
                         gpu_id,
                         tp_rank,
+                        attn_cp_rank,
+                        moe_dp_rank,
                         moe_ep_rank,
                         pp_rank,
                         None,  # dp_rank

@@ -110,6 +110,11 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
 
+        self.allow_bidirectional_attention_in_extend = (
+            model_runner.server_args.disable_cuda_graph
+            and (model_runner.server_args.chunked_prefill_size == -1)
+        )
+
         # Decide whether enable deterministic inference with batch-invariant operations
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
@@ -389,17 +394,20 @@ class TritonAttnBackend(AttentionBackend):
             )
             # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_kv_indptr, window_kv_indices, _, _ = (
-                    update_sliding_window_buffer(
-                        self.window_kv_indptr,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        forward_batch.extend_prefix_lens,
-                        forward_batch.req_pool_indices,
-                        bs,
-                        self.device,
-                        self.token_to_kv_pool_allocator,
-                    )
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool_allocator,
                 )
 
             qo_indptr = self.qo_indptr
@@ -602,7 +610,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             num_tokens_per_bs = self.speculative_num_steps + 1
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -749,7 +757,7 @@ class TritonAttnBackend(AttentionBackend):
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -812,7 +820,14 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+        if (
+            layer.is_cross_attention
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+            or (
+                layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+                and self.allow_bidirectional_attention_in_extend
+            )
+        ):
             causal = False
 
         # Deterministic mode: use unified 1-stage kernel

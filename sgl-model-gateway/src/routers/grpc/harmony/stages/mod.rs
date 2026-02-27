@@ -5,10 +5,10 @@
 //! - HarmonyRequestBuildingStage: Token-based request building
 //! - HarmonyResponseProcessingStage: Harmony channel parsing
 
-pub mod preparation;
-pub mod request_building;
-pub mod response_processing;
+pub(crate) mod preparation;
+pub(crate) mod request_building;
+pub(crate) mod response_processing;
 
-pub use preparation::HarmonyPreparationStage;
-pub use request_building::HarmonyRequestBuildingStage;
-pub use response_processing::HarmonyResponseProcessingStage;
+pub(crate) use preparation::HarmonyPreparationStage;
+pub(crate) use request_building::HarmonyRequestBuildingStage;
+pub(crate) use response_processing::HarmonyResponseProcessingStage;

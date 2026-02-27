@@ -5,8 +5,9 @@
 
 use axum::response::Response;
 
-use crate::routers::grpc::{
-    context::ExecutionResult, error, proto_wrapper::ProtoGenerateComplete, utils,
+use crate::routers::{
+    error,
+    grpc::{context::ExecutionResult, proto_wrapper::ProtoGenerateComplete, utils},
 };
 
 /// Collect and merge responses from execution result
@@ -20,7 +21,7 @@ use crate::routers::grpc::{
 ///
 /// # Returns
 /// Vector of GenerateComplete responses, one per index (n parameter)
-pub async fn collect_responses(
+pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
@@ -54,10 +55,20 @@ pub async fn collect_responses(
 
             decode_responses
         }
+        ExecutionResult::Embedding { .. } => {
+            // Embeddings do not support this path (no generate complete response)
+            return Err(error::internal_error(
+                "invalid_execution_mode",
+                "Embedding result encountered in response collection",
+            ));
+        }
     };
 
     if all_responses.is_empty() {
-        return Err(error::internal_error("No responses from server"));
+        return Err(error::internal_error(
+            "no_responses_from_server",
+            "No responses from server",
+        ));
     }
 
     Ok(all_responses)

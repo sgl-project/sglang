@@ -161,6 +161,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
             is_previous_layer_sparse=False,
+            is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -212,7 +213,7 @@ class LongcatFlashModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 

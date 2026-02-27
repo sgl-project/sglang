@@ -1,6 +1,6 @@
 # AMD GPUs
 
-This document describes how run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how to run SGLang on AMD GPUs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## System Configuration
 
@@ -44,7 +44,7 @@ You can install SGLang using one of the methods below.
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.6.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -52,7 +52,7 @@ pip install --upgrade pip
 cd sgl-kernel
 python setup_rocm.py install
 
-# Install sglang python package
+# Install sglang python package along with diffusion support
 cd ..
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_hip]"

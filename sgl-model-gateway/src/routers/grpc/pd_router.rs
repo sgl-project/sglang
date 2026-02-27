@@ -7,7 +7,12 @@ use tracing::debug;
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
     app_context::AppContext,
-    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, ConnectionMode, RetryExecutor, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
+    },
+    observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::RouterTrait,
 };
@@ -18,6 +23,7 @@ pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
+    retry_config: RetryConfig,
 }
 
 impl GrpcPDRouter {
@@ -27,12 +33,9 @@ impl GrpcPDRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Extract necessary components from context
-        let tokenizer = ctx
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| "gRPC PD router requires tokenizer".to_string())?
-            .clone();
+        // Get tokenizer registry (no longer requires pre-loaded tokenizer)
+        let tokenizer_registry = ctx.tokenizer_registry.clone();
+
         let reasoning_parser_factory = ctx
             .reasoning_parser_factory
             .as_ref()
@@ -46,7 +49,7 @@ impl GrpcPDRouter {
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
-            tokenizer: tokenizer.clone(),
+            tokenizer_registry: tokenizer_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
@@ -55,7 +58,6 @@ impl GrpcPDRouter {
         let pipeline = RequestPipeline::new_pd(
             worker_registry.clone(),
             policy_registry.clone(),
-            tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -66,6 +68,7 @@ impl GrpcPDRouter {
             worker_registry,
             pipeline,
             shared_components,
+            retry_config: ctx.router_config.effective_retry_config(),
         })
     }
 
@@ -77,19 +80,54 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing generate request for model: {:?} (PD mode)",
-            model_id
+            "Processing generate request for model: {} (PD mode)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
-        self.pipeline
-            .execute_generate(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+        let pipeline = &self.pipeline;
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_generate(request, headers, model_id, components)
+                        .await
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_GENERATE,
+                );
+            },
+        )
+        .await
     }
 
     /// Main route_chat implementation with PD dual dispatch
@@ -100,19 +138,54 @@ impl GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         debug!(
-            "Processing chat completion request for model: {:?} (PD mode)",
-            model_id
+            "Processing chat completion request for model: {} (PD mode)",
+            model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
-        self.pipeline
-            .execute_chat(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-            )
-            .await
+        // Clone values needed for retry closure
+        let request = Arc::new(body.clone());
+        let headers_cloned = headers.cloned();
+        let model_id_cloned = model_id.map(|s| s.to_string());
+        let components = self.shared_components.clone();
+        let pipeline = &self.pipeline;
+
+        RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_attempt| {
+                let request = Arc::clone(&request);
+                let headers = headers_cloned.clone();
+                let model_id = model_id_cloned.clone();
+                let components = Arc::clone(&components);
+                async move {
+                    pipeline
+                        .execute_chat(request, headers, model_id, components)
+                        .await
+                }
+            },
+            |res, _attempt| is_retryable_status(res.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retry(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+                Metrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::ENDPOINT_CHAT,
+                );
+            },
+        )
+        .await
     }
 }
 

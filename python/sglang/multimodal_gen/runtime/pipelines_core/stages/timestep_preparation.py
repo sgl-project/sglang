@@ -10,6 +10,8 @@ This module contains implementations of timestep preparation stages for diffusio
 import inspect
 from typing import Any, Callable, Tuple
 
+import torch
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -43,8 +45,11 @@ class TimestepPreparationStage(PipelineStage):
             Callable[[Req, ServerArgs], Tuple[str, Any]]
         ] = [],
     ) -> None:
+        super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = prepare_extra_set_timesteps_kwargs
+        self.prepare_extra_set_timesteps_kwargs = (
+            prepare_extra_set_timesteps_kwargs or []
+        )
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -58,9 +63,7 @@ class TimestepPreparationStage(PipelineStage):
         """
         Prepare timesteps for the diffusion process.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with prepared timesteps.
@@ -73,6 +76,7 @@ class TimestepPreparationStage(PipelineStage):
         n_tokens = batch.n_tokens
 
         sigmas = server_args.pipeline_config.prepare_sigmas(sigmas, num_inference_steps)
+        batch.sigmas = sigmas
 
         # Prepare extra kwargs for set_timesteps
         extra_set_timesteps_kwargs = {}
@@ -86,6 +90,8 @@ class TimestepPreparationStage(PipelineStage):
             key, value = callee(batch, server_args)
             assert isinstance(key, str)
             extra_set_timesteps_kwargs[key] = value
+            if key == "mu":
+                batch.extra["mu"] = value
 
         # Handle custom timesteps or sigmas
         if timesteps is not None and sigmas is not None:
@@ -127,7 +133,8 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
-        self.log_debug(f"timesteps: {timesteps}")
+        if not batch.is_warmup:
+            self.log_debug("timesteps: %s", timesteps)
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -143,6 +150,17 @@ class TimestepPreparationStage(PipelineStage):
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify timestep preparation stage outputs."""
+        if (
+            batch.is_warmup
+            and isinstance(batch.timesteps, torch.Tensor)
+            and torch.isnan(batch.timesteps).any()
+        ):
+            # when num-inference-steps == 1, the last sigma being 1, the 1 / last_sigma could be nan
+            # this a workaround for warmup req only
+            batch.timesteps = torch.ones(
+                (1,), dtype=torch.float32, device=get_local_torch_device()
+            )
+
         result = VerificationResult()
         result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)])
         return result

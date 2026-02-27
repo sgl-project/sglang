@@ -18,6 +18,24 @@ class HunyuanSamplingParams(SamplingParams):
 
     guidance_scale: float = 1.0
 
+    # HunyuanVideo supported resolutions
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            # 540p resolutions
+            (960, 544),  # 9:16
+            (544, 960),  # 16:9
+            (832, 624),  # 4:3
+            (624, 832),  # 3:4
+            (720, 720),  # 1:1
+            # 720p resolutions (recommended)
+            (1280, 720),  # 9:16
+            (720, 1280),  # 16:9
+            (832, 1104),  # 4:3
+            (1104, 832),  # 3:4
+            (960, 960),  # 1:1
+        ]
+    )
+
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.15,

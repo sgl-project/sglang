@@ -60,7 +60,7 @@ RUN --mount=type=secret,id=github_token \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . && \
     pip install xgrammar --no-deps && \
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops --root-user-action=ignore && \
+    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc
