@@ -605,7 +605,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             # Add the pipeline name for downstream use
             config["pipeline_name"] = config["_class_name"]
 
-            logger.info(
+            logger.debug(
                 "Downloaded model_index.json for %s, pipeline: %s",
                 model_name_or_path,
                 config["_class_name"],
@@ -893,7 +893,6 @@ def snapshot_download(
             "allow_patterns": allow_patterns,
             "local_files_only": local_files_only,
             "max_workers": max_workers,
-            "resume_download": True,
             "etag_timeout": 60,
         }
         hf_kwargs.update(kwargs)

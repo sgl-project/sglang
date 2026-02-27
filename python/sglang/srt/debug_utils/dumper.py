@@ -223,7 +223,24 @@ class _Dumper:
         self._state.step += 1
         print(f"[Dumper] [{time.time()}] step={self._state.step}")
 
-    def dump(self, name: str, value, save: bool = True, **kwargs) -> None:
+    def dump(
+        self,
+        name: str,
+        value,
+        save: bool = True,
+        dims: Optional[str] = None,
+        dims_grad: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        value_meta: dict = {}
+        grad_meta: dict = {}
+        if dims is not None:
+            value_meta["dims"] = dims
+            grad_meta["dims"] = dims
+        if dims_grad is not None:
+            value_meta["dims_grad"] = dims_grad
+            grad_meta["dims"] = dims_grad
+
         self._dump_inner(
             name=name,
             value=value,
@@ -234,6 +251,8 @@ class _Dumper:
             enable_future_grad=self._config.enable_grad,
             value_tag="Dumper.Value",
             grad_tag="Dumper.Grad",
+            value_meta_only_fields=value_meta,
+            grad_meta_only_fields=grad_meta,
         )
 
     def dump_model(
@@ -336,6 +355,8 @@ class _Dumper:
         enable_future_grad: bool,
         value_tag: str,
         grad_tag: str,
+        value_meta_only_fields: Optional[dict] = None,
+        grad_meta_only_fields: Optional[dict] = None,
     ) -> None:
         self._http_manager  # noqa: B018
 
@@ -359,6 +380,7 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
+                meta_only_fields=value_meta_only_fields or {},
             )
 
         if (
@@ -371,6 +393,7 @@ class _Dumper:
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
+                meta_only_fields=grad_meta_only_fields or {},
             )
 
         if enable_future_grad:
@@ -379,6 +402,7 @@ class _Dumper:
                 tensor=value,
                 extra_kwargs=extra_kwargs,
                 save=save,
+                meta_only_fields=grad_meta_only_fields or {},
             )
 
     def _register_dump_grad_hook(
@@ -388,6 +412,7 @@ class _Dumper:
         tensor,
         extra_kwargs: dict,
         save: bool,
+        meta_only_fields: Optional[dict] = None,
     ) -> None:
         if not isinstance(tensor, torch.Tensor):
             return
@@ -396,6 +421,7 @@ class _Dumper:
 
         captured_step = self._state.step
         captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
+        captured_meta_only = meta_only_fields or {}
 
         def grad_hook(grad: torch.Tensor) -> None:
             self._dump_single(
@@ -404,6 +430,7 @@ class _Dumper:
                 value=grad,
                 save=save,
                 step=captured_step,
+                meta_only_fields=captured_meta_only,
             )
 
         tensor.register_hook(grad_hook)
@@ -416,6 +443,7 @@ class _Dumper:
         value,
         save: bool,
         step: Optional[int] = None,
+        meta_only_fields: Optional[dict] = None,
     ) -> None:
         self._ensure_exp_name()
         self._state.dump_index += 1
@@ -445,7 +473,11 @@ class _Dumper:
         if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value,
-                "meta": dict(**full_kwargs, **self._static_meta),
+                "meta": dict(
+                    **full_kwargs,
+                    **self._static_meta,
+                    **(meta_only_fields or {}),
+                ),
             }
 
             if capturing:
@@ -818,6 +850,12 @@ def _compute_static_meta():
         if info := plugin.collect_parallel_info():
             result[f"{plugin.name}_parallel_info"] = info
 
+    for plugin in _plugins:
+        tokenizer_path: Optional[str] = plugin.get_tokenizer_path()
+        if tokenizer_path is not None:
+            result["tokenizer_path"] = tokenizer_path
+            break
+
     return result
 
 
@@ -1073,6 +1111,9 @@ class _FrameworkPlugin(ABC):
     def core_fields(self) -> frozenset[str]:
         return frozenset()
 
+    def get_tokenizer_path(self) -> Optional[str]:
+        return None
+
 
 class _SGLangPlugin(_FrameworkPlugin):
     _available = True
@@ -1133,11 +1174,15 @@ class _SGLangPlugin(_FrameworkPlugin):
         if isinstance(value, self.ForwardBatch):
             if skip_forward_batch:
                 return {}
-            return {
+            result = {
                 "input_ids": value.input_ids,
                 "seq_lens": value.seq_lens,
                 "positions": value.positions,
+                "req_pool_indices": value.req_pool_indices,
             }
+            if value.rids is not None:
+                result["rids"] = value.rids
+            return result
         if isinstance(value, self.PPProxyTensors):
             return {k: v for k, v in value.tensors.items()}
 
@@ -1149,7 +1194,24 @@ class _SGLangPlugin(_FrameworkPlugin):
         return None
 
     def core_fields(self) -> frozenset[str]:
-        return frozenset({"input_ids", "positions", "seq_lens"})
+        return frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
+
+    def get_tokenizer_path(self) -> Optional[str]:
+        if not self._available:
+            return None
+
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            args = get_global_server_args()
+            if args is None:
+                return None
+
+            return args.tokenizer_path
+        except Exception:
+            return None
 
 
 class _MegatronPlugin(_FrameworkPlugin):
@@ -1199,6 +1261,18 @@ class _MegatronPlugin(_FrameworkPlugin):
             info["dp_src_rank"] = self._mpu.get_data_parallel_src_rank()
         except (AttributeError, AssertionError):
             info["megatron_error"] = True
+
+        # Megatron sequence parallel reuses the TP group (no dedicated parallel state API).
+        # When sequence_parallel=True, inject sp_rank/sp_size for the comparator unsharder.
+        try:
+            from megatron.training.global_vars import get_args
+
+            args = get_args()
+            if getattr(args, "sequence_parallel", False) and "tp_rank" in info:
+                info["sp_rank"] = info["tp_rank"]
+                info["sp_size"] = info["tp_size"]
+        except (ImportError, AssertionError, AttributeError):
+            pass
 
         return info
 
