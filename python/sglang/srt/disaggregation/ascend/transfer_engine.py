@@ -46,7 +46,10 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.initialize()
 
     def initialize(self) -> None:
-        from sglang.srt.distributed.parallel_state import get_world_size, get_world_group
+        from sglang.srt.distributed.parallel_state import (
+            get_world_size, 
+            get_world_group
+        )
 
         transfer_protocol = self._get_transfer_protocol()
         if transfer_protocol is None or transfer_protocol == "sdma":
@@ -56,8 +59,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             """with device RDMA for PD transfer"""
             tmp_tensor = torch.zeros(1, device="npu")
             output_tensor_list = [
-                torch.empty_like(tmp_tensor)
-                for _ in range(get_world_size())
+                torch.empty_like(tmp_tensor) for _ in range(get_world_size())
             ]
             # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
             torch.distributed.all_gather(

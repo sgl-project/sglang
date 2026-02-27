@@ -54,20 +54,20 @@ class AscendKVManager(MooncakeKVManager):
             )
 
             layers_params = [
-                                (
-                                    src_k_ptrs[layer_id],
-                                    dst_k_ptrs[layer_id],
-                                    self.kv_args.kv_item_lens[layer_id],
-                                )
-                                for layer_id in range(layers_current_pp_stage)
-                            ] + [
-                                (
-                                    src_v_ptrs[layer_id],
-                                    dst_v_ptrs[layer_id],
-                                    self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
-                                )
-                                for layer_id in range(layers_current_pp_stage)
-                            ]
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
         else:
             num_layers = len(self.kv_args.kv_data_ptrs)
             layers_params = [
