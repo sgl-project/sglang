@@ -653,6 +653,7 @@ class TboForwardBatchPreparer:
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
             "lora_ids",
+            "rids",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
