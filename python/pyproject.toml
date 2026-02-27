@@ -111,7 +111,7 @@ diffusion = [
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.2.0",
+  "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
 ]
