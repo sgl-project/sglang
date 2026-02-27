@@ -64,7 +64,7 @@ class BaseKVManager(ABC):
 
     @abstractmethod
     def register_to_bootstrap(self):
-        """Register to the bootstrap server."""
+        """Register prefill server info to the bootstrap server."""
         ...
 
 

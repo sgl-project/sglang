@@ -138,6 +138,22 @@ def _apply_dim_names_from_meta(
     return [apply_dim_names(t, dim_names) for t in tensors]
 
 
+def _apply_dim_names_from_meta(
+    *,
+    tensors: list[torch.Tensor],
+    metas: list[dict[str, Any]],
+) -> list[torch.Tensor]:
+    if not metas:
+        return tensors
+
+    dims_str: Optional[str] = metas[0].get("dims")
+    if dims_str is None:
+        return tensors
+
+    dim_names: list[str] = parse_dim_names(dims_str)
+    return [apply_dim_names(t, dim_names) for t in tensors]
+
+
 def _load_valid_tensors(filenames: list[str], base_path: Path) -> list[ValueWithMeta]:
     return [
         x
