@@ -88,12 +88,12 @@ class _MaybeIntermediateTensors:
 
 def _mark_dynamic_on_value(val, dims):
     if isinstance(val, torch.Tensor):
-        torch._dynamo.mark_dynamic(val, _normalize_dims(dims, val.ndim))
+        torch._dynamo.maybe_mark_dynamic(val, _normalize_dims(dims, val.ndim))
     else:
         mit = _MaybeIntermediateTensors(val)
         if mit.is_intermediate:
             for t in mit.obj.tensors.values():
-                torch._dynamo.mark_dynamic(t, _normalize_dims(dims, t.ndim))
+                torch._dynamo.maybe_mark_dynamic(t, _normalize_dims(dims, t.ndim))
         # else: ignore (None or non-tensor)
 
 

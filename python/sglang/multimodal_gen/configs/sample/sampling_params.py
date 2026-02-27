@@ -97,6 +97,8 @@ class SamplingParams:
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
+    output_quality: str | None = "default"
+    output_compression: int | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -154,7 +156,7 @@ class SamplingParams:
     suppress_logs: bool = False
 
     return_file_paths_only: bool = True
-    enable_sequence_shard: bool = False
+    enable_sequence_shard: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -207,12 +209,25 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
+        # Handle output_quality to output_compression conversion
+        if self.output_compression is None and self.output_quality is not None:
+            self.output_compression = self._adjust_output_quality(
+                self.output_quality, self.data_type
+            )
+
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
+        """Convert output_quality string to compression level."""
+        output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+        if output_quality == "default":
+            return 50 if data_type == DataType.VIDEO else 75
+        return output_quality_mapper.get(output_quality)
 
     def _validate(self):
         """
@@ -315,6 +330,13 @@ class SamplingParams:
                     f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
+        if not pipeline_config.task_type.accepts_image_input():
+            # does not support image input
+            if self.image_path is not None:
+                raise ValueError(
+                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                )
+
     def _adjust(
         self,
         server_args,
@@ -368,10 +390,20 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
+
+        if "wan" in pipeline_name_lower and (
+            self.enable_sequence_shard is None or self.enable_sequence_shard
+        ):
+            self.enable_sequence_shard = True
+            logger.debug("Automatically enabled enable_sequence_shard")
+        else:
+            self.enable_sequence_shard = False
+
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment"
+                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
@@ -380,52 +412,66 @@ class SamplingParams:
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
-        elif self.adjust_frames:
+        else:
+            # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
+            original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
+                original_num_frames
+            )
+            logger.info(
+                "Adjusting number of frames from %s to %s based on model",
+                original_num_frames,
+                self.num_frames,
             )
 
-            # Adjust number of frames based on number of GPUs for video task
-            use_temporal_scaling_frames = (
-                pipeline_config.vae_config.use_temporal_scaling_frames
-            )
-            num_frames = self.num_frames
-            num_gpus = server_args.num_gpus
-            temporal_scale_factor = (
-                pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
-
-            if use_temporal_scaling_frames:
-                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-
-            if orig_latent_num_frames % server_args.num_gpus != 0:
-                # Adjust latent frames to be divisible by number of GPUs
-                if self.num_frames_round_down:
-                    # Ensure we have at least 1 batch per GPU
-                    new_latent_num_frames = (
-                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                    )
-                else:
-                    new_latent_num_frames = (
-                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                    )
+            if self.adjust_frames:
+                # Adjust number of frames based on number of GPUs for video task
+                use_temporal_scaling_frames = (
+                    pipeline_config.vae_config.use_temporal_scaling_frames
+                )
+                num_frames = self.num_frames
+                num_gpus = server_args.num_gpus
+                temporal_scale_factor = (
+                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                )
 
                 if use_temporal_scaling_frames:
-                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                    new_num_frames = (
-                        new_latent_num_frames - 1
-                    ) * temporal_scale_factor + 1
+                    orig_latent_num_frames = (
+                        num_frames - 1
+                    ) // temporal_scale_factor + 1
+                else:
+                    orig_latent_num_frames = num_frames
 
-                logger.info(
-                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                    self.num_frames,
-                    new_num_frames,
-                    server_args.num_gpus,
-                )
-                self.num_frames = new_num_frames
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
+                    if self.num_frames_round_down:
+                        # Ensure we have at least 1 batch per GPU
+                        new_latent_num_frames = (
+                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                        )
+                    else:
+                        new_latent_num_frames = (
+                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                        )
+
+                    if use_temporal_scaling_frames:
+                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                        new_num_frames = (
+                            new_latent_num_frames - 1
+                        ) * temporal_scale_factor + 1
+                    else:
+                        new_num_frames = new_latent_num_frames
+
+                    logger.info(
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                        self.num_frames,
+                        new_num_frames,
+                        server_args.num_gpus,
+                    )
+                    self.num_frames = new_num_frames
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
@@ -566,6 +612,18 @@ class SamplingParams:
             type=str,
             default=SamplingParams.output_file_name,
             help="Name of the output file",
+        )
+        parser.add_argument(
+            "--output-quality",
+            type=str,
+            default=SamplingParams.output_quality,
+            help="Output quality setting (default, low, medium, high, maximum)",
+        )
+        parser.add_argument(
+            "--output-compression",
+            type=int,
+            default=SamplingParams.output_compression,
+            help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         parser.add_argument(
             "--num-outputs-per-prompt",

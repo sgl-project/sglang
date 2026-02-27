@@ -57,10 +57,21 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        from vllm import _custom_ops as vllm_ops
+    # Note: vllm_ops is not needed for HIP when _use_aiter=False
+    # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+
+# Try to import vllm_ops for non-CUDA/HIP/XPU platforms
+_has_vllm_ops = False
+if not _is_cuda and not _is_hip and not _is_xpu:
+    try:
+        from vllm import _custom_ops as vllm_ops
+
+        _has_vllm_ops = True
+    except ImportError:
+        # Fallback: vllm not available, will use native PyTorch implementations
+        _has_vllm_ops = False
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -513,9 +524,15 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
+                if _has_vllm_ops:
+                    vllm_ops.silu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+                else:
+                    # Fallback: native PyTorch silu_and_mul
+                    x = intermediate_cache1.view(-1, N)
+                    d = x.shape[-1] // 2
+                    intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -533,9 +550,15 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
+                if _has_vllm_ops:
+                    vllm_ops.gelu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+                else:
+                    # Fallback: native PyTorch gelu_and_mul
+                    x = intermediate_cache1.view(-1, N)
+                    d = x.shape[-1] // 2
+                    intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
         # Activation function without multiplication
         elif activation == "silu" and not is_gated:
             intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -634,10 +657,18 @@ def fused_experts_impl(
                 routed_scaling_factor,
             )
         else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
+            if _has_vllm_ops:
+                vllm_ops.moe_sum(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                )
+            else:
+                # Fallback: use triton moe_sum_reduce when vllm is not available
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    routed_scaling_factor,
+                )
 
     return out_hidden_states
 

@@ -3,7 +3,7 @@ exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/jit_kernel/flash_atte
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-symlinks
       - id: destroyed-symlinks
@@ -21,12 +21,12 @@ repos:
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
+    rev: 7.0.0
     hooks:
       - id: isort
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.7
+    rev: v0.15.1
     hooks:
       - id: ruff
         args:
@@ -43,7 +43,7 @@ repos:
           python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
           )$
   - repo: https://github.com/psf/black
-    rev: 24.10.0
+    rev: 26.1.0
     hooks:
       - id: black-jupyter
         exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
@@ -53,13 +53,13 @@ repos:
       - id: codespell
         args: ['--config', '.codespellrc']
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v18.1.8
+    rev: v20.1.7
     hooks:
     - id: clang-format
       types_or: [c++, cuda]
       args: [--style=file, --verbose]
   - repo: https://github.com/kynan/nbstripout
-    rev: 0.8.1
+    rev: 0.9.0
     hooks:
       - id: nbstripout
         args:

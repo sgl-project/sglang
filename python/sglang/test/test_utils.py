@@ -44,7 +44,7 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback
+from sglang.utils import get_exception_traceback, normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -377,7 +377,7 @@ def call_select_guidance(context, choices, model=None):
 
 def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
         "--backend",
@@ -426,7 +426,7 @@ def auto_config_device() -> str:
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument(
@@ -450,7 +450,7 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        backend = RuntimeEndpoint(normalize_base_url(args.host, args.port))
     elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
@@ -459,14 +459,15 @@ def select_sglang_backend(args: argparse.Namespace):
 
 
 def _get_call_generate(args: argparse.Namespace):
+    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_lightllm, url=f"{base_url}/generate")
     elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_vllm, url=f"{base_url}/generate")
     elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
     elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
+        return partial(call_generate_outlines, url=f"{base_url}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -479,10 +480,11 @@ def _get_call_generate(args: argparse.Namespace):
 
 
 def _get_call_select(args: argparse.Namespace):
+    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_select_lightllm, url=f"{base_url}/generate")
     elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{args.host}:{args.port}/generate")
+        return partial(call_select_vllm, url=f"{base_url}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -546,21 +548,21 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
-def popen_with_error_check(command: list[str], allow_exit: bool = False):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def popen_with_error_check(command: list[str]):
+    process = subprocess.Popen(command, stdout=None, stderr=None)
 
     def _run_and_check():
-        stdout, stderr = process.communicate()
+        process.wait()
 
-        while process.poll() is None:
-            time.sleep(5)
+        if process.returncode == -9:
+            return
 
-        if not allow_exit or process.returncode != 0:
+        if process.returncode != 0:
             raise Exception(
-                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
+                f"{shlex.join(command)} exited with code {process.returncode}"
             )
 
-    t = threading.Thread(target=_run_and_check)
+    t = threading.Thread(target=_run_and_check, daemon=True)
     t.start()
     return process
 
@@ -855,7 +857,9 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        env = env.copy()
+        merged = os.environ.copy()
+        merged.update(env)
+        env = merged
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -1039,6 +1043,7 @@ def get_benchmark_args(
     gsp_output_len=32,
     gsp_num_turns=1,
     header=None,
+    max_concurrency=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -1080,6 +1085,7 @@ def get_benchmark_args(
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
         header=header,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -2000,6 +2006,56 @@ async def send_concurrent_generate_requests_with_custom_params(
         req.update(c)
         tasks.append(asyncio.create_task(async_generate_with_priority(req)))
     return await asyncio.gather(*tasks)
+
+
+def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
+    """Spawn ``world_size`` processes, initialise torch.distributed in each,
+    run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
+    """
+    import torch.multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    port = find_available_port(29500)
+
+    processes = []
+    for rank in range(world_size):
+        p = ctx.Process(
+            target=_distributed_worker,
+            args=(rank, world_size, backend, port, func, result_queue, kwargs),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    errors = [result_queue.get() for _ in range(world_size)]
+    errors = [e for e in errors if e]
+    if errors:
+        raise AssertionError("\n".join(errors))
+
+
+def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwargs):
+    import traceback
+
+    import torch.distributed as dist
+
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://127.0.0.1:{port}",
+        world_size=world_size,
+        rank=rank,
+    )
+    try:
+        func(rank, **kwargs)
+        result_queue.put(None)
+    except Exception as e:
+        result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
+    finally:
+        dist.destroy_process_group()
 
 
 class CustomTestCase(unittest.TestCase):

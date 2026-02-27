@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Literal, Optional, Type, overload
 
 import numpy as np
 import torch
@@ -15,6 +15,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.common.conn import (
+        CommonKVBootstrapServer,
+        CommonKVManager,
+        CommonKVReceiver,
+        CommonKVSender,
+    )
     from sglang.srt.managers.schedule_batch import Req
 
 #########################
@@ -91,10 +98,13 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+            # TODO: Fix me when npu backend supports torch.uint64
+            bootstrap_room_dtype = torch.int64
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
@@ -137,7 +147,7 @@ class MetadataBuffers:
             )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.int64, device=device
+                (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
     def get_buf_infos(self):
@@ -260,6 +270,28 @@ class KVClassType(Enum):
     BOOTSTRAP_SERVER = "bootstrap_server"
 
 
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.KVARGS]
+) -> Type[KVArgs]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.MANAGER]
+) -> Type[CommonKVManager]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.SENDER]
+) -> Type[CommonKVSender]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.RECEIVER]
+) -> Type[CommonKVReceiver]: ...
+@overload
+def get_kv_class(
+    transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
+) -> Type[CommonKVBootstrapServer]: ...
+
+
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
 ) -> Optional[Type]:
@@ -335,10 +367,15 @@ def get_kv_class(
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
-        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+        from sglang.srt.disaggregation.fake import (
+            FakeKVManager,
+            FakeKVReceiver,
+            FakeKVSender,
+        )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
         }
