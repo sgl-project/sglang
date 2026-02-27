@@ -57,7 +57,6 @@ def execute_aligner_plan(
         combined: Pair[torch.Tensor] = execute_token_aligner(
             plan=plan.token_aligner_plan,
             tensor_of_step_pair=Pair(x=step_tensors_x, y=step_tensors_y),
-            token_dims=plan.token_dims,
         )
     else:
         assert len(step_tensors_x) == 1 and len(step_tensors_y) == 1
