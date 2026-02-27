@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
-from sglang.srt.metrics.collector import StorageMetrics
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -222,47 +222,74 @@ class MooncakeStoreConfig:
         )
 
 
-class MooncakeStore(HiCacheStorage):
+class MooncakeBaseStore:
+    def __init__(self):
+        self.store = None
+        self.config = None
+
+    def _import_mooncake_store(self):
+        try:
+            from mooncake.store import MooncakeDistributedStore
+
+            return MooncakeDistributedStore
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html "
+                "to run SGLang with MooncakeConnector."
+            ) from e
+
+    def _load_config(self, storage_config: Any = None):
+        extra_config = (
+            getattr(storage_config, "extra_config", None) if storage_config else None
+        )
+
+        if extra_config and (
+            extra_config.get("master_server_address") is not None
+            or extra_config.get("client_server_address") is not None
+        ):
+            config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            logger.info("Mooncake Configuration loaded from extra_config successfully.")
+
+        elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            config = MooncakeStoreConfig.from_file()
+            logger.info("Mooncake Configuration loaded from file successfully.")
+
+        else:
+            config = MooncakeStoreConfig.load_from_env()
+            logger.info("Mooncake Configuration loaded from env successfully.")
+
+        return config
+
+    def register_buffer(self, tensor: torch.Tensor):
+        if self.store is None:
+            raise RuntimeError("Mooncake store is not initialized.")
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error(f"Failed to register buffer, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+            )
+
+
+class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
-        try:
-            from mooncake.store import MooncakeDistributedStore
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html"
-                "to run SGLang with MooncakeConnector."
-            ) from e
-
+        MooncakeBaseStore.__init__(self)
+        MooncakeDistributedStore = self._import_mooncake_store()
         try:
             self.store = MooncakeDistributedStore()
 
+            self.config = self._load_config(storage_config)
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
                 else None
             )
-            # Load configuration with master_server_address prioritized from extra_config if available
-            if extra_config is not None and (
-                extra_config.get("master_server_address") is not None
-                or extra_config.get("client_server_address") is not None
-            ):
-                # Load from extra_config
-                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-                logger.info(
-                    "Mooncake Configuration loaded from extra_config successfully."
-                )
-            elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-                # Load from config file
-                self.config = MooncakeStoreConfig.from_file()
-                logger.info("Mooncake Configuration loaded from file successfully.")
-            else:
-                # Load from environment variables
-                self.config = MooncakeStoreConfig.load_from_env()
-                logger.info("Mooncake Configuration loaded from env successfully.")
-
             tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
 
             per_tp_global_segment_size = (
@@ -380,6 +407,21 @@ class MooncakeStore(HiCacheStorage):
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
 
+            self.storage_config = storage_config
+            self.split_factor = 0
+            if self.storage_config.should_split_heads:
+                self.split_factor = (
+                    self.storage_config.tp_lcm_size // self.storage_config.tp_size
+                )
+                base_rank = self.local_rank * self.split_factor
+                target_ranks = [base_rank + i for i in range(self.split_factor)]
+                if self.enable_pp:
+                    self.mha_suffix = [
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                    ]
+                else:
+                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
+
             self.gb_per_page = None
             self.prefetch_pgs = []
             self.backup_pgs = []
@@ -442,20 +484,27 @@ class MooncakeStore(HiCacheStorage):
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
-            buffer_ptr = buffer.data_ptr()
-            buffer_size = buffer.numel() * buffer.element_size()
-            ret_code = self.store.register_buffer(buffer_ptr, buffer_size)
-            if ret_code:
-                logger.error(f"Failed to register buffer, error code: {ret_code}")
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
+            super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_split_heads_page_buffer_meta(
+                indices, self.split_factor
+            )
+        )
+        key_list = []
+        for key_ in keys:
+            for suffix in self.mha_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
@@ -480,7 +529,10 @@ class MooncakeStore(HiCacheStorage):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            return self._get_mha_buffer_meta(keys, host_indices)
+            if self.storage_config.should_split_heads:
+                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+            else:
+                return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
@@ -493,15 +545,29 @@ class MooncakeStore(HiCacheStorage):
         if self.is_mla_backend:
             return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
         else:
-            kv_pairs = zip(results[::2], results[1::2])
-            return [
-                (
-                    (k_res == 0 and v_res == 0)
-                    if is_set_operate
-                    else (k_res > 0 and v_res > 0)
-                )
-                for k_res, v_res in kv_pairs
-            ]
+            if self.storage_config.should_split_heads:
+                kv_groups = [
+                    results[i : i + self.split_factor * 2]
+                    for i in range(0, len(results), self.split_factor * 2)
+                ]
+                return [
+                    (
+                        all(res == 0 for res in kv_group)
+                        if is_set_operate
+                        else all(res > 0 for res in kv_group)
+                    )
+                    for kv_group in kv_groups
+                ]
+            else:
+                kv_pairs = zip(results[::2], results[1::2])
+                return [
+                    (
+                        (k_res == 0 and v_res == 0)
+                        if is_set_operate
+                        else (k_res > 0 and v_res > 0)
+                    )
+                    for k_res, v_res in kv_pairs
+                ]
 
     def batch_get_v1(
         self,
@@ -692,10 +758,17 @@ class MooncakeStore(HiCacheStorage):
             key_multiplier = 1
         else:
             query_keys = []
-            for key in keys:
-                query_keys.append(f"{key}_{self.mha_suffix}_k")
-                query_keys.append(f"{key}_{self.mha_suffix}_v")
-            key_multiplier = 2
+            if self.storage_config.should_split_heads:
+                for key in keys:
+                    for suffix in self.mha_suffix:
+                        query_keys.append(f"{key}_{suffix}_k")
+                        query_keys.append(f"{key}_{suffix}_v")
+                key_multiplier = 2 * self.split_factor
+            else:
+                for key in keys:
+                    query_keys.append(f"{key}_{self.mha_suffix}_k")
+                    query_keys.append(f"{key}_{self.mha_suffix}_v")
+                key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):

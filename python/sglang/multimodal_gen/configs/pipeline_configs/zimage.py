@@ -272,7 +272,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             device=device,
         ).flatten(0, 2)
 
-        C = self.dit_config.num_channels_latents
         F = 1
         H = height // self.vae_config.arch_config.spatial_compression_ratio
         W = width // self.vae_config.arch_config.spatial_compression_ratio

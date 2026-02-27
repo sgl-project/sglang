@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import urllib.request
+import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -120,6 +121,19 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
             fout.write(
                 "=" * 40 + f" {i} " + "=" * 40 + "\n" + s + "\n" + "=" * 80 + "\n\n"
             )
+
+
+def normalize_base_url(host: str, port: int) -> str:
+    if host.startswith("http://") or host.startswith("https://"):
+        warnings.warn(
+            f"Including the scheme in --host ('{host}') is deprecated. "
+            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    else:
+        host = f"http://{host}"
+    return f"{host}:{port}"
 
 
 class HttpResponse:
@@ -531,15 +545,13 @@ def wait_for_server(
         headers={"Authorization": "Bearer None"},
     )
     time.sleep(5)
-    print_highlight(
-        """\n
+    print_highlight("""\n
         NOTE: Typically, the server runs in a separate terminal.
         In this notebook, we run the server and notebook code together, so their outputs are combined.
         To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
         To reduce the log length, we set the log level to warning for the server, the default log level is info.
         We are running those notebooks in a CI environment, so the throughput is not representative of the actual performance.
-        """
-    )
+        """)
 
 
 class TypeBasedDispatcher:
