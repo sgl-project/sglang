@@ -114,6 +114,41 @@ The steps below show how to build and use an image.
 
 With your AMD system properly configured and SGLang installed, you can now fully leverage AMD hardware to power SGLang’s machine learning capabilities.
 
+## Quantization on AMD GPUs
+
+The [Quantization documentation](../advanced_features/quantization.md#platform-compatibility) has a full compatibility matrix. The short version: FP8, AWQ, MXFP4, W8A8, GPTQ, compressed-tensors, and Quark all work on AMD. Methods that depend on Marlin or NVIDIA-specific kernels (`awq_marlin`, `gptq_marlin`, `gguf`, `modelopt_fp8`, `modelopt_fp4`, `petit_nvfp4`) do not.
+
+A few things to keep in mind:
+
+- FP8 works via Aiter or Triton. Pre-quantized FP8 models like DeepSeek-V3/R1 work out of the box.
+- AWQ uses Triton dequantization kernels on AMD. The faster Marlin path is not available.
+- MXFP4 requires CDNA3/CDNA4 and `SGLANG_USE_AITER=1`.
+- `quark_int4fp8_moe` is an AMD-only online quantization method for MoE models on CDNA3/CDNA4.
+
+Several of these backends are accelerated by [Aiter](https://github.com/ROCm/aiter). Enable it with:
+
+```bash
+export SGLANG_USE_AITER=1
+```
+
+Example -- serving an AWQ model:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4 \
+    --trust-remote-code \
+    --port 30000 --host 0.0.0.0
+```
+
+Example -- FP8 online quantization:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --quantization fp8 \
+    --port 30000 --host 0.0.0.0
+```
+
 ## Examples
 
 ### Running DeepSeek-V3
