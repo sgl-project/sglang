@@ -5,8 +5,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.axis_swapper import (
-    execute_axis_swapper_plan,
+from sglang.srt.debug_utils.comparator.aligner.axis_aligner import (
+    execute_axis_aligner_plan,
 )
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
@@ -65,11 +65,11 @@ def execute_aligner_plan(
             y=list(step_tensors_y.values())[0],
         )
 
-    # Cross-side: axis swap (rearrange x to match y's dim order)
-    if (swap_plan := plan.axis_swapper_plan) is not None:
+    # Cross-side: axis alignment (squeeze singletons + rearrange dim order)
+    if (aligner_plan := plan.axis_aligner_plan) is not None:
         combined = Pair(
-            x=execute_axis_swapper_plan(tensor=combined.x, plan=swap_plan),
-            y=combined.y,
+            x=execute_axis_aligner_plan(tensor=combined.x, plan=aligner_plan, side="x"),
+            y=execute_axis_aligner_plan(tensor=combined.y, plan=aligner_plan, side="y"),
         )
 
     return AlignerResult(tensors=combined, failed_side_xy=None)

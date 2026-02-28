@@ -3,6 +3,9 @@ from pydantic import ValidationError
 
 from sglang.srt.debug_utils.source_patcher.source_editor import apply_edits
 from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchApplicationError
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="default")
 
 
 class TestApplyEdits:

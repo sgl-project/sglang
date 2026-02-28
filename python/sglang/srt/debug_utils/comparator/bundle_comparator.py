@@ -18,7 +18,10 @@ from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import AlignerPl
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.dims import apply_dim_names, parse_dim_names
+from sglang.srt.debug_utils.comparator.dims import (
+    apply_dim_names,
+    resolve_dim_names,
+)
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
@@ -241,7 +244,7 @@ def _apply_dim_names_from_meta(
     if dims_str is None:
         return tensors
 
-    dim_names: list[str] = parse_dim_names(dims_str)
+    dim_names: list[str] = resolve_dim_names(dims_str)
     return [apply_dim_names(t, dim_names) for t in tensors]
 
 

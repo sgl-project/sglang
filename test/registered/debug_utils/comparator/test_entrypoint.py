@@ -945,6 +945,115 @@ class TestEntrypointGroupingLogical:
         assert len(recompute_warnings) > 0
 
 
+class TestEntrypointAxisAligner:
+    """Test cross-framework dim reordering through the full entrypoint pipeline."""
+
+    def test_axis_swap_different_dim_order(self, tmp_path, capsys):
+        """Baseline dims 'b h d' vs target dims 'b d h': axis swapper rearranges baseline to match."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h d",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            dims="b d h",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 16, 8]
+        assert comp.target.shape == [4, 16, 8]
+
+    def test_axis_swap_with_tp_unshard(self, tmp_path, capsys):
+        """Baseline TP=2 with dims 'b h(tp) d' vs target TP=2 with dims 'b d h(tp)': unshard + axis swap."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp) d",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            name="hidden",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="b d h(tp)",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_squeeze_dim_one_side(self, tmp_path, capsys):
+        """SGLang dims 't h' vs Megatron dims 't 1 h': axis aligner squeezes the singleton dim."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="t h",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.unsqueeze(1),
+            dims="t 1 h",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 8]
+        assert comp.target.shape == [4, 8]
+
+
 class TestEntrypointAxisSwapper:
     """Test cross-framework dim reordering through the full entrypoint pipeline."""
 
