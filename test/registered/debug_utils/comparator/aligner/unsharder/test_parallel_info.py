@@ -54,6 +54,22 @@ class TestNormalizeParallelInfo:
         with pytest.raises(ValueError, match="multiple parallel_info"):
             normalize_parallel_info(meta)
 
+    def test_megatron_with_sp(self) -> None:
+        """Megatron SP reuses TP group: sp_rank==tp_rank, sp_size==tp_size."""
+        meta = {
+            "megatron_parallel_info": {
+                "tp_rank": 1,
+                "tp_size": 4,
+                "sp_rank": 1,
+                "sp_size": 4,
+            }
+        }
+        result = normalize_parallel_info(meta)
+        assert result == {
+            ParallelAxis.TP: AxisInfo(axis_rank=1, axis_size=4),
+            ParallelAxis.SP: AxisInfo(axis_rank=1, axis_size=4),
+        }
+
     def test_size_1_filtered(self) -> None:
         meta = {
             "sglang_parallel_info": {
