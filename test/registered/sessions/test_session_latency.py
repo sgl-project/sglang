@@ -309,7 +309,11 @@ class BenchSessionLatency(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--attention-backend", "flashinfer"],
+            other_args=[
+                "--attention-backend",
+                "flashinfer",
+                "--enable-streaming-session",
+            ],
         )
         cls.tokenizer = get_tokenizer(cls.model)
 
