@@ -721,6 +721,10 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+
+        self.tree_cache = SessionAwareCache(self.tree_cache)
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -751,6 +755,7 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.sessions: Dict[str, Session] = {}
+        self._last_reap_sessions: float = 0.0
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1118,7 +1123,8 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # When the server is idle, do self-check and re-init some states
+                # When the server is idle, do self-check and re-init some states.
+                # Skip if there are any streaming sessions (latency sensitive).
                 self.self_check_during_idle()
 
             # Update last_batch
@@ -1349,7 +1355,10 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-
+        now = time.monotonic()
+        if now - self._last_reap_sessions > 1.0:  # reap sessions every second
+            self._last_reap_sessions = now
+            self.reap_timed_out_sessions()
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1458,7 +1467,7 @@ class Scheduler(
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
             # For session requests, keep mm_inputs for the next request
-            if req.session_id:
+            if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
             for item in mm_inputs.mm_items:
@@ -2929,17 +2938,37 @@ class Scheduler(
             return OpenSessionReqOutput(session_id, False)
         else:
             self.sessions[session_id] = Session(
-                recv_req.capacity_of_str_len, session_id
+                recv_req.capacity_of_str_len,
+                session_id,
+                streaming=bool(recv_req.streaming),
+                timeout=recv_req.timeout,
             )
             return OpenSessionReqOutput(session_id, True)
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        # handle error
         session_id = recv_req.session_id
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
-            del self.sessions[session_id]
+            self._close_session(session_id)
+
+    def _close_session(self, session_id: str):
+        session = self.sessions[session_id]
+        if session.streaming and session.req_nodes:
+            assert len(session.req_nodes) == 1
+            req = next(iter(session.req_nodes.values())).req
+            if not req.finished():
+                req.session = None
+        self.tree_cache.release_session(session_id)
+        del self.sessions[session_id]
+
+    def reap_timed_out_sessions(self):
+        timed_out = [
+            sid for sid, session in self.sessions.items() if session.is_timed_out()
+        ]
+        for sid in timed_out:
+            logger.info(f"Session {sid} timed out, closing.")
+            self._close_session(sid)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

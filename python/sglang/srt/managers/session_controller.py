@@ -11,6 +11,7 @@
 # ==============================================================================
 
 import logging
+import time
 import uuid
 from typing import Dict, Optional
 
@@ -65,25 +66,59 @@ class SessionReqNode:
 
 
 class Session:
-    def __init__(self, capacity_of_str_len: int, session_id: Optional[str] = None):
+    def __init__(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
+    ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
+        self.streaming = streaming
+        self.timeout = timeout
+        self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
+
+    def is_timed_out(self) -> bool:
+        if self.timeout is None:
+            return False
+        return time.monotonic() - self.last_active_time > self.timeout
 
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer, vocab_size: int):
         assert req.session_params is not None
+        self.last_active_time = time.monotonic()
         session_params = req.session_params
 
         last_req_node = None
         last_req = None
         abort = False
-        if session_params.replace:
+        abort_message = ""
+        if self.streaming:
+            # Streaming sessions: only simple appends allowed; reject otherwise.
+            if session_params.replace:
+                abort = True
+                abort_message = "Streaming sessions do not support replace."
+            elif session_params.drop_previous_output:
+                abort = True
+                abort_message = (
+                    "Streaming sessions do not support drop_previous_output."
+                )
+            elif session_params.offset and session_params.offset != 0:
+                abort = True
+                abort_message = "Streaming sessions do not support offset."
+            elif self.req_nodes:
+                assert len(self.req_nodes) == 1
+                _, last_req_node = self.req_nodes.popitem()
+                last_req = last_req_node.req
+        elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
                     req_node.clear(self.req_nodes)
             else:
                 if session_params.rid not in self.req_nodes:
                     abort = True
+                    abort_message = "Invalid request session id"
                 else:
                     last_req_node = self.req_nodes[session_params.rid]
                     last_req_node.abort()
@@ -93,18 +128,22 @@ class Session:
             if session_params.rid is not None:
                 if session_params.rid not in self.req_nodes:
                     abort = True
+                    abort_message = "Invalid request session id"
                 else:
                     last_req_node = self.req_nodes[session_params.rid]
                     last_req = last_req_node.req
                     if not last_req.finished():
-                        logging.warning(
-                            "The request in a session is appending to a request that hasn't finished."
-                        )
                         abort = True
+                        abort_message = "Session request is appending to a request that hasn't finished."
+                        logging.warning(abort_message)
 
         if last_req is not None:
             # trim bos token if it is an append
-            if tokenizer is not None and req.input_ids[0] == tokenizer.bos_token_id:
+            if (
+                tokenizer is not None
+                and req.input_ids
+                and req.input_ids[0] == tokenizer.bos_token_id
+            ):
                 req.input_ids = req.input_ids[1:]
 
             input_ids = (
@@ -136,6 +175,7 @@ class Session:
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
@@ -143,7 +183,7 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
-            session_id=self.session_id,
+            session=self,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,
@@ -156,7 +196,11 @@ class Session:
         new_req.tokenizer = tokenizer
 
         if abort:
-            new_req.set_finish_with_abort("Invalid request session id")
+            new_req.set_finish_with_abort(abort_message)
+        elif self.streaming:
+            if last_req is not None:
+                last_req.session = None
+            self.req_nodes[req.rid] = SessionReqNode(new_req)
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node

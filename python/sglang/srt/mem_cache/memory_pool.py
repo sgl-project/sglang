@@ -158,7 +158,7 @@ class ReqToTokenPool:
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
             assert (
-                len(reusing) <= 1
+                sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
             ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
