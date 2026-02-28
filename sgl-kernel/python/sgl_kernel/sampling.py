@@ -1,5 +1,6 @@
 from typing import Optional, Union
 
+import flashinfer.sampling
 import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
@@ -46,7 +47,10 @@ def top_k_renorm_probs(
     This combination of ``top_k_renorm_probs`` and ``sampling_from_probs`` should be equivalent to
     ``top_k_sampling_from_probs``.
     """
-    return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
+    if probs.device.type == "musa":
+        return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
+    else:
+        return flashinfer.sampling.top_k_renorm_probs(probs, top_k)
 
 
 top_k_renorm_prob = top_k_renorm_probs
@@ -96,7 +100,10 @@ def top_p_renorm_probs(
     ``top_p_sampling_from_probs``.
 
     """
-    return _top_p_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_p))
+    if probs.device.type == "musa":
+        return _top_p_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_p))
+    else:
+        return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
 
 
 top_p_renorm_prob = top_p_renorm_probs
@@ -169,4 +176,7 @@ def top_k_mask_logits(
     --------
     top_k_renorm_probs
     """
-    return _top_k_mask_logits_internal(logits, *_to_tensor_scalar_tuple(top_k))
+    if logits.device.type == "musa":
+        return _top_k_mask_logits_internal(logits, *_to_tensor_scalar_tuple(top_k))
+    else:
+        return flashinfer.sampling.top_k_mask_logits(logits, top_k)
