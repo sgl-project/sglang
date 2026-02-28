@@ -395,11 +395,7 @@ class MMEncoder:
         return hashes
 
     async def _encode_missing(
-        self,
-        pixel_values: torch.Tensor,
-        images_input: dict,
-        indices: List[int],
-        keep_on_gpu: bool = False,
+        self, pixel_values: torch.Tensor, images_input: dict, indices: List[int]
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of images missing from the cache.
@@ -436,11 +432,7 @@ class MMEncoder:
                 mm_item.set(k, val)
 
         with torch.inference_mode():
-            new_embeddings = self.model.get_image_feature([mm_item])
-            if keep_on_gpu:
-                new_embeddings = new_embeddings.contiguous()
-            else:
-                new_embeddings = new_embeddings.cpu()
+            new_embeddings = self.model.get_image_feature([mm_item]).cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
 
@@ -753,10 +745,9 @@ class MMEncoder:
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
-    async def preprocess_only(self, mm_items, hashes=None):
-        """Phase 1: image load + preprocess (+ optional global cache check).
-        Returns (preprocess_state, embedding_len, embedding_dim, embedding_size).
-        preprocess_state is a dict consumed by forward_and_store."""
+    async def preprocess_only(self, mm_items):
+        """Phase 1: img_load + preprocess only. Returns shape metadata without VIT forward."""
+        t0 = time.time()
         try:
             images = await self._flatten_and_load_images(mm_items)
         except Exception as e:
@@ -765,44 +756,9 @@ class MMEncoder:
         try:
             kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
             images_input = self.image_processor(images=images, **kwargs)
-            grid_thw = _get_image_grid_dim(images_input)
 
-            state = {"images_input": images_input}
-
-            if self.mm_global_cache is not None:
-                pixel_values = images_input["pixel_values"]
-                num_images = len(grid_thw)
-
-                if self.rank == 0:
-                    if hashes is None:
-                        image_hashes = self._calculate_hashes_from_features(
-                            pixel_values, grid_thw
-                        )
-                    else:
-                        image_hashes = hashes
-                    exist_mask = await self.mm_global_cache.batch_is_exist(image_hashes)
-                    mask_tensor = torch.tensor(
-                        [1 if e else 0 for e in exist_mask], dtype=torch.int32
-                    )
-                else:
-                    image_hashes = None
-                    mask_tensor = torch.zeros(num_images, dtype=torch.int32)
-
-                if self.server_args.tp_size > 1:
-                    torch.distributed.broadcast(
-                        mask_tensor,
-                        src=0,
-                        group=self.mm_global_cache.prefetch_tp_group,
-                    )
-
-                exist_mask = [m.item() == 1 for m in mask_tensor]
-                state["image_hashes"] = image_hashes
-                state["missing_indices"] = [
-                    i for i, e in enumerate(exist_mask) if not e
-                ]
-                state["hit_indices"] = [i for i, e in enumerate(exist_mask) if e]
-
-            embedding_len = sum(self.get_num_tokens(g) for g in grid_thw)
+            image_grid_dim = _get_image_grid_dim(images_input)
+            embedding_len = sum(self.get_num_tokens(g) for g in image_grid_dim)
             embedding_dim = self.vit_embedding_dim
             embedding_size = (
                 embedding_len
@@ -811,25 +767,34 @@ class MMEncoder:
                 // 8
             )
 
-            return state, embedding_len, embedding_dim, embedding_size
+            return images_input, embedding_len, embedding_dim, embedding_size
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
 
-    async def forward_and_store(self, state, req_id, num_parts, part_idx):
-        """Phase 2: VIT forward + store embedding, then signal ready.
-        Handles both plain and global-cache paths based on state contents."""
-        use_global_cache = "image_hashes" in state
-        images_input = state["images_input"]
-
+    def _forward_and_store_sync(self, images_input, req_id, num_parts, part_idx):
+        """Phase 2 (sync): VIT forward + store embedding. Runs in thread pool to avoid blocking event loop."""
         try:
-            if use_global_cache:
-                mm_embedding = await self._forward_with_global_cache(
-                    state, req_id, images_input
-                )
-            else:
-                mm_embedding = await self._forward_plain(images_input)
+            feature = images_input["pixel_values"]
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": Modality.IMAGE,
+                    "feature": _convert(feature),
+                }
+            )
+            for k, v in images_input.items():
+                if k == "pixel_values":
+                    continue
+                mm_item.set(k, _convert(v))
+
+            with torch.inference_mode():
+                mm_embedding = self.model.get_image_feature([mm_item])
+                t_forward = time.time()
+                mm_embedding = mm_embedding.contiguous()
+                t_contiguous = time.time()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
             if self.profiler is not None:
                 self.profiler.step()
@@ -841,7 +806,6 @@ class MMEncoder:
                     req_id, num_parts, part_idx, image_grid_dim, mm_embedding
                 )
                 self.embedding_to_send[req_id] = mm_data
-
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
@@ -856,122 +820,19 @@ class MMEncoder:
                     error_code=error_code,
                 )
                 self.embedding_to_send[req_id] = mm_data
-        finally:
-            if self.rank == 0 and req_id in self._forward_ready_events:
-                self._forward_ready_events[req_id].set()
 
-    async def _forward_plain(self, images_input):
-        """VIT forward for all images (no global cache)."""
-        feature = images_input["pixel_values"]
-        mm_item = MultimodalDataItem.from_dict(
-            {"modality": Modality.IMAGE, "feature": _convert(feature)}
+    async def forward_and_store(self, images_input, req_id, num_parts, part_idx):
+        """Phase 2 (async wrapper): runs VIT forward in thread pool, then signals ready."""
+        await asyncio.get_event_loop().run_in_executor(
+            self.executor,
+            self._forward_and_store_sync,
+            images_input,
+            req_id,
+            num_parts,
+            part_idx,
         )
-        for k, v in images_input.items():
-            if k == "pixel_values":
-                continue
-            mm_item.set(k, _convert(v))
-
-        with torch.inference_mode():
-            mm_embedding = self.model.get_image_feature([mm_item])
-            mm_embedding = mm_embedding.contiguous()
-        if len(mm_embedding.shape) != 2:
-            mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
-        return mm_embedding
-
-    async def _forward_with_global_cache(self, state, req_id, images_input):
-        """VIT forward for cache-miss images, prefetch cache-hit, assemble on GPU."""
-        image_hashes = state["image_hashes"]
-        missing_indices = state["missing_indices"]
-        hit_indices = state["hit_indices"]
-        pixel_values = images_input["pixel_values"]
-        grid_thw = images_input["image_grid_thw"]
-        num_images = len(grid_thw)
-
-        new_slices = []
-        if missing_indices:
-            new_slices = await self._encode_missing(
-                pixel_values, images_input, missing_indices, keep_on_gpu=True
-            )
-
-        prefetch_status = torch.tensor([1], dtype=torch.int32)
-        if self.rank == 0 and hit_indices:
-            hit_hashes = [image_hashes[i] for i in hit_indices]
-            hit_tokens = [self.get_num_tokens(grid_thw[i]) for i in hit_indices]
-            self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens)
-
-            try:
-
-                async def _wait_prefetch():
-                    while not self.mm_global_cache.check_prefetch_progress(req_id):
-                        await asyncio.sleep(0.005)
-
-                await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.error(
-                    f"Prefetch failed for req {req_id}: {e}. "
-                    f"Falling back to ViT for {len(hit_indices)} hit images."
-                )
-                prefetch_status[0] = 0
-
-        if self.server_args.tp_size > 1:
-            torch.distributed.broadcast(
-                prefetch_status,
-                src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
-            )
-
-        fallback_slices = None
-        if prefetch_status.item() == 0 and hit_indices:
-            logger.info(
-                f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} images."
-            )
-            fallback_slices = await self._encode_missing(
-                pixel_values, images_input, hit_indices, keep_on_gpu=True
-            )
-
-        if self.rank == 0:
-            final_slices = [None] * num_images
-            for i, idx in enumerate(missing_indices):
-                final_slices[idx] = new_slices[i]
-
-            if prefetch_status.item() == 1 and hit_indices:
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    [image_hashes[i] for i in hit_indices]
-                )
-                for i, idx in enumerate(hit_indices):
-                    s = cached_slices[i]
-                    if not s.is_cuda:
-                        s = s.to(self.device)
-                    final_slices[idx] = s
-            elif fallback_slices is not None:
-                for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = fallback_slices[i]
-
-            mm_embedding = torch.cat(final_slices, dim=0).contiguous()
-
-            all_new_hashes = [image_hashes[i] for i in missing_indices]
-            all_new_slices = [s.cpu() for s in new_slices]
-            if fallback_slices is not None:
-                all_new_hashes += [image_hashes[i] for i in hit_indices]
-                all_new_slices += [s.cpu() for s in fallback_slices]
-
-            if all_new_hashes:
-
-                async def _background_insert():
-                    await asyncio.to_thread(
-                        self.mm_global_cache.insert_batch,
-                        all_new_hashes,
-                        all_new_slices,
-                    )
-
-                insert_task = asyncio.create_task(_background_insert())
-                self.background_tasks.add(insert_task)
-                insert_task.add_done_callback(self.background_tasks.discard)
-
-            return mm_embedding
-
-        return None
+        if self.rank == 0 and req_id in self._forward_ready_events:
+            self._forward_ready_events[req_id].set()
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -1236,12 +1097,10 @@ async def handle_encode_request(request: dict):
             socket.send_pyobj(request)
 
         if encoder.server_args.encoder_transfer_backend == "mooncake_to_scheduler":
+            # TODO: support global mm cache
             try:
-                state, embedding_len, embedding_dim, embedding_size = (
-                    await encoder.preprocess_only(
-                        mm_items=request["mm_items"],
-                        hashes=request.get("hashes", None),
-                    )
+                images_input, embedding_len, embedding_dim, embedding_size = (
+                    await encoder.preprocess_only(mm_items=request["mm_items"])
                 )
 
                 event = asyncio.Event()
@@ -1250,7 +1109,7 @@ async def handle_encode_request(request: dict):
                 async def _bg_forward():
                     try:
                         await encoder.forward_and_store(
-                            state,
+                            images_input,
                             req_id=request["req_id"],
                             num_parts=request["num_parts"],
                             part_idx=request["part_idx"],
