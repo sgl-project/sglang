@@ -54,7 +54,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -1038,6 +1038,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
@@ -1059,6 +1070,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1070,6 +1083,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1090,6 +1105,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if name is None:
                         continue
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
