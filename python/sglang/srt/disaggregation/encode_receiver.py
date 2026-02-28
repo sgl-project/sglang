@@ -556,7 +556,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         receive_count=self.tp_size,
                         embeddings_engine=self.embeddings_engine,
                         dtype=self.dtype,
-                        embedding_meta=recv_req.mooncake_embedding_meta,
+                        embedding_meta=recv_req.mm_metadata,
                         embeddings_buffer_dict=self.embeddings_buffer,
                     )
                 else:
