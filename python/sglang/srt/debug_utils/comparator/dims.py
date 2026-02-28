@@ -8,6 +8,7 @@ import torch
 TOKEN_DIM_NAME: str = "t"
 BATCH_DIM_NAME: str = "b"
 SEQ_DIM_NAME: str = "s"
+SQUEEZE_DIM_NAME: str = "1"
 
 
 class TokenLayout(Enum):
@@ -20,6 +21,7 @@ class ParallelAxis(Enum):
     CP = "cp"
     EP = "ep"
     SP = "sp"
+    RECOMPUTE_PSEUDO = "recompute_pseudo"
 
 
 class Ordering(Enum):
@@ -39,6 +41,46 @@ class DimSpec:
     reduction: Optional[Reduction] = None
 
 
+class _SingletonDimUtil:
+    """Utilities for squeeze dims (name="1") and their singleton tensor-name mapping."""
+
+    PREFIX: str = "singleton"
+
+    @staticmethod
+    def is_squeeze(spec: DimSpec) -> bool:
+        return spec.name == SQUEEZE_DIM_NAME
+
+    @staticmethod
+    def filter_out(dim_specs: list[DimSpec]) -> list[DimSpec]:
+        return [s for s in dim_specs if not _SingletonDimUtil.is_squeeze(s)]
+
+    @staticmethod
+    def make_name(index: int) -> str:
+        return f"{_SingletonDimUtil.PREFIX}{index}"
+
+    @staticmethod
+    def is_singleton_name(name: str) -> bool:
+        return (
+            name.startswith(_SingletonDimUtil.PREFIX)
+            and name[len(_SingletonDimUtil.PREFIX) :].isdigit()
+        )
+
+    @staticmethod
+    def sanitize_names(names: list[str]) -> list[str]:
+        """Replace '1' with 'singleton0', 'singleton1', ... for named tensor compatibility."""
+        result: list[str] = []
+        sq_idx: int = 0
+
+        for name in names:
+            if name == SQUEEZE_DIM_NAME:
+                result.append(_SingletonDimUtil.make_name(sq_idx))
+                sq_idx += 1
+            else:
+                result.append(name)
+
+        return result
+
+
 _DIM_PATTERN = re.compile(r"^(?P<name>[a-zA-Z_]\w*)(?:\((?P<modifiers>[^)]+)\))?$")
 
 _MODIFIER_FIELDS: list[tuple[type[Enum], str]] = [
@@ -54,6 +96,9 @@ for _enum_cls, _field in _MODIFIER_FIELDS:
 
 
 def parse_dim(token: str) -> DimSpec:
+    if token == SQUEEZE_DIM_NAME:
+        return DimSpec(name=SQUEEZE_DIM_NAME)
+
     match = _DIM_PATTERN.match(token)
     if match is None:
         raise ValueError(f"Invalid dim token: {token!r}")
@@ -83,16 +128,22 @@ def parse_dims(dims_str: str) -> list[DimSpec]:
 
     result = [parse_dim(token) for token in dims_str.strip().split()]
 
-    names = [spec.name for spec in result]
-    if len(names) != len(set(names)):
-        duplicates = sorted({n for n in names if names.count(n) > 1})
+    non_squeeze_names: list[str] = [
+        spec.name for spec in result if not _SingletonDimUtil.is_squeeze(spec)
+    ]
+    if len(non_squeeze_names) != len(set(non_squeeze_names)):
+        duplicates = sorted(
+            {n for n in non_squeeze_names if non_squeeze_names.count(n) > 1}
+        )
         raise ValueError(f"Duplicate dim names: {duplicates}")
 
     return result
 
 
-def parse_dim_names(dims_str: str) -> list[str]:
-    return [spec.name for spec in parse_dims(dims_str)]
+def resolve_dim_names(dims_str: str) -> list[str]:
+    """Parse dims string and return tensor-compatible names ('1' → 'singleton0', ...)."""
+    names: list[str] = [spec.name for spec in parse_dims(dims_str)]
+    return _SingletonDimUtil.sanitize_names(names)
 
 
 def find_dim_index(dim_specs: list[DimSpec], name: str) -> Optional[int]:

@@ -725,6 +725,15 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if (self.prefill_delayer_single_pass is not None) and (
+            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+            )
+        ):
+            return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -770,15 +779,6 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                return AddReqResult.OTHER
-            if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                    local_prefillable=True,
-                    running_batch=self.running_batch.batch_size(),
-                    max_prefill_bs=self.max_prefill_bs,
-                    max_running_requests=self.max_running_requests,
-                )
-            ):
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:

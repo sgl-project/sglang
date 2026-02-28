@@ -24,6 +24,7 @@ from sglang.srt.debug_utils.comparator.dims import ParallelAxis, TokenLayout
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
+    NonTensorRecord,
     SkipRecord,
     SummaryRecord,
     parse_record_json,
@@ -186,7 +187,7 @@ def _make_tensor_info() -> TensorInfo:
     return TensorInfo(
         shape=[4, 4],
         dtype="float32",
-        stats=TensorStats(mean=0.0, std=1.0, min=-2.0, max=2.0),
+        stats=TensorStats(mean=0.0, abs_mean=0.8, std=1.0, min=-2.0, max=2.0),
     )
 
 
@@ -249,6 +250,157 @@ class TestOutputRecordCategories:
             diff=_make_diff_info(passed=True),
         )
         assert record.category == "passed"
+
+    def test_non_tensor_record_equal_is_passed(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.125",
+            baseline_type="float",
+            target_type="float",
+            values_equal=True,
+        )
+        assert record.category == "passed"
+
+    def test_non_tensor_record_different_is_failed(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.25",
+            baseline_type="float",
+            target_type="float",
+            values_equal=False,
+        )
+        assert record.category == "failed"
+
+    def test_non_tensor_record_with_warnings_is_failed(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.125",
+            baseline_type="float",
+            target_type="float",
+            values_equal=True,
+            warnings=[GeneralWarning(category="c", message="m")],
+        )
+        assert record.category == "failed"
+
+    def test_non_tensor_record_json_roundtrip(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.25",
+            baseline_type="float",
+            target_type="float",
+            values_equal=False,
+        )
+        json_str: str = record.model_dump_json()
+        roundtripped = parse_record_json(json_str)
+        assert isinstance(roundtripped, NonTensorRecord)
+        assert roundtripped.name == "sm_scale"
+        assert roundtripped.values_equal is False
+        assert roundtripped.baseline_value == "0.125"
+        assert roundtripped.target_value == "0.25"
+
+    def test_non_tensor_record_text_format_equal(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.125",
+            baseline_type="float",
+            target_type="float",
+            values_equal=True,
+        )
+        text: str = record.to_text()
+        assert "sm_scale" in text
+        assert "[equal]" in text
+
+    def test_non_tensor_record_text_format_different(self) -> None:
+        record = NonTensorRecord(
+            name="sm_scale",
+            baseline_value="0.125",
+            target_value="0.25",
+            baseline_type="float",
+            target_type="float",
+            values_equal=False,
+        )
+        text: str = record.to_text()
+        assert "baseline" in text
+        assert "target" in text
+
+
+def _make_aligner_plan() -> AlignerPlan:
+    unsharder = UnsharderPlan(
+        axis=ParallelAxis.TP,
+        params=ConcatParams(dim_name="h"),
+        groups=[[0, 1]],
+    )
+    return AlignerPlan(
+        per_step_plans=Pair(
+            x=[
+                AlignerPerStepPlan(
+                    step=0, input_object_indices=[0, 1], sub_plans=[unsharder]
+                )
+            ],
+            y=[
+                AlignerPerStepPlan(
+                    step=0, input_object_indices=[0, 1], sub_plans=[unsharder]
+                )
+            ],
+        ),
+    )
+
+
+class TestAlignerPlanInComparisonRecord:
+    def test_comparison_record_with_aligner_plan(self) -> None:
+        plan: AlignerPlan = _make_aligner_plan()
+        record: ComparisonRecord = _make_comparison_record(
+            diff=_make_diff_info(passed=True),
+        )
+        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+        assert record_with_plan.aligner_plan is not None
+        assert record_with_plan.aligner_plan.per_step_plans.x[0].step == 0
+
+    def test_aligner_plan_json_roundtrip(self) -> None:
+        plan: AlignerPlan = _make_aligner_plan()
+        record: ComparisonRecord = _make_comparison_record(
+            diff=_make_diff_info(passed=True),
+        )
+        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+
+        json_str: str = record_with_plan.model_dump_json()
+        parsed = json.loads(json_str)
+        assert "aligner_plan" in parsed
+        assert (
+            parsed["aligner_plan"]["per_step_plans"]["x"][0]["sub_plans"][0]["type"]
+            == "unsharder"
+        )
+
+        roundtripped: ComparisonRecord = parse_record_json(json_str)
+        assert roundtripped.aligner_plan is not None
+        assert (
+            roundtripped.aligner_plan.per_step_plans.x[0].sub_plans[0].type
+            == "unsharder"
+        )
+
+    def test_comparison_record_without_aligner_plan(self) -> None:
+        record: ComparisonRecord = _make_comparison_record(
+            diff=_make_diff_info(passed=True),
+        )
+        json_str: str = record.model_dump_json()
+        roundtripped: ComparisonRecord = parse_record_json(json_str)
+        assert roundtripped.aligner_plan is None
+
+    def test_aligner_plan_text_format(self) -> None:
+        plan: AlignerPlan = _make_aligner_plan()
+        record: ComparisonRecord = _make_comparison_record(
+            diff=_make_diff_info(passed=True),
+        )
+        record_with_plan = record.model_copy(update={"aligner_plan": plan})
+
+        text: str = record_with_plan.to_text()
+        assert "Aligner Plan:" in text
+        assert "unsharder" in text
 
 
 def _make_aligner_plan() -> AlignerPlan:

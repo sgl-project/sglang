@@ -140,6 +140,31 @@ class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
         return body
 
 
+class NonTensorRecord(_OutputRecord):
+    type: Literal["non_tensor"] = "non_tensor"
+    name: str
+    baseline_value: str
+    target_value: str
+    baseline_type: str
+    target_type: str
+    values_equal: bool
+
+    @property
+    def category(self) -> str:
+        if self.warnings:
+            return "failed"
+        return "passed" if self.values_equal else "failed"
+
+    def _format_body(self) -> str:
+        if self.values_equal:
+            return f"NonTensor: {self.name} = {self.baseline_value} ({self.baseline_type}) [equal]"
+        return (
+            f"NonTensor: {self.name}\n"
+            f"  baseline = {self.baseline_value} ({self.baseline_type})\n"
+            f"  target   = {self.target_value} ({self.target_type})"
+        )
+
+
 class SummaryRecord(_OutputRecord):
     type: Literal["summary"] = "summary"
     total: int
@@ -194,8 +219,13 @@ def _format_aligner_plan(plan: AlignerPlan) -> str:
         num_tokens: int = len(plan.token_aligner_plan.locators.x.steps)
         lines.append(f"  token_aligner: {num_tokens} tokens aligned")
 
-    if plan.axis_swapper_plan is not None:
-        lines.append(f"  axis_swapper: {plan.axis_swapper_plan.pattern}")
+    if plan.axis_aligner_plan is not None:
+        parts: list[str] = []
+        if plan.axis_aligner_plan.pattern.x:
+            parts.append(f"x: {plan.axis_aligner_plan.pattern.x}")
+        if plan.axis_aligner_plan.pattern.y:
+            parts.append(f"y: {plan.axis_aligner_plan.pattern.y}")
+        lines.append(f"  axis_aligner: {', '.join(parts)}")
 
     return "\n".join(lines)
 
@@ -207,6 +237,7 @@ AnyRecord = Annotated[
         InputIdsRecord,
         SkipRecord,
         ComparisonRecord,
+        NonTensorRecord,
         SummaryRecord,
         WarningRecord,
     ],
