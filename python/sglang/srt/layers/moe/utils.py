@@ -86,12 +86,6 @@ class MoeRunnerBackend(Enum):
     def is_flashinfer_trtllm_routed(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
-    def is_flashinfer_trtllm_family(self):
-        return self in (
-            MoeRunnerBackend.FLASHINFER_TRTLLM,
-            MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
-        )
-
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
 

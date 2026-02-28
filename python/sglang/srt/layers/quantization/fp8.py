@@ -1156,9 +1156,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from flashinfer import mxfp8_quantize
 
             weight_flat = weight.view(-1, k).contiguous()
-            # Match FlashInfer TRT-LLM MoE test contracts:
-            # 1) quantize in canonical (non-swizzled) scale layout, and
-            # 2) do row/layout shuffling in align_mxfp8_moe_weights_for_flashinfer_trtllm.
             qweight, scale = mxfp8_quantize(weight_flat, False)
             scale_u8 = (
                 scale.view(torch.uint8).contiguous().view(num_experts, m, k // 32)
@@ -1177,6 +1174,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
             ):
+                # Match FlashInfer TRT-LLM MoE test contracts:
+                # 1) quantize in canonical (non-swizzled) scale layout, and
+                # 2) do row/layout shuffling in align_mxfp8_moe_weights_for_flashinfer_trtllm.
                 w13_q, w13_s = _quantize_with_flashinfer_trtllm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_with_flashinfer_trtllm(layer.w2_weight.data)
             else:
@@ -1457,10 +1457,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        if moe_runner_backend.is_flashinfer_trtllm_routed() and not self.block_quant:
-            raise ValueError(
-                "flashinfer_trtllm_routed requires block-wise FP8 MoE quantization."
-            )
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()

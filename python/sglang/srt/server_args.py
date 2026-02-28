@@ -2271,7 +2271,7 @@ class ServerArgs:
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
             if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
             elif self.moe_runner_backend not in [
                 "cutlass",
                 "flashinfer_trtllm",
@@ -2282,7 +2282,7 @@ class ServerArgs:
                     "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-                self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [

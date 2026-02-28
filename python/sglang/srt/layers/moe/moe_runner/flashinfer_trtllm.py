@@ -169,21 +169,22 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         for i in range(num_experts)
     ]
 
-    layer.w13_weight = Parameter(
-        torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
-        requires_grad=False,
+    # Keep parameter identities stable for CUDA graph capture reuse.
+    copy_or_rebind_param(
+        layer, "w13_weight", torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
     )
-    layer.w2_weight = Parameter(
-        torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
-        requires_grad=False,
+    copy_or_rebind_param(
+        layer, "w2_weight", torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
     )
-    layer.w13_weight_scale_inv = Parameter(
+    copy_or_rebind_param(
+        layer,
+        "w13_weight_scale_inv",
         torch.stack(w13_scale_shuffled).reshape_as(w13_scale).contiguous(),
-        requires_grad=False,
     )
-    layer.w2_weight_scale_inv = Parameter(
+    copy_or_rebind_param(
+        layer,
+        "w2_weight_scale_inv",
         torch.stack(w2_scale_shuffled).reshape_as(w2_scale).contiguous(),
-        requires_grad=False,
     )
     layer.w13_weight_scale_inv.format_ue8m0 = True
     layer.w2_weight_scale_inv.format_ue8m0 = True
@@ -286,14 +287,9 @@ def _pack_topk_for_flashinfer_routed(
     """Pack routed top-k tensors into FlashInfer's int32 format."""
     packed_ids = topk_ids.to(torch.int32)
     packed_weights = topk_weights.to(torch.bfloat16)
-    invalid = packed_ids < 0
-    packed_ids = torch.where(invalid, torch.zeros_like(packed_ids), packed_ids)
-    packed_weights = torch.where(
-        invalid, torch.zeros_like(packed_weights), packed_weights
-    )
-    return (packed_ids << 16) | packed_weights.contiguous().view(torch.int16).to(
-        torch.int32
-    )
+    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
+    # SGLang can mark padded tokens with -1 expert ids.
+    return packed.masked_fill_(packed_ids < 0, 0)
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -318,12 +314,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(hidden_states.dtype)
+        )
+    else:
+        router_logits = None
+        topk_config = None
+        correction_bias = None
+
     routing_method_type = quant_info.routing_method_type
-    # routed_scaling_factor = (
-    #     runner_config.routed_scaling_factor
-    #     if runner_config.routed_scaling_factor is not None
-    #     else 1.0
-    # )
     fp8_quantization_type = (
         Fp8QuantizationType.MxFp8
         if quant_info.use_mxfp8
@@ -343,15 +347,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             a_q, a_sf = mxfp8_quantize(hidden_states, False)
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
-            hidden_states_scale = a_sf.view(torch.uint8).reshape(
-                hidden_states.shape[0], -1
-            )
+            a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
             a_q, a_sf = per_token_group_quant_fp8(
                 hidden_states, quant_info.weight_block_k
             )
-            # DeepSeek block-FP8 uses [hidden_size // 128, num_tokens] layout.
-            hidden_states_scale = a_sf.t().contiguous()
+            a_sf_t = a_sf.t().contiguous()
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -366,16 +367,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     topk_weights=topk_output.topk_weights,
                 )
 
-                symm_output = torch.empty(
-                    hidden_states.shape,
-                    dtype=torch.bfloat16,
-                    device=hidden_states.device,
-                )
                 output = trtllm_fp8_block_scale_routed_moe(
                     topk_ids=packed_topk_ids,
                     routing_bias=None,
                     hidden_states=a_q,
-                    hidden_states_scale=hidden_states_scale,
+                    hidden_states_scale=a_sf_t,
                     gemm1_weights=quant_info.w13_weight,
                     gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                     gemm2_weights=quant_info.w2_weight,
@@ -395,19 +391,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     routing_method_type=routing_method_type,
                     use_shuffled_weight=use_shuffled_weight,
                     weight_layout=0,
-                    output=symm_output,
                     tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                     fp8_quantization_type=fp8_quantization_type,
                 )
             else:
                 assert TopKOutputChecker.format_is_bypassed(topk_output)
-                router_logits = topk_output.router_logits
-                topk_config = topk_output.topk_config
-                correction_bias = (
-                    None
-                    if topk_config.correction_bias is None
-                    else topk_config.correction_bias.to(hidden_states.dtype)
-                )
 
                 # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
                 # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
@@ -421,7 +409,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     ),
                     routing_bias=correction_bias,
                     hidden_states=a_q,
-                    hidden_states_scale=hidden_states_scale,
+                    hidden_states_scale=a_sf_t,
                     gemm1_weights=quant_info.w13_weight,
                     gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                     gemm2_weights=quant_info.w2_weight,
@@ -449,23 +437,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     fp8_quantization_type=fp8_quantization_type,
                 )
     else:
-        assert not quant_info.use_mxfp8, "MXFP8 only supports block-quantized FP8 MoE."
-        assert (
-            not use_routed_topk
-        ), "flashinfer_trtllm_routed only supports block-quantized FP8 MoE."
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
         assert quant_info.output1_scales_gate_scalar is not None
         assert quant_info.output2_scales_scalar is not None
 
-        router_logits = topk_output.router_logits
-        topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
         a_q, _ = scaled_fp8_quant(hidden_states, quant_info.w13_input_scale)
         routing_bias_cast = (
             None if correction_bias is None else correction_bias.to(torch.bfloat16)
