@@ -54,13 +54,10 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
             # Use pretranspose (K-last / V-major) decode kernel to match
             # the K-last pool layout [pool, HV, V, K]
-            _flashinfer_gated_delta_rule_decode = (
-                gated_delta_rule_decode_pretranspose
-            )
+            _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             # SM90+ required for FlashInfer GDN CUTLASS kernels
             _flashinfer_gdn_available = (
-                torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] >= 9
+                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
             )
             if _flashinfer_gdn_available:
                 logger.info(
@@ -114,7 +111,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             "K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels"
         )
 
-
     # ---- decode ----
 
     def decode(
@@ -133,7 +129,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         """K-last decode using FlashInfer pretranspose kernel (stock, no pool indexing).
-        
+
         TODO: Once FlashInfer PR#2521 is merged and released, switch back
         to pool-indexed decode (passing state_indices directly) to avoid
         the gather/scatter overhead (~7-9% decode regression).
