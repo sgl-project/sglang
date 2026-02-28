@@ -38,7 +38,6 @@ from sgl_kernel.expert_specialization import (
     es_sm100_mxfp8_blockscaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_quant,
 )
-from sgl_kernel.fused_moe import moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -101,13 +100,9 @@ from sgl_kernel.quantization import (
     ggml_mul_mat_vec_a8,
 )
 from sgl_kernel.sampling import (
-    min_p_sampling_from_probs,
     top_k_mask_logits,
     top_k_renorm_prob,
-    top_k_top_p_sampling_from_logits,
-    top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
-    top_p_sampling_from_probs,
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,

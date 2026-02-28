@@ -34,11 +34,13 @@ on:
           - 'nightly-8-gpu-kimi-k25'
           - 'nightly-8-gpu-qwen3-235b'
           - 'nightly-8-gpu-glm5'
+          - 'nightly-8-gpu-minimax-m25'
           # MI35x jobs
           - 'nightly-test-1-gpu-mi35x'
           - 'nightly-8-gpu-mi35x-qwen3-235b-mxfp4'
           - 'nightly-8-gpu-mi35x-kimi-k25'
           - 'nightly-8-gpu-mi35x-glm5'
+          - 'nightly-8-gpu-mi35x-minimax-m25'
           - 'nightly-accuracy-8-gpu-mi35x'
           - 'nightly-8-gpu-mi35x-grok1-int4'
           - 'nightly-8-gpu-mi35x-grok2'
@@ -559,6 +561,37 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # 8-GPU MiniMax-M2.5 (Accuracy)
+  nightly-8-gpu-minimax-m25:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-minimax-m25')
+    runs-on: linux-mi325-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Accuracy Test (8-GPU MiniMax-M2.5)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m25 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # ============================================== MI35x Tests ==============================================
   # MI35x 1-GPU tests - platform-agnostic tests that may work on CDNA4 (gfx950)
   nightly-test-1-gpu-mi35x:
@@ -959,6 +992,39 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  # MI35x 8-GPU MiniMax-M2.5 (Accuracy)
+  nightly-8-gpu-mi35x-minimax-m25:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-8-gpu-mi35x-minimax-m25')
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy Test MI35x (8-GPU MiniMax-M2.5)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-minimax-m25 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   # MI35x 8-GPU DeepSeek-V3.2 Performance Test (MTP)
   nightly-perf-8-gpu-mi35x-deepseek-v32-mtp:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-perf-8-gpu-mi35x-deepseek-v32-mtp')
@@ -1013,6 +1079,7 @@ jobs:
       - nightly-8-gpu-kimi-k25
       - nightly-8-gpu-qwen3-235b
       - nightly-8-gpu-glm5
+      - nightly-8-gpu-minimax-m25
       # MI35x jobs
       - nightly-test-1-gpu-mi35x
       - nightly-accuracy-8-gpu-mi35x
@@ -1024,6 +1091,7 @@ jobs:
       - nightly-8-gpu-mi35x-kimi-k25
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
       - nightly-8-gpu-mi35x-glm5
+      - nightly-8-gpu-mi35x-minimax-m25
       # MI35x perf jobs excluded from check - perf failures don't block CI
       # - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
       # - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp

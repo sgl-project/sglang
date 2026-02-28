@@ -1,8 +1,8 @@
-.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou
+.github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @bingxche
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
-/python/sglang/jit_kernel @DarkSharpness @BBuf
+/python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
 /python/sglang/multimodal_gen @mickqian @yhyang201 @ping1jing2
 /python/sglang/multimodal_gen/runtime/layers @mickqian @yhyang201 @BBuf @yingluosanqian @ping1jing2
@@ -26,9 +26,9 @@
 /python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
-/python/sglang/srt/layers/attention/nsa @1am9trash @hubertlu-tw @HaiShaw @Fridge003 @hlu1 @rainj-me
-/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ
-/python/sglang/srt/layers/quantization/quark @kkHuang-amd @hubertlu-tw @1am9trash @HaiShaw
+/python/sglang/srt/layers/attention/nsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @hlu1 @rainj-me
+/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw
+/python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
