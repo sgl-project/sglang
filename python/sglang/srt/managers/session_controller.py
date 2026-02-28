@@ -283,6 +283,7 @@ class SessionController:
         del self.sessions[session_id]
 
     def maybe_reap(self, now: float, interval: float = 1.0):
+        # reap sessions every second
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
             timed_out = [
@@ -294,7 +295,9 @@ class SessionController:
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):
-        """Shift multimodal offsets when Session.create_req prepended context."""
+        # For session requests, adjust mm_inputs offsets by the prefix length.
+        # Session.create_req prepends previous context to origin_input_ids,
+        # so offsets from the new prompt need to be shifted.
         if len(recv_req.input_ids) >= len(req.origin_input_ids):
             return
         prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
