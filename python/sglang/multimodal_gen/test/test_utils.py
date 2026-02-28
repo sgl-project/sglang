@@ -337,6 +337,22 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
         cap.release()
 
 
+def get_video_frame_count(file_path: str) -> int:
+    """Return the number of frames in a video file using OpenCV."""
+    cap = cv2.VideoCapture(file_path)
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if count > 0:
+            return count
+        # Fallback: count frames manually
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        return n
+    finally:
+        cap.release()
+
+
 def validate_video_file(
     file_path: str,
     expected_filename: str,

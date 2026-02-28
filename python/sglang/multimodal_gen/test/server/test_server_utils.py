@@ -37,6 +37,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
+    get_video_frame_count,
     is_image_url,
     prepare_perf_log,
     validate_image,
@@ -663,6 +664,7 @@ def get_generate_fn(
         seconds: int | None = None,
         input_reference: Any | None = None,
         extra_body: dict[Any] | None = None,
+        expected_frame_count: int | None = None,
     ) -> str:
         """
         Create a video job via /v1/videos, poll until completion,
@@ -745,6 +747,13 @@ def get_generate_fn(
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
+
+        if expected_frame_count is not None:
+            actual_count = get_video_frame_count(tmp_path)
+            assert actual_count == expected_frame_count, (
+                f"{case_id}: frame count mismatch after interpolation — "
+                f"expected {expected_frame_count}, got {actual_count}"
+            )
 
         upload_file_to_slack(
             case_id=case_id,
@@ -976,6 +985,20 @@ def get_generate_fn(
         extra_body = {}
         if sampling_params.enable_teacache:
             extra_body["enable_teacache"] = True
+        if sampling_params.num_frames:
+            extra_body["num_frames"] = sampling_params.num_frames
+        if sampling_params.enable_frame_interpolation:
+            extra_body["enable_frame_interpolation"] = True
+            extra_body["frame_interpolation_exp"] = (
+                sampling_params.frame_interpolation_exp
+            )
+
+        # Compute expected output frame count for validation
+        expected_frame_count = None
+        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+            n = sampling_params.num_frames
+            exp = sampling_params.frame_interpolation_exp
+            expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
             client,
@@ -985,6 +1008,7 @@ def get_generate_fn(
             size=output_size,
             seconds=video_seconds,
             extra_body=extra_body if extra_body else None,
+            expected_frame_count=expected_frame_count,
         )
 
     def generate_image_to_video(case_id, client) -> tuple[str, bytes]:
