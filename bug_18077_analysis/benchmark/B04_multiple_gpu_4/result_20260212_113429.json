@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "config": "B04_multiple_gpu_4",
+    "gpus": 4,
+    "tp": 1,
+    "sp": 4,
+    "timestamp": "20260212_113429",
+    "model": "zai-org/GLM-Image",
+    "width": 1536,
+    "height": 1536
+  },
+  "metrics": {
+    "duration": 1390.0193092600675,
+    "completed_requests": 10,
+    "failed_requests": 0,
+    "throughput_qps": 0.0071941446664673895,
+    "latency_mean": 139.00168871999486,
+    "latency_median": 136.28846203297144,
+    "latency_p99": 158.07717548334156,
+    "latency_p50": 136.28846203297144,
+    "peak_memory_mb_max": 44284.24365234375,
+    "peak_memory_mb_mean": 41689.99321289062,
+    "peak_memory_mb_median": 41401.7431640625
+  }
+}

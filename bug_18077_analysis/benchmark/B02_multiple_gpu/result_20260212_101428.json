@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "config": "B02_multiple_gpu",
+    "gpus": 2,
+    "tp": 1,
+    "sp": 2,
+    "timestamp": "20260212_101428",
+    "model": "zai-org/GLM-Image",
+    "width": 512,
+    "height": 512
+  },
+  "metrics": {
+    "duration": 277.6146276410436,
+    "completed_requests": 10,
+    "failed_requests": 0,
+    "throughput_qps": 0.03602115668389788,
+    "latency_mean": 27.761124419793486,
+    "latency_median": 26.339820137014613,
+    "latency_p99": 39.41020656107343,
+    "latency_p50": 26.339820137014613,
+    "peak_memory_mb_max": 34553.24365234375,
+    "peak_memory_mb_mean": 34553.24365234375,
+    "peak_memory_mb_median": 34553.24365234375
+  }
+}
