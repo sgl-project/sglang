@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import next_power_of_2
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
@@ -802,22 +803,9 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-def next_power_of_2_bitwise(n):
-    if n <= 0:
-        return 1
-    n -= 1  # so that n=32 returns 32, not 64
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    return n + 1
-
-
-def pad_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    assert dim == 0 or dim == 1, "dim must be 0 or 1"
+def pad_tensor_into_power_of_2(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     seq_length = tensor.shape[dim]
-    padded_length = next_power_of_2_bitwise(seq_length)
+    padded_length = next_power_of_2(seq_length)
     padding_length = padded_length - seq_length
     if padding_length == 0:
         return tensor
@@ -1218,13 +1206,13 @@ class QwenImageTransformerBlock(nn.Module):
             img_modulated, img_gate1, img_mod2 = module(hidden_states, temb_img_silu)
 
         seq_len_txt = encoder_hidden_states.shape[1]
-        padded_seq_len_txt = next_power_of_2_bitwise(seq_len_txt)
+        padded_seq_len_txt = next_power_of_2(seq_len_txt)
         if not self._enable_cuda_graph_capture:
             txt_modulated, txt_gate1, txt_mod2 = self._txt_pre_attention_forward(
                 encoder_hidden_states, temb_txt_silu
             )
         else:
-            padded_encoder_hidden_states = pad_tensor(
+            padded_encoder_hidden_states = pad_tensor_into_power_of_2(
                 encoder_hidden_states, 1
             )  # [B, S, H]
             if (
@@ -1331,7 +1319,7 @@ class QwenImageTransformerBlock(nn.Module):
                 txt_attn_output, txt_mod2, txt_gate1, encoder_hidden_states
             )
         else:
-            padded_txt_attn_output = pad_tensor(txt_attn_output, dim=1)
+            padded_txt_attn_output = pad_tensor_into_power_of_2(txt_attn_output, dim=1)
             if (
                 "txt_post_attention_forward",
                 txt_attn_output.shape,
