@@ -2282,7 +2282,7 @@ class ServerArgs:
                     "or flashinfer_trtllm_routed backends. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-                self.moe_runner_backend = "flashinfer_trtllm"
+            self.moe_runner_backend = "flashinfer_trtllm"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2295,27 +2295,28 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if self.moe_runner_backend in [
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-        ]:
-            if self.moe_runner_backend == "flashinfer_trtllm_routed":
-                assert self.quantization in [
-                    "fp8",
-                    "mxfp8",
-                ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
-            else:
-                assert self.quantization in [
-                    "modelopt_fp4",
-                    "fp8",
-                    "mxfp8",
-                    "modelopt_fp8",
-                    "compressed-tensors",
-                    None,
-                ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'mxfp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
+        if self.moe_runner_backend == "flashinfer_trtllm":
+            assert self.quantization in [
+                "modelopt_fp4",
+                "fp8",
+                "mxfp8",
+                "modelopt_fp8",
+                "compressed-tensors",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
-                f"{self.moe_runner_backend} MoE is enabled. --disable-shared-experts-fusion is automatically set."
+                "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "flashinfer_trtllm_routed":
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8' or 'mxfp8'."
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
