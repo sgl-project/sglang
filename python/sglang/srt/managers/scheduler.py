@@ -2929,9 +2929,7 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        # handle error
         session_id = recv_req.session_id
-        is_streaming = bool(recv_req.streaming)
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
             return OpenSessionReqOutput(session_id, False)
@@ -2939,19 +2937,10 @@ class Scheduler(
             logger.warning("session id is None, cannot open.")
             return OpenSessionReqOutput(session_id, False)
         else:
-            if is_streaming:
-                assert self.server_args.enable_streaming_session, (
-                    "Streaming sessions are disabled. "
-                    "Please set --enable-streaming-session to enable this feature."
-                )
-                assert self.spec_algorithm == SpeculativeAlgorithm.NONE, (
-                    "Streaming sessions are incompatible with speculative decoding "
-                    f"(speculative_algorithm={self.server_args.speculative_algorithm})."
-                )
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
                 session_id,
-                streaming=is_streaming,
+                streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
             )
             return OpenSessionReqOutput(session_id, True)
