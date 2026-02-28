@@ -1,4 +1,3 @@
-import argparse
 import pickle
 import random
 import uuid
@@ -29,10 +28,10 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     output_len: int
     range_ratio: float
     seed: int
-    gsp_fast_prepare: bool
-    gsp_send_routing_key: bool
-    gsp_num_turns: int
-    gsp_ordered: bool
+    fast_prepare: bool
+    send_routing_key: bool
+    num_turns: int
+    ordered: bool
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
@@ -45,10 +44,10 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             output_len=args.gsp_output_len,
             range_ratio=getattr(args, "gsp_range_ratio", 1.0),
             seed=args.seed,
-            gsp_fast_prepare=getattr(args, "gsp_fast_prepare", False),
-            gsp_send_routing_key=getattr(args, "gsp_send_routing_key", False),
-            gsp_num_turns=getattr(args, "gsp_num_turns", 1),
-            gsp_ordered=getattr(args, "gsp_ordered", False),
+            fast_prepare=getattr(args, "gsp_fast_prepare", False),
+            send_routing_key=getattr(args, "gsp_send_routing_key", False),
+            num_turns=getattr(args, "gsp_num_turns", 1),
+            ordered=getattr(args, "gsp_ordered", False),
         )
 
     def load(
@@ -62,18 +61,29 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             output_len=self.output_len,
             range_ratio=self.range_ratio,
             tokenizer=tokenizer,
-            args=self,
+            seed=self.seed,
+            send_routing_key=self.send_routing_key,
+            num_turns=self.num_turns,
+            fast_prepare=self.fast_prepare,
+            ordered=self.ordered,
         )
 
 
-def get_gen_prefix_cache_path(args, tokenizer):
+def get_gen_prefix_cache_path(
+    seed: int,
+    num_groups: int,
+    prompts_per_group: int,
+    system_prompt_len: int,
+    question_len: int,
+    output_len: int,
+    tokenizer,
+):
     """Create cache directory under ~/.cache/sglang/benchmark"""
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
-    # Create a unique cache filename based on the generation parameters
     cache_key = (
-        f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
-        f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
+        f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
+        f"{system_prompt_len}_{question_len}_{output_len}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
@@ -87,13 +97,22 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
-    args: argparse.Namespace,
+    seed: int,
+    send_routing_key: bool = False,
+    num_turns: int = 1,
+    fast_prepare: bool = False,
+    ordered: bool = False,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    send_routing_key = getattr(args, "gsp_send_routing_key", False)
-    num_turns = getattr(args, "gsp_num_turns", 1)
-
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    cache_path = get_gen_prefix_cache_path(
+        seed,
+        num_groups,
+        prompts_per_group,
+        system_prompt_len,
+        question_len,
+        output_len,
+        tokenizer,
+    )
     should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
 
     # Try to load from cache first
@@ -168,11 +187,7 @@ def sample_generated_shared_prefix_requests(
                 1:
             ]
             full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-            prompt_len = (
-                1
-                if getattr(args, "gsp_fast_prepare", False)
-                else len(tokenizer.encode(turn_prompts[0]))
-            )
+            prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
             output_len_val = int(output_lens[group_idx, prompt_idx])
 
             input_requests.append(
@@ -186,7 +201,7 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len_val
 
-    if not getattr(args, "gsp_ordered", False):
+    if not ordered:
         random.shuffle(input_requests)
 
     # Print statistics
@@ -195,7 +210,7 @@ def sample_generated_shared_prefix_requests(
     print(f"Prompts per group: {prompts_per_group}")
     print(f"Number of turns: {num_turns}")
     print(f"Total prompts: {len(input_requests)}")
-    if not getattr(args, "gsp_fast_prepare", False):
+    if not fast_prepare:
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
         print(
