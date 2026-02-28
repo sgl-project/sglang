@@ -44,7 +44,7 @@ class DisaggregationMode(Enum):
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
-def poll_and_all_reduce(pollers, gloo_group):
+def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
@@ -57,6 +57,26 @@ def poll_and_all_reduce(pollers, gloo_group):
         polls = [int(poller.poll()) for poller in pollers]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    return tensor_to_reduce.tolist()
+
+
+def poll_and_all_reduce_attn_cp_tp_group(
+    pollers,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+):
+    # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
+    # shard observe the same status transitions.
+    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+
+    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
+    # converge to the same global status.
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(
+        tensor_to_reduce,
+        op=dist.ReduceOp.MIN,
+        group=attn_cp_cpu_group,
+    )
     return tensor_to_reduce.tolist()
 
 
@@ -98,10 +118,13 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
             device = "npu"
+            # TODO: Fix me when npu backend supports torch.uint64
+            bootstrap_room_dtype = torch.int64
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
@@ -144,7 +167,7 @@ class MetadataBuffers:
             )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.uint64, device=device
+                (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
     def get_buf_infos(self):
