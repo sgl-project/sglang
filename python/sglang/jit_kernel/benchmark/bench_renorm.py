@@ -26,6 +26,11 @@ def torch_top_k_renorm_probs(probs, top_k):
         # Create mask: batch_size x vocab_size
         mask = torch.zeros_like(probs)
         mask.scatter_(1, topk_indices, 1.0)
+
+        # Vectorized renormalization
+        masked_probs = probs * mask
+        renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + 1e-10)
+        return renorm_probs
     else:
         # Variable k per batch - need to handle separately
         renorm_probs = torch.zeros_like(probs)
@@ -37,11 +42,6 @@ def torch_top_k_renorm_probs(probs, top_k):
             masked_probs = probs[i] * mask
             renorm_probs[i] = masked_probs / (masked_probs.sum() + 1e-10)
         return renorm_probs
-
-    # Vectorized renormalization
-    masked_probs = probs * mask
-    renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + 1e-10)
-    return renorm_probs
 
 
 def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
@@ -64,6 +64,11 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
         # Create mask in original order
         mask = torch.zeros_like(probs)
         mask.scatter_(1, sorted_indices, cutoff_mask.float())
+
+        # Vectorized renormalization
+        masked_probs = probs * mask
+        renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + eps)
+        return renorm_probs
     else:
         # Variable p per batch - need to handle separately
         renorm_probs = torch.zeros_like(probs)
@@ -76,11 +81,6 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
             masked_probs = probs[i] * mask
             renorm_probs[i] = masked_probs / (masked_probs.sum() + eps)
         return renorm_probs
-
-    # Vectorized renormalization
-    masked_probs = probs * mask
-    renorm_probs = masked_probs / (masked_probs.sum(dim=1, keepdim=True) + eps)
-    return renorm_probs
 
 
 def torch_top_k_mask_logits(logits, top_k):
