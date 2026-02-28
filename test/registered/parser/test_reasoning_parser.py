@@ -1,10 +1,13 @@
 import unittest
 
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     Glm45Detector,
     KimiDetector,
+    KimiK2ReasoningDetector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -782,6 +785,180 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestKimiK2ReasoningDetector(CustomTestCase):
+    """
+    Reproduce issue #18086: Kimi-K2 model generates tool call tokens
+    (<|tool_calls_section_begin|>) without first emitting </think>,
+    causing the reasoning parser to swallow tool call tokens.
+
+    These tests simulate the full pipeline: reasoning parser -> tool call parser,
+    covering the case where reasoning and tool call tokens are interleaved.
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="ReadFile",
+                    description="Read a file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path",
+                            }
+                        },
+                        "required": ["path"],
+                    },
+                ),
+            ),
+        ]
+
+    def _run_pipeline_non_stream(self, full_text):
+        """Simulate the non-streaming pipeline: reasoning parse then tool call parse."""
+        reasoning_detector = KimiK2ReasoningDetector(stream_reasoning=False)
+        result = reasoning_detector.detect_and_parse(full_text)
+        reasoning_text = result.reasoning_text
+        text = result.normal_text
+
+        fc_parser = FunctionCallParser(tools=self.tools, tool_call_parser="kimi_k2")
+        remaining_text, tool_calls = fc_parser.parse_non_stream(text)
+        return reasoning_text, remaining_text, tool_calls
+
+    def _run_pipeline_streaming(self, chunks):
+        """Simulate the streaming pipeline: reasoning parse then tool call parse.
+
+        Returns (reasoning_text, normal_text, aggregated_tool_calls) where
+        aggregated_tool_calls is a list of dicts with "name" and "parameters"
+        grouped by tool_index (matching how the real server aggregates them).
+        """
+        reasoning_detector = KimiK2ReasoningDetector(
+            stream_reasoning=True, force_reasoning=False
+        )
+        fc_parser = FunctionCallParser(tools=self.tools, tool_call_parser="kimi_k2")
+
+        all_reasoning = []
+        all_normal = []
+        tool_calls = []
+
+        for chunk in chunks:
+            r_result = reasoning_detector.parse_streaming_increment(chunk)
+            if r_result.reasoning_text:
+                all_reasoning.append(r_result.reasoning_text)
+            delta = r_result.normal_text
+            if delta:
+                normal_text, calls = fc_parser.parse_stream_chunk(delta)
+                if normal_text:
+                    all_normal.append(normal_text)
+                for call_item in calls:
+                    if call_item.tool_index is not None:
+                        while len(tool_calls) <= call_item.tool_index:
+                            tool_calls.append({"name": "", "parameters": ""})
+                        tc = tool_calls[call_item.tool_index]
+                        if call_item.name:
+                            tc["name"] += call_item.name
+                        if call_item.parameters:
+                            tc["parameters"] += call_item.parameters
+
+        return "".join(all_reasoning), "".join(all_normal), tool_calls
+
+    def test_non_stream_normal_case_with_think_end(self):
+        """Normal case: model emits </think> before tool call tokens."""
+        text = (
+            "<think>Let me read the file.</think>"
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{"path": "/tmp/test.ts"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        reasoning_text, remaining_text, tool_calls = self._run_pipeline_non_stream(text)
+        self.assertIn("read the file", reasoning_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "ReadFile")
+        self.assertEqual(tool_calls[0].parameters, '{"path": "/tmp/test.ts"}')
+
+    def test_non_stream_missing_think_end(self):
+        """Bug scenario: model skips </think> and goes directly to tool call tokens."""
+        text = (
+            "<think>Let me read the file."
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{"path": "/tmp/test.ts"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        reasoning_text, remaining_text, tool_calls = self._run_pipeline_non_stream(text)
+        self.assertIn("read the file", reasoning_text)
+        self.assertEqual(len(tool_calls), 1, "Tool calls should be parsed even without </think>")
+        self.assertEqual(tool_calls[0].name, "ReadFile")
+        self.assertEqual(tool_calls[0].parameters, '{"path": "/tmp/test.ts"}')
+
+    def test_streaming_normal_case_with_think_end(self):
+        """Streaming normal case: </think> is emitted before tool call tokens."""
+        chunks = [
+            "<think>",
+            "Let me read the file.",
+            "</think>",
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{",
+            '"path": "/tmp/test.ts"',
+            "}<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        reasoning_text, normal_text, tool_calls = self._run_pipeline_streaming(chunks)
+        self.assertIn("read the file", reasoning_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
+
+    def test_streaming_missing_think_end(self):
+        """Bug scenario (streaming): model skips </think> and emits tool tokens directly."""
+        chunks = [
+            "<think>",
+            "Let me read the file.",
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{",
+            '"path": "/tmp/test.ts"',
+            "}<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        reasoning_text, normal_text, tool_calls = self._run_pipeline_streaming(chunks)
+        self.assertIn("read the file", reasoning_text)
+        self.assertEqual(len(tool_calls), 1, "Tool calls should be parsed even without </think> in streaming")
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
+
+    def test_streaming_tool_token_split_across_chunks(self):
+        """Tool call token is split across chunks while in reasoning mode."""
+        chunks = [
+            "<think>Thinking...",
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{"path": "/tmp/a.ts"}',
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        reasoning_text, normal_text, tool_calls = self._run_pipeline_streaming(chunks)
+        self.assertIn("Thinking", reasoning_text)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
+
+    def test_non_stream_no_thinking_at_all(self):
+        """Model emits tool call tokens without any thinking block."""
+        text = (
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{"path": "/tmp/test.ts"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        reasoning_text, remaining_text, tool_calls = self._run_pipeline_non_stream(text)
+        self.assertEqual(reasoning_text, "")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "ReadFile")
+
+    def test_streaming_no_thinking_at_all(self):
+        """Streaming: model emits tool call tokens without any thinking block."""
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.ReadFile:0<|tool_call_argument_begin|>{",
+            '"path": "/tmp/test.ts"',
+            "}<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+        reasoning_text, normal_text, tool_calls = self._run_pipeline_streaming(chunks)
+        self.assertEqual(reasoning_text, "")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "ReadFile")
 
 
 if __name__ == "__main__":
