@@ -442,28 +442,79 @@ async fn chat_completions_handler(
     if is_stream {
         let request_id = format!("chatcmpl-{}", Uuid::new_v4());
 
-        let stream = stream::once(async move {
-            let chunk = json!({
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": timestamp,
-                "model": "mock-model",
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": "This is a mock chat response."
-                    },
-                    "finish_reason": null
-                }]
+        // Check for slow streaming mode (used by upstream cancel tests).
+        // Reads from the global SLOW_STREAM_CONFIG (set via set_slow_stream_chunks)
+        // rather than the payload, because the gateway deserializes/re-serializes
+        // the request body and drops unknown fields.
+        let slow_chunks = get_slow_stream_chunks_for_port(config.port);
+
+        if let Some(num_chunks) = slow_chunks {
+            let port = config.port;
+            let delay_ms = config.response_delay_ms;
+
+            init_stream_tracking(port, num_chunks);
+
+            // Use capacity > 1 so the producer task can detect a dropped receiver
+            // (via send returning Err) without getting permanently parked.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
+
+            tokio::spawn(async move {
+                for i in 0..num_chunks {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    let chunk = json!({
+                        "id": &request_id,
+                        "object": "chat.completion.chunk",
+                        "created": timestamp,
+                        "model": "mock-model",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": format!("chunk-{} ", i)
+                            },
+                            "finish_reason": null
+                        }]
+                    });
+                    if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        // Client disconnected, stream was cancelled
+                        return;
+                    }
+                    record_chunk_sent(port);
+                }
+                // Send [DONE]
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                mark_stream_completed(port);
             });
 
-            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
-        })
-        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else {
+            let stream = stream::once(async move {
+                let chunk = json!({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": timestamp,
+                    "model": "mock-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": "This is a mock chat response."
+                        },
+                        "finish_reason": null
+                    }]
+                });
 
-        Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response()
+                Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+            })
+            .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
     } else {
         Json(json!({
             "id": format!("chatcmpl-{}", Uuid::new_v4()),
@@ -1192,6 +1243,92 @@ async fn responses_cancel_handler(
         .into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+// --- Slow-stream configuration (for upstream cancel tests) ---
+// Configured via a global map keyed by worker port so that tests
+// can enable slow streaming WITHOUT relying on the request payload
+// (the gateway deserializes/re-serializes the body, dropping unknown fields).
+
+static SLOW_STREAM_CONFIG: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
+
+fn get_slow_stream_config() -> &'static Mutex<HashMap<u16, usize>> {
+    SLOW_STREAM_CONFIG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Configure a worker (by port) to send `num_chunks` chunks with
+/// `response_delay_ms` between each when handling a streaming request.
+/// Call this before making the request through the gateway.
+pub fn set_slow_stream_chunks(port: u16, num_chunks: usize) {
+    let mut map = get_slow_stream_config().lock().unwrap();
+    map.insert(port, num_chunks);
+}
+
+/// Clear slow-stream configuration for a worker port.
+pub fn clear_slow_stream_chunks(port: u16) {
+    let mut map = get_slow_stream_config().lock().unwrap();
+    map.remove(&port);
+}
+
+fn get_slow_stream_chunks_for_port(port: u16) -> Option<usize> {
+    let map = get_slow_stream_config().lock().unwrap();
+    map.get(&port).copied()
+}
+
+// --- Stream cancellation tracking (for upstream cancel tests) ---
+
+/// Tracks the state of a streaming response for cancel verification.
+#[derive(Clone, Debug)]
+pub struct StreamTrackingState {
+    pub total_chunks: usize,
+    pub chunks_sent: usize,
+    pub completed: bool,
+}
+
+static STREAM_CANCEL_TRACKER: OnceLock<Mutex<HashMap<u16, StreamTrackingState>>> = OnceLock::new();
+
+fn get_stream_tracker() -> &'static Mutex<HashMap<u16, StreamTrackingState>> {
+    STREAM_CANCEL_TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reset the stream tracker for a given port before starting a new test.
+pub fn reset_stream_tracker(port: u16) {
+    let mut map = get_stream_tracker().lock().unwrap();
+    map.remove(&port);
+}
+
+/// Get the stream tracking state for a given port.
+pub fn get_stream_tracking_state(port: u16) -> Option<StreamTrackingState> {
+    let map = get_stream_tracker().lock().unwrap();
+    map.get(&port).cloned()
+}
+
+/// Initialize tracking for a new stream. Callers should invoke
+/// `reset_stream_tracker(port)` before each test to avoid stale state.
+fn init_stream_tracking(port: u16, total_chunks: usize) {
+    let mut map = get_stream_tracker().lock().unwrap();
+    map.insert(
+        port,
+        StreamTrackingState {
+            total_chunks,
+            chunks_sent: 0,
+            completed: false,
+        },
+    );
+}
+
+fn record_chunk_sent(port: u16) {
+    let mut map = get_stream_tracker().lock().unwrap();
+    if let Some(state) = map.get_mut(&port) {
+        state.chunks_sent += 1;
+    }
+}
+
+fn mark_stream_completed(port: u16) {
+    let mut map = get_stream_tracker().lock().unwrap();
+    if let Some(state) = map.get_mut(&port) {
+        state.completed = true;
     }
 }
 
