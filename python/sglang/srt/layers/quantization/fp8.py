@@ -72,6 +72,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -497,17 +498,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
 
-        cached_swizzled = getattr(layer, "weight_scale_inv_swizzled", None)
-        # Keep storage address stable when possible so CUDA graph captures remain valid.
-        if (
-            cached_swizzled is not None
-            and cached_swizzled.shape == new_swizzled.shape
-            and cached_swizzled.device == new_swizzled.device
-            and cached_swizzled.dtype == new_swizzled.dtype
-        ):
-            cached_swizzled.copy_(new_swizzled)
-        else:
-            layer.weight_scale_inv_swizzled = new_swizzled
+        copy_or_rebind_param(layer, "weight_scale_inv_swizzled", new_swizzled)
         layer._weight_scale_inv_swizzled_src_version = layer.weight_scale_inv._version
         layer._weight_scale_inv_swizzled_src_data_ptr = (
             layer.weight_scale_inv.data_ptr()
