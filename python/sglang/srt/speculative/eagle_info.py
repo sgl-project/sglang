@@ -39,13 +39,19 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
+    )
+elif is_hip():
+    from sgl_kernel import tree_speculative_sampling_target_only
+    from sglang.srt.speculative.spec_utils import (
+        top_k_renorm_prob_fallback as top_k_renorm_prob,
+        top_p_renorm_prob_fallback as top_p_renorm_prob,
     )
 
 logger = logging.getLogger(__name__)

@@ -47,7 +47,37 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda or _is_hip
+
+
+def top_k_renorm_prob_fallback(probs: torch.Tensor, top_k) -> torch.Tensor:
+    """PyTorch fallback for top-k probability renormalization (used on AMD/HIP)."""
+    if isinstance(top_k, int):
+        k = top_k
+    else:
+        k = top_k.max().item()
+    topk_vals, _ = torch.topk(probs, k=k, dim=-1)
+    if isinstance(top_k, torch.Tensor):
+        threshold = topk_vals.gather(-1, (top_k - 1).clamp(min=0).unsqueeze(-1).long())
+    else:
+        threshold = topk_vals[:, -1:]
+    probs = probs.masked_fill(probs < threshold, 0.0)
+    return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def top_p_renorm_prob_fallback(probs: torch.Tensor, top_p) -> torch.Tensor:
+    """PyTorch fallback for top-p probability renormalization (used on AMD/HIP)."""
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    if isinstance(top_p, torch.Tensor):
+        mask = (cumsum - sorted_probs) > top_p.unsqueeze(-1)
+    else:
+        mask = (cumsum - sorted_probs) > top_p
+    sorted_probs[mask] = 0.0
+    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    result = torch.zeros_like(probs)
+    result.scatter_(1, sorted_indices, sorted_probs)
+    return result
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
