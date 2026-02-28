@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -37,6 +38,8 @@ class AttentionType(Enum):
 
     # Decoder attention between previous layer Q/K/V
     DECODER = "decoder"
+    # Decoder bidirectional attention between image tokens
+    DECODER_BIDIRECTIONAL = "decoder_bidirectional"
     # Encoder attention between previous layer Q/K/V
     ENCODER_ONLY = "encoder_only"
 

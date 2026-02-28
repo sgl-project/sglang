@@ -15,13 +15,13 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
+use data_connector::{
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+};
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
-    data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-    },
     policies::PolicyRegistry,
     routers::RouterFactory,
     server::{build_app, AppState},
@@ -113,7 +113,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("WorkflowEngines should only be initialized once");
 
     // Initialize MCP manager with empty config
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -668,10 +668,8 @@ async fn test_wasm_module_execution() {
         .expect("Workflow engines should be initialized");
 
     // Create workflow context for registration
-    use smg::{
-        core::steps::{WasmModuleConfigRequest, WasmRegistrationWorkflowData},
-        workflow::WorkflowId,
-    };
+    use smg::core::steps::{WasmModuleConfigRequest, WasmRegistrationWorkflowData};
+    use wfaas::WorkflowId;
 
     let descriptor = WasmModuleDescriptor {
         name: "test_execution_module".to_string(),
@@ -716,7 +714,7 @@ async fn test_wasm_module_execution() {
             .expect("Failed to get workflow status");
 
         match state.status {
-            smg::workflow::WorkflowStatus::Completed => {
+            wfaas::WorkflowStatus::Completed => {
                 // Extract module UUID from typed workflow data
                 break state
                     .context
@@ -724,7 +722,7 @@ async fn test_wasm_module_execution() {
                     .module_uuid
                     .expect("Module UUID should be in context");
             }
-            smg::workflow::WorkflowStatus::Failed => {
+            wfaas::WorkflowStatus::Failed => {
                 panic!("Workflow failed: {:?}", state);
             }
             _ => {

@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -233,6 +235,9 @@ class TokenizerCommunicatorMixin:
         self.get_loads_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.dumper_control_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -330,6 +335,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadsReqOutput,
                     self.get_loads_communicator.handle_recv,
+                ),
+                (
+                    DumperControlReqOutput,
+                    self.dumper_control_communicator.handle_recv,
                 ),
             ]
         )
@@ -471,7 +480,7 @@ class TokenizerCommunicatorMixin:
         return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
-        self,
+        self: TokenizerManager,
         obj: DestroyWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -514,7 +523,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def init_weights_send_group_for_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -529,7 +538,7 @@ class TokenizerCommunicatorMixin:
         return result.success, result.message
 
     async def send_weights_to_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: SendWeightsToRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -572,7 +581,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def update_weights_from_ipc(
-        self,
+        self: TokenizerManager,
         obj: UpdateWeightsFromIPCReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -861,6 +870,11 @@ class TokenizerCommunicatorMixin:
         )
         return [res.updated for res in responses]
 
+    async def dumper_control(
+        self: TokenizerManager, obj: DumperControlReqInput
+    ) -> List[DumperControlReqOutput]:
+        return await self.dumper_control_communicator(obj)
+
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
@@ -893,9 +907,26 @@ class TokenizerCommunicatorMixin:
         return results
 
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: OpenSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if obj.streaming:
+            if not self.server_args.enable_streaming_session:
+                raise ValueError(
+                    "Streaming sessions are disabled. "
+                    "Please relaunch with --enable-streaming-session."
+                )
+            if (
+                self.server_args.speculative_algorithm is not None
+                and not self.server_args.disable_overlap_schedule
+            ):
+                raise ValueError(
+                    "Streaming sessions are incompatible with speculative decoding v2 "
+                    "(overlap + speculative). Use --disable-overlap-schedule or "
+                    "disable speculative decoding."
+                )
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
@@ -910,11 +941,15 @@ class TokenizerCommunicatorMixin:
         return session_id
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: CloseSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+    def _update_weight_version_if_provided(
+        self: TokenizerManager, weight_version: Optional[str]
+    ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version

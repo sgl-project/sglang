@@ -426,7 +426,7 @@ def fused_recurrent_sigmoid_update_128x32_col(
     )
 
 
-def cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update(
+def cutedsl_transpose_fused_sigmoid_gated_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -500,12 +500,12 @@ def cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update(
 
     if (
         compile_key
-        not in cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update.compile_cache
+        not in cutedsl_transpose_fused_sigmoid_gated_delta_rule_update.compile_cache
     ):
         logger.info(
-            f"\nCompiling fused_recurrent_sigmoid_gated_delta_rule_update_fwd kernel with state_dtype={dtype}, B={B}, T={T}, H={H}, HV={HV}, K={K}, V={V}, BV={BV}, use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel}"
+            f"\nCompiling cutedsl_transpose_fused_sigmoid_gated_delta_rule_update kernel with state_dtype={dtype}, B={B}, T={T}, H={H}, HV={HV}, K={K}, V={V}, BV={BV}, use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel}"
         )
-        cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update.compile_cache[
+        cutedsl_transpose_fused_sigmoid_gated_delta_rule_update.compile_cache[
             compile_key
         ] = cute.compile(
             fused_recurrent_sigmoid_update_128x32_col,
@@ -531,7 +531,7 @@ def cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update(
             # options="--enable-tvm-ffi"
         )
 
-    cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update.compile_cache[compile_key](
+    cutedsl_transpose_fused_sigmoid_gated_delta_rule_update.compile_cache[compile_key](
         A_log_,
         a_,
         dt_bias_,
@@ -549,7 +549,7 @@ def cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update(
     return o
 
 
-cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update.compile_cache = {}
+cutedsl_transpose_fused_sigmoid_gated_delta_rule_update.compile_cache = {}
 
 
 @cute.kernel
@@ -894,7 +894,7 @@ def fused_recurrent_update_128x32_col(
     )
 
 
-def cutedsl_fused_recurrent_gated_delta_rule_update(
+def cutedsl_transpose_fused_recurrent_gated_delta_rule_update(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -980,39 +980,44 @@ def cutedsl_fused_recurrent_gated_delta_rule_update(
     if stream is None:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if compile_key not in cutedsl_fused_recurrent_gated_delta_rule_update.compile_cache:
+    if (
+        compile_key
+        not in cutedsl_transpose_fused_recurrent_gated_delta_rule_update.compile_cache
+    ):
         logger.info(
-            f"\nCompiling cutedsl_fused_recurrent_gated_delta_rule_update kernel with state_dtype={dtype}, B={B}, T={T}, K={K}, V={V}, BV={BV}, use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel}, cache_steps={cache_steps}"
+            f"\nCompiling cutedsl_transpose_fused_recurrent_gated_delta_rule_update kernel with state_dtype={dtype}, B={B}, T={T}, K={K}, V={V}, BV={BV}, use_qk_l2norm_in_kernel={use_qk_l2norm_in_kernel}, cache_steps={cache_steps}"
         )
-        cutedsl_fused_recurrent_gated_delta_rule_update.compile_cache[compile_key] = (
-            cute.compile(
-                fused_recurrent_update_128x32_col,
-                q_,
-                k_,
-                v_,
-                h_,
-                o_,
-                g_,
-                beta_,
-                ind_,
-                cu_seqlens_,
-                intermediate_states_buffer_,
-                intermediate_state_indices_,
-                BK,
-                BV,
-                DIM=K,
-                scale=scale,
-                USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-                DISABLE_STATE_UPDATE=disable_state_update,
-                DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
-                CACHE_INTERMEDIATE_STATES=CACHE_INTERMEDIATE_STATES,
-                CACHE_STEPS=cache_steps,
-                stream=stream,
-                #  options="--enable-tvm-ffi"
-            )
+        cutedsl_transpose_fused_recurrent_gated_delta_rule_update.compile_cache[
+            compile_key
+        ] = cute.compile(
+            fused_recurrent_update_128x32_col,
+            q_,
+            k_,
+            v_,
+            h_,
+            o_,
+            g_,
+            beta_,
+            ind_,
+            cu_seqlens_,
+            intermediate_states_buffer_,
+            intermediate_state_indices_,
+            BK,
+            BV,
+            DIM=K,
+            scale=scale,
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            DISABLE_STATE_UPDATE=disable_state_update,
+            DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
+            CACHE_INTERMEDIATE_STATES=CACHE_INTERMEDIATE_STATES,
+            CACHE_STEPS=cache_steps,
+            stream=stream,
+            #  options="--enable-tvm-ffi"
         )
 
-    cutedsl_fused_recurrent_gated_delta_rule_update.compile_cache[compile_key](
+    cutedsl_transpose_fused_recurrent_gated_delta_rule_update.compile_cache[
+        compile_key
+    ](
         q_,
         k_,
         v_,
@@ -1030,4 +1035,4 @@ def cutedsl_fused_recurrent_gated_delta_rule_update(
     return o
 
 
-cutedsl_fused_recurrent_gated_delta_rule_update.compile_cache = {}
+cutedsl_transpose_fused_recurrent_gated_delta_rule_update.compile_cache = {}

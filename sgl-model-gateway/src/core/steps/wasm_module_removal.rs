@@ -3,15 +3,13 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tracing::{debug, info};
 use uuid::Uuid;
+use wfaas::{
+    FailureAction, StepDefinition, StepExecutor, StepId, StepResult, WorkflowContext,
+    WorkflowDefinition, WorkflowError, WorkflowResult,
+};
 
 use super::workflow_data::WasmRemovalWorkflowData;
-use crate::{
-    app_context::AppContext,
-    workflow::{
-        FailureAction, StepDefinition, StepExecutor, StepId, StepResult, WorkflowContext,
-        WorkflowDefinition, WorkflowError, WorkflowResult,
-    },
-};
+use crate::app_context::AppContext;
 
 /// WASM module removal request
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
