@@ -172,6 +172,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
@@ -721,9 +722,9 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+        if server_args.enable_streaming_session:
 
-        self.tree_cache = SessionAwareCache(self.tree_cache)
+            self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2937,7 +2938,6 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        # handle error
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
@@ -2968,7 +2968,8 @@ class Scheduler(
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
                 req.session = None
-        self.tree_cache.release_session(session_id)
+        if isinstance(self.tree_cache, SessionAwareCache):
+            self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
 
     def reap_timed_out_sessions(self):

@@ -45,6 +45,7 @@ class TestSessionControl(unittest.TestCase):
             other_args=[
                 "--attention-backend",
                 "flashinfer",
+                "--enable-streaming-session",
             ],
         )
 
