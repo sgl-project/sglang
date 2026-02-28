@@ -6,6 +6,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 
 import cv2
 import httpx
@@ -115,20 +116,20 @@ def wait_for_server_health(
 ) -> None:
     """Poll ``GET <base_url><path>`` until it returns HTTP 200."""
     deadline = time.time() + timeout
-    last_err: Exception | None = None
+    last_err: httpx.RequestError | None = None
     last_status: int | None = None
     while time.time() < deadline:
         try:
-            r = httpx.get(f"{base_url}{path}", timeout=5.0)
+            r = httpx.get(urljoin(base_url, path), timeout=5.0)
             last_status = r.status_code
             if r.status_code == 200:
                 return
-        except Exception as e:
+        except httpx.RequestError as e:
             last_err = e
         time.sleep(interval)
     raise TimeoutError(
-        f"Server at {base_url}{path} not healthy after {timeout}s. "
-        f"last_status={last_status} last_err={last_err}"
+        f"Server at {urljoin(base_url, path)} not healthy after {timeout}s. "
+        f"={last_status=} ={last_err=}"
     )
 
 
@@ -139,7 +140,7 @@ def post_json(
     timeout: float = 300.0,
 ) -> httpx.Response:
     """POST JSON to ``<base_url><path>`` and return the response."""
-    return httpx.post(f"{base_url}{path}", json=payload, timeout=timeout)
+    return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +148,11 @@ def post_json(
 # ---------------------------------------------------------------------------
 
 
-def query_gpu_mem_used_mib(gpu_index: int = 0) -> int | None:
-    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure."""
+def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | None:
+    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure.
+
+    When *required* is ``True`` the function raises instead of returning ``None``.
+    """
     try:
         out = subprocess.check_output(
             [
@@ -161,18 +165,12 @@ def query_gpu_mem_used_mib(gpu_index: int = 0) -> int | None:
         ).strip()
         return int(out.splitlines()[0].strip())
     except Exception as e:
-        logger.warning("nvidia-smi memory query failed: %s: %s", type(e).__name__, e)
+        logger.warning(f"nvidia-smi memory query failed: {type(e).__name__}: {e}")
+        assert not required, (
+            "nvidia-smi memory query is unavailable; "
+            "cannot enforce GPU memory assertions."
+        )
         return None
-
-
-def require_gpu_mem_query(gpu_index: int = 0) -> int:
-    """Like :func:`query_gpu_mem_used_mib` but raises when unavailable."""
-    mem = query_gpu_mem_used_mib(gpu_index)
-    assert mem is not None, (
-        "nvidia-smi memory query is unavailable; "
-        "cannot enforce GPU memory assertions."
-    )
-    return mem
 
 
 def assert_gpu_mem_changed(
@@ -183,12 +181,8 @@ def assert_gpu_mem_changed(
 ) -> None:
     """Assert that GPU memory changed by at least *min_delta_mib* MiB."""
     delta = abs(after_mib - before_mib)
-    logger.info(
-        "[MEM] %s: before=%d MiB  after=%d MiB  |delta|=%d MiB",
-        label,
-        before_mib,
-        after_mib,
-        delta,
+    logger.debug(
+        f"[MEM] {label}: before={before_mib} MiB  after={after_mib} MiB  |delta|={delta} MiB"
     )
     assert delta >= min_delta_mib, (
         f"GPU memory change too small for '{label}': "
