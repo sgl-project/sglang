@@ -32,10 +32,10 @@ if __name__ == "__main__":
     import warnings
 
     warnings.warn(
-        "'python -m sglang.launch_server' is deprecated and will be removed "
-        "in a future release. Use 'sglang serve' instead.\n"
+        "'python -m sglang.launch_server' is still supported, but "
+        "'sglang serve' is the recommended entrypoint.\n"
         "  Example: sglang serve --model-path <model> [options]",
-        FutureWarning,
+        UserWarning,
         stacklevel=1,
     )
 
