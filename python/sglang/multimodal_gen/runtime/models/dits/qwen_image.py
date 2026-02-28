@@ -1306,8 +1306,8 @@ class QwenImageTransformerBlock(nn.Module):
                     (img_attn_output, img_mod2, img_gate1, hidden_states),
                     pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-                logger.info(
-                    f"memory usage after img_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
+                logger.debug(
+                    f"memory usage after captured img_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
                 )
             module = self._cuda_graphs[
                 ("img_post_attention_forward", img_attn_output.shape)
@@ -1336,8 +1336,8 @@ class QwenImageTransformerBlock(nn.Module):
                     ),
                     pool=self.GLOBAL_GRAPH_POOL_HANDLE,
                 )
-                logger.info(
-                    f"memory usage after txt_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
+                logger.debug(
+                    f"memory usage after captured txt_post_attention_forward: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024:.2f} GB"
                 )
             module = self._cuda_graphs[
                 ("txt_post_attention_forward", txt_attn_output.shape)
