@@ -222,6 +222,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
+        # GQA expansion: tile Q/K from num_k_heads to num_v_heads (tiled pattern)
+        if layer.num_k_heads != layer.num_v_heads:
+            gqa_ratio = layer.num_v_heads // layer.num_k_heads
+            query = query.repeat(1, 1, gqa_ratio, 1)
+            key = key.repeat(1, 1, gqa_ratio, 1)
+
         core_attn_out = self.kernel_dispatcher.decode(
             q=query,
             k=key,
@@ -337,6 +343,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        # GQA expansion: tile Q/K from num_k_heads to num_v_heads.
+        # Must use tiled pattern [h0..h15, h0..h15] (torch.repeat),
+        # NOT interleaved [h0,h0,h1,h1,...] (repeat_interleave).
+        # The FLA kernel's built-in GQA (i_h // (H//Hg)) uses interleaved,
+        # but the model weights expect tiled pairing.
+        if layer.num_k_heads != layer.num_v_heads:
+            gqa_ratio = layer.num_v_heads // layer.num_k_heads
+            query = query.repeat(1, 1, gqa_ratio, 1)
+            key = key.repeat(1, 1, gqa_ratio, 1)
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 

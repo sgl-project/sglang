@@ -66,6 +66,7 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3VLConfig,
@@ -101,6 +102,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
@@ -294,8 +296,14 @@ def get_config(
 ):
     is_gguf = check_gguf_file(model)
     if is_gguf:
-        kwargs["gguf_file"] = model
-        model = Path(model).parent
+        gguf_parent = Path(model).parent
+        if (gguf_parent / "config.json").exists():
+            # Use config.json directly — avoids transformers GGUF binary parsing
+            # which doesn't support all architectures (e.g., qwen35moe).
+            model = str(gguf_parent)
+        else:
+            kwargs["gguf_file"] = model
+            model = gguf_parent
 
     if is_remote_url(model):
         # BaseConnector implements __del__() to clean up the local dir.
@@ -395,9 +403,13 @@ def get_config(
     # Special architecture mapping check for GGUF models
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
+            # For architectures not in HF's mapping (e.g., qwen3_5_moe_text),
+            # trust the architectures field from config.json if present.
+            if not getattr(config, "architectures", None):
+                raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+        else:
+            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            config.update({"architectures": [model_type]})
 
     return config
 

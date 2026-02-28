@@ -380,6 +380,7 @@ class ColumnParallelLinear(LinearBase):
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            param_data = param.data  # Refresh after materialization
 
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow here
@@ -538,8 +539,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
-            param.data[loaded_shard_id].copy_(loaded_weight)
-            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            if loaded_shard_id is not None:
+                param.data[loaded_shard_id].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+            else:
+                # Merged weight type — set all shards to the same type
+                for i in range(len(self.output_sizes)):
+                    param.data[i].copy_(loaded_weight)
+                    param.shard_weight_type[i] = loaded_weight.item()
             return
 
         if is_gguf_weight:
@@ -549,9 +556,23 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-            param.shard_id.append(loaded_shard_id)
-            param.shard_id_map[loaded_shard_id] = len(param.data_container)
-            param.data_container.append(loaded_weight)
+            if loaded_shard_id is not None:
+                # Individual shard (e.g., q_proj, k_proj, v_proj separately)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+            else:
+                # Merged weight (e.g., fused QKV from GGUF) — split into
+                # individual shards so _create_padded_weight_param can
+                # process them.
+                current_offset = 0
+                for i, output_size in enumerate(self.output_sizes):
+                    shard_dim = output_size // self.tp_size
+                    shard = loaded_weight.narrow(output_dim, current_offset, shard_dim)
+                    param.shard_id.append(i)
+                    param.shard_id_map[i] = len(param.data_container)
+                    param.data_container.append(shard)
+                    current_offset += shard_dim
             return
 
         param_data = param.data

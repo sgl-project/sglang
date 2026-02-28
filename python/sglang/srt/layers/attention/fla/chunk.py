@@ -190,9 +190,6 @@ def chunk_gated_delta_rule(
     """
     assert q.dtype == k.dtype == v.dtype
     assert (
-        q.dtype != torch.float32
-    ), "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert (
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
