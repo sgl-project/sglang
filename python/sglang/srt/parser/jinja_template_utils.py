@@ -127,6 +127,7 @@ def process_content_for_template_format(
     video_data: list,
     audio_data: list,
     modalities: list,
+    use_dpsk_v32_encoding: bool = False,
 ) -> dict:
     """
     Process message content based on detected template format.
@@ -138,6 +139,7 @@ def process_content_for_template_format(
         video_data: List to append extracted video URLs
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
+        use_dpsk_v32_encoding: If True, extract multimodal data and convert content to string (for DeepSeek-V3.2 encoding)
 
     Returns:
         Processed message dictionary
@@ -146,9 +148,11 @@ def process_content_for_template_format(
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
 
-    if content_format == "openai":
+    if content_format == "openai" or use_dpsk_v32_encoding:
         # OpenAI format: preserve structured content list, normalize types
+        # V32 encoding: extract multimodal data but convert content to string
         processed_content_parts = []
+        text_parts = []
         for chunk in msg_dict["content"]:
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
@@ -190,14 +194,21 @@ def process_content_for_template_format(
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
-                else:
-                    # Keep other content as-is (text, etc.)
-                    processed_content_parts.append(chunk)
+                elif chunk_type == "text":
+                    # For v32 encoding, collect text parts separately
+                    if use_dpsk_v32_encoding:
+                        text_parts.append(chunk["text"])
+                    else:
+                        # Keep text content as-is for openai format
+                        processed_content_parts.append(chunk)
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
         }
-        new_msg["content"] = processed_content_parts
+        if use_dpsk_v32_encoding:
+            new_msg["content"] = " ".join(text_parts) if text_parts else ""
+        else:
+            new_msg["content"] = processed_content_parts
         return new_msg
 
     elif content_format == "string":

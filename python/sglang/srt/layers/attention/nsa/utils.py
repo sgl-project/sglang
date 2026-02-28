@@ -13,11 +13,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    attn_tp_all_gather_into_tensor,
+    attn_cp_all_gather_into_tensor,
+    get_attention_cp_group,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_rank,
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -52,7 +52,7 @@ def is_nsa_prefill_cp_round_robin_split():
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
-    cp_size = get_attention_tp_size()
+    cp_size = get_attention_cp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
     return is_nsa_prefill_cp_round_robin_split() and seq_len > 0 and cp_size > 1
 
@@ -70,8 +70,8 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
     |   +-------------------------+
     """
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     if isinstance(input_, (tuple, list)):
         indices = range(cp_rank, len(input_), cp_size)
         return input_[indices]
@@ -93,9 +93,9 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
-    attn_tp_size = get_attention_tp_size()
+    attn_cp_size = get_attention_cp_size()
     for i in range(sync_group_size):
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
         forward_batch.is_extend_in_batch, global_num_tokens
     )
@@ -106,12 +106,17 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     else:
         tokens = global_num_tokens[0]
     if can_nsa_prefill_cp_round_robin_split(forward_batch):
-        tokens = ceil_div(tokens, attn_tp_size)
+        tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
-    if forward_batch.global_num_tokens_cpu is None:
+    attn_cp_size = get_attention_cp_size()
+    needs_cp_pad = attn_cp_size > 1 and can_nsa_prefill_cp_round_robin_split(
+        forward_batch
+    )
+    needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
+    if not needs_cp_pad and not needs_dp_pad:
         return nsa_cache_seqlens
     tokens = cal_padded_tokens(forward_batch)
     pad_len = tokens - nsa_cache_seqlens.shape[0]
@@ -170,7 +175,7 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_tp_size()
+        cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
@@ -187,7 +192,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_tp_size()
+        cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
@@ -227,8 +232,8 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
 
 
 def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
@@ -253,8 +258,8 @@ def nsa_cp_round_robin_split_q_seqs(
     bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
         i.e., those with a partitioned length greater than zero.
     """
-    cp_size = get_attention_tp_size()
-    cp_rank = get_attention_tp_rank()
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
@@ -299,7 +304,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     if pad_size > 0:
         input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
     with use_symmetric_memory(
-        get_attention_tp_group(), disabled=not is_allocation_symmetric()
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
     ):
         input_tensor_all = torch.empty(
             max_len * attn_tp_size,
@@ -308,7 +313,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
             dtype=input_.dtype,
         )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
+    get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_all, input_, stream_op
     )
     # step3
@@ -356,12 +361,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     if is_nsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
-            get_attention_tp_group(), disabled=not is_allocation_symmetric()
+            get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
             )
-        attn_tp_all_gather_into_tensor(
+        attn_cp_all_gather_into_tensor(
             output_tensor,
             input_tensor,
         )
