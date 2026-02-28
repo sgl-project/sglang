@@ -1129,7 +1129,6 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                # Skip if there are any streaming sessions (latency sensitive).
                 self.self_check_during_idle()
 
             # Update last_batch
@@ -1481,12 +1480,13 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        # Create a new request
-        if (
-            recv_req.session_params is None
-            or recv_req.session_params.id is None
-            or recv_req.session_params.id not in self.session_controller
-        ):
+        # Route: normal request / session request / session-not-found
+        session_id = (
+            recv_req.session_params.id if recv_req.session_params is not None else None
+        )
+
+        if session_id is None:
+            # Normal non-session request
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -1549,21 +1549,14 @@ class Scheduler(
                     self.stream_output([req], req.return_logprob)
                     return
 
-            if (
-                recv_req.session_params is not None
-                and recv_req.session_params.id is not None
-            ):
-                req.set_finish_with_abort(
-                    f"Invalid request: session id {recv_req.session_params.id} does not exist"
-                )
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-        else:
-            # Create a new request from a previous session
-            session = self.session_controller.get(recv_req.session_params.id)
+        elif session_id in self.session_controller:
+            # Session exists: create request from session
+            session = self.session_controller.get(session_id)
             req = session.create_req(
-                recv_req, self.tokenizer, self.model_config.vocab_size
+                recv_req,
+                self.tokenizer,
+                self.model_config.vocab_size,
+                eos_token_ids=self.model_config.hf_eos_token_id,
             )
             # TODO: set trace context
             if self.enable_metrics:
@@ -1573,22 +1566,28 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        else:
+            # Session ID provided but session not found
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                vocab_size=self.model_config.vocab_size,
+            )
+            req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(
+                f"Invalid request: session id {session_id} does not exist"
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
-            # For session requests, adjust mm_inputs offsets by the prefix length.
-            # Session.create_req prepends previous context to origin_input_ids,
-            # so offsets from the new prompt need to be shifted.
-            if len(recv_req.input_ids) < len(req.origin_input_ids):
-                assert recv_req.session_params.id in self.session_controller
-                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
-                for mm_item in image_inputs.mm_items:
-                    if mm_item.offsets:
-                        mm_item.offsets = [
-                            (start + prefix_len, end + prefix_len)
-                            for start, end in mm_item.offsets
-                        ]
+            SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings

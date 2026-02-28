@@ -98,7 +98,13 @@ class Session:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
 
-    def create_req(self, req: TokenizedGenerateReqInput, tokenizer, vocab_size: int):
+    def create_req(
+        self,
+        req: TokenizedGenerateReqInput,
+        tokenizer,
+        vocab_size: int,
+        eos_token_ids=None,
+    ):
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
         session_params = req.session_params
@@ -203,6 +209,14 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=vocab_size,
+            eos_token_ids=eos_token_ids,
+            require_reasoning=req.require_reasoning,
+            return_hidden_states=req.return_hidden_states,
+            return_routed_experts=req.return_routed_experts,
+            priority=req.priority,
+            routing_key=req.routing_key,
+            http_worker_ipc=req.http_worker_ipc,
+            time_stats=req.time_stats,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
@@ -277,3 +291,16 @@ class SessionController:
             for sid in timed_out:
                 logger.info(f"Session {sid} timed out, closing.")
                 self._close(sid)
+
+    @staticmethod
+    def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):
+        """Shift multimodal offsets when Session.create_req prepended context."""
+        if len(recv_req.input_ids) >= len(req.origin_input_ids):
+            return
+        prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+        for mm_item in image_inputs.mm_items:
+            if mm_item.offsets:
+                mm_item.offsets = [
+                    (start + prefix_len, end + prefix_len)
+                    for start, end in mm_item.offsets
+                ]
