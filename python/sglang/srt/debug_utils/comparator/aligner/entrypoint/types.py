@@ -4,7 +4,7 @@ from typing import Annotated, Optional, Union
 
 from pydantic import Discriminator
 
-from sglang.srt.debug_utils.comparator.aligner.axis_swapper import AxisSwapperPlan
+from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
 from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
     TokenAlignerPlan,
@@ -27,4 +27,4 @@ class AlignerPerStepPlan(_FrozenBase):
 class AlignerPlan(_FrozenBase):
     per_step_plans: Pair[list[AlignerPerStepPlan]]
     token_aligner_plan: Optional[TokenAlignerPlan] = None
-    axis_swapper_plan: Optional[AxisSwapperPlan] = None
+    axis_aligner_plan: Optional[AxisAlignerPlan] = None

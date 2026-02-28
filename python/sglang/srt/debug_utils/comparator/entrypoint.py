@@ -25,6 +25,7 @@ from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
+    NonTensorRecord,
     SkipRecord,
     SummaryRecord,
     print_record,
@@ -73,6 +74,10 @@ def run(args: argparse.Namespace) -> None:
         ),
     )
 
+    viz_output_dir: Optional[Path] = (
+        Path(args.viz_output_dir) if args.viz_bundle_details else None
+    )
+
     comparison_records = _compare_bundle_pairs(
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
@@ -80,6 +85,7 @@ def run(args: argparse.Namespace) -> None:
         token_aligner_plan=ta_result.plan,
         diff_threshold=args.diff_threshold,
         thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
+        viz_output_dir=viz_output_dir,
     )
     _consume_comparison_records(
         comparison_records=comparison_records, output_format=args.output_format
@@ -123,7 +129,7 @@ def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
 def _compute_skip_keys(args, *, has_token_aligner_plan: bool):
     skip_keys: set[str] = {"dump_index", "filename"}
     if args.grouping == "logical":
-        skip_keys |= {"rank"}
+        skip_keys |= {"rank", "recompute_status"}
         if has_token_aligner_plan:
             skip_keys |= {"step"}
     return skip_keys
@@ -137,7 +143,8 @@ def _compare_bundle_pairs(
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
-) -> Iterator[Union[ComparisonRecord, SkipRecord]]:
+    viz_output_dir: Optional[Path] = None,
+) -> Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
             continue
@@ -154,12 +161,13 @@ def _compare_bundle_pairs(
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
+            viz_output_dir=viz_output_dir,
         )
 
 
 def _consume_comparison_records(
     *,
-    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord]],
+    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]],
     output_format: str,
 ) -> None:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}
@@ -203,5 +211,17 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Tokenizer path for decoding input_ids (auto-discovered from dump metadata if not set)",
+    )
+    parser.add_argument(
+        "--viz-bundle-details",
+        action="store_true",
+        default=False,
+        help="Generate comparison heatmap/histogram PNG for each compared tensor",
+    )
+    parser.add_argument(
+        "--viz-output-dir",
+        type=str,
+        default="/tmp/comparator_viz/",
+        help="Output directory for visualization PNGs (default: /tmp/comparator_viz/)",
     )
     return parser.parse_args()

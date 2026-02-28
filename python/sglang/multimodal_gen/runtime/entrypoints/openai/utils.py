@@ -259,6 +259,10 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
             )
 
     total_time = time.perf_counter() - total_start_time

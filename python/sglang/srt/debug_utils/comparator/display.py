@@ -12,7 +12,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     RankInfoRecord,
     print_record,
 )
-from sglang.srt.debug_utils.dump_loader import ValueWithMeta
+from sglang.srt.debug_utils.dump_loader import LOAD_FAILED, ValueWithMeta
 
 _PARALLEL_INFO_KEYS: list[str] = ["sglang_parallel_info", "megatron_parallel_info"]
 
@@ -96,7 +96,7 @@ def _collect_input_ids_and_positions(
     for row in filtered.to_dicts():
         key: tuple[int, int] = (row["step"], row["rank"])
         item: ValueWithMeta = ValueWithMeta.load(dump_dir / row["filename"])
-        if item.value is not None:
+        if item.value is not LOAD_FAILED:
             data_by_step_rank[key][row["name"]] = item.value
 
     table_rows: list[dict[str, Any]] = []

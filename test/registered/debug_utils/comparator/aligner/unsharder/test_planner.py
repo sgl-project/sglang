@@ -421,6 +421,20 @@ class TestReplicatedAxes:
         with pytest.raises(ValueError, match="missing parallel_info"):
             compute_unsharder_plan(dim_specs, parallel_infos)
 
+    def test_recompute_pseudo_replicated(self) -> None:
+        """RECOMPUTE_PSEUDO with no dim annotation → replicated → PickParams."""
+        dim_specs = parse_dims("h d")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = [
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=0, axis_size=2)},
+            {ParallelAxis.RECOMPUTE_PSEUDO: AxisInfo(axis_rank=1, axis_size=2)},
+        ]
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 1
+        assert plans[0].axis == ParallelAxis.RECOMPUTE_PSEUDO
+        assert isinstance(plans[0].params, PickParams)
+        assert plans[0].groups == [[0, 1]]
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
