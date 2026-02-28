@@ -976,6 +976,7 @@ class Scheduler(
         ):
             self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
+                dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 pp_rank=self.pp_rank,
                 tp_rank=self.tp_rank,

@@ -251,6 +251,7 @@ class WaitingImageRequestMooncake:
         host_name,
         receive_count,
         tp_rank: int = 0,
+        gpu_id: int = 0,
         embeddings_engine=None,
         dtype=None,
         embedding_meta=None,
@@ -263,6 +264,7 @@ class WaitingImageRequestMooncake:
         self.host_name = host_name
         self.receive_count = receive_count
         self.tp_rank = tp_rank
+        self.gpu_id = gpu_id
         self.embeddings_engine = embeddings_engine
         self.embeddings_buffer_dict = embeddings_buffer_dict
         self.dtype = dtype
@@ -287,9 +289,11 @@ class WaitingImageRequestMooncake:
     def _run_send(self):
         """Allocate GPU buffer, register with mooncake, send /send to encoders."""
         try:
+            torch.cuda.set_device(self.gpu_id)
             asyncio.run(self._send_async())
         except Exception as e:
             logger.error(f"Mooncake send failed for {self.rid}: {e}", exc_info=True)
+            self._cleanup()
             self.error_msg = str(e)
             self.error_code = HTTPStatus.INTERNAL_SERVER_ERROR
             self.status = WaitingImageRequestStatus.FAIL
@@ -305,7 +309,7 @@ class WaitingImageRequestMooncake:
         embeddings = torch.zeros(
             (embedding_length_tot, embedding_dim),
             dtype=self.dtype,
-            device="cuda",
+            device=f"cuda:{self.gpu_id}",
         )
         self.embeddings_engine.register(embeddings.data_ptr(), embeddings.nbytes)
         self.embeddings_buffer_dict[self.rid] = embeddings
@@ -381,8 +385,13 @@ class WaitingImageRequestMooncake:
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
+
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
+        self.recv_embedding_data = None
+        self.embeddings_engine = None
+        self.embeddings_buffer_dict = None
+        self.mm_processor = None
 
     def _cleanup(self):
         if self.embeddings_buffer_dict and self.rid in self.embeddings_buffer_dict:
@@ -554,6 +563,8 @@ class MMReceiverHTTP(MMReceiverBase):
                         encoder_urls=self.encode_urls,
                         host_name=self.hostname,
                         receive_count=self.tp_size,
+                        tp_rank=self.tp_rank,
+                        gpu_id=self.scheduler.gpu_id,
                         embeddings_engine=self.embeddings_engine,
                         dtype=self.dtype,
                         embedding_meta=recv_req.mm_metadata,
@@ -602,6 +613,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )
+                if hasattr(waiting_req, "_cleanup"):
+                    waiting_req._cleanup()
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
@@ -613,6 +626,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 logger.error(
                     f"Timed out waiting for image embeddings for request {waiting_req.rid}"
                 )
+                if hasattr(waiting_req, "_cleanup"):
+                    waiting_req._cleanup()
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
