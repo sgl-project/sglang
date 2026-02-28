@@ -374,11 +374,14 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
-        if self.output_path is None and server_args.output_path is not None:
-            self.output_path = server_args.output_path
-            logger.debug(
-                f"Overriding output_path with server configuration: {self.output_path}"
-            )
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -890,6 +893,8 @@ class SamplingParams:
         return {attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
 
     def output_file_path(self):
+        if self.output_path is None:
+            return None
         return os.path.join(self.output_path, self.output_file_name)
 
     def _merge_with_user_params(self, user_params: "SamplingParams"):

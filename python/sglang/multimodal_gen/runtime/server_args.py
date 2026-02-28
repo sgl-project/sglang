@@ -293,6 +293,7 @@ class ServerArgs:
     scheduler_port: int = 5555
 
     output_path: str | None = "outputs/"
+    input_save_path: str | None = "inputs/uploads"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -336,6 +337,7 @@ class ServerArgs:
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._adjust_save_paths()
         self._adjust_offload()
         self._adjust_path()
         self._adjust_quant_config()
@@ -353,6 +355,13 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+
+    def _adjust_save_paths(self):
+        """Normalize empty-string save paths to None (disabled)."""
+        if self.output_path is not None and self.output_path.strip() == "":
+            self.output_path = None
+        if self.input_save_path is not None and self.input_save_path.strip() == "":
+            self.input_save_path = None
 
     def _adjust_quant_config(self):
         """validate and adjust"""
@@ -838,7 +847,13 @@ class ServerArgs:
             "--output-path",
             type=str,
             default=ServerArgs.output_path,
-            help="Directory path to save generated images/videos",
+            help='Directory path to save generated images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--input-save-path",
+            type=str,
+            default=ServerArgs.input_save_path,
+            help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
 
         # LoRA
