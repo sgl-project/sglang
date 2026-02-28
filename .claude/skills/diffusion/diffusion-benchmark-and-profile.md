@@ -71,9 +71,9 @@ if [ "$FAIL" -gt 0 ]; then
 fi
 ```
 
-**Minimum required for benchmarking**: `sglang`, `torch` with CUDA.  
-**Additional for Level 1 profiling**: `torch.profiler` (bundled with torch, always available).  
-**Additional for Level 2 profiling**: `nsys` on PATH, `gputrc2graph.py` present, `pandas`, `regex`.  
+**Minimum required for benchmarking**: `sglang`, `torch` with CUDA.
+**Additional for Level 1 profiling**: `torch.profiler` (bundled with torch, always available).
+**Additional for Level 2 profiling**: `nsys` on PATH, `gputrc2graph.py` present, `pandas`, `regex`.
 `plotly` is only needed to generate the HTML chart; `result.csv` is generated regardless.
 
 ---
@@ -98,7 +98,7 @@ All commands include `--warmup` (pre-warm torch.compile) and `--enable-torch-com
 
 ### 1. Qwen/Qwen-Image-2512 (Text-to-Image, single GPU)
 
-**Task**: Text-to-Image  
+**Task**: Text-to-Image
 **Resolution**: 1024×1024, 50 steps
 
 ```bash
@@ -124,8 +124,8 @@ sglang generate \
 
 ### 2. Qwen/Qwen-Image-Edit-2511 (Image Editing, single GPU)
 
-**Task**: Text-guided Image Editing  
-**Prerequisite**: `cat.png` (see Prerequisites)  
+**Task**: Text-guided Image Editing
+**Prerequisite**: `cat.png` (see Prerequisites)
 **Resolution**: 1024×1024, 50 steps
 
 ```bash
@@ -152,7 +152,7 @@ sglang generate \
 
 ### 3. black-forest-labs/FLUX.1-dev (Text-to-Image, single GPU)
 
-**Task**: Text-to-Image  
+**Task**: Text-to-Image
 **Resolution**: 1024×1024, 50 steps
 
 ```bash
@@ -175,7 +175,7 @@ sglang generate \
 
 ### 4. black-forest-labs/FLUX.2-dev (Text-to-Image, single GPU)
 
-**Task**: Text-to-Image  
+**Task**: Text-to-Image
 **Resolution**: 1024×1024
 
 ```bash
@@ -198,7 +198,7 @@ sglang generate \
 
 ### 5. Tongyi-MAI/Z-Image-Turbo (Turbo Text-to-Image, single GPU)
 
-**Task**: Text-to-Image (few-step turbo mode, guidance=0)  
+**Task**: Text-to-Image (few-step turbo mode, guidance=0)
 **Resolution**: 1024×1024, **9 steps**
 
 ```bash
@@ -224,8 +224,8 @@ sglang generate \
 
 ### 6. Wan-AI/Wan2.2-T2V-A14B-Diffusers 720P (Text-to-Video, 8 GPUs)
 
-**Task**: Text-to-Video  
-**Resolution**: 720P, 81 frames, 40 steps  
+**Task**: Text-to-Video
+**Resolution**: 720P, 81 frames, 40 steps
 **Parallelism**: 8 GPUs, Ulysses degree=4, CFG parallel + layerwise offload
 
 ```bash
@@ -257,8 +257,8 @@ sglang generate \
 
 ### 7. Wan-AI/Wan2.2-TI2V-5B-Diffusers 720P (Text-Image-to-Video, single GPU)
 
-**Task**: Text-Image-to-Video  
-**Prerequisite**: `astronaut.jpg` (see Prerequisites)  
+**Task**: Text-Image-to-Video
+**Prerequisite**: `astronaut.jpg` (see Prerequisites)
 **Resolution**: 720P, 81 frames, 50 steps
 
 ```bash
