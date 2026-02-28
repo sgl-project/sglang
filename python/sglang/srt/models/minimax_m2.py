@@ -967,6 +967,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+        self.pp_group = get_pp_group()
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -999,17 +1000,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # _print_tensor_info(input_ids, "input_ids")
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
@@ -1067,11 +1077,12 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
                 if name not in params_dict:
                     continue
+
+                if name.endswith(".bias"):
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
