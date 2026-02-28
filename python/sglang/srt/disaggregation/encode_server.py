@@ -662,8 +662,8 @@ class MMEncoder:
             self.engine.deregister(embedding.data_ptr())
 
             if backend != "mooncake_to_scheduler":
-                # only mooncake_to_scheduler needs to keep the embedding
-                # TODO: embedding will released after send
+                # mooncake_to_scheduler keeps embedding alive for multi-receiver;
+                # released in /send endpoint when _send_ref_counts drops to zero.
                 mm_data.embedding = None
                 mm_data.embedding_list[mm_data.part_idx] = None
 
@@ -1251,7 +1251,10 @@ async def handle_send_request(request: dict):
             encoder._send_ref_counts[req_id] = ref - 1
         if encoder._send_ref_counts[req_id] <= 0:
             encoder._send_ref_counts.pop(req_id, None)
-            encoder.embedding_to_send.pop(req_id, None)
+            mm_data = encoder.embedding_to_send.pop(req_id, None)
+            if mm_data is not None:
+                mm_data.embedding = None
+                mm_data.embedding_list[mm_data.part_idx] = None
             encoder._forward_ready_events.pop(req_id, None)
     else:
         encoder.embedding_to_send.pop(req_id, None)
