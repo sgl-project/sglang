@@ -971,7 +971,8 @@ class Scheduler(
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ("zmq_to_scheduler", "mooncake_to_scheduler")
         ):
             self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
@@ -1304,7 +1305,8 @@ class Scheduler(
         if (
             self.pp_rank == 0
             and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend
+            in ("zmq_to_scheduler", "mooncake_to_scheduler")
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:

@@ -228,6 +228,7 @@ class GenerateReqInput(BaseReq):
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
     num_items_assigned: Optional[List] = None
+    mm_metadata: Optional[List[dict]] = None
 
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
@@ -733,6 +734,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+    mm_metadata: Optional[List[dict]] = None
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None

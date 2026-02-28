@@ -147,7 +147,12 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
-ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+ENCODER_TRANSFER_BACKEND_CHOICES = [
+    "zmq_to_scheduler",
+    "zmq_to_tokenizer",
+    "mooncake",
+    "mooncake_to_scheduler",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -2626,7 +2631,7 @@ class ServerArgs:
         if (
             self.disaggregation_transfer_backend == "mooncake"
             and self.disaggregation_mode in ("prefill", "decode")
-        ) or self.encoder_transfer_backend == "mooncake":
+        ) or self.encoder_transfer_backend in ("mooncake", "mooncake_to_scheduler"):
             self.disaggregation_ib_device = self._validate_ib_devices(
                 self.disaggregation_ib_device
             )

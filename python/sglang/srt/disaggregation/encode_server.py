@@ -192,6 +192,12 @@ class MMEncoder:
             device_config=self.device_config,
         )
 
+        visual = getattr(self.model, "visual", None)
+        if visual is not None and hasattr(visual, "out_hidden_size"):
+            self.vit_embedding_dim = visual.out_hidden_size
+        else:
+            self.vit_embedding_dim = self.model_config.hidden_size
+
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
@@ -231,12 +237,33 @@ class MMEncoder:
                 f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
             )
 
-            if self.server_args.encoder_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend in (
+                "mooncake",
+                "mooncake_to_scheduler",
+            ):
                 self.local_ip = get_local_ip_auto()
 
+                # for encoder-only, we need to initialize mooncake transfer engine
+                # while for language-only, mooncake transfer engine is initialized by ModelRunner
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    init_mooncake_transfer_engine,
+                )
+
+                init_mooncake_transfer_engine(
+                    hostname=self.local_ip,
+                    gpu_id=self.gpu_id,
+                    ib_device=(
+                        self.server_args.disaggregation_ib_device
+                        or self.server_args.mooncake_ib_device
+                    ),
+                )
                 self.engine = get_mooncake_transfer_engine()
 
             self.embedding_to_send = dict()
+            # for mooncake_to_scheduler, we need to keep the reference count of the embedding
+            # so that the embedding can be released after send
+            self._send_ref_counts: dict = {}
+            self._forward_ready_events: dict = {}
 
         logger.info(f"rank {rank} init finish ")
 
@@ -594,7 +621,13 @@ class MMEncoder:
             if mm_embedding is None:
                 with torch.inference_mode():
                     mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                    mm_embedding = mm_embedding.cpu()
+                    if (
+                        self.server_args.encoder_transfer_backend
+                        == "mooncake_to_scheduler"
+                    ):
+                        mm_embedding = mm_embedding.contiguous()
+                    else:
+                        mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
@@ -620,15 +653,19 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        backend = self.server_args.encoder_transfer_backend
+        if backend in ("mooncake", "mooncake_to_scheduler"):
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
             )
             self.engine.deregister(embedding.data_ptr())
 
-            mm_data.embedding = None
-            mm_data.embedding_list[mm_data.part_idx] = None
+            if backend != "mooncake_to_scheduler":
+                # only mooncake_to_scheduler needs to keep the embedding
+                # TODO: embedding will released after send
+                mm_data.embedding = None
+                mm_data.embedding_list[mm_data.part_idx] = None
 
         # Send ack/data
         endpoint = (
@@ -639,11 +676,16 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if self.server_args.encoder_transfer_backend == "mooncake":
-            serialized_data = pickle.dumps(mm_data)
+        if backend != "mooncake":
+            new_mm_data = mm_data.copy_without_embedding()
+        else:
+            new_mm_data = mm_data
+        new_mm_data.send_time = time.time()
+
+        if backend in ("mooncake", "mooncake_to_scheduler"):
+            serialized_data = pickle.dumps(new_mm_data)
             buffer = None
         else:
-            new_mm_data = mm_data.copy_without_embedding()
             if new_mm_data.error_msg is not None:
                 buffer = None
                 serialized_data = pickle.dumps(new_mm_data)
@@ -702,6 +744,95 @@ class MMEncoder:
                 self.embedding_to_send[req_id] = mm_data
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
+
+    async def preprocess_only(self, mm_items):
+        """Phase 1: img_load + preprocess only. Returns shape metadata without VIT forward."""
+        t0 = time.time()
+        try:
+            images = await self._flatten_and_load_images(mm_items)
+        except Exception as e:
+            raise BadRequestError(f"Failed to load images from input: {str(e)}")
+
+        try:
+            kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+            images_input = self.image_processor(images=images, **kwargs)
+
+            image_grid_dim = _get_image_grid_dim(images_input)
+            embedding_len = sum(self.get_num_tokens(g) for g in image_grid_dim)
+            embedding_dim = self.vit_embedding_dim
+            embedding_size = (
+                embedding_len
+                * embedding_dim
+                * torch.finfo(self.model_config.dtype).bits
+                // 8
+            )
+
+            return images_input, embedding_len, embedding_dim, embedding_size
+        except BadRequestError as e:
+            raise BadRequestError(f"Bad request error: {str(e)}")
+        except Exception as e:
+            raise InternalError(f"Internal encoding error: {str(e)}")
+
+    def _forward_and_store_sync(self, images_input, req_id, num_parts, part_idx):
+        """Phase 2 (sync): VIT forward + store embedding. Runs in thread pool to avoid blocking event loop."""
+        try:
+            feature = images_input["pixel_values"]
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": Modality.IMAGE,
+                    "feature": _convert(feature),
+                }
+            )
+            for k, v in images_input.items():
+                if k == "pixel_values":
+                    continue
+                mm_item.set(k, _convert(v))
+
+            with torch.inference_mode():
+                mm_embedding = self.model.get_image_feature([mm_item])
+                t_forward = time.time()
+                mm_embedding = mm_embedding.contiguous()
+                t_contiguous = time.time()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+
+            if self.profiler is not None:
+                self.profiler.step()
+
+            image_grid_dim = _get_image_grid_dim(images_input)
+
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id, num_parts, part_idx, image_grid_dim, mm_embedding
+                )
+                self.embedding_to_send[req_id] = mm_data
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(f"Rank {self.rank} forward_and_store failed: {error_msg}")
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    None,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
+                self.embedding_to_send[req_id] = mm_data
+
+    async def forward_and_store(self, images_input, req_id, num_parts, part_idx):
+        """Phase 2 (async wrapper): runs VIT forward in thread pool, then signals ready."""
+        await asyncio.get_event_loop().run_in_executor(
+            self.executor,
+            self._forward_and_store_sync,
+            images_input,
+            req_id,
+            num_parts,
+            part_idx,
+        )
+        if self.rank == 0 and req_id in self._forward_ready_events:
+            self._forward_ready_events[req_id].set()
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -964,6 +1095,49 @@ async def handle_encode_request(request: dict):
         request.update({"enter_time": time.time()})
         for socket in send_sockets:
             socket.send_pyobj(request)
+
+        if encoder.server_args.encoder_transfer_backend == "mooncake_to_scheduler":
+            # TODO: support global mm cache
+            try:
+                images_input, embedding_len, embedding_dim, embedding_size = (
+                    await encoder.preprocess_only(mm_items=request["mm_items"])
+                )
+
+                event = asyncio.Event()
+                encoder._forward_ready_events[req_id] = event
+
+                async def _bg_forward():
+                    try:
+                        await encoder.forward_and_store(
+                            images_input,
+                            req_id=request["req_id"],
+                            num_parts=request["num_parts"],
+                            part_idx=request["part_idx"],
+                        )
+                    except Exception as e:
+                        logger.error(f"Background forward failed for {req_id}: {e}")
+
+                task = asyncio.create_task(_bg_forward())
+                encoder.background_tasks.add(task)
+                task.add_done_callback(encoder.background_tasks.discard)
+
+                del request["mm_items"]
+                request.update(
+                    {
+                        "embedding_size": embedding_size,
+                        "embedding_len": embedding_len,
+                        "embedding_dim": embedding_dim,
+                    }
+                )
+                return ORJSONResponse(content=request)
+            except Exception as e:
+                error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+                error_msg = str(e)
+                return ORJSONResponse(
+                    status_code=error_code,
+                    content={"status": "error", "message": error_msg, "req_id": req_id},
+                )
+
         if encoder.mm_global_cache is not None:
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode_with_global_cache(
@@ -1053,15 +1227,34 @@ async def handle_encode_request(request: dict):
 
 @app.post("/send")
 async def handle_send_request(request: dict):
-    # mooncake backend
+    # mooncake / mooncake_to_scheduler backend
+    req_id = request["req_id"]
+
+    if encoder.server_args.encoder_transfer_backend == "mooncake_to_scheduler":
+        event = encoder._forward_ready_events.get(req_id)
+        if event is not None and not event.is_set():
+            await event.wait()
+
     await encoder.send(
-        req_id=request["req_id"],
+        req_id=req_id,
         prefill_host=request["prefill_host"],
         embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    encoder.embedding_to_send.pop(request["req_id"], None)
+    if encoder.server_args.encoder_transfer_backend == "mooncake_to_scheduler":
+        receive_count = request.get("receive_count", 1)
+        ref = encoder._send_ref_counts.get(req_id)
+        if ref is None:
+            encoder._send_ref_counts[req_id] = receive_count - 1
+        else:
+            encoder._send_ref_counts[req_id] = ref - 1
+        if encoder._send_ref_counts[req_id] <= 0:
+            encoder._send_ref_counts.pop(req_id, None)
+            encoder.embedding_to_send.pop(req_id, None)
+            encoder._forward_ready_events.pop(req_id, None)
+    else:
+        encoder.embedding_to_send.pop(req_id, None)
     return ORJSONResponse(content=None)
 
 
