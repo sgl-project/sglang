@@ -159,7 +159,11 @@ def _resolve_unshard_params(
             f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
         )
 
-    if spec.name == TOKEN_DIM_NAME and thd_global_seq_lens is not None:
+    if (
+        spec.name == TOKEN_DIM_NAME
+        and spec.parallel == ParallelAxis.CP
+        and thd_global_seq_lens is not None
+    ):
         if spec.parallel is None:
             raise ValueError(
                 f"THD unshard requires a parallel axis on dim '{spec.name}', but got None"

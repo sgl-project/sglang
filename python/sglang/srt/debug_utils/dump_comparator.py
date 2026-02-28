@@ -194,16 +194,12 @@ def _compute_and_print_diff(
     mean_abs_diff = raw_abs_diff.mean().item()
     rel_diff = _calc_rel_diff(x_target, x_baseline)
 
+    rel_diff_marker: str = "❌" if rel_diff > diff_threshold else "✅"
     print(
         prefix_text
-        + "\t".join(
-            f"{'❌' if value > diff_threshold else '✅'} {name}={value}"
-            for name, value in [
-                ("rel_diff", rel_diff),
-                ("max_abs_diff", max_abs_diff),
-                ("mean_abs_diff", mean_abs_diff),
-            ]
-        )
+        + f"{rel_diff_marker} rel_diff={rel_diff}\t"
+        + f"max_abs_diff={max_abs_diff}\t"
+        + f"mean_abs_diff={mean_abs_diff}"
     )
 
     max_diff_coord = _argmax_coord(raw_abs_diff)

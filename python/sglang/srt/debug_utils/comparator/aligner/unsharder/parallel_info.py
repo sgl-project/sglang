@@ -6,12 +6,17 @@ from sglang.srt.debug_utils.comparator.dims import ParallelAxis
 _PARALLEL_INFO_KEYS = ("sglang_parallel_info", "megatron_parallel_info")
 
 
+def _is_error_sentinel(value: dict) -> bool:
+    """Check if a parallel_info dict is an error sentinel (e.g. {'megatron_error': True})."""
+    return any(k.endswith("_error") for k in value)
+
+
 def normalize_parallel_info(meta: dict) -> dict[ParallelAxis, AxisInfo]:
     """Extract unified parallel info from dump meta."""
     info: Optional[dict] = None
     for key in _PARALLEL_INFO_KEYS:
         value = meta.get(key)
-        if isinstance(value, dict) and value:
+        if isinstance(value, dict) and value and not _is_error_sentinel(value):
             if info is not None:
                 raise ValueError(
                     f"Meta contains multiple parallel_info keys among {_PARALLEL_INFO_KEYS}"
