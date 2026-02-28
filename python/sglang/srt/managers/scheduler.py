@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -112,7 +112,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -167,7 +166,7 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.managers.session_controller import Session
+from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -755,8 +754,7 @@ class Scheduler(
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-        self.sessions: Dict[str, Session] = {}
-        self._last_reap_sessions: float = 0.0
+        self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1363,9 +1361,7 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
-        if now - self._last_reap_sessions > 1.0:  # reap sessions every second
-            self._last_reap_sessions = now
-            self.reap_timed_out_sessions()
+        self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1489,7 +1485,7 @@ class Scheduler(
         if (
             recv_req.session_params is None
             or recv_req.session_params.id is None
-            or recv_req.session_params.id not in self.sessions
+            or recv_req.session_params.id not in self.session_controller
         ):
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
@@ -1565,7 +1561,7 @@ class Scheduler(
                 return
         else:
             # Create a new request from a previous session
-            session = self.sessions[recv_req.session_params.id]
+            session = self.session_controller.get(recv_req.session_params.id)
             req = session.create_req(
                 recv_req, self.tokenizer, self.model_config.vocab_size
             )
@@ -1585,7 +1581,7 @@ class Scheduler(
             # Session.create_req prepends previous context to origin_input_ids,
             # so offsets from the new prompt need to be shifted.
             if len(recv_req.input_ids) < len(req.origin_input_ids):
-                assert recv_req.session_params.id in self.sessions
+                assert recv_req.session_params.id in self.session_controller
                 prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
                 for mm_item in image_inputs.mm_items:
                     if mm_item.offsets:
@@ -2938,47 +2934,10 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        session_id = recv_req.session_id
-        if session_id in self.sessions:
-            logger.warning(f"session id {session_id} already exist, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
-        elif session_id is None:
-            logger.warning("session id is None, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
-        else:
-            self.sessions[session_id] = Session(
-                recv_req.capacity_of_str_len,
-                session_id,
-                streaming=bool(recv_req.streaming),
-                timeout=recv_req.timeout,
-            )
-            return OpenSessionReqOutput(session_id, True)
+        return self.session_controller.open(recv_req)
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        session_id = recv_req.session_id
-        if session_id not in self.sessions:
-            logger.warning(f"session id {session_id} does not exist, cannot delete.")
-        else:
-            self._close_session(session_id)
-
-    def _close_session(self, session_id: str):
-        session = self.sessions[session_id]
-        if session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            req = next(iter(session.req_nodes.values())).req
-            if not req.finished():
-                req.session = None
-        if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(session_id)
-        del self.sessions[session_id]
-
-    def reap_timed_out_sessions(self):
-        timed_out = [
-            sid for sid, session in self.sessions.items() if session.is_timed_out()
-        ]
-        for sid in timed_out:
-            logger.info(f"Session {sid} timed out, closing.")
-            self._close_session(sid)
+        self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
