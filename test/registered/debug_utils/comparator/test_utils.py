@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.debug_utils.comparator.utils import (
+    Pair,
     argmax_coord,
     calc_rel_diff,
     compute_smaller_dtype,
@@ -78,16 +79,43 @@ class TestTryUnifyShape:
 
 class TestComputeSmallerDtype:
     def test_float32_bfloat16(self):
-        assert compute_smaller_dtype(torch.float32, torch.bfloat16) == torch.bfloat16
+        assert (
+            compute_smaller_dtype(Pair(x=torch.float32, y=torch.bfloat16))
+            == torch.bfloat16
+        )
 
     def test_reverse_order(self):
-        assert compute_smaller_dtype(torch.bfloat16, torch.float32) == torch.bfloat16
+        assert (
+            compute_smaller_dtype(Pair(x=torch.bfloat16, y=torch.float32))
+            == torch.bfloat16
+        )
 
     def test_same_dtype_returns_none(self):
-        assert compute_smaller_dtype(torch.float32, torch.float32) is None
+        assert compute_smaller_dtype(Pair(x=torch.float32, y=torch.float32)) is None
 
     def test_unknown_pair_returns_none(self):
-        assert compute_smaller_dtype(torch.int32, torch.int64) is None
+        assert compute_smaller_dtype(Pair(x=torch.int32, y=torch.int64)) is None
+
+
+class TestPairMap:
+    def test_map_basic(self):
+        pair = Pair(x=[1, 2, 3], y=[4, 5, 6])
+        result = pair.map(lambda lst: sum(lst))
+        assert result.x == 6
+        assert result.y == 15
+
+    def test_map_type_change(self):
+        pair = Pair(x=[1, 2, 3], y=[10, 20])
+        result = pair.map(len)
+        assert result.x == 3
+        assert result.y == 2
+
+    def test_map_returns_new_pair(self):
+        pair = Pair(x="hello", y="world")
+        result = pair.map(str.upper)
+        assert result.x == "HELLO"
+        assert result.y == "WORLD"
+        assert result is not pair
 
 
 if __name__ == "__main__":
