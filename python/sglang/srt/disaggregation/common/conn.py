@@ -128,8 +128,7 @@ class CommonKVManager(BaseKVManager):
             self.is_dummy_cp_rank = (
                 is_mla_backend and self.attn_cp_size > 1 and self.attn_cp_rank != 0
             )
-            if not self.is_dummy_cp_rank:
-                self.register_to_bootstrap()
+            self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -663,7 +662,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, host: str, port: int, dp_size: int = 1):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         self.app = web.Application()
@@ -673,7 +672,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.pp_size = None
         self.attn_tp_size = None
         self.attn_cp_size = None
-        self.dp_size = dp_size
+        self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
@@ -694,11 +693,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _is_ready(self) -> bool:
-        if self.attn_tp_size is None or self.pp_size is None:
+        if (
+            self.attn_tp_size is None
+            or self.attn_cp_size is None
+            or self.pp_size is None
+            or self.dp_size is None
+        ):
             return False
-        # TODO: verify this expected count is correct for all parallelism
-        # combinations (CP / DP attention / system DP / TP / PP).
-        expected = self.dp_size * self.attn_tp_size * self.pp_size
+        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        logger.debug(
+            f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
+        )
         return self._registered_count >= expected
 
     def _setup_routes(self):
