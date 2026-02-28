@@ -1585,7 +1585,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner.runner_backend.is_flashinfer_trtllm()
             or self.runner.runner_backend.is_flashinfer_trtllm_routed()
         ):
-            # FlashInfer TRT-LLM backends only support fused execution.
             global_num_experts = int(getattr(layer, "num_experts"))
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
