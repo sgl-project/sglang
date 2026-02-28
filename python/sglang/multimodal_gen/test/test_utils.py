@@ -1,12 +1,15 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
+import io
 import json
 import os
 import socket
+import tempfile
 import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -79,6 +82,19 @@ def is_png(data):
 def is_webp(data: bytes) -> bool:
     # WebP files start with: RIFF....WEBP
     return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def detect_image_format(data: bytes) -> str:
+    """Detect image format from bytes (magic). Returns 'png'|'jpeg'|'webp'; default 'png'."""
+    if len(data) < 12:
+        return "png"
+    if is_png(data):
+        return "png"
+    if is_jpeg(data):
+        return "jpeg"
+    if is_webp(data):
+        return "webp"
+    return "png"
 
 
 def get_expected_image_format(
@@ -321,6 +337,22 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
         cap.release()
 
 
+def get_video_frame_count(file_path: str) -> int:
+    """Return the number of frames in a video file using OpenCV."""
+    cap = cv2.VideoCapture(file_path)
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if count > 0:
+            return count
+        # Fallback: count frames manually
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        return n
+    finally:
+        cap.release()
+
+
 def validate_video_file(
     file_path: str,
     expected_filename: str,
@@ -358,3 +390,88 @@ def validate_video_file(
         assert (
             actual_height == expected_height
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
+
+
+def output_format_to_ext(output_format: str | None) -> str:
+    """Map output_format to file extension. Used by GT naming and consistency check."""
+    if not output_format:
+        return "png"
+    of = output_format.lower()
+    if of == "jpeg":
+        return "jpg"
+    if of in ("png", "webp", "jpg"):
+        return of
+    return "png"
+
+
+def _consistency_gt_filenames(
+    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+) -> list[str]:
+    """Return the list of GT image filenames for a case. Reused by GT generation and consistency check."""
+    n = num_gpus
+    if is_video:
+        return [
+            f"{case_id}_{n}gpu_frame_0.png",
+            f"{case_id}_{n}gpu_frame_mid.png",
+            f"{case_id}_{n}gpu_frame_last.png",
+        ]
+    ext = output_format_to_ext(output_format)
+    return [f"{case_id}_{n}gpu.{ext}"]
+
+
+def extract_key_frames_from_video(
+    video_bytes: bytes,
+    num_frames: int | None = None,
+) -> list[np.ndarray]:
+    """
+    Extract key frames (first, middle, last) from video bytes.
+
+    Args:
+        video_bytes: Raw video bytes (MP4 format)
+        num_frames: Total number of frames (if known), used for validation
+
+    Returns:
+        List of numpy arrays [first_frame, middle_frame, last_frame].
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise ValueError("Failed to open video file")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 1:
+            raise ValueError("Video has no frames")
+
+        first_idx = 0
+        mid_idx = total_frames // 2
+        last_idx = total_frames - 1
+        key_indices = [first_idx, mid_idx, last_idx]
+
+        frames = []
+        for idx in key_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                raise ValueError(f"Failed to read frame at index {idx}")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+
+        cap.release()
+        logger.info(
+            f"Extracted {len(frames)} key frames from video "
+            f"(total: {total_frames}, indices: {key_indices})"
+        )
+        return frames
+
+    finally:
+        os.unlink(tmp_path)
+
+
+def image_bytes_to_numpy(image_bytes: bytes) -> np.ndarray:
+    """Convert image bytes to numpy array."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.array(img)

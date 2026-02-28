@@ -1133,7 +1133,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)

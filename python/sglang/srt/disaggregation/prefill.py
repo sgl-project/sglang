@@ -39,7 +39,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
-    poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -269,8 +269,10 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce(
-            [req.disagg_kv_sender for req in self.queue], self.gloo_group
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -553,8 +555,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
@@ -621,8 +624,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Used by PP, get the transferred rids but **do not pop**
         """
-        polls = poll_and_all_reduce(
+        polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 

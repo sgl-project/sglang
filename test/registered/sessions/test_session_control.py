@@ -3,11 +3,13 @@ Usage:
 python3 -m unittest test_session_control.TestSessionControl.test_session_control
 python3 -m unittest test_session_control.TestSessionControl.test_session_control_with_branching
 python3 -m unittest test_session_control.TestSessionControl.test_session_control_backtrack_with_abort
+python3 -m unittest test_session_control.TestSessionControl.test_streaming_session
 python3 -m unittest test_session_control.TestSessionControlVision.test_session_control
 """
 
 import asyncio
 import json
+import time
 import unittest
 
 import aiohttp
@@ -15,6 +17,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -22,6 +25,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=60, suite="stage-b-test-large-1-gpu")
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -40,6 +45,7 @@ class TestSessionControl(unittest.TestCase):
             other_args=[
                 "--attention-backend",
                 "flashinfer",
+                "--enable-streaming-session",
             ],
         )
 
@@ -428,6 +434,162 @@ class TestSessionControl(unittest.TestCase):
     def test_session_control_backtrack_with_abort(self):
         asyncio.run(self.run_session_control_backtrack_with_abort(replace=True))
         asyncio.run(self.run_session_control_backtrack_with_abort(replace=False))
+
+    def test_streaming_session(self, gen_len=12):
+        chunks = [
+            "Let me tell you something about France.",
+            "The capital of France is",
+            "The population of the city is",
+        ]
+        tokenizer = get_tokenizer(self.model)
+        chunks_ids = [tokenizer.encode(x) for x in chunks]
+        for i in range(1, len(chunks_ids)):
+            if chunks_ids[i][0] == tokenizer.bos_token_id:
+                chunks_ids[i] = chunks_ids[i][1:]
+
+        # === Part 1: streaming session ===
+        requests.post(self.base_url + "/flush_cache")
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 1000, "streaming": True},
+        ).json()
+        rid = None
+        outputs_from_session = []
+
+        prev_kv_len = 0
+        for turn_idx, chunk_ids in enumerate(chunks_ids):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": chunk_ids,
+                    "session_params": {"id": session_id, "rid": rid},
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": gen_len,
+                        "no_stop_trim": True,
+                        "skip_special_tokens": False,
+                    },
+                },
+            ).json()
+            rid = response["meta_info"]["id"]
+            outputs_from_session.append(response["text"])
+            cached = response["meta_info"]["cached_tokens"]
+            prompt_tokens = response["meta_info"]["prompt_tokens"]
+            completion_tokens = response["meta_info"]["completion_tokens"]
+
+            if turn_idx == 0:
+                # Turn 1 should have no cache hit (cache was flushed).
+                self.assertEqual(
+                    cached, 0, "Turn 1 should have 0 cached tokens (clean start)"
+                )
+            else:
+                # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
+                # not radix tree matching). cached_tokens reflects the inherited prefix.
+                self.assertEqual(
+                    cached,
+                    prev_kv_len,
+                    f"Turn {turn_idx + 1}: should inherit {prev_kv_len} KV tokens from previous turn",
+                )
+            prev_kv_len = prompt_tokens + completion_tokens
+
+        # Close the session before checking cache/memory state.
+        ret = requests.post(
+            self.base_url + "/close_session",
+            json={"session_id": session_id},
+        )
+        self.assertEqual(ret.status_code, 200)
+
+        # === Cache verification (after close, before flush) ===
+
+        # Assertion 2: turn 1's prompt was inserted to the cache.
+        verify_resp = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": chunks_ids[0],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+        ).json()
+        self.assertGreater(
+            verify_resp["meta_info"]["cached_tokens"],
+            0,
+            "Turn 1's prompt should be cached in the radix tree",
+        )
+
+        # Assertion 3 (insertion): turn 2's prompt tokens should NOT be in cache.
+        # The tree should only contain turn 1's extent (prompt + output from
+        # cache_unfinished_req during decode). Turn 2's prompt starts fresh tokens
+        # that were never inserted.
+        verify_resp2 = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": chunks_ids[1],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+        ).json()
+        self.assertEqual(
+            verify_resp2["meta_info"]["cached_tokens"],
+            0,
+            "Turn 2's prompt should not be in cache (no insertion for turns 2+)",
+        )
+
+        # === Memory verification ===
+
+        # Assertion 4 & 5: KV is released properly and no memory leak.
+        # SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE is True by default;
+        # the scheduler will crash if it detects a leak during idle.
+        time.sleep(2)
+        health_resp = requests.get(self.base_url + "/health")
+        self.assertEqual(
+            health_resp.status_code,
+            200,
+            "Server should be healthy after session close (no memory leak)",
+        )
+
+        # After flush, all cache should be reclaimed.
+        requests.post(self.base_url + "/flush_cache")
+        verify_resp3 = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": chunks_ids[0],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            },
+        ).json()
+        self.assertEqual(
+            verify_resp3["meta_info"]["cached_tokens"],
+            0,
+            "After session close + flush, cache should be fully reclaimed",
+        )
+
+        # === Part 2: non-session baseline for output comparison ===
+        requests.post(self.base_url + "/flush_cache")
+
+        outputs_normal = []
+        input_ids = chunks_ids[0][:]
+        for i in range(len(chunks_ids)):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": input_ids,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": gen_len,
+                        "no_stop_trim": True,
+                        "skip_special_tokens": False,
+                    },
+                },
+            ).json()
+            outputs_normal.append(response["text"])
+            if i + 1 < len(chunks_ids):
+                out_ids = tokenizer.encode(response["text"])
+                if out_ids and out_ids[0] == tokenizer.bos_token_id:
+                    out_ids = out_ids[1:]
+                input_ids = input_ids + out_ids + chunks_ids[i + 1]
+
+        print("outputs from streaming session:")
+        print(outputs_from_session)
+        print("outputs from normal queries:")
+        print(outputs_normal)
+        self.assertEqual(outputs_from_session, outputs_normal)
 
     def run_session_control_with_branching(
         self, root_prompt, chunks_per_step, gen_len=16
