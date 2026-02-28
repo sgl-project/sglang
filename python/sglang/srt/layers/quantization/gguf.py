@@ -156,19 +156,17 @@ def fused_mul_mat_gguf(
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
-    # DISABLED: Force DEQUANT path for f32 precision matching ik_llama
-    if False and x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
-    elif False and qweight_type in MMQ_QUANT_TYPES:
+    elif qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        # Dequantize to f32 and do f32 matmul for precision (matching ik_llama)
-        weight = ggml_dequantize(qweight, qweight_type, *shape, torch.float32)
-        y = (x.float() @ weight.T).to(x.dtype)
+        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
@@ -243,8 +241,7 @@ def fused_moe_gguf(
         )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
-    elif False and qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
-        # DISABLED: testing fallback path to see if ggml_moe_a8_vec has IQ4_XS bug
+    elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
