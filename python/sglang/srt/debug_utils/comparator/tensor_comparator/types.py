@@ -2,16 +2,16 @@ from typing import Optional
 
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
 
+DEFAULT_PERCENTILES: tuple[int, ...] = (1, 5, 50, 95, 99)
+
 
 class TensorStats(_StrictBase):
     mean: float
+    abs_mean: float
     std: float
     min: float
     max: float
-    p1: Optional[float] = None
-    p5: Optional[float] = None
-    p95: Optional[float] = None
-    p99: Optional[float] = None
+    percentiles: dict[int, float] = {}
 
 
 class TensorInfo(_StrictBase):
@@ -25,6 +25,7 @@ class DiffInfo(_StrictBase):
     rel_diff: float
     max_abs_diff: float
     mean_abs_diff: float
+    abs_diff_percentiles: dict[int, float] = {}
     max_diff_coord: list[int]
     baseline_at_max: float
     target_at_max: float

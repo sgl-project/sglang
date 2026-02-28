@@ -187,7 +187,7 @@ def _make_tensor_info() -> TensorInfo:
     return TensorInfo(
         shape=[4, 4],
         dtype="float32",
-        stats=TensorStats(mean=0.0, std=1.0, min=-2.0, max=2.0),
+        stats=TensorStats(mean=0.0, abs_mean=0.8, std=1.0, min=-2.0, max=2.0),
     )
 
 

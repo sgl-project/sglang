@@ -56,20 +56,30 @@ def format_comparison(info: TensorComparisonInfo) -> str:
 
 def _format_stats_comparison(baseline: TensorStats, target: TensorStats) -> list[str]:
     lines: list[str] = []
+
     for stat_name in TensorStats.model_fields:
-        value_baseline = getattr(baseline, stat_name)
-        value_target = getattr(target, stat_name)
-        if value_baseline is None or value_target is None:
+        if stat_name == "percentiles":
             continue
+        value_baseline: float = getattr(baseline, stat_name)
+        value_target: float = getattr(target, stat_name)
         lines.append(
             f"[{stat_name}] {value_baseline:.4f} vs {value_target:.4f} "
             f"(diff: {value_target - value_baseline:.4f})"
         )
+
+    for p in sorted(set(baseline.percentiles) & set(target.percentiles)):
+        value_baseline = baseline.percentiles[p]
+        value_target = target.percentiles[p]
+        lines.append(
+            f"[p{p}] {value_baseline:.4f} vs {value_target:.4f} "
+            f"(diff: {value_target - value_baseline:.4f})"
+        )
+
     return lines
 
 
 def _format_diff(diff: DiffInfo, prefix_text: str = "") -> list[str]:
-    return [
+    lines: list[str] = [
         prefix_text
         + "\t".join(
             f"{'❌' if value > diff.diff_threshold else '✅'} {name}={value}"
@@ -83,3 +93,12 @@ def _format_diff(diff: DiffInfo, prefix_text: str = "") -> list[str]:
         f"baseline={diff.baseline_at_max} "
         f"target={diff.target_at_max}",
     ]
+
+    if diff.abs_diff_percentiles:
+        quantile_parts: list[str] = [
+            f"p{p}={value:.4f}"
+            for p, value in sorted(diff.abs_diff_percentiles.items())
+        ]
+        lines.append("[abs_diff] " + " ".join(quantile_parts))
+
+    return lines
