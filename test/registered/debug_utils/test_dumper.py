@@ -451,7 +451,6 @@ class TestDumperDistributed:
             config=DumperConfig(
                 enable=True,
                 collective_timeout=3,
-                enable_http_server=False,
             ),
         )
 
@@ -663,12 +662,11 @@ class TestDumpDictFormat:
 
 
 def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
-    """Create a _Dumper for CPU testing without HTTP server or distributed."""
+    """Create a _Dumper for CPU testing without distributed."""
     defaults = dict(
         enable=True,
         dir=str(tmp_path),
         exp_name="test",
-        enable_http_server=False,
     )
     defaults.update(overrides)
     config = DumperConfig(**defaults)
@@ -2293,7 +2291,6 @@ class TestDumperDims:
             config=DumperConfig(
                 enable=True,
                 dir=str(tmp_path),
-                enable_http_server=False,
                 enable_grad=True,
             )
         )
@@ -2323,7 +2320,6 @@ class TestDumperDims:
             config=DumperConfig(
                 enable=True,
                 dir=str(tmp_path),
-                enable_http_server=False,
                 enable_grad=True,
             )
         )
@@ -2338,6 +2334,63 @@ class TestDumperDims:
         grad_file = [f for f in exp_dir.glob("*.pt") if "grad__" in f.stem][0]
         grad_data = torch.load(grad_file, weights_only=False)
         assert grad_data["meta"]["dims"] == "b h(tp)"
+
+
+class TestCtxDecorator:
+    def test_ctx_dynamic_lambda(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        class FakeLayer:
+            def __init__(self, layer_id: int) -> None:
+                self.layer_id = layer_id
+
+            @d.ctx(lambda self: dict(layer_id=self.layer_id))
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                d.dump("hidden", x)
+                return x
+
+        layer = FakeLayer(layer_id=42)
+        layer.forward(torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["layer_id=42"])
+
+    def test_ctx_static_kwargs(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        @d.ctx(phase="decode")
+        def decode_step(x: torch.Tensor) -> torch.Tensor:
+            d.dump("step_out", x)
+            return x
+
+        decode_step(torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["phase=decode"])
+
+    def test_ctx_clears_on_exception(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        @d.ctx(phase="train")
+        def buggy_fn() -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            buggy_fn()
+
+        assert d._state.global_ctx == {}
+
+    def test_ctx_rejects_mixed_args(self) -> None:
+        d = _make_test_dumper("/tmp")
+
+        with pytest.raises(ValueError, match="cannot mix"):
+            d.ctx(lambda self: dict(a=1), phase="x")
+
+    def test_ctx_rejects_empty_args(self) -> None:
+        d = _make_test_dumper("/tmp")
+
+        with pytest.raises(ValueError, match="must provide"):
+            d.ctx()
 
 
 if __name__ == "__main__":

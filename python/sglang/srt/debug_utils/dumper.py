@@ -134,7 +134,6 @@ class DumperConfig(_BaseConfig):
     enable_model_value: bool = False
     enable_model_grad: bool = False
     exp_name: Optional[str] = None
-    enable_http_server: bool = True
     cleanup_previous: bool = False
     collective_timeout: int = 60
     server_port: str = "-1"
@@ -292,6 +291,39 @@ class _Dumper:
         self._state.global_ctx = {
             k: v for k, v in (self._state.global_ctx | kwargs).items() if v is not None
         }
+
+    def ctx(
+        self,
+        _extractor: Optional[Callable[..., dict]] = None,
+        **static_ctx: Any,
+    ) -> Callable:
+        """Decorator that sets context before calling the wrapped function and clears it after.
+
+        Two forms:
+            @dumper.ctx(lambda self: dict(layer_id=self.layer_id))
+            def forward(self, x): ...
+
+            @dumper.ctx(phase="decode")
+            def decode_step(self, x): ...
+        """
+        if _extractor is not None and static_ctx:
+            raise ValueError("cannot mix lambda extractor with static kwargs")
+        if _extractor is None and not static_ctx:
+            raise ValueError("must provide either a lambda or static kwargs")
+
+        def decorator(fn: Callable) -> Callable:
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                ctx_dict: dict = _extractor(args[0]) if _extractor else static_ctx
+                self.set_ctx(**ctx_dict)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    self.set_ctx(**{k: None for k in ctx_dict})
+
+            return wrapper
+
+        return decorator
 
     def register_non_intrusive_dumper(
         self,
