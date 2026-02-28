@@ -1961,6 +1961,71 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _build_qwen35moe_gguf_weight_map(config) -> Dict[str, str]:
+    """GGUF tensor name -> SGLang parameter name for Qwen3.5 MoE.
+
+    Names must match what load_weights() sees AFTER its transforms:
+    - No 'model.' prefix (params_dict uses module-relative names)
+    - '.self_attn.' is stripped by load_weights(), so emit it in HF
+      style — it gets stripped to match the actual param name.
+    - Shared expert uses gate_proj/up_proj (stacked_params_mapping
+      will merge to gate_up_proj).
+    - Expert tensors use experts.gate_proj/up_proj/down_proj (GGUF
+      merged format handled by load_weights GGUF expert code).
+    """
+    num_layers = config.num_hidden_layers
+    full_attn_interval = getattr(config, "full_attention_interval", 4)
+
+    m = {}
+    # Global — no 'model.' prefix
+    m["token_embd.weight"] = "embed_tokens.weight"
+    m["output.weight"] = "lm_head.weight"
+    m["output_norm.weight"] = "norm.weight"
+
+    for i in range(num_layers):
+        is_attn = (i + 1) % full_attn_interval == 0
+        b = f"blk.{i}"
+        s = f"layers.{i}"
+
+        # Norms (all layers)
+        m[f"{b}.attn_norm.weight"] = f"{s}.input_layernorm.weight"
+        m[f"{b}.post_attention_norm.weight"] = f"{s}.post_attention_layernorm.weight"
+
+        if is_attn:
+            # Full GQA attention layers — use .self_attn. prefix
+            # (load_weights strips it to match param names)
+            m[f"{b}.attn_q.weight"] = f"{s}.self_attn.q_proj.weight"
+            m[f"{b}.attn_k.weight"] = f"{s}.self_attn.k_proj.weight"
+            m[f"{b}.attn_v.weight"] = f"{s}.self_attn.v_proj.weight"
+            m[f"{b}.attn_q_norm.weight"] = f"{s}.self_attn.q_norm.weight"
+            m[f"{b}.attn_k_norm.weight"] = f"{s}.self_attn.k_norm.weight"
+            m[f"{b}.attn_output.weight"] = f"{s}.self_attn.o_proj.weight"
+        else:
+            # GatedDeltaNet layers — no .self_attn. prefix (params
+            # already use linear_attn. directly)
+            m[f"{b}.attn_qkv.weight"] = f"{s}.linear_attn.in_proj_qkv.weight"
+            m[f"{b}.attn_gate.weight"] = f"{s}.linear_attn.in_proj_z.weight"
+            m[f"{b}.ssm_alpha.weight"] = f"{s}.linear_attn.in_proj_a.weight"
+            m[f"{b}.ssm_beta.weight"] = f"{s}.linear_attn.in_proj_b.weight"
+            m[f"{b}.ssm_out.weight"] = f"{s}.linear_attn.out_proj.weight"
+            m[f"{b}.ssm_conv1d.weight"] = f"{s}.linear_attn.conv1d.weight"
+            m[f"{b}.ssm_a"] = f"{s}.linear_attn.attn.A_log"
+            m[f"{b}.ssm_dt.bias"] = f"{s}.linear_attn.attn.dt_bias"
+            m[f"{b}.ssm_norm.weight"] = f"{s}.linear_attn.norm.weight"
+
+        # MoE (all layers)
+        m[f"{b}.ffn_gate_inp.weight"] = f"{s}.mlp.gate.weight"
+        m[f"{b}.ffn_gate_inp_shexp.weight"] = f"{s}.mlp.shared_expert_gate.weight"
+        m[f"{b}.ffn_gate_exps.weight"] = f"{s}.mlp.experts.gate_proj.weight"
+        m[f"{b}.ffn_up_exps.weight"] = f"{s}.mlp.experts.up_proj.weight"
+        m[f"{b}.ffn_down_exps.weight"] = f"{s}.mlp.experts.down_proj.weight"
+        m[f"{b}.ffn_gate_shexp.weight"] = f"{s}.mlp.shared_expert.gate_proj.weight"
+        m[f"{b}.ffn_up_shexp.weight"] = f"{s}.mlp.shared_expert.up_proj.weight"
+        m[f"{b}.ffn_down_shexp.weight"] = f"{s}.mlp.shared_expert.down_proj.weight"
+
+    return m
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -2004,6 +2069,11 @@ class GGUFModelLoader(BaseModelLoader):
 
         config = model_config.hf_config
         model_type = config.model_type
+
+        # Custom weight map for architectures not in gguf pip package
+        if model_type == "qwen3_5_moe_text":
+            return _build_qwen35moe_gguf_weight_map(config)
+
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"

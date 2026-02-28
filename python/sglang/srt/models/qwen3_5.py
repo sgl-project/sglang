@@ -16,7 +16,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import (
 )
 
 # Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -59,7 +59,15 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
+from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -257,12 +265,46 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         seq_len, _ = hidden_states.shape
+        _trace = getattr(self, '_trace_count', 0) < 1  # Enable L0 detail trace
+        if _trace and self.layer_id == 0:
+            self._trace_count = getattr(self, '_trace_count', 0) + 1
+        elif self.layer_id != 0:
+            _trace = False
 
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
         z, _ = self.in_proj_z(hidden_states)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
         b, _ = self.in_proj_b(hidden_states)
         a, _ = self.in_proj_a(hidden_states)
+
+        if _trace:
+            # Trace projection outputs
+            q = mixed_qkv.float()
+            r = q[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_mixed_qkv shape=[{q.shape[1]},{q.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+            af = a.float()[0]
+            vals_a = ", ".join(f"{v:.6f}" for v in af[:10].tolist())
+            print(f"TRACE L0_a shape=[{a.shape[1]},{a.shape[0]},1,1] first10=[{vals_a}] mean={af.mean():.6f} std={af.std():.6f}", flush=True)
+            bf = b.float()[0]
+            vals_b = ", ".join(f"{v:.6f}" for v in bf[:10].tolist())
+            print(f"TRACE L0_b shape=[{b.shape[1]},{b.shape[0]},1,1] first10=[{vals_b}] mean={bf.mean():.6f} std={bf.std():.6f}", flush=True)
+            # z trace: z is [seq, 32, 128] at this point. Flatten to [4096] for token 0 for comparison with ik_llama
+            zf = z.float()  # [seq, 32, 128]
+            z_flat = zf[0].flatten()  # [4096] - all heads for token 0
+            vals_z = ", ".join(f"{v:.6f}" for v in z_flat[:10].tolist())
+            print(f"TRACE L0_z shape=[{z_flat.shape[0]},{zf.shape[0]},1,1] first10=[{vals_z}] mean={z_flat.mean():.6f} std={z_flat.std():.6f}", flush=True)
+            # Per-head z stats for token 0
+            for hi in range(32):
+                hz = zf[0, hi]  # [128]
+                print(f"TRACE L0_z_h{hi} mean={hz.mean():.6f} std={hz.std():.6f} first3=[{hz[0]:.6f},{hz[1]:.6f},{hz[2]:.6f}]", flush=True)
+            # Show A_log and dt_bias
+            alog = self.attn.A_log.float()
+            vals_alog = ", ".join(f"{v:.6f}" for v in alog[:10].tolist())
+            print(f"TRACE L0_A_log shape=[{alog.shape[0]}] first10=[{vals_alog}] mean={alog.mean():.6f} std={alog.std():.6f}", flush=True)
+            dtb = self.attn.dt_bias.float()
+            vals_dt = ", ".join(f"{v:.6f}" for v in dtb[:10].tolist())
+            print(f"TRACE L0_dt_bias shape=[{dtb.shape[0]}] first10=[{vals_dt}] mean={dtb.mean():.6f} std={dtb.std():.6f}", flush=True)
 
         b = b.contiguous()
         a = a.contiguous()
@@ -274,13 +316,109 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             b=b,
         )
 
+        if _trace:
+            co = core_attn_out.float()
+            # core_attn_out shape: [seq, num_v_heads, head_v_dim] or [seq, v_dim]
+            r = co[0].flatten()
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_core_attn_out shape={list(co.shape)} first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+
+        if _trace:
+            co = core_attn_out.float()
+            r = co[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_after_norm shape={list(co.shape)} first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+            # Print per-head stats for token 0 (co is [192, 128], rows 0-31 are token 0's 32 heads)
+            for hi in range(min(32, co.shape[0])):
+                hvals = co[hi]
+                print(f"TRACE L0_after_norm_h{hi} mean={hvals.mean():.6f} std={hvals.std():.6f} first3=[{hvals[0]:.6f},{hvals[1]:.6f},{hvals[2]:.6f}]", flush=True)
+
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+
+        if _trace:
+            # Print the full 4096-dim input to o_proj for token 0
+            inp = core_attn_out.float()[0]  # [4096]
+            print(f"TRACE L0_oproj_input shape=[{inp.shape[0]}] mean={inp.mean():.6f} std={inp.std():.6f}", flush=True)
+            # Print per-head stats on the rearranged input
+            for hi in range(32):
+                hslice = inp[hi*128:(hi+1)*128]
+                print(f"TRACE L0_oproj_input_h{hi} mean={hslice.mean():.6f} std={hslice.std():.6f}", flush=True)
+            # DETAILED h12 dump — this head dominates the oproj_input
+            h12 = inp[12*128:13*128]
+            h12_vals = ", ".join(f"{v:.6f}" for v in h12[:20].tolist())
+            print(f"TRACE L0_oproj_input_h12_first20=[{h12_vals}]", flush=True)
+            h12_vals_last = ", ".join(f"{v:.6f}" for v in h12[-10:].tolist())
+            print(f"TRACE L0_oproj_input_h12_last10=[{h12_vals_last}]", flush=True)
+            # Compute h12's contribution to o_proj output dim 0 and dim 1
+            try:
+                from sglang.srt.layers.quantization.gguf import ggml_dequantize
+                import gguf as _gguf2
+                qw = self.out_proj.qweight
+                qt2 = self.out_proj.qweight_type.weight_type
+                block_size2, type_size2 = _gguf2.GGML_QUANT_SIZES[qt2]
+                shape2 = (qw.shape[0], qw.shape[1] // type_size2 * block_size2)
+                w_f32 = ggml_dequantize(qw, qt2, *shape2, torch.float32)
+                # h12 partial dot product for output dims 0-9
+                w_h12 = w_f32[:10, 12*128:13*128]  # [10, 128]
+                partial_dot = (w_h12 * h12.unsqueeze(0)).sum(dim=1)
+                partial_vals = ", ".join(f"{v:.6f}" for v in partial_dot.tolist())
+                print(f"TRACE L0_h12_partial_dot_y0to9=[{partial_vals}]", flush=True)
+                # Full dot product decomposition: sum of per-head contributions for y[0]
+                w_row0 = w_f32[0]  # [4096]
+                for chi in range(32):
+                    hs = inp[chi*128:(chi+1)*128]
+                    ws = w_row0[chi*128:(chi+1)*128]
+                    contrib = (hs * ws).sum()
+                    print(f"TRACE L0_y0_head{chi}_contrib={contrib:.8f}", flush=True)
+            except Exception as e:
+                print(f"TRACE L0_h12_detail_error: {e}", flush=True)
         output, _ = self.out_proj(core_attn_out)
+
+        if _trace:
+            o = output.float()
+            r = o[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_out_proj shape=[{o.shape[1]},{o.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+            # Compare MMVQ vs dequant path
+            try:
+                from sglang.srt.layers.quantization.gguf import ggml_dequantize, DEQUANT_TYPES
+                import gguf as _gguf
+                qw = self.out_proj.qweight
+                qt = self.out_proj.qweight_type.weight_type
+                block_size, type_size = _gguf.GGML_QUANT_SIZES[qt]
+                shape = (qw.shape[0], qw.shape[1] // type_size * block_size)
+                weight_f = ggml_dequantize(qw, qt, *shape, core_attn_out.dtype)
+                dequant_out = core_attn_out @ weight_f.T
+                d = dequant_out.float()[0]
+                dvals = ", ".join(f"{v:.6f}" for v in d[:10].tolist())
+                print(f"TRACE L0_out_proj_DEQUANT first10=[{dvals}] mean={d.mean():.6f} std={d.std():.6f}", flush=True)
+                # Cosine similarity between MMVQ and dequant
+                cos = torch.nn.functional.cosine_similarity(o[0].unsqueeze(0), dequant_out.float()[0].unsqueeze(0))
+                print(f"TRACE L0_out_proj MMVQ_vs_DEQUANT cosine={cos.item():.6f}", flush=True)
+                # Dump weight matrix values for comparison with ik_llama
+                print(f"TRACE L0_oproj_weight_dequant shape={list(weight_f.shape)} dtype={weight_f.dtype}", flush=True)
+                # Row 0 (output dim 0)
+                wrow0 = weight_f[0].float()
+                print(f"TRACE L0_oproj_weight_row0 first10=[{', '.join(f'{v:.6f}' for v in wrow0[:10].tolist())}] mean={wrow0.mean():.6f} std={wrow0.std():.6f}", flush=True)
+                # Row 1
+                wrow1 = weight_f[1].float()
+                print(f"TRACE L0_oproj_weight_row1 first10=[{', '.join(f'{v:.6f}' for v in wrow1[:10].tolist())}] mean={wrow1.mean():.6f} std={wrow1.std():.6f}", flush=True)
+                # Also dump the input vector for manual verification
+                inp_t0 = core_attn_out.float()[0]  # [4096]
+                print(f"TRACE L0_oproj_input_t0 first10=[{', '.join(f'{v:.6f}' for v in inp_t0[:10].tolist())}] mean={inp_t0.mean():.6f} std={inp_t0.std():.6f}", flush=True)
+                # Manual dot product: y[0] = inp_t0 @ weight_row_0
+                manual_y0 = (inp_t0 * wrow0).sum()
+                manual_y1 = (inp_t0 * weight_f[1].float()).sum()
+                print(f"TRACE L0_manual_dot y0={manual_y0:.6f} y1={manual_y1:.6f}", flush=True)
+            except Exception as e:
+                print(f"TRACE L0_dequant_compare ERROR: {e}", flush=True)
+
         return output
 
 
@@ -343,8 +481,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        # GGUF stores norm weights with +1 already baked in (values ~1.0),
+        # so use standard RMSNorm (just multiply), not GemmaRMSNorm (which adds +1).
+        norm_cls = RMSNorm if config.model_type == "qwen3_5_moe_text" else GemmaRMSNorm
+        self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_communicator = LayerCommunicator(
@@ -355,6 +496,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
+    _layer_trace_count = 0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -362,10 +505,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
+        _do_layer_trace = Qwen3_5LinearDecoderLayer._layer_trace_count < 1
+        _trace_l0 = _do_layer_trace and self.layer_id == 0
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+
+        if _trace_l0:
+            h = hidden_states.float()
+            r = h[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_after_input_ln shape=[{h.shape[1]},{h.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(
@@ -373,10 +524,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch,
             )
 
+        if _do_layer_trace:
+            _h = hidden_states.float()
+            _r = _h.flatten()
+            print(f"TRACE attn_out-{self.layer_id} std={_r.std():.6f} mean={_r.mean():.6f} first5=[{', '.join(f'{v:.6f}' for v in _r[:5].tolist())}]", flush=True)
+
+        if _trace_l0:
+            h = hidden_states.float()
+            r = h[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_after_attn shape=[{h.shape[1]},{h.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if _trace_l0:
+            h = hidden_states.float()
+            r = h[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_after_post_ln shape=[{h.shape[1]},{h.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+            h2 = residual.float()
+            r2 = h2[0]
+            vals2 = ", ".join(f"{v:.6f}" for v in r2[:10].tolist())
+            print(f"TRACE L0_residual_after_attn shape=[{h2.shape[1]},{h2.shape[0]},1,1] first10=[{vals2}] mean={r2.mean():.6f} std={r2.std():.6f}", flush=True)
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -388,11 +560,46 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            if _trace_l0:
+                # Trace MoE components separately
+                import torch.nn.functional as _F
+                _moe = self.mlp
+                _hs = hidden_states.view(-1, hidden_states.shape[-1])
+                # Router
+                _router_logits, _ = _moe.gate(_hs)
+                _rl = _router_logits.float()
+                print(f"TRACE L0_router_logits shape={list(_rl.shape)} mean={_rl.mean():.6f} std={_rl.std():.6f} max={_rl.max():.6f} min={_rl.min():.6f}", flush=True)
+                _top_vals, _top_ids = _rl.topk(8, dim=-1)
+                print(f"TRACE L0_router_top8_vals t0={_top_vals[0].tolist()}", flush=True)
+                print(f"TRACE L0_router_top8_ids t0={_top_ids[0].tolist()}", flush=True)
+                # Shared expert
+                _shared = _moe._forward_shared_experts(_hs)
+                if _shared is not None:
+                    _sf = _shared.float()
+                    print(f"TRACE L0_shared_expert shape={list(_sf.shape)} mean={_sf[0].mean():.6f} std={_sf[0].std():.6f}", flush=True)
+                # Routed experts
+                _routed = _moe._forward_router_experts(_hs)
+                _rf = _routed.float()
+                print(f"TRACE L0_routed_experts shape={list(_rf.shape)} mean={_rf[0].mean():.6f} std={_rf[0].std():.6f}", flush=True)
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+
+        if _do_layer_trace:
+            _h = hidden_states.float()
+            _r = _h.flatten()
+            print(f"TRACE mlp_out-{self.layer_id} std={_r.std():.6f} mean={_r.mean():.6f} first5=[{', '.join(f'{v:.6f}' for v in _r[:5].tolist())}]", flush=True)
+            if self.layer_id == 39:
+                Qwen3_5LinearDecoderLayer._layer_trace_count += 1
+
+        if _trace_l0:
+            h = hidden_states.float()
+            r = h[0]
+            vals = ", ".join(f"{v:.6f}" for v in r[:10].tolist())
+            print(f"TRACE L0_after_mlp shape=[{h.shape[1]},{h.shape[0]},1,1] first10=[{vals}] mean={r.mean():.6f} std={r.std():.6f}", flush=True)
+
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -447,11 +654,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
+        # Only pass rope_scaling to get_rope if it contains an actual scaling
+        # type (e.g., "yarn", "llama3"). If it's just a parameter container
+        # (rope_theta, partial_rotary_factor), pass None for plain RoPE.
+        rope_scaling_for_rope = self.rope_scaling
+        if rope_scaling_for_rope and "rope_type" not in rope_scaling_for_rope and "type" not in rope_scaling_for_rope:
+            rope_scaling_for_rope = None
+
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
+            rope_scaling=rope_scaling_for_rope,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
             is_neox_style=True,
@@ -530,13 +744,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        norm_cls = RMSNorm if config.model_type == "qwen3_5_moe_text" else GemmaRMSNorm
+        self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -610,6 +825,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        _do_layer_trace = Qwen3_5LinearDecoderLayer._layer_trace_count < 1
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -620,6 +837,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+        if _do_layer_trace:
+            _h = hidden_states.float()
+            _r = _h.flatten()
+            print(f"TRACE attn_out-{self.layer_id} std={_r.std():.6f} mean={_r.mean():.6f} first5=[{', '.join(f'{v:.6f}' for v in _r[:5].tolist())}]", flush=True)
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -640,6 +862,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+
+        if _do_layer_trace:
+            _h = hidden_states.float()
+            _r = _h.flatten()
+            print(f"TRACE mlp_out-{self.layer_id} std={_r.std():.6f} mean={_r.mean():.6f} first5=[{', '.join(f'{v:.6f}' for v in _r[:5].tolist())}]", flush=True)
+
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -678,6 +906,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
             )
 
@@ -705,7 +934,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Final normalization
         if self.pp_group.is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_cls = RMSNorm if config.model_type == "qwen3_5_moe_text" else GemmaRMSNorm
+            self.norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -733,6 +963,28 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
+        _trace_fwd = getattr(self, '_trace_fwd_count', 0)
+        self._trace_fwd_count = _trace_fwd + 1
+        _do_trace = _trace_fwd < 1  # Trace first forward only
+
+        def _trace_tensor(name, t):
+            """Print tensor in ik_llama.cpp compatible format: first 10 of token 0 + stats."""
+            ft = t.float()
+            # t is [seq_len, hidden_size] — take token 0 (row 0)
+            row = ft[0]  # [hidden_size]
+            n = row.shape[0]
+            n_print = min(n, 10)
+            vals = row[:n_print].tolist()
+            vals_str = ", ".join(f"{v:.6f}" for v in vals)
+            mean = row.mean().item()
+            std = row.std().item()
+            print(f"TRACE {name} shape=[{ft.shape[1]},{ft.shape[0]},1,1] first10=[{vals_str}] mean={mean:.6f} std={std:.6f}", flush=True)
+
+        if _do_trace:
+            print(f"=== SGLANG TRACE forward #{_trace_fwd} input_ids={input_ids.shape} ids={input_ids.tolist()} ===", flush=True)
+            # Trace embedding — note: ggml uses [hidden, seq] layout, we use [seq, hidden]
+            _trace_tensor("embd", hidden_states)
+
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -744,6 +996,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                 )
+            if _do_trace:
+                # After each layer, trace the combined hidden_states + residual
+                # In SGLang, the layer returns (hidden_states, residual) where
+                # the full layer output = hidden_states + residual
+                # But ik_llama l_out-N = full residual stream output
+                if residual is not None:
+                    _trace_tensor(f"l_out-{layer_idx}", hidden_states + residual)
+                else:
+                    _trace_tensor(f"l_out-{layer_idx}", hidden_states)
 
             # Process deepstack embeddings if provided
             if (
@@ -841,6 +1102,68 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        if getattr(config, "tie_word_embeddings", False):
+            self.lm_head = self.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix="lm_head",
+            )
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorOutput:
+        hidden_states = super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            input_deepstack_embeds,
+        )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                _lm_trace = getattr(self, '_lm_trace_count', 0)
+                self._lm_trace_count = _lm_trace + 1
+                if False and _lm_trace < 3:
+                    try:
+                        h = hidden_states.float()
+                        # Trace result_norm (last token hidden state after final norm)
+                        last_tok = h[-1]  # [hidden_size]
+                        n = min(last_tok.shape[0], 10)
+                        vals_str = ", ".join(f"{v:.6f}" for v in last_tok[:n].tolist())
+                        print(f"TRACE result_norm shape=[{last_tok.shape[0]},1,1,1] first10=[{vals_str}] mean={last_tok.mean():.6f} std={last_tok.std():.6f}", flush=True)
+                        # Compute raw logits for last token
+                        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+                        logits_raw = fused_mul_mat_gguf(h[-1:], self.lm_head.qweight, self.lm_head.qweight_type.weight_type)
+                        logits_row = logits_raw[0]
+                        n2 = min(logits_row.shape[0], 10)
+                        vals2 = ", ".join(f"{v:.6f}" for v in logits_row[:n2].tolist())
+                        print(f"TRACE result_output shape=[{logits_row.shape[0]},1,1,1] first10=[{vals2}] mean={logits_row.mean():.6f} std={logits_row.std():.6f}", flush=True)
+                        topk = torch.topk(logits_row, k=10)
+                        print(f"TRACE top10_values: {topk.values.tolist()}", flush=True)
+                        print(f"TRACE top10_indices: {topk.indices.tolist()}", flush=True)
+                    except Exception as e:
+                        import traceback
+                        print(f"TRACE result ERROR: {e}\n{traceback.format_exc()}", flush=True)
+                return self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -907,6 +1230,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
+        # Accumulator for GGUF MoE w13 shards (gate_proj=w1 + up_proj=w3).
+        # GGUF merged expert tensors are [E, I, bytes] — we cat gate+up
+        # along dim 1 to form w13 [E, 2*I, bytes] after all weights load.
+        gguf_w13_shards: Dict[str, Dict[str, torch.Tensor]] = {}
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -918,6 +1246,68 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            # Handle GGUF merged expert tensors (no per-expert ID in name).
+            # GGUF experts arrive as [num_experts, rows, bytes_per_row]
+            # with names like experts.gate_proj.qweight.
+            # For w13: accumulate gate (w1) and up (w3) shards, then
+            # concatenate along dim 1 after the main loop.
+            # For w2: materialize directly (single tensor).
+            # Bypasses FusedMoE.weight_loader which can't handle
+            # GGUFUninitializedParameter (no data to index per-expert).
+            gguf_expert_mapping = [
+                ("experts.gate_proj.", "experts.w13_", "w1"),
+                ("experts.up_proj.", "experts.w13_", "w3"),
+                ("experts.down_proj.", "experts.w2_", "w2"),
+            ]
+            gguf_expert_handled = False
+            for gguf_pattern, param_prefix, gguf_shard_id in gguf_expert_mapping:
+                if gguf_pattern in name and "experts.0." not in name:
+                    param_name = name.replace(gguf_pattern, param_prefix)
+                    if param_name in params_dict:
+                        if "qweight_type" in name:
+                            # qweight_type is a scalar type tag — set data AND attribute
+                            param = params_dict[param_name]
+                            default_weight_loader(param, loaded_weight)
+                            param.weight_type = loaded_weight.item()
+                        elif gguf_shard_id == "w2":
+                            # down_proj — single tensor, materialize directly
+                            param = params_dict[param_name]
+                            param.materialize(
+                                loaded_weight.shape,
+                                dtype=loaded_weight.dtype,
+                            )
+                            param.data.copy_(loaded_weight)
+                        else:
+                            # gate_proj (w1) or up_proj (w3) — accumulate
+                            if param_name not in gguf_w13_shards:
+                                gguf_w13_shards[param_name] = {}
+                            gguf_w13_shards[param_name][gguf_shard_id] = (
+                                loaded_weight
+                            )
+                    gguf_expert_handled = True
+                    loaded_params.add(param_name)  # Track the actual param name
+                    break
+            if gguf_expert_handled:
+                loaded_params.add(name)  # Also track original name
+                continue
+
+            # GGUF conv1d weight is [kernel, dim] but model expects
+            # [dim, 1, kernel] (transposed + unsqueezed).
+            if "conv1d.weight" in name and loaded_weight.dim() == 2:
+                if loaded_weight.shape[0] < loaded_weight.shape[1]:
+                    loaded_weight = loaded_weight.T
+                loaded_weight = loaded_weight.unsqueeze(1)
+
+            # GGUF shared_expert_gate is [hidden] but model expects [1, hidden]
+            if "shared_expert_gate" in name and loaded_weight.dim() == 1:
+                loaded_weight = loaded_weight.unsqueeze(0)
+
+            # GGUF ssm_a stores raw decay rates (negative values like -0.036, -72.33).
+            # SGLang's fused_gdn_gating expects A_log (log-space): g = -exp(A_log) * softplus(...)
+            # Convert: A_log = log(-ssm_a) so that -exp(A_log) = ssm_a
+            if "A_log" in name and loaded_weight.dtype == torch.float32:
+                loaded_weight = torch.log(-loaded_weight)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -1024,6 +1414,39 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
+            # A_log and dt_bias are registered on both Qwen3_5GatedDeltaNet (parent)
+            # and RadixLinearAttention (child) pointing to the same nn.Parameter.
+            # Mark the alias path as loaded too to suppress false UNLOADED warnings.
+            if "linear_attn.attn.A_log" in name:
+                loaded_params.add(name.replace("linear_attn.attn.A_log", "linear_attn.A_log"))
+            elif "linear_attn.attn.dt_bias" in name:
+                loaded_params.add(name.replace("linear_attn.attn.dt_bias", "linear_attn.dt_bias"))
+
+        # Finalize GGUF MoE w13 params: concatenate gate (w1) + up (w3)
+        # along dim 1 to form the combined [E, 2*I, bytes] tensor.
+        for param_name, shards in gguf_w13_shards.items():
+            if "w1" in shards and "w3" in shards:
+                gate = shards["w1"]  # [E, I, bytes_per_row]
+                up = shards["w3"]    # [E, I, bytes_per_row]
+                w13 = torch.cat([gate, up], dim=1)  # [E, 2*I, bytes_per_row]
+                param = params_dict[param_name]
+                param.materialize(w13.shape, dtype=w13.dtype)
+                param.data.copy_(w13)
+            else:
+                logger.warning(
+                    f"Incomplete w13 shards for {param_name}: "
+                    f"{list(shards.keys())}"
+                )
+
+        # DEBUG: Check for unloaded parameters
+        all_params = set(params_dict.keys())
+        unloaded = all_params - loaded_params
+        if unloaded:
+            logger.warning(f"=== UNLOADED PARAMETERS ({len(unloaded)}/{len(all_params)}) ===")
+            for p in sorted(unloaded):
+                logger.warning(f"  UNLOADED: {p}")
+        else:
+            logger.info(f"=== ALL {len(all_params)} PARAMETERS LOADED ===")
 
         return loaded_params
 
@@ -1350,4 +1773,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

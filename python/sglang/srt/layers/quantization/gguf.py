@@ -156,17 +156,19 @@ def fused_mul_mat_gguf(
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    # DISABLED: Force DEQUANT path for f32 precision matching ik_llama
+    if False and x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    elif False and qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
-        y = x @ weight.T
+        # Dequantize to f32 and do f32 matmul for precision (matching ik_llama)
+        weight = ggml_dequantize(qweight, qweight_type, *shape, torch.float32)
+        y = (x.float() @ weight.T).to(x.dtype)
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
@@ -191,9 +193,9 @@ def fused_moe_gguf(
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(out, x)
+            silu_and_mul(x, out)
         elif activation == "gelu":
-            gelu_and_mul(out, x)
+            gelu_and_mul(x, out)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out
@@ -241,7 +243,8 @@ def fused_moe_gguf(
         )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
-    elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
+    elif False and qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
+        # DISABLED: testing fallback path to see if ggml_moe_a8_vec has IQ4_XS bug
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
@@ -305,6 +308,8 @@ def apply_gguf_embedding(
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
 
+
+_gguf_trace_counter = [0]  # mutable counter for one-time tracing
 
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF.
@@ -423,6 +428,20 @@ class GGUFLinearMethod(LinearMethodBase):
             for idx in shard_id:
                 start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
+
+                # One-time trace for shared expert (gate_up_proj has shard_id [0,1])
+                if _gguf_trace_counter[0] == 0 and idx == 0 and not isinstance(idx, str):
+                    try:
+                        w = qweight[start:end, :offset].contiguous()
+                        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+                        out_dim = w.shape[0]
+                        in_dim = w.shape[1] // type_size * block_size
+                        dequant = ggml_dequantize(w, qweight_type, in_dim, out_dim, torch.float32)
+                        type_name = WeightType(qweight_type).name
+                        print(f"TRACE LinearMethod shard={idx} qweight_type={qweight_type} ({type_name}) shape={list(w.shape)} dequant shape={list(dequant.shape)} mean={dequant.mean():.6f} std={dequant.std():.6f} absmax={dequant.abs().max():.6f}", flush=True)
+                    except Exception as e:
+                        print(f"TRACE LinearMethod shard dequant error: {e}", flush=True)
+
                 result.append(
                     fused_mul_mat_gguf(
                         x, qweight[start:end, :offset].contiguous(), qweight_type
@@ -447,6 +466,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        self.fused_experts = None
 
     def create_weights(
         self,
@@ -534,6 +554,35 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         topk_weights, topk_ids, _ = topk_output
+
+        # One-time MoE weight diagnostic
+        if _gguf_trace_counter[0] < 1:
+            _gguf_trace_counter[0] += 1
+            w13_type = layer.w13_qweight_type.weight_type
+            w2_type = layer.w2_qweight_type.weight_type
+            try:
+                w13_type_name = WeightType(w13_type).name
+            except Exception:
+                w13_type_name = f"unknown({w13_type})"
+            try:
+                w2_type_name = WeightType(w2_type).name
+            except Exception:
+                w2_type_name = f"unknown({w2_type})"
+            print(f"TRACE MoE w13_qweight shape={list(layer.w13_qweight.shape)} dtype={layer.w13_qweight.dtype} type={w13_type} ({w13_type_name})", flush=True)
+            print(f"TRACE MoE w2_qweight shape={list(layer.w2_qweight.shape)} dtype={layer.w2_qweight.dtype} type={w2_type} ({w2_type_name})", flush=True)
+            print(f"TRACE MoE x shape={list(x.shape)} dtype={x.dtype}", flush=True)
+            print(f"TRACE MoE topk_ids shape={list(topk_ids.shape)} topk_weights shape={list(topk_weights.shape)}", flush=True)
+            # Dequantize ONE expert's gate weight to check magnitudes
+            try:
+                expert0_w = layer.w13_qweight[0]  # [2*I, bytes]
+                block_size, type_size = gguf.GGML_QUANT_SIZES[w13_type]
+                out_dim = expert0_w.shape[0]
+                in_dim = expert0_w.shape[1] // type_size * block_size
+                dequant = ggml_dequantize(expert0_w, w13_type, in_dim, out_dim, torch.float32)
+                print(f"TRACE MoE expert0_w13 dequant shape={list(dequant.shape)} mean={dequant.mean():.6f} std={dequant.std():.6f} absmax={dequant.abs().max():.6f}", flush=True)
+            except Exception as e:
+                print(f"TRACE MoE dequant error: {e}", flush=True)
+
         output = fused_moe_gguf(
             x=x,
             w1=layer.w13_qweight,
@@ -544,6 +593,13 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             qweight_type2=layer.w2_qweight_type.weight_type,
             activation=moe_runner_config.activation,
         )
+
+        # Trace output
+        if _gguf_trace_counter[0] == 1:
+            _gguf_trace_counter[0] += 1
+            of = output.float()
+            print(f"TRACE MoE output shape={list(output.shape)} mean={of.mean():.6f} std={of.std():.6f}", flush=True)
+
         return StandardCombineInput(hidden_states=output)
 
 
