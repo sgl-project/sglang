@@ -106,6 +106,7 @@ jobs:
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
+              - "python/sglang/jit_kernel/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
@@ -317,6 +318,45 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800
+
+  stage-b-test-small-1-gpu-amd-nondeterministic:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-small-1-gpu-amd-nondeterministic') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-nondeterministic --timeout-per-file 1800 --continue-on-error
 
   stage-b-test-small-1-gpu-amd-mi35x:
     needs: [check-changes, stage-a-test-1-amd]
@@ -890,6 +930,7 @@ jobs:
         stage-a-test-1-amd,
         jit-kernel-unit-test-amd,
         stage-b-test-small-1-gpu-amd,
+        stage-b-test-small-1-gpu-amd-nondeterministic,
         stage-b-test-small-1-gpu-amd-mi35x,
         stage-b-test-large-1-gpu-amd,
         stage-b-test-large-2-gpu-amd,
