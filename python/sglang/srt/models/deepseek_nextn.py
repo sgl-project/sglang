@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
@@ -49,6 +50,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -60,6 +62,7 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -160,6 +163,7 @@ class DeepseekModelNextN(nn.Module):
 
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
@@ -189,6 +193,15 @@ class DeepseekModelNextN(nn.Module):
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+
+    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
+    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
+    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.layers.61": "model.decoder",
+        },
+    )
 
     def __init__(
         self,

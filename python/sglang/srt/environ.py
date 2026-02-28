@@ -489,6 +489,9 @@ class Envs:
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
+    # Elastic EP Backup Port
+    SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

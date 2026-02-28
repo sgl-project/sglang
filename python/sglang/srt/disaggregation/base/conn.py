@@ -64,7 +64,7 @@ class BaseKVManager(ABC):
 
     @abstractmethod
     def register_to_bootstrap(self):
-        """Register to the bootstrap server."""
+        """Register prefill server info to the bootstrap server."""
         ...
 
 
@@ -164,4 +164,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, host: str, port: int, dp_size: int = 1): ...
+    def __init__(self, host: str, port: int): ...
