@@ -12,6 +12,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
     GeneralWarning,
+    NonTensorRecord,
     SkipRecord,
     SummaryRecord,
     WarningRecord,
@@ -1303,11 +1304,156 @@ class TestEntrypointAlignment:
         assert summary.passed == 2
 
 
+class TestEntrypointNonTensorValues:
+    """Test non-tensor value comparison through the full entrypoint pipeline."""
+
+    def test_non_tensor_float_same_value(self, tmp_path: Path, capsys) -> None:
+        """Two sides dump the same float → NonTensorRecord with values_equal=True, category=passed."""
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.125
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+        assert non_tensors[0].name == "sm_scale"
+        assert non_tensors[0].values_equal is True
+        assert non_tensors[0].category == "passed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1
+        assert summary.failed == 0
+
+    def test_non_tensor_float_different_value(self, tmp_path: Path, capsys) -> None:
+        """Two sides dump different floats → NonTensorRecord with values_equal=False, category=failed."""
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.25
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+        assert non_tensors[0].values_equal is False
+        assert non_tensors[0].category == "failed"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 1
+
+    def test_non_tensor_string_value(self, tmp_path: Path, capsys) -> None:
+        """String non-tensor values are compared and displayed correctly."""
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path,
+            name="attn_backend",
+            baseline_value="flash_attn",
+            target_value="flash_attn",
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+        assert non_tensors[0].values_equal is True
+        assert non_tensors[0].baseline_type == "str"
+        assert non_tensors[0].target_type == "str"
+
+    def test_non_tensor_mixed_with_tensor(self, tmp_path: Path, capsys) -> None:
+        """Tensors and non_tensors in the same dump are each handled correctly."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 4)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            _create_non_tensor_rank_dump(
+                side_dir,
+                rank=0,
+                name="sm_scale",
+                value=0.125,
+                extra_tensor_dumps=[("hidden", tensor)],
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            grouping="raw",
+        )
+        records = _run_and_parse(args, capsys)
+
+        comparisons = _get_comparisons(records)
+        non_tensors = _get_non_tensors(records)
+        assert len(comparisons) == 1
+        assert comparisons[0].name == "hidden"
+        assert len(non_tensors) == 1
+        assert non_tensors[0].name == "sm_scale"
+        assert non_tensors[0].values_equal is True
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 2
+
+    def test_non_tensor_complex_object(self, tmp_path: Path, capsys) -> None:
+        """Complex objects (e.g. dict containing a tensor) are displayed via repr, not skipped."""
+        value = {"a": 1, "b": "hello", "c": torch.tensor([1.0, 2.0])}
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path, name="debug_info", baseline_value=value, target_value=value
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+        assert non_tensors[0].name == "debug_info"
+        assert non_tensors[0].baseline_type == "dict"
+        assert non_tensors[0].target_type == "dict"
+
+    def test_non_tensor_none_value(self, tmp_path: Path, capsys) -> None:
+        """Dumping None is displayed as NonTensorRecord, not skipped as load failure."""
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path, name="optional_param", baseline_value=None, target_value=None
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+        assert non_tensors[0].name == "optional_param"
+        assert non_tensors[0].values_equal is True
+        assert non_tensors[0].baseline_value == "None"
+        assert non_tensors[0].baseline_type == "NoneType"
+        assert non_tensors[0].category == "passed"
+
+    def test_non_tensor_json_roundtrip(self, tmp_path: Path, capsys) -> None:
+        """NonTensorRecord JSON output can be parsed back correctly."""
+        baseline_path, target_path = _create_non_tensor_dumps(
+            tmp_path, name="sm_scale", baseline_value=0.125, target_value=0.125
+        )
+        args = _make_args(baseline_path, target_path, grouping="raw")
+        records = _run_and_parse(args, capsys)
+
+        non_tensors = _get_non_tensors(records)
+        assert len(non_tensors) == 1
+
+        json_str: str = non_tensors[0].model_dump_json()
+        roundtripped = parse_record_json(json_str)
+        assert isinstance(roundtripped, NonTensorRecord)
+        assert roundtripped.name == "sm_scale"
+        assert roundtripped.values_equal is True
+
+
 # --------------------------- Assertion helpers -------------------
 
 
 def _get_comparisons(records: list[AnyRecord]) -> list[ComparisonRecord]:
     return [r for r in records if isinstance(r, ComparisonRecord)]
+
+
+def _get_non_tensors(records: list[AnyRecord]) -> list[NonTensorRecord]:
+    return [r for r in records if isinstance(r, NonTensorRecord)]
 
 
 def _assert_single_comparison_passed(records: list[AnyRecord]) -> ComparisonRecord:
@@ -1364,6 +1510,56 @@ def _create_dumps(
         exp_paths.append(d / dumper._config.exp_name)
 
     return exp_paths[0], exp_paths[1]
+
+
+def _create_non_tensor_rank_dump(
+    directory: Path,
+    *,
+    rank: int,
+    name: str,
+    value: object,
+    extra_tensor_dumps: list[tuple[str, torch.Tensor]] | None = None,
+) -> Path:
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
+
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+                enable_http_server=False,
+            )
+        )
+        dumper.__dict__["_static_meta"] = {"world_rank": rank, "world_size": 1}
+
+        dumper.dump(name, value)
+        for extra_name, extra_tensor in extra_tensor_dumps or []:
+            dumper.dump(extra_name, extra_tensor)
+        dumper.step()
+
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_non_tensor_dumps(
+    tmp_path: Path,
+    *,
+    name: str,
+    baseline_value: object,
+    target_value: object,
+) -> tuple[Path, Path]:
+    baseline_dir = tmp_path / "baseline"
+    target_dir = tmp_path / "target"
+    baseline_dir.mkdir()
+    target_dir.mkdir()
+
+    baseline_path = _create_non_tensor_rank_dump(
+        baseline_dir, rank=0, name=name, value=baseline_value
+    )
+    target_path = _create_non_tensor_rank_dump(
+        target_dir, rank=0, name=name, value=target_value
+    )
+    return baseline_path, target_path
 
 
 def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace:

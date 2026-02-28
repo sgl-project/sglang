@@ -25,6 +25,7 @@ from sglang.srt.debug_utils.comparator.display import emit_display_records
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
+    NonTensorRecord,
     SkipRecord,
     SummaryRecord,
     print_record,
@@ -137,7 +138,7 @@ def _compare_bundle_pairs(
     token_aligner_plan: Optional[TokenAlignerPlan],
     diff_threshold: float,
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
-) -> Iterator[Union[ComparisonRecord, SkipRecord]]:
+) -> Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
             continue
@@ -159,7 +160,7 @@ def _compare_bundle_pairs(
 
 def _consume_comparison_records(
     *,
-    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord]],
+    comparison_records: Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]],
     output_format: str,
 ) -> None:
     counts: dict[str, int] = {"passed": 0, "failed": 0, "skipped": 0}

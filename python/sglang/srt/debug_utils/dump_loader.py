@@ -9,6 +9,8 @@ import torch
 
 _TYPED_FIELDS: list[tuple[str, type]] = [("rank", int)]
 
+LOAD_FAILED: object = object()
+
 
 def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
     stem = Path(path).stem
@@ -38,7 +40,7 @@ class ValueWithMeta:
         except Exception as e:
             print(f"Skip load {path} since error {e}")
             return ValueWithMeta(
-                value=None, meta={**meta_from_filename, "filename": path.name}
+                value=LOAD_FAILED, meta={**meta_from_filename, "filename": path.name}
             )
 
         value, meta_from_embedded = _unwrap_dict_format(raw)
