@@ -1019,80 +1019,6 @@ class TestEntrypointAxisSwapper:
         assert comp.name == "hidden"
 
 
-class TestEntrypointAxisSwapper:
-    """Test cross-framework dim reordering through the full entrypoint pipeline."""
-
-    def test_axis_swap_different_dim_order(self, tmp_path, capsys):
-        """Baseline dims 'b h d' vs target dims 'b d h': axis swapper rearranges baseline to match."""
-        torch.manual_seed(42)
-        full_tensor = torch.randn(4, 8, 16)
-
-        baseline_dir = tmp_path / "baseline"
-        target_dir = tmp_path / "target"
-
-        _create_rank_dump(
-            baseline_dir,
-            rank=0,
-            name="hidden",
-            tensor=full_tensor,
-            dims="b h d",
-        )
-        _create_rank_dump(
-            target_dir,
-            rank=0,
-            name="hidden",
-            tensor=full_tensor.permute(0, 2, 1).contiguous(),
-            dims="b d h",
-        )
-
-        args = _make_args(
-            baseline_dir / _FIXED_EXP_NAME,
-            target_dir / _FIXED_EXP_NAME,
-            diff_threshold=1e-3,
-        )
-
-        records = _run_and_parse(args, capsys)
-        comp = _assert_single_comparison_passed(records)
-        assert comp.name == "hidden"
-        assert comp.baseline.shape == [4, 16, 8]
-        assert comp.target.shape == [4, 16, 8]
-
-    def test_axis_swap_with_tp_unshard(self, tmp_path, capsys):
-        """Baseline TP=2 with dims 'b h(tp) d' vs target TP=2 with dims 'b d h(tp)': unshard + axis swap."""
-        torch.manual_seed(42)
-        full_tensor = torch.randn(4, 8, 16)
-
-        baseline_dir = tmp_path / "baseline"
-        target_dir = tmp_path / "target"
-
-        _create_tp_sharded_dumps(
-            baseline_dir,
-            full_tensor=full_tensor,
-            name="hidden",
-            tp_size=2,
-            shard_dim=1,
-            dims_str="b h(tp) d",
-        )
-        _create_tp_sharded_dumps(
-            target_dir,
-            full_tensor=full_tensor.permute(0, 2, 1).contiguous(),
-            name="hidden",
-            tp_size=2,
-            shard_dim=2,
-            dims_str="b d h(tp)",
-        )
-
-        args = _make_args(
-            baseline_dir / _FIXED_EXP_NAME,
-            target_dir / _FIXED_EXP_NAME,
-            diff_threshold=1e-3,
-        )
-
-        records = _run_and_parse(args, capsys)
-        comp = _assert_single_comparison_passed(records)
-        assert comp.name == "hidden"
-
-
 class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
@@ -1578,6 +1504,52 @@ class TestEntrypointNonTensorValues:
         assert roundtripped.values_equal is True
 
 
+# ───────────────────── Visualization integration tests ─────────────────────
+
+
+class TestEntrypointVisualize:
+    """Test --visualize-bundle-details integration."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_if_no_matplotlib(self) -> None:
+        pytest.importorskip("matplotlib")
+
+    def test_visualize_creates_pngs(self, tmp_path, capsys):
+        """--visualize-bundle-details with --filter produces PNG files."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a", "tensor_b"])
+        viz_dir = tmp_path / "viz_out"
+        args = _make_args(
+            baseline_path,
+            target_path,
+            grouping="raw",
+            filter="tensor_a",
+            viz_bundle_details=True,
+            viz_output_dir=str(viz_dir),
+        )
+
+        records = _run_and_parse(args, capsys)
+        assert len(_get_comparisons(records)) == 1
+
+        png_files = list(viz_dir.glob("*.png"))
+        assert len(png_files) == 1
+        assert png_files[0].stat().st_size > 0
+
+    def test_no_visualize_no_png(self, tmp_path, capsys):
+        """Without --visualize-bundle-details, no PNGs are created."""
+        baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
+        viz_dir = tmp_path / "viz_out"
+        args = _make_args(
+            baseline_path,
+            target_path,
+            grouping="raw",
+            viz_bundle_details=False,
+            viz_output_dir=str(viz_dir),
+        )
+
+        _run_and_parse(args, capsys)
+        assert not viz_dir.exists() or len(list(viz_dir.glob("*.png"))) == 0
+
+
 # --------------------------- Assertion helpers -------------------
 
 
@@ -1702,6 +1674,8 @@ def _make_args(baseline_path: Path, target_path: Path, **overrides) -> Namespace
         filter=None,
         output_format="json",
         grouping="logical",
+        viz_bundle_details=False,
+        viz_output_dir="/tmp/comparator_viz/",
     )
     defaults.update(overrides)
     return Namespace(**defaults)

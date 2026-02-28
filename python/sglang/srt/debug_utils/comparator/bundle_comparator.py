@@ -21,6 +21,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
 from sglang.srt.debug_utils.comparator.dims import apply_dim_names, parse_dim_names
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
+    GeneralWarning,
     NonTensorRecord,
     SkipRecord,
 )
@@ -45,6 +46,7 @@ def compare_bundle_pair(
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
+    viz_output_dir: Optional[Path] = None,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     with warning_sink.context() as collected_warnings:
         result = _compare_bundle_pair_inner(
@@ -55,6 +57,7 @@ def compare_bundle_pair(
             token_aligner_plan=token_aligner_plan,
             diff_threshold=diff_threshold,
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
+            viz_output_dir=viz_output_dir,
         )
 
     return result.model_copy(update={"warnings": collected_warnings})
@@ -71,6 +74,7 @@ def _compare_bundle_pair_inner(
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
+    viz_output_dir: Optional[Path] = None,
 ) -> Union[ComparisonRecord, SkipRecord, NonTensorRecord]:
     # 1. Load all successfully loaded values
     all_pair: Pair[list[ValueWithMeta]] = Pair(
@@ -96,6 +100,7 @@ def _compare_bundle_pair_inner(
         token_aligner_plan=token_aligner_plan,
         diff_threshold=diff_threshold,
         thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
+        viz_output_dir=viz_output_dir,
     )
 
 
@@ -108,6 +113,7 @@ def _compare_bundle_pair_tensor_type(
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]] = Pair(
         x=None, y=None
     ),
+    viz_output_dir: Optional[Path] = None,
 ) -> Union[ComparisonRecord, SkipRecord]:
     if not valid_pair.x or not valid_pair.y:
         reason = "baseline_load_failed" if not valid_pair.x else "target_load_failed"
@@ -145,13 +151,59 @@ def _compare_bundle_pair_tensor_type(
         return SkipRecord(name=name, reason=reason)
 
     # Compare
+    aligned_baseline: torch.Tensor = aligner_result.tensors.x.rename(None)
+    aligned_target: torch.Tensor = aligner_result.tensors.y.rename(None)
+
     info = compare_tensor_pair(
-        x_baseline=aligner_result.tensors.x.rename(None),
-        x_target=aligner_result.tensors.y.rename(None),
+        x_baseline=aligned_baseline,
+        x_target=aligned_target,
         name=name,
         diff_threshold=diff_threshold,
     )
-    return ComparisonRecord(**info.model_dump(), aligner_plan=plan)
+    record = ComparisonRecord(**info.model_dump(), aligner_plan=plan)
+
+    if viz_output_dir is not None:
+        _try_generate_viz(
+            baseline=aligned_baseline,
+            target=aligned_target,
+            name=name,
+            viz_output_dir=viz_output_dir,
+        )
+
+    return record
+
+
+def _try_generate_viz(
+    *,
+    baseline: torch.Tensor,
+    target: torch.Tensor,
+    name: str,
+    viz_output_dir: Path,
+) -> None:
+    from sglang.srt.debug_utils.comparator.visualizer import (
+        generate_comparison_figure,
+    )
+    from sglang.srt.debug_utils.comparator.visualizer.preprocessing import (
+        _sanitize_filename,
+    )
+
+    filename: str = _sanitize_filename(name) + ".png"
+    output_path: Path = viz_output_dir / filename
+
+    try:
+        generate_comparison_figure(
+            baseline=baseline,
+            target=target,
+            name=name,
+            output_path=output_path,
+        )
+    except Exception as exc:
+        warning_sink.add(
+            GeneralWarning(
+                category="visualizer",
+                message=f"Visualization failed for {name}: {exc}",
+            )
+        )
 
 
 def _compare_bundle_pair_non_tensor_type(

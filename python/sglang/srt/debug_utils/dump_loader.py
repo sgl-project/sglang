@@ -9,8 +9,6 @@ import torch
 
 LOAD_FAILED: object = object()
 
-LOAD_FAILED: object = object()
-
 
 def parse_meta_from_filename(path: Path) -> Dict[str, Any]:
     stem = Path(path).stem
