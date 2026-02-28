@@ -506,6 +506,138 @@ class TestVerifyReplicatedGroup:
         assert len(warnings) == 1
         assert warnings[0].differing_index == 1
 
+    def test_recompute_pseudo_mismatch_warns(self) -> None:
+        """_verify_replicated_group produces warning for RECOMPUTE_PSEUDO axis mismatch."""
+        tensor_a = torch.ones(4)
+        tensor_b = torch.ones(4) + 0.1
+
+        with warning_sink.context() as warnings:
+            _verify_replicated_group(
+                [tensor_a, tensor_b],
+                axis=ParallelAxis.RECOMPUTE_PSEUDO,
+                group_index=0,
+            )
+        assert len(warnings) == 1
+        assert warnings[0].axis == "recompute_pseudo"
+        assert warnings[0].group_index == 0
+        assert warnings[0].differing_index == 1
+        assert warnings[0].baseline_index == 0
+        assert warnings[0].max_abs_diff == pytest.approx(0.1, abs=1e-5)
+
+
+class TestThdCpConcat:
+    def test_single_seq(self) -> None:
+        """Single seq THD unshard: 2 ranks → per-seq concat."""
+        rank0 = torch.tensor([1, 2, 3]).refine_names("t")
+        rank1 = torch.tensor([4, 5, 6]).refine_names("t")
+
+        plan = UnsharderPlan(
+            axis=ParallelAxis.CP,
+            params=CpThdConcatParams(dim_name="t", seq_lens_per_rank=[3]),
+            groups=[[0, 1]],
+        )
+        with warning_sink.context():
+            result = execute_unsharder_plan(plan, [rank0, rank1])
+
+        assert len(result) == 1
+        expected = torch.tensor([1, 2, 3, 4, 5, 6])
+        assert torch.equal(result[0].rename(None), expected)
+
+    def test_multi_seq(self) -> None:
+        """Multi-seq THD unshard: 2 ranks, seq_lens=[50, 32, 46]."""
+        # rank0: [seqA_r0(50) | seqB_r0(32) | pad_r0(46)]
+        # rank1: [seqA_r1(50) | seqB_r1(32) | pad_r1(46)]
+        seq_a_r0 = torch.arange(0, 50)
+        seq_b_r0 = torch.arange(100, 132)
+        pad_r0 = torch.full((46,), -1)
+        rank0 = torch.cat([seq_a_r0, seq_b_r0, pad_r0]).refine_names("t")
+
+        seq_a_r1 = torch.arange(50, 100)
+        seq_b_r1 = torch.arange(132, 164)
+        pad_r1 = torch.full((46,), -2)
+        rank1 = torch.cat([seq_a_r1, seq_b_r1, pad_r1]).refine_names("t")
+
+        plan = UnsharderPlan(
+            axis=ParallelAxis.CP,
+            params=CpThdConcatParams(dim_name="t", seq_lens_per_rank=[50, 32, 46]),
+            groups=[[0, 1]],
+        )
+        with warning_sink.context():
+            result = execute_unsharder_plan(plan, [rank0, rank1])
+
+        assert len(result) == 1
+        unsharded: torch.Tensor = result[0].rename(None)
+
+        # seqA: r0(50) + r1(50) = 100 tokens, values 0..99
+        assert torch.equal(unsharded[:100], torch.cat([seq_a_r0, seq_a_r1]))
+        # seqB: r0(32) + r1(32) = 64 tokens
+        assert torch.equal(unsharded[100:164], torch.cat([seq_b_r0, seq_b_r1]))
+        # pad: r0(46) + r1(46) = 92 tokens
+        assert torch.equal(unsharded[164:256], torch.cat([pad_r0, pad_r1]))
+
+    def test_with_hidden_dim(self) -> None:
+        """THD unshard with trailing hidden dim: shape [T, H]."""
+        torch.manual_seed(42)
+        hidden: int = 4
+        # rank0: [seqA_r0(3, 4) | seqB_r0(2, 4)]
+        # rank1: [seqA_r1(3, 4) | seqB_r1(2, 4)]
+        seq_a_r0 = torch.randn(3, hidden)
+        seq_b_r0 = torch.randn(2, hidden)
+        rank0 = torch.cat([seq_a_r0, seq_b_r0]).refine_names("t", "h")
+
+        seq_a_r1 = torch.randn(3, hidden)
+        seq_b_r1 = torch.randn(2, hidden)
+        rank1 = torch.cat([seq_a_r1, seq_b_r1]).refine_names("t", "h")
+
+        plan = UnsharderPlan(
+            axis=ParallelAxis.CP,
+            params=CpThdConcatParams(dim_name="t", seq_lens_per_rank=[3, 2]),
+            groups=[[0, 1]],
+        )
+        with warning_sink.context():
+            result = execute_unsharder_plan(plan, [rank0, rank1])
+
+        assert len(result) == 1
+        unsharded: torch.Tensor = result[0].rename(None)
+
+        assert unsharded.shape == (10, hidden)
+        assert torch.equal(unsharded[:6], torch.cat([seq_a_r0, seq_a_r1]))
+        assert torch.equal(unsharded[6:10], torch.cat([seq_b_r0, seq_b_r1]))
+
+    def test_with_leading_batch_dim(self) -> None:
+        """THD unshard with leading batch dim: shape [B, T, H], t is dim=1."""
+        torch.manual_seed(42)
+        batch: int = 2
+        hidden: int = 4
+        # rank0: [seqA_r0(3) | seqB_r0(2)] per batch item
+        # rank1: [seqA_r1(3) | seqB_r1(2)] per batch item
+        seq_a_r0 = torch.randn(batch, 3, hidden)
+        seq_b_r0 = torch.randn(batch, 2, hidden)
+        rank0 = torch.cat([seq_a_r0, seq_b_r0], dim=1).refine_names("b", "t", "h")
+
+        seq_a_r1 = torch.randn(batch, 3, hidden)
+        seq_b_r1 = torch.randn(batch, 2, hidden)
+        rank1 = torch.cat([seq_a_r1, seq_b_r1], dim=1).refine_names("b", "t", "h")
+
+        plan = UnsharderPlan(
+            axis=ParallelAxis.CP,
+            params=CpThdConcatParams(dim_name="t", seq_lens_per_rank=[3, 2]),
+            groups=[[0, 1]],
+        )
+        with warning_sink.context():
+            result = execute_unsharder_plan(plan, [rank0, rank1])
+
+        assert len(result) == 1
+        unsharded: torch.Tensor = result[0].rename(None)
+
+        assert unsharded.shape == (batch, 10, hidden)
+        # seqA: r0(3) + r1(3) = 6 tokens per batch
+        assert torch.equal(unsharded[:, :6, :], torch.cat([seq_a_r0, seq_a_r1], dim=1))
+        # seqB: r0(2) + r1(2) = 4 tokens per batch
+        assert torch.equal(
+            unsharded[:, 6:10, :], torch.cat([seq_b_r0, seq_b_r1], dim=1)
+        )
+
 
 class TestThdCpConcat:
     def test_single_seq(self) -> None:

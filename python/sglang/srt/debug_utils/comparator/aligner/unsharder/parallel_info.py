@@ -24,12 +24,18 @@ def normalize_parallel_info(meta: dict) -> dict[ParallelAxis, AxisInfo]:
             info = value
 
     if info is None:
-        return {}
+        info = {}
 
     result: dict[ParallelAxis, AxisInfo] = {}
     for axis in ParallelAxis:
         axis_rank = info.get(f"{axis.value}_rank")
         axis_size = info.get(f"{axis.value}_size")
+
+        # Recompute pseudo-axis lives at top-level meta, not inside parallel_info
+        if axis_rank is None:
+            axis_rank = meta.get(f"{axis.value}_rank")
+            axis_size = meta.get(f"{axis.value}_size")
+
         if axis_rank is not None and axis_size is not None and axis_size > 1:
             result[axis] = AxisInfo(
                 axis_rank=axis_rank,

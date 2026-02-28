@@ -1,3 +1,4 @@
+import enum
 import functools
 import json
 import os
@@ -415,7 +416,14 @@ class _Dumper:
         if not self._config.enable:
             return
 
-        tags = dict(name=name, **extra_kwargs, **self._state.global_ctx)
+        recompute_status = _detect_recompute_status()
+        tags = dict(
+            name=name,
+            recompute_status=recompute_status.value,
+            **extra_kwargs,
+            **self._state.global_ctx,
+        )
+
         if (f := self._config.filter) is not None and re.search(
             f, _format_tags(tags)
         ) is None:
@@ -424,6 +432,7 @@ class _Dumper:
         if not (enable_value or enable_curr_grad or enable_future_grad):
             return
 
+        recompute_meta = recompute_status.to_pseudo_parallel_meta()
         value = _materialize_value(value)
 
         if enable_value:
@@ -432,7 +441,7 @@ class _Dumper:
                 tags=tags,
                 value=value,
                 save=save,
-                meta_only_fields=value_meta_only_fields or {},
+                meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
             )
 
         if (
@@ -445,7 +454,7 @@ class _Dumper:
                 tags={**tags, "name": f"grad__{name}"},
                 value=g,
                 save=save,
-                meta_only_fields=grad_meta_only_fields or {},
+                meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
             )
 
         if enable_future_grad:
@@ -472,7 +481,10 @@ class _Dumper:
             return
 
         captured_step = self._state.step
-        captured_tags = dict(name=f"grad__{name}", **deepcopy(extra_kwargs))
+        captured_tags = dict(
+            name=f"grad__{name}",
+            **deepcopy(extra_kwargs),
+        )
         captured_meta_only = meta_only_fields or {}
 
         def grad_hook(grad: torch.Tensor) -> None:
@@ -1142,6 +1154,20 @@ def _get_local_ip_by_remote() -> Optional[str]:
 # -------------------------------------- framework plugins ------------------------------------------
 
 
+class _RecomputeStatus(enum.Enum):
+    DISABLED = "disabled"
+    ORIGINAL = "original"  # inside checkpoint, original forward
+    RECOMPUTE = "recompute"  # inside checkpoint, recompute forward
+
+    def to_pseudo_parallel_meta(self) -> dict[str, Any]:
+        if self == _RecomputeStatus.DISABLED:
+            return {}
+        return {
+            "recompute_pseudo_rank": 1 if self == _RecomputeStatus.RECOMPUTE else 0,
+            "recompute_pseudo_size": 2,
+        }
+
+
 class _FrameworkPlugin(ABC):
     @property
     @abstractmethod
@@ -1167,6 +1193,9 @@ class _FrameworkPlugin(ABC):
 
     def get_tokenizer_path(self) -> Optional[str]:
         return None
+
+    def detect_recompute_status(self) -> _RecomputeStatus:
+        return _RecomputeStatus.DISABLED
 
 
 class _SGLangPlugin(_FrameworkPlugin):
@@ -1353,8 +1382,30 @@ class _MegatronPlugin(_FrameworkPlugin):
             {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
         )
 
+    def detect_recompute_status(self) -> _RecomputeStatus:
+        if not self._available:
+            return _RecomputeStatus.DISABLED
+        try:
+            from megatron.core.tensor_parallel.random import is_checkpointing
+
+            if not is_checkpointing():
+                return _RecomputeStatus.DISABLED
+            if torch.is_grad_enabled():
+                return _RecomputeStatus.RECOMPUTE
+            return _RecomputeStatus.ORIGINAL
+        except (ImportError, AttributeError):
+            return _RecomputeStatus.DISABLED
+
 
 _plugins: list[_FrameworkPlugin] = [_SGLangPlugin(), _MegatronPlugin()]
+
+
+def _detect_recompute_status() -> _RecomputeStatus:
+    for plugin in _plugins:
+        info = plugin.detect_recompute_status()
+        if info != _RecomputeStatus.DISABLED:
+            return info
+    return _RecomputeStatus.DISABLED
 
 
 # -------------------------------------- singleton ------------------------------------------

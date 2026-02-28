@@ -124,7 +124,7 @@ def _read_df(args: argparse.Namespace) -> Pair[pl.DataFrame]:
 def _compute_skip_keys(args, *, has_token_aligner_plan: bool):
     skip_keys: set[str] = {"dump_index", "filename"}
     if args.grouping == "logical":
-        skip_keys |= {"rank"}
+        skip_keys |= {"rank", "recompute_status"}
         if has_token_aligner_plan:
             skip_keys |= {"step"}
     return skip_keys

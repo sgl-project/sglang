@@ -13,13 +13,14 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ConfigRecord,
     GeneralWarning,
     NonTensorRecord,
+    ReplicatedMismatchWarning,
     SkipRecord,
     SummaryRecord,
     WarningRecord,
     _OutputRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
+from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="default", nightly=True)
@@ -875,6 +876,142 @@ class TestEntrypointGroupingLogical:
             baseline_dir / _FIXED_EXP_NAME,
             target_dir / _FIXED_EXP_NAME,
             diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_recompute_pseudo_replicated_verification(self, tmp_path, capsys):
+        """Recompute pseudo-axis with identical original/recompute tensors → passed."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            _create_recompute_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                original_tensor=tensor,
+                recompute_tensor=tensor.clone(),
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_recompute_pseudo_mismatch_warning(self, tmp_path, capsys):
+        """Recompute pseudo-axis with differing original/recompute → ReplicatedMismatchWarning."""
+        torch.manual_seed(42)
+        tensor = torch.randn(4, 8)
+        mismatched_tensor = tensor + torch.randn(4, 8) * 10.0
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir in [baseline_dir, target_dir]:
+            _create_recompute_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                original_tensor=tensor,
+                recompute_tensor=mismatched_tensor,
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comparisons = _get_comparisons(records)
+        assert len(comparisons) == 1
+
+        recompute_warnings = [
+            w
+            for w in comparisons[0].warnings
+            if isinstance(w, ReplicatedMismatchWarning) and w.axis == "recompute_pseudo"
+        ]
+        assert len(recompute_warnings) > 0
+
+
+class TestEntrypointAxisSwapper:
+    """Test cross-framework dim reordering through the full entrypoint pipeline."""
+
+    def test_axis_swap_different_dim_order(self, tmp_path, capsys):
+        """Baseline dims 'b h d' vs target dims 'b d h': axis swapper rearranges baseline to match."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_rank_dump(
+            baseline_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor,
+            dims="b h d",
+        )
+        _create_rank_dump(
+            target_dir,
+            rank=0,
+            name="hidden",
+            tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            dims="b d h",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+        assert comp.baseline.shape == [4, 16, 8]
+        assert comp.target.shape == [4, 16, 8]
+
+    def test_axis_swap_with_tp_unshard(self, tmp_path, capsys):
+        """Baseline TP=2 with dims 'b h(tp) d' vs target TP=2 with dims 'b d h(tp)': unshard + axis swap."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8, 16)
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        _create_tp_sharded_dumps(
+            baseline_dir,
+            full_tensor=full_tensor,
+            name="hidden",
+            tp_size=2,
+            shard_dim=1,
+            dims_str="b h(tp) d",
+        )
+        _create_tp_sharded_dumps(
+            target_dir,
+            full_tensor=full_tensor.permute(0, 2, 1).contiguous(),
+            name="hidden",
+            tp_size=2,
+            shard_dim=2,
+            dims_str="b d h(tp)",
+        )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
+            diff_threshold=1e-3,
         )
 
         records = _run_and_parse(args, capsys)
@@ -1823,6 +1960,53 @@ def _create_tp_sharded_dumps(
             parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
             num_steps=num_steps,
         )
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_recompute_rank_dump(
+    directory: Path,
+    *,
+    rank: int,
+    name: str,
+    original_tensor: torch.Tensor,
+    recompute_tensor: torch.Tensor,
+    dims: str = "h d",
+) -> Path:
+    """Create a dump with both original and recompute forward passes via monkeypatched dumper.
+
+    The dumper naturally produces recompute_pseudo_rank=0 for original and =1 for recompute,
+    plus recompute_pseudo_size=2.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_dumper_module, "_get_rank", lambda: rank)
+
+        dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=str(directory),
+                exp_name=_FIXED_EXP_NAME,
+            )
+        )
+        dumper.__dict__["_static_meta"] = {"world_rank": rank, "world_size": 1}
+
+        # dump original forward
+        mp.setattr(
+            _dumper_module,
+            "_detect_recompute_status",
+            lambda: _RecomputeStatus.ORIGINAL,
+        )
+        dumper.dump(name, original_tensor, dims=dims)
+
+        # dump recompute forward
+        mp.setattr(
+            _dumper_module,
+            "_detect_recompute_status",
+            lambda: _RecomputeStatus.RECOMPUTE,
+        )
+        dumper.dump(name, recompute_tensor, dims=dims)
+
+        dumper.step()
+
     return directory / _FIXED_EXP_NAME
 
 
