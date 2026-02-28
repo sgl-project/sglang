@@ -1462,9 +1462,10 @@ class Scheduler(
             # For session requests, keep mm_inputs for the next request
             if req.session_id:
                 continue
-            # For non-session requests, clear features and mm_inputs
+            # For non-session requests, clear features, precomputed embeddings, and mm_inputs
             for item in mm_inputs.mm_items:
                 item.feature = None
+                item.precomputed_embeddings = None
             req.multimodal_inputs = None
 
     def handle_generate_request(
