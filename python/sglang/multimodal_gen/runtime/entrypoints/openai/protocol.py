@@ -47,7 +47,6 @@ class ImageGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
-    profile: Optional[bool] = False
 
 
 # Video API protocol models

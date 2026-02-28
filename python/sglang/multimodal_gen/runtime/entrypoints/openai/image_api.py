@@ -104,13 +104,6 @@ async def generations(
 ):
     request_id = generate_request_id()
     ext = choose_output_image_ext(request.output_format, request.background)
-    if request.profile:
-        kwargs = {
-            "profile": True,
-            "profile_all_stages": True,
-        }
-    else:
-        kwargs = {}
     sampling = build_sampling_params(
         request_id,
         prompt=request.prompt,
@@ -126,7 +119,6 @@ async def generations(
         enable_teacache=request.enable_teacache,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
-        **kwargs,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
