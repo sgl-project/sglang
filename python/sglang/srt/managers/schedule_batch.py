@@ -87,6 +87,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -103,6 +104,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
+OPT_PREBUILT_BATCH = get_int_env_var("SGLANG_ENABLE_OPT_PREBUILT_BATCH", False)
 
 logger = logging.getLogger(__name__)
 
@@ -2108,6 +2110,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+        if OPT_PREBUILT_BATCH:
+            self.maybe_wait_verify_done()
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
@@ -2229,7 +2233,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def copy(self):
         # Only contain fields that will be used by process_batch_result
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
