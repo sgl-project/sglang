@@ -36,6 +36,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -491,12 +492,18 @@ class Engine(EngineBase):
         self,
         capacity_of_str_len: int,
         session_id: Optional[str] = None,
+        streaming: bool = False,
+        timeout: Optional[float] = None,
     ) -> str:
         """Open a session for multi-turn conversation with shared context.
 
         Args:
             capacity_of_str_len: Maximum string length capacity for the session.
             session_id: Optional session ID. If not provided, a UUID will be generated.
+            streaming: Use low-overhead path for realtime streaming (append-only mode).
+            timeout: If set, the session is automatically closed after being inactive
+                for this many seconds. Inactivity is measured from session open or the
+                most recent request submission.
 
         Returns:
             The session ID (either the provided one or a newly generated UUID).
@@ -504,6 +511,8 @@ class Engine(EngineBase):
         obj = OpenSessionReqInput(
             capacity_of_str_len=capacity_of_str_len,
             session_id=session_id,
+            streaming=streaming,
+            timeout=timeout,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.open_session(obj, None)
@@ -882,25 +891,33 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
-    if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-        def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
-            kill_process_tree(os.getpid())
+    # Signal handlers can only be registered from the main thread.
+    if threading.current_thread() is threading.main_thread():
+        if server_args.custom_sigquit_handler is None:
+            # Register the signal handler.
+            # The child processes will send SIGQUIT to this process when any error happens
+            # This process then clean up the whole process tree
+            # Note: This sigquit handler is used in the launch phase, and may be replaced by
+            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+            def launch_phase_sigquit_handler(signum, frame):
+                logger.error(
+                    "Received sigquit from a child process. It usually means the child failed."
+                )
+                kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        else:
+            # Allow users to register a custom SIGQUIT handler for things like crash dump
+            logger.error(
+                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+            )
+            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
     else:
-        # Allow users to register a custom SIGQUIT handler for things like crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        logger.warning(
+            "Signal handler is not added because the engine is not in the "
+            "main thread. This disables the SIGQUIT handler for cleaning up "
+            "the process tree when a child process fails."
         )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
@@ -1059,6 +1076,12 @@ def _launch_subprocesses(
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
     )
+
+    if (
+        server_args.enable_elastic_expert_backup
+        and server_args.elastic_ep_backend is not None
+    ):
+        run_expert_backup_manager(server_args, port_args)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,

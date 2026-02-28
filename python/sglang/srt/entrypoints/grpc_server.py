@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Dict, Optional
 
 import grpc
+import numpy as np
+import torch
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -35,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -571,12 +574,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_req.disaggregated_params.bootstrap_room
             )  # Can be 0, don't use 'or None'
 
+        # Parse multimodal inputs if present
+        mm_inputs = None
+        if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField(
+            "pixel_values"
+        ):
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
-            mm_inputs=None,  # TODO: implement mm support
+            mm_inputs=mm_inputs,
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=(
@@ -594,6 +604,51 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
         )
+
+    @staticmethod
+    def _decode_tensor_data(tensor_data):
+        """Decode a proto TensorData message into a torch.Tensor."""
+        dtype_map = {"float32": np.float32, "int64": np.int64}
+        np_dtype = dtype_map.get(tensor_data.dtype, np.float32)
+        shape = list(tensor_data.shape)
+        arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
+        return torch.from_numpy(arr)
+
+    def _parse_mm_inputs(self, mm_proto) -> dict:
+        """Parse proto MultimodalInputs into the mm_inputs dict expected by scheduler."""
+        # Decode pixel_values from typed TensorData field
+        pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
+
+        # Decode model-specific tensors
+        model_specific_data = {}
+        for key, tensor_data in mm_proto.model_specific_tensors.items():
+            model_specific_data[key] = self._decode_tensor_data(tensor_data)
+
+        # Convert placeholder ranges to offsets: list of (start, end_inclusive)
+        offsets = [
+            (p.offset, p.offset + p.length - 1) for p in mm_proto.mm_placeholders
+        ]
+        if not offsets:
+            logger.warning(
+                "No mm_placeholders from Rust gateway — token expansion may have "
+                "failed to find the placeholder token in input_ids. "
+                "Check that placeholder_token_id matches the tokenized image token."
+            )
+            offsets = None
+
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=pixel_values,
+            model_specific_data=model_specific_data,
+            offsets=offsets,
+        )
+
+        result = {"mm_items": [mm_item]}
+
+        if mm_proto.HasField("im_token_id"):
+            result["im_token_id"] = mm_proto.im_token_id
+
+        return result
 
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
