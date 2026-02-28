@@ -1,10 +1,6 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-
 template <typename T>
 struct dtype_trait {};
 
@@ -64,16 +60,7 @@ SGL_REGISTER_DTYPE_TRAIT(
     bf16x2_t, void, SGL_REGISTER_TYPE_END; SGL_REGISTER_FROM_FUNCTION(fp32x2_t, __float22bfloat162_rn););
 
 #ifndef USE_ROCM
-SGL_REGISTER_DTYPE_TRAIT(
-    fp8_e4m3_t, fp8x2_e4m3_t, SGL_REGISTER_TYPE_END; SGL_DEVICE static self_t from(const bf16_t& x) {
-      self_t r;
-      r.__x = __nv_cvt_bfloat16raw_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
-      return r;
-    } SGL_DEVICE static self_t from(const fp16_t& x) {
-      self_t r;
-      r.__x = __nv_cvt_halfraw_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
-      return r;
-    });
+SGL_REGISTER_DTYPE_TRAIT(fp8_e4m3_t, fp8x2_e4m3_t);
 #endif
 
 #undef SGL_REGISTER_DTYPE_TRAIT

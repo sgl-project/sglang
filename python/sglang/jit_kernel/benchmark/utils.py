@@ -28,13 +28,7 @@ def get_benchmark_range(full_range: List, ci_range: List) -> List:
 def run_benchmark(
     fn: Callable, quantiles: List[float] = None
 ) -> Tuple[float, float, float]:
-    """Execute benchmark using CUDA events and return times in microseconds.
-
-    Uses do_bench instead of do_bench_cudagraph because TVM FFI kernels always
-    launch on the default CUDA stream (stream 0) regardless of the current
-    PyTorch stream. do_bench_cudagraph creates a separate capture stream, so
-    TVM FFI kernels are never captured in the graph, causing race conditions
-    and illegal memory accesses across benchmark configs.
+    """Execute benchmark using CUDA graph and return times in microseconds.
 
     Args:
         fn: Function to benchmark
@@ -44,5 +38,5 @@ def run_benchmark(
         Tuple of (median_us, max_us, min_us)
     """
     quantiles = quantiles or DEFAULT_QUANTILES
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms

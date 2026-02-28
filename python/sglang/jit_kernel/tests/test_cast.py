@@ -249,5 +249,62 @@ def test_downcast_fp8_mult_offset(mult, offset, dtype):
     )
 
 
+# ---------------------------------------------------------------------------
+# static_cast conversion: verify static_cast<fp8_e4m3_t> matches PyTorch fp8
+# for a comprehensive sweep including values near and at the fp8 boundary.
+# This specifically validates that the static_cast fallback (used after
+# removing explicit __nv_cvt_*raw_to_fp8 from dtype_trait) produces the
+# same bit patterns as the reference path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_downcast_fp8_static_cast_boundary(dtype):
+    """Test conversion accuracy near ±448 fp8 boundary using static_cast path."""
+    torch.manual_seed(0)
+    # Values specifically chosen to stress the static_cast conversion path:
+    #   - exactly at ±448 (representable fp8 max)
+    #   - just inside the range
+    #   - just outside (must saturate)
+    #   - zero, small, and mid-range values
+    boundary_vals = [
+        0.0,
+        1.0,
+        -1.0,
+        100.0,
+        -100.0,
+        447.0,
+        -447.0,
+        448.0,
+        -448.0,
+        449.0,
+        -449.0,
+        1000.0,
+        -1000.0,
+    ]
+    input_sl = len(boundary_vals)
+    head, dim, out_sl = 1, 8, input_sl
+
+    base = torch.tensor(boundary_vals, dtype=dtype, device="cuda")
+    k = base.unsqueeze(1).unsqueeze(2).expand(input_sl, head, dim).contiguous()
+    v = (-base).unsqueeze(1).unsqueeze(2).expand(input_sl, head, dim).contiguous()
+    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    loc = torch.arange(input_sl, dtype=torch.int64, device="cuda")
+
+    k_out = torch.zeros(out_sl, head, dim, dtype=torch.uint8, device="cuda")
+    v_out = torch.zeros(out_sl, head, dim, dtype=torch.uint8, device="cuda")
+    downcast_fp8(k, v, k_out, v_out, scale, scale, loc)
+
+    k_ref = _ref_downcast(k, scale, loc, out_sl)
+    v_ref = _ref_downcast(v, scale, loc, out_sl)
+
+    torch.testing.assert_close(
+        k_out, k_ref, msg="boundary values: k static_cast vs reference mismatch"
+    )
+    torch.testing.assert_close(
+        v_out, v_ref, msg="boundary values: v static_cast vs reference mismatch"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
