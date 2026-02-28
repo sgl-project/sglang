@@ -4,6 +4,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.observability.req_time_stats import convert_time_to_realtime_ns
+from sglang.srt.observability.trace import get_global_tracing_enabled
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -312,13 +315,60 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            tracing_enabled = get_global_tracing_enabled()
+
+            if tracing_enabled:
+                draft_start_ts = convert_time_to_realtime_ns(time.perf_counter())
+                for req in batch.reqs:
+                    req.time_stats.trace_ctx.trace_slice_start(
+                        "spec_draft", 2, draft_start_ts
+                    )
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
+
+            if tracing_enabled:
+                draft_end_ts = convert_time_to_realtime_ns(time.perf_counter())
+                for req in batch.reqs:
+                    req.time_stats.trace_ctx.trace_slice_end(
+                        "spec_draft", 2, draft_end_ts
+                    )
+
+            if tracing_enabled:
+                verify_start_ts = convert_time_to_realtime_ns(time.perf_counter())
+                for req in batch.reqs:
+                    req.time_stats.trace_ctx.trace_slice_start(
+                        "spec_verify", 2, verify_start_ts
+                    )
+
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+
+            if tracing_enabled:
+                verify_end_ts = convert_time_to_realtime_ns(time.perf_counter())
+                for idx, req in enumerate(batch.reqs):
+                    accepted = verify_output.accept_length_per_req_cpu[idx]
+                    req.time_stats.trace_ctx.trace_slice_end(
+                        "spec_verify", 2, verify_end_ts
+                    )
+                    req.time_stats.trace_ctx.trace_event(
+                        "spec_accept",
+                        2,
+                        verify_end_ts,
+                        {"accepted_tokens": accepted},
+                    )
+
+            if tracing_enabled:
+                draft_extend_start_ts = convert_time_to_realtime_ns(
+                    time.perf_counter()
+                )
+                for req in batch.reqs:
+                    req.time_stats.trace_ctx.trace_slice_start(
+                        "spec_draft_extend", 3, draft_extend_start_ts
+                    )
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -331,6 +381,15 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if tracing_enabled:
+                draft_extend_end_ts = convert_time_to_realtime_ns(
+                    time.perf_counter()
+                )
+                for req in batch.reqs:
+                    req.time_stats.trace_ctx.trace_slice_end(
+                        "spec_draft_extend", 3, draft_extend_end_ts
+                    )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
