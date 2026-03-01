@@ -367,14 +367,16 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
-    # Detect quantized models and raise error
+    # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
     if is_quantized and backend != Backend.DIFFUSERS:
-        raise RuntimeError(
-            f"Detected a quantized model format ('{model_path}'). "
+        logger.info(
+            "Detected a quantized model format ('%s'). "
             "The native sglang-diffusion engine currently only supports BF16/FP16. "
-            "Please use '--backend diffusers' to run this model."
+            "Falling back to diffusers backend.",
+            model_path,
         )
+        return _get_diffusers_model_info(model_path)
 
     # 2. Get pipeline class from model's model_index.json
     try:
