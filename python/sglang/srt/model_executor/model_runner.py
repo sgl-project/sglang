@@ -1813,13 +1813,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+        Currently: FlashInfer autotune (attention etc.) and FlashInfer sampling
+        JIT warmup on the last PP stage (e.g. 2nd rank in PP2 prefill) to avoid
+        sampling.lock contention on first request (see e.g. sgl-project/sglang#19583).
         """
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        if self._should_run_flashinfer_sampling_warmup():
+            self._flashinfer_sampling_warmup()
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
@@ -1867,6 +1872,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
+
+    def _should_run_flashinfer_sampling_warmup(self) -> bool:
+        """Run FlashInfer sampling JIT warmup on the last PP stage to avoid sampling.lock
+        contention on first request (e.g. PP2 prefill: 2nd rank PP1 runs sampling;
+        all ATTN_CP ranks on that stage block on same lock, see issue #19583)."""
+        if self.server_args.sampling_backend != "flashinfer":
+            return False
+        # Sampling runs only on the last pipeline stage (e.g. PP1 in PP2). In PD
+        # separation prefill (PP2+TP8+CP8), that is the 2nd prefill rank, not decode.
+        if self.pp_rank != self.pp_size - 1:
+            return False
+        return True
+
+    def _flashinfer_sampling_warmup(self):
+        """Warm up FlashInfer sampling kernel JIT/cache so the first user request
+        does not trigger lock contention across TP/CP ranks (see issue #19583).
+        Only the last PP stage runs sampling; serialize by tp_rank so one rank
+        uses sampling.lock at a time."""
+        from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+        logger.info(
+            "Running FlashInfer sampling warmup (last PP stage) to pre-populate "
+            "JIT cache and avoid sampling.lock contention on first request..."
+        )
+        # Serialize across TP ranks so we don't contend on sampling.lock
+        for step in range(self.tp_size):
+            self.tp_group.barrier()
+            if self.tp_rank == step:
+                with torch.inference_mode():
+                    batch_size = 2
+                    vocab_size = 128
+                    probs = torch.rand(
+                        batch_size, vocab_size, device=self.device, dtype=torch.float32
+                    )
+                    probs = probs / probs.sum(dim=-1, keepdim=True)
+                    top_k = torch.full(
+                        (batch_size,), 50, device=self.device, dtype=torch.int32
+                    )
+                    top_p = torch.full(
+                        (batch_size,), 1.0, device=self.device, dtype=torch.float32
+                    )
+                    top_k_top_p_sampling_from_probs(
+                        probs,
+                        top_k,
+                        top_p,
+                        filter_apply_order="joint",
+                        check_nan=False,
+                    )
+            self.tp_group.barrier()
+        logger.info("FlashInfer sampling warmup completed.")
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
