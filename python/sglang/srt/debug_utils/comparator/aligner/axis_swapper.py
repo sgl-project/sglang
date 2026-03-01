@@ -25,8 +25,8 @@ def compute_axis_swapper_plan(
     if dims_str_pair.x is None or dims_str_pair.y is None:
         return None
 
-    x_names: list[str] = [spec.name for spec in parse_dims(dims_str_pair.x)]
-    y_names: list[str] = [spec.name for spec in parse_dims(dims_str_pair.y)]
+    x_names: list[str] = [spec.name for spec in parse_dims(dims_str_pair.x).dims]
+    y_names: list[str] = [spec.name for spec in parse_dims(dims_str_pair.y).dims]
 
     if x_names == y_names:
         return None
