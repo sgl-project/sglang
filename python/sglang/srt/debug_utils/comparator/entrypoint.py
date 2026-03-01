@@ -36,6 +36,9 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.comparator.per_token_visualizer import (
     generate_per_token_heatmap,
 )
+from sglang.srt.debug_utils.comparator.per_token_visualizer import (
+    generate_per_token_heatmap,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
@@ -254,6 +257,12 @@ def _consume_comparison_records(
         )
 
     return summary, skipped_names
+
+    if visualize_per_token is not None and collected_comparisons:
+        generate_per_token_heatmap(
+            records=collected_comparisons,
+            output_path=visualize_per_token,
+        )
 
 
 def _parse_args() -> argparse.Namespace:
