@@ -1038,7 +1038,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
-    def _merge_into_running(self, batch):
+    def _merge_into_running(self: Scheduler, batch: ScheduleBatch):
         if batch.is_empty():
             return
         if self.running_batch.is_empty():
@@ -1047,7 +1047,7 @@ class SchedulerDisaggregationDecodeMixin:
             # merge running_batch with prefill batch
             self.running_batch.merge_batch(batch)
 
-    def _finalize_running(self):
+    def _finalize_running(self: Scheduler):
         if self.running_batch.is_empty():
             return None
         self.running_batch = self.update_running_batch(self.running_batch)
