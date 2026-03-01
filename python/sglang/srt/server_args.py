@@ -2225,7 +2225,6 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "nixl":
             self.ep_size = self.tp_size
-            envs.SGLANG_NIXL_EP_ENABLED.set(True)
             logger.warning(
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

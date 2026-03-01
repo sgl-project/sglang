@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -16,9 +16,11 @@ from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
-    CombineInputFormat,
     DispatchOutput,
-    DispatchOutputFormat,
+)
+from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPLLCombineInput,
+    DeepEPLLDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
@@ -32,39 +34,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-class NixlEPDispatchOutput(NamedTuple):
-    """NixlEP dispatch output.
-
-    Note: Uses same format as DeepEPLLOutput for compatibility with downstream code.
-    """
-
-    hidden_states: torch.Tensor
-    hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    expected_m: int
-
-    @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.DEEPEP_LL
-
-
-assert isinstance(NixlEPDispatchOutput, DispatchOutput)
-
-
-class NixlEPCombineInput(NamedTuple):
-    """NixlEP combine input."""
-
-    pass
-
-    @property
-    def format(self) -> CombineInputFormat:
-        return CombineInputFormat.DEEPEP_LL
-
-
-assert isinstance(NixlEPCombineInput, CombineInput)
+NixlEPDispatchOutput = DeepEPLLDispatchOutput
+NixlEPCombineInput = DeepEPLLCombineInput
 
 
 class NixlEPBuffer:

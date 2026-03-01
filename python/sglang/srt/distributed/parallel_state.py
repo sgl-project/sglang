@@ -1655,6 +1655,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
     timeout: Optional[int] = None,
+    moe_a2a_backend: Optional[str] = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1695,7 +1696,7 @@ def init_distributed_environment(
         )
 
         # Create a global TCPStore for coordination (used by NIXL)
-        if envs.SGLANG_NIXL_EP_ENABLED.get():
+        if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
     # set the local rank
