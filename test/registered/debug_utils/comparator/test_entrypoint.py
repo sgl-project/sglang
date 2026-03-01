@@ -944,6 +944,107 @@ class TestEntrypointGroupingLogical:
         ]
         assert len(recompute_warnings) > 0
 
+    def test_tp_partial_reduction_unshard(self, tmp_path, capsys):
+        """TP=2 with partial reduction: element-wise sum reconstructs full tensor."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8)
+        full_target = full_baseline + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_tp_partial_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+        target_path = _create_tp_partial_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 1
+        assert summary.passed == 1
+
+    def test_tp_partial_vs_single_rank(self, tmp_path, capsys):
+        """Baseline single rank vs target TP=2 partial: unshard target then compare."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+        target_full = full_tensor + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_rank_dump(
+            baseline_dir, rank=0, name="attn_out", tensor=full_tensor
+        )
+        target_path = _create_tp_partial_dumps(
+            target_dir,
+            full_tensor=target_full,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+    def test_cp_concat_tp_partial_reduction(self, tmp_path, capsys):
+        """CP=2 concat + TP=2 partial reduction: multi-axis unshard."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        for side_dir, full_tensor in [
+            (tmp_path / "baseline", full_baseline),
+            (tmp_path / "target", full_target),
+        ]:
+            side_dir.mkdir()
+            cp_chunks = list(full_tensor.chunk(2, dim=1))
+            rank = 0
+            for cp_rank in range(2):
+                for tp_rank in range(2):
+                    _create_rank_dump(
+                        side_dir,
+                        rank=rank,
+                        name="hidden",
+                        tensor=cp_chunks[cp_rank] / 2,
+                        dims="b s(cp) h(tp,partial)",
+                        parallel_info={
+                            "cp_rank": cp_rank,
+                            "cp_size": 2,
+                            "tp_rank": tp_rank,
+                            "tp_size": 2,
+                        },
+                    )
+                    rank += 1
+
+        args = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
 
 class TestEntrypointAxisAligner:
     """Test cross-framework dim reordering through the full entrypoint pipeline."""
@@ -2040,6 +2141,33 @@ def _create_tp_sharded_dumps(
             rank=tp_rank,
             name=name,
             tensor=shards[tp_rank],
+            dims=dims_str,
+            parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
+            num_steps=num_steps,
+        )
+    return directory / _FIXED_EXP_NAME
+
+
+def _create_tp_partial_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    tp_size: int,
+    dims_str: str,
+    num_steps: int = 1,
+) -> Path:
+    """Create TP-partial dump files where each rank holds full_tensor / tp_size.
+
+    Each rank stores an equal fraction of the full tensor so that
+    element-wise summation across ranks reconstructs the original.
+    """
+    for tp_rank in range(tp_size):
+        _create_rank_dump(
+            directory,
+            rank=tp_rank,
+            name=name,
+            tensor=full_tensor / tp_size,
             dims=dims_str,
             parallel_info={"tp_rank": tp_rank, "tp_size": tp_size},
             num_steps=num_steps,

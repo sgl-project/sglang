@@ -6,6 +6,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     CpThdConcatParams,
     PickParams,
+    ReduceSumParams,
     UnsharderParams,
     UnsharderPlan,
 )
@@ -155,9 +156,7 @@ def _resolve_unshard_params(
     thd_global_seq_lens: Optional[list[int]] = None,
 ) -> UnsharderParams:
     if spec.reduction is not None:
-        raise NotImplementedError(
-            f"Unshard for reduction={spec.reduction} not yet implemented (Phase 2)"
-        )
+        return ReduceSumParams()
 
     if (
         spec.name == TOKEN_DIM_NAME

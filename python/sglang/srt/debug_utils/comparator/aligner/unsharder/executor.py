@@ -6,6 +6,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     CpThdConcatParams,
     PickParams,
+    ReduceSumParams,
     UnsharderParams,
     UnsharderPlan,
 )
@@ -62,6 +63,14 @@ def _apply_unshard(
             dim=thd_dim,
             seq_lens_per_rank=params.seq_lens_per_rank,
         )
+
+    if isinstance(params, ReduceSumParams):
+        stripped: list[torch.Tensor] = [t.rename(None) for t in ordered_tensors]
+        result: torch.Tensor = torch.stack(stripped).sum(dim=0)
+        names: tuple[Optional[str], ...] = ordered_tensors[0].names
+        if names[0] is not None:
+            result = result.refine_names(*names)
+        return result
 
     raise ValueError(f"Unsupported unshard operation: {type(params).__name__}")
 
