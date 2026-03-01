@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
     ConfigRecord,
     GeneralWarning,
     NonTensorRecord,
-    ReplicatedMismatchWarning,
+    ReplicatedCheckResult,
     SkipRecord,
     SummaryRecord,
     WarningRecord,
@@ -910,7 +910,7 @@ class TestEntrypointGroupingLogical:
         assert comp.name == "hidden"
 
     def test_recompute_pseudo_mismatch_warning(self, tmp_path, capsys):
-        """Recompute pseudo-axis with differing original/recompute → ReplicatedMismatchWarning."""
+        """Recompute pseudo-axis with differing original/recompute → failed replicated_checks."""
         torch.manual_seed(42)
         tensor = torch.randn(4, 8)
         mismatched_tensor = tensor + torch.randn(4, 8) * 10.0
@@ -937,12 +937,112 @@ class TestEntrypointGroupingLogical:
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 1
 
-        recompute_warnings = [
-            w
-            for w in comparisons[0].warnings
-            if isinstance(w, ReplicatedMismatchWarning) and w.axis == "recompute_pseudo"
+        recompute_checks: list[ReplicatedCheckResult] = [
+            c for c in comparisons[0].replicated_checks if c.axis == "recompute_pseudo"
         ]
-        assert len(recompute_warnings) > 0
+        assert len(recompute_checks) > 0
+        assert any(not c.passed for c in recompute_checks)
+
+    def test_tp_partial_reduction_unshard(self, tmp_path, capsys):
+        """TP=2 with partial reduction: element-wise sum reconstructs full tensor."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8)
+        full_target = full_baseline + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_tp_partial_dumps(
+            baseline_dir,
+            full_tensor=full_baseline,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+        target_path = _create_tp_partial_dumps(
+            target_dir,
+            full_tensor=full_target,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.total == 1
+        assert summary.passed == 1
+
+    def test_tp_partial_vs_single_rank(self, tmp_path, capsys):
+        """Baseline single rank vs target TP=2 partial: unshard target then compare."""
+        torch.manual_seed(42)
+        full_tensor = torch.randn(4, 8)
+        target_full = full_tensor + torch.randn(4, 8) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        baseline_path = _create_rank_dump(
+            baseline_dir, rank=0, name="attn_out", tensor=full_tensor
+        )
+        target_path = _create_tp_partial_dumps(
+            target_dir,
+            full_tensor=target_full,
+            name="attn_out",
+            tp_size=2,
+            dims_str="b h(tp,partial)",
+        )
+
+        args = _make_args(baseline_path, target_path, diff_threshold=0.01)
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "attn_out"
+
+    def test_cp_concat_tp_partial_reduction(self, tmp_path, capsys):
+        """CP=2 concat + TP=2 partial reduction: multi-axis unshard."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 16)
+        full_target = full_baseline + torch.randn(4, 8, 16) * 0.001
+
+        for side_dir, full_tensor in [
+            (tmp_path / "baseline", full_baseline),
+            (tmp_path / "target", full_target),
+        ]:
+            side_dir.mkdir()
+            cp_chunks = list(full_tensor.chunk(2, dim=1))
+            rank = 0
+            for cp_rank in range(2):
+                for tp_rank in range(2):
+                    _create_rank_dump(
+                        side_dir,
+                        rank=rank,
+                        name="hidden",
+                        tensor=cp_chunks[cp_rank] / 2,
+                        dims="b s(cp) h(tp,partial)",
+                        parallel_info={
+                            "cp_rank": cp_rank,
+                            "cp_size": 2,
+                            "tp_rank": tp_rank,
+                            "tp_size": 2,
+                        },
+                    )
+                    rank += 1
+
+        args = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
 
     def test_tp_partial_reduction_unshard(self, tmp_path, capsys):
         """TP=2 with partial reduction: element-wise sum reconstructs full tensor."""
@@ -1233,7 +1333,7 @@ class TestEntrypointReplicatedAxis:
     """Test replicated-axis scenarios through the full entrypoint pipeline."""
 
     def test_replicated_axis_identical_replicas_passed(self, tmp_path, capsys):
-        """CP2 TP2, TP replicated and identical → passed, no warnings."""
+        """CP2 TP2, TP replicated and identical → passed, replicated_checks all passed."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -1264,13 +1364,14 @@ class TestEntrypointReplicatedAxis:
         records = _run_and_parse(args, capsys)
         comp = _assert_single_comparison_passed(records)
         assert comp.warnings == []
+        assert all(c.passed for c in comp.replicated_checks)
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.passed == 1
 
     def test_replicated_mismatch_fails(self, tmp_path, capsys):
-        """CP2 TP2, TP replicas differ (> atol) → failed with warnings."""
+        """CP2 TP2, TP replicas differ (> atol) → failed with replicated_checks."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -1303,14 +1404,14 @@ class TestEntrypointReplicatedAxis:
         comparisons = _get_comparisons(records)
         assert len(comparisons) == 1
         assert comparisons[0].category == "failed"
-        assert len(comparisons[0].warnings) > 0
+        assert any(not c.passed for c in comparisons[0].replicated_checks)
 
         summary = records[-1]
         assert isinstance(summary, SummaryRecord)
         assert summary.failed == 1
 
-    def test_summary_counts_failed_from_warnings_only(self, tmp_path, capsys):
-        """Diff itself passes but TP replicas differ → summary.failed=1 from warnings."""
+    def test_summary_counts_failed_from_replicated_checks_only(self, tmp_path, capsys):
+        """Diff itself passes but TP replicas differ → summary.failed=1 from replicated_checks."""
         torch.manual_seed(42)
         full_baseline = torch.randn(4, 8, 6)
         full_target = full_baseline + torch.randn(4, 8, 6) * 0.0001
@@ -1352,7 +1453,7 @@ class TestEntrypointReplicatedAxis:
         comp = comparisons[0]
         assert comp.diff is not None
         assert comp.diff.passed
-        assert len(comp.warnings) > 0
+        assert any(not c.passed for c in comp.replicated_checks)
         assert comp.category == "failed"
 
         summary = records[-1]

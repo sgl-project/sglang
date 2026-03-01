@@ -160,6 +160,7 @@ def _compare_bundle_pair_tensor_type(
     aligner_result: AlignerResult = execute_aligner_plan(
         tensors_pair=tensors_pair, plan=plan
     )
+    replicated_checks = aligner_result.replicated_checks
 
     if aligner_result.tensors is None:
         assert aligner_result.failed_side_xy is not None
@@ -183,7 +184,11 @@ def _compare_bundle_pair_tensor_type(
         diff_threshold=diff_threshold,
         seq_dim=seq_dim,
     )
-    record = ComparisonRecord(**info.model_dump(), aligner_plan=plan)
+    record = ComparisonRecord(
+        **info.model_dump(),
+        aligner_plan=plan,
+        replicated_checks=replicated_checks,
+    )
 
     if viz_output_dir is not None:
         _try_generate_viz(

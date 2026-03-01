@@ -6,9 +6,9 @@ import torch
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     QUANTILE_NUMEL_THRESHOLD,
     SAMPLE_DIFF_THRESHOLD,
-    _compute_diff,
     _compute_tensor_stats,
     compare_tensor_pair,
+    compute_diff,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,7 +55,7 @@ class TestComputeTensorStats:
 class TestComputeDiff:
     def test_identical_tensors(self):
         x = torch.ones(10, 10)
-        diff = _compute_diff(x_baseline=x, x_target=x)
+        diff = compute_diff(x_baseline=x, x_target=x)
 
         assert diff.rel_diff == pytest.approx(0.0, abs=1e-5)
         assert diff.max_abs_diff == pytest.approx(0.0, abs=1e-5)
@@ -70,7 +70,7 @@ class TestComputeDiff:
         y = x.clone()
         y[3, 7] = 1.5
 
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.max_abs_diff == pytest.approx(0.5, abs=1e-4)
         assert diff.max_diff_coord == [3, 7]
@@ -85,14 +85,14 @@ class TestComputeDiff:
     def test_large_tensor_skips_diff_quantiles(self):
         x = torch.randn(QUANTILE_NUMEL_THRESHOLD + 1)
         y = x + 0.001
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.abs_diff_percentiles == {}
 
     def test_rel_diff_value(self):
         x = torch.tensor([1.0, 0.0])
         y = torch.tensor([0.0, 1.0])
-        diff = _compute_diff(x_baseline=x, x_target=y)
+        diff = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.rel_diff == pytest.approx(1.0, abs=1e-5)
         assert diff.passed is False
@@ -103,7 +103,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = _compute_diff(
+        diff: DiffInfo = compute_diff(
             x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
         )
 
@@ -117,7 +117,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = _compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
 
         assert diff.per_token_rel_diff is None
 
@@ -127,7 +127,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(4, 8)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = _compute_diff(
+        diff: DiffInfo = compute_diff(
             x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
         )
 

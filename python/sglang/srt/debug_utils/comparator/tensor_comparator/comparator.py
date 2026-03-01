@@ -57,7 +57,7 @@ def compare_tensor_pair(
     downcast_dtype: Optional[torch.dtype] = None
 
     if not shape_mismatch:
-        diff = _compute_diff(
+        diff = compute_diff(
             x_baseline=x_baseline_f,
             x_target=x_target_f,
             diff_threshold=diff_threshold,
@@ -74,7 +74,7 @@ def compare_tensor_pair(
                 Pair(x=baseline_original_dtype, y=target_original_dtype)
             )
             if downcast_dtype is not None:
-                diff_downcast = _compute_diff(
+                diff_downcast = compute_diff(
                     x_baseline=x_baseline_f.to(downcast_dtype),
                     x_target=x_target_f.to(downcast_dtype),
                     diff_threshold=diff_threshold,
@@ -121,7 +121,7 @@ def _compute_percentiles(x: torch.Tensor, *, include: bool) -> dict[int, float]:
     return {p: torch.quantile(x_float, p / 100.0).item() for p in DEFAULT_PERCENTILES}
 
 
-def _compute_diff(
+def compute_diff(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
     diff_threshold: float = 1e-3,

@@ -8,8 +8,10 @@ from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_valida
 
 from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison,
+    format_replicated_checks,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
+    DiffInfo,
     TensorComparisonInfo,
 )
 from sglang.srt.debug_utils.comparator.utils import _StrictBase
@@ -18,22 +20,6 @@ if TYPE_CHECKING:
     from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
         AlignerPlan,
     )
-
-
-class ReplicatedMismatchWarning(_StrictBase):
-    kind: Literal["replicated_mismatch"] = "replicated_mismatch"
-    axis: str
-    group_index: int
-    differing_index: int
-    baseline_index: int
-    max_abs_diff: float
-
-    def to_text(self) -> str:
-        return (
-            f"Replicated along {self.axis}: group {self.group_index}, "
-            f"index {self.differing_index} differs from {self.baseline_index} "
-            f"(max_abs_diff={self.max_abs_diff:.6e})"
-        )
 
 
 class GeneralWarning(_StrictBase):
@@ -45,10 +31,19 @@ class GeneralWarning(_StrictBase):
         return self.message
 
 
-AnyWarning = Annotated[
-    Union[ReplicatedMismatchWarning, GeneralWarning],
-    Discriminator("kind"),
-]
+# Type alias — currently only GeneralWarning exists.
+# When adding new warning types, convert back to Union + Discriminator("kind").
+AnyWarning = GeneralWarning
+
+
+class ReplicatedCheckResult(_StrictBase):
+    axis: str
+    group_index: int
+    compared_index: int
+    baseline_index: int
+    passed: bool
+    atol: float
+    diff: DiffInfo
 
 
 class _OutputRecord(_StrictBase):
@@ -126,15 +121,20 @@ class ComparisonRecord(TensorComparisonInfo, _OutputRecord):
 
     type: Literal["comparison"] = "comparison"
     aligner_plan: Optional[AlignerPlan] = None
+    replicated_checks: list[ReplicatedCheckResult] = Field(default_factory=list)
 
     @property
     def category(self) -> str:
         if self.warnings:
             return "failed"
+        if any(not check.passed for check in self.replicated_checks):
+            return "failed"
         return "passed" if self.diff is not None and self.diff.passed else "failed"
 
     def _format_body(self) -> str:
         body: str = format_comparison(self)
+        if self.replicated_checks:
+            body += "\n" + format_replicated_checks(self.replicated_checks)
         if self.aligner_plan is not None:
             body += "\n" + _format_aligner_plan(self.aligner_plan)
         return body
