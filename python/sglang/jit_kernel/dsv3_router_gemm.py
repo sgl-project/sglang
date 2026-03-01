@@ -18,21 +18,24 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dsv3_router_gemm_module(out_dtype: torch.dtype) -> Module:
+def _jit_dsv3_router_gemm_module(
+    out_dtype: torch.dtype,
+    num_experts: int,
+    num_tokens: int,
+) -> Module:
     if out_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(f"Unsupported output dtype for dsv3_router_gemm: {out_dtype}")
 
     # Keep PDL gating aligned with AOT behavior.
     enable_pdl = is_arch_support_pdl() and os.getenv("TRTLLM_ENABLE_PDL") == "1"
-    args = make_cpp_args(enable_pdl, out_dtype)
+    args = make_cpp_args(enable_pdl, out_dtype, num_experts, num_tokens)
 
     return load_jit(
         "dsv3_router_gemm",
         *args,
         cuda_files=[
             "gemm/dsv3_router_gemm_entry.cuh",
-            "gemm/dsv3_router_gemm_bf16_out.cuh",
-            "gemm/dsv3_router_gemm_float_out.cuh",
+            "gemm/dsv3_router_gemm_kernel.cuh",
         ],
         cuda_wrappers=[("dsv3_router_gemm", f"dsv3_router_gemm_kernel<{args}>::run")],
     )
@@ -47,7 +50,11 @@ def jit_dsv3_router_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
 ) -> None:
-    module = _jit_dsv3_router_gemm_module(output.dtype)
+    module = _jit_dsv3_router_gemm_module(
+        output.dtype,
+        int(output.shape[1]),
+        int(mat_a.shape[0]),
+    )
     module.dsv3_router_gemm(output, mat_a, mat_b)
 
 

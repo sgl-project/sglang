@@ -18,25 +18,31 @@
  * limitations under the License.
  */
 
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
 namespace dsv3_router_jit {
 
-using bf16_t = __nv_bfloat16;
-
-template <typename T, int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
-__global__
-__launch_bounds__(kBlockSize, 1) void router_gemm_kernel_float_output(float* out, T const* mat_a, T const* mat_b) {
+template <
+    typename T,
+    typename OutT,
+    int kBlockSize,
+    int VPT,
+    int kNumTokens,
+    int kNumExperts,
+    int kHiddenDim,
+    bool kUsePDL>
+__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel(OutT* out, T const* mat_a, T const* mat_b) {
   constexpr int kWarpSize = 32;
   constexpr int kNumWarps = kBlockSize / kWarpSize;
   constexpr int kElemsPerKIter = VPT * kBlockSize;
   static_assert(kHiddenDim % kElemsPerKIter == 0, "hidden_dim must be divisible by one K iteration");
   constexpr int kIters = kHiddenDim / kElemsPerKIter;
+  // For kNumWarps=4, bank conflicts start when token lanes exceed 8.
+  constexpr int kSmReductionPad = (kNumTokens > 8) ? 1 : 0;
+  static_assert(kSmReductionPad == 0 || kSmReductionPad == 1, "kSmReductionPad only supports 0 or 1");
 
   int const n_idx = blockIdx.x;
   int const tid = threadIdx.x;
@@ -44,7 +50,8 @@ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel_float_output(float* out
   int const lane_id = tid % kWarpSize;
 
   float acc[kNumTokens] = {};
-  __shared__ float sm_reduction[kNumTokens][kNumWarps];
+
+  __shared__ float sm_reduction[kNumTokens][kNumWarps + kSmReductionPad];
 
   T const* b_col = mat_b + n_idx * kHiddenDim;
 
@@ -63,7 +70,7 @@ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel_float_output(float* out
 
 #pragma unroll
       for (int k = 0; k < VPT; ++k) {
-        acc[m_idx] += __bfloat162float(a_vec[k]) * __bfloat162float(b_vec[k]);
+        acc[m_idx] += device::cast<float>(a_vec[k]) * device::cast<float>(b_vec[k]);
       }
     }
   }
@@ -78,28 +85,25 @@ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel_float_output(float* out
 
   __syncthreads();
 
-  if (tid == 0) {
+  // Final reduction across warps - each lane in warp 0 handles one token
+  if (warp_id == 0 && lane_id < kNumTokens) {
+    float final_sum = 0.0f;
 #pragma unroll
-    for (int m_idx = 0; m_idx < kNumTokens; ++m_idx) {
-      float final_sum = 0.0f;
-#pragma unroll
-      for (int w = 0; w < kNumWarps; ++w) {
-        final_sum += sm_reduction[m_idx][w];
-      }
-      out[m_idx * kNumExperts + n_idx] = final_sum;
+    for (int w = 0; w < kNumWarps; ++w) {
+      final_sum += sm_reduction[lane_id][w];
     }
+    out[lane_id * kNumExperts + n_idx] = device::cast<OutT>(final_sum);
   }
 
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
-void invokeRouterGemmFloatOutput(float* output, T const* mat_a, T const* mat_b, cudaStream_t stream) {
+template <typename T, typename OutT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
+void invokeRouterGemm(OutT* output, T const* mat_a, T const* mat_b, cudaStream_t stream) {
   constexpr int VPT = 16 / sizeof(T);
   constexpr int kBlockSize = 128;
 
-  constexpr auto kernel =
-      router_gemm_kernel_float_output<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim, kUsePDL>;
+  constexpr auto kernel = router_gemm_kernel<T, OutT, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim, kUsePDL>;
 
   host::LaunchKernel(dim3(kNumExperts), dim3(kBlockSize), stream).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
 }

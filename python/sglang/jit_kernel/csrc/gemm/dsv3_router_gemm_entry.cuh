@@ -29,11 +29,8 @@
 
 namespace dsv3_router_jit {
 
-template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
-void invokeRouterGemmFloatOutput(float* output, T const* mat_a, T const* mat_b, cudaStream_t stream);
-
-template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
-void invokeRouterGemmBf16Output(__nv_bfloat16* output, T const* mat_a, T const* mat_b, cudaStream_t stream);
+template <typename T, typename OutT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
+void invokeRouterGemm(OutT* output, T const* mat_a, T const* mat_b, cudaStream_t stream);
 
 }  // namespace dsv3_router_jit
 
@@ -45,53 +42,13 @@ static constexpr int kDefaultNumExperts = 256;
 static constexpr int kKimiK2NumExperts = 384;
 static constexpr int kDefaultHiddenDim = 7168;
 
-template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim, bool kUsePDL>
-struct LoopUnroller {
-  static void
-  unroll_float_output(int num_tokens, float* output, bf16_t const* input, bf16_t const* weights, cudaStream_t stream) {
-    if (num_tokens == kBegin) {
-      dsv3_router_jit::invokeRouterGemmFloatOutput<bf16_t, kBegin, kNumExperts, kHiddenDim, kUsePDL>(
-          output, input, weights, stream);
-    } else {
-      LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim, kUsePDL>::unroll_float_output(
-          num_tokens, output, input, weights, stream);
-    }
-  }
-
-  static void
-  unroll_bf16_output(int num_tokens, bf16_t* output, bf16_t const* input, bf16_t const* weights, cudaStream_t stream) {
-    if (num_tokens == kBegin) {
-      dsv3_router_jit::invokeRouterGemmBf16Output<bf16_t, kBegin, kNumExperts, kHiddenDim, kUsePDL>(
-          output, input, weights, stream);
-    } else {
-      LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim, kUsePDL>::unroll_bf16_output(
-          num_tokens, output, input, weights, stream);
-    }
-  }
-};
-
-template <int kEnd, int kNumExperts, int kHiddenDim, bool kUsePDL>
-struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim, kUsePDL> {
-  static void
-  unroll_float_output(int num_tokens, float* output, bf16_t const* input, bf16_t const* weights, cudaStream_t stream) {
-    if (num_tokens == kEnd) {
-      dsv3_router_jit::invokeRouterGemmFloatOutput<bf16_t, kEnd, kNumExperts, kHiddenDim, kUsePDL>(
-          output, input, weights, stream);
-    }
-  }
-
-  static void
-  unroll_bf16_output(int num_tokens, bf16_t* output, bf16_t const* input, bf16_t const* weights, cudaStream_t stream) {
-    if (num_tokens == kEnd) {
-      dsv3_router_jit::invokeRouterGemmBf16Output<bf16_t, kEnd, kNumExperts, kHiddenDim, kUsePDL>(
-          output, input, weights, stream);
-    }
-  }
-};
-
-template <bool kUsePDL, typename OutDType>
+template <bool kUsePDL, typename OutDType, int kNumExperts, int kNumTokens>
 struct dsv3_router_gemm_kernel {
   static_assert(std::is_same_v<OutDType, bf16_t> || std::is_same_v<OutDType, fp32_t>);
+  static_assert(
+      kNumExperts == kDefaultNumExperts || kNumExperts == kKimiK2NumExperts,
+      "required num_experts == 256 or num_experts == 384");
+  static_assert(kNumTokens >= 1 && kNumTokens <= 16, "required 1 <= kNumTokens <= 16");
 
   static void
   run(const tvm::ffi::TensorView output, const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b) {
@@ -112,11 +69,9 @@ struct dsv3_router_gemm_kernel {
     const auto num_experts = static_cast<int>(num_experts_sym.unwrap());
     const auto hidden_dim = static_cast<int>(hidden_dim_sym.unwrap());
 
+    RuntimeCheck(num_tokens == kNumTokens, "required num_tokens == ", kNumTokens);
+    RuntimeCheck(num_experts == kNumExperts, "required num_experts == ", kNumExperts);
     RuntimeCheck(hidden_dim == kDefaultHiddenDim, "required hidden_dim == 7168");
-    RuntimeCheck(
-        num_experts == kDefaultNumExperts || num_experts == kKimiK2NumExperts,
-        "required num_experts == 256 or num_experts == 384");
-    RuntimeCheck(num_tokens >= 1 && num_tokens <= 16, "required 1 <= num_tokens <= 16");
 
     auto cc_major = runtime::get_cc_major(device.unwrap().device_id);
     RuntimeCheck(cc_major >= 9, "required CUDA ARCH >= SM_90");
@@ -128,23 +83,8 @@ struct dsv3_router_gemm_kernel {
     auto* mat_a_ptr = static_cast<bf16_t const*>(mat_a.data_ptr());
     auto* mat_b_ptr = static_cast<bf16_t const*>(mat_b.data_ptr());
 
-    if constexpr (std::is_same_v<OutDType, fp32_t>) {
-      if (num_experts == kDefaultNumExperts) {
-        LoopUnroller<1, 16, kDefaultNumExperts, kDefaultHiddenDim, kUsePDL>::unroll_float_output(
-            num_tokens, static_cast<float*>(output_ptr), mat_a_ptr, mat_b_ptr, stream);
-      } else {
-        LoopUnroller<1, 16, kKimiK2NumExperts, kDefaultHiddenDim, kUsePDL>::unroll_float_output(
-            num_tokens, static_cast<float*>(output_ptr), mat_a_ptr, mat_b_ptr, stream);
-      }
-    } else {
-      if (num_experts == kDefaultNumExperts) {
-        LoopUnroller<1, 16, kDefaultNumExperts, kDefaultHiddenDim, kUsePDL>::unroll_bf16_output(
-            num_tokens, static_cast<bf16_t*>(output_ptr), mat_a_ptr, mat_b_ptr, stream);
-      } else {
-        LoopUnroller<1, 16, kKimiK2NumExperts, kDefaultHiddenDim, kUsePDL>::unroll_bf16_output(
-            num_tokens, static_cast<bf16_t*>(output_ptr), mat_a_ptr, mat_b_ptr, stream);
-      }
-    }
+    dsv3_router_jit::invokeRouterGemm<bf16_t, OutDType, kNumTokens, kNumExperts, kDefaultHiddenDim, kUsePDL>(
+        output_ptr, mat_a_ptr, mat_b_ptr, stream);
   }
 };
 
