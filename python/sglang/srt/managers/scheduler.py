@@ -987,9 +987,6 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.schedule_stream: CudaStream = self.device_module.current_stream()
-        if self.device == "cpu":
-            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
@@ -3162,9 +3159,10 @@ def run_scheduler_process(
 
         pipe_writer.send(result_dict)
 
-        schedule_stream: CudaStream = scheduler.device_module.Stream(priority=0)
-        schedule_stream_ctx = CudaStreamContext(schedule_stream)
-        with schedule_stream_ctx:
+        scheduler.schedule_stream = scheduler.device_module.Stream(priority=0)
+        if scheduler.device == "cpu":
+            scheduler.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        with CudaStreamContext(scheduler.schedule_stream):
             dispatch_event_loop(scheduler)
 
     except Exception:
