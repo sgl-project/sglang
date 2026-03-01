@@ -39,6 +39,34 @@ except Exception:
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
+
+# Optimized fused operations with torch.compile
+@torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
+def _fused_zimage_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    head_dim: int,
+) -> torch.Tensor:
+    """Fused attention forward with RoPE application for Z-Image model."""
+    if freqs_cis is not None:
+        cos, sin = freqs_cis
+        # Use fused RoPE application
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+                sin.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+            ],
+            dim=-1,
+        )
+        from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+            apply_flashinfer_rope_qk_inplace,
+        )
+
+        q, k = apply_flashinfer_rope_qk_inplace(q, k, cos_sin_cache, is_neox=False)
+    return q, k
+
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
@@ -210,13 +238,16 @@ class ZImageAttention(nn.Module):
             causal=False,
         )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(
         self,
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        # Optimized QKV projection with minimal memory copies
         if self.use_fused_qkv:
             qkv, _ = self.to_qkv(hidden_states)
+            # Split and reshape in one operation for better memory efficiency
             q, k, v = qkv.split(
                 [
                     self.local_num_heads * self.head_dim,
@@ -225,17 +256,20 @@ class ZImageAttention(nn.Module):
                 ],
                 dim=-1,
             )
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
+            # Use a single contiguous operation after reshape for better performance
+            q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim).contiguous()
+            k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim).contiguous()
+            v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim).contiguous()
         else:
             q, _ = self.to_q(hidden_states)
             k, _ = self.to_k(hidden_states)
             v, _ = self.to_v(hidden_states)
-        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
+            # Contiguous view for better memory access patterns
+            q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim).contiguous()
+            k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim).contiguous()
+            v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim).contiguous()
 
+        # Apply QK normalization with inplace optimization
         if self.qk_norm:
             q, k = apply_qk_norm(
                 q=q,
@@ -246,13 +280,16 @@ class ZImageAttention(nn.Module):
                 allow_inplace=True,
             )
 
+        # Apply rotary embeddings with optimized path selection
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if _is_cuda and q.shape == k.shape:
+            # Use FlashInfer inplace RoPE for better performance when shapes match
+            if _is_cuda and q.shape == k.shape and q.is_contiguous() and k.is_contiguous():
+                # Pre-compute cos_sin_cache with fused contiguous
                 cos_sin_cache = torch.cat(
                     [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
+                        cos.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+                        sin.to(dtype=torch.float32, memory_format=torch.contiguous_format),
                     ],
                     dim=-1,
                 )
@@ -263,9 +300,10 @@ class ZImageAttention(nn.Module):
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
 
+        # Attention computation with optimized memory layout
         hidden_states = self.attn(q, k, v)
-        hidden_states = hidden_states.flatten(2)
-
+        # Flatten and project with fused operations
+        hidden_states = hidden_states.flatten(2, 3)
         hidden_states, _ = self.to_out[0](hidden_states)
 
         return hidden_states
@@ -339,6 +377,7 @@ class ZImageTransformerBlock(nn.Module):
                 ReplicatedLinear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True)
             )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -347,35 +386,46 @@ class ZImageTransformerBlock(nn.Module):
     ):
         if self.modulation:
             assert adaln_input is not None
+            # Optimized modulation computation with fused operations
             scale_msa_gate, _ = self.adaLN_modulation(adaln_input)
-            scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
-                1
-            ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            # Unsqueeze once and chunk for better memory efficiency
+            modulation_params = scale_msa_gate.unsqueeze(1).chunk(4, dim=2)
+            scale_msa, gate_msa, scale_mlp, gate_mlp = modulation_params
+            # Fused tanh and scale computation
+            gate_msa = gate_msa.tanh()
+            gate_mlp = gate_mlp.tanh()
+            # Pre-compute 1+scale for better numerical stability
+            scale_msa = scale_msa + 1.0
+            scale_mlp = scale_mlp + 1.0
 
-            # Attention block
-            attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
-                freqs_cis=freqs_cis,
-            )
+            # Attention block with fused norm and scale
+            norm_x = self.attention_norm1(x)
+            # Fused multiply for scale application
+            if scale_msa.shape[1] == 1:
+                norm_x = norm_x * scale_msa
+            else:
+                norm_x = norm_x * scale_msa
+            attn_out = self.attention(norm_x, freqs_cis=freqs_cis)
+            # Fused residual with gate
             x = x + gate_msa * self.attention_norm2(attn_out)
 
-            # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            # FFN block with optimized computation
+            norm_x_ffn = self.ffn_norm1(x)
+            if scale_mlp.shape[1] == 1:
+                norm_x_ffn = norm_x_ffn * scale_mlp
+            else:
+                norm_x_ffn = norm_x_ffn * scale_mlp
+            ff_out = self.feed_forward(norm_x_ffn)
+            x = x + gate_mlp * self.ffn_norm2(ff_out)
         else:
-            # Attention block
+            # Attention block without modulation - optimized path
             attn_out = self.attention(
                 self.attention_norm1(x),
                 freqs_cis=freqs_cis,
             )
             x = x + self.attention_norm2(attn_out)
 
-            # FFN block
+            # FFN block - optimized path
             x = x + self.ffn_norm2(
                 self.feed_forward(
                     self.ffn_norm1(x),

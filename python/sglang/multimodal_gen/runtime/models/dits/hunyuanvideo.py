@@ -38,12 +38,18 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.optimized_ops import (
+    prepare_cos_sin_cache,
+    should_use_flashinfer_rope,
+)
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+
+_is_cuda = current_platform.is_cuda()
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -215,14 +221,22 @@ class MMDoubleStreamBlock(nn.Module):
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
         # Apply QK-Norm if needed
-
         img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
         img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
-        # Apply rotary embeddings
+
+        # Apply rotary embeddings with optimized path
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        if should_use_flashinfer_rope(img_q, img_k, _is_cuda):
+            from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+                apply_flashinfer_rope_qk_inplace,
+            )
+            cos_sin_cache = prepare_cos_sin_cache(cos, sin, dtype=torch.float32)
+            img_q, img_k = apply_flashinfer_rope_qk_inplace(
+                img_q, img_k, cos_sin_cache, is_neox=False
+            )
+        else:
+            img_q = _apply_rotary_emb(img_q, cos, sin, is_neox_style=False)
+            img_k = _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -384,11 +398,19 @@ class MMSingleStreamBlock(nn.Module):
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
-        # Apply rotary embeddings to image parts
+        # Apply rotary embeddings to image parts with optimized path
         cos, sin = freqs_cis
-        img_q, img_k = _apply_rotary_emb(
-            img_q, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
+        if should_use_flashinfer_rope(img_q, img_k, _is_cuda):
+            from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+                apply_flashinfer_rope_qk_inplace,
+            )
+            cos_sin_cache = prepare_cos_sin_cache(cos, sin, dtype=torch.float32)
+            img_q, img_k = apply_flashinfer_rope_qk_inplace(
+                img_q, img_k, cos_sin_cache, is_neox=False
+            )
+        else:
+            img_q = _apply_rotary_emb(img_q, cos, sin, is_neox_style=False)
+            img_k = _apply_rotary_emb(img_k, cos, sin, is_neox_style=False)
 
         # Run distributed attention
         img_attn_output, txt_attn_output = self.attn(

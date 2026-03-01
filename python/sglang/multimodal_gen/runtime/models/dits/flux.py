@@ -54,8 +54,13 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.models.dits.optimized_ops import (
+    optimize_model_for_inference,
+    get_chunk_size,
+)
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+_is_cuda = current_platform.is_cuda()
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -340,6 +345,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             causal=False,
         )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -383,10 +389,11 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
+            # Optimized cos_sin_cache creation with single contiguous conversion
             cos_sin_cache = torch.cat(
                 [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
+                    cos.to(dtype=torch.float32, memory_format=torch.contiguous_format),
+                    sin.to(dtype=torch.float32, memory_format=torch.contiguous_format),
                 ],
                 dim=-1,
             )
@@ -708,12 +715,34 @@ class FluxPosEmbed(nn.Module):
             ),
         )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos = ids.float()
         # TODO: potential error: flux use n_axes = ids.shape[-1]
         # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
         freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
+
+
+@torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
+def _fused_flux_single_block_forward(
+    norm_hidden_states: torch.Tensor,
+    mlp_fc1,
+    mlp_fc2,
+    act_mlp,
+    attn,
+    freqs_cis,
+    use_nunchaku: bool,
+    _nunchaku_available: bool,
+) -> torch.Tensor:
+    """Fused forward for single transformer block operations."""
+    if use_nunchaku and _nunchaku_available:
+        mlp_hidden_states = _fused_gelu_mlp(norm_hidden_states, mlp_fc1, mlp_fc2)
+    else:
+        mlp_out, _ = mlp_fc1(norm_hidden_states)
+        mlp_hidden_states = act_mlp(mlp_out)
+        mlp_hidden_states, _ = mlp_fc2(mlp_hidden_states)
+    return mlp_hidden_states
 
 
 class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):

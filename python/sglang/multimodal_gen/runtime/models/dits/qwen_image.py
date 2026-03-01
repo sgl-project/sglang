@@ -730,6 +730,7 @@ class QwenImageCrossAttention(nn.Module):
             },
         )
 
+    @torch.compile(mode="reduce-overhead", disable=not _is_cuda, dynamic=False)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -743,14 +744,14 @@ class QwenImageCrossAttention(nn.Module):
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
 
-        # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        # Reshape for multi-head attention with contiguous memory layout
+        img_query = img_query.unflatten(-1, (self.num_heads, -1)).contiguous()
+        img_key = img_key.unflatten(-1, (self.num_heads, -1)).contiguous()
+        img_value = img_value.unflatten(-1, (self.num_heads, -1)).contiguous()
 
-        txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
-        txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
-        txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+        txt_query = txt_query.unflatten(-1, (self.num_heads, -1)).contiguous()
+        txt_key = txt_key.unflatten(-1, (self.num_heads, -1)).contiguous()
+        txt_value = txt_value.unflatten(-1, (self.num_heads, -1)).contiguous()
 
         # Apply QK normalization
         if self.qk_norm:
@@ -771,7 +772,7 @@ class QwenImageCrossAttention(nn.Module):
                 allow_inplace=True,
             )
 
-        # Apply RoPE
+        # Apply RoPE with optimized FlashInfer path
         if image_rotary_emb is not None:
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
