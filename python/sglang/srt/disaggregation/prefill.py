@@ -162,6 +162,15 @@ class PrefillBootstrapQueue:
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
+        # Add tensor buffer references for CPU buffer KV transfer
+        if getattr(self.scheduler.server_args, "nixl_use_cpu_buffer", False):
+            if hasattr(self.token_to_kv_pool, "k_buffer") and hasattr(
+                self.token_to_kv_pool, "v_buffer"
+            ):
+                kv_args.k_buffers = self.token_to_kv_pool.k_buffer
+                kv_args.v_buffers = self.token_to_kv_pool.v_buffer
+                kv_args.head_dim = self.token_to_kv_pool.head_dim
+
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )

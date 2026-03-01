@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -40,6 +40,10 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # Optional tensor buffer references for CPU buffer KV transfer
+    k_buffers: Optional[List[Any]] = None  # List[torch.Tensor], one per layer
+    v_buffers: Optional[List[Any]] = None  # List[torch.Tensor], one per layer
+    head_dim: Optional[int] = None
 
 
 class KVPoll:
