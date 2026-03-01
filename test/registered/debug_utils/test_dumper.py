@@ -16,6 +16,7 @@ from sglang.srt.debug_utils.dumper import (
     DumperConfig,
     _collective_with_timeout,
     _deepcopy_or_clone,
+    _detect_recompute_status,
     _Dumper,
     _format_tags,
     _get_default_exp_name,
@@ -23,6 +24,7 @@ from sglang.srt.debug_utils.dumper import (
     _materialize_value,
     _MegatronPlugin,
     _obj_to_dict,
+    _RecomputeStatus,
     _register_forward_hook_or_replace_fn,
     _SGLangPlugin,
     _torch_save,
@@ -191,8 +193,10 @@ class TestKvPairsParsing:
         assert type(cfg.server_port) is str
 
     def test_from_kv_pairs_optional_str_field(self):
-        cfg = DumperConfig.from_kv_pairs(["filter=layer_id=[0-3]"])
-        assert cfg.filter == "layer_id=[0-3]"
+        cfg = DumperConfig.from_kv_pairs(
+            ["filter=layer_id is not None and layer_id < 3"]
+        )
+        assert cfg.filter == "layer_id is not None and layer_id < 3"
 
     def test_from_kv_pairs_optional_str_exp_name(self):
         cfg = DumperConfig.from_kv_pairs(["exp_name=my_experiment"])
@@ -203,14 +207,14 @@ class TestKvPairsParsing:
             [
                 "enable=true",
                 "dir=/my/dir",
-                "filter=name=foo",
+                "filter=name == 'foo'",
                 "collective_timeout=30",
                 "enable_grad=1",
             ]
         )
         assert cfg.enable is True
         assert cfg.dir == "/my/dir"
-        assert cfg.filter == "name=foo"
+        assert cfg.filter == "name == 'foo'"
         assert cfg.collective_timeout == 30
         assert cfg.enable_grad is True
 
@@ -235,8 +239,8 @@ class TestKvPairsParsing:
         assert DumperConfig._kv_pairs_to_dict([]) == {}
 
     def test_from_kv_pairs_value_with_equals_in_value(self):
-        cfg = DumperConfig.from_kv_pairs(["filter=name=foo"])
-        assert cfg.filter == "name=foo"
+        cfg = DumperConfig.from_kv_pairs(["filter=name == 'foo'"])
+        assert cfg.filter == "name == 'foo'"
 
     def test_from_kv_pairs_type_validation_still_works(self):
         with pytest.raises(TypeError, match="collective_timeout.*expected int"):
@@ -425,7 +429,7 @@ class TestDumperDistributed:
         dumper.set_ctx(ctx_arg=None)
         dumper.step()
 
-        dumper.configure(filter=r"^$")
+        dumper.configure(filter="False")
         dumper.dump("tensor_skip", tensor)
         dumper.configure(filter=None)
         dumper.step()
@@ -451,7 +455,6 @@ class TestDumperDistributed:
             config=DumperConfig(
                 enable=True,
                 collective_timeout=3,
-                enable_http_server=False,
             ),
         )
 
@@ -496,7 +499,7 @@ class TestDumperFileWriteControl:
         with temp_set_env(
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
-            DUMPER_FILTER="name=keep",
+            DUMPER_FILTER="name.startswith('keep')",
         ):
             run_distributed_test(self._test_filter_func, tmpdir=str(tmp_path))
 
@@ -617,7 +620,7 @@ class TestOutputControl:
                     pass
 
     def test_capture_output_respects_filter(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter="name=keep")
+        d = _make_test_dumper(tmp_path, filter="'keep' in name")
 
         with d.capture_output() as captured:
             d.dump("keep_this", torch.randn(3, 3))
@@ -663,12 +666,11 @@ class TestDumpDictFormat:
 
 
 def _make_test_dumper(tmp_path, **overrides) -> _Dumper:
-    """Create a _Dumper for CPU testing without HTTP server or distributed."""
+    """Create a _Dumper for CPU testing without distributed."""
     defaults = dict(
         enable=True,
         dir=str(tmp_path),
         exp_name="test",
-        enable_http_server=False,
     )
     defaults.update(overrides)
     config = DumperConfig(**defaults)
@@ -866,7 +868,7 @@ class TestKvFilter:
         assert _format_tags({}) == ""
 
     def test_filter_matches_extra_kwargs(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter="layer_id=0")
+        d = _make_test_dumper(tmp_path, filter="layer_id == 0")
         d.dump("tensor_a", torch.randn(3), layer_id=0)
         d.dump("tensor_b", torch.randn(3), layer_id=1)
 
@@ -874,7 +876,7 @@ class TestKvFilter:
         _assert_files(filenames, exist=["tensor_a"], not_exist=["tensor_b"])
 
     def test_filter_matches_global_ctx(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter="ctx_arg=200")
+        d = _make_test_dumper(tmp_path, filter="ctx_arg == 200")
         d.set_ctx(ctx_arg=200)
         d.dump("tensor_a", torch.randn(3))
         d.set_ctx(ctx_arg=None)
@@ -884,21 +886,52 @@ class TestKvFilter:
         _assert_files(filenames, exist=["tensor_a"], not_exist=["tensor_b"])
 
     def test_filter_matches_name(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter="name=keep")
+        d = _make_test_dumper(tmp_path, filter="'keep' in name")
         d.dump("keep_this", torch.randn(3))
         d.dump("skip_this", torch.randn(3))
 
         filenames = _get_filenames(tmp_path)
         _assert_files(filenames, exist=["keep_this"], not_exist=["skip_this"])
 
-    def test_filter_regex(self, tmp_path):
-        d = _make_test_dumper(tmp_path, filter=r"layer_id=[0-2]")
+    def test_filter_expr_range(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="layer_id is not None and layer_id < 3")
         d.dump("t0", torch.randn(3), layer_id=0)
         d.dump("t1", torch.randn(3), layer_id=1)
         d.dump("t5", torch.randn(3), layer_id=5)
 
         filenames = _get_filenames(tmp_path)
         _assert_files(filenames, exist=["name=t0", "name=t1"], not_exist=["name=t5"])
+
+    def test_filter_expr_with_none(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="layer_id is None or layer_id < 3")
+        d.dump("no_layer", torch.randn(3))
+        d.dump("layer0", torch.randn(3), layer_id=0)
+        d.dump("layer5", torch.randn(3), layer_id=5)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(
+            filenames,
+            exist=["no_layer", "layer0"],
+            not_exist=["layer5"],
+        )
+
+    def test_filter_expr_with_re_search(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="search(r'attn|mlp', name)")
+        d.dump("self_attn", torch.randn(3))
+        d.dump("mlp_proj", torch.randn(3))
+        d.dump("layernorm", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(
+            filenames,
+            exist=["self_attn", "mlp_proj"],
+            not_exist=["layernorm"],
+        )
+
+    def test_filter_expr_syntax_error(self, tmp_path):
+        d = _make_test_dumper(tmp_path, filter="layer_id ===")
+        with pytest.raises(SyntaxError):
+            d.dump("tensor", torch.randn(3))
 
     def test_no_filter_dumps_all(self, tmp_path):
         d = _make_test_dumper(tmp_path)
@@ -952,7 +985,10 @@ class TestDumpModel:
 
     def test_filter(self, tmp_path):
         d = _make_test_dumper(
-            tmp_path, enable_model_value=True, enable_model_grad=True, filter="weight"
+            tmp_path,
+            enable_model_value=True,
+            enable_model_grad=True,
+            filter="'weight' in name",
         )
         model = torch.nn.Linear(4, 2)
         x = torch.randn(3, 4)
@@ -1355,16 +1391,16 @@ class TestDumperHttp:
             dumper_http_url,
             "configure",
             enable=True,
-            filter="layer_id=0",
+            filter="layer_id == 0",
             dir="/tmp/test_http",
         )
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.enable", True)
-        self._assert_all_ranks(states, "config.filter", "layer_id=0")
+        self._assert_all_ranks(states, "config.filter", "layer_id == 0")
         self._assert_all_ranks(states, "config.dir", "/tmp/test_http")
 
     def test_configure_clear_optional(self, dumper_http_url: str):
-        self._post(dumper_http_url, "configure", filter="layer_id=0")
+        self._post(dumper_http_url, "configure", filter="layer_id == 0")
         self._post(dumper_http_url, "configure", filter=None)
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.filter", None)
@@ -1377,10 +1413,17 @@ class TestDumperHttp:
         self._assert_all_ranks(states, "step", 0)
 
     def test_get_state(self, dumper_http_url: str):
-        self._post(dumper_http_url, "configure", enable=True, filter="layer_id=[0-3]")
+        self._post(
+            dumper_http_url,
+            "configure",
+            enable=True,
+            filter="layer_id is not None and layer_id < 3",
+        )
         states = self._post(dumper_http_url, "get_state")
         self._assert_all_ranks(states, "config.enable", True)
-        self._assert_all_ranks(states, "config.filter", "layer_id=[0-3]")
+        self._assert_all_ranks(
+            states, "config.filter", "layer_id is not None and layer_id < 3"
+        )
         for state in states:
             assert "dump_index" in state
             assert "step" in state
@@ -1713,7 +1756,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
                 return self.relu(self.linear(x))
 
         captured, x, output = self._run(
-            tmp_path, Inner, filter="name=non_intrusive__model.linear.output"
+            tmp_path, Inner, filter="name == 'non_intrusive__model.linear.output'"
         )
 
         assert "non_intrusive__model.linear.output" in captured
@@ -1757,7 +1800,6 @@ def _make_forward_batch():
 
 
 class TestNonIntrusiveDumperConfigMode(_NonIntrusiveTestBase):
-
     @staticmethod
     def _build_model() -> torch.nn.Module:
         class SubLayer(torch.nn.Module):
@@ -1906,8 +1948,8 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         assert layer_key in captured
         assert captured[layer_key]["meta"]["layer_id"] == 5
 
-    def test_no_layer_id_when_no_attr(self, tmp_path):
-        """layers.N modules without layer_number/layer_id -> no layer_id injected."""
+    def test_layer_id_fallback_from_module_name(self, tmp_path):
+        """layers.N modules without layer_number/layer_id -> layer_id from module name."""
 
         class Inner(torch.nn.Module):
             def __init__(self):
@@ -1924,11 +1966,20 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         captured, x, output = self._run(tmp_path, Inner)
 
         assert len(captured) > 0
-        for key, entry in captured.items():
-            assert "layer_id" not in entry["meta"], f"{key} has unexpected layer_id"
+        input_keys: list[str] = [
+            k for k in captured if "model.layers." in k and "inputs" in k
+        ]
+        assert len(input_keys) > 0
+        for key in input_keys:
+            meta = captured[key]["meta"]
+            assert "layer_id" in meta, f"{key} missing layer_id"
+            if "layers.0" in key:
+                assert meta["layer_id"] == 0
+            elif "layers.1" in key:
+                assert meta["layer_id"] == 1
 
     def test_filter_by_layer_id(self, tmp_path):
-        """filter='layer_id=0' keeps only layer 0 dumps."""
+        """filter='layer_id == 0' keeps only layer 0 dumps."""
 
         class Inner(torch.nn.Module):
             def __init__(self):
@@ -1942,7 +1993,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        captured, x, output = self._run(tmp_path, Inner, filter="layer_id=0")
+        captured, x, output = self._run(tmp_path, Inner, filter="layer_id == 0")
 
         layer0_keys = [k for k in captured if "layers.0" in k]
         layer1_keys = [k for k in captured if "layers.1" in k]
@@ -2002,7 +2053,7 @@ class TestDumperE2E:
             assert len(dump_files) > 0, f"No dump files in {dump_dir}"
             filenames = {f.name for f in dump_files}
 
-            for field in ("input_ids", "positions"):
+            for field in ("input_ids", "positions", "rids"):
                 assert any(f"name={field}" in f for f in filenames), (
                     f"Missing {field} dump from non-intrusive hooks, "
                     f"got: {sorted(filenames)[:10]}"
@@ -2022,6 +2073,46 @@ class TestDumperE2E:
             assert "name" in loaded["meta"]
             assert "rank" in loaded["meta"]
             assert "step" in loaded["meta"]
+
+            par = loaded["meta"].get("sglang_parallel_info", {})
+            expected_keys = [
+                "tp_rank",
+                "tp_size",
+                "pp_rank",
+                "pp_size",
+                "moe_ep_rank",
+                "moe_ep_size",
+                "moe_tp_rank",
+                "moe_tp_size",
+                "moe_dp_rank",
+                "moe_dp_size",
+                "enable_dp_attention",
+                "attn_tp_rank",
+                "attn_tp_size",
+                "attn_dp_rank",
+                "attn_dp_size",
+                "local_attn_dp_rank",
+                "local_attn_dp_size",
+                "attn_cp_rank",
+                "attn_cp_size",
+            ]
+            for key in expected_keys:
+                assert (
+                    key in par
+                ), f"Missing {key} in sglang_parallel_info, got: {sorted(par)}"
+
+            rids_files = [f for f in dump_files if "name=rids" in f.name]
+            rids_loaded = torch.load(
+                rids_files[0], map_location="cpu", weights_only=False
+            )
+            rids_value = rids_loaded["value"]
+            assert isinstance(
+                rids_value, list
+            ), f"rids should be a list, got {type(rids_value)}"
+            assert len(rids_value) > 0, "rids should be non-empty"
+            assert all(
+                isinstance(r, str) for r in rids_value
+            ), f"each rid should be a str, got {[type(r) for r in rids_value]}"
         finally:
             kill_process_tree(proc.pid)
 
@@ -2114,7 +2205,9 @@ class TestRegisterForwardHook:
 class TestPluginCoreFields:
     def test_sglang_core_fields(self):
         plugin = _SGLangPlugin()
-        assert plugin.core_fields() == frozenset({"input_ids", "positions", "seq_lens"})
+        assert plugin.core_fields() == frozenset(
+            {"input_ids", "positions", "seq_lens", "req_pool_indices", "rids"}
+        )
 
     def test_megatron_core_fields(self):
         plugin = _MegatronPlugin()
@@ -2158,7 +2251,6 @@ class TestMegatronConvertValue:
 
 
 class TestNonIntrusiveKwargsModel(_NonIntrusiveTestBase):
-
     def test_kwargs_core_fields(self, tmp_path):
         class KwargsModel(torch.nn.Module):
             def forward(self, *, input_ids, position_ids):
@@ -2278,13 +2370,12 @@ class TestDumperDims:
             config=DumperConfig(
                 enable=True,
                 dir=str(tmp_path),
-                enable_http_server=False,
                 enable_grad=True,
             )
         )
 
         tensor = torch.randn(4, 8, requires_grad=True)
-        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp,partial)")
+        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp:partial)")
         dumper.step()
 
         tensor.backward(torch.ones_like(tensor))
@@ -2298,17 +2389,16 @@ class TestDumperDims:
 
         value_data = torch.load(value_file, weights_only=False)
         assert value_data["meta"]["dims"] == "b h(tp)"
-        assert value_data["meta"]["dims_grad"] == "b h(tp,partial)"
+        assert value_data["meta"]["dims_grad"] == "b h(tp:partial)"
 
         grad_data = torch.load(grad_file, weights_only=False)
-        assert grad_data["meta"]["dims"] == "b h(tp,partial)"
+        assert grad_data["meta"]["dims"] == "b h(tp:partial)"
 
     def test_dims_grad_inherits(self, tmp_path) -> None:
         dumper = _Dumper(
             config=DumperConfig(
                 enable=True,
                 dir=str(tmp_path),
-                enable_http_server=False,
                 enable_grad=True,
             )
         )
@@ -2323,6 +2413,171 @@ class TestDumperDims:
         grad_file = [f for f in exp_dir.glob("*.pt") if "grad__" in f.stem][0]
         grad_data = torch.load(grad_file, weights_only=False)
         assert grad_data["meta"]["dims"] == "b h(tp)"
+
+
+class TestCtxDecorator:
+    def test_ctx_dynamic_lambda(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        class FakeLayer:
+            def __init__(self, layer_id: int) -> None:
+                self.layer_id = layer_id
+
+            @d.ctx(lambda self: dict(layer_id=self.layer_id))
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                d.dump("hidden", x)
+                return x
+
+        layer = FakeLayer(layer_id=42)
+        layer.forward(torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["layer_id=42"])
+
+    def test_ctx_static_kwargs(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        @d.ctx(phase="decode")
+        def decode_step(x: torch.Tensor) -> torch.Tensor:
+            d.dump("step_out", x)
+            return x
+
+        decode_step(torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["phase=decode"])
+
+    def test_ctx_clears_on_exception(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+
+        @d.ctx(phase="train")
+        def buggy_fn() -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            buggy_fn()
+
+        assert d._state.global_ctx == {}
+
+    def test_ctx_rejects_mixed_args(self) -> None:
+        d = _make_test_dumper("/tmp")
+
+        with pytest.raises(ValueError, match="cannot mix"):
+            d.ctx(lambda self: dict(a=1), phase="x")
+
+    def test_ctx_rejects_empty_args(self) -> None:
+        d = _make_test_dumper("/tmp")
+
+        with pytest.raises(ValueError, match="must provide"):
+            d.ctx()
+
+
+class TestRecomputeStatus:
+    def test_disabled_by_default(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(3, 3)
+        d.dump("test_tensor", tensor)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["recompute_status=disabled"])
+
+    def test_recompute_status_in_embedded_meta(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(3, 3)
+        d.dump("test_tensor", tensor)
+
+        path = _find_dump_file(tmp_path, rank=0, name="test_tensor")
+        raw = _load_dump(path)
+        assert raw["meta"]["recompute_status"] == "disabled"
+
+    def test_recompute_status_recompute(self, tmp_path: Path, monkeypatch) -> None:
+        import sglang.srt.debug_utils.dumper as dumper_mod
+
+        monkeypatch.setattr(
+            dumper_mod, "_detect_recompute_status", lambda: _RecomputeStatus.RECOMPUTE
+        )
+
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(3, 3)
+        d.dump("test_tensor", tensor)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["recompute_status=recompute"])
+
+        path = _find_dump_file(tmp_path, rank=0, name="test_tensor")
+        raw = _load_dump(path)
+        assert raw["meta"]["recompute_status"] == "recompute"
+        assert raw["meta"]["recompute_pseudo_rank"] == 1
+        assert raw["meta"]["recompute_pseudo_size"] == 2
+
+    def test_recompute_status_original(self, tmp_path: Path, monkeypatch) -> None:
+        import sglang.srt.debug_utils.dumper as dumper_mod
+
+        monkeypatch.setattr(
+            dumper_mod,
+            "_detect_recompute_status",
+            lambda: _RecomputeStatus.ORIGINAL,
+        )
+
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(3, 3)
+        d.dump("test_tensor", tensor)
+
+        filenames = _get_filenames(tmp_path)
+        _assert_files(filenames, exist=["recompute_status=original"])
+
+        path = _find_dump_file(tmp_path, rank=0, name="test_tensor")
+        raw = _load_dump(path)
+        assert raw["meta"]["recompute_status"] == "original"
+        assert raw["meta"]["recompute_pseudo_rank"] == 0
+        assert raw["meta"]["recompute_pseudo_size"] == 2
+
+    def test_disabled_no_recompute_pseudo_fields(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path)
+        tensor = torch.randn(3, 3)
+        d.dump("test_tensor", tensor)
+
+        path = _find_dump_file(tmp_path, rank=0, name="test_tensor")
+        raw = _load_dump(path)
+        assert "recompute_pseudo_rank" not in raw["meta"]
+        assert "recompute_pseudo_size" not in raw["meta"]
+
+    def test_grad_hook_has_no_recompute_status(self, tmp_path: Path) -> None:
+        d = _make_test_dumper(tmp_path, enable_grad=True)
+        x = torch.randn(3, 3, requires_grad=True)
+        y = (x * 2).sum()
+
+        d.dump("test_tensor", x)
+        y.backward()
+
+        grad_files = [f for f in _get_filenames(tmp_path) if "grad__test_tensor" in f]
+        assert len(grad_files) == 1
+        assert "recompute_status" not in grad_files[0]
+
+    def test_non_intrusive_hooks_have_recompute_status(self, tmp_path: Path) -> None:
+        class Simple(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.linear(x)
+
+        model = Simple()
+        d = _make_test_dumper(tmp_path, non_intrusive_mode="all")
+        d.register_non_intrusive_dumper(model)
+
+        with d.capture_output() as captured:
+            model(torch.randn(2, 4))
+
+        for key, data in captured.items():
+            assert (
+                "recompute_status" in data["meta"]
+            ), f"missing recompute_status in {key}"
+            assert data["meta"]["recompute_status"] == "disabled"
+
+    def test_detect_recompute_status_default(self) -> None:
+        assert _detect_recompute_status() == _RecomputeStatus.DISABLED
 
 
 if __name__ == "__main__":

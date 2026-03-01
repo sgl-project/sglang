@@ -243,6 +243,10 @@ class DiffGenerator:
                         audios_out=audios_out,
                         frames_out=frames_out,
                         output_compression=req.output_compression,
+                        enable_frame_interpolation=req.enable_frame_interpolation,
+                        frame_interpolation_exp=req.frame_interpolation_exp,
+                        frame_interpolation_scale=req.frame_interpolation_scale,
+                        frame_interpolation_model_path=req.frame_interpolation_model_path,
                     )
 
                     for idx in range(len(samples_out)):

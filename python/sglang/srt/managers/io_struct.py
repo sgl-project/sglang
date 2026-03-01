@@ -1337,6 +1337,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
 
 
 @dataclass
@@ -1399,6 +1401,19 @@ class SendWeightsToRemoteInstanceReqInput(BaseReq):
 class SendWeightsToRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class UpdateExpertBackupReq(BaseReq):
+    pass
+
+
+@dataclass
+class BackupDramReq(BaseReq):
+    rank: int
+    weight_pointer_map: Dict[str, Any]
+    session_id: str
+    buffer_size: int
 
 
 @dataclass
@@ -1610,6 +1625,8 @@ class ConfigureLoggingReq(BaseReq):
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
 
 
 @dataclass

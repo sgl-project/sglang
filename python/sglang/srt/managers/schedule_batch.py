@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -499,7 +500,7 @@ class Req(ReqDllmMixin):
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         token_type_ids: List[int] = None,
-        session_id: Optional[str] = None,
+        session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
@@ -535,7 +536,7 @@ class Req(ReqDllmMixin):
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
-        self.session_id = session_id
+        self.session = session
         self.input_embeds = input_embeds
 
         # For req-level memory management
@@ -874,7 +875,7 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self if tree_cache.supports_mamba() else None,
+                    req=self,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )
