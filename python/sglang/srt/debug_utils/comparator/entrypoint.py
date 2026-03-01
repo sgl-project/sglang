@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.comparator.bundle_matcher import (
     match_bundles,
 )
 from sglang.srt.debug_utils.comparator.display import emit_display_records
+from sglang.srt.debug_utils.comparator.meta_overrider import MetaOverrider
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     ConfigRecord,
@@ -85,6 +86,13 @@ def run(args: argparse.Namespace) -> None:
         Path(args.visualize_per_token) if args.visualize_per_token else None
     )
 
+    meta_overrider: MetaOverrider = MetaOverrider.from_args_and_config(
+        override_dims=args.override_dims,
+        override_baseline_dims=args.override_baseline_dims,
+        override_target_dims=args.override_target_dims,
+        override_config=Path(args.override_config) if args.override_config else None,
+    )
+
     comparison_records = _compare_bundle_pairs(
         bundle_info_pairs=bundle_info_pairs,
         baseline_path=Path(args.baseline_path),
@@ -94,6 +102,7 @@ def run(args: argparse.Namespace) -> None:
         thd_seq_lens_by_step_pair=ta_result.thd_seq_lens_by_step_pair,
         viz_output_dir=viz_output_dir,
         compute_per_token=visualize_per_token is not None,
+        meta_overrider=meta_overrider,
     )
     _consume_comparison_records(
         comparison_records=comparison_records,
@@ -155,6 +164,7 @@ def _compare_bundle_pairs(
     thd_seq_lens_by_step_pair: Pair[Optional[dict[int, list[int]]]],
     viz_output_dir: Optional[Path] = None,
     compute_per_token: bool = False,
+    meta_overrider: Optional[MetaOverrider] = None,
 ) -> Iterator[Union[ComparisonRecord, SkipRecord, NonTensorRecord]]:
     for bundle_info_pair in bundle_info_pairs:
         if not bundle_info_pair.y:
@@ -174,6 +184,7 @@ def _compare_bundle_pairs(
             thd_seq_lens_by_step_pair=thd_seq_lens_by_step_pair,
             viz_output_dir=viz_output_dir,
             compute_per_token=compute_per_token,
+            meta_overrider=meta_overrider,
         )
 
 
@@ -252,4 +263,31 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Output path for per-token relative difference heatmap PNG",
     )
+
+    # Dims override
+    parser.add_argument(
+        "--override-dims",
+        action="append",
+        default=[],
+        help="Override dims for both sides: 'name:dims_string' (repeatable)",
+    )
+    parser.add_argument(
+        "--override-baseline-dims",
+        action="append",
+        default=[],
+        help="Override dims for baseline only: 'name:dims_string' (repeatable)",
+    )
+    parser.add_argument(
+        "--override-target-dims",
+        action="append",
+        default=[],
+        help="Override dims for target only: 'name:dims_string' (repeatable)",
+    )
+    parser.add_argument(
+        "--override-config",
+        type=str,
+        default=None,
+        help="Path to YAML override config file (dims overrides, etc.)",
+    )
+
     return parser.parse_args()
