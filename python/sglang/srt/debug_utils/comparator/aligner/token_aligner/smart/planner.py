@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import NamedTuple, Optional
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     SeqId,
     TokenAlignerPlan,
     TokenAlignerSeqInfo,

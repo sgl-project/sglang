@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     SeqId,
     SGLangSeqId,
@@ -122,7 +122,7 @@ class _SGLangPlugin(_AuxFrameworkPlugin):
         will be mishandled. Callers should set dims explicitly for non-zigzag CP.
         """
         if ndim == 1:
-            return "t(cp,zigzag)"
+            return "t(cp:zigzag)"
         raise ValueError(
             f"SGLang: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
         )
@@ -208,9 +208,9 @@ class _MegatronPlugin(_AuxFrameworkPlugin):
         will be mishandled. Callers should set dims explicitly for non-zigzag CP.
         """
         if ndim == 1:
-            return "t(cp,zigzag)"
+            return "t(cp:zigzag)"
         if ndim == 2:
-            return "b s(cp,zigzag)"
+            return "b s(cp:zigzag)"
         raise ValueError(
             f"Megatron: cannot infer dims for CP-sharded '{name}' with ndim={ndim}"
         )

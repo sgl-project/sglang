@@ -79,6 +79,10 @@ jobs:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [ 0, 1 ]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
     steps:
@@ -113,7 +117,7 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-npu-a2
+          python3 run_suite.py --suite per-commit-1-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   per-commit-2-npu-a2:
     needs: [check-changes, pr-gate]
@@ -122,7 +126,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
     steps:
@@ -157,14 +161,14 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  per-commit-4-npu-a2:
+  per-commit-4-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: linux-aarch64-a2-4
+    runs-on: linux-aarch64-a3-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -180,7 +184,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -197,16 +201,12 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-npu-a3 --timeout-per-file 3600
 
   per-commit-16-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
-    strategy:
-      fail-fast: true
-      matrix:
-        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
@@ -241,12 +241,12 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
     steps:

@@ -94,6 +94,26 @@ class RadixKey:
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
+def maybe_bigram_convert(
+    is_eagle: bool,
+    key: RadixKey,
+    value: Optional[torch.Tensor] = None,
+) -> Tuple[RadixKey, Optional[torch.Tensor]]:
+    if is_eagle and not key.is_bigram:
+        key.token_ids = convert_to_bigram_key(key.token_ids)
+        key.is_bigram = True
+        if value is not None:
+            value = value[: len(key)]
+    return key, value
+
+
+def page_align_keys(key: list, page_size) -> list:
+    if page_size == 1:
+        return key
+    page_aligned_len = len(key) // page_size * page_size
+    return key[:page_aligned_len]
+
+
 class TreeNode:
 
     counter = 0
@@ -342,12 +362,7 @@ class RadixCache(BasePrefixCache):
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        if self.is_eagle and not key.is_bigram:
-            key.token_ids = convert_to_bigram_key(key.token_ids)
-            if value is not None:
-                value = value[: len(key)]
-
-        return key, value
+        return maybe_bigram_convert(self.is_eagle, key, value)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -437,12 +452,6 @@ class RadixCache(BasePrefixCache):
         prefix_len = self._insert_helper(self.root_node, key, value, priority)
         return InsertResult(prefix_len=prefix_len)
 
-    def _page_align_keys(self, key: list) -> list:
-        if self.page_size == 1:
-            return key
-        page_aligned_len = len(key) // self.page_size * self.page_size
-        return key[:page_aligned_len]
-
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -464,7 +473,7 @@ class RadixCache(BasePrefixCache):
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-        keys = self._page_align_keys(keys)
+        keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
@@ -502,7 +511,7 @@ class RadixCache(BasePrefixCache):
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-        keys = self._page_align_keys(keys)
+        keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
