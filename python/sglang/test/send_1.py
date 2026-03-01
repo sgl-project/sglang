@@ -295,23 +295,24 @@ async def send_one_prompt(args: BenchArgs):
             if args.stream:
                 last_len = 0
                 ret = None
-                while True:
-                    raw = await response.content.readline()
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8").strip()
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    ret = orjson.loads(payload)
-                    print(ret["text"][last_len:], end="", flush=True)
-                    last_len = len(ret["text"])
+                buffer = ""
+                async for chunk in response.content.iter_any():
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    # SSE events are delimited by \n\n
+                    while "\n\n" in buffer:
+                        event_raw, buffer = buffer.split("\n\n", 1)
+                        for line in event_raw.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith(":"):
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                break
+                            ret = orjson.loads(payload)
+                            print(ret["text"][last_len:], end="", flush=True)
+                            last_len = len(ret["text"])
                 print()
             else:
                 data = await response.read()
