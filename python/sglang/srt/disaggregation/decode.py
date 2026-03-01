@@ -65,7 +65,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -75,9 +74,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.server_args import ServerArgs
 
-CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
-# export SGLANG_ENABLE_OPT_PREBUILT_BATCH=1
-OPT_PREBUILT_BATCH = get_int_env_var("SGLANG_ENABLE_OPT_PREBUILT_BATCH", False)
+CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+OPT_PREBUILT_BATCH = envs.SGLANG_ENABLE_OPT_PREBUILT_BATCH.get()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -1039,7 +1037,7 @@ class SchedulerDisaggregationDecodeMixin:
             return self.run_batch(idle_batch)
 
         return GenerationBatchResult()
-    
+
     def _merge_into_running(self, batch):
         if batch.is_empty():
             return
@@ -1061,11 +1059,11 @@ class SchedulerDisaggregationDecodeMixin:
         """Create fake completed prefill if possible and merge with running batch"""
         ret: Optional[ScheduleBatch] = None
         if OPT_PREBUILT_BATCH:
-            # Optimized the decode processing and prebuilt processing flow. 
-            # The decode stage is significantly affected by prebuilt processing under large batch sizes. 
-            # The specific optimization logic is as follows: 
-            # when encountering prebuilt data, perform output processing first, 
-            # and then add it to the running_batch, 
+            # Optimized the decode processing and prebuilt processing flow.
+            # The decode stage is significantly affected by prebuilt processing under large batch sizes.
+            # The specific optimization logic is as follows:
+            # when encountering prebuilt data, perform output processing first,
+            # and then add it to the running_batch,
             # eliminating the idle processing logic caused by prebuilt data.
             new_prebuilt_batch = self.get_new_prebuilt_batch()
             if new_prebuilt_batch:
