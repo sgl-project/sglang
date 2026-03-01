@@ -787,17 +787,24 @@ def run_benchmark_internal(
         else:
             tokenizer = get_tokenizer(tokenizer_path)
 
-        # Get token capacity
         internal_state = server_info.get("internal_states", [{}])
-        skip_token_capacity_threshold = (
-            internal_state[0].get("memory_usage", {}).get("token_capacity", 1000000000)
-        )
+        dp_size = internal_state[0].get("dp_size", None) or 1
 
         # Get effective max running requests
         max_running_requests_per_dp = internal_state[0].get(
             "effective_max_running_requests_per_dp", -1
         )
-        dp_size = server_info.get("dp_size", None) or 1
+
+        # Get token capacity
+        skip_token_capacity_threshold = 0
+
+        for i in range(dp_size):
+            skip_token_capacity_threshold += (
+                internal_state[i]
+                .get("memory_usage", {})
+                .get("token_capacity", 1000000000)
+            )
+
         assert (
             max_running_requests_per_dp > 0
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"

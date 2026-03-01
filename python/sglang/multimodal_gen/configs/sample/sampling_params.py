@@ -100,6 +100,14 @@ class SamplingParams:
     output_quality: str | None = "default"
     output_compression: int | None = None
 
+    # Frame interpolation
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1  # 1=2x, 2=4x
+    frame_interpolation_scale: float = 1.0  # RIFE inference scale (0.5 for high-res)
+    frame_interpolation_model_path: str | None = (
+        None  # local dir or HF repo ID with flownet.pkl (default: elfgum/RIFE-4.22.lite)
+    )
+
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
@@ -156,7 +164,7 @@ class SamplingParams:
     suppress_logs: bool = False
 
     return_file_paths_only: bool = True
-    enable_sequence_shard: bool = False
+    enable_sequence_shard: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -390,10 +398,20 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
+
+        if "wan" in pipeline_name_lower and (
+            self.enable_sequence_shard is None or self.enable_sequence_shard
+        ):
+            self.enable_sequence_shard = True
+            logger.debug("Automatically enabled enable_sequence_shard")
+        else:
+            self.enable_sequence_shard = False
+
         if self.enable_sequence_shard:
             self.adjust_frames = False
             logger.info(
-                f"Sequence dimension shard is enabled, disabling frame adjustment"
+                f"Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
         if pipeline_config.task_type.is_image_gen():
@@ -402,52 +420,66 @@ class SamplingParams:
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
 
-        elif self.adjust_frames:
+        else:
+            # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
+            original_num_frames = self.num_frames
             self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
+                original_num_frames
+            )
+            logger.info(
+                "Adjusting number of frames from %s to %s based on model",
+                original_num_frames,
+                self.num_frames,
             )
 
-            # Adjust number of frames based on number of GPUs for video task
-            use_temporal_scaling_frames = (
-                pipeline_config.vae_config.use_temporal_scaling_frames
-            )
-            num_frames = self.num_frames
-            num_gpus = server_args.num_gpus
-            temporal_scale_factor = (
-                pipeline_config.vae_config.arch_config.temporal_compression_ratio
-            )
-
-            if use_temporal_scaling_frames:
-                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
-
-            if orig_latent_num_frames % server_args.num_gpus != 0:
-                # Adjust latent frames to be divisible by number of GPUs
-                if self.num_frames_round_down:
-                    # Ensure we have at least 1 batch per GPU
-                    new_latent_num_frames = (
-                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
-                    )
-                else:
-                    new_latent_num_frames = (
-                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
-                    )
+            if self.adjust_frames:
+                # Adjust number of frames based on number of GPUs for video task
+                use_temporal_scaling_frames = (
+                    pipeline_config.vae_config.use_temporal_scaling_frames
+                )
+                num_frames = self.num_frames
+                num_gpus = server_args.num_gpus
+                temporal_scale_factor = (
+                    pipeline_config.vae_config.arch_config.temporal_compression_ratio
+                )
 
                 if use_temporal_scaling_frames:
-                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
-                    new_num_frames = (
-                        new_latent_num_frames - 1
-                    ) * temporal_scale_factor + 1
+                    orig_latent_num_frames = (
+                        num_frames - 1
+                    ) // temporal_scale_factor + 1
+                else:
+                    orig_latent_num_frames = num_frames
 
-                logger.info(
-                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
-                    self.num_frames,
-                    new_num_frames,
-                    server_args.num_gpus,
-                )
-                self.num_frames = new_num_frames
+                if orig_latent_num_frames % server_args.num_gpus != 0:
+                    # Adjust latent frames to be divisible by number of GPUs
+                    if self.num_frames_round_down:
+                        # Ensure we have at least 1 batch per GPU
+                        new_latent_num_frames = (
+                            max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                        )
+                    else:
+                        new_latent_num_frames = (
+                            math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                        )
+
+                    if use_temporal_scaling_frames:
+                        # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                        new_num_frames = (
+                            new_latent_num_frames - 1
+                        ) * temporal_scale_factor + 1
+                    else:
+                        new_num_frames = new_latent_num_frames
+
+                    logger.info(
+                        "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                        self.num_frames,
+                        new_num_frames,
+                        server_args.num_gpus,
+                    )
+                    self.num_frames = new_num_frames
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
@@ -792,6 +824,30 @@ class SamplingParams:
             action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
+        )
+        parser.add_argument(
+            "--enable-frame-interpolation",
+            action="store_true",
+            help="Enable post-generation frame interpolation using RIFE 4.22.lite.",
+        )
+        parser.add_argument(
+            "--frame-interpolation-exp",
+            type=int,
+            default=SamplingParams.frame_interpolation_exp,
+            help="Frame interpolation exponent: 1=2x, 2=4x (default: 1).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-scale",
+            type=float,
+            default=SamplingParams.frame_interpolation_scale,
+            help="RIFE inference scale factor (default: 1.0; use 0.5 for high-res).",
+        )
+        parser.add_argument(
+            "--frame-interpolation-model-path",
+            type=str,
+            default=SamplingParams.frame_interpolation_model_path,
+            help="Local directory or HuggingFace repo ID containing RIFE flownet.pkl weights "
+            "(default: elfgum/RIFE-4.22.lite, downloaded automatically).",
         )
         return parser
 

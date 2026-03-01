@@ -169,6 +169,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         swa_indices = self._maybe_translate_swa(page_indices)
         metadata.swa_page_table[:, :num_pages].copy_(swa_indices // self.page_size)
 
+    def _get_layer_cache_loc(
+        self,
+        layer: RadixAttention,
+        cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return cache locations in the correct index space for the given layer."""
+        if self.use_sliding_window_kv_pool:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return self._swa_kv_pool.translate_loc_from_full_to_swa(cache_loc)
+        return cache_loc
+
     def _bind_swa_page_table(
         self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
     ):
@@ -540,7 +552,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         """Fused FP8 quantization and KV cache write."""
-        cache_loc = forward_batch.out_cache_loc
+        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
 
         # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

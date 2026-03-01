@@ -8,6 +8,17 @@ on:
       - sgl-kernel/python/sgl_kernel/version.py
   workflow_dispatch:
     inputs:
+      target:
+        type: choice
+        description: 'Build target'
+        required: false
+        default: 'all'
+        options:
+          - 'all'
+          - 'cu129'
+          - 'cu130'
+          - 'rocm700'
+          - 'musa43'
       tag_name:
         type: string
         required: false
@@ -22,7 +33,9 @@ concurrency:
 
 jobs:
   build-cu129-matrix:
-    if: github.repository == 'sgl-project/sglang'
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -119,7 +132,9 @@ jobs:
 
   # for now we do not release CUDA 13.0 wheels to pypi
   build-cu130-matrix:
-    if: github.repository == 'sgl-project/sglang'
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -209,7 +224,9 @@ jobs:
           git push
 
   build-rocm700:
-    if: github.repository == 'sgl-project/sglang'
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700')
     runs-on: amd-docker-scale
     strategy:
       matrix:
@@ -280,6 +297,85 @@ jobs:
 
       - name: Update wheel index
         run: python3 scripts/update_kernel_whl_index.py --rocm 700
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update whl index"
+          git push
+
+  build-musa43:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'musa43')
+    runs-on: kernel-build-node-musa
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+        musa-version: ["43"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Build wheels
+        run: |
+          cd sgl-kernel
+          mv pyproject_musa.toml pyproject.toml
+          python setup_musa.py sdist bdist_wheel
+
+      - name: Rename MUSA wheels
+        run: |
+          bash scripts/ci/musa/rename_wheels_musa.sh ${{ matrix.musa-version }} sgl-kernel/dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-musa${{ matrix.musa-version }}
+          path: sgl-kernel/dist/*
+
+  release-musa43:
+    needs: build-musa43
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - name: Set tag name
+        id: set_tag_name
+        run: |
+          if [ -z "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            sgl-kernel/dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py --musa 43
 
       - name: Push wheel index
         run: |
