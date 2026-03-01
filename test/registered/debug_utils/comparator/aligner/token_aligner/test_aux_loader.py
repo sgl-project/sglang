@@ -291,5 +291,98 @@ class TestLoadAndAlignAuxTensor:
         assert "aux_no_dims" in warnings[0].category
 
 
+class TestLoadNonTensorAuxDp:
+    """DP filtering in _load_non_tensor_aux."""
+
+    def test_dp2_non_tensor_returns_value(self, tmp_path: Path) -> None:
+        """DP=2 non-tensor aux: both ranks have same value, filter keeps all (non-tensor)."""
+        fn0: str = _save_pt(
+            tmp_path,
+            name="rids",
+            step=0,
+            rank=0,
+            value=["req_A"],
+            meta={
+                "sglang_parallel_info": {
+                    "dp_rank": 0,
+                    "dp_size": 2,
+                }
+            },
+        )
+        fn1: str = _save_pt(
+            tmp_path,
+            name="rids",
+            step=0,
+            rank=1,
+            value=["req_A"],
+            meta={
+                "sglang_parallel_info": {
+                    "dp_rank": 1,
+                    "dp_size": 2,
+                }
+            },
+        )
+        df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
+
+        sink = WarningSink()
+        with sink.context():
+            from unittest.mock import patch
+
+            with patch(
+                "sglang.srt.debug_utils.comparator.aligner.token_aligner.aux_loader.warning_sink",
+                sink,
+            ):
+                result = _load_non_tensor_aux(
+                    name="rids", step=0, df=df, dump_path=tmp_path
+                )
+
+        assert result == ["req_A"]
+
+
+class TestLoadAndAlignAuxTensorDp:
+    """DP filtering in _load_and_align_aux_tensor."""
+
+    def test_dp2_tensor_one_empty(self, tmp_path: Path) -> None:
+        """DP=2 tensor aux: rank 0 has data, rank 1 empty -> returns rank 0 tensor."""
+        fn0: str = _save_pt(
+            tmp_path,
+            name="input_ids",
+            step=0,
+            rank=0,
+            value=torch.tensor([10, 20, 30]),
+            meta={
+                "sglang_parallel_info": {
+                    "dp_rank": 0,
+                    "dp_size": 2,
+                }
+            },
+        )
+        fn1: str = _save_pt(
+            tmp_path,
+            name="input_ids",
+            step=0,
+            rank=1,
+            value=torch.tensor([]),
+            meta={
+                "sglang_parallel_info": {
+                    "dp_rank": 1,
+                    "dp_size": 2,
+                }
+            },
+        )
+        df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
+
+        result = _load_and_align_aux_tensor(
+            name="input_ids",
+            step=0,
+            df=df,
+            dump_path=tmp_path,
+            plugin=_sglang_plugin,
+        )
+
+        assert result is not None
+        assert torch.equal(result, torch.tensor([10, 20, 30]))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

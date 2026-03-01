@@ -24,6 +24,7 @@ from sglang.srt.debug_utils.comparator.dims import (
     apply_dim_names,
     resolve_dim_names,
 )
+from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
 from sglang.srt.debug_utils.comparator.output_types import (
     ComparisonRecord,
     GeneralWarning,
@@ -93,6 +94,12 @@ def _compare_bundle_pair_inner(
     if not all_pair.x or not all_pair.y:
         reason = "baseline_load_failed" if not all_pair.x else "target_load_failed"
         return SkipRecord(name=name, reason=reason)
+
+    # 1b. DP filter: keep only the non-empty dp_rank
+    all_pair = Pair(
+        x=filter_to_non_empty_dp_rank(all_pair.x),
+        y=filter_to_non_empty_dp_rank(all_pair.y),
+    )
 
     # 2. Check if any side has non-tensor values → non-tensor display path
     has_non_tensor: bool = any(

@@ -2525,5 +2525,216 @@ class TestEntrypointThdCpZigzag:
         assert all(c.diff is not None and c.diff.passed for c in hidden_comparisons)
 
 
+class TestEntrypointDpFilter:
+    """E2E tests for DP (data parallel) filtering.
+
+    When DP > 1, only one dp_rank has non-empty tensors; the others
+    dump empty (numel=0) tensors. The comparator should filter out the
+    empty dp_rank items and produce correct comparison results.
+    """
+
+    def test_dp2_sglang_both_sides(self, tmp_path: Path, capsys) -> None:
+        """DP=2 sglang: both baseline and target have 1 non-empty + 1 empty dp_rank."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side, side_dir_name, data in [
+            ("baseline", "baseline", tensor_data),
+            ("target", "target", target_data),
+        ]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            # dp_rank=0: non-empty tensor
+            _create_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                tensor=data,
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 0,
+                    "dp_size": 2,
+                },
+                framework="sglang",
+            )
+
+            # dp_rank=1: empty tensor
+            _create_rank_dump(
+                side_dir,
+                rank=1,
+                name="hidden",
+                tensor=torch.empty(0, 8),
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 1,
+                    "dp_size": 2,
+                },
+                framework="sglang",
+            )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
+
+    def test_dp2_megatron_both_sides(self, tmp_path: Path, capsys) -> None:
+        """DP=2 megatron: both baseline and target have 1 non-empty + 1 empty dp_rank."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side, side_dir_name, data in [
+            ("baseline", "baseline", tensor_data),
+            ("target", "target", target_data),
+        ]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            # dp_rank=0: non-empty tensor
+            _create_rank_dump(
+                side_dir,
+                rank=0,
+                name="hidden",
+                tensor=data,
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 0,
+                    "dp_size": 2,
+                },
+                framework="megatron",
+            )
+
+            # dp_rank=1: empty tensor
+            _create_rank_dump(
+                side_dir,
+                rank=1,
+                name="hidden",
+                tensor=torch.empty(0, 8),
+                dims="t h",
+                parallel_info={
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "dp_rank": 1,
+                    "dp_size": 2,
+                },
+                framework="megatron",
+            )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
+
+    def test_dp2_tp2_sglang(self, tmp_path: Path, capsys) -> None:
+        """DP=2 x TP=2 sglang: 4 ranks, dp_rank=0 has data, dp_rank=1 empty."""
+        torch.manual_seed(42)
+        full_tensor: torch.Tensor = torch.randn(10, 8)
+        tp_chunks: list[torch.Tensor] = list(full_tensor.chunk(2, dim=1))
+
+        target_full: torch.Tensor = full_tensor + torch.randn(10, 8) * 0.001
+        target_tp_chunks: list[torch.Tensor] = list(target_full.chunk(2, dim=1))
+
+        for side, side_dir_name, chunks in [
+            ("baseline", "baseline", tp_chunks),
+            ("target", "target", target_tp_chunks),
+        ]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            rank: int = 0
+            for dp_rank in range(2):
+                for tp_rank in range(2):
+                    tensor: torch.Tensor = (
+                        chunks[tp_rank] if dp_rank == 0 else torch.empty(0, 4)
+                    )
+                    _create_rank_dump(
+                        side_dir,
+                        rank=rank,
+                        name="hidden",
+                        tensor=tensor,
+                        dims="t h(tp)",
+                        parallel_info={
+                            "tp_rank": tp_rank,
+                            "tp_size": 2,
+                            "dp_rank": dp_rank,
+                            "dp_size": 2,
+                        },
+                        framework="sglang",
+                    )
+                    rank += 1
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+        records: list[AnyRecord] = _run_and_parse(args, capsys)
+
+        comparison: ComparisonRecord = _assert_single_comparison_passed(records)
+        assert comparison.name == "hidden"
+
+    def test_dp2_both_nonempty_raises(self, tmp_path: Path, capsys) -> None:
+        """DP=2 sglang: both dp_rank=0 and dp_rank=1 have non-empty tensors => AssertionError."""
+        torch.manual_seed(42)
+        tensor_data: torch.Tensor = torch.randn(10, 8)
+        target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
+
+        for side, side_dir_name, data in [
+            ("baseline", "baseline", tensor_data),
+            ("target", "target", target_data),
+        ]:
+            side_dir: Path = tmp_path / side_dir_name
+            side_dir.mkdir()
+
+            for dp_rank in range(2):
+                _create_rank_dump(
+                    side_dir,
+                    rank=dp_rank,
+                    name="hidden",
+                    tensor=data,
+                    dims="t h",
+                    parallel_info={
+                        "tp_rank": 0,
+                        "tp_size": 1,
+                        "dp_rank": dp_rank,
+                        "dp_size": 2,
+                    },
+                    framework="sglang",
+                )
+
+        args: Namespace = _make_args(
+            tmp_path / "baseline" / _FIXED_EXP_NAME,
+            tmp_path / "target" / _FIXED_EXP_NAME,
+            grouping="logical",
+            diff_threshold=1e-3,
+        )
+
+        with pytest.raises(
+            AssertionError, match="Expected exactly 1 non-empty dp_rank"
+        ):
+            _run_and_parse(args, capsys)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
