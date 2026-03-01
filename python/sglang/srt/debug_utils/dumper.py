@@ -424,9 +424,7 @@ class _Dumper:
             **self._state.global_ctx,
         )
 
-        if (f := self._config.filter) is not None and re.search(
-            f, _format_tags(tags)
-        ) is None:
+        if (f := self._config.filter) is not None and not _evaluate_filter(f, tags):
             return
 
         if not (enable_value or enable_curr_grad or enable_future_grad):
@@ -895,6 +893,27 @@ def _materialize_value(value):
 
 def _format_tags(kwargs: dict) -> str:
     return "___".join(f"{k}={v}" for k, v in kwargs.items())
+
+
+class _DefaultNoneDict(dict):
+    """dict subclass that returns None for missing keys, for filter expression eval."""
+
+    def __missing__(self, key: str):
+        return None
+
+
+_FILTER_BUILTINS: dict[str, Any] = {"search": re.search, "match": re.match}
+
+
+def _evaluate_filter(filter_expr: str, tags: dict[str, Any]) -> bool:
+    """Evaluate a Python filter expression against the tags dict.
+
+    Unknown tag keys resolve to None, so `layer_id is None` works when layer_id is absent.
+    `re.search` and `re.match` are available as `search()` and `match()`.
+    """
+    namespace = _DefaultNoneDict(tags)
+    namespace.update(_FILTER_BUILTINS)
+    return bool(eval(filter_expr, {"__builtins__": {}}, namespace))
 
 
 def _deepcopy_or_clone(x):
