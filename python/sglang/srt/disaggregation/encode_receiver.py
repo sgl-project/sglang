@@ -282,15 +282,15 @@ class WaitingImageRequestMooncake:
         Each TP rank runs this independently."""
         self._thread_dispatch_time = time.time()
         threading.Thread(
-            target=self._run_send,
+            target=self._run_send_embedding_port,
             daemon=True,
         ).start()
 
-    def _run_send(self):
+    def _run_send_embedding_port(self):
         """Allocate GPU buffer, register with mooncake, send /send to encoders."""
         try:
             torch.cuda.set_device(self.gpu_id)
-            asyncio.run(self._send_async())
+            asyncio.run(self._send_embedding_port())
         except Exception as e:
             logger.error(f"Mooncake send failed for {self.rid}: {e}", exc_info=True)
             self._cleanup()
@@ -298,9 +298,13 @@ class WaitingImageRequestMooncake:
             self.error_code = HTTPStatus.INTERNAL_SERVER_ERROR
             self.status = WaitingImageRequestStatus.FAIL
 
-    async def _send_async(self):
+    async def _send_embedding_port(self):
         meta_list = self.embedding_meta
         num_parts = len(meta_list)
+        if num_parts == 0:
+            logger.warning(f"No embedding metadata for {self.rid}, skipping send")
+            self._send_done = True
+            return
 
         embedding_length_tot = sum(m["embedding_len"] for m in meta_list)
         embedding_dim = meta_list[0]["embedding_dim"]
@@ -826,10 +830,12 @@ class MMReceiverHTTP(MMReceiverBase):
             )
             encode_thread.start()
 
-    async def wait_mm_metadata(self, obj):
+    async def wait_mm_metadata(self, obj) -> Optional[str]:
         """Send /encode to all encoders and collect embedding metadata.
         Metadata is used to allocate embedding buffer with RDMA transfer.
-        Called in tokenizer_manager's async context; no GPU ops."""
+        Called in tokenizer_manager's async context; no GPU ops.
+
+        Returns None on success, or an error message string on failure."""
         num_items_assigned = obj.num_items_assigned
         image_urls = self._extract_urls(obj)
         num_parts = sum(1 for x in num_items_assigned if x != 0)
@@ -875,7 +881,7 @@ class MMReceiverHTTP(MMReceiverBase):
                     except Exception:
                         msg = await response.text()
                     logger.error(f"Encoder returned error {response.status}: {msg}")
-                    return
+                    return msg
 
             response_json_list_unsort = [
                 await response.json() for response in responses

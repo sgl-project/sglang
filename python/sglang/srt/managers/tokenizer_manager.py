@@ -2276,7 +2276,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.server_args.encoder_transfer_backend == "mooncake_to_scheduler"
                 and obj.need_wait_for_image
             ):
-                await self.mm_receiver.wait_mm_metadata(obj)
+                error = await self.mm_receiver.wait_mm_metadata(obj)
+                if error:
+                    raise ValueError(f"Encoder failed: {error}")
 
     def convert_to_span_attrs(
         self,
