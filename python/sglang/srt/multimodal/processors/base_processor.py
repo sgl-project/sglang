@@ -173,6 +173,7 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    IMAGE_NUM_LIMITATION = 5
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -619,6 +620,15 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
+    def _get_image_limit(self) -> int:
+        """Return the effective image limit. CLI override takes priority."""
+        if (
+            self.server_args.limit_mm_data_per_request
+            and "image" in self.server_args.limit_mm_data_per_request
+        ):
+            return self.server_args.limit_mm_data_per_request["image"]
+        return self.IMAGE_NUM_LIMITATION
+
     def load_mm_data(
         self,
         prompt: str,
@@ -632,6 +642,15 @@ class BaseMultimodalProcessor(ABC):
     ) -> BaseMultiModalProcessorOutput:
 
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+
+        # Check image count against processor limit
+        if image_data:
+            limit = self._get_image_limit()
+            if len(image_data) > limit:
+                raise ValueError(
+                    f"Number of images ({len(image_data)}) exceeds "
+                    f"the limit ({limit}) for this processor."
+                )
 
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
