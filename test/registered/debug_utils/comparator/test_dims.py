@@ -11,6 +11,7 @@ from sglang.srt.debug_utils.comparator.dims import (
     DimSpec,
     Ordering,
     ParallelAxis,
+    ParallelModifier,
     Reduction,
     _SingletonDimUtil,
     apply_dim_names,
@@ -32,28 +33,52 @@ class TestParseDim:
         assert parse_dim("b") == DimSpec(name="b")
 
     def test_parallel_axis(self) -> None:
-        assert parse_dim("h(tp)") == DimSpec(name="h", parallel=ParallelAxis.TP)
+        assert parse_dim("h(tp)") == DimSpec(
+            name="h",
+            parallel_modifiers=[ParallelModifier(axis=ParallelAxis.TP)],
+        )
 
     def test_all_parallel_axes(self) -> None:
-        assert parse_dim("a(tp)").parallel == ParallelAxis.TP
-        assert parse_dim("a(cp)").parallel == ParallelAxis.CP
-        assert parse_dim("a(ep)").parallel == ParallelAxis.EP
-        assert parse_dim("a(sp)").parallel == ParallelAxis.SP
+        assert parse_dim("a(tp)").parallel_modifiers[0].axis == ParallelAxis.TP
+        assert parse_dim("a(cp)").parallel_modifiers[0].axis == ParallelAxis.CP
+        assert parse_dim("a(ep)").parallel_modifiers[0].axis == ParallelAxis.EP
+        assert parse_dim("a(sp)").parallel_modifiers[0].axis == ParallelAxis.SP
 
     def test_ordering(self) -> None:
-        assert parse_dim("s(cp,zigzag)").ordering == Ordering.ZIGZAG
-        assert parse_dim("s(cp,natural)").ordering == Ordering.NATURAL
+        assert (
+            parse_dim("s(cp:zigzag)").parallel_modifiers[0].ordering == Ordering.ZIGZAG
+        )
+        assert (
+            parse_dim("s(cp:natural)").parallel_modifiers[0].ordering
+            == Ordering.NATURAL
+        )
 
     def test_reduction(self) -> None:
-        assert parse_dim("h(tp,partial)").reduction == Reduction.PARTIAL
-
-    def test_all_modifiers(self) -> None:
-        assert parse_dim("s(cp,zigzag,partial)") == DimSpec(
-            name="s",
-            parallel=ParallelAxis.CP,
-            ordering=Ordering.ZIGZAG,
-            reduction=Reduction.PARTIAL,
+        assert (
+            parse_dim("h(tp:partial)").parallel_modifiers[0].reduction
+            == Reduction.PARTIAL
         )
+
+    def test_all_qualifiers(self) -> None:
+        assert parse_dim("s(cp:zigzag+partial)") == DimSpec(
+            name="s",
+            parallel_modifiers=[
+                ParallelModifier(
+                    axis=ParallelAxis.CP,
+                    ordering=Ordering.ZIGZAG,
+                    reduction=Reduction.PARTIAL,
+                ),
+            ],
+        )
+
+    def test_multi_axis(self) -> None:
+        result: DimSpec = parse_dim("t(cp:zigzag,sp)")
+        assert result.name == "t"
+        assert len(result.parallel_modifiers) == 2
+        assert result.parallel_modifiers[0] == ParallelModifier(
+            axis=ParallelAxis.CP, ordering=Ordering.ZIGZAG
+        )
+        assert result.parallel_modifiers[1] == ParallelModifier(axis=ParallelAxis.SP)
 
     def test_invalid_token_raises(self) -> None:
         with pytest.raises(ValueError, match="Invalid dim token"):
@@ -61,19 +86,25 @@ class TestParseDim:
         with pytest.raises(ValueError, match="Invalid dim token"):
             parse_dim("h(tp(x))")
 
-    def test_unknown_modifier_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unknown modifier"):
+    def test_unknown_axis_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown axis"):
             parse_dim("h(xyz)")
-        with pytest.raises(ValueError, match="Unknown modifier"):
-            parse_dim("h(tp,foobar)")
+
+    def test_unknown_qualifier_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown qualifier"):
+            parse_dim("h(tp:foobar)")
 
     def test_multiple_ordering_raises(self) -> None:
         with pytest.raises(ValueError, match="Multiple ordering"):
-            parse_dim("s(cp,zigzag,natural)")
+            parse_dim("s(cp:zigzag+natural)")
 
     def test_multiple_reduction_raises(self) -> None:
         with pytest.raises(ValueError, match="Multiple reduction"):
-            parse_dim("h(tp,partial,partial)")
+            parse_dim("h(tp:partial+partial)")
+
+    def test_duplicate_axis_raises(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate axis"):
+            parse_dim("h(tp,tp)")
 
     def test_squeeze_dim(self) -> None:
         assert parse_dim("1") == DimSpec(name="1")
@@ -96,10 +127,18 @@ class TestParseDims:
         assert parse_dims("t") == [DimSpec(name="t")]
 
     def test_mixed_annotated(self) -> None:
-        assert parse_dims("b s(cp,zigzag) h(tp) d") == [
+        assert parse_dims("b s(cp:zigzag) h(tp) d") == [
             DimSpec(name="b"),
-            DimSpec(name="s", parallel=ParallelAxis.CP, ordering=Ordering.ZIGZAG),
-            DimSpec(name="h", parallel=ParallelAxis.TP),
+            DimSpec(
+                name="s",
+                parallel_modifiers=[
+                    ParallelModifier(axis=ParallelAxis.CP, ordering=Ordering.ZIGZAG),
+                ],
+            ),
+            DimSpec(
+                name="h",
+                parallel_modifiers=[ParallelModifier(axis=ParallelAxis.TP)],
+            ),
             DimSpec(name="d"),
         ]
 
@@ -158,7 +197,7 @@ class TestFindDimIndex:
         assert find_dim_index(specs, "d") == 3
 
     def test_with_modifiers(self) -> None:
-        specs: list[DimSpec] = parse_dims("b s(cp,zigzag) h(tp) d")
+        specs: list[DimSpec] = parse_dims("b s(cp:zigzag) h(tp) d")
         assert find_dim_index(specs, "h") == 2
 
     def test_empty_list(self) -> None:

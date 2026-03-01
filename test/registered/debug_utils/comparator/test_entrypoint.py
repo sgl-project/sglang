@@ -837,7 +837,7 @@ class TestEntrypointGroupingLogical:
                 tp_size=1,
                 seq_dim=1,
                 head_dim=2,
-                dims_str="b s(cp,zigzag) h",
+                dims_str="b s(cp:zigzag) h",
             )
 
         args = _make_args(
@@ -871,7 +871,7 @@ class TestEntrypointGroupingLogical:
                 tp_size=2,
                 seq_dim=1,
                 head_dim=2,
-                dims_str="b s(cp,zigzag) h(tp)",
+                dims_str="b s(cp:zigzag) h(tp)",
             )
 
         args = _make_args(
@@ -959,14 +959,14 @@ class TestEntrypointGroupingLogical:
             full_tensor=full_baseline,
             name="attn_out",
             tp_size=2,
-            dims_str="b h(tp,partial)",
+            dims_str="b h(tp:partial)",
         )
         target_path = _create_tp_partial_dumps(
             target_dir,
             full_tensor=full_target,
             name="attn_out",
             tp_size=2,
-            dims_str="b h(tp,partial)",
+            dims_str="b h(tp:partial)",
         )
 
         args = _make_args(baseline_path, target_path, diff_threshold=0.01)
@@ -997,7 +997,7 @@ class TestEntrypointGroupingLogical:
             full_tensor=target_full,
             name="attn_out",
             tp_size=2,
-            dims_str="b h(tp,partial)",
+            dims_str="b h(tp:partial)",
         )
 
         args = _make_args(baseline_path, target_path, diff_threshold=0.01)
@@ -1026,7 +1026,7 @@ class TestEntrypointGroupingLogical:
                         rank=rank,
                         name="hidden",
                         tensor=cp_chunks[cp_rank] / 2,
-                        dims="b s(cp) h(tp,partial)",
+                        dims="b s(cp) h(tp:partial)",
                         parallel_info={
                             "cp_rank": cp_rank,
                             "cp_size": 2,
@@ -1039,6 +1039,38 @@ class TestEntrypointGroupingLogical:
         args = _make_args(
             tmp_path / "baseline" / _FIXED_EXP_NAME,
             tmp_path / "target" / _FIXED_EXP_NAME,
+            diff_threshold=0.01,
+        )
+
+        records, _ = _run_and_parse(args, capsys)
+        comp = _assert_single_comparison_passed(records)
+        assert comp.name == "hidden"
+
+    def test_cp_zigzag_sp_same_dim_unshard(self, tmp_path, capsys):
+        """CP=2 zigzag + SP=2 on same seq dim: multi-axis unshard + reorder."""
+        torch.manual_seed(42)
+        full_baseline = torch.randn(4, 8, 6)
+        full_target = full_baseline + torch.randn(4, 8, 6) * 0.001
+
+        baseline_dir = tmp_path / "baseline"
+        target_dir = tmp_path / "target"
+
+        for side_dir, full_tensor in [
+            (baseline_dir, full_baseline),
+            (target_dir, full_target),
+        ]:
+            _create_cp_zigzag_sp_sharded_dumps(
+                side_dir,
+                full_tensor=full_tensor,
+                name="hidden",
+                cp_size=2,
+                sp_size=2,
+                dims_str="b s(cp:zigzag,sp) h",
+            )
+
+        args = _make_args(
+            baseline_dir / _FIXED_EXP_NAME,
+            target_dir / _FIXED_EXP_NAME,
             diff_threshold=0.01,
         )
 
@@ -2578,6 +2610,63 @@ def _create_cp_zigzag_tp_sharded_dumps(
     return directory / _FIXED_EXP_NAME
 
 
+def _create_cp_zigzag_sp_sharded_dumps(
+    directory: Path,
+    *,
+    full_tensor: torch.Tensor,
+    name: str,
+    cp_size: int,
+    sp_size: int,
+    dims_str: str,
+    seq_dim: int = 1,
+    num_steps: int = 1,
+) -> Path:
+    """Create CP-zigzag + SP sharded dump files for a seq dim (b s h format).
+
+    Shard order (outer to inner, matching left-to-right in dims annotation):
+      1. CP zigzag splits seq dim into cp_size chunks (zigzag order)
+      2. SP splits each CP chunk into sp_size chunks
+    """
+    num_chunks: int = cp_size * 2
+    natural_chunks: list[torch.Tensor] = list(
+        full_tensor.chunk(num_chunks, dim=seq_dim)
+    )
+
+    zigzag_order: list[int] = []
+    for i in range(cp_size):
+        zigzag_order.append(i)
+        zigzag_order.append(num_chunks - 1 - i)
+
+    zigzagged: torch.Tensor = torch.cat(
+        [natural_chunks[idx] for idx in zigzag_order], dim=seq_dim
+    )
+    cp_chunks: list[torch.Tensor] = list(zigzagged.chunk(cp_size, dim=seq_dim))
+
+    rank: int = 0
+    for cp_rank in range(cp_size):
+        sp_chunks: list[torch.Tensor] = list(
+            cp_chunks[cp_rank].chunk(sp_size, dim=seq_dim)
+        )
+        for sp_rank in range(sp_size):
+            _create_rank_dump(
+                directory,
+                rank=rank,
+                name=name,
+                tensor=sp_chunks[sp_rank],
+                dims=dims_str,
+                parallel_info={
+                    "cp_rank": cp_rank,
+                    "cp_size": cp_size,
+                    "sp_rank": sp_rank,
+                    "sp_size": sp_size,
+                },
+                num_steps=num_steps,
+            )
+            rank += 1
+
+    return directory / _FIXED_EXP_NAME
+
+
 def _create_replicated_tp_sharded_cp_dumps(
     directory: Path,
     *,
@@ -2772,7 +2861,7 @@ def _create_thd_cp_zigzag_dumps(
     seq_lens: list[int],
     cp_size: int,
     total_per_rank: int,
-    dims_str: str = "t(cp,zigzag)",
+    dims_str: str = "t(cp:zigzag)",
     num_steps: int = 1,
 ) -> Path:
     """Create THD CP-zigzag sharded dump files simulating Megatron forward.
@@ -2981,7 +3070,7 @@ class TestEntrypointThdCpZigzag:
                 rank=cp_rank,
                 name="hidden_states",
                 tensor=rank_hidden,
-                dims="t(cp,zigzag) h",
+                dims="t(cp:zigzag) h",
                 parallel_info={"cp_rank": cp_rank, "cp_size": cp_size},
                 framework="megatron",
                 extra_dumps=[

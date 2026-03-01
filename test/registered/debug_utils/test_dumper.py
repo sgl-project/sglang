@@ -2348,7 +2348,7 @@ class TestDumperDims:
         )
 
         tensor = torch.randn(4, 8, requires_grad=True)
-        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp,partial)")
+        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp:partial)")
         dumper.step()
 
         tensor.backward(torch.ones_like(tensor))
@@ -2362,10 +2362,10 @@ class TestDumperDims:
 
         value_data = torch.load(value_file, weights_only=False)
         assert value_data["meta"]["dims"] == "b h(tp)"
-        assert value_data["meta"]["dims_grad"] == "b h(tp,partial)"
+        assert value_data["meta"]["dims_grad"] == "b h(tp:partial)"
 
         grad_data = torch.load(grad_file, weights_only=False)
-        assert grad_data["meta"]["dims"] == "b h(tp,partial)"
+        assert grad_data["meta"]["dims"] == "b h(tp:partial)"
 
     def test_dims_grad_inherits(self, tmp_path) -> None:
         dumper = _Dumper(

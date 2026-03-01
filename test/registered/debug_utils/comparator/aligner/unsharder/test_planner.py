@@ -175,7 +175,7 @@ class TestComputeUnsharderPlan:
             compute_unsharder_plan(dim_specs, parallel_infos)
 
     def test_reduction_partial_returns_reduce_sum(self) -> None:
-        dim_specs = parse_dims("h(tp,partial)")
+        dim_specs = parse_dims("h(tp:partial)")
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
@@ -188,7 +188,7 @@ class TestComputeUnsharderPlan:
 
     def test_reduction_partial_tp4(self) -> None:
         """TP=4 with partial reduction produces a single ReduceSumParams step."""
-        dim_specs = parse_dims("h(tp,partial)")
+        dim_specs = parse_dims("h(tp:partial)")
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=i, axis_size=4)} for i in range(4)
         ]
@@ -200,7 +200,7 @@ class TestComputeUnsharderPlan:
 
     def test_multi_axis_with_reduction_on_one(self) -> None:
         """CP concat + TP reduce produces a 2-step plan."""
-        dim_specs = parse_dims("s(cp) h(tp,partial)")
+        dim_specs = parse_dims("s(cp) h(tp:partial)")
         parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
         for cp_rank in range(2):
             for tp_rank in range(2):
@@ -221,7 +221,7 @@ class TestComputeUnsharderPlan:
 
     def test_reduction_scrambled_ranks(self) -> None:
         """Scrambled world_rank order with partial reduction."""
-        dim_specs = parse_dims("h(tp,partial)")
+        dim_specs = parse_dims("h(tp:partial)")
         parallel_infos = [
             {ParallelAxis.TP: AxisInfo(axis_rank=2, axis_size=4)},
             {ParallelAxis.TP: AxisInfo(axis_rank=0, axis_size=4)},
@@ -235,7 +235,7 @@ class TestComputeUnsharderPlan:
         assert plans[0].groups == [[1, 3, 0, 2]]
 
     def test_ordering_zigzag_accepted(self) -> None:
-        dim_specs = parse_dims("s(cp,zigzag)")
+        dim_specs = parse_dims("s(cp:zigzag)")
         parallel_infos = [
             {ParallelAxis.CP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
@@ -244,7 +244,7 @@ class TestComputeUnsharderPlan:
         assert plans[0].axis == ParallelAxis.CP
 
     def test_ordering_natural_accepted(self) -> None:
-        dim_specs = parse_dims("s(cp,natural)")
+        dim_specs = parse_dims("s(cp:natural)")
         parallel_infos = [
             {ParallelAxis.CP: AxisInfo(axis_rank=i, axis_size=2)} for i in range(2)
         ]
@@ -287,6 +287,77 @@ class TestComputeUnsharderPlan:
         # Step 2 (TP): 2 tensors → 1 (single group of 2)
         assert len(plans[2].groups) == 1
         assert len(plans[2].groups[0]) == 2
+
+    def test_same_dim_cp_sp_plan(self) -> None:
+        """t(cp:zigzag,sp) with CP=2 SP=2: SP unshards first (inner), then CP."""
+        dim_specs = parse_dims("t(cp:zigzag,sp) 1 h")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for sp_rank in range(2):
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.SP: AxisInfo(axis_rank=sp_rank, axis_size=2),
+                    }
+                )
+
+        plans = compute_unsharder_plan(dim_specs, parallel_infos)
+
+        assert len(plans) == 2
+
+        # SP unshards first (rightmost modifier = innermost shard)
+        sp_plan = plans[0]
+        assert sp_plan.axis == ParallelAxis.SP
+        assert isinstance(sp_plan.params, ConcatParams)
+        assert sp_plan.params.dim_name == "t"
+        assert len(sp_plan.groups) == 2
+        for group in sp_plan.groups:
+            assert len(group) == 2
+
+        # CP unshards second (leftmost modifier = outermost shard)
+        cp_plan = plans[1]
+        assert cp_plan.axis == ParallelAxis.CP
+        assert isinstance(cp_plan.params, ConcatParams)
+        assert cp_plan.params.dim_name == "t"
+        assert len(cp_plan.groups) == 1
+        assert len(cp_plan.groups[0]) == 2
+
+    def test_same_dim_cp_sp_with_thd(self) -> None:
+        """t(cp:zigzag,sp) with THD: SP → ConcatParams, CP → CpThdConcatParams."""
+        from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+            CpThdConcatParams,
+        )
+
+        dim_specs = parse_dims("t(cp:zigzag,sp) h")
+        parallel_infos: list[dict[ParallelAxis, AxisInfo]] = []
+        for cp_rank in range(2):
+            for sp_rank in range(2):
+                parallel_infos.append(
+                    {
+                        ParallelAxis.CP: AxisInfo(axis_rank=cp_rank, axis_size=2),
+                        ParallelAxis.SP: AxisInfo(axis_rank=sp_rank, axis_size=2),
+                    }
+                )
+
+        thd_global_seq_lens: list[int] = [100, 64]
+        plans = compute_unsharder_plan(
+            dim_specs, parallel_infos, thd_global_seq_lens=thd_global_seq_lens
+        )
+
+        assert len(plans) == 2
+
+        # SP unshards first: plain concat (SP is not CP, no THD special handling)
+        sp_plan = plans[0]
+        assert sp_plan.axis == ParallelAxis.SP
+        assert isinstance(sp_plan.params, ConcatParams)
+        assert sp_plan.params.dim_name == "t"
+
+        # CP unshards second: THD concat because dim is 't' + axis is CP + thd_global_seq_lens provided
+        cp_plan = plans[1]
+        assert cp_plan.axis == ParallelAxis.CP
+        assert isinstance(cp_plan.params, CpThdConcatParams)
+        assert cp_plan.params.dim_name == "t"
+        assert cp_plan.params.seq_lens_per_rank == [50, 32]
 
     def test_sp_in_dims_but_not_in_parallel_info(self) -> None:
         """s(sp) in dims but SP absent from parallel_info (SP disabled), should auto-skip."""
